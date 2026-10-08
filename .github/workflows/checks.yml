@@ -1,0 +1,41 @@
+name: Source checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        run: python -m pip install uv==0.10.4
+      - name: Install locked workspace
+        run: uv sync --all-packages --locked
+      - name: Lint
+        run: make lint
+      - name: Check formatting
+        run: make format-check
+      - name: Build workspace wheels
+        run: make wheels
+      - name: Verify wheel installation
+        run: |
+          uv venv "$RUNNER_TEMP/merlin-wheel-smoke" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/merlin-wheel-smoke/bin/python" dist/wheels/*.whl
+          "$RUNNER_TEMP/merlin-wheel-smoke/bin/merlin" --version
+          "$RUNNER_TEMP/merlin-wheel-smoke/bin/python" -c 'from merlin_packs.knowledge import knowledge_catalogue; assert len(knowledge_catalogue()) == 7'
+      - name: Run source regression tests
+        run: >-
+          uv run pytest
+          packages/merlin-packs/tests/test_packs.py
+          packages/merlin-kernel/tests/test_kernel.py
+          apps/merlin-tui/tests/test_operator_controls.py
+          apps/merlin-tui/tests/test_kernel_backend.py
+          apps/merlin-tui/tests/test_workspace_version.py
+          apps/merlin-tui/tests/test_release_contract.py
+          apps/merlin-tui/tests/test_packaged_launcher.py
+          apps/merlin-tui/tests/test_install_release_script.py

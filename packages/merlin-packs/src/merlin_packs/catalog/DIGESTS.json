@@ -1,0 +1,10 @@
+{
+  "catalog_set_digest": "sha256:91d62c9f27ceae0ceebb9c735e41eeaea3c296780aad8adea53a3fe01f40d945",
+  "files": {
+    "injection-cases.jsonl": "sha256:37248288217d07ef847720dcc5e7aa94fb415a11ec98eed7f106da18c196db20",
+    "injection-taxonomy.json": "sha256:c174f4434377e04fc59da3dfd1b99d7a65ce91e751dfabe2c32770b9ecb2f925",
+    "execution-pairs.json": "sha256:8f7f476fca070738a32c87fda3fbe76b475cb70294aa31617dc0c31f48a0425b",
+    "adaptive-strategies.json": "sha256:2420f8de61032e835a01eb14746207dc7c3f03cf2ccc3443ad5e117ef7131bf0",
+    "offensive-experiments.json": "sha256:30d0333400226a0c06ab8c9e6070ae75139a0a9da1cb892b258067736ec54a8a"
+  }
+}

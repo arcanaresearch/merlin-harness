@@ -1,0 +1,184 @@
+#!/bin/sh
+set -eu
+launcher=$0
+while [ -L "$launcher" ]; do
+  link=$(readlink "$launcher")
+  case "$link" in
+    /*) launcher=$link ;;
+    *) launcher=$(dirname "$launcher")/$link ;;
+  esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd)
+export PLAYWRIGHT_BROWSERS_PATH="$root/payload/playwright"
+postgres_version=18.1.0
+postgres_home="$HOME/.pg0/installation"
+install_root=${MERLIN_INSTALL_ROOT:-"$HOME/.local/share/merlin"}
+bin_root=${MERLIN_BIN_ROOT:-"$HOME/.local/bin"}
+bin_path="$bin_root/merlin"
+runtime="$root/payload/merlin-runtime/merlin-runtime"
+channel_file="$install_root/release-channel"
+
+usage() {
+  cat <<'EOF'
+usage: merlin [COMMAND]
+
+  update [--channel NAME] atomically install this release and select its update channel
+  start                   start the Merlin daemon
+  stop                    stop the Merlin daemon
+  restart                 restart the Merlin daemon
+  status                  show daemon status
+  uninstall [--purge]     remove Merlin and all Merlin data (default)
+  uninstall --keep-data   remove the app but preserve user data
+EOF
+}
+
+install_bundle() {
+  requested_channel=${1:-}
+  if [ -z "$requested_channel" ]; then
+    if [ -n "${MERLIN_RELEASE_CHANNEL:-}" ]; then
+      requested_channel=$MERLIN_RELEASE_CHANNEL
+    elif [ -f "$channel_file" ]; then
+      requested_channel=$(sed -n '1p' "$channel_file")
+    elif [ -f "$root/release-channel" ]; then
+      requested_channel=$(sed -n '1p' "$root/release-channel")
+    else
+      requested_channel=stable
+    fi
+  fi
+  case "$requested_channel" in
+    ""|*[!a-zA-Z0-9._-]*)
+      echo "release channel must contain only letters, digits, dot, underscore, or hyphen" >&2
+      exit 2
+      ;;
+  esac
+  release_name=$(basename "$root")
+  destination="$install_root/$release_name"
+  previous="$install_root/.previous-$release_name"
+  mkdir -p -- "$install_root" "$bin_root"
+  if [ "$root" != "$destination" ]; then
+    # A rebuilt bundle may retain the same semantic version during local iteration.
+    # Stop the installed daemon before replacing its runtime so the newly launched TUI
+    # cannot attach to an older in-memory process from the overwritten bundle.
+    if [ -x "$bin_path" ]; then
+      "$bin_path" stop >/dev/null 2>&1 || true
+    fi
+    stage=$(mktemp -d "$install_root/.install.XXXXXX")
+    trap 'rm -rf -- "$stage" "$previous"' EXIT HUP INT TERM
+    cp -R "$root/." "$stage/"
+    rm -rf -- "$previous"
+    if [ -e "$destination" ]; then
+      mv "$destination" "$previous"
+    fi
+    if ! mv "$stage" "$destination"; then
+      if [ -e "$previous" ]; then
+        mv "$previous" "$destination"
+      fi
+      exit 1
+    fi
+    rm -rf -- "$previous"
+    trap - EXIT HUP INT TERM
+  fi
+  ln -sfn "$destination/merlin" "$bin_path"
+  channel_stage=$(mktemp "$install_root/.release-channel.XXXXXX")
+  printf '%s\n' "$requested_channel" > "$channel_stage"
+  mv "$channel_stage" "$channel_file"
+  mkdir -p -- "$postgres_home"
+  ln -sfn "$destination/payload/postgresql/$postgres_version" \
+    "$postgres_home/$postgres_version"
+  "$bin_path" --version
+  echo "installed: $bin_path"
+}
+
+uninstall_bundle() {
+  keep_data=0
+  case "${1:-}" in
+    ""|--purge) ;;
+    --keep-data) keep_data=1 ;;
+    *) echo "usage: merlin uninstall [--purge|--keep-data]" >&2; exit 2 ;;
+  esac
+  "$runtime" daemon stop >/dev/null 2>&1 || true
+  if [ "$keep_data" -eq 1 ]; then
+    "$runtime" storage stop >/dev/null 2>&1 || true
+  else
+    "$runtime" storage purge >/dev/null 2>&1 || true
+    rm -rf -- "$HOME/.merlin"
+  fi
+
+  installed_dir=""
+  if [ -L "$bin_path" ]; then
+    link_target=$(readlink "$bin_path")
+    case "$link_target" in
+      "$install_root"/*/merlin)
+        installed_dir=${link_target%/merlin}
+        rm -f -- "$bin_path"
+        ;;
+    esac
+  fi
+  if [ -z "$installed_dir" ]; then
+    case "$root" in
+      "$install_root"/*) installed_dir="$root" ;;
+    esac
+  fi
+  if [ -n "$installed_dir" ]; then
+    rm -rf -- "$installed_dir"
+  fi
+  if [ "$keep_data" -eq 0 ]; then
+    rm -f -- "$channel_file"
+    rmdir -- "$install_root" >/dev/null 2>&1 || true
+  fi
+  if [ -L "$postgres_home/$postgres_version" ]; then
+    pg_target=$(readlink "$postgres_home/$postgres_version")
+    case "$pg_target" in
+      */payload/postgresql/"$postgres_version") rm -f -- "$postgres_home/$postgres_version" ;;
+    esac
+  fi
+  if [ "$keep_data" -eq 1 ]; then
+    echo "Merlin uninstalled; data preserved in $HOME/.merlin"
+  else
+    echo "Merlin uninstalled and all Merlin data purged"
+  fi
+}
+
+if [ -L "$postgres_home/$postgres_version" ]; then
+  ln -sfn "$root/payload/postgresql/$postgres_version" "$postgres_home/$postgres_version"
+elif [ ! -e "$postgres_home/$postgres_version" ]; then
+  mkdir -p -- "$postgres_home"
+  ln -s "$root/payload/postgresql/$postgres_version" "$postgres_home/$postgres_version"
+fi
+
+case "${1:-}" in
+  install) echo "Merlin installs automatically on first launch; run merlin with no command" >&2; exit 2 ;;
+  update)
+    case "$#" in
+      1) install_bundle "" ;;
+      3) [ "$2" = "--channel" ] || { usage >&2; exit 2; }; install_bundle "$3" ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    exit
+    ;;
+  start) shift; exec "$runtime" daemon start "$@" ;;
+  stop) shift; exec "$runtime" daemon stop "$@" ;;
+  restart)
+    shift
+    "$runtime" daemon stop >/dev/null 2>&1 || true
+    exec "$runtime" daemon start "$@"
+    ;;
+  status) shift; exec "$runtime" daemon status "$@" ;;
+  uninstall) shift; uninstall_bundle "$@"; exit ;;
+  help|--help|-h) usage; exit ;;
+esac
+
+if [ "$#" -eq 0 ]; then
+  case "$root" in
+    "$install_root"/*) ;;
+    *)
+      install_bundle ""
+      if [ "${MERLIN_INSTALL_NO_LAUNCH:-0}" = "1" ]; then
+        exit
+      fi
+      exec "$bin_path"
+      ;;
+  esac
+fi
+
+exec "$runtime" "$@"

@@ -1,0 +1,135 @@
+{
+  "schema": "merlin.knowledge-pack.v1",
+  "manifest": {
+    "pack_id": "com.merlin.pricing-schedules",
+    "pack_version": "1.0.0",
+    "format_version": 1,
+    "kind": "pricing_schedules",
+    "publisher": "merlin",
+    "published_at": "2026-08-25T00:00:00Z",
+    "content_digest": "sha256:6c1218073218bf2a0ee20529dec766dfaa135d42d3a40f043e0c7e87dde07a92",
+    "merlin_compatibility": "8.x",
+    "storage": "plaintext",
+    "provenance": {
+      "source": "project-authored-from-runtime-mechanics",
+      "license": "Apache-2.0",
+      "as_of": "2026-08-25",
+      "references": [
+        "crates/merlin-provider/src/registry.rs",
+        "crates/merlin-provider/src/pricing.rs",
+        "docs/e9/e9-0-source-ledger.md"
+      ]
+    }
+  },
+  "entries": [
+    {
+      "entry_id": "pricing/route/open_ai_responses",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:7933f1617cf07a310c7c167d5898fd80bb5aaff19757668038f58235e1008ac6",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["hosted", "open_ai_responses"],
+      "applicability_tags": ["billable", "unresolved-production-rates"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":null,\"effective_from\":null,\"effective_until\":null,\"pricing_mode\":\"billable_schedule_required\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":null,\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":\"micros_per_million_tokens\",\"rates\":null,\"resolution\":\"unresolved\",\"route_family\":\"open_ai_responses\",\"transport_family\":\"hosted\",\"unresolved_reason\":\"no production provider/model rate catalogue with attributable currency, effective interval, and provenance is loaded; numeric rates in Rust tests are fixtures only\",\"usage_buckets\":[\"input_tokens\",\"cached_input_tokens\",\"output_tokens\",\"reasoning_output_tokens\"]}"
+    },
+    {
+      "entry_id": "pricing/route/anthropic_messages",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:170566512b4ce12ec3a561ddf73accdb9b6c5218cda125941c86fce0ec778fc9",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["hosted", "anthropic_messages"],
+      "applicability_tags": ["billable", "unresolved-production-rates"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":null,\"effective_from\":null,\"effective_until\":null,\"pricing_mode\":\"billable_schedule_required\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":null,\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":\"micros_per_million_tokens\",\"rates\":null,\"resolution\":\"unresolved\",\"route_family\":\"anthropic_messages\",\"transport_family\":\"hosted\",\"unresolved_reason\":\"no production provider/model rate catalogue with attributable currency, effective interval, and provenance is loaded; numeric rates in Rust tests are fixtures only\",\"usage_buckets\":[\"input_tokens\",\"cache_creation_input_tokens\",\"cache_read_input_tokens\",\"output_tokens\"]}"
+    },
+    {
+      "entry_id": "pricing/route/gemini_generate_content",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:ce77b3593991d716a2d77473bbc0f11e5cae71eb6d230ddbc971b1ca2ab384fe",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["hosted", "gemini_generate_content"],
+      "applicability_tags": ["billable", "unresolved-production-rates"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":null,\"effective_from\":null,\"effective_until\":null,\"pricing_mode\":\"billable_schedule_required\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":null,\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":\"micros_per_million_tokens\",\"rates\":null,\"resolution\":\"unresolved\",\"route_family\":\"gemini_generate_content\",\"transport_family\":\"hosted\",\"unresolved_reason\":\"no production provider/model rate catalogue with attributable currency, effective interval, and provenance is loaded; numeric rates in Rust tests are fixtures only\",\"usage_buckets\":[\"input_tokens\",\"cached_input_tokens\",\"output_tokens\",\"thoughts_tokens\",\"tool_use_tokens\"]}"
+    },
+    {
+      "entry_id": "pricing/route/open_ai_chat_completions",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:84606d64757752dddc42b9c9981975d529cba207e679f36b3fa81a12e32c5b23",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["hosted", "open_ai_chat_completions"],
+      "applicability_tags": ["metered-unpriced", "unresolved-pricing-authority"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":null,\"effective_from\":null,\"effective_until\":null,\"pricing_mode\":\"metered_unpriced\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":null,\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":null,\"rates\":null,\"resolution\":\"unresolved\",\"route_family\":\"open_ai_chat_completions\",\"transport_family\":\"hosted\",\"unresolved_reason\":\"the runtime meters input and output tokens for this API shape but has no retained pricing-rate schema or trusted pricing authority for exact provider/model tuples\",\"usage_buckets\":[\"input_tokens\",\"output_tokens\"]}"
+    },
+    {
+      "entry_id": "pricing/route/local_open_ai_compatible",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:41ff6736c66777a2e87b55235b2c547ab81e28280bcdffebff40994d3bf4cc2c",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["local", "local_open_ai_compatible"],
+      "applicability_tags": ["non-billable", "resolved"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":\"NON\",\"effective_from\":\"runtime-schedule-creation\",\"effective_until\":\"runtime-authority-expiry\",\"pricing_mode\":\"local_non_billable\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":\"merlin deterministic local-non-billable rule\",\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":\"micros_per_million_tokens\",\"rates\":{\"input_tokens\":0,\"output_tokens\":0},\"resolution\":\"resolved_non_billable\",\"route_family\":\"local_open_ai_compatible\",\"transport_family\":\"local_open_ai_compatible\",\"unresolved_reason\":null,\"usage_buckets\":[\"input_tokens\",\"output_tokens\"]}"
+    },
+    {
+      "entry_id": "pricing/route/cli_process",
+      "media_type": "application/vnd.merlin.provider-pricing-route+json",
+      "kind": "pricing_schedule",
+      "digest": "sha256:5ed247cfd3344657536afd62c48eb05deb57fe122d2ae402b67aa79c3d9a7727",
+      "sensitivity": "public",
+      "provider_visibility": "any",
+      "specialist_tags": ["pricing"],
+      "target_tags": ["cli", "cli_process"],
+      "applicability_tags": ["metered-unpriced", "subscription-route"],
+      "provenance": {
+        "source": "project-authored-from-runtime-mechanics",
+        "license": "Apache-2.0",
+        "as_of": "2026-08-25",
+        "references": ["crates/merlin-provider/src/pricing.rs", "crates/merlin-provider/src/registry.rs"]
+      },
+      "content": "{\"currency\":null,\"effective_from\":null,\"effective_until\":null,\"pricing_mode\":\"metered_unpriced\",\"provenance\":{\"as_of\":\"2026-08-25\",\"rate_source\":null,\"runtime_mechanics\":\"crates/merlin-provider/src/pricing.rs\"},\"rate_unit\":null,\"rates\":null,\"resolution\":\"unresolved\",\"route_family\":\"cli_process\",\"transport_family\":\"cli_process\",\"unresolved_reason\":\"CLI and app-server subscription transports report token usage but do not expose an attributable per-token production pricing schedule\",\"usage_buckets\":[\"input_tokens\",\"output_tokens\"]}"
+    }
+  ],
+  "transforms": []
+}

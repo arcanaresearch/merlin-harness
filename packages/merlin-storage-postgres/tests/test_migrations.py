@@ -1,0 +1,189 @@
+from pathlib import Path
+
+from merlin_storage_postgres import (
+    CampaignStore,
+    Database,
+    DatabaseConfig,
+    MigrationRunner,
+    SessionRepository,
+    load_migrations,
+)
+
+
+def test_migrations_have_stable_versions_and_checksums() -> None:
+    migrations = load_migrations()
+    assert [migration.version for migration in migrations] == list(range(1, 80))
+    assert all(len(migration.checksum) == 64 for migration in migrations)
+    assert "'partial'" in migrations[74].sql
+    assert "ADD COLUMN partial_signal" in migrations[74].sql
+    assert "'reproduction'" in migrations[75].sql
+    assert "'review'" in migrations[75].sql
+    assert "'missing_target_effect'" in migrations[76].sql
+    assert "'result_schema_invalid'" in migrations[76].sql
+    assert "CREATE TABLE merlin_storage.technique_history" in migrations[60].sql
+    assert "'blocked_terminal'" in migrations[61].sql
+    assert "ADD COLUMN language_id" in migrations[62].sql
+    assert "ADD COLUMN mutation_id" in migrations[62].sql
+    assert "ALTER COLUMN objective_matched DROP NOT NULL" in migrations[63].sql
+    assert "CREATE TABLE merlin_storage.events" in migrations[0].sql
+    assert "ADD COLUMN tool_calls" in migrations[1].sql
+    assert "CREATE TABLE merlin_storage.pack_runs" in migrations[2].sql
+    assert "CREATE TABLE merlin_storage.agent_tasks" in migrations[3].sql
+    assert "CREATE TABLE merlin_storage.findings" in migrations[5].sql
+    assert "CREATE TABLE merlin_storage.scheduler_schedules" in migrations[6].sql
+    assert "CREATE TABLE merlin_storage.permission_rules" in migrations[7].sql
+    assert "CREATE TABLE merlin_storage.browser_contexts" in migrations[10].sql
+    assert "CREATE TABLE merlin_storage.assessment_campaigns" in migrations[11].sql
+    assert "CREATE TABLE merlin_storage.campaign_lead_journal" in migrations[12].sql
+    assert "CREATE TABLE merlin_storage.campaign_lessons" in migrations[13].sql
+    assert "CREATE TABLE merlin_storage.interaction_lessons" in migrations[18].sql
+    assert "ADD COLUMN reasoning_content" in migrations[19].sql
+    assert "ADD CONSTRAINT scheduler_schedules_status_check" in migrations[20].sql
+    assert "ADD COLUMN operation_group" in migrations[20].sql
+    assert "CREATE TABLE merlin_storage.campaign_worker_messages" in migrations[21].sql
+    assert "ADD COLUMN attempt_identity" in migrations[22].sql
+    assert "ADD COLUMN valid_until" in migrations[23].sql
+    assert "CREATE TABLE merlin_storage.campaign_budget_reservations" in migrations[24].sql
+    assert "ADD COLUMN reserved_cost_usd" in migrations[25].sql
+    assert "'adapter'" in migrations[26].sql
+    assert "CREATE TABLE merlin_storage.campaign_api_sessions" in migrations[27].sql
+    assert "CREATE TABLE merlin_storage.campaign_lead_directives" in migrations[30].sql
+    assert "CREATE TABLE merlin_storage.conversation_compactions" in migrations[15].sql
+    assert "CREATE TABLE merlin_storage.tool_effects" in migrations[14].sql
+    assert "CREATE TABLE merlin_storage.cleanup_receipts" in migrations[14].sql
+    assert "CREATE TABLE merlin_storage.crescendo_step_receipts" in migrations[34].sql
+    assert "CREATE TABLE merlin_storage.crescendo_terminal_receipts" in migrations[34].sql
+    assert "ADD COLUMN scenario_fingerprint" in migrations[38].sql
+    assert "CREATE TABLE merlin_storage.exploration_critic_decisions" in migrations[39].sql
+    assert "CREATE TABLE merlin_storage.campaign_technique_attempts" in migrations[41].sql
+    assert "CREATE TABLE merlin_storage.automation_artifacts" in migrations[42].sql
+    assert "CREATE TABLE merlin_storage.automation_artifact_runs" in migrations[42].sql
+    assert "CREATE TABLE merlin_storage.campaign_dynamic_specialists" in migrations[45].sql
+    assert "'operator-continuation'" in migrations[43].sql
+    assert "DROP CONSTRAINT campaign_arms_source_check" in migrations[50].sql
+    assert "ADD CONSTRAINT campaign_arms_source_check" in migrations[50].sql
+    assert "'failure-derived'" in migrations[50].sql
+    assert "DROP INDEX IF EXISTS" in migrations[51].sql
+    assert "report_revisions_completion_digest_idx" in migrations[51].sql
+    assert "CREATE TABLE merlin_storage.campaign_hypotheses" in migrations[52].sql
+    assert "CREATE TABLE merlin_storage.campaign_counter_events" in migrations[52].sql
+    assert "CREATE TABLE merlin_storage.campaign_arm_outcomes" in migrations[52].sql
+    assert "CREATE TABLE merlin_storage.technique_language_evidence" in migrations[52].sql
+    assert "ADD COLUMN causal_ambiguity" in migrations[53].sql
+    assert "ADD COLUMN impact_level" in migrations[53].sql
+    assert "ADD COLUMN requires_independent_reproduction" in migrations[53].sql
+    assert "'catalog-mutation'" in migrations[54].sql
+    assert "ADD COLUMN execution_reachability" in migrations[55].sql
+    assert "ADD COLUMN usage" in migrations[56].sql
+    assert "ADD COLUMN generation" in migrations[58].sql
+    assert "ADD COLUMN probe_token" in migrations[59].sql
+    assert "CREATE INDEX tool_effects_campaign_technique_attempt_target_idx" in migrations[64].sql
+    assert "ADD COLUMN session_scope_id" in migrations[65].sql
+    assert "ADD COLUMN cleanup_disposition" in migrations[66].sql
+    assert "ADD COLUMN failure_kind" in migrations[67].sql
+    assert "'provider_transient'" in migrations[68].sql
+    assert "ALTER COLUMN objective_matched DROP NOT NULL" in migrations[70].sql
+    assert "'cleanup_requirement_unestablished'" in migrations[71].sql
+    assert "ALTER COLUMN ttl_waves DROP NOT NULL" in migrations[72].sql
+    assert "CREATE TABLE merlin_storage.campaign_capability_observations" in migrations[73].sql
+    evidence = next(migration for migration in migrations if migration.version == 17)
+    assert "CREATE TABLE merlin_storage.campaign_observations" in evidence.sql
+    assert "CREATE TABLE IF NOT EXISTS merlin_storage.report_revisions" in migrations[17].sql
+
+
+def test_api_session_scope_migration_reserves_legacy_rows(tmp_path: Path) -> None:
+    migrations = load_migrations()
+    campaign_id = "campaign/legacy-api-session"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-api-scope")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:65])
+            session = SessionRepository(connection).create("legacy API scope")
+            CampaignStore(connection).prepare(
+                campaign_id,
+                str(session.id),
+                {"manifest": {"id": campaign_id}, "assignment_context": {}},
+                "sha256:reviewed",
+            )
+            connection.execute(
+                """INSERT INTO merlin_storage.campaign_api_sessions
+                       (campaign_id, target_id, adapter_digest, state)
+                   VALUES (%s, 'target-1', 'sha256:adapter', 'active')""",
+                (campaign_id,),
+            )
+            connection.commit()
+
+            runner.apply(migrations[65:])
+
+            row = connection.execute(
+                """SELECT target_id, session_scope_id, remote_session_id
+                   FROM merlin_storage.campaign_api_sessions
+                   WHERE campaign_id = %s""",
+                (campaign_id,),
+            ).fetchone()
+            assert row == {
+                "target_id": "target-1",
+                "session_scope_id": "legacy:campaign",
+                "remote_session_id": None,
+            }
+
+
+def test_observability_migration_discards_only_partial_arm_learning_rows(tmp_path: Path) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:52])
+            session = SessionRepository(connection).create("preserved evidence authority")
+            connection.execute(
+                """INSERT INTO merlin_storage.campaign_arms
+                       (id, target_id, scenario_fingerprint, semantic_id, strategy_id,
+                        technique_id, objective, source)
+                   VALUES ('old-arm', 'target-1', 'scenario-1', 'semantic-1', 'direct',
+                           'prompt-override', 'Old partial arm', 'seed')"""
+            )
+            connection.commit()
+
+            runner.apply(migrations)
+
+            assert (
+                connection.execute(
+                    "SELECT count(*) AS value FROM merlin_storage.campaign_arms"
+                ).fetchone()["value"]
+                == 0
+            )
+            assert SessionRepository(connection).get(session.id) == session
+
+
+def test_finding_validation_policy_migration_preserves_legacy_rows(tmp_path: Path) -> None:
+    migrations = load_migrations()
+    finding_id = "11111111-1111-1111-1111-111111111111"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-findings")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:53])
+            session = SessionRepository(connection).create("legacy finding")
+            connection.execute(
+                """INSERT INTO merlin_storage.findings
+                       (id, session_id, title, severity, summary, reproduction,
+                        remediation, creator, identity)
+                   VALUES (%s, %s, 'Legacy finding', 'medium', 'Legacy evidence',
+                           'Repeat legacy steps', 'Apply legacy remediation',
+                           'agent:legacy', 'legacy:finding')""",
+                (finding_id, session.id),
+            )
+            connection.commit()
+
+            runner.apply(migrations)
+
+            row = connection.execute(
+                """SELECT causal_ambiguity, impact_level,
+                          requires_independent_reproduction
+                   FROM merlin_storage.findings WHERE id = %s""",
+                (finding_id,),
+            ).fetchone()
+            assert row == {
+                "causal_ambiguity": False,
+                "impact_level": 0,
+                "requires_independent_reproduction": False,
+            }

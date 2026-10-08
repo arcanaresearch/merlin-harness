@@ -1,0 +1,13 @@
+{
+  "schema": "merlin.adaptive-strategies.v1",
+  "strategies": {
+    "cat/multi-turn/crescendo-context-drift": "crescendo",
+    "cat/multi-turn/crescendo-foot-in-door": "crescendo",
+    "cat/multi-turn/crescendo-gradual-escalation": "crescendo",
+    "cat/multi-turn/crescendo-trust-build-exfil": "crescendo",
+    "cat/multi-turn/multiturn-authority-build": "goat",
+    "cat/multi-turn/hydra-catalogue-diversity-sample": "hydra-select",
+    "cat/multi-turn/partial-compliance-expansion": "crescendo",
+    "cat/multi-turn/urgency-exception-pressure": "crescendo"
+  }
+}

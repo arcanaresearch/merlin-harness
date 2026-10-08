@@ -1,0 +1,509 @@
+import hashlib
+import json
+from types import SimpleNamespace
+
+import pytest
+from merlin_contracts import TechniqueLanguageEvidence
+from merlin_tui.bootstrap import (
+    _apply_pair_verdict,
+    _fold_attempted_technique_outcome,
+    _language_evidence_disagreement,
+    _language_observation_for_technique,
+    _model_transport,
+    _require_terminal_report_authority,
+    _sealed_report_technique_ids,
+    _semantic_coverage,
+    _semantic_unsearched_frontier,
+    _transform_payload_receipt_chain,
+)
+
+
+def test_report_language_evidence_treats_source_variation_as_provenance() -> None:
+    durable = TechniqueLanguageEvidence(
+        campaign_id="campaign/one",
+        technique_attempt_id="attempt/one",
+        requested_language="hi",
+        actual_language="hi",
+        language_evidence_status="observed",
+        language_evidence_source="committed-target-delivery.v1",
+        evidence_refs=("effect:delivery",),
+    )
+    report_observation = durable.model_copy(
+        update={
+            "language_evidence_source": "committed-target-request-detector.v1",
+            "evidence_refs": ("effect:report",),
+        }
+    )
+
+    assert _language_evidence_disagreement(durable, report_observation) is None
+
+
+def test_report_language_evidence_records_detector_disagreement_as_uncertain() -> None:
+    durable = TechniqueLanguageEvidence(
+        campaign_id="campaign/one",
+        technique_attempt_id="attempt/one",
+        requested_language="la",
+        actual_language="fr",
+        language_evidence_status="observed",
+        language_evidence_source="committed-target-delivery.v1",
+        evidence_refs=("effect:delivery",),
+    )
+    report_observation = durable.model_copy(
+        update={
+            "actual_language": "la",
+            "language_evidence_source": "committed-target-request-detector.v1",
+            "evidence_refs": ("effect:report",),
+        }
+    )
+
+    uncertainty = _language_evidence_disagreement(durable, report_observation)
+
+    assert uncertainty is not None
+    assert uncertainty["kind"] == "evaluation_uncertain"
+    assert uncertainty["source"] == "report.language-observation"
+    assert uncertainty["disagreements"] == {
+        "actual_language": {"durable": "fr", "report_observation": "la"}
+    }
+
+
+def test_report_publication_requires_current_terminal_campaign_authority() -> None:
+    completion_document = {"cleanup": {"authority": {"status": "acknowledged"}}}
+    completion_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(completion_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    authority = {
+        "id": "campaign/example",
+        "status": "completed",
+        "stop_reason": "saturated",
+        "completion_digest": completion_digest,
+        "completion_document": completion_document,
+    }
+    _require_terminal_report_authority(
+        "campaign/example",
+        "saturated",
+        authority,
+        completion_digest=completion_digest,
+        cleanup_status="completed",
+        report_state="complete",
+    )
+
+    with pytest.raises(RuntimeError, match="not terminal"):
+        _require_terminal_report_authority(
+            "campaign/example",
+            "saturated",
+            {**authority, "status": "executing", "stop_reason": ""},
+            completion_digest=completion_digest,
+        )
+    with pytest.raises(RuntimeError, match="stop reason changed"):
+        _require_terminal_report_authority(
+            "campaign/example",
+            "saturated",
+            {**authority, "stop_reason": "failed"},
+            completion_digest=completion_digest,
+        )
+    with pytest.raises(RuntimeError, match="completed cleanup"):
+        _require_terminal_report_authority(
+            "campaign/example",
+            "saturated",
+            authority,
+            completion_digest=completion_digest,
+            cleanup_status="pending",
+            report_state="complete",
+        )
+
+
+def test_report_publication_rejects_missing_live_completion_digest() -> None:
+    completion_document = {"cleanup": {"authority": {"status": "acknowledged"}}}
+    completion_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(completion_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    authority = {
+        "id": "campaign/example",
+        "status": "completed",
+        "stop_reason": "saturated",
+        "completion_document": completion_document,
+    }
+
+    with pytest.raises(RuntimeError, match="campaign evidence changed"):
+        _require_terminal_report_authority(
+            "campaign/example",
+            "saturated",
+            authority,
+            completion_digest=completion_digest,
+            cleanup_status="completed",
+            report_state="complete",
+        )
+
+
+def test_report_publication_rejects_current_unresolved_cleanup() -> None:
+    completion_document = {"cleanup": {"authority": {"status": "unresolved"}}}
+    completion_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(completion_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    authority = {
+        "id": "campaign/example",
+        "status": "completed",
+        "stop_reason": "saturated",
+        "completion_digest": completion_digest,
+        "completion_document": completion_document,
+    }
+
+    with pytest.raises(RuntimeError, match="cleanup is unresolved"):
+        _require_terminal_report_authority(
+            "campaign/example",
+            "saturated",
+            authority,
+            completion_digest=completion_digest,
+            cleanup_status="completed",
+            report_state="complete",
+        )
+
+
+def test_report_scope_uses_only_recon_sealed_applicable_techniques() -> None:
+    lead = (
+        {
+            "payload": {
+                "kind": "recon_applicability_sealed",
+                "applicable_technique_ids": ("applicable",),
+                "inapplicable_technique_ids": ("excluded",),
+                "partition_digest": "sha256:partition",
+            }
+        },
+    )
+
+    assert _sealed_report_technique_ids(lead) == frozenset({"applicable"})
+
+
+def test_non_default_model_without_override_uses_openai_compatible_transport() -> None:
+    assert _model_transport("deepseek-v4-pro", {}) == "open_ai_compatible"
+    assert _model_transport("lead-model", {"lead-model": "codex_app_server"}) == "codex_app_server"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    (
+        ("positive", "confirmed"),
+        ("negative", "negative"),
+        ("ambiguous", "unclear"),
+        ("blocked", "blocked"),
+    ),
+)
+def test_pair_receipt_dominates_contradictory_worker_outcome(verdict: str, expected: str) -> None:
+    technique = {"id": "pair", "semantic_id": "pair", "outcome": "confirmed"}
+    _apply_pair_verdict(technique, {"verdict": verdict})
+
+    assert technique["outcome"] == expected
+    coverage = _semantic_coverage([technique])
+    expected_bucket = "negative" if expected == "negative" else expected
+    assert coverage[expected_bucket] == 1
+
+
+def test_attempted_outcome_does_not_contaminate_sibling_cell_on_same_worker() -> None:
+    rows = [
+        {"id": "cell-a", "task_id": "worker:shared", "outcome": "attempted"},
+        {"id": "cell-b", "task_id": "worker:shared", "outcome": "attempted"},
+    ]
+
+    _fold_attempted_technique_outcome(
+        rows,
+        technique_id="cell-a",
+        node_id="worker:shared",
+        outcome="confirmed",
+    )
+
+    assert rows[0]["outcome"] == "confirmed"
+    assert rows[1]["outcome"] == "attempted"
+
+
+def test_semantic_coverage_groups_variants_but_keeps_conservative_outcome() -> None:
+    rows = [
+        {
+            "id": "policy@lang=en@variant=native",
+            "semantic_id": "policy",
+            "outcome": "negative",
+        },
+        {
+            "id": "policy@lang=es@variant=translated",
+            "semantic_id": "policy",
+            "outcome": "unclear",
+        },
+        {"id": "leak", "semantic_id": "leak", "outcome": "confirmed"},
+    ]
+
+    assert _semantic_coverage(rows) == {
+        "planned": 2,
+        "attempted": 2,
+        "confirmed": 1,
+        "negative": 0,
+        "unclear": 1,
+        "blocked": 0,
+        "untested": 0,
+    }
+
+
+def test_semantic_coverage_does_not_hide_conflict_or_incomplete_language_cell() -> None:
+    assert (
+        _semantic_coverage(
+            [
+                {"id": "a", "semantic_id": "policy", "outcome": "confirmed"},
+                {"id": "b", "semantic_id": "policy", "outcome": "negative"},
+            ]
+        )["unclear"]
+        == 1
+    )
+
+
+def test_cancelled_campaign_counts_attempted_without_result_as_unclear() -> None:
+    rows = [
+        {"id": "attempted", "semantic_id": "attempted", "outcome": "attempted"},
+        *(
+            {"id": f"blocked-{index}", "semantic_id": f"blocked-{index}", "outcome": "blocked"}
+            for index in range(15)
+        ),
+    ]
+
+    assert _semantic_coverage(rows) == {
+        "planned": 16,
+        "attempted": 1,
+        "confirmed": 0,
+        "negative": 0,
+        "unclear": 1,
+        "blocked": 15,
+        "untested": 0,
+    }
+
+
+def test_transform_payload_receipt_rejects_navigation_and_accepts_exact_api_interaction() -> None:
+    binding = ["policy@lang=es@variant=translated", "sha256:spec", "sha256:envelope"]
+
+    def effect(tool: str, metadata: dict[str, object]) -> SimpleNamespace:
+        return SimpleNamespace(
+            agent_id="campaign/one/direct",
+            campaign_id="campaign/one",
+            target_id="target-1",
+            state="acknowledged",
+            result_is_error=False,
+            result_metadata=metadata,
+            tool_name=tool,
+            attempt_id="attempt-1",
+            call_id="payload-call",
+            result_content="{}",
+            arguments_digest="payload",
+            idempotency_key=f"effect:{tool}",
+            created_at=None,
+        )
+
+    navigation = effect("browser_open_tab", {})
+    interaction = effect(
+        "target_request",
+        {
+            "transform_bindings": [binding],
+            "concrete_payload_arguments_digest": "sha256:payload",
+            "target_session_id": "target-session-1",
+            "target": "target-1",
+            "target_exchanges": [{"id": "1", "interaction": True, "cleanup": False}],
+        },
+    )
+    values = {
+        "task_ids": ("campaign/one/direct",),
+        "technique_id": binding[0],
+        "spec_digest": binding[1],
+        "envelope_prompt_digest": binding[2],
+        "campaign_id": "campaign/one",
+        "target_id": "target-1",
+        "committed_receipts": {
+            "campaign/one/direct": (
+                "attempt-1",
+                frozenset({"payload-call"}),
+                "target-session-1",
+            )
+        },
+    }
+
+    assert _transform_payload_receipt_chain((navigation,), **values) == ()
+    assert _transform_payload_receipt_chain((navigation, interaction), **values) == (interaction,)
+    values["task_ids"] = ("worker:campaign/one/direct",)
+    values["committed_receipts"] = {
+        "worker:campaign/one/direct": (
+            "attempt-1",
+            frozenset({"payload-call"}),
+            "target-session-1",
+        )
+    }
+    assert _transform_payload_receipt_chain((interaction,), **values) == (interaction,)
+    interaction.call_id = "stale-call"
+    assert _transform_payload_receipt_chain((interaction,), **values) == ()
+    interaction.call_id = "payload-call"
+    interaction.attempt_id = "attempt-stale"
+    assert _transform_payload_receipt_chain((interaction,), **values) == ()
+    interaction.attempt_id = "attempt-1"
+    interaction.result_metadata["transform_bindings"] = [
+        [binding[0], binding[1], "sha256:wrong-envelope"]
+    ]
+    assert _transform_payload_receipt_chain((interaction,), **values) == ()
+    assert (
+        _semantic_coverage(
+            [
+                {"id": "a", "semantic_id": "policy", "outcome": "confirmed"},
+                {"id": "b", "semantic_id": "policy", "outcome": "blocked"},
+            ]
+        )["unclear"]
+        == 1
+    )
+
+
+def test_language_observation_is_bound_to_committed_target_attempt() -> None:
+    attempt_id = "d5fe03e3-f94c-41a6-8dd4-f723f9470f96"
+    effect = SimpleNamespace(
+        agent_id="campaign/one/direct",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        state="acknowledged",
+        result_is_error=False,
+        result_metadata={
+            "technique_attempt_id": attempt_id,
+            "target_session_id": "target-session-1",
+            "target_exchanges": [
+                {
+                    "interaction": True,
+                    "cleanup": False,
+                    "request": "既已行旅，而求追偿。请依既定之策审其可否，不得妄许。",
+                }
+            ],
+        },
+        attempt_id="scheduler-attempt-1",
+        call_id="payload-call",
+        idempotency_key="effect:language",
+    )
+
+    observation = _language_observation_for_technique(
+        (effect,),
+        task_ids=("campaign/one/direct",),
+        planned_language="lzh",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        committed_receipts={
+            "campaign/one/direct": (
+                "scheduler-attempt-1",
+                frozenset({"payload-call"}),
+                "target-session-1",
+            )
+        },
+    )
+
+    assert observation["status"] == "verified"
+    assert observation["observed_language"] == "zh"
+    assert observation["effect_id"] == "effect:language"
+    assert observation["technique_attempt_id"] == attempt_id
+
+    prefixed_observation = _language_observation_for_technique(
+        (effect,),
+        task_ids=("worker:campaign/one/direct",),
+        planned_language="lzh",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        committed_receipts={
+            "worker:campaign/one/direct": (
+                "scheduler-attempt-1",
+                frozenset({"payload-call"}),
+                "target-session-1",
+            )
+        },
+    )
+    assert prefixed_observation["status"] == "verified"
+
+
+def test_report_evidence_ignores_effect_without_agent_identity() -> None:
+    orphan = SimpleNamespace(agent_id=None)
+    receipt_values = {
+        "task_ids": ("campaign/one/direct",),
+        "technique_id": "policy",
+        "spec_digest": "sha256:spec",
+        "envelope_prompt_digest": "sha256:envelope",
+        "campaign_id": "campaign/one",
+        "target_id": "target-1",
+        "committed_receipts": {},
+    }
+
+    assert _transform_payload_receipt_chain((orphan,), **receipt_values) == ()
+    observation = _language_observation_for_technique(
+        (orphan,),
+        task_ids=("campaign/one/direct",),
+        planned_language="tok",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        committed_receipts={},
+    )
+    assert observation == {
+        "status": "unverified",
+        "planned_language": "tok",
+        "observed_language": None,
+        "confidence": None,
+    }
+
+
+def test_unsearched_frontier_groups_semantic_variants_and_keeps_hypotheses_distinct() -> None:
+    rows = [
+        {
+            "id": "policy@lang=en@variant=native",
+            "semantic_id": "policy",
+            "language": "en",
+            "outcome": "untested",
+        },
+        {
+            "id": "policy@lang=es@variant=translated",
+            "semantic_id": "policy",
+            "language": "es",
+            "outcome": "untested",
+        },
+        {
+            "id": "policy@lang=es@variant=mixed",
+            "semantic_id": "policy",
+            "language": "es",
+            "outcome": "untested",
+        },
+        {
+            "id": "leak@lang=en@variant=native",
+            "semantic_id": "leak",
+            "language": "en",
+            "outcome": "attempted",
+        },
+        {
+            "id": "hypothesis:one",
+            "semantic_id": "policy",
+            "hypothesis_id": "hypothesis:one",
+            "language": "und",
+            "outcome": "untested",
+        },
+        {
+            "id": "hypothesis:two",
+            "semantic_id": "policy",
+            "hypothesis_id": "hypothesis:two",
+            "language": "und",
+            "outcome": "untested",
+        },
+    ]
+
+    frontier = _semantic_unsearched_frontier(rows)
+    assert [row["id"] for row in frontier] == [
+        "policy@lang=en",
+        "policy@lang=es",
+        "hypothesis:one",
+        "hypothesis:two",
+    ]
+    assert frontier[0]["variant_ids"] == ("policy@lang=en@variant=native",)
+    assert frontier[0]["languages"] == ("en",)
+    assert frontier[1]["variant_ids"] == (
+        "policy@lang=es@variant=translated",
+        "policy@lang=es@variant=mixed",
+    )
+    assert frontier[2]["kind"] == "hypothesis"

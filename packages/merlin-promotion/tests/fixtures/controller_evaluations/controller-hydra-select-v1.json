@@ -1,0 +1,46 @@
+{
+  "baseline_metrics": {
+    "authority_violations": 0,
+    "cancellation_recovery_rate": 1.0,
+    "evidence_attribution_rate": 1.0,
+    "false_positive_rate": 0.0,
+    "input_tokens": 0,
+    "mean_cost": 0.0,
+    "output_tokens": 0,
+    "p95_latency_ms": 1,
+    "task_success_rate": 1.0,
+    "total_tokens": 0
+  },
+  "budget": {
+    "case_timeout_seconds": 60
+  },
+  "candidate_kind": "routing",
+  "cases": [
+    {
+      "fixture_digest": "sha256:b8b776acd3708fd4bca8bad22684e33fc4260e3d7e08ab452d0d8eed3986461d",
+      "id": "controller-hydra-bounded-selection",
+      "source_group": "controller-fixture",
+      "target_fixture": "controller-hydra-bounded-selection.json"
+    }
+  ],
+  "dataset_digest": "sha256:72d26b8714366ef0159fdf85ebdc6206faf26716123a00a7d33f173520ea8a17",
+  "dataset_provenance": "controller-fixture-2026-09-04",
+  "held_out": true,
+  "id": "controller-hydra-select-v1",
+  "model": "controller-fixture-model",
+  "policy": {
+    "maximum_cost_ratio": 1,
+    "maximum_false_positive_regression": 0,
+    "maximum_latency_ratio": 2.0,
+    "maximum_token_ratio": 1,
+    "minimum_attribution_rate": 1,
+    "minimum_recovery_rate": 1,
+    "minimum_task_success_gain": 0
+  },
+  "provider": "fixture-attacker",
+  "route": "controller_replay",
+  "route_role_scopes": [
+    "lead"
+  ],
+  "source_disjoint": true
+}

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "merlin-providers"
+version = "0.2.0"
+description = "First-party model providers for Merlin"
+requires-python = ">=3.13"
+dependencies = ["httpx>=0.28,<1", "merlin-contracts"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/merlin_providers"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.uv.sources]
+merlin-contracts = { workspace = true }

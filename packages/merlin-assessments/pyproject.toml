@@ -1,0 +1,35 @@
+[project]
+name = "merlin-assessments"
+version = "0.2.0"
+description = "Bounded AI-target assessment orchestration for Merlin"
+requires-python = ">=3.13"
+dependencies = [
+  "httpx>=0.28,<1",
+  "merlin-contracts",
+  "merlin-packs",
+  "merlin-providers",
+  "merlin-storage-postgres",
+]
+
+[tool.uv.sources]
+merlin-contracts = { workspace = true }
+merlin-packs = { workspace = true }
+merlin-providers = { workspace = true }
+merlin-storage-postgres = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/merlin_assessments"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

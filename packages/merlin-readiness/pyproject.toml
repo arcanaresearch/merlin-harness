@@ -1,0 +1,17 @@
+[project]
+name = "merlin-readiness"
+version = "0.2.0"
+description = "Production diagnostics and lifecycle seams for Merlin"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

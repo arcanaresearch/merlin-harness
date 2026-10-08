@@ -1,0 +1,59 @@
+[project]
+name = "merlin-tui"
+version = "0.2.0"
+description = "Conversation-first terminal UI for Merlin"
+requires-python = ">=3.13"
+dependencies = [
+  "merlin-agents",
+  "merlin-assessments",
+  "merlin-browser",
+  "merlin-config",
+  "merlin-contracts",
+  "merlin-findings",
+  "merlin-kernel",
+  "merlin-mcp",
+  "merlin-memory",
+  "merlin-packs",
+  "merlin-permissions",
+  "merlin-providers",
+  "merlin-promotion",
+  "merlin-readiness",
+  "merlin-storage-postgres",
+  "merlin-skills",
+  "merlin-tools",
+  "textual>=8.2,<9",
+  "tomli-w>=1.2,<2",
+]
+
+[tool.uv.sources]
+merlin-agents = { workspace = true }
+merlin-config = { workspace = true }
+merlin-assessments = { workspace = true }
+merlin-browser = { workspace = true }
+merlin-contracts = { workspace = true }
+merlin-findings = { workspace = true }
+merlin-kernel = { workspace = true }
+merlin-mcp = { workspace = true }
+merlin-memory = { workspace = true }
+merlin-packs = { workspace = true }
+merlin-permissions = { workspace = true }
+merlin-providers = { workspace = true }
+merlin-promotion = { workspace = true }
+merlin-readiness = { workspace = true }
+merlin-storage-postgres = { workspace = true }
+merlin-skills = { workspace = true }
+merlin-tools = { workspace = true }
+
+[project.scripts]
+merlin = "merlin_tui.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,52 @@
+{
+  "baseline_metrics": {
+    "authority_violations": 0,
+    "cancellation_recovery_rate": 1.0,
+    "evidence_attribution_rate": 1.0,
+    "false_positive_rate": 0.0,
+    "input_tokens": 0,
+    "mean_cost": 0.0,
+    "output_tokens": 0,
+    "p95_latency_ms": 2,
+    "task_success_rate": 1.0,
+    "total_tokens": 0
+  },
+  "budget": {
+    "case_timeout_seconds": 60
+  },
+  "candidate_kind": "routing",
+  "cases": [
+    {
+      "fixture_digest": "sha256:63ec74a04851a1fbe58c9e76fba36b515bfd5e3b6d7382146a688daf00c3d4d3",
+      "id": "controller-goat-oracle-outcome",
+      "source_group": "controller-fixture",
+      "target_fixture": "controller-goat-oracle-outcome.json"
+    },
+    {
+      "fixture_digest": "sha256:d1594183eedccf9deaa03a6465f575b5afafe6ad06e02a2a523490f7db536110",
+      "id": "controller-goat-small-window-fail-closed",
+      "source_group": "controller-fixture",
+      "target_fixture": "controller-goat-small-window-fail-closed.json"
+    }
+  ],
+  "dataset_digest": "sha256:6b160dd0ed44da29b29d71e70ff2cee974d52710c671da8da9a3123f0b492f7d",
+  "dataset_provenance": "controller-fixture-2026-09-04",
+  "held_out": true,
+  "id": "controller-goat-v1",
+  "model": "controller-fixture-model",
+  "policy": {
+    "maximum_cost_ratio": 1,
+    "maximum_false_positive_regression": 0,
+    "maximum_latency_ratio": 2.0,
+    "maximum_token_ratio": 1,
+    "minimum_attribution_rate": 1,
+    "minimum_recovery_rate": 1,
+    "minimum_task_success_gain": 0
+  },
+  "provider": "fixture-attacker",
+  "route": "controller_replay",
+  "route_role_scopes": [
+    "lead"
+  ],
+  "source_disjoint": true
+}

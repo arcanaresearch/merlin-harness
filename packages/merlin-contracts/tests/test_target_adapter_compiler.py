@@ -1,0 +1,638 @@
+from copy import deepcopy
+
+import pytest
+from merlin_contracts.target_adapter import executable_adapter_digest
+from merlin_contracts.target_adapter_compiler import (
+    ADAPTER_COMPILATION_VERSION,
+    AdapterAdvisoryKind,
+    AdapterCompilation,
+    AdapterCompileError,
+    AdapterCompileFailureKind,
+    AdapterStepRole,
+    BrowserChat,
+    HttpApi,
+    ProviderChat,
+    compile_target_adapter,
+    compiled_target_adapter_digest,
+    read_target_adapter,
+)
+from pydantic import ValidationError
+
+
+def _http_adapter() -> dict[str, object]:
+    return {
+        "interface": "http_api",
+        "endpoint": "https://TARGET.test/api",
+        "credential_handle": "credential:target",
+        "api_transport": "browser_context",
+        "target_delivery": "inter-agent-message",
+        "api_steps": [
+            {
+                "step_id": "setup-label",
+                "endpoint": "sessions",
+                "method": "post",
+                "request_template": {},
+                "captures": {"session_id": "/sessionId"},
+            },
+            {
+                "step_id": "message-label",
+                "endpoint": "/messages",
+                "method": "POST",
+                "request_template": {"message": "{{prompt}}"},
+                "interaction": True,
+                "captures": {},
+                "response_selector": "/reply",
+                "expected_status": 200,
+                "oracle_predicate": {"pointer": "/won", "match_values": [True]},
+            },
+            {
+                "step_id": "cleanup-label",
+                "endpoint": "/sessions/current",
+                "method": "DELETE",
+                "request_template": {},
+                "cleanup": True,
+                "captures": {},
+                "idempotency_key": "cleanup",
+            },
+        ],
+        "observed_surfaces": ["memory"],
+        "language_policy": {"planned_languages": ["lzh"]},
+    }
+
+
+def _browser_adapter() -> dict[str, object]:
+    return {
+        "interface": "browser",
+        "endpoint": "https://target.test/chat",
+        "target_delivery": "direct-user-channel",
+        "browser_steps": [
+            {
+                "step_id": "fill-label",
+                "tool": "browser_fill",
+                "arguments": {"locator": "textbox Message", "value": "{{user_input}}"},
+            },
+            {
+                "step_id": "submit-label",
+                "tool": "browser_click",
+                "arguments": {"locator": "button Send"},
+            },
+        ],
+        "interaction_contract": {
+            "input_locator": "textbox Message",
+            "submit_action": "button Send",
+            "frame_context": None,
+            "success_indicator": "reply rendered",
+        },
+    }
+
+
+@pytest.mark.parametrize("interface", ["api", "open_ai_compatible"])
+def test_provider_aliases_compile_to_one_canonical_actor(interface: str) -> None:
+    compiled = compile_target_adapter(
+        {
+            "interface": interface,
+            "endpoint": "HTTPS://TARGET.TEST/v1/chat/completions",
+            "credential_handle": "credential:target",
+        }
+    )
+
+    assert isinstance(compiled.executable, ProviderChat)
+    assert compiled.executable.kind == "provider_chat"
+    assert compiled.executable.actor == "target_chat"
+    assert compiled.executable.input_key == "input"
+    assert compiled.executable.endpoint == "https://target.test/v1/chat/completions"
+
+
+def test_provider_aliases_have_the_same_executable_digest() -> None:
+    legacy_api = compile_target_adapter(
+        {"interface": "api", "endpoint": "https://target.test/v1/chat/completions"}
+    )
+    open_ai = compile_target_adapter(
+        {
+            "interface": "open_ai_compatible",
+            "endpoint": "https://target.test/v1/chat/completions",
+        }
+    )
+
+    assert legacy_api.executable == open_ai.executable
+    assert compiled_target_adapter_digest(legacy_api) == compiled_target_adapter_digest(open_ai)
+
+
+def test_http_api_compiles_typed_steps_and_separates_evaluation_hints() -> None:
+    compiled = compile_target_adapter(_http_adapter())
+
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.actor == "target_request"
+    assert compiled.executable.input_key == "input"
+    assert compiled.executable.target_delivery == "inter-agent-message"
+    assert [step.role for step in compiled.executable.steps] == [
+        AdapterStepRole.SETUP,
+        AdapterStepRole.INTERACTION,
+        AdapterStepRole.CLEANUP,
+    ]
+    assert compiled.executable.steps[0].endpoint == "https://target.test/api/sessions"
+    assert compiled.executable.steps[0].method == "POST"
+    assert compiled.executable.steps[1].request_template == {"message": "{{input}}"}
+    assert {item.path for item in compiled.advisories} >= {
+        "api_steps[1].response_selector",
+        "api_steps[1].expected_status",
+        "api_steps[1].oracle_predicate",
+        "observed_surfaces",
+        "language_policy",
+    }
+
+
+def test_advisory_changes_do_not_change_executable_digest() -> None:
+    original = _http_adapter()
+    changed = deepcopy(original)
+    changed["observed_surfaces"] = ["rag", "multimodal"]
+    steps = changed["api_steps"]
+    assert isinstance(steps, list)
+    message = steps[1]
+    assert isinstance(message, dict)
+    message["response_selector"] = "/other"
+    message["expected_status"] = 202
+    message["oracle_predicate"] = {"pointer": "/score", "match_values": [99]}
+
+    assert compiled_target_adapter_digest(compile_target_adapter(original)) == (
+        compiled_target_adapter_digest(compile_target_adapter(changed))
+    )
+
+
+def test_http_direct_transport_alias_is_canonical_and_unknown_transport_is_rejected() -> None:
+    absent = _http_adapter()
+    absent.pop("api_transport")
+    explicit = deepcopy(absent)
+    explicit["api_transport"] = "direct"
+    unknown = deepcopy(absent)
+    unknown["api_transport"] = "carrier_pigeon"
+
+    absent_compiled = compile_target_adapter(absent)
+    explicit_compiled = compile_target_adapter(explicit)
+    assert isinstance(absent_compiled.executable, HttpApi)
+    assert absent_compiled.executable.api_transport == "direct"
+    assert compiled_target_adapter_digest(absent_compiled) == compiled_target_adapter_digest(
+        explicit_compiled
+    )
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(unknown)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_TRANSPORT
+
+
+def test_executable_request_change_changes_digest() -> None:
+    original = _http_adapter()
+    changed = deepcopy(original)
+    steps = changed["api_steps"]
+    assert isinstance(steps, list)
+    message = steps[1]
+    assert isinstance(message, dict)
+    message["request_template"] = {"message": "{{input}}", "prefix": "changed"}
+
+    assert compiled_target_adapter_digest(compile_target_adapter(original)) != (
+        compiled_target_adapter_digest(compile_target_adapter(changed))
+    )
+
+
+def test_conflicting_interaction_cleanup_roles_are_rejected_for_state_integrity() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    interaction = steps[1]
+    assert isinstance(interaction, dict)
+    interaction["cleanup"] = True
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_CLEANUP
+
+
+def test_browser_compiles_actor_input_and_typed_actions() -> None:
+    compiled = compile_target_adapter(_browser_adapter())
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.actor == "browser_chat_exchange"
+    assert compiled.executable.input_key == "input"
+    assert compiled.executable.steps[0].role is AdapterStepRole.INTERACTION
+    assert compiled.executable.steps[0].arguments["value"] == "{{input}}"
+    assert compiled.executable.interaction.input_locator == "textbox Message"
+    assert [item.path for item in compiled.advisories] == ["interaction_contract.success_indicator"]
+
+
+@pytest.mark.parametrize("interface", ["api", "open_ai_compatible", "browser"])
+def test_delivery_contradiction_is_typed_advisory_not_execution_gate(interface: str) -> None:
+    raw = (
+        _browser_adapter()
+        if interface == "browser"
+        else {"interface": interface, "endpoint": "https://target.test/chat"}
+    )
+    raw["target_delivery"] = "inter-agent-message"
+
+    compiled = compile_target_adapter(raw)
+
+    assert compiled.executable.target_delivery is None
+    assert compiled.executable.delivery_resolution == "unresolved"
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path == "target_delivery"
+        and item.value == "inter-agent-message"
+        for item in compiled.advisories
+    )
+
+
+def test_unknown_delivery_is_advisory_for_http_api() -> None:
+    raw = _http_adapter()
+    raw["target_delivery"] = "telepathy"
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.target_delivery is None
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path == "target_delivery"
+        and item.value == "telepathy"
+        for item in compiled.advisories
+    )
+
+
+def test_http_steps_default_to_same_origin_and_require_explicit_cross_origin_authority() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    setup = steps[0]
+    assert isinstance(setup, dict)
+    setup["endpoint"] = "https://sessions.target.test/start"
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.UNAUTHORIZED_ORIGIN
+
+    raw["authorized_origins"] = [
+        "https://target.test",
+        "https://sessions.target.test",
+    ]
+    compiled = compile_target_adapter(raw)
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.authorized_origins == (
+        "https://sessions.target.test",
+        "https://target.test",
+    )
+
+
+def test_endpoint_must_belong_to_explicit_authorized_origins() -> None:
+    raw = _http_adapter()
+    raw["allowed_origins"] = ["https://other.test"]
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.UNAUTHORIZED_ORIGIN
+
+
+def test_http_interaction_requires_exact_canonical_input_binding() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    interaction = steps[1]
+    assert isinstance(interaction, dict)
+    interaction["request_template"] = {"message": "prefix {{input}}"}
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_INPUT
+
+
+def test_http_capture_dependencies_must_come_from_prior_valid_pointers() -> None:
+    valid = _http_adapter()
+    valid_steps = valid["api_steps"]
+    assert isinstance(valid_steps, list)
+    valid_interaction = valid_steps[1]
+    assert isinstance(valid_interaction, dict)
+    valid_interaction["request_template"] = {
+        "sessionId": "{{capture:session_id}}",
+        "message": "{{input}}",
+    }
+    compiled = compile_target_adapter(valid)
+    assert isinstance(compiled.executable, HttpApi)
+
+    missing = deepcopy(valid)
+    missing_steps = missing["api_steps"]
+    assert isinstance(missing_steps, list)
+    missing_interaction = missing_steps[1]
+    assert isinstance(missing_interaction, dict)
+    missing_interaction["request_template"] = {
+        "sessionId": "{{capture:future_session}}",
+        "message": "{{input}}",
+    }
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(missing)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_STEPS
+
+    invalid_pointer = deepcopy(valid)
+    invalid_steps = invalid_pointer["api_steps"]
+    assert isinstance(invalid_steps, list)
+    invalid_setup = invalid_steps[0]
+    assert isinstance(invalid_setup, dict)
+    invalid_setup["captures"] = {"session_id": "sessionId"}
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(invalid_pointer)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_STEPS
+
+
+def test_replay_without_idempotency_is_disabled_with_advisory() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    interaction = steps[1]
+    assert isinstance(interaction, dict)
+    interaction["replay_after_ambiguous_result"] = True
+    interaction["idempotency_key"] = None
+
+    compiled = compile_target_adapter(raw)
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.steps[1].replay_after_ambiguous_result is False
+    assert any(
+        item.path == "api_steps[1].replay_after_ambiguous_result" and "idempotency" in item.message
+        for item in compiled.advisories
+    )
+
+
+@pytest.mark.parametrize("missing", ["fill", "submit", "input_locator", "submit_locator"])
+def test_browser_requires_executable_fill_submit_and_locators(missing: str) -> None:
+    raw = _browser_adapter()
+    steps = raw["browser_steps"]
+    contract = raw["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    if missing == "fill":
+        del steps[0]
+    elif missing == "submit":
+        del steps[1]
+    elif missing == "input_locator":
+        contract["input_locator"] = None
+        fill = steps[0]
+        assert isinstance(fill, dict)
+        arguments = fill["arguments"]
+        assert isinstance(arguments, dict)
+        arguments.pop("locator")
+    else:
+        contract["submit_action"] = None
+        submit = steps[1]
+        assert isinstance(submit, dict)
+        arguments = submit["arguments"]
+        assert isinstance(arguments, dict)
+        arguments.pop("locator")
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_STEPS
+
+
+def test_browser_press_requires_nonempty_value_and_normalizes_key_alias() -> None:
+    missing = _browser_adapter()
+    missing_steps = missing["browser_steps"]
+    assert isinstance(missing_steps, list)
+    missing_steps[1] = {
+        "tool": "browser_press",
+        "arguments": {"locator": "textbox Message"},
+    }
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(missing)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_STEPS
+
+    legacy = _browser_adapter()
+    legacy_steps = legacy["browser_steps"]
+    assert isinstance(legacy_steps, list)
+    legacy_steps[1] = {
+        "tool": "browser_press",
+        "arguments": {"locator": "textbox Message", "key": " Enter "},
+    }
+    compiled = compile_target_adapter(legacy)
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.steps[1].arguments == {
+        "locator": "textbox Message",
+        "value": "Enter",
+    }
+
+
+def test_browser_arguments_drop_unknown_and_malformed_runtime_fields() -> None:
+    raw = _browser_adapter()
+    steps = raw["browser_steps"]
+    assert isinstance(steps, list)
+    fill = steps[0]
+    assert isinstance(fill, dict)
+    arguments = fill["arguments"]
+    assert isinstance(arguments, dict)
+    arguments.update(
+        {
+            "mystery": "not a BrowserTool argument",
+            "step": -1,
+            "timeout_ms": "slow",
+            "tab_ref": 42,
+        }
+    )
+
+    compiled = compile_target_adapter(raw)
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.steps[0].arguments == {
+        "locator": "textbox Message",
+        "value": "{{input}}",
+    }
+    paths = {item.path for item in compiled.advisories}
+    assert {
+        "browser_steps[0].arguments",
+        "browser_steps[0].arguments.step",
+        "browser_steps[0].arguments.timeout_ms",
+        "browser_steps[0].arguments.tab_ref",
+    } <= paths
+
+
+def test_malformed_interaction_locators_fall_back_to_valid_step_locators() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = {"truthy": "but malformed"}
+    contract["submit_action"] = ["also", "malformed"]
+
+    compiled = compile_target_adapter(raw)
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.input_locator == "textbox Message"
+    assert compiled.executable.interaction.submit_action == "button Send"
+    assert compiled.executable.steps[0].arguments["locator"] == "textbox Message"
+    assert compiled.executable.steps[1].arguments["locator"] == "button Send"
+
+
+def test_cleanup_lifecycle_is_derived_and_required_cleanup_must_execute() -> None:
+    compiled = compile_target_adapter(_http_adapter())
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.cleanup_lifecycle == "required"
+    assert compiled.executable.steps[-1].role is AdapterStepRole.CLEANUP
+
+    missing = _http_adapter()
+    missing_steps = missing["api_steps"]
+    assert isinstance(missing_steps, list)
+    missing["api_steps"] = missing_steps[:-1]
+    missing["cleanup_lifecycle"] = {"status": "required"}
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(missing)
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_CLEANUP
+
+
+@pytest.mark.parametrize("credential", ["", "   ", 42, {"secret": "inline"}])
+def test_malformed_credential_handle_is_typed_error(credential: object) -> None:
+    raw = _http_adapter()
+    raw["credential_handle"] = credential
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.MALFORMED_CREDENTIAL
+
+
+def test_pydantic_reader_failures_are_wrapped_as_typed_compile_errors() -> None:
+    payload = compile_target_adapter(_http_adapter()).model_dump(mode="json")
+    executable = payload["executable"]
+    assert isinstance(executable, dict)
+    steps = executable["steps"]
+    assert isinstance(steps, list)
+    first = steps[0]
+    assert isinstance(first, dict)
+    first["repeat"] = 0
+
+    with pytest.raises(AdapterCompileError) as caught:
+        read_target_adapter(payload)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_source_aliases_are_class_metadata_not_executable_digest_fields() -> None:
+    provider = compile_target_adapter({"interface": "api", "endpoint": "https://target.test/chat"})
+    payload = provider.executable.model_dump(mode="json")
+
+    assert ProviderChat.accepted_interface_aliases == ("api", "open_ai_compatible")
+    assert "accepted_interface_aliases" not in payload
+
+
+@pytest.mark.parametrize(
+    ("raw", "kind", "path"),
+    [
+        (
+            {"interface": "smtp", "endpoint": "https://target.test"},
+            AdapterCompileFailureKind.UNKNOWN_INTERFACE,
+            "interface",
+        ),
+        (
+            {"interface": "api", "endpoint": "target.test"},
+            AdapterCompileFailureKind.NON_EXECUTABLE_ENDPOINT,
+            "endpoint",
+        ),
+        (
+            {"interface": "http_api", "endpoint": "https://target.test", "api_steps": []},
+            AdapterCompileFailureKind.NON_EXECUTABLE_STEPS,
+            "api_steps",
+        ),
+        (
+            {
+                "interface": "browser",
+                "endpoint": "https://target.test",
+                "browser_steps": [{"tool": "browser_snapshot", "arguments": {}}],
+            },
+            AdapterCompileFailureKind.NON_EXECUTABLE_STEPS,
+            "browser_steps",
+        ),
+        (
+            {
+                "interface": "browser",
+                "endpoint": "https://target.test",
+                "browser_steps": [
+                    {"tool": "browser_click", "arguments": {"locator": "button Send"}}
+                ],
+            },
+            AdapterCompileFailureKind.NON_EXECUTABLE_STEPS,
+            "browser_steps",
+        ),
+    ],
+)
+def test_only_non_executable_transport_contracts_hard_fail(
+    raw: dict[str, object], kind: AdapterCompileFailureKind, path: str
+) -> None:
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+
+    assert caught.value.kind is kind
+    assert caught.value.path == path
+
+
+def test_reader_accepts_raw_v1_json_compiled_variant_and_envelope() -> None:
+    raw = _http_adapter()
+    from_mapping = read_target_adapter(raw)
+    from_json = read_target_adapter(__import__("json").dumps(raw))
+    from_variant = read_target_adapter(from_mapping.executable.model_dump(mode="json"))
+    from_envelope = read_target_adapter(from_mapping.model_dump(mode="json"))
+
+    assert from_mapping == from_json
+    assert from_variant.executable == from_mapping.executable
+    assert from_envelope == from_mapping
+    assert from_envelope.schema_version == ADAPTER_COMPILATION_VERSION
+
+
+def test_unusable_extra_steps_are_advisory_when_an_interaction_remains() -> None:
+    http_raw = _http_adapter()
+    http_steps = http_raw["api_steps"]
+    assert isinstance(http_steps, list)
+    http_steps.insert(0, {"method": "", "request_template": {}})
+    browser_raw = _browser_adapter()
+    browser_steps = browser_raw["browser_steps"]
+    assert isinstance(browser_steps, list)
+    browser_steps.insert(0, {"tool": "browser_snapshot", "arguments": {}})
+
+    http = compile_target_adapter(http_raw)
+    browser = compile_target_adapter(browser_raw)
+
+    assert isinstance(http.executable, HttpApi)
+    assert len(http.executable.steps) == 3
+    assert isinstance(browser.executable, BrowserChat)
+    assert len(browser.executable.steps) == 2
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path == "api_steps[0].method"
+        for item in http.advisories
+    )
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY and item.path == "browser_steps[0]"
+        for item in browser.advisories
+    )
+
+
+def test_compiled_models_are_closed_discriminated_contracts() -> None:
+    compiled = compile_target_adapter(_http_adapter())
+    payload = compiled.model_dump(mode="json")
+    executable = payload["executable"]
+    assert isinstance(executable, dict)
+    executable["kind"] = "browser_chat"
+
+    with pytest.raises(ValidationError):
+        AdapterCompilation.model_validate(payload)
+
+
+def test_existing_v1_digest_reader_remains_frozen() -> None:
+    adapter = {
+        "interface": "http_api",
+        "endpoint": "https://target.test",
+        "credential_handle": "credential:target",
+        "api_transport": "direct",
+        "api_steps": [
+            {
+                "tool": "target_request",
+                "endpoint": "/messages",
+                "method": "POST",
+                "request_template": {"message": "{{prompt}}"},
+                "interaction": True,
+                "cleanup": False,
+                "captures": {},
+                "repeat": 1,
+                "idempotency_key": None,
+            }
+        ],
+    }
+
+    assert executable_adapter_digest(adapter) == (
+        "sha256:6d52c30812ba937fabdae547f217060b107ff0fdc4530516e6503022b83201eb"
+    )

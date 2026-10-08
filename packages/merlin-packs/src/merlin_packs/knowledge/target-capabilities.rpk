@@ -1,0 +1,138 @@
+{
+  "schema": "merlin.knowledge-pack.v1",
+  "manifest": {
+    "pack_id": "com.merlin.target-capabilities",
+    "pack_version": "1.0.0",
+    "format_version": 1,
+    "kind": "target_capability_guidance",
+    "publisher": "merlin",
+    "published_at": "2026-08-26T00:00:00Z",
+    "content_digest": "sha256:019d0aad408e9e657d6c1ec2a4e0aab359614c753b9ef7b2f070993e756097f2",
+    "merlin_compatibility": "8.x",
+    "storage": "plaintext",
+    "provenance": {
+      "source": "merlin-authored-generic-target-surface-guidance",
+      "license": "Apache-2.0",
+      "as_of": "2026-08-26",
+      "references": [
+        "docs/e9/e9-0-contract.md",
+        "docs/PLAN.md#e9-content-migration"
+      ]
+    }
+  },
+  "entries": [
+    {
+      "entry_id": "target-capability.openai-compatible-api-chat",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:7cabce808a8f014d279452a097cb069f869d85bb4fd2bdeb97acaa784428b509",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "injection", "data-exposure", "capability-abuse"],
+      "target_tags": ["api", "chatbot", "openai-compatible"],
+      "applicability_tags": ["http", "json", "streaming", "multi-turn"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["crates/merlin-app/knowledge-packs/interaction-guidance.rpk"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"openai_compatible_api_chat\",\"fallibility\":\"Generic OpenAI-compatible routes often accept role/content messages and may stream events, but route names, fields, model behavior, limits, and error shapes vary. Treat every detail here as a hypothesis, never a capability claim.\",\"observe\":[\"review the admitted origin and adapter configuration\",\"record one bounded live response status, headers, content type, body or stream-frame shape, and usage metadata\",\"test conversation continuity only within the authorized session and request budget\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target identity\",\"provider/model tuple as reported live\",\"request-shape digest\",\"response or error evidence digest\"],\"expiry\":\"Discard the hint after the entry expiry or any observed deployment/model/configuration change.\",\"live_evidence_override\":\"Fresh replayable evidence for the exact authorized provider/model/target tuple overrides this guidance, including evidence that a familiar route or field is absent.\",\"authority_boundary\":\"This entry grants no origin, endpoint, credential, model, tool, method, or action. Redirects and discovered routes require deterministic admission.\",\"adaptive_use\":\"Begin from the smallest adapter-supported request, then adapt to typed live errors and observed schemas; do not infer family-wide support.\"}"
+    },
+    {
+      "entry_id": "target-capability.stateful-http-api-session",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:9e4005cb5a341d3a58cdba381e6138452d43b216985eb462caaca2c0b2d104ae",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "auth-session", "business-logic", "data-exposure"],
+      "target_tags": ["api", "stateful-session"],
+      "applicability_tags": ["http", "cookies", "tokens", "multi-turn"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["crates/merlin-app/knowledge-packs/interaction-guidance.rpk"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"stateful_http_api_session\",\"fallibility\":\"State may reside in cookies, bearer tokens, opaque conversation identifiers, server-side records, or combinations of them. Names, lifetimes, rotation, and binding behavior are target-specific hypotheses.\",\"observe\":[\"compare bounded responses before and after one authorized state transition\",\"retain status, relevant headers, response-shape, session-identifier digest, and externally visible state evidence\",\"observe expiry, rotation, replay rejection, and isolation only through admitted requests\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target identity\",\"authorized principal or anonymous-context label\",\"request-sequence digest\",\"state-difference evidence digest\"],\"expiry\":\"Re-observe after expiry, authentication change, session rotation, deployment change, or contradictory response.\",\"live_evidence_override\":\"Fresh exact-target evidence overrides assumptions about where state lives or how long it persists.\",\"authority_boundary\":\"This entry does not grant identities, credentials, cookies, tokens, endpoints, methods, or cross-principal access. Never transplant session material outside its explicit grant.\",\"adaptive_use\":\"Change one state-bearing element at a time, observe the result, and preserve cleanup obligations; do not declare persistence from response prose alone.\"}"
+    },
+    {
+      "entry_id": "target-capability.browser-chatbot",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:098e930957e3d5ca454b33c3fda8bb3f91a3116dc305fa0685e3578c7a5d2225",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "auth-session", "injection", "adversarial-explorer"],
+      "target_tags": ["browser", "chatbot"],
+      "applicability_tags": ["dom", "accessibility", "multi-turn", "streaming"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["crates/merlin-app/knowledge-packs/interaction-guidance.rpk"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"browser_chatbot\",\"fallibility\":\"Chat controls, readiness signals, transcript containers, stop controls, and navigation behavior vary across builds and sessions. No selector, label, or layout is stable merely because it worked before.\",\"observe\":[\"inspect current tabs, admitted origin, visible state, and a fresh bounded accessibility or DOM snapshot\",\"after one semantic action, observe navigation, transcript change, network-visible status when available, and a fresh snapshot\",\"treat spinners, enabled controls, and rendered prose as readiness hints rather than proof\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted origin and stable tab handle\",\"page-state digest\",\"semantic action description\",\"post-action evidence digest\"],\"expiry\":\"Selectors and UI hints expire immediately on navigation, rerender, tab replacement, deployment change, or entry expiry.\",\"live_evidence_override\":\"The current sanitized page observation overrides every recorded UI hint. Rediscover semantically when stale.\",\"authority_boundary\":\"This entry grants no origin, browser profile, authenticated identity, download, upload, navigation, or action. CAPTCHA, MFA, consent, and account recovery remain manual blockers unless separately authorized.\",\"adaptive_use\":\"Use roles, names, and nearby text from the current snapshot; perform one narrow action and resnapshot. Never prescribe or retain fixed CSS/XPath selectors.\"}"
+    },
+    {
+      "entry_id": "target-capability.tool-using-agent",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:99969da5c1cca0362e9ccaa3ee450258fefecd2cf2c7a101e646c9388ad2ee7e",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "capability-abuse", "business-logic", "injection"],
+      "target_tags": ["agent", "tool-use"],
+      "applicability_tags": ["tools", "multi-turn", "side-effects", "delegation"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["docs/e9/e9-0-contract.md"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"tool_using_agent\",\"fallibility\":\"An agent may advertise tools, delegate, retry, summarize results, or request confirmation, but advertised names and prose do not prove availability, authority, execution, or side effects.\",\"observe\":[\"capture the live tool schema or unavailable error exposed inside the admitted interaction\",\"distinguish model intent, tool request, deterministic authorization decision, execution receipt, and externally observed effect\",\"observe arguments, result/error shape, retry behavior, and cleanup evidence for one bounded action\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted agent/provider/model/target tuple\",\"tool-schema or error digest\",\"authorization-decision reference\",\"execution and effect evidence digests\"],\"expiry\":\"Re-observe after tool-registry, grant, model, prompt, policy, deployment, or session change, and no later than entry expiry.\",\"live_evidence_override\":\"Fresh deterministic authorization and execution evidence overrides advertised or historical capability. Absence must be surfaced from live failure, not a static table.\",\"authority_boundary\":\"This entry cannot grant, widen, discover-and-use, or synthesize tools, targets, credentials, side effects, delegation, or child authority. Every action remains within an explicit narrower-than-parent grant.\",\"adaptive_use\":\"Prefer read-only or reversible probes, require receipts for claimed execution, and stop when confirmation or authority is missing.\"}"
+    },
+    {
+      "entry_id": "target-capability.retrieval-rag",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:7a6ae36c0f33094ea79b679f5c79bbb240cf14167dd0a50c0473356e878378ed",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "injection", "data-exposure"],
+      "target_tags": ["retrieval", "rag", "chatbot"],
+      "applicability_tags": ["documents", "citations", "indexing", "multi-turn"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["docs/e9/e9-0-contract.md"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"retrieval_rag\",\"fallibility\":\"Responses may use retrieval, cached context, model knowledge, hidden instructions, or no retrieval at all. Citations and quoted text are clues, not proof of source access, ranking, tenant isolation, or causal use.\",\"observe\":[\"use authorized non-sensitive canaries or known corpus facts to distinguish retrieval from generic generation\",\"record citations, bounded retrieved excerpts when permitted, response differences, latency/status signals, and externally visible source state\",\"test freshness and isolation only against corpus objects and principals explicitly admitted\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target and corpus scope\",\"principal-context label\",\"query digest\",\"corpus-state and response evidence digests\"],\"expiry\":\"Re-observe after corpus, index, embedding model, retrieval policy, principal, deployment, or session change, and no later than entry expiry.\",\"live_evidence_override\":\"Fresh exact-scope evidence overrides assumptions about indexing delay, chunking, citations, ranking, or retrieval presence.\",\"authority_boundary\":\"This entry grants no corpus, tenant, collection, document, query endpoint, credential, upload, deletion, or cross-principal read.\",\"adaptive_use\":\"Prefer reversible canaries and differential observations; report uncertainty when the evidence cannot distinguish retrieval from generation.\"}"
+    },
+    {
+      "entry_id": "target-capability.uploads-files",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:b11d5fab5deae31c0334c36a7d0d48c2298ac53e9f59bc593ad6b291df06a200",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "data-exposure", "business-logic", "injection"],
+      "target_tags": ["uploads", "files"],
+      "applicability_tags": ["multipart", "documents", "storage", "cleanup"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["docs/e9/e9-0-contract.md"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"uploads_files\",\"fallibility\":\"A target may accept multipart bodies, direct uploads, attachment references, or asynchronous ingestion; limits, accepted types, scanning, parsing, visibility, retention, and deletion semantics are target-specific.\",\"observe\":[\"begin with an authorized inert uniquely identified fixture within declared size and type limits\",\"record admission response, object/reference digest, processing-state transitions, downstream visibility, rejection details, and deletion outcome\",\"confirm cleanup through an external read/list absence observation when authorized\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target, container, and principal scope\",\"fixture digest and non-sensitive classification\",\"request and response digests\",\"cleanup evidence digest\"],\"expiry\":\"Re-observe after storage, parser, scanner, policy, principal, deployment, or session change, and no later than entry expiry.\",\"live_evidence_override\":\"Fresh live acceptance, rejection, processing, and cleanup evidence overrides documented or historical limits.\",\"authority_boundary\":\"This entry grants no file, upload endpoint, storage container, parser, download, sharing, deletion, credential, or data classification. Never use customer/private material as a probe.\",\"adaptive_use\":\"Use the smallest inert fixture, make one change per attempt, bound processing waits, and leave no object behind.\"}"
+    },
+    {
+      "entry_id": "target-capability.memory",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:316600b6f6f659697a31571a7abb4a860c2188455d8c28ee4657a0bc5c80b492",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "auth-session", "data-exposure", "injection"],
+      "target_tags": ["memory", "chatbot", "agent"],
+      "applicability_tags": ["multi-turn", "cross-session", "persistence", "cleanup"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["docs/e9/e9-0-contract.md"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"memory\",\"fallibility\":\"Apparent recall may come from the current transcript, server session, explicit memory store, retrieval, cache, prompt context, or coincidence. One recalled phrase does not prove durable or cross-session memory.\",\"observe\":[\"place only an authorized non-sensitive unique canary in one precisely labeled context\",\"probe separately within-turn, within-session, new-session, new-principal, and post-deletion behavior only where each scope is admitted\",\"record positive and negative observations plus externally visible memory/list/delete state when available\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target, principal, and session labels\",\"canary digest\",\"context-transition sequence digest\",\"recall and cleanup evidence digests\"],\"expiry\":\"Re-observe after principal, session, memory setting, model, deployment, retention policy, or corpus change, and no later than entry expiry.\",\"live_evidence_override\":\"Fresh differential evidence for the exact context overrides any assumed memory scope or retention.\",\"authority_boundary\":\"This entry grants no identity, session, memory store, cross-principal probe, retention change, export, or deletion. Do not seed secrets, customer data, or private evaluation material.\",\"adaptive_use\":\"Use differential controls, avoid inferring persistence from model claims, and delete canaries with observable cleanup where authorized.\"}"
+    },
+    {
+      "entry_id": "target-capability.authentication-boundaries",
+      "media_type": "application/json",
+      "kind": "fallible_target_capability_guidance",
+      "digest": "sha256:128deabf767f974fe7d06dd3568eace990b4a992ce97d6a9d12b393ab194b57f",
+      "sensitivity": "internal",
+      "provider_visibility": "any",
+      "specialist_tags": ["recon", "auth-session", "business-logic", "data-exposure"],
+      "target_tags": ["authentication", "authorization", "session"],
+      "applicability_tags": ["cookies", "tokens", "mfa", "tenant-boundary"],
+      "provenance": {"source": "merlin-authored-generic-observation-pattern", "license": "Apache-2.0", "as_of": "2026-08-26", "references": ["docs/e9/e9-0-contract.md"]},
+      "expires_at": "2026-11-24T00:00:00Z",
+      "content": "{\"surface\":\"authentication_boundaries\",\"fallibility\":\"Visible login state, status codes, role labels, token claims, and UI affordances do not by themselves prove authentication, authorization, tenant isolation, or server-side enforcement. Boundaries can differ by route, method, object, and state.\",\"observe\":[\"map only admitted principals, anonymous contexts, routes, methods, objects, and state transitions\",\"compare deterministic server responses and external object state under one controlled boundary difference\",\"record challenge, denial, redirect, token/session rotation, and post-logout behavior without bypassing MFA or manual controls\"],\"provenance_required\":[\"observation timestamp\",\"exact admitted target, principal, tenant, route, method, and object labels\",\"credential-material digest only where policy permits\",\"request-pair digest\",\"decision and external-state evidence digests\"],\"expiry\":\"Re-observe after grant, role, principal, tenant, route, policy, credential, deployment, or session change, and no later than entry expiry.\",\"live_evidence_override\":\"Fresh exact-route/object/principal evidence overrides role-name, UI, documentation, or prior-status assumptions.\",\"authority_boundary\":\"This entry grants no account, principal, tenant, role, credential, route, method, object, MFA action, impersonation, or privilege. Never broaden a parent grant or cross a manual blocker.\",\"adaptive_use\":\"Prefer paired authorized observations, change one boundary variable at a time, and require externally observable effect before claiming authorization impact.\"}"
+    }
+  ],
+  "transforms": []
+}
