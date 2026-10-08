@@ -108,16 +108,14 @@ def discover_arms(
             win_arm = None
         if win_arm is not None:
             win_candidates.append(win_arm)
-    reserved_signals = min(maximum - 1, len(failure_candidates) + len(win_candidates))
     # The reviewed local catalogue is the reliable floor when a model-backed
-    # generator is malformed or unavailable. Rank its complete candidate grid
-    # and allow it to fill the whole discovery capacity; brainstorm and
-    # receipt-derived signals still interleave ahead of final admission.
-    catalog_maximum = max(1, maximum - reserved_signals)
+    # generator is malformed or unavailable. Generate a full source-local pool
+    # before interleaving: assigning the catalogue first used to leave only one
+    # slot for target-derived brainstorm proposals.
     catalog_candidates = catalog_mutation_candidates(
         seeds,
         existing_arms,
-        maximum=catalog_maximum,
+        maximum=maximum,
     )
     try:
         brainstorm_candidates = generate_brainstorm_arms(
@@ -125,7 +123,7 @@ def discover_arms(
             receipts=receipts,
             existing_arms=existing_arms,
             generator=generator,
-            maximum=max(1, maximum - reserved_signals - len(catalog_candidates)),
+            maximum=maximum,
         )
     except ModelJsonError as error:
         generation_failures.append(
@@ -228,9 +226,17 @@ def _enrich_arm(
         # other source starts as a trial.
         "status": "active" if source == "win-generalization" else "trial",
     }
-    rationale = str(arm.get("rationale") or "").strip()
-    if rationale:
-        enriched["rationale"] = rationale
+    for name in (
+        "rationale",
+        "mechanism_claim",
+        "trust_boundary",
+        "expected_effect",
+        "falsification_test",
+        "closest_known_technique_id",
+    ):
+        value = str(arm.get(name) or "").strip()
+        if value:
+            enriched[name] = value
     axis_coords = arm.get("axis_coords")
     if isinstance(axis_coords, Mapping) and axis_coords:
         enriched["axis_coords"] = dict(axis_coords)

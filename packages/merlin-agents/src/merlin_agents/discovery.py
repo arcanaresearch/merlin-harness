@@ -634,7 +634,9 @@ def rank_tasks_by_ucb(
             else state
         )
         quality = (item.wins + policy.partial_weight * item.partial_signal) / max(item.attempts, 1)
-        uncertainty = policy.exploration_constant * sqrt(log(total_runs + 2) / (item.attempts + 1))
+        exploration_bonus = policy.exploration_constant * sqrt(
+            log(total_runs + 2) / (item.attempts + 1)
+        )
         generalization = policy.generalization_weight * (
             gen_op + item.generalized_wins / max(item.attempts, 1)
         )
@@ -667,10 +669,18 @@ def rank_tasks_by_ucb(
                 "wins plus weighted near-miss signal per eligible attempt",
             ),
             ScoreComponent(
-                "uncertainty",
-                uncertainty,
-                uncertainty,
-                "UCB exploration bonus decreases as eligible evidence accumulates",
+                "portfolio_exploration_bonus",
+                exploration_bonus,
+                exploration_bonus,
+                "increases as peer evidence accumulates and decreases as this candidate "
+                "receives eligible attempts",
+            ),
+            ScoreComponent(
+                "epistemic_uncertainty",
+                evaluation_uncertainty,
+                0.0,
+                "evaluator uncertainty is reported separately and affects only reversible "
+                "downranking",
             ),
             ScoreComponent(
                 "novelty",
@@ -718,7 +728,17 @@ def rank_tasks_by_ucb(
                 decision.reason,
             )
         )
-    return tuple(sorted(rankings, key=lambda item: (-item.score, item.key)))
+    attempts_by_key = {item.key: item.attempts for item in stats}
+    return tuple(
+        sorted(
+            rankings,
+            key=lambda item: (
+                0 if attempts_by_key[item.key] == 0 else 1,
+                -item.score,
+                item.key,
+            ),
+        )
+    )
 
 
 def _bounded(value: float) -> float:

@@ -25,6 +25,11 @@ def _brainstorm_generator(prompt: str) -> list[dict[str, object]]:
             "semantic_id": "cross-tenant-isolation",
             "strategy_id": "direct",
             "rationale": "fresh boundary",
+            "mechanism_claim": "cross-tenant object reference confusion",
+            "trust_boundary": "tenant A to tenant B object ownership",
+            "expected_effect": "tenant B case data is reflected to tenant A",
+            "falsification_test": "repeat against a patched ownership check",
+            "closest_known_technique_id": "catalogue/idor",
         }
     ]
 
@@ -56,8 +61,51 @@ def test_discover_arms_runs_brainstorm_and_records_enriched_arms() -> None:
     assert arm["semantic_id"] == "cross-tenant-isolation"
     assert arm["strategy_id"] == "direct"
     assert arm["rationale"] == "fresh boundary"
+    assert arm["mechanism_claim"] == "cross-tenant object reference confusion"
+    assert arm["trust_boundary"] == "tenant A to tenant B object ownership"
+    assert arm["expected_effect"] == "tenant B case data is reflected to tenant A"
+    assert arm["falsification_test"] == "repeat against a patched ownership check"
+    assert arm["closest_known_technique_id"] == "catalogue/idor"
     assert result.pool == result.admitted
     assert recorded == list(result.admitted)
+
+
+def test_discover_arms_interleaves_full_catalog_and_brainstorm_pools() -> None:
+    prompts: list[str] = []
+
+    def generator(prompt: str) -> list[dict[str, object]]:
+        prompts.append(prompt)
+        return [
+            _arm(
+                f"brainstorm/{index}",
+                f"Probe target-derived boundary {index}.",
+                f"target-boundary-{index}",
+            )
+            for index in range(10)
+        ]
+
+    result = discover_arms(
+        target_id=_TARGET_ID,
+        scenario_fingerprint=_SCENARIO,
+        seeds=[
+            {
+                "technique_id": "cat/direct/override-baseline",
+                "semantic_id": "cat/direct/override-baseline",
+                "objective": "Test the reviewed target policy boundary.",
+                "execution_role": "direct",
+                "tags": ("prompt-injection",),
+            }
+        ],
+        receipts=[{"summary": "observed tenant boundary"}],
+        existing_arms=(),
+        generator=generator,
+        maximum=10,
+    )
+
+    sources = [arm["source"] for arm in result.admitted]
+    assert sources.count("catalog-mutation") == 5
+    assert sources.count("brainstorm") == 5
+    assert "Propose at most 10 arms" in prompts[0]
 
 
 def test_discover_arms_runs_failure_and_win_generators_when_signalled() -> None:

@@ -250,14 +250,20 @@ def rank_frontier(
         novelty = _measurement(arm, "novelty")
         generalization = _measurement(arm, "generalization_opportunity")
         boundary = _measurement(arm, "boundary_opportunity")
-        uncertainty = policy.exploration_constant * sqrt(log(eligible_attempts + 2))
+        exploration_bonus = policy.exploration_constant * sqrt(log(eligible_attempts + 2))
         components = (
             ScoreComponent("quality_signal", 0.0, 0.0, "no attributable execution yet"),
             ScoreComponent(
-                "uncertainty",
-                uncertainty,
-                uncertainty,
+                "portfolio_exploration_bonus",
+                exploration_bonus,
+                exploration_bonus,
                 "cold-start exploration bonus before an eligible target attempt",
+            ),
+            ScoreComponent(
+                "epistemic_uncertainty",
+                0.0,
+                0.0,
+                "no evaluator uncertainty has been observed before execution",
             ),
             ScoreComponent(
                 "novelty",
@@ -291,7 +297,20 @@ def rank_frontier(
                 materialized=False,
             )
         )
-    return tuple(sorted(ranked, key=lambda item: (-item.score, item.key)))
+    materialized_attempts = {
+        "execution:" + key: stats.attempts
+        for key, stats in aggregate_observations(observations).items()
+    }
+    return tuple(
+        sorted(
+            ranked,
+            key=lambda item: (
+                0 if not item.materialized or materialized_attempts.get(item.key, 0) == 0 else 1,
+                -item.score,
+                item.key,
+            ),
+        )
+    )
 
 
 def load_ranked_pool(

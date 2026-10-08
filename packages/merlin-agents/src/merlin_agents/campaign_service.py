@@ -10100,13 +10100,11 @@ class CampaignService:
         """Advisory Jev semantic dedup over newly admitted wave hypotheses.
 
         The deterministic admission pass dedups by canonical digest only, so
-        paraphrased duplicates are both admitted.  Each newly admitted
-        hypothesis gets one ``noul`` pair against every earlier kept
-        hypothesis: a confident same (probability >= 0.7) marks the later one
-        a duplicate — journaled with ``graded_by="jev"`` and excluded from
-        wave composition.  Jev only removes; an unavailable client, a disabled
-        toggle, more than the capped number of new admissions, or any failed
-        or non-confident call keeps the deterministic admission unchanged.
+        paraphrased duplicates are both admitted. Each newly admitted
+        hypothesis gets one ``noul`` pair against every earlier hypothesis.
+        A confident same (probability >= 0.7) is journaled as advisory semantic
+        evidence only. It never removes, retires, or blocks a distinct
+        canonical hypothesis from wave composition.
         """
         new_followups = [
             followup
@@ -10120,7 +10118,6 @@ class CampaignService:
             return assessment
         kept: list[LeadFollowUp] = []
         duplicates: list[dict[str, object]] = []
-        duplicate_ids: set[str] = set()
         for followup in assessment.followups:
             hypothesis = followup.hypothesis
             if hypothesis is None:
@@ -10162,7 +10159,6 @@ class CampaignService:
                         match = (anchor_hypothesis.id, probability)
                         break
                 if match is not None:
-                    duplicate_ids.add(hypothesis.id)
                     duplicates.append(
                         {
                             "hypothesis_id": hypothesis.id,
@@ -10170,7 +10166,6 @@ class CampaignService:
                             "jev_probability": round(match[1], 4),
                         }
                     )
-                    continue
             kept.append(followup)
         if not duplicates:
             return assessment
@@ -10182,24 +10177,17 @@ class CampaignService:
                 wave,
                 {
                     "kind": "jev_hypothesis_dedup",
-                    "status": "duplicate",
+                    "status": "advisory_duplicate",
                     "duplicates": duplicates,
                     "graded_by": "jev",
                     "reason": (
                         "Jev judged these newly admitted hypotheses materially the "
-                        f"same as an earlier kept hypothesis (p >= {_JEV_HYP_DUP_THRESHOLD}); "
-                        "excluded them from wave composition"
+                        f"same as an earlier hypothesis (p >= {_JEV_HYP_DUP_THRESHOLD}); "
+                        "recorded as advisory evidence without changing execution eligibility"
                     ),
                 },
             )
-        return replace(
-            assessment,
-            followups=tuple(
-                followup
-                for followup in assessment.followups
-                if followup.hypothesis is None or followup.hypothesis.id not in duplicate_ids
-            ),
-        )
+        return assessment
 
     async def _jev_coverage_state(self, campaign_id: str, manifest: CampaignManifest) -> str:
         """Serialize admitted cells, committed outcomes, and unresolved hypotheses."""

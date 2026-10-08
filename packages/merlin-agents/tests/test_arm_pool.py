@@ -114,10 +114,16 @@ def test_ambiguous_and_cancelled_rows_never_advance_retirement_attempts() -> Non
     )
 
     assert ranked[0].ranking.lifecycle == "trial"
-    uncertainty = next(item for item in ranked[0].ranking.components if item.name == "uncertainty")
+    uncertainty = next(
+        item
+        for item in ranked[0].ranking.components
+        if item.name == "portfolio_exploration_bonus"
+    )
     pristine = rank_pool((arm,), ())[0]
     pristine_uncertainty = next(
-        item for item in pristine.ranking.components if item.name == "uncertainty"
+        item
+        for item in pristine.ranking.components
+        if item.name == "portfolio_exploration_bonus"
     )
     assert uncertainty.measured_value == pristine_uncertainty.measured_value
 

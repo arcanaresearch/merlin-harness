@@ -23,6 +23,11 @@ BRAINSTORM_OUTPUT_SCHEMA: dict[str, object] = {
         "semantic_id": {"type": "string", "minLength": 1},
         "strategy_id": {"type": "string", "minLength": 1},
         "rationale": {"type": "string"},
+        "mechanism_claim": {"type": "string"},
+        "trust_boundary": {"type": "string"},
+        "expected_effect": {"type": "string"},
+        "falsification_test": {"type": "string"},
+        "closest_known_technique_id": {"type": "string"},
     },
     "required": ["technique_id", "objective", "semantic_id", "strategy_id"],
 }
@@ -123,8 +128,16 @@ def generate_arms(
             "objective": candidate["objective"],
             "source": "brainstorm",
         }
-        if candidate["rationale"]:
-            arm["rationale"] = candidate["rationale"]
+        for name in (
+            "rationale",
+            "mechanism_claim",
+            "trust_boundary",
+            "expected_effect",
+            "falsification_test",
+            "closest_known_technique_id",
+        ):
+            if candidate[name]:
+                arm[name] = candidate[name]
         admitted.append(arm)
         seen_keys.add(key)
         if len(admitted) >= maximum:
@@ -146,14 +159,22 @@ def _validated(raw: object) -> dict[str, str] | None:
     technique_id = str(instance["technique_id"]).strip()
     if not (semantic_id and strategy_id and objective and technique_id):
         return None
-    rationale = str(instance["rationale"]).strip() if instance.get("rationale") else ""
-    return {
+    candidate = {
         "technique_id": technique_id,
         "objective": objective,
         "semantic_id": semantic_id,
         "strategy_id": strategy_id,
-        "rationale": rationale,
     }
+    for name in (
+        "rationale",
+        "mechanism_claim",
+        "trust_boundary",
+        "expected_effect",
+        "falsification_test",
+        "closest_known_technique_id",
+    ):
+        candidate[name] = str(instance[name]).strip() if instance.get(name) else ""
+    return candidate
 
 
 def _render(item: object) -> object:

@@ -116,7 +116,8 @@ def test_ranking_exposes_all_components_and_rewards_near_miss() -> None:
     assert ranked[0].key == partial.key
     assert {item.name for item in ranked[0].components} == {
         "quality_signal",
-        "uncertainty",
+        "portfolio_exploration_bonus",
+        "epistemic_uncertainty",
         "novelty",
         "generalization",
         "boundary",
@@ -125,6 +126,29 @@ def test_ranking_exposes_all_components_and_rewards_near_miss() -> None:
         "reversible_downrank",
     }
     assert sum(item.contribution for item in ranked[0].components) == pytest.approx(ranked[0].score)
+
+
+def test_untried_arm_precedes_a_perfect_tried_arm_without_faking_its_score() -> None:
+    untried = AttemptStats(_identity(technique_id="untried"), 0, 0, 0.0, 0)
+    winner = AttemptStats(_identity(technique_id="winner"), 1, 1, 0.0, 0)
+
+    ranked = rank_tasks_by_ucb((winner, untried))
+
+    assert ranked[0].key == untried.key
+    assert ranked[0].score < ranked[1].score
+
+
+def test_ucb_and_epistemic_uncertainty_are_exposed_as_separate_components() -> None:
+    identity = _identity(technique_id="uncertain")
+    ranking = rank_tasks_by_ucb(
+        (AttemptStats(identity, 2, 0, 0.0, 2),),
+        arm_measurements={identity.key: {"evaluation_uncertainty": 0.75}},
+    )[0]
+    components = {item.name: item for item in ranking.components}
+
+    assert components["epistemic_uncertainty"].measured_value == pytest.approx(0.75)
+    assert components["epistemic_uncertainty"].contribution == 0
+    assert "peer evidence" in components["portfolio_exploration_bonus"].reason
 
 
 def test_retirement_uses_quality_attempts_and_partial_keeps_arm_live() -> None:

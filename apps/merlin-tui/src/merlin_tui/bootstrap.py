@@ -20,9 +20,19 @@ from uuid import UUID
 
 from merlin_browser import normalize_api_adapter_input_aliases
 from merlin_contracts import (
+    ChatMessage,
+    ChatRequest,
+    ModelCompleted,
+    ModelError,
+    ModelJsonError,
+    ModelUsage,
+    ModelWarning,
+    ReasoningDelta,
     TechniqueLanguageEvidence,
+    TextDelta,
     executable_adapter_digest,
     executable_adapter_projection,
+    parse_model_json,
     reviewed_adapter_cleanup_lifecycle,
 )
 from merlin_contracts.target_adapter_compiler import (
@@ -106,6 +116,132 @@ _INTERNAL_NON_CAMPAIGN_TOOL_IDS = frozenset(
 )
 
 _logger = logging.getLogger(__name__)
+
+_STRUCTURED_OUTPUT_FALLBACK_TOKENS = 16_384
+
+
+def _structured_model_for_role(config: object, role: str, fallback_model: str) -> str:
+    models = getattr(config, "provider_role_models", {})
+    if not isinstance(models, Mapping):
+        return fallback_model
+    selected = models.get(role) or models.get("routine") or fallback_model
+    return str(selected)
+
+
+def _structured_output_token_limit(
+    capability_registry: object,
+    provider: object,
+    selected_model: str,
+) -> int:
+    """Return a conservative cap bounded by the exact routed model.
+
+    A registry value backed only by the conservative-assumption tier is not a
+    provider fact, so it cannot lower the established provider default.
+    """
+    resolve = getattr(capability_registry, "resolve_model", None)
+    if not callable(resolve):
+        return _STRUCTURED_OUTPUT_FALLBACK_TOKENS
+    route = None
+    route_resolver = getattr(provider, "route_identity_for_model", None)
+    if callable(route_resolver):
+        route = route_resolver(selected_model)
+    if route is None:
+        route = getattr(provider, "route_identity", None)
+    try:
+        field = resolve(
+            selected_model,
+            transport=getattr(route, "transport", "openai_compatible"),
+            endpoint=getattr(route, "endpoint", ""),
+        ).max_output_tokens
+    except Exception:  # capability lookup must not disable model-backed discovery
+        return _STRUCTURED_OUTPUT_FALLBACK_TOKENS
+    candidate = getattr(field, "value", None)
+    assumed = bool(getattr(getattr(field, "provenance", None), "assumed", True))
+    if assumed or not isinstance(candidate, int) or isinstance(candidate, bool) or candidate < 1:
+        return _STRUCTURED_OUTPUT_FALLBACK_TOKENS
+    return min(_STRUCTURED_OUTPUT_FALLBACK_TOKENS, candidate)
+
+
+async def _request_structured_json(
+    *,
+    provider: object,
+    capability_registry: object,
+    selected_model: str,
+    messages: Sequence[ChatMessage],
+    expected_container: str,
+    max_attempts: int,
+    budget_id: str | None = None,
+    usage_sink: Callable[[ModelUsage], None] | None = None,
+) -> object:
+    """Request complete machine JSON with bounded, pre-effect repair attempts."""
+    if expected_container not in {"array", "object"}:
+        raise ValueError("expected_container must be 'array' or 'object'")
+    attempts = max(1, max_attempts)
+    output_limit = _structured_output_token_limit(capability_registry, provider, selected_model)
+    last_failure = "provider returned no complete JSON"
+    for attempt in range(attempts):
+        request_messages = list(messages)
+        if attempt:
+            request_messages.append(
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "The prior response was incomplete or invalid. Return a fresh, complete "
+                        f"JSON {expected_container} only. Do not include reasoning, prose, or "
+                        "Markdown fences."
+                    ),
+                )
+            )
+        parts: list[str] = []
+        completion: ModelCompleted | None = None
+        warnings: list[str] = []
+        provider_error: ModelError | None = None
+        async for event in provider.stream(
+            ChatRequest(
+                model=selected_model,
+                messages=request_messages,
+                max_output_tokens=output_limit,
+                budget_id=budget_id,
+                reasoning="disabled",
+            )
+        ):
+            if isinstance(event, TextDelta):
+                parts.append(event.text)
+            elif isinstance(event, ReasoningDelta):
+                continue
+            elif isinstance(event, ModelUsage):
+                if usage_sink is not None:
+                    usage_sink(event)
+            elif isinstance(event, ModelWarning):
+                warnings.append(f"{event.code}: {event.message}")
+            elif isinstance(event, ModelError):
+                provider_error = event
+                break
+            elif isinstance(event, ModelCompleted):
+                completion = event
+        if provider_error is not None:
+            last_failure = provider_error.message
+            if not provider_error.retryable:
+                raise OSError(provider_error.message)
+            continue
+        text = "".join(parts)
+        try:
+            value = parse_model_json(text)
+        except ModelJsonError as error:
+            finish = completion.finish_reason if completion is not None else "unknown"
+            disposition = completion.disposition if completion is not None else "unknown"
+            suffix = f"; warnings={'; '.join(warnings)}" if warnings else ""
+            last_failure = f"{error}; finish_reason={finish}; disposition={disposition}{suffix}"
+            continue
+        valid = (
+            isinstance(value, list) if expected_container == "array" else isinstance(value, dict)
+        )
+        if valid:
+            return value
+        last_failure = f"provider returned a non-{expected_container} JSON value"
+    raise ModelJsonError(
+        f"structured JSON generation failed after {attempts} attempt(s): {last_failure}"
+    )
 
 
 def _telemetry_client_identity(configured: str | None, config_dir: Path) -> str:
@@ -5407,37 +5543,26 @@ def build_backend(
             review_usage: list[Mapping[str, object]] = []
 
             async def request_json(role: str, instruction: str, payload: object) -> dict[str, Any]:
-                from merlin_contracts import parse_model_json
-
-                selected_model = (
-                    config.provider_role_models.get(role)
-                    or config.provider_role_models.get("routine")
-                    or model
+                selected_model = _structured_model_for_role(config, role, model)
+                value = await _request_structured_json(
+                    provider=provider,
+                    capability_registry=capability_registry,
+                    selected_model=selected_model,
+                    messages=(
+                        ChatMessage(role="system", content=instruction),
+                        ChatMessage(
+                            role="user",
+                            content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                        ),
+                    ),
+                    expected_container="object",
+                    max_attempts=config.provider_runtime.worker_retry_attempts,
+                    budget_id=campaign_id,
+                    usage_sink=lambda event: review_usage.append(
+                        stream_usage_record(selected_model, event)
+                    ),
                 )
-                parts: list[str] = []
-                async for event in provider.stream(
-                    ChatRequest(
-                        model=selected_model,
-                        messages=[
-                            ChatMessage(role="system", content=instruction),
-                            ChatMessage(
-                                role="user",
-                                content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                            ),
-                        ],
-                        max_output_tokens=2_048,
-                        budget_id=campaign_id,
-                    )
-                ):
-                    if isinstance(event, TextDelta):
-                        parts.append(event.text)
-                    elif isinstance(event, ModelUsage):
-                        review_usage.append(stream_usage_record(selected_model, event))
-                    elif isinstance(event, ModelError):
-                        raise OSError(event.message)
-                value = parse_model_json("".join(parts))
-                if not isinstance(value, dict):
-                    raise ValueError(f"{role} returned a non-object response")
+                assert isinstance(value, dict)
                 return value
 
             try:
@@ -8961,6 +9086,7 @@ def build_backend(
             return outcome
 
         arm_generation_usage: list[Mapping[str, object]] = []
+        arm_generation_model = _structured_model_for_role(config, "adversarial-researcher", model)
 
         def arm_generator(prompt: str) -> tuple[Mapping[str, object], ...]:
             """Bridge the sync arm-discovery orchestrator to the async provider.
@@ -8970,37 +9096,29 @@ def build_backend(
             usage is buffered on ``drain_usage`` for the campaign journal; the
             generator contract has no campaign identity of its own.
             """
-            from merlin_contracts import parse_model_json
 
             async def _generate() -> tuple[Mapping[str, object], ...]:
-                parts: list[str] = []
-                async for event in provider.stream(
-                    ChatRequest(
-                        model=model,
-                        messages=[
-                            ChatMessage(
-                                role="system",
-                                content=(
-                                    "You propose novel assessment arms for a reviewed target. "
-                                    "Return a JSON array of arm objects."
-                                ),
+                value = await _request_structured_json(
+                    provider=provider,
+                    capability_registry=capability_registry,
+                    selected_model=arm_generation_model,
+                    messages=(
+                        ChatMessage(
+                            role="system",
+                            content=(
+                                "You propose novel assessment arms for a reviewed target. "
+                                "Return a JSON array of arm objects."
                             ),
-                            ChatMessage(role="user", content=prompt),
-                        ],
-                        max_output_tokens=2_048,
-                    )
-                ):
-                    if isinstance(event, TextDelta):
-                        parts.append(event.text)
-                    elif isinstance(event, ModelUsage):
-                        arm_generation_usage.append(stream_usage_record(model, event))
-                    elif isinstance(event, ModelError):
-                        raise OSError(event.message)
-                value = parse_model_json("".join(parts))
-                if isinstance(value, Mapping):
-                    value = (value,)
-                if not isinstance(value, (list, tuple)):
-                    raise ValueError("arm generator returned a non-array response")
+                        ),
+                        ChatMessage(role="user", content=prompt),
+                    ),
+                    expected_container="array",
+                    max_attempts=config.provider_runtime.worker_retry_attempts,
+                    usage_sink=lambda event: arm_generation_usage.append(
+                        stream_usage_record(arm_generation_model, event)
+                    ),
+                )
+                assert isinstance(value, list)
                 return tuple(item for item in value if isinstance(item, Mapping))
 
             return asyncio.run(_generate())

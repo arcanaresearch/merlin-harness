@@ -94,20 +94,20 @@ def _kept_assertions(assessment: LeadAssessment) -> list[str]:
     ]
 
 
-def test_confident_same_marks_later_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_confident_same_keeps_later_hypothesis_eligible(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service()
     _attach_client(service)
     _stub_jev_post(monkeypatch, 0.9)
     result = _run(service, _assessment("leak the canary", "expose the canary value"))
-    assert _kept_assertions(result) == ["leak the canary"]
+    assert _kept_assertions(result) == ["leak the canary", "expose the canary value"]
 
 
-def test_boundary_same_marks_later_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_boundary_same_keeps_later_hypothesis_eligible(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service()
     _attach_client(service)
     _stub_jev_post(monkeypatch, 0.7)
     result = _run(service, _assessment("leak the canary", "expose the canary value"))
-    assert _kept_assertions(result) == ["leak the canary"]
+    assert _kept_assertions(result) == ["leak the canary", "expose the canary value"]
 
 
 def test_below_threshold_keeps_both(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,7 +170,7 @@ def test_existing_hypotheses_are_anchors_never_removed(
     assert existing is not None
     new_ids = _new_ids(assessment) - frozenset({existing.id})
     result = _run(service, assessment, new_ids=new_ids)
-    assert _kept_assertions(result) == ["leak the canary"]
+    assert _kept_assertions(result) == ["leak the canary", "expose the canary value"]
 
 
 def test_duplicate_is_journaled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,7 +188,9 @@ def test_duplicate_is_journaled(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(entries) == 1
     entry = entries[0]
     assert entry["kind"] == "jev_hypothesis_dedup"
+    assert entry["status"] == "advisory_duplicate"
     assert entry["graded_by"] == "jev"
+    assert "without changing execution eligibility" in entry["reason"]
     duplicates = entry["duplicates"]
     assert len(duplicates) == 1
     assert duplicates[0]["hypothesis_id"] == assessment.followups[1].hypothesis.id
