@@ -10,7 +10,7 @@
 
 Tell Merlin what you are authorized to test. It learns how the application works, proposes an
 offensive campaign for review, follows promising evidence, and returns evidence-backed findings
-with explicit uncertainty.
+with clear evidence status and coverage gaps.
 
 **72 attack cases · 14 benign controls · Browser + API · Adaptive exploration · Heterogeneous models**
 
@@ -20,6 +20,13 @@ with explicit uncertainty.
 </div>
 
 ![Merlin coordinated security assessment](assets/merlin-hero.png)
+
+## Watch the CLI walkthrough
+
+[![Watch the 106-second Merlin CLI walkthrough](assets/merlin-cli-walkthrough.jpg)](https://github.com/triwiz-ai/merlin-harness/releases/download/v0.2.0/merlin-cli-walkthrough-v2.mp4)
+
+See Merlin connect models, define an authorized target, review a campaign, coordinate agents,
+accept operator guidance, and produce an evidence-linked report.
 
 ![Merlin conversation-first assessment interface](assets/merlin-welcome.png)
 
@@ -41,7 +48,7 @@ Merlin
   3. Waits for your review
   4. Runs applicable attacks with matched benign controls where the target supports them
   5. Follows useful clues and records attributable evidence
-  6. Returns findings, uncertainty, coverage, and what was never tested
+  6. Returns findings, evidence status, coverage gaps, and what was never tested
 ```
 
 If you already use Codex or Claude Code, the interaction should feel familiar: describe the job in
@@ -54,7 +61,7 @@ To run Merlin from source, install Python 3.13+ and `uv`, prepare the workspace 
 launcher in the repository:
 
 ```bash
-git clone https://github.com/TVLBOYS/merlin-harness.git
+git clone https://github.com/triwiz-ai/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin
@@ -117,7 +124,7 @@ continuous learning, adaptive exploration, specialist coordination, and applicat
 | Primarily scores responses | Compares attacks with controls and target-state evidence |
 | Uses one general execution path | Can route different jobs to different models |
 | Starts each scan from zero | Reuses comparable lessons and revalidates stale evidence |
-| Reports interesting output | Reports findings, uncertainty, coverage, and lineage |
+| Reports interesting output | Reports findings, evidence status, coverage, and lineage |
 
 ## How Merlin works
 
