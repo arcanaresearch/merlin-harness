@@ -139,6 +139,15 @@ The current workspace shell tool runs a bounded subprocess on the owner host. It
 workspace confinement, environment minimization, timeout/output bounds, process-group teardown,
 and permission confirmation, but it is **not a general OS/container sandbox**.
 
+Before approval, the TUI shows the shell command, resolved working directory, and scrollable
+arguments with credential redaction. `Allow this command + directory (session)` remembers the
+complete original argv and resolved directory within the current session, workspace, and target
+scope. Changed arguments (including redacted values) or a different directory require approval
+again. `Allow all commands here for this session` remains an explicit broader choice; a broad
+session denial overrides remembered command approvals. Command rules use the existing session
+expiry and persist across daemon restarts. The command identity covers arguments and directory,
+not executable or script contents.
+
 Provider routing is selected from the exact `ChatRequest.model`. Native CLI transports are
 no-tool routes unless their production contract explicitly supports Merlin's continuation model;
 tool-bearing workers normally use a provider route that can return structured tool calls.

@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Protocol
 
 from jsonschema import SchemaError, ValidationError
@@ -91,6 +92,46 @@ def _infrastructure_failure_category(
     ):
         return InfrastructureFailureCategory.UNHEALTHY_TARGET_SESSION
     return None
+
+
+def _shell_command_scope(
+    tool: Tool,
+    effect: PermissionEffect,
+    scope: PermissionScope,
+    context: ToolContext,
+    arguments: Mapping[str, Any],
+) -> PermissionScope | None:
+    # Import at invocation time: workspace tools themselves import this broker.
+    from .workspace import ShellCommandTool
+
+    if type(tool) is not ShellCommandTool or effect is not PermissionEffect.SUBPROCESS:
+        return None
+    argv = arguments.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= 128
+        or any(not isinstance(item, str) or not item or "\x00" in item for item in argv)
+    ):
+        return None
+    value = arguments.get("cwd", ".")
+    if not isinstance(value, str):
+        return None
+    try:
+        relative = Path(value or ".")
+        if relative.is_absolute():
+            return None
+        root = Path(context.workspace_root).resolve(strict=True)
+        cwd = (root / relative).resolve(strict=True)
+        cwd.relative_to(root)
+        if not cwd.is_dir():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    # Match the executor's resolved directory and the complete, unredacted argv.
+    # Preserve the existing workspace identity and all other authority boundaries.
+    payload = json.dumps({"argv": argv, "cwd": str(cwd)}, sort_keys=True, separators=(",", ":"))
+    digest = sha256(payload.encode()).hexdigest()
+    return replace(scope, operation_group=f"{scope.rule_key}:command:{digest}")
 
 
 class ToolBroker:
@@ -305,6 +346,7 @@ class ToolBroker:
                 if self._permission_scope is not None
                 else self._default_scope(name, context, arguments)
             )
+            command_scope = _shell_command_scope(tool, effect, scope, context, arguments)
 
             async def resolve(
                 _request: PermissionRequest,
@@ -318,11 +360,12 @@ class ToolBroker:
                         "__permission_target": scope.target,
                         "__permission_plugin": scope.plugin_id,
                         "__permission_group": scope.operation_group,
+                        "__permission_command_scope": command_scope is not None,
                     }
                 )
                 return await self._confirmer(spec, context, permission_arguments)
 
-            request = PermissionRequest(effect, scope)
+            request = PermissionRequest(effect, scope, command_scope=command_scope)
             grant = (
                 await self._durable_grant(name, context, effect)
                 if self._durable_grant is not None
@@ -352,6 +395,23 @@ class ToolBroker:
                     is_error=True,
                     metadata={"effect": effect.value, "permission_denied": True},
                 )
+            if command_scope is not None:
+                current_command_scope = _shell_command_scope(
+                    tool, effect, scope, context, arguments
+                )
+                if current_command_scope != command_scope:
+                    return ToolResult(
+                        content=(
+                            "command or working directory changed during permission approval; "
+                            "retry to review the current execution details"
+                        ),
+                        is_error=True,
+                        metadata={
+                            "effect": effect.value,
+                            "permission_scope_changed": True,
+                            "retry_required": True,
+                        },
+                    )
         elif effect is PermissionEffect.TARGET_NETWORK or (
             spec.name.startswith("mcp__") and effect is PermissionEffect.UNKNOWN
         ):

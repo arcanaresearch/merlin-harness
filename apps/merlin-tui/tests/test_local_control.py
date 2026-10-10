@@ -976,6 +976,85 @@ async def test_daemon_serializes_concurrent_approvals_on_one_channel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_command_session_permission_roundtrips_daemon_socket(tmp_path: Path) -> None:
+    from uuid import uuid4
+
+    from merlin_permissions import PermissionDecision, PermissionEngine, PermissionMode
+    from merlin_tools import workspace_tool_broker
+
+    class Store:
+        def __init__(self):
+            self.rules = {}
+            self.audits = []
+
+        async def find_rule(self, request):
+            return self.rules.get((request.scope.fingerprint, request.effect))
+
+        async def save_rule(self, rule):
+            self.rules[(rule.scope_fingerprint, rule.effect)] = rule
+
+        async def record_audit(self, audit):
+            self.audits.append(audit)
+
+    results = []
+
+    class CommandBackend(Backend):
+        def __init__(self, tool_confirmer):
+            self.broker = workspace_tool_broker(
+                permissions=PermissionEngine(PermissionMode.PROMPT, Store()),
+                confirmer=tool_confirmer,
+            )
+            self.context = ToolContext(session_id="same-session", workspace_root=str(tmp_path))
+
+        async def stream(self, prompt):
+            result = await self.broker.invoke(
+                "shell_command", self.context, {"argv": ["/bin/echo", prompt]}
+            )
+            results.append(result)
+            yield StreamEvent("error" if result.is_error else "content", result.content.strip())
+
+    prompts = []
+
+    async def confirm(spec, context, arguments):
+        assert spec.name == "shell_command"
+        assert context.session_id == "same-session"
+        assert arguments["__permission_command_scope"] is True
+        assert arguments["argv"] == ["/bin/echo", "a" if not prompts else "b"]
+        prompts.append(arguments)
+        return (
+            PermissionDecision.ALLOW_COMMAND_SESSION
+            if len(prompts) == 1
+            else PermissionDecision.DENY_ONCE
+        )
+
+    socket_path = Path(f"/tmp/merlin-command-{uuid4().hex}.sock")
+    daemon = asyncio.create_task(serve(socket_path, backend_factory=CommandBackend))
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        client = LocalControlClient(confirmer=confirm, socket_path=socket_path)
+        for _ in range(2):
+            events = [event async for event in client.stream("a")]
+            assert [(event.kind, event.text) for event in events] == [("content", "a")]
+        assert len(prompts) == 1
+
+        events = [event async for event in client.stream("b")]
+        assert len(prompts) == 2
+        assert [(event.kind, event.text) for event in events] == [
+            ("error", "permission denied for tool: shell_command")
+        ]
+        assert [result.metadata.get("exit_code") for result in results] == [0, 0, None]
+        assert results[-1].metadata["permission_denied"] is True
+    finally:
+        daemon.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await daemon
+        socket_path.with_suffix(".journal.json").unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_process_daemon_retains_owner_lock_after_socket_cleanup() -> None:
     from merlin_tui.local_control import _PROCESS_LIFETIME_LOCKS
 

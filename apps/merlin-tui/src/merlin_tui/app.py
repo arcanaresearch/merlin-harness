@@ -3474,10 +3474,11 @@ class MerlinApp(App[None]):
     #permission-title { height: 1; text-style: bold; color: #d7d7d7; }
     #permission-scope { height: auto; color: #a8a8a8; margin-bottom: 1; }
     #permission-details-scroll {
-        height: auto; max-height: 7; scrollbar-size: 1 1; margin-bottom: 1;
+        height: auto; max-height: 6; scrollbar-size: 1 1; margin-bottom: 1;
     }
     #permission-details { height: auto; }
     #permission-help { height: 1; color: $text-muted; }
+    #permission-allow-command-session { display: none; }
     #permission-drawer Button {
         width: 100%; height: 1; min-height: 1; margin: 0; padding: 0 1;
         border: none; background: #202020; color: #bcbcbc; text-align: left;
@@ -3594,6 +3595,9 @@ class MerlinApp(App[None]):
                 "Scroll / Page Up / Page Down: inspect details", id="permission-help", markup=False
             )
             yield Button("1. Allow once", id="permission-allow-once")
+            yield Button(
+                "2. Allow this command + directory (session)", id="permission-allow-command-session"
+            )
             yield Button("2. Allow this scope for this session", id="permission-allow-session")
             yield Button("3. Deny", id="permission-deny-once")
             yield Button("4. Deny this scope for this session", id="permission-deny-session")
@@ -5628,7 +5632,19 @@ class MerlinApp(App[None]):
             )
             details.scroll_home(animate=False)
             shell = scope.tool_name == "shell_command"
-            for decision, verb, number in (("allow", "Allow", 2), ("deny", "Deny", 4)):
+            command_available = (
+                shell
+                and arguments is not None
+                and arguments.get("__permission_command_scope") is True
+            )
+            self.query_one("#permission-allow-command-session", Button).display = command_available
+            self.query_one("#permission-deny-once", Button).label = (
+                "4. Deny" if command_available else "3. Deny"
+            )
+            for decision, verb, number in (
+                ("allow", "Allow", 3 if command_available else 2),
+                ("deny", "Deny", 5 if command_available else 4),
+            ):
                 self.query_one(f"#permission-{decision}-session", Button).label = (
                     f"{number}. {verb} all commands here for this session"
                     if shell
@@ -5665,7 +5681,9 @@ class MerlinApp(App[None]):
         if event.key in {"up", "down"}:
             event.prevent_default()
             event.stop()
-            buttons = list(self.query("#permission-drawer Button"))
+            buttons = [
+                button for button in self.query("#permission-drawer Button") if button.display
+            ]
             current = next((index for index, button in enumerate(buttons) if button.has_focus), 0)
             offset = -1 if event.key == "up" else 1
             buttons[(current + offset) % len(buttons)].focus()
@@ -5681,6 +5699,15 @@ class MerlinApp(App[None]):
             "4": "deny_session",
             "n": "deny_session",
         }
+        if self.query_one("#permission-allow-command-session", Button).display:
+            shortcuts.update(
+                {
+                    "2": "allow_command_session",
+                    "3": "allow_session",
+                    "4": "deny_once",
+                    "5": "deny_session",
+                }
+            )
         if decision := shortcuts.get(event.key):
             event.prevent_default()
             event.stop()

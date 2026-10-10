@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from merlin_permissions import (
     PermissionDecision,
     PermissionEffect,
@@ -141,3 +142,165 @@ async def test_expired_session_rule_is_not_inherited_by_later_workers() -> None:
         "session rule expired",
         "operator decision required",
     ]
+
+
+class CommandStore(Store):
+    async def find_rule(self, request):
+        return next(
+            (
+                rule
+                for rule in reversed(self.rules)
+                if rule.session_id == request.scope.session_id
+                and rule.tool_name == request.scope.rule_key
+                and rule.effect == request.effect
+                and rule.scope_fingerprint == request.scope.fingerprint
+            ),
+            None,
+        )
+
+
+def command_request(
+    command: str = "command-a", *, root: str = "/one", target: str | None = None
+) -> PermissionRequest:
+    scope = PermissionScope("session", "shell_command", root, target=target)
+    command_scope = PermissionScope(
+        "session", "shell_command", root, target=target, operation_group=command
+    )
+    return PermissionRequest(PermissionEffect.SUBPROCESS, scope, command_scope)
+
+
+async def test_command_session_rule_reuses_only_exact_command_scope() -> None:
+    store = CommandStore()
+    decisions = [PermissionDecision.ALLOW_COMMAND_SESSION] + [PermissionDecision.DENY_ONCE] * 3
+
+    async def resolve(_request):
+        return decisions.pop(0)
+
+    engine = PermissionEngine(PermissionMode.PROMPT, store, resolver=resolve)
+    requested = command_request()
+
+    assert await engine.authorize(requested)
+    assert await engine.authorize(requested)
+    assert not await engine.authorize(command_request("command-b"))
+    assert not await engine.authorize(command_request(root="/changed"))
+    assert not await engine.authorize(command_request(target="another-target"))
+    assert not decisions
+    assert len(store.rules) == 1
+    assert store.rules[0].decision is PermissionDecision.ALLOW_SESSION
+    assert store.rules[0].scope_fingerprint == requested.command_scope.fingerprint
+    assert store.rules[0].tool_name == "command-a"
+    assert store.rules[0].expires_at > datetime.now(UTC)
+    assert [audit.decision for audit in store.audits[:2]] == [
+        PermissionDecision.ALLOW_COMMAND_SESSION,
+        PermissionDecision.ALLOW_COMMAND_SESSION,
+    ]
+    assert all(audit.request.scope == requested.command_scope for audit in store.audits[:2])
+    assert store.audits[1].reason == "matching command session rule"
+
+
+async def test_broad_session_deny_overrides_exact_command_allow() -> None:
+    store = CommandStore()
+
+    async def resolve(_request):
+        return PermissionDecision.ALLOW_COMMAND_SESSION
+
+    engine = PermissionEngine(PermissionMode.PROMPT, store, resolver=resolve)
+    requested = command_request()
+    assert await engine.authorize(requested)
+    store.rules.append(
+        PermissionRule(
+            requested.scope.session_id,
+            requested.scope.rule_key,
+            requested.effect,
+            requested.scope.fingerprint,
+            PermissionDecision.DENY_SESSION,
+        )
+    )
+
+    assert not await engine.authorize(requested)
+    assert store.audits[-1].decision is PermissionDecision.DENY_SESSION
+    assert store.audits[-1].reason == "matching session rule"
+
+
+async def test_expired_command_session_rule_requires_new_approval() -> None:
+    store = CommandStore()
+    requested = command_request()
+    scope = requested.command_scope
+    store.rules.append(
+        PermissionRule(
+            scope.session_id,
+            scope.rule_key,
+            requested.effect,
+            scope.fingerprint,
+            PermissionDecision.ALLOW_SESSION,
+            datetime.now(UTC) - timedelta(seconds=1),
+        )
+    )
+    engine = PermissionEngine(PermissionMode.PROMPT, store)
+
+    assert not await engine.authorize(requested)
+    assert [audit.reason for audit in store.audits] == [
+        "command session rule expired",
+        "operator decision required",
+    ]
+
+
+async def test_expired_broad_deny_falls_back_to_exact_command_allow() -> None:
+    store = CommandStore()
+
+    async def resolve(_request):
+        return PermissionDecision.ALLOW_COMMAND_SESSION
+
+    engine = PermissionEngine(PermissionMode.PROMPT, store, resolver=resolve)
+    requested = command_request()
+    assert await engine.authorize(requested)
+    store.rules.append(
+        PermissionRule(
+            requested.scope.session_id,
+            requested.scope.rule_key,
+            requested.effect,
+            requested.scope.fingerprint,
+            PermissionDecision.DENY_SESSION,
+            datetime.now(UTC) - timedelta(seconds=1),
+        )
+    )
+
+    assert await engine.authorize(requested)
+    assert [audit.reason for audit in store.audits[-2:]] == [
+        "session rule expired",
+        "matching command session rule",
+    ]
+
+
+async def test_command_session_decision_without_exact_scope_denies_without_persisting() -> None:
+    store = CommandStore()
+
+    async def resolve(_request):
+        return PermissionDecision.ALLOW_COMMAND_SESSION
+
+    engine = PermissionEngine(PermissionMode.PROMPT, store, resolver=resolve)
+
+    assert not await engine.authorize(request(PermissionEffect.SUBPROCESS))
+    assert not store.rules
+    assert store.audits[-1].reason == "command session decision requires an exact command scope"
+
+
+@pytest.mark.parametrize(
+    "decision", [PermissionDecision.ALLOW_SESSION, PermissionDecision.DENY_SESSION]
+)
+async def test_existing_broad_session_decisions_still_cover_different_commands(decision) -> None:
+    store = CommandStore()
+    calls = 0
+
+    async def resolve(_request):
+        nonlocal calls
+        calls += 1
+        return decision
+
+    engine = PermissionEngine(PermissionMode.PROMPT, store, resolver=resolve)
+    expected = decision is PermissionDecision.ALLOW_SESSION
+
+    assert await engine.authorize(command_request()) is expected
+    assert await engine.authorize(command_request("command-b")) is expected
+    assert calls == 1
+    assert len(store.rules) == 1

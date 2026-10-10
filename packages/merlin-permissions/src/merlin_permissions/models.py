@@ -23,6 +23,7 @@ class PermissionEffect(StrEnum):
 class PermissionDecision(StrEnum):
     ALLOW_ONCE = "allow_once"
     ALLOW_SESSION = "allow_session"
+    ALLOW_COMMAND_SESSION = "allow_command_session"
     DENY_ONCE = "deny_once"
     DENY_SESSION = "deny_session"
 
@@ -72,6 +73,7 @@ class PermissionScope:
 class PermissionRequest:
     effect: PermissionEffect
     scope: PermissionScope
+    command_scope: PermissionScope | None = None
 
 
 @dataclass(frozen=True, slots=True)

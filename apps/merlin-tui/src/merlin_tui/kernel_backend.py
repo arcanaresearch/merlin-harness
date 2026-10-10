@@ -1132,7 +1132,7 @@ class KernelBackend:
                 scope=str(row["scope"]),
             )
             for row in rows
-            if row.get("decision") in {"allow_session", "deny_session"}
+            if row.get("decision") in {"allow_session", "allow_command_session", "deny_session"}
         )
 
     async def list_permission_history(self) -> tuple[PermissionAuditView, ...]:

@@ -1116,6 +1116,33 @@ async def test_backend_projects_permission_service_mode_rules_and_history() -> N
 
 
 @pytest.mark.asyncio
+async def test_backend_includes_exact_command_grants_in_permission_rules() -> None:
+    class CommandPermissions:
+        async def list_permissions(self, session_id):
+            return [
+                {
+                    "tool": "shell_command",
+                    "effect": "subprocess",
+                    "mode": "prompt",
+                    "verdict": "allow",
+                    "decision": "allow_command_session",
+                    "reason": "operator exact command session decision",
+                    "scope": "sha256:exact-command",
+                },
+            ]
+
+    backend = KernelBackend(FakeKernel([]), permissions=CommandPermissions())  # type: ignore[arg-type]
+
+    rules = await backend.list_permission_rules()
+    history = await backend.list_permission_history()
+
+    assert len(rules) == 1
+    assert rules[0].decision == "allow_command_session"
+    assert rules[0].scope == "sha256:exact-command"
+    assert history[0].decision == "allow_command_session"
+
+
+@pytest.mark.asyncio
 async def test_backend_hot_reload_applies_reload_safe_settings_and_reports_drift() -> None:
     settings = KernelSettings(
         Config(

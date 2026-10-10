@@ -3024,6 +3024,8 @@ async def test_permission_long_scope_keeps_all_decisions_visible(terminal_size) 
         drawer = app.query_one("#permission-drawer").content_region
         composer = app.query_one("#composer").region
         for button in app.query("#permission-drawer Button"):
+            if not button.display:
+                continue
             assert button.region.height > 0
             assert button.region.y >= drawer.y
             assert button.region.bottom <= drawer.bottom
@@ -5993,3 +5995,146 @@ async def test_scan_completion_hint_survives_refresh_and_hides_for_next_scan():
         await app._poll_swarm_progress()
         await pilot.pause()
         assert not app.query_one("#scan-next").has_class("visible")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ("number", "arrows", "mouse"))
+async def test_command_session_permission_choice_is_explicit_and_keyboard_accessible(
+    tmp_path, choice
+):
+    app = build_app(DemoBackend())
+    async with app.run_test(size=(60, 20)) as pilot:
+        pending = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-command", workspace_root=str(tmp_path)),
+                {
+                    "argv": ["echo", "reviewed"],
+                    "__permission_effect": "subprocess",
+                    "__permission_command_scope": True,
+                },
+            )
+        )
+        await pilot.pause()
+        exact = app.query_one("#permission-allow-command-session", Button)
+        assert exact.display
+        assert "command + directory" in str(exact.label)
+        drawer = app.query_one("#permission-drawer").content_region
+        for button in app.query("#permission-drawer Button"):
+            assert drawer.contains_region(button.region)
+            assert button.region.bottom <= app.query_one("#composer").region.y
+        assert "Command: echo reviewed" in str(app.query_one("#permission-details").render())
+        if choice == "number":
+            await pilot.press("2")
+        elif choice == "arrows":
+            await pilot.press("down", "enter")
+        else:
+            await pilot.click("#permission-allow-command-session")
+        await pilot.pause()
+        assert str(await pending) == "allow_command_session"
+
+
+@pytest.mark.asyncio
+async def test_unverified_command_cannot_select_command_session_permission(tmp_path):
+    app = build_app(DemoBackend())
+    async with app.run_test() as pilot:
+        pending = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-unverified", workspace_root=str(tmp_path)),
+                {"argv": ["echo", "reviewed"], "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        assert not app.query_one("#permission-allow-command-session", Button).display
+        await pilot.press("5")
+        await pilot.pause()
+        assert not pending.done()
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        assert str(await pending) == "allow_session"
+
+
+@pytest.mark.asyncio
+async def test_command_session_approval_reaches_broker_and_changed_arguments_reprompt(tmp_path):
+    from merlin_contracts import ToolContext
+    from merlin_permissions import PermissionEngine, PermissionMode
+    from merlin_tools import workspace_tool_broker
+
+    class CommandStore:
+        def __init__(self):
+            self.rules = {}
+            self.audits = []
+
+        async def find_rule(self, request):
+            return self.rules.get((request.effect, request.scope.fingerprint))
+
+        async def save_rule(self, rule):
+            self.rules[(rule.effect, rule.scope_fingerprint)] = rule
+
+        async def record_audit(self, audit):
+            self.audits.append(audit)
+
+    app = build_app(DemoBackend())
+    store = CommandStore()
+    broker = workspace_tool_broker(
+        confirmer=app.confirm_permission_tool,
+        permissions=PermissionEngine(PermissionMode.PROMPT, store),
+    )
+    context = ToolContext(session_id="command-integration", workspace_root=str(tmp_path))
+    async with app.run_test() as pilot:
+        first = asyncio.create_task(
+            broker.invoke("shell_command", context, {"argv": ["/bin/echo", "a"]})
+        )
+        await pilot.pause()
+        assert not first.done()
+        assert app.query_one("#permission-allow-command-session", Button).display
+        await pilot.press("2")
+        await pilot.pause()
+        assert (await first).content == "a\n"
+        repeated = await broker.invoke("shell_command", context, {"argv": ["/bin/echo", "a"]})
+        assert repeated.content == "a\n"
+        assert not app.query_one("#permission-drawer").has_class("visible")
+        changed = asyncio.create_task(
+            broker.invoke("shell_command", context, {"argv": ["/bin/echo", "b"]})
+        )
+        await pilot.pause()
+        assert not changed.done()
+        assert "Command: /bin/echo b" in str(app.query_one("#permission-details").render())
+        await pilot.press("escape")
+        await pilot.pause()
+        assert (await changed).is_error
+        assert len(store.rules) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    (
+        ("1", "allow_once"),
+        ("2", "allow_command_session"),
+        ("3", "allow_session"),
+        ("4", "deny_once"),
+        ("5", "deny_session"),
+    ),
+)
+async def test_command_permission_numbers_match_visible_choices(tmp_path, key, expected):
+    app = build_app(DemoBackend())
+    async with app.run_test() as pilot:
+        pending = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-numbered", workspace_root=str(tmp_path)),
+                {
+                    "argv": ["echo", "numbered"],
+                    "__permission_effect": "subprocess",
+                    "__permission_command_scope": True,
+                },
+            )
+        )
+        await pilot.pause()
+        buttons = [button for button in app.query("#permission-drawer Button") if button.display]
+        assert [str(button.label).split(".", 1)[0] for button in buttons] == list("12345")
+        await pilot.press(key)
+        await pilot.pause()
+        assert str(await pending) == expected

@@ -85,6 +85,23 @@ class PermissionEngine:
         if rule is not None:
             await self._audit(request, PermissionVerdict.PROMPT, None, "session rule expired")
 
+        if request.command_scope is not None:
+            command_request = PermissionRequest(request.effect, request.command_scope)
+            command_rule = await self._store.find_rule(command_request)
+            if command_rule is not None and not command_rule.expired:
+                allowed = command_rule.decision is PermissionDecision.ALLOW_SESSION
+                await self._audit(
+                    command_request,
+                    PermissionVerdict.ALLOW if allowed else PermissionVerdict.DENY,
+                    PermissionDecision.ALLOW_COMMAND_SESSION if allowed else command_rule.decision,
+                    "matching command session rule",
+                )
+                return allowed
+            if command_rule is not None:
+                await self._audit(
+                    command_request, PermissionVerdict.PROMPT, None, "command session rule expired"
+                )
+
         verdict = self._default(request.effect)
         if verdict is PermissionVerdict.ALLOW:
             await self._audit(request, verdict, None, f"{self.mode} mode default")
@@ -131,7 +148,27 @@ class PermissionEngine:
         allowed = decision in (
             PermissionDecision.ALLOW_ONCE,
             PermissionDecision.ALLOW_SESSION,
+            PermissionDecision.ALLOW_COMMAND_SESSION,
         )
+        if decision is PermissionDecision.ALLOW_COMMAND_SESSION:
+            if request.command_scope is None:
+                await self._audit(
+                    request,
+                    PermissionVerdict.DENY,
+                    decision,
+                    "command session decision requires an exact command scope",
+                )
+                return False
+            await self._store.save_rule(
+                PermissionRule(
+                    request.command_scope.session_id,
+                    request.command_scope.rule_key,
+                    request.effect,
+                    request.command_scope.fingerprint,
+                    PermissionDecision.ALLOW_SESSION,
+                    datetime.now(UTC) + self._session_rule_ttl,
+                )
+            )
         if decision in (
             PermissionDecision.ALLOW_SESSION,
             PermissionDecision.DENY_SESSION,
@@ -147,10 +184,15 @@ class PermissionEngine:
                 )
             )
         await self._audit(
-            request,
+            PermissionRequest(request.effect, request.command_scope)
+            if decision is PermissionDecision.ALLOW_COMMAND_SESSION
+            and request.command_scope is not None
+            else request,
             PermissionVerdict.ALLOW if allowed else PermissionVerdict.DENY,
             decision,
-            "operator decision",
+            "operator exact command session decision"
+            if decision is PermissionDecision.ALLOW_COMMAND_SESSION
+            else "operator decision",
         )
         return allowed
 
