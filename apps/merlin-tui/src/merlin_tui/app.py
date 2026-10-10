@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import json
 import re
+import shlex
 import time
 import webbrowser
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
@@ -3466,12 +3467,17 @@ class MerlinApp(App[None]):
     }
     #command-hints.visible { display: block; }
     #permission-drawer {
-        display: none; width: 1fr; height: auto; max-height: 14;
+        display: none; width: 1fr; height: auto; max-height: 80%;
         margin: 0 3; padding: 1 2; background: #202020;
     }
     #permission-drawer.visible { display: block; }
     #permission-title { height: 1; text-style: bold; color: #d7d7d7; }
     #permission-scope { height: auto; color: #a8a8a8; margin-bottom: 1; }
+    #permission-details-scroll {
+        height: auto; max-height: 7; scrollbar-size: 1 1; margin-bottom: 1;
+    }
+    #permission-details { height: auto; }
+    #permission-help { height: 1; color: $text-muted; }
     #permission-drawer Button {
         width: 100%; height: 1; min-height: 1; margin: 0; padding: 0 1;
         border: none; background: #202020; color: #bcbcbc; text-align: left;
@@ -3581,11 +3587,16 @@ class MerlinApp(App[None]):
         yield Static("", id="command-hints", markup=False)
         with Vertical(id="permission-drawer"):
             yield Static("Permission required", id="permission-title", markup=False)
-            yield Static("", id="permission-scope", markup=False)
+            with VerticalScroll(id="permission-details-scroll", can_focus=False):
+                yield Static("", id="permission-details", markup=False)
+                yield Static("", id="permission-scope", markup=False)
+            yield Static(
+                "Scroll / Page Up / Page Down: inspect details", id="permission-help", markup=False
+            )
             yield Button("1. Allow once", id="permission-allow-once")
-            yield Button("2. Always allow in this scope", id="permission-allow-session")
+            yield Button("2. Allow this scope for this session", id="permission-allow-session")
             yield Button("3. Deny", id="permission-deny-once")
-            yield Button("4. Never allow in this scope", id="permission-deny-session")
+            yield Button("4. Deny this scope for this session", id="permission-deny-session")
         yield Composer(name="Message composer", id="composer")
         yield Static(
             "Enter send · Shift+Enter newline · / commands · Ctrl+O details · "
@@ -5584,7 +5595,9 @@ class MerlinApp(App[None]):
         self.push_screen(ToolConfirmationScreen(str(spec.name), arguments), resolved)
         return await result
 
-    async def resolve_permission(self, request: Any) -> Any:
+    async def resolve_permission(
+        self, request: Any, *, arguments: Mapping[str, Any] | None = None
+    ) -> Any:
         from merlin_permissions import PermissionDecision
 
         async with self._permission_lock:
@@ -5592,17 +5605,35 @@ class MerlinApp(App[None]):
             self._permission_result = result
             self._permission_previous_focus = self.focused
             scope = request.scope
-            qualifiers = [f"Workspace: {scope.workspace_root}"]
+            qualifiers = [f"Workspace: {_permission_single_line(scope.workspace_root)}"]
             if scope.plugin_id:
-                qualifiers.append(f"Plugin: {scope.plugin_id}")
+                qualifiers.append(f"Plugin: {_permission_single_line(scope.plugin_id)}")
             if scope.target:
-                qualifiers.append(f"Target: {scope.target}")
+                qualifiers.append(f"Target: {_permission_single_line(scope.target)}")
             if scope.operation_group:
-                qualifiers.append(f"Scope: {scope.operation_group}")
+                qualifiers.append(f"Scope: {_permission_single_line(scope.operation_group)}")
             self.query_one("#permission-scope", Static).update(
-                f"Effect: {request.effect.value} · Tool: {scope.tool_name}\n"
+                f"Effect: {request.effect.value} · "
+                f"Tool: {_permission_single_line(scope.tool_name)}\n"
                 + " · ".join(qualifiers)
+                + "\nReason: Approval required by current permission settings."
             )
+            details = self.query_one("#permission-details-scroll", VerticalScroll)
+            invocation = self.query_one("#permission-details", Static)
+            invocation.display = arguments is not None
+            invocation.update(
+                _render_permission_details(scope.tool_name, scope.workspace_root, arguments)
+                if arguments is not None
+                else ""
+            )
+            details.scroll_home(animate=False)
+            shell = scope.tool_name == "shell_command"
+            for decision, verb, number in (("allow", "Allow", 2), ("deny", "Deny", 4)):
+                self.query_one(f"#permission-{decision}-session", Button).label = (
+                    f"{number}. {verb} all commands here for this session"
+                    if shell
+                    else f"{number}. {verb} this scope for this session"
+                )
             self.query_one("#permission-drawer", Vertical).add_class("visible")
             self.query_one("#composer", Composer).disabled = True
             self.query_one("#permission-allow-once", Button).focus()
@@ -5621,6 +5652,15 @@ class MerlinApp(App[None]):
 
     def on_key(self, event: events.Key) -> None:
         if self._permission_result is None:
+            return
+        if event.key in {"pageup", "pagedown"}:
+            event.prevent_default()
+            event.stop()
+            details = self.query_one("#permission-details-scroll", VerticalScroll)
+            if event.key == "pageup":
+                details.scroll_page_up(animate=False)
+            else:
+                details.scroll_page_down(animate=False)
             return
         if event.key in {"up", "down"}:
             event.prevent_default()
@@ -5696,7 +5736,8 @@ class MerlinApp(App[None]):
                         else None
                     ),
                 ),
-            )
+            ),
+            arguments=arguments,
         )
 
     async def _load_permission_mode(self) -> None:
@@ -5909,6 +5950,84 @@ def _render_mcp_servers(servers: tuple[McpServerView, ...]) -> str:
             f"  Recent calls: {calls}\n  Recent audit: {audit}{stderr}"
         )
     return "\n\n".join(rows)
+
+
+def _permission_single_line(value: str) -> str:
+    """Keep untrusted labels from inserting terminal controls or extra prompt lines."""
+    return re.sub(
+        r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]",
+        lambda match: json.dumps(match[0], ensure_ascii=True)[1:-1],
+        value,
+    )
+
+
+def _permission_display_values(value: Any) -> Any:
+    """Scrub display copies, including credentials passed as argv flag/value pairs."""
+    if isinstance(value, Mapping):
+        return {str(key): _permission_display_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        rendered = []
+        hide_next = False
+        for item in value:
+            rendered.append("[redacted]" if hide_next else _permission_display_values(item))
+            hide_next = isinstance(item, str) and bool(
+                re.fullmatch(
+                    r"(?i)--?(?:api[-_]?key|access[-_]?key|password|passwd|secret|token|"
+                    r"authorization|cookie|credential|private[-_]?key)",
+                    item,
+                )
+            )
+        return rendered
+    if isinstance(value, str):
+        if re.match(r"(?i)^(authorization|cookie|x-api-key)\s*:", value):
+            return value.split(":", 1)[0] + ": [redacted]"
+        assignment = re.match(
+            r"(?i)^(?:--?)?(?:api[-_]?key|access[-_]?key|password|passwd|secret|token|"
+            r"authorization|cookie|credential|private[-_]?key)=",
+            value,
+        )
+        if assignment:
+            return value[: assignment.end()] + "[redacted]"
+        value = re.sub(
+            r"(?i)\b(api[-_ ]?key|access[-_ ]?key|password|passwd|secret|token|"
+            r"authorization|cookie|credential)\b(\s*[:=]\s*)"
+            r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            r"\1\2[redacted]",
+            value,
+        )
+        return _scrub_secrets(value)
+    return value
+
+
+def _render_permission_details(
+    tool_name: str, workspace_root: str, arguments: Mapping[str, Any]
+) -> str:
+    """Show the invocation before approval; never alter the execution arguments."""
+    public = {key: value for key, value in arguments.items() if not key.startswith("__permission_")}
+    safe = _permission_display_values(_redact_sensitive(public))
+    lines = []
+    if tool_name == "shell_command":
+        argv = safe.get("argv")
+        if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
+            # Make terminal controls visible instead of letting command text spoof the prompt.
+            command = _permission_single_line(shlex.join(argv))
+            lines.append(f"Command: {command}")
+        cwd = arguments.get("cwd", ".")
+        try:
+            if not isinstance(cwd, str) or Path(cwd).is_absolute():
+                raise ValueError("cwd must be relative to the workspace")
+            root = Path(workspace_root).resolve(strict=True)
+            directory = (root / cwd).resolve(strict=True)
+            if not directory.is_relative_to(root) or not directory.is_dir():
+                raise ValueError("cwd must be a directory inside the workspace")
+            directory_text = json.dumps(str(directory), ensure_ascii=True)[1:-1]
+            lines.append(f"Working directory: {directory_text}")
+        except (OSError, RuntimeError, ValueError) as error:
+            error_text = json.dumps(str(error), ensure_ascii=True)[1:-1]
+            lines.append(f"Working directory: invalid ({error_text})")
+    lines.append("Arguments (sensitive values redacted):")
+    lines.append(json.dumps(safe, indent=2, ensure_ascii=True, default=str))
+    return "\n".join(lines)
 
 
 def _render_tool_arguments(arguments: Mapping[str, Any]) -> str:

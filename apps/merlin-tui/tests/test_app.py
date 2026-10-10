@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shlex
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -2832,6 +2833,154 @@ async def test_daemon_permission_metadata_keeps_effect_and_target_scope() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("button_id", "expected"),
+    (
+        ("#permission-allow-once", "allow_once"),
+        ("#permission-allow-session", "allow_session"),
+        ("#permission-deny-once", "deny_once"),
+        ("#permission-deny-session", "deny_session"),
+    ),
+)
+async def test_shell_permission_shows_execution_before_each_decision(
+    tmp_path, button_id: str, expected: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    working_directory = workspace / "scripts"
+    working_directory.mkdir(parents=True)
+    argv = ["python", "-c", "print('[bold]literal text[/bold]')", "argument with spaces"]
+    app = build_app(DemoBackend())
+    async with app.run_test() as pilot:
+        decision = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-shell", workspace_root=workspace),
+                {"argv": argv, "cwd": "scripts", "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        details = str(app.query_one("#permission-details").render())
+        scope = str(app.query_one("#permission-scope").render())
+        assert not decision.done()
+        assert str(working_directory.resolve()) in details
+        assert "[bold]literal text[/bold]" in details
+        assert "argument with spaces" in details
+        assert shlex.join(argv) in details
+        displayed_arguments, _ = json.JSONDecoder().raw_decode(
+            details.split("Arguments (sensitive values redacted):", 1)[1].lstrip()
+        )
+        assert displayed_arguments["argv"] == argv
+        assert "Reason:" in scope
+        session_label = str(app.query_one("#permission-allow-session", Button).label).lower()
+        assert "all commands" in session_label
+        assert "session" in session_label
+        app.query_one(button_id, Button).press()
+        await pilot.pause()
+        assert str(await decision) == expected
+
+
+@pytest.mark.asyncio
+async def test_shell_permission_long_command_is_scrollable_before_approval(tmp_path) -> None:
+    command = "prefix-" + "x" * 8000 + "-review-this-command-tail"
+    app = build_app(DemoBackend())
+    async with app.run_test(size=(90, 32)) as pilot:
+        decision = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-long", workspace_root=tmp_path),
+                {"argv": ["python", "-c", command], "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        assert not decision.done()
+        details = str(app.query_one("#permission-details").render())
+        assert command in details
+        scroll = app.query_one("#permission-details-scroll")
+        assert scroll.max_scroll_y > 0
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert scroll.scroll_y > 0
+        await pilot.press("pageup")
+        await pilot.pause()
+        assert scroll.scroll_y == 0
+        assert app.query_one("#permission-allow-once", Button).region.height > 0
+        app.query_one("#permission-deny-once", Button).press()
+        await pilot.pause()
+        assert str(await decision) == "deny_once"
+
+
+@pytest.mark.asyncio
+async def test_shell_permission_redacts_secrets_without_mutating_execution_arguments(
+    tmp_path,
+) -> None:
+    argv = [
+        "curl",
+        "https://example.test/api",
+        "--token",
+        "private-token-value",
+        "-H",
+        "Authorization: Bearer private-bearer-value",
+        "API_KEY=private-environment-value",
+    ]
+    arguments = {"argv": argv.copy(), "__permission_effect": "subprocess"}
+    app = build_app(DemoBackend())
+    async with app.run_test() as pilot:
+        decision = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(session_id="session-secret", workspace_root=tmp_path),
+                arguments,
+            )
+        )
+        await pilot.pause()
+        rendered = str(app.query_one("#permission-details").render())
+        assert "curl" in rendered
+        assert "https://example.test/api" in rendered
+        assert "private-token-value" not in rendered
+        assert "private-bearer-value" not in rendered
+        assert "private-environment-value" not in rendered
+        assert arguments["argv"] == argv
+        app.query_one("#permission-deny-once", Button).press()
+        await pilot.pause()
+        assert str(await decision) == "deny_once"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_shell_permission_details_stay_with_their_request(tmp_path) -> None:
+    app = build_app(DemoBackend())
+    context = SimpleNamespace(session_id="session-concurrent", workspace_root=tmp_path)
+    async with app.run_test() as pilot:
+        first = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                context,
+                {"argv": ["echo", "first-command"], "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        second = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                context,
+                {"argv": ["echo", "second-command"], "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        first_details = str(app.query_one("#permission-details").render())
+        assert "first-command" in first_details
+        assert "second-command" not in first_details
+        app.query_one("#permission-allow-once", Button).press()
+        await pilot.pause()
+        assert str(await first) == "allow_once"
+        second_details = str(app.query_one("#permission-details").render())
+        assert "second-command" in second_details
+        assert "first-command" not in second_details
+        app.query_one("#permission-deny-once", Button).press()
+        await pilot.pause()
+        assert str(await second) == "deny_once"
+
+
+@pytest.mark.asyncio
 async def test_permissions_drawer_and_palette_show_rules_and_history() -> None:
     app = build_app(DemoBackend())
     async with app.run_test() as pilot:
@@ -2846,6 +2995,93 @@ async def test_permissions_drawer_and_palette_show_rules_and_history() -> None:
         await pilot.press("ctrl+p")
         assert app.screen.query_one("#choice-mode")
         assert app.screen.query_one("#choice-permissions")
+
+
+def test_permission_detail_default_cwd_matches_resolved_workspace(tmp_path) -> None:
+    rendered = app_module._render_permission_details(  # noqa: SLF001
+        "shell_command", str(tmp_path), {"argv": ["pwd"]}
+    )
+    assert f"Working directory: {tmp_path.resolve()}" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_size", ((80, 24), (60, 20)))
+async def test_permission_long_scope_keeps_all_decisions_visible(terminal_size) -> None:
+    app = build_app(DemoBackend())
+    async with app.run_test(size=terminal_size) as pilot:
+        decision = asyncio.create_task(
+            app.confirm_permission_tool(
+                SimpleNamespace(name="shell_command"),
+                SimpleNamespace(
+                    session_id="session-small-terminal",
+                    workspace_root="/workspace/" + "long-directory/" * 20,
+                    target_id="long-target-" * 40,
+                ),
+                {"argv": ["echo", "visible command"], "__permission_effect": "subprocess"},
+            )
+        )
+        await pilot.pause()
+        drawer = app.query_one("#permission-drawer").content_region
+        composer = app.query_one("#composer").region
+        for button in app.query("#permission-drawer Button"):
+            assert button.region.height > 0
+            assert button.region.y >= drawer.y
+            assert button.region.bottom <= drawer.bottom
+            assert button.region.bottom <= composer.y
+        assert "visible command" in str(app.query_one("#permission-details").render())
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert app.query_one("#permission-details-scroll").scroll_y > 0
+        app.query_one("#permission-deny-once", Button).press()
+        await pilot.pause()
+        assert str(await decision) == "deny_once"
+
+
+def test_permission_detail_rejects_symlink_cwd_outside_workspace(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    rendered = app_module._render_permission_details(  # noqa: SLF001
+        "shell_command", str(workspace), {"argv": ["pwd"], "cwd": "escape"}
+    )
+    assert "Working directory: invalid" in rendered
+    assert f"Working directory: {outside.resolve()}" not in rendered
+
+
+def test_permission_detail_escapes_command_and_cwd_terminal_controls(tmp_path) -> None:
+    directory = tmp_path / "line\n\x1b[31m"
+    directory.mkdir()
+    rendered = app_module._render_permission_details(  # noqa: SLF001
+        "shell_command",
+        str(tmp_path),
+        {"argv": ["echo", "line\n\x1b[31m\tend"], "cwd": directory.name},
+    )
+    assert "\x1b" not in rendered
+    assert "line\n" not in rendered
+    assert r"line\n\u001b[31m" in rendered
+    assert r"\tend" in rendered
+
+
+@pytest.mark.parametrize(
+    "secret_argument",
+    (
+        "--token=private value with spaces",
+        '--token="private value\ncontinued secret"',
+        "API_KEY='private value\ncontinued secret'",
+    ),
+)
+def test_permission_detail_redacts_complete_secret_arguments(
+    tmp_path, secret_argument: str
+) -> None:
+    rendered = app_module._render_permission_details(  # noqa: SLF001
+        "shell_command", str(tmp_path), {"argv": ["example", secret_argument]}
+    )
+    assert "private value" not in rendered
+    assert "value with spaces" not in rendered
+    assert "continued secret" not in rendered
+    assert "[redacted]" in rendered
 
 
 @pytest.mark.asyncio
