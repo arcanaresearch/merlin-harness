@@ -139,6 +139,17 @@ The current workspace shell tool runs a bounded subprocess on the owner host. It
 workspace confinement, environment minimization, timeout/output bounds, process-group teardown,
 and permission confirmation, but it is **not a general OS/container sandbox**.
 
+In `auto` mode, verified read-only argv commands run without an approval prompt and retain
+subprocess audit records. The initial allowlist covers installed system versions of `ls`, `pwd`,
+`cat`, `head`, `tail`, `wc`, and `grep`, plus trusted system/Homebrew `rg` and a limited grammar for
+`git status`, `git diff`, and `git log`. Filesystem operands must resolve inside the workspace.
+Executables are pinned to their verified paths. Git optional writes, filesystem monitoring,
+external diffs, text conversion, and signature helpers are disabled; repositories with configured
+clean/process filters still require approval. Unknown options, wrappers, interpreters, network
+commands, and writes keep the regular approval flow. Existing session denials still apply, and
+`prompt` mode continues to ask for these commands.
+Git worktrees whose repository metadata lives outside the workspace also require approval.
+
 Before approval, the TUI shows the shell command, resolved working directory, and scrollable
 arguments with credential redaction. `Allow this command + directory (session)` remembers the
 complete original argv and resolved directory within the current session, workspace, and target

@@ -27,11 +27,13 @@ from merlin_permissions import (
     PermissionDecision,
     PermissionEffect,
     PermissionEngine,
+    PermissionMode,
     PermissionRequest,
     PermissionScope,
 )
 
 from .delivery_receipt import target_delivery_receipt
+from .read_only import prepare_read_only_command
 
 
 class ToolConfirmer(Protocol):
@@ -283,6 +285,13 @@ class ToolBroker:
                 is_error=True,
                 metadata={"schema_validation_failed": True},
             )
+        from .workspace import ShellCommandTool
+
+        prepared_read_only = None
+        if type(tool) is ShellCommandTool:
+            # Snapshot caller-owned argv before authorization yields. Only this
+            # built-in executor may claim the read-only subprocess distinction.
+            arguments = dict(arguments) | {"argv": list(arguments["argv"])}
         effect_name = self.effect(name) or PermissionEffect.UNKNOWN.value
         try:
             effect = PermissionEffect(effect_name)
@@ -347,6 +356,8 @@ class ToolBroker:
                 else self._default_scope(name, context, arguments)
             )
             command_scope = _shell_command_scope(tool, effect, scope, context, arguments)
+            if command_scope is not None and self._permissions.mode is PermissionMode.AUTO:
+                prepared_read_only = await prepare_read_only_command(context, arguments)
 
             async def resolve(
                 _request: PermissionRequest,
@@ -365,7 +376,12 @@ class ToolBroker:
                 )
                 return await self._confirmer(spec, context, permission_arguments)
 
-            request = PermissionRequest(effect, scope, command_scope=command_scope)
+            request = PermissionRequest(
+                effect,
+                scope,
+                command_scope=command_scope,
+                read_only_command=prepared_read_only is not None,
+            )
             grant = (
                 await self._durable_grant(name, context, effect)
                 if self._durable_grant is not None
@@ -541,7 +557,7 @@ class ToolBroker:
                     metadata={"effect_ambiguous": True, "idempotency_key": key},
                 )
         try:
-            result = await tool.invoke(context, arguments)
+            result = await tool.invoke(context, prepared_read_only or arguments)
         except asyncio.CancelledError:
             if intent is not None:
                 await self._effect_store.finish(

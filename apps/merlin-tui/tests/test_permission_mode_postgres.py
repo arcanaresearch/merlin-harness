@@ -202,3 +202,34 @@ async def test_tui_mode_command_with_postgres(runtime, tmp_path, fail_audit):
         assert len(rows) == (0 if fail_audit else 1)
         if rows:
             assert rows[0].request.scope.session_id == runtime.kernel.session_id
+
+
+async def test_auto_shell_reads_and_prompted_writes_are_audited_in_postgres(runtime, tmp_path):
+    from merlin_contracts import ToolContext
+    from merlin_permissions import PermissionEffect
+    from merlin_tools import workspace_tool_broker
+
+    session_id = await runtime.kernel.start()
+    await runtime.service.set_mode("auto", session_id=session_id)
+    prompts = []
+
+    async def deny(spec, context, arguments):
+        prompts.append(arguments)
+        return False
+
+    broker = workspace_tool_broker(permissions=runtime.engine, confirmer=deny)
+    context = ToolContext(session_id=session_id, workspace_root=str(tmp_path))
+    (tmp_path / "sample.txt").write_text("read fixture")
+    listing = await broker.invoke("shell_command", context, {"argv": ["ls", "-la"]})
+    content = await broker.invoke("shell_command", context, {"argv": ["cat", "sample.txt"]})
+    assert not listing.is_error and not content.is_error
+    assert content.content == "read fixture"
+    assert prompts == []
+    denied = await broker.invoke("shell_command", context, {"argv": ["rm", "sample.txt"]})
+    assert denied.is_error and len(prompts) == 1
+    assert (tmp_path / "sample.txt").exists()
+    audits = audit_rows(runtime)
+    reads = [row for row in audits if row.reason == "auto mode verified read-only command"]
+    assert len(reads) == 2
+    assert all(row.request.effect is PermissionEffect.SUBPROCESS for row in reads)
+    assert all(row.request.scope.session_id == session_id for row in reads)

@@ -74,6 +74,7 @@ class PermissionRequest:
     effect: PermissionEffect
     scope: PermissionScope
     command_scope: PermissionScope | None = None
+    read_only_command: bool = False
 
 
 @dataclass(frozen=True, slots=True)

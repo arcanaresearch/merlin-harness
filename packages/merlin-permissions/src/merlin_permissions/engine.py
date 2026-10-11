@@ -17,8 +17,8 @@ from .models import (
 
 # Effect-driven auto-permission distinction. Pure observation may run
 # automatically; reviewed mutation (harness state, workspace writes) requires
-# operator review; authority expansion, subprocess, and destructive action are
-# never automatic.
+# operator review; authority expansion, unverified subprocesses, and destructive
+# action are never automatic. Verified read-only commands are handled separately.
 _AUTO_RUNNABLE_EFFECTS = frozenset(
     {
         PermissionEffect.WORKSPACE_READ,
@@ -103,8 +103,25 @@ class PermissionEngine:
                 )
 
         verdict = self._default(request.effect)
+        verified_read = (
+            self.mode is PermissionMode.AUTO
+            and request.effect is PermissionEffect.SUBPROCESS
+            and request.command_scope is not None
+            and request.read_only_command
+        )
+        if verified_read:
+            verdict = PermissionVerdict.ALLOW
         if verdict is PermissionVerdict.ALLOW:
-            await self._audit(request, verdict, None, f"{self.mode} mode default")
+            await self._audit(
+                request,
+                verdict,
+                None,
+                (
+                    "auto mode verified read-only command"
+                    if verified_read
+                    else f"{self.mode} mode default"
+                ),
+            )
             return True
         if verdict is PermissionVerdict.DENY:
             await self._audit(request, verdict, None, "unknown effects fail closed")
