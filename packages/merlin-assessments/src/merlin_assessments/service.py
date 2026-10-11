@@ -35,7 +35,7 @@ from merlin_storage_postgres import PostgresPackStore
 
 from .runner import AssessmentProgress, AssessmentResult, AssessmentRunner
 
-_URL_PATTERN = re.compile(r"https://[^\s<>\]\[(){}\"']+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://(?:\[[0-9a-f:.]+\]|[^\s<>\]\[(){}\"'])+", re.IGNORECASE)
 
 
 def _adapter_state_integrity_result(message: str) -> ToolResult:
@@ -93,7 +93,7 @@ def _target_from_objective(objective: str) -> TargetProfile | None:
     raw_url = match.group(0).rstrip(".,;:!?")
     parsed = urlsplit(raw_url)
     if (
-        parsed.scheme.lower() != "https"
+        parsed.scheme.lower() not in {"http", "https"}
         or not parsed.hostname
         or parsed.username
         or parsed.password
@@ -105,7 +105,8 @@ def _target_from_objective(objective: str) -> TargetProfile | None:
     except ValueError:
         return None
     port = f":{parsed_port}" if parsed_port is not None else ""
-    base_url = urlunsplit(("https", f"{hostname}{port}", parsed.path or "/", "", ""))
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    base_url = urlunsplit((parsed.scheme.lower(), f"{host}{port}", parsed.path or "/", "", ""))
     readable_host = hostname.removeprefix("www.")
     suffix = hashlib.sha256(base_url.encode()).hexdigest()[:10]
     return TargetProfile(
@@ -458,7 +459,7 @@ class AssessmentService:
             else:
                 raise ValueError(
                     "the objective does not identify exactly one reviewed target; "
-                    "name a configured target id or an https URL"
+                    "name a configured target id or an HTTP or HTTPS URL"
                 )
         profile = await self._store.get_target(self._selected_target_id)
         if profile is None:

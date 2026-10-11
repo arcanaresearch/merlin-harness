@@ -12,6 +12,41 @@ from merlin_tui.app import MerlinApp
 from merlin_tui.bootstrap import build_backend
 
 
+async def test_production_backend_discovers_http_target_without_registration(tmp_path, monkeypatch):
+    from merlin_contracts import ChatMessage
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        async with local_target() as origin:
+            monkeypatch.setattr(
+                "merlin_config.load_config",
+                lambda: Config(
+                    database_url=database.url,
+                    values={
+                        "provider": {"base_url": origin + "/v1", "model": "local-model"},
+                        "permission_mode": "auto",
+                    },
+                ),
+            )
+            monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": ""})
+            backend = build_backend(tmp_path / "workspace")
+            try:
+                session_id = await backend.kernel.start()
+                await backend.kernel._store.append_message(
+                    session_id,
+                    ChatMessage(role="user", content=f"Assess the game at {origin}/game"),
+                )
+                # Exercise the actual bootstrap resolver: no /targets add or select.
+                session = await backend._browser.for_tool(session_id)
+                assert session.bounds.allowed_origins == frozenset({origin})
+                tab = await session.new_tab(origin + "/game")
+                observation = await session.snapshot(tab)
+                assert any(
+                    element.name == "Local target action" for element in observation.elements
+                )
+            finally:
+                await backend.close()
+
+
 @asynccontextmanager
 async def local_target():
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

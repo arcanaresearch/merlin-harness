@@ -4223,7 +4223,8 @@ def build_backend(
                     await assessments.resolve_target(objective)
                 except ValueError as error:
                     raise ValueError(
-                        "name exactly one https target in the objective before using browser tools"
+                        "name exactly one HTTP or HTTPS target in the objective "
+                        "before using browser tools"
                     ) from error
                 selected = next(
                     (item for item in await assessments.list_targets() if item["selected"]),
