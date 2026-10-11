@@ -2102,7 +2102,8 @@ class Kernel:
         elif len(arguments) != 1 or arguments[0].lower() not in {"prompt", "auto", "yolo"}:
             await self._emit(self._event("error", text="usage: /mode prompt|auto|yolo"))
         else:
-            mode = await self._permissions.set_mode(arguments[0].lower())
+            session_id = await self._ensure_session()
+            mode = await self._permissions.set_mode(arguments[0].lower(), session_id=session_id)
             await self._result("mode", {"mode": mode})
 
     async def _route_permissions(self, arguments: list[str]) -> None:

@@ -198,7 +198,7 @@ class KernelBackend:
         current = self._settings.config
         reloadable, restart = current.changed_settings(newer)
         if "permission_mode" in reloadable and self._permissions is not None:
-            await self._permissions.set_mode(str(newer.values.get("permission_mode", "auto")))
+            await self.set_permission_mode(str(newer.values.get("permission_mode", "auto")))
         self._settings.apply_reload(newer, reloadable)
         self._config_reload_status = {
             "applied": tuple(sorted(reloadable)),
@@ -1118,7 +1118,8 @@ class KernelBackend:
     async def set_permission_mode(self, mode: str) -> str:
         if self._permissions is None:
             return mode
-        return str(await self._permissions.set_mode(mode))
+        session_id = self.kernel.session_id or await self.kernel.start()
+        return str(await self._permissions.set_mode(mode, session_id=session_id))
 
     async def list_permission_rules(self) -> tuple[PermissionRuleView, ...]:
         if self._permissions is None:

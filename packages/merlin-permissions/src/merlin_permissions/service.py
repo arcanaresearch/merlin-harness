@@ -32,21 +32,22 @@ class PermissionService:
     async def get_mode(self) -> str:
         return self.engine.mode.value
 
-    async def set_mode(self, mode: str) -> str:
-        self.engine.mode = PermissionMode(mode)
+    async def set_mode(self, mode: str, *, session_id: str) -> str:
+        selected = PermissionMode(mode)
         await self._store.record_audit(
             PermissionAudit(
                 PermissionRequest(
                     PermissionEffect.HARNESS_STATE,
-                    PermissionScope("kernel", "permission.mode", "kernel"),
+                    PermissionScope(session_id, "permission.mode", "kernel"),
                 ),
-                self.engine.mode,
+                selected,
                 PermissionVerdict.ALLOW,
                 None,
-                f"operator set permission mode to {self.engine.mode.value}",
+                f"operator set permission mode to {selected.value}",
             )
         )
-        return self.engine.mode.value
+        self.engine.mode = selected
+        return selected.value
 
     async def list_permissions(self, session_id: str) -> list[Mapping[str, object]]:
         history = await self._store.list_audit(session_id)

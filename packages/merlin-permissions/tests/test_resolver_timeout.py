@@ -99,7 +99,7 @@ async def test_set_mode_records_permission_audit() -> None:
     engine = PermissionEngine(PermissionMode.PROMPT, store)
     service = PermissionService(engine, store)
 
-    assert await service.set_mode("yolo") == "yolo"
+    assert await service.set_mode("yolo", session_id="session") == "yolo"
     assert await service.get_mode() == "yolo"
 
     assert len(store.audits) == 1
@@ -108,4 +108,5 @@ async def test_set_mode_records_permission_audit() -> None:
     assert audit.mode is PermissionMode.YOLO
     assert audit.verdict is PermissionVerdict.ALLOW
     assert audit.request.effect is PermissionEffect.HARNESS_STATE
+    assert audit.request.scope.session_id == "session"
     assert "yolo" in audit.reason

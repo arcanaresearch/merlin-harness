@@ -1072,7 +1072,8 @@ class Permissions:
     async def get_mode(self):
         return self.mode
 
-    async def set_mode(self, mode):
+    async def set_mode(self, mode, *, session_id):
+        assert session_id == "session-1"
         self.mode = mode
         return mode
 
