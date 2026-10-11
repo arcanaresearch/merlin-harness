@@ -708,13 +708,10 @@ async def test_semantic_triage_cannot_retire_partial_repeat(monkeypatch):
     prepared = _preparation((technique,))
     service = CampaignService(None, None, object())
     monkeypatch.setattr(service, "_jev_escalation_client", lambda: NegativeTriage())
-    runnable, skipped = await service._jev_cell_triage(  # noqa: SLF001
-        prepared,
-        {technique_cell_parts(technique): {"outcome": "partial"}},
-        (technique,),
+    runnable = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, (technique,), 1
     )
     assert runnable == (technique,)
-    assert skipped == ()
 
 
 def test_partial_repeat_context_keeps_variant_histories_separate():

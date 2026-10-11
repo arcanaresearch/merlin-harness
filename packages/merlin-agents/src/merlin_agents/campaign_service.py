@@ -943,13 +943,6 @@ class CampaignService:
             if (row := history.get(technique_cell_parts(technique))) is not None
             and normalize_outcome(row.get("outcome")) == "partial"
         )
-        runnable, jev_skips = await self._jev_cell_triage(prepared, history, runnable)
-        print(
-            f"PREPARE_STAGE jev_cell_triage done runnable={len(runnable)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        skipped = (*skipped, *jev_skips)
         if not skipped and not partial_priors:
             return prepared, (), ()
         repeat_documents = partial_repeat_documents(prepared.assignment_context, history)
@@ -983,92 +976,121 @@ class CampaignService:
             partial_priors,
         )
 
-    async def _jev_cell_triage(
+    async def _prioritize_execution_candidates(
         self,
-        prepared: CampaignPreparation,
-        history: Mapping[tuple[str, str, str, str, str], Mapping[str, object]],
-        runnable: tuple[Any, ...],
-    ) -> tuple[tuple[Any, ...], tuple[dict[str, object], ...]]:
-        """Advisory Jev triage over plan_skip's runnable cells.
+        campaign_id: str,
+        manifest: CampaignManifest,
+        candidates: tuple[Any, ...],
+        wave: int,
+    ) -> tuple[Any, ...]:
+        """Refine the next dispatch shortlist without changing eligibility.
 
-        Each runnable cell gets one ``noul`` question: given the target
-        capability summary and the cell's prior outcomes on this target, is
-        executing it likely to produce new information?  Only a confident no
-        (probability <= 0.3) removes the cell — the skip is journaled through
-        the same ``technique_skip`` envelope with ``graded_by="jev"`` — and
-        every other outcome (unavailable, disabled, error, uncertain) keeps
-        the cell runnable.  Jev can only add skips; deterministic plan_skip
-        rows are never revisited.
+        The incoming order carries coverage/history/ARM priorities. Preserve its
+        leading exploration candidate and compare at most two worker batches.
+        All remaining candidates stay queued, including negative or unavailable
+        judgments. Scores never become attack outcomes or retirement evidence.
         """
-        if not runnable:
-            return runnable, ()
         client = self._jev_escalation_client()
-        if client is None:
-            return runnable, ()
-        semaphore = asyncio.Semaphore(_JEV_TRIAGE_CONCURRENCY)
+        if client is None or len(candidates) < 2:
+            return candidates
+        width = max(1, self._max_worker_concurrency)
+        shortlist = candidates[1 : 1 + 2 * width]
+        semaphore = asyncio.Semaphore(width)
+        deadline = time.monotonic() + client.timeout_seconds
 
-        async def triage_one(technique: Any) -> tuple[Any, dict[str, object] | None]:
-            if str(technique.id).startswith("hypothesis:"):
-                return technique, None
-            cell_parts = technique_cell_parts(technique)
-            prior = history.get(cell_parts)
-            # Partial results remain eligible. A semantic triage opinion must
-            # not retire their unresolved experiment before a worker can adapt.
-            if isinstance(prior, Mapping) and normalize_outcome(prior.get("outcome")) == "partial":
-                return technique, None
-            input_before, output_before = client.input_tokens, client.output_tokens
+        async def score(index: int, candidate: Any) -> tuple[int, float | None]:
+            identity = str(getattr(candidate, "id", "") or _followup_digest(candidate))
+            state = json.dumps(
+                {
+                    "target_id": manifest.target.id,
+                    "target_interface": str(manifest.target.interface),
+                    "campaign_objective": manifest.objective[:512],
+                    "technique_cell": {
+                        "technique_id": identity,
+                        "objective": str(candidate.objective)[:512],
+                        "language": str(getattr(candidate, "language", "und")),
+                    },
+                    "ranking_evidence": (
+                        dict(candidate.arm.get("rank_components", {}))
+                        if isinstance(getattr(candidate, "arm", None), Mapping)
+                        and isinstance(candidate.arm.get("rank_components"), Mapping)
+                        else {}
+                    ),
+                    "unknown_evidence_policy": "Do not invent prior outcomes or capabilities",
+                    "ranking_policy": "priority only; every candidate remains eligible",
+                },
+                sort_keys=True,
+            )
+            probability = None
             started = time.monotonic()
             try:
                 async with semaphore:
-                    probability = await client.noul(
-                        _jev_cell_state(prepared.manifest, technique, prior),
-                        _JEV_CELL_QUESTION,
-                        true_meaning=_JEV_CELL_TRUE,
-                        false_meaning=_JEV_CELL_FALSE,
-                    )
-            except Exception:  # noqa: BLE001 - advisory triage; never raise
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        async with asyncio.timeout(remaining):
+                            probability = await client.noul(
+                                state,
+                                _JEV_CELL_QUESTION,
+                                true_meaning=_JEV_CELL_TRUE,
+                                false_meaning=_JEV_CELL_FALSE,
+                            )
+            except Exception:  # noqa: BLE001 - advisory ranking must not block execution
                 probability = None
-            latency_ms = int((time.monotonic() - started) * 1000)
-            if probability is None:
-                return technique, None
-            worthwhile = probability > _JEV_CELL_SKIP_THRESHOLD
+            if (
+                isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+                or not math.isfinite(probability)
+                or not 0 <= probability <= 1
+            ):
+                probability = None
             emit_judgment(
-                campaign_id=prepared.manifest.id,
-                task_id=f"prepare/{prepared.manifest.id}",
-                technique_ids=(str(technique.id),),
-                verdict="worthwhile" if worthwhile else "not_worthwhile",
-                confidence=probability if worthwhile else 1.0 - probability,
+                campaign_id=campaign_id,
+                task_id=f"execution-priority/{campaign_id}/wave-{wave}",
+                technique_ids=(identity,),
+                verdict="unavailable" if probability is None else "priority_scored",
+                confidence=0.0 if probability is None else probability,
                 graded_by="jev",
-                latency_ms=latency_ms,
-                input_tokens=client.input_tokens - input_before,
-                output_tokens=client.output_tokens - output_before,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                input_tokens=0,
+                output_tokens=0,
             )
-            if worthwhile:
-                return technique, None
-            _, controller_id, payload_family, language_id, mutation_id = cell_parts
-            return None, {
-                "technique_id": str(technique.id),
-                "controller_id": controller_id,
-                "payload_family": payload_family,
-                "language_id": language_id,
-                "mutation_id": mutation_id,
-                "outcome": "jev_triaged",
-                "source_campaign_id": str(prior.get("source_campaign_id", ""))
-                if isinstance(prior, Mapping)
-                else "",
-                "graded_by": "jev",
-                "jev_probability": probability,
-                "reason": (
-                    f"jev cell triage: P(worthwhile)={probability:.2f} <= "
-                    f"{_JEV_CELL_SKIP_THRESHOLD}; the cell is unlikely to produce "
-                    "new information on this target given prior outcomes"
-                ),
-            }
+            return index, probability
 
-        results = await asyncio.gather(*(triage_one(t) for t in runnable))
-        kept = [technique for technique, _ in results if technique is not None]
-        triaged = [skip for _, skip in results if skip is not None]
-        return tuple(kept), tuple(triaged)
+        scores = await asyncio.gather(*(score(i, item) for i, item in enumerate(shortlist)))
+        # Missing scores are neutral. Equal scores retain the authoritative
+        # incoming order, including the all-low/all-unavailable cases.
+        ordered = sorted(scores, key=lambda item: (-(0.5 if item[1] is None else item[1]), item[0]))
+        append_lead = getattr(self._store, "append_lead", None)
+        if callable(append_lead):
+            await asyncio.to_thread(
+                append_lead,
+                campaign_id,
+                wave,
+                {
+                    "kind": "execution_priority",
+                    "shortlist_size": len(shortlist),
+                    "concurrency": width,
+                    "scores": tuple(
+                        {
+                            "candidate_id": str(
+                                getattr(shortlist[index], "id", "")
+                                or _followup_digest(shortlist[index])
+                            ),
+                            "index": index,
+                            "probability": value,
+                        }
+                        for index, value in scores
+                    ),
+                    "preserved_exploration_slots": 1,
+                    "unscored_queued": len(candidates) - len(shortlist),
+                    "policy": "advisory ordering only; no candidate removed or retired",
+                },
+            )
+        return (
+            candidates[0],
+            *(shortlist[index] for index, _ in ordered),
+            *candidates[1 + len(shortlist) :],
+        )
 
     async def _arm_lifecycle_counts(
         self, target_id: str, scenario_fingerprint: str
@@ -2819,6 +2841,9 @@ class CampaignService:
                         generated=generated_pairs,
                         history=arm_history,
                     )
+                    novel = await self._prioritize_execution_candidates(
+                        campaign_id, manifest, novel, wave + 1
+                    )
                     admitted_arms = tuple(
                         dict(item.arm) for item in novel if isinstance(item.arm, Mapping)
                     )
@@ -2880,6 +2905,9 @@ class CampaignService:
                         neighbours=neighbour_candidates,
                         generated=generated_pairs,
                         history=arm_history,
+                    )
+                    novel = await self._prioritize_execution_candidates(
+                        campaign_id, manifest, novel, wave + 1
                     )
                     admitted_arms = tuple(
                         dict(item.arm) for item in novel if isinstance(item.arm, Mapping)
@@ -8525,6 +8553,12 @@ class CampaignService:
         so the leading slice is the highest-priority baseline coverage. Capped
         cells are journaled as coverage limitations, never silently dropped.
         """
+        context = replace(
+            context,
+            techniques=await self._prioritize_execution_candidates(
+                campaign_id, manifest, context.techniques, wave
+            ),
+        )
         if (
             manifest.profile is not CampaignProfile.QUICKSCAN
             or len(context.techniques) <= QUICKSCAN_INITIAL_CELL_LIMIT
@@ -15196,11 +15230,6 @@ _JEV_CELL_FALSE = (
     "The cell is very unlikely to add information beyond what prior outcomes "
     "on this target already established"
 )
-# Cell triage only skips on a confident no; anything above the threshold or
-# unavailable keeps the cell runnable.
-_JEV_CELL_SKIP_THRESHOLD = 0.3
-_JEV_TRIAGE_CONCURRENCY = 16
-_JEV_CELL_STATE_BUDGET_CHARS = 4_000
 
 _JEV_COVERAGE_QUESTION = (
     "Given the admitted technique cells, their committed outcomes, and unresolved "
@@ -15256,46 +15285,6 @@ def _jev_hypothesis_pair_state(first: FrontierHypothesis, second: FrontierHypoth
         {"hypothesis_a": _body(first), "hypothesis_b": _body(second)},
         sort_keys=True,
     )
-
-
-def _jev_cell_state(
-    manifest: CampaignManifest,
-    technique: Any,
-    prior: Mapping[str, object] | None,
-) -> str:
-    """Serialize target capability surface + cell summary + prior outcome for Jev."""
-    capability = {
-        "target_id": str(manifest.target.id),
-        "interface": str(manifest.target.interface),
-        "endpoint": str(manifest.target.endpoint),
-        "model": str(manifest.target.model or ""),
-        "authentication": str(manifest.target.authentication or ""),
-        "campaign_objective": str(manifest.objective)[:512],
-    }
-    cell = {
-        "technique_id": str(technique.id),
-        "objective": str(getattr(technique, "objective", ""))[:512],
-        "strategy_id": str(getattr(technique, "strategy_id", "")),
-        "transform_id": str(getattr(technique, "transform_id", "")),
-        "language": str(getattr(technique, "language", "")),
-        "domain_id": str(getattr(technique, "domain_id", "")),
-    }
-    prior_outcome = (
-        {
-            "outcome": normalize_outcome(prior.get("outcome")),
-            "source_campaign_id": str(prior.get("source_campaign_id", "")),
-        }
-        if isinstance(prior, Mapping)
-        else None
-    )
-    return json.dumps(
-        {
-            "target_capability": capability,
-            "technique_cell": cell,
-            "prior_cell_outcome": prior_outcome,
-        },
-        sort_keys=True,
-    )[:_JEV_CELL_STATE_BUDGET_CHARS]
 
 
 def _finding_validation_high_stakes(record: object) -> bool:

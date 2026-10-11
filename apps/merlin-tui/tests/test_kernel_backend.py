@@ -1924,3 +1924,58 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
     assert campaigns[0].wave_number == 2
     assert campaigns[0].wave_kind == "attack"
     assert campaigns[0].wave_status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", [True, False])
+async def test_timed_out_preparation_restores_verified_review_without_execution(verified):
+    import json
+
+    saved = {
+        "campaign_id": "campaign/saved",
+        "manifest_digest": "sealed",
+        "review": {"budget": {"turns": 10}},
+        "approval_required": True,
+    }
+
+    class Store:
+        async def load_messages(self, session_id):
+            return [SimpleNamespace(role="tool", content=json.dumps(saved))] if verified else []
+
+    class Campaigns:
+        async def recover(self, **kwargs):
+            pass
+
+        async def list(self, session_id, *, limit):
+            return [
+                dict(
+                    saved,
+                    session_id=session_id,
+                    status="prepared",
+                    profile="quickscan",
+                    objective="Test",
+                )
+            ]
+
+        async def list_all(self):
+            return await self.list("session-1", limit=None)
+
+        async def execute(self, *args):
+            raise AssertionError("Recovery must wait for explicit approval")
+
+    kernel = FakeKernel(
+        [
+            app_event(
+                "tool",
+                name="assessment_prepare",
+                state="failed",
+                text="assessment_prepare timed out after 600 seconds",
+            )
+        ]
+    )
+    kernel._store = Store()
+    backend = KernelBackend(kernel, campaigns=Campaigns())
+    events = [event async for event in backend.stream("Continue preparation")]
+    reviews = [json.loads(event.text) for event in events if event.kind == "campaign_review"]
+    assert reviews == ([saved] if verified else [])
+    assert kernel.submissions == ["Continue preparation"]

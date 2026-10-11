@@ -1888,3 +1888,64 @@ async def test_new_session_recovers_while_real_daemon_holds_startup_lock(monkeyp
         server.cancel()
         with pytest.raises(asyncio.CancelledError):
             await server
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reads_do_not_wait_for_or_grow_the_replay_journal(monkeypatch) -> None:
+    import threading
+
+    from merlin_tui import local_control
+
+    entered = threading.Event()
+    release = threading.Event()
+    write_journal = local_control._write_journal
+
+    def blocked_write(*args, **kwargs):
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("test journal was never released")
+        return write_journal(*args, **kwargs)
+
+    class SnapshotBackend(Backend):
+        async def list_agents(self):
+            return ["agent output" * 10_000]
+
+    monkeypatch.setattr(local_control, "_write_journal", blocked_write)
+    socket_path = Path(f"/tmp/merlin-snapshot-{os.getpid()}.sock")
+    journal_path = socket_path.with_suffix(".journal.json")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    await asyncio.to_thread(journal_path.unlink, missing_ok=True)
+    daemon = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: SnapshotBackend()))
+    stream = None
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        client = LocalControlClient(socket_path=socket_path)
+
+        async def create_session():
+            return [event async for event in client.stream("/new")]
+
+        stream = asyncio.create_task(create_session())
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+        # The stream's terminal acknowledgment must still wait for durable replay.
+        assert not stream.done()
+        for _ in range(3):
+            context = await asyncio.wait_for(client.conversation_context(), timeout=1)
+            assert context.session_id == "session-1"
+            assert await asyncio.wait_for(client.list_agents(), timeout=1)
+        assert not journal_path.exists()
+        release.set()
+        assert len(await asyncio.wait_for(stream, timeout=2)) == 1
+        journal = json.loads(journal_path.read_text())
+        assert not journal["completed"]
+        assert next(iter(journal["streams"].values()))["done"] is True
+    finally:
+        release.set()
+        if stream is not None:
+            await asyncio.gather(stream, return_exceptions=True)
+        daemon.cancel()
+        await asyncio.gather(daemon, return_exceptions=True)
+        await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+        await asyncio.to_thread(journal_path.unlink, missing_ok=True)

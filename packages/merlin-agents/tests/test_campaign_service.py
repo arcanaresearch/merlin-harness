@@ -7899,22 +7899,12 @@ async def _jev_triage_prepared(probabilities, history=None):
 
 async def test_jev_cell_triage_skips_only_confident_unworthwhile_cells() -> None:
     prepared, client, admitted, skipped, partial = await _jev_triage_prepared({"jailbreak": 0.1})
-    baseline_id = prepared.assignment_context.techniques[0].id
-
-    # No probability recorded for the baseline cell: a missing/unavailable
-    # answer keeps the cell runnable; only the confident no is triaged out.
-    assert {item.id for item in admitted.assignment_context.techniques} == {baseline_id}
+    # Preparation never asks Jev to judge catalogue eligibility, even when the
+    # configured client would return a strongly negative opinion.
+    assert admitted.assignment_context.techniques == prepared.assignment_context.techniques
+    assert client.states == []
+    assert skipped == ()
     assert partial == ()
-    assert len(skipped) == 1
-    row = skipped[0]
-    assert row["technique_id"] == "jailbreak"
-    assert row["outcome"] == "jev_triaged"
-    assert row["graded_by"] == "jev"
-    assert row["jev_probability"] == 0.1
-    triaged_ids = {
-        str(json.loads(state)["technique_cell"]["technique_id"]) for state in client.states
-    }
-    assert triaged_ids == {baseline_id, "jailbreak"}
 
 
 async def test_jev_cell_triage_unavailable_or_uncertain_keeps_cells_runnable() -> None:
@@ -7927,7 +7917,7 @@ async def test_jev_cell_triage_unavailable_or_uncertain_keeps_cells_runnable() -
     }
     assert skipped == ()
     assert partial == ()
-    assert len(client.states) == len(prepared.assignment_context.techniques)
+    assert client.states == []
 
 
 async def test_jev_cell_triage_never_revisits_deterministic_skips() -> None:
@@ -7969,9 +7959,8 @@ async def test_jev_cell_triage_never_revisits_deterministic_skips() -> None:
     assert len(skipped) == 1
     assert skipped[0]["technique_id"] == "jailbreak"
     assert skipped[0]["outcome"] == "confirmed"
-    # Only the runnable baseline cell was triaged; the skipped cell never was.
-    assert len(client.states) == 1
-    assert "jailbreak" not in client.states[0]
+    # Conclusive history remains attributable; preparation makes no Jev calls.
+    assert client.states == []
 
 
 async def test_probe_receipt_survives_restart_without_duplicate_journal() -> None:
@@ -18100,3 +18089,106 @@ async def test_arm_generator_usage_drain_skips_generators_without_buffer() -> No
     )
 
     await service._journal_arm_generator_usage("campaign-1")  # noqa: SLF001
+
+
+async def test_execution_priority_scores_shortlist_in_parallel_without_removing_candidates():
+    manifest, context = await _api_probe_manifest(
+        (_api_adapter_document([_text_message_step()]), _memory_probe_plan())
+    )
+    candidates = tuple(replace(context.techniques[0], id=f"cell/{i}") for i in range(100))
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+    called = []
+
+    class Client:
+        timeout_seconds = 1.0
+
+        async def noul(self, state, *args, **kwargs):
+            nonlocal active, peak
+            identity = json.loads(state)["technique_cell"]["technique_id"]
+            called.append(identity)
+            active += 1
+            peak = max(peak, active)
+            if active == 3:
+                release.set()
+            try:
+                await release.wait()
+                return int(identity.split("/")[1]) / 10
+            finally:
+                active -= 1
+
+    journal_rows = []
+
+    class RecordingStore(Store):
+        def append_lead(self, campaign_id, wave, payload):
+            journal_rows.append(payload)
+
+    store = RecordingStore()
+    service = CampaignService(store, Agents(store), None, max_worker_concurrency=3)
+    service._jev_client = Client()
+    service._jev_client_checked = True
+    async with asyncio.timeout(2):
+        ordered = await service._prioritize_execution_candidates(
+            manifest.id, manifest, candidates, 1
+        )
+    assert peak == 3
+    assert called == [f"cell/{i}" for i in range(1, 7)]
+    assert ordered[0] == candidates[0]  # Authoritative exploration choice survives.
+    assert [item.id for item in ordered[1:7]] == [f"cell/{i}" for i in range(6, 0, -1)]
+    assert ordered[7:] == candidates[7:]
+    assert set(item.id for item in ordered) == set(item.id for item in candidates)
+    journal = next(item for item in journal_rows if item["kind"] == "execution_priority")
+    assert journal["shortlist_size"] == 6
+    assert journal["unscored_queued"] == 94
+
+
+@pytest.mark.parametrize("answer", [0.0, None, "error", "timeout", float("nan"), 2.0])
+async def test_execution_priority_all_low_or_unavailable_keeps_full_queue(answer):
+    manifest, context = await _api_probe_manifest(
+        (_api_adapter_document([_text_message_step()]), _memory_probe_plan())
+    )
+    candidates = tuple(replace(context.techniques[0], id=f"cell/{i}") for i in range(8))
+    cancelled = 0
+
+    class Client:
+        timeout_seconds = 0.02
+
+        async def noul(self, *args, **kwargs):
+            nonlocal cancelled
+            if answer == "error":
+                raise OSError("Jev unavailable")
+            if answer == "timeout":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled += 1
+            return answer
+
+    store = Store()
+    service = CampaignService(store, Agents(store), None, max_worker_concurrency=3)
+    service._jev_client = Client()
+    service._jev_client_checked = True
+    async with asyncio.timeout(1):
+        ordered = await service._prioritize_execution_candidates(
+            manifest.id, manifest, candidates, 1
+        )
+    assert ordered == candidates
+    if answer == "timeout":
+        assert cancelled == 3
+
+
+async def test_execution_priority_is_applied_at_initial_dispatch_not_preparation():
+    prepared, client, admitted, skipped, _ = await _jev_triage_prepared({"jailbreak": 0.1})
+    assert client.states == []
+    assert skipped == ()
+    client.timeout_seconds = 1.0
+    store = Store()
+    service = CampaignService(store, Agents(store), None)
+    service._jev_client = client
+    service._jev_client_checked = True
+    ranked = await service._cap_quickscan_attack_context(
+        prepared.manifest.id, prepared.manifest, admitted.assignment_context, 1
+    )
+    assert len(client.states) == 1
+    assert ranked.techniques == admitted.assignment_context.techniques

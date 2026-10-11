@@ -82,6 +82,11 @@ class JevClient:
         self.input_tokens = 0
         self.output_tokens = 0
 
+    @property
+    def timeout_seconds(self) -> float:
+        """Transport deadline, also used by optional execution ranking."""
+        return self._timeout
+
     @classmethod
     def from_config(cls, config: JevSettings) -> Self | None:
         """Build a client from judgments config; ``None`` when no token is set."""

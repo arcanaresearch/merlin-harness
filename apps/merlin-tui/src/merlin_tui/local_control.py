@@ -47,6 +47,25 @@ _MAX_FRAME_BYTES = 1_000_000
 _MAX_CHUNK_BYTES = 700_000
 _MAX_MESSAGE_BYTES = 64_000_000
 _MAX_CACHED_REQUESTS = 256
+# These snapshots can be queried again safely after reconnecting. Persisting
+# every UI poll serializes reads behind command replay writes and accumulates
+# hundreds of copies of large agent/history responses in the journal.
+_SNAPSHOT_METHODS = frozenset(
+    {
+        "get_runtime_status",
+        "get_agent_transcript",
+        "list_agents",
+        "list_history",
+        "list_resume_sessions",
+        "list_resume_session_page",
+        "conversation_context",
+        "conversation_history",
+        "campaign_status",
+        "list_campaigns",
+        "list_active_schedules",
+        "list_schedules",
+    }
+)
 _BATCHABLE_STREAM_KINDS = frozenset({"status", "content", "thinking"})
 _STARTER_EXIT_GRACE_SECONDS = 0.5
 _RECOVERY_WATCHDOG_SECONDS = 5.0
@@ -393,7 +412,10 @@ def _write_journal(
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
+            # Encode once rather than issuing a Python write for every JSON
+            # fragment. Large replay journals otherwise hold the writer queue
+            # for seconds even when the filesystem itself is fast.
+            handle.write(json.dumps(payload, separators=(",", ":")))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -722,6 +744,9 @@ async def serve(
             function = getattr(backend, str(method))
             value = await function(*request.get("args", ()), **request.get("kwargs", {}))
             response = {"type": "result", "value": _json(value)}
+            if method in _SNAPSHOT_METHODS:
+                await channel.send(response)
+                return
             completed[request_id] = response
             if len(completed) > _MAX_CACHED_REQUESTS:
                 completed.pop(next(iter(completed)))
