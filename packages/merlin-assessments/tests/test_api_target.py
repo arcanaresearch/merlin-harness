@@ -3091,3 +3091,101 @@ async def test_reviewed_api_tool_without_declared_signal_keeps_delivery_rejected
     assert result.metadata["failure_code"] == "target_delivery_rejected"
     # No session_creation_transition declared: the setup step is never replayed.
     assert calls == ["start", "message"]
+
+
+@pytest.mark.asyncio
+async def test_generated_request_values_survive_retry_rejection_and_tool_restart(tmp_path: Path):
+    from uuid import UUID
+
+    adapter = _adapter()
+    step = adapter["api_steps"][1]
+    step["request_template"]["envelope"] = {"opaque": "captured-example"}
+    step["request_bindings"] = {"/envelope/opaque": "uuid4"}
+    step["idempotency_key"] = "reviewed-retry-safe"
+    step["replay_after_ambiguous_result"] = True
+    campaign_id = "campaign/generated-request-values"
+    seen = []
+    delivered = {}
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+
+            def handler(request):
+                if request.url.path.endswith("/start"):
+                    return httpx.Response(200, json={"sessionId": "stable-session"})
+                body = json.loads(request.content)
+                pending = sessions.load(
+                    campaign_id,
+                    target_id="target-refund",
+                    session_scope_id=f"{campaign_id}/injection",
+                ).pending_step
+                # The exact request, including the nonce, was committed before dispatch.
+                assert pending["request"] == body
+                seen.append(body)
+                nonce = body["envelope"]["opaque"]
+                if nonce in delivered and delivered[nonce] != body["userMessage"]:
+                    return httpx.Response(409, json={"error": "duplicate ID, different payload"})
+                delivered[nonce] = body["userMessage"]
+                if len(seen) == 1:
+                    raise httpx.ReadTimeout("response lost after delivery", request=request)
+                if body["userMessage"] == "rejected":
+                    return httpx.Response(409, json={"error": "known rejection"})
+                return httpx.Response(200, json={"reply": "received"})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+
+                def make_tool():
+                    return ReviewedApiTargetTool(
+                        sessions,
+                        lambda _: adapter,
+                        {"target-token": "test"},
+                        client=client,
+                    )
+
+                first = await make_tool().invoke(
+                    _sealed_context(campaign_id, adapter), {"input": "first"}
+                )
+                rejected = await make_tool().invoke(
+                    _sealed_context(campaign_id, adapter), {"input": "rejected"}
+                )
+                state = sessions.load(
+                    campaign_id,
+                    target_id="target-refund",
+                    session_scope_id=f"{campaign_id}/injection",
+                )
+                assert state.state == "active" and state.pending_step is None
+                third = await make_tool().invoke(
+                    _sealed_context(campaign_id, adapter), {"input": "third"}
+                )
+
+    assert not first.is_error and not third.is_error
+    assert rejected.is_error and rejected.metadata["target_profile_id"] == "target-refund"
+    assert rejected.metadata["infrastructure_failure_category"] == "delivery_failure"
+    assert len(seen) == 4
+    assert seen[0] == seen[1]  # Same logical message, same ID on transport retry.
+    assert len({item["envelope"]["opaque"] for item in seen}) == 3
+    assert all(UUID(item["envelope"]["opaque"]).version == 4 for item in seen)
+    assert all(item["sessionId"] == "stable-session" for item in seen)
+
+
+@pytest.mark.asyncio
+async def test_api_error_retains_target_identity_when_transport_is_unavailable(tmp_path: Path):
+    adapter = _adapter()
+    adapter.pop("credential_handle")
+    adapter["api_transport"] = "browser_context"
+    campaign_id = "campaign/error-target-identity"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            result = await ReviewedApiTargetTool(
+                _prepare(connection, campaign_id),
+                lambda _: adapter,
+                {},
+            ).invoke(_sealed_context(campaign_id, adapter), {"input": "probe"})
+    assert result.is_error
+    assert result.metadata["target_profile_id"] == "target-refund"
+    assert result.metadata["compiled_adapter_digest"] == compiled_target_adapter_digest(
+        compile_target_adapter(adapter)
+    )

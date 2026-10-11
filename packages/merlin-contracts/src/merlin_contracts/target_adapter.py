@@ -95,6 +95,11 @@ def executable_adapter_projection(adapter: Mapping[str, object]) -> dict[str, ob
                 )
             },
             **(
+                {"request_bindings": step.get("request_bindings")}
+                if step.get("request_bindings")
+                else {}
+            ),
+            **(
                 {"replay_after_ambiguous_result": step.get("replay_after_ambiguous_result")}
                 if "replay_after_ambiguous_result" in step
                 else {}

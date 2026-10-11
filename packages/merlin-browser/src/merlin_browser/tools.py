@@ -15,7 +15,7 @@ from datetime import datetime
 from inspect import isawaitable
 from typing import Any, Protocol
 from urllib.parse import unquote, urljoin, urlsplit
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from merlin_contracts import (
     TargetDeliveryClass,
@@ -25,6 +25,7 @@ from merlin_contracts import (
     ToolSpec,
     executable_adapter_digest,
 )
+from merlin_contracts.request_bindings import bind_request_values, validate_request_bindings
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompilation,
     AdapterCompileError,
@@ -2491,6 +2492,12 @@ class CompiledApiReconHandoffTool:
                 "invent cleanup or label setup/resume as cleanup. Session concurrency and "
                 "interaction limits remain explicitly unverified unless captured evidence "
                 "establishes them; one observed session is not proof of a concurrency limit."
+                " Classify non-input request values as constants, response/session captures, or "
+                "client-generated per-message values. Supply request_bindings for generated "
+                "values using exact JSON Pointers and observed format (uuid4 or hex32). Compare "
+                "two distinct harmless messages within the authorized recon budget when needed; "
+                "never treat a session ID, credential, server-issued token, or merely UUID-shaped "
+                "constant as a request nonce. Unknown semantics remain recorded uncertainty."
             ),
             input_schema={
                 "type": "object",
@@ -2504,6 +2511,17 @@ class CompiledApiReconHandoffTool:
                             "Path to the prompt field in the captured request. Prefer RFC 6901 "
                             "JSON Pointer such as /message; simple JSONPath such as $.message is "
                             "also accepted and normalized."
+                        ),
+                    },
+                    "request_bindings": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string", "enum": ["uuid4", "hex32"]},
+                        "description": (
+                            "Optional exact request JSON Pointers to client-generated per-message "
+                            "values, e.g. /envelope/nonce: uuid4. Based on frontend or multiple "
+                            "exchange evidence, not field names. A fresh value is persisted before "
+                            "each request; transport retries reuse that value. Session captures "
+                            "and input fields cannot be overridden."
                         ),
                     },
                     "response_selector": {
@@ -4152,6 +4170,34 @@ class CompiledApiReconHandoffTool:
             "captures": {},
             "repeat": 1,
         }
+        try:
+            bindings = _observed_request_bindings(
+                request_json, request_template, exchanges, method, url, input_pointer
+            )
+            bindings.update(
+                validate_request_bindings(request_template, arguments.get("request_bindings", {}))
+            )
+        except ValueError as error:
+            return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
+        if bindings:
+            message_step["request_bindings"] = bindings
+        for pointer, value in _string_scalar_paths(request_template):
+            if pointer in bindings:
+                continue
+            try:
+                parsed = UUID(value)
+            except ValueError:
+                continue
+            if parsed.version == 4:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        f"api_steps.observed-message-exchange.request_template{pointer}",
+                        "This literal UUID has no established per-request generation contract. "
+                        "Inspect frontend evidence or compare distinct messages to distinguish "
+                        "a constant from a client nonce or a server/session capture. The value "
+                        "was retained; UUID shape alone cannot authorize regeneration.",
+                    )
+                )
         if oracle_predicate is not None:
             message_step["oracle_predicate"] = oracle_predicate
         if terminal_response_contract is not None:
@@ -4353,6 +4399,57 @@ class CompiledApiReconHandoffTool:
         )
 
 
+def _observed_request_bindings(
+    request: object,
+    template: object,
+    exchanges: tuple[dict[str, object], ...],
+    method: str,
+    url: str,
+    input_pointer: str,
+) -> dict[str, str]:
+    """Recognize changing client UUIDs, never UUID-shaped constants or captures."""
+    candidates = [
+        event
+        for event in exchanges
+        if event.get("method") == method
+        and event.get("url") == url
+        and isinstance(event.get("status"), int)
+        and 200 <= event["status"] < 300
+    ]
+    response_values = {
+        value
+        for event in exchanges
+        for _, value in _string_scalar_paths(event.get("response_json"))
+    }
+    bindings: dict[str, str] = {}
+    for pointer, value in _string_scalar_paths(request):
+        if pointer == input_pointer or value in response_values:
+            continue
+        # A capture placeholder at this exact path takes precedence over generation.
+        literal = _json_pointer_value_or_missing(template, pointer)
+        if not isinstance(literal, str) or "{{" in literal:
+            continue
+        observations: dict[str, str] = {}
+        for event in candidates:
+            candidate = _json_pointer_value_or_missing(event.get("request_json"), pointer)
+            prompt = _json_pointer_value_or_missing(event.get("request_json"), input_pointer)
+            if not isinstance(candidate, str) or not isinstance(prompt, str):
+                continue
+            try:
+                parsed = UUID(candidate)
+            except ValueError:
+                continue
+            if (
+                parsed.version == 4
+                and candidate == str(parsed)
+                and candidate not in response_values
+            ):
+                observations[prompt] = candidate
+        if len(observations) >= 2 and len(set(observations.values())) == len(observations):
+            bindings[pointer] = "uuid4"
+    return bindings
+
+
 def _render_template(value: object, variables: Mapping[str, object], input_text: str) -> object:
     if isinstance(value, Mapping):
         return {
@@ -4381,7 +4478,10 @@ async def _replay_step(
 
     step_id = str(step["step_id"])
     try:
-        body = _render_template(step["request_template"], variables, _FRESH_SESSION_PROBE_INPUT)
+        body = bind_request_values(
+            _render_template(step["request_template"], variables, _FRESH_SESSION_PROBE_INPUT),
+            step.get("request_bindings", {}),
+        )
     except ValueError as error:
         return None, f"compiled adapter failed fresh-session replay: {error}"
     try:

@@ -223,6 +223,23 @@ Browser or API reconnaissance records attributable observations and a durable ha
 binds the target, interface, endpoint, session assumptions, observed surfaces, interaction steps,
 evidence references, oracle information, and any explicit DOM fallback.
 
+HTTP handoffs distinguish literal request values, response captures (`{{capture:name}}`),
+runtime input (`{{input}}`), and client-generated values. Optional step-level `request_bindings`
+maps exact RFC 6901 JSON Pointers to `uuid4` or `hex32` generators, including nested arrays.
+Recon can declare bindings from frontend/network evidence; the compiler also recognizes UUIDs
+that change across distinct successful messages in the same observed lifecycle, excluding
+response-sourced values. A UUID-shaped constant alone is not enough to infer a generator.
+Unsupported or uncertain value semantics require further recon evidence, rather than guessing
+from a target name or field name. Session captures and input cannot be overridden by generators.
+
+Bindings are part of the reviewed adapter identity. Execution creates values once per request,
+persists the exact prepared request before dispatch, and reuses it for permitted transport
+retries. A new message gets new generated values. Acknowledging a pending request resolves its
+local ambiguity, including when its HTTP response rejects delivery; an unacknowledged effect
+still requires reconciliation. Adapter error results retain their reviewed target identity.
+Existing approved adapters are not silently rewritten; changing bindings requires a new handoff
+and campaign review.
+
 Relevant code:
 
 - `merlin-browser`: observation and handoff capture

@@ -362,7 +362,7 @@ class CampaignApiSessionRepository:
         with self._lock, self.connection.transaction():
             row = self.connection.execute(
                 """UPDATE merlin_storage.campaign_api_sessions
-                   SET variables = %s, pending_step = NULL, updated_at = now()
+                   SET variables = %s, pending_step = NULL, state = 'active', updated_at = now()
                    WHERE campaign_id = %s AND target_id = %s
                      AND session_scope_id = %s
                      AND state IN ('active', 'ambiguous') AND pending_step IS NOT NULL

@@ -12,10 +12,12 @@ import json
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from functools import wraps
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, Self
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+
+from .request_bindings import RequestValueGenerator, validate_request_bindings
 
 COMPILED_TARGET_ADAPTER_VERSION = "merlin.compiled-target-adapter.v1"
 ADAPTER_COMPILATION_VERSION = "merlin.target-adapter-compilation.v1"
@@ -106,10 +108,16 @@ class HttpApiStep(AdapterContract):
     endpoint: str = Field(min_length=1)
     method: str = Field(min_length=1)
     request_template: object
+    request_bindings: dict[str, RequestValueGenerator] = Field(default_factory=dict)
     captures: dict[str, str] = Field(default_factory=dict)
     repeat: int = Field(default=1, ge=1)
     idempotency_key: str | None = None
     replay_after_ambiguous_result: bool = False
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> Self:
+        validate_request_bindings(self.request_template, self.request_bindings)
+        return self
 
 
 class BrowserStep(AdapterContract):
@@ -659,6 +667,16 @@ def _compile_http_steps(
             )
         advisories.extend(_step_advisories(item, path=path))
         request_template = _canonical_input_values(item["request_template"])
+        try:
+            request_bindings = validate_request_bindings(
+                request_template, item.get("request_bindings", {})
+            )
+        except ValueError as error:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.NON_EXECUTABLE_INPUT,
+                f"{path}.request_bindings",
+                str(error),
+            ) from error
         missing_captures = _capture_dependencies(request_template) - prior_captures
         if missing_captures:
             _unsupported_step(
@@ -725,6 +743,7 @@ def _compile_http_steps(
                 endpoint=endpoint,
                 method=method,
                 request_template=request_template,
+                request_bindings=request_bindings,
                 captures=captures,
                 repeat=repeat,
                 idempotency_key=idempotency_key,
@@ -1073,8 +1092,14 @@ def read_target_adapter(value: object) -> AdapterCompilation:
 def compiled_target_adapter_digest(value: AdapterCompilation | CompiledTargetAdapter) -> str:
     """Hash only normalized executable semantics, never advisory interpretation."""
     executable = value.executable if isinstance(value, AdapterCompilation) else value
+    payload = executable.model_dump(mode="json")
+    # Optional bindings must not invalidate already-reviewed legacy adapters.
+    if isinstance(executable, HttpApi):
+        for step in payload["steps"]:
+            if not step.get("request_bindings"):
+                step.pop("request_bindings", None)
     encoded = json.dumps(
-        executable.model_dump(mode="json"),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()

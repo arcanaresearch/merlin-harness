@@ -6,7 +6,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urljoin
 
@@ -19,6 +19,7 @@ from merlin_contracts import (
     ToolSpec,
     executable_adapter_digest,
 )
+from merlin_contracts.request_bindings import RequestValueGenerator, bind_request_values
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompilation,
     AdapterCompileError,
@@ -205,6 +206,7 @@ class _ApiStep:
     evaluation_uncertainties: tuple[Mapping[str, object], ...]
     terminal_response: tuple[_TerminalResponseContract, ...]
     cleanup_acknowledgement: _CleanupAcknowledgement | None
+    request_bindings: Mapping[str, RequestValueGenerator] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1261,7 +1263,7 @@ class ReviewedApiTargetTool:
             )
             return
         variables = dict(state.variables)
-        request = _render(step.request, variables, "")
+        request = bind_request_values(_render(step.request, variables, ""), step.request_bindings)
         await asyncio.to_thread(
             self._sessions.begin_cleanup,
             campaign_id,
@@ -1272,7 +1274,7 @@ class ReviewedApiTargetTool:
         try:
             started = time.monotonic()
             observed, status_code, response_body, _attempt_count = await self._request(
-                campaign_id, adapter, step, variables, input_text=""
+                campaign_id, adapter, step, variables, input_text="", prepared_request=request
             )
         except (
             httpx.HTTPError,
@@ -1359,7 +1361,9 @@ class ReviewedApiTargetTool:
         session_scope_id: str,
         input_text: str,
     ) -> tuple[object, dict[str, object], dict[str, object]]:
-        request = _render(step.request, variables, input_text)
+        request = bind_request_values(
+            _render(step.request, variables, input_text), step.request_bindings
+        )
         await asyncio.to_thread(
             self._sessions.begin_step,
             campaign_id,
@@ -1370,7 +1374,12 @@ class ReviewedApiTargetTool:
         started = time.monotonic()
         try:
             observed, status_code, response_json, attempt_count = await self._request(
-                campaign_id, adapter, step, variables, input_text=input_text
+                campaign_id,
+                adapter,
+                step,
+                variables,
+                input_text=input_text,
+                prepared_request=request,
             )
         except (
             httpx.HTTPError,
@@ -1568,8 +1577,13 @@ class ReviewedApiTargetTool:
         variables: Mapping[str, object],
         *,
         input_text: str,
+        prepared_request: object | None = None,
     ) -> tuple[object, int, object, int]:
-        request = _render(step.request, variables, input_text)
+        request = prepared_request
+        if request is None:
+            request = bind_request_values(
+                _render(step.request, variables, input_text), step.request_bindings
+            )
         headers: dict[str, str] = {}
         if adapter.credential_handle is not None:
             secret = self._credentials.get(adapter.credential_handle)
@@ -1819,6 +1833,7 @@ def _step_from_compiled(
             "endpoint": compiled.endpoint,
             "method": compiled.method,
             "request_template": compiled.request_template,
+            "request_bindings": compiled.request_bindings,
             "response_selector": (
                 source.get("response_selector")
                 if isinstance(source.get("response_selector"), str)
@@ -1886,6 +1901,7 @@ def _step(value: Mapping[str, object]) -> _ApiStep:
         endpoint=str(value["endpoint"]),
         method=str(value["method"]).upper(),
         request=value["request_template"],
+        request_bindings=value.get("request_bindings", {}),
         response_pointer=str(value["response_selector"]),
         expected_status=(
             int(value["expected_status"])
@@ -2306,6 +2322,7 @@ def _adapter_identity_failure(
 
 def _with_adapter_identity(result: ToolResult, adapter: _ApiAdapter) -> ToolResult:
     metadata = dict(result.metadata)
+    metadata.setdefault("target_profile_id", adapter.target_id)
     metadata.setdefault("adapter_digest", adapter.digest)
     metadata["compiled_adapter_digest"] = adapter.compiled_digest
     return result.model_copy(update={"metadata": metadata})
@@ -2320,6 +2337,7 @@ def _pending_step(step: _ApiStep, request: object) -> dict[str, object]:
     return {
         "id": step.id,
         "request_digest": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        "request": request,
         "idempotency_key": step.idempotency_key,
         "replay_after_ambiguous_result": step.replay_after_ambiguous_result,
     }

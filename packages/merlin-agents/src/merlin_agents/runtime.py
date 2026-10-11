@@ -2608,6 +2608,12 @@ class WorkerRuntime:
             if observed != sealed_compiled_adapter_digest:
                 return "target result used a different compiled adapter identity"
             observed_target = result.metadata.get("target_profile_id")
+            if observed_target is None and result.is_error:
+                # A bound adapter error may omit response identity; absence is
+                # not evidence that execution reached a different target.
+                return None
+            if observed_target is None:
+                return "target result omitted the reviewed target identity"
             if observed_target != handoff.assignment.target_profile_id:
                 return "target result used a different reviewed target identity"
             return None

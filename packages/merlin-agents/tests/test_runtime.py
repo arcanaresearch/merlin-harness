@@ -9173,3 +9173,65 @@ async def test_partial_repeat_rationale_is_audited_without_blocking_target(dynam
     restored = WorkerRuntime._restore_action_history(result.checkpoint)  # noqa: SLF001
     assert restored[-1]["repeat_reason"] == reason
     assert restored[-1]["repeat_prior_context"] == entry["repeat_prior_context"]
+
+
+@pytest.mark.parametrize("observed_target", [None, "another-target"])
+async def test_bound_adapter_error_missing_identity_is_not_a_target_change(observed_target):
+    compilation = compile_target_adapter(
+        {"interface": "open_ai_compatible", "endpoint": "https://target.test/v1"}
+    )
+    digest = compiled_target_adapter_digest(compilation)
+    base = handoff(tools=("target_request",))
+    sealed = replace(
+        base,
+        assignment=replace(
+            base.assignment,
+            strategy_contract=(
+                ("compiled_adapter", compilation.model_dump_json()),
+                ("compiled_adapter_digest", digest),
+            ),
+        ),
+    )
+
+    class RejectedTarget(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="target_request", description="Target", input_schema={"type": "object"}
+                ),
+            )
+
+        def effect(self, name):
+            return "target_network"
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            metadata = {
+                "compiled_adapter_digest": digest,
+                "infrastructure_failure_category": "delivery_failure",
+                "target_delivery_rejected": True,
+            }
+            if observed_target is not None:
+                metadata["target_profile_id"] = observed_target
+            return ToolResult(content="known HTTP rejection", is_error=True, metadata=metadata)
+
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="rejected-one", name="target_request", arguments={"input": "probe"}
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    tools = RejectedTarget()
+    result = await WorkerRuntime(provider, tools, max_model_turns=1).run(sealed)
+    assert tools.calls == ["target_request"]
+    if observed_target is None:
+        assert result.infrastructure_failure_category != "adapter_state_integrity"
+        assert "different reviewed target identity" not in (result.error or "")
+    else:
+        assert result.status == "quarantined"
+        assert result.infrastructure_failure_category == "adapter_state_integrity"
+        assert "different reviewed target identity" in (result.error or "")

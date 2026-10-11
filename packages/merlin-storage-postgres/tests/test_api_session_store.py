@@ -664,3 +664,22 @@ def test_finish_without_cleanup_records_claim_loser_without_touching_owner(
                 )
                 == owner
             )
+
+
+def test_acknowledged_pending_request_resolves_ambiguity_before_next_step(tmp_path: Path):
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _prepare_campaign(connection)
+            sessions = CampaignApiSessionRepository(connection)
+            state = sessions.create("campaign/api-session", "target-1", "sha256:adapter")
+            request = {"id": "request-one", "text": "first"}
+            sessions.begin_step(state.campaign_id, {"id": "send", "request": request})
+            sessions.mark_ambiguous(state.campaign_id)
+            restored = sessions.load(state.campaign_id)
+            assert restored.pending_step["request"] == request
+            assert restored.state == "ambiguous"
+            resolved = sessions.finish_step(state.campaign_id, {"last_status": 409})
+            assert resolved.state == "active" and resolved.pending_step is None
+            pending = sessions.begin_step(state.campaign_id, {"id": "next"})
+            assert pending.pending_step["id"] == "next"
