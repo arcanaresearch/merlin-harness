@@ -1281,6 +1281,67 @@ async def test_request_ids_make_completed_calls_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_reads_do_not_wait_for_or_grow_the_replay_journal(monkeypatch) -> None:
+    import threading
+
+    from merlin_tui import local_control
+
+    entered = threading.Event()
+    release = threading.Event()
+    write_journal = local_control._write_journal
+
+    def blocked_write(*args, **kwargs):
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("test journal was never released")
+        return write_journal(*args, **kwargs)
+
+    class SnapshotBackend(Backend):
+        async def list_agents(self):
+            return ["agent output" * 10_000]
+
+    monkeypatch.setattr(local_control, "_write_journal", blocked_write)
+    socket_path = Path(f"/tmp/merlin-snapshot-{os.getpid()}.sock")
+    journal_path = socket_path.with_suffix(".journal.json")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    await asyncio.to_thread(journal_path.unlink, missing_ok=True)
+    daemon = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: SnapshotBackend()))
+    stream = None
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        client = LocalControlClient(socket_path=socket_path)
+
+        async def create_session():
+            return [event async for event in client.stream("/new")]
+
+        stream = asyncio.create_task(create_session())
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+        # The stream's terminal acknowledgment must still wait for durable replay.
+        assert not stream.done()
+        for _ in range(3):
+            context = await asyncio.wait_for(client.conversation_context(), timeout=1)
+            assert context.session_id == "session-1"
+            assert await asyncio.wait_for(client.list_agents(), timeout=1)
+        assert not journal_path.exists()
+        release.set()
+        assert len(await asyncio.wait_for(stream, timeout=2)) == 1
+        journal = json.loads(journal_path.read_text())
+        assert not journal["completed"]
+        assert next(iter(journal["streams"].values()))["done"] is True
+    finally:
+        release.set()
+        if stream is not None:
+            await asyncio.gather(stream, return_exceptions=True)
+        daemon.cancel()
+        await asyncio.gather(daemon, return_exceptions=True)
+        await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+        await asyncio.to_thread(journal_path.unlink, missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_stream_can_resume_from_ordered_cursor() -> None:
     backend = Backend()
     socket_path = Path(f"/tmp/merlin-cursor-{os.getpid()}.sock")
@@ -1891,61 +1952,506 @@ async def test_new_session_recovers_while_real_daemon_holds_startup_lock(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_snapshot_reads_do_not_wait_for_or_grow_the_replay_journal(monkeypatch) -> None:
-    import threading
+async def test_restart_foreground_waits_for_lease_eof_and_backend_cleanup(monkeypatch) -> None:
+    from uuid import uuid4
 
-    from merlin_tui import local_control
+    from merlin_tui.local_control import restart_daemon
 
-    entered = threading.Event()
-    release = threading.Event()
-    write_journal = local_control._write_journal
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    owner_notified = asyncio.Event()
 
-    def blocked_write(*args, **kwargs):
-        entered.set()
-        if not release.wait(10):
-            raise TimeoutError("test journal was never released")
-        return write_journal(*args, **kwargs)
+    class RestartBackend(Backend):
+        async def close(self):
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            await super().close()
 
-    class SnapshotBackend(Backend):
-        async def list_agents(self):
-            return ["agent output" * 10_000]
+    backend = RestartBackend()
+    path = Path(f"/tmp/merlin-restart-owner-{uuid4().hex[:12]}.sock")
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    owner = LocalControlClient(socket_path=path)
+    starts = []
 
-    monkeypatch.setattr(local_control, "_write_journal", blocked_write)
-    socket_path = Path(f"/tmp/merlin-snapshot-{os.getpid()}.sock")
-    journal_path = socket_path.with_suffix(".journal.json")
-    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
-    await asyncio.to_thread(journal_path.unlink, missing_ok=True)
-    daemon = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: SnapshotBackend()))
-    stream = None
+    async def start(socket_path):
+        assert owner_notified.is_set()
+        assert backend.closed
+        assert not socket_path.exists()
+        assert _daemon_lock_released(socket_path)
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    quit_owner = None
+    restarting = None
     try:
-        for _ in range(100):
-            if await asyncio.to_thread(socket_path.exists):
-                break
-            await asyncio.sleep(0.01)
-        client = LocalControlClient(socket_path=socket_path)
+        async with asyncio.timeout(5):
+            for _ in range(500):
+                if await asyncio.to_thread(path.exists):
+                    break
+                await asyncio.sleep(0.01)
+            await owner.acquire_foreground_lease(close_notifications=True)
 
-        async def create_session():
-            return [event async for event in client.stream("/new")]
+            async def release_on_notification():
+                await owner.wait_for_foreground_close()
+                owner_notified.set()
+                assert owner._lease_writer is not None
+                await _close_writer(owner._lease_writer)
 
-        stream = asyncio.create_task(create_session())
-        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
-        # The stream's terminal acknowledgment must still wait for durable replay.
-        assert not stream.done()
-        for _ in range(3):
-            context = await asyncio.wait_for(client.conversation_context(), timeout=1)
-            assert context.session_id == "session-1"
-            assert await asyncio.wait_for(client.list_agents(), timeout=1)
-        assert not journal_path.exists()
-        release.set()
-        assert len(await asyncio.wait_for(stream, timeout=2)) == 1
-        journal = json.loads(journal_path.read_text())
-        assert not journal["completed"]
-        assert next(iter(journal["streams"].values()))["done"] is True
+            quit_owner = asyncio.create_task(release_on_notification())
+            restarting = asyncio.create_task(restart_daemon(path))
+            await cleanup_started.wait()
+            assert owner_notified.is_set()
+            assert not restarting.done()
+            assert starts == []
+            allow_cleanup.set()
+            await restarting
+            await quit_owner
+            await server
+            assert starts == [path]
+    finally:
+        allow_cleanup.set()
+        tasks = [task for task in (quit_owner, restarting, server) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        path.with_suffix(".journal.json").unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_idle_daemon_cleans_resources_before_start(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import restart_daemon
+
+    backend = Backend()
+    path = Path(f"/tmp/merlin-restart-idle-{uuid4().hex[:12]}.sock")
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    starts = []
+
+    async def start(socket_path):
+        assert backend.closed
+        assert not socket_path.exists()
+        assert _daemon_lock_released(socket_path)
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    try:
+        async with asyncio.timeout(5):
+            for _ in range(500):
+                if await asyncio.to_thread(path.exists):
+                    break
+                await asyncio.sleep(0.01)
+            await restart_daemon(path)
+            await server
+        assert starts == [path]
+    finally:
+        if not server.done():
+            server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        path.with_suffix(".journal.json").unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_absent_daemon_starts_once(monkeypatch, tmp_path) -> None:
+    from merlin_tui.local_control import restart_daemon
+
+    path = tmp_path / "absent.sock"
+    starts = []
+
+    async def start(socket_path):
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+
+    await restart_daemon(path)
+
+    assert starts == [path]
+
+
+@pytest.mark.asyncio
+async def test_restart_unreachable_lock_owner_never_force_kills_or_starts(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import restart_daemon
+
+    path = Path(f"/tmp/merlin-restart-unreachable-{uuid4().hex[:12]}.sock")
+    lock = _acquire_daemon_lock(path)
+    monkeypatch.setattr("merlin_tui.local_control._configured_daemon_timeout", lambda *args: 0.05)
+
+    async def unexpected_start(*args, **kwargs):
+        pytest.fail("a daemon whose cleanup is unconfirmed must not be replaced")
+
+    original_kill = os.kill
+
+    def unexpected_signal(pid, sig):
+        if sig != 0:
+            pytest.fail("restart must not forcibly kill the locked daemon")
+        original_kill(pid, sig)
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", unexpected_start)
+    monkeypatch.setattr("merlin_tui.local_control.os.kill", unexpected_signal)
+    try:
+        with pytest.raises(RuntimeError):
+            await restart_daemon(path)
+        assert not _daemon_lock_released(path)
+    finally:
+        lock.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_owner_timeout_preserves_session_and_does_not_start(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import restart_daemon
+
+    path = Path(f"/tmp/merlin-restart-timeout-{uuid4().hex[:12]}.sock")
+    backend = Backend()
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    owner = LocalControlClient(socket_path=path)
+    monkeypatch.setattr("merlin_tui.local_control._configured_daemon_timeout", lambda *args: 0.1)
+
+    async def unexpected_start(*args, **kwargs):
+        pytest.fail("restart must wait for the foreground owner to release its lease")
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", unexpected_start)
+    try:
+        async with asyncio.timeout(5):
+            for _ in range(500):
+                if await asyncio.to_thread(path.exists):
+                    break
+                await asyncio.sleep(0.01)
+            await owner.acquire_foreground_lease(close_notifications=True)
+            with pytest.raises(TimeoutError, match="existing session is still closing"):
+                await restart_daemon(path)
+            await owner.wait_for_foreground_close()
+            assert not backend.closed
+            assert not _daemon_lock_released(path)
+            await owner.shutdown()
+            await server
+    finally:
+        if not server.done():
+            server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        path.with_suffix(".journal.json").unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_connected_silent_daemon_times_out_without_start_or_signal(
+    monkeypatch,
+) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import restart_daemon
+
+    path = Path(f"/tmp/merlin-restart-silent-{uuid4().hex[:12]}.sock")
+    connected = asyncio.Event()
+    release = asyncio.Event()
+    peer_tasks = []
+
+    async def silent_peer(reader, writer):
+        peer_tasks.append(asyncio.current_task())
+        try:
+            request = json.loads(await reader.readline())
+            assert request == {"method": "close_foreground"}
+            connected.set()
+            await release.wait()
+        finally:
+            await _close_writer(writer)
+
+    async def unexpected_start(*args, **kwargs):
+        pytest.fail("restart must not start before an existing daemon acknowledges shutdown")
+
+    def unexpected_signal(*args, **kwargs):
+        pytest.fail("a silent daemon must not be signalled by restart")
+
+    monkeypatch.setattr("merlin_tui.local_control._configured_daemon_timeout", lambda *args: 0.02)
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", unexpected_start)
+    monkeypatch.setattr("merlin_tui.local_control.os.kill", unexpected_signal)
+    server = await asyncio.start_unix_server(silent_peer, path)
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(TimeoutError, match="did not respond"):
+                await restart_daemon(path)
+            assert connected.is_set()
     finally:
         release.set()
-        if stream is not None:
-            await asyncio.gather(stream, return_exceptions=True)
-        daemon.cancel()
-        await asyncio.gather(daemon, return_exceptions=True)
-        await asyncio.to_thread(socket_path.unlink, missing_ok=True)
-        await asyncio.to_thread(journal_path.unlink, missing_ok=True)
+        server.close()
+        await server.wait_closed()
+        await asyncio.gather(*peer_tasks)
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_suspended_foreground_for_normal_cleanup(
+    monkeypatch, tmp_path
+) -> None:
+    import signal
+    from uuid import uuid4
+
+    from merlin_tui.local_control import restart_daemon
+
+    path = Path(f"/tmp/merlin-restart-stopped-{uuid4().hex[:12]}.sock")
+    backend = Backend()
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    script = tmp_path / "suspended_frontend.py"
+    await asyncio.to_thread(
+        script.write_text,
+        f"""import asyncio, os, signal
+from pathlib import Path
+from merlin_tui.local_control import LocalControlClient
+async def main():
+    client = LocalControlClient(socket_path=Path({str(path)!r}))
+    await client.acquire_foreground_lease(close_notifications=True)
+    print('attached', flush=True)
+    os.kill(os.getpid(), signal.SIGSTOP)
+    await client.wait_for_foreground_close()
+    await client.shutdown()
+asyncio.run(main())
+""",
+    )
+    starts = []
+
+    async def start(socket_path):
+        assert backend.closed
+        assert not await asyncio.to_thread(socket_path.exists)
+        assert await asyncio.to_thread(_daemon_lock_released, socket_path)
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    process = None
+    try:
+        async with asyncio.timeout(15):
+            for _ in range(500):
+                if await asyncio.to_thread(path.exists):
+                    break
+                await asyncio.sleep(0.01)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            assert await process.stdout.readline() == b"attached\n"
+            # Wait for the child's SIGSTOP, rather than racing its stdout flush.
+            for _ in range(500):
+                status_process = await asyncio.create_subprocess_exec(
+                    "ps",
+                    "-o",
+                    "stat=",
+                    "-p",
+                    str(process.pid),
+                    stdout=asyncio.subprocess.PIPE,
+                )
+                status, _ = await status_process.communicate()
+                if status.strip().startswith(b"T"):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("foreground test child did not enter the suspended state")
+            monkeypatch.setattr(
+                "merlin_tui.local_control._legacy_foreground_pid", lambda socket_path: process.pid
+            )
+            await restart_daemon(path)
+            assert await process.wait() == 0
+            await server
+            assert starts == [path]
+    finally:
+        if process is not None and process.returncode is None:
+            os.kill(process.pid, signal.SIGCONT)
+            process.terminate()
+            await process.wait()
+        if not server.done():
+            server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        await asyncio.to_thread(path.with_suffix(".journal.json").unlink, missing_ok=True)
+
+
+def test_restart_resume_leaves_running_foreground_unsignalled(monkeypatch) -> None:
+    from merlin_tui.local_control import _resume_stopped_foreground
+
+    path = Path("/tmp/merlin-running-resume-test.sock")
+    monkeypatch.setattr("merlin_tui.local_control._legacy_foreground_pid", lambda _: 123)
+    monkeypatch.setattr(
+        "merlin_tui.local_control.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="S+\n"),
+    )
+    monkeypatch.setattr(
+        "merlin_tui.local_control.os.kill",
+        lambda *args: pytest.fail("running foreground must not be signalled"),
+    )
+
+    _resume_stopped_foreground(path)
+
+
+def test_restart_resume_skips_unidentified_foreground(monkeypatch) -> None:
+    from merlin_tui.local_control import _resume_stopped_foreground
+
+    def unidentified(_):
+        raise RuntimeError("Cannot identify the existing Merlin window")
+
+    monkeypatch.setattr("merlin_tui.local_control._legacy_foreground_pid", unidentified)
+    monkeypatch.setattr(
+        "merlin_tui.local_control.os.kill",
+        lambda *args: pytest.fail("unidentified processes must not be signalled"),
+    )
+
+    _resume_stopped_foreground(Path("/tmp/merlin-unidentified-resume-test.sock"))
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_verified_real_orphan_before_start(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import _daemon_lock_owner, restart_daemon
+
+    path = Path(f"/tmp/merlin-restart-orphan-{uuid4().hex[:12]}.sock")
+    orphan = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; from pathlib import Path; "
+        "from merlin_tui.local_control import _acquire_daemon_lock; "
+        f"lock = _acquire_daemon_lock(Path({str(path)!r})); "
+        "print('locked', flush=True); time.sleep(60)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    starts = []
+
+    def verify_fixture_owner(socket_path):
+        return socket_path == path and _daemon_lock_owner(path) == orphan.pid
+
+    async def start(socket_path):
+        assert socket_path == path
+        assert await asyncio.to_thread(_daemon_lock_released, path)
+        assert await orphan.wait() is not None
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control._verified_daemon_owner", verify_fixture_owner)
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    try:
+        async with asyncio.timeout(5):
+            assert await orphan.stdout.readline() == b"locked\n"
+            assert await asyncio.to_thread(_daemon_lock_owner, path) == orphan.pid
+            await restart_daemon(path)
+            assert starts == [path]
+    finally:
+        if orphan.returncode is None:
+            orphan.kill()
+            await orphan.wait()
+        await asyncio.to_thread(path.with_suffix(".lock").unlink, missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    ("uid_offset", "command", "is_self", "expected"),
+    [
+        (0, "/usr/bin/python -m merlin_tui.local_control daemon", False, True),
+        (0, "/Applications/Merlin/merlin-runtime daemon", False, True),
+        (1, "/usr/bin/python -m merlin_tui.local_control daemon", False, False),
+        (0, "/usr/bin/python unrelated.py", False, False),
+        (0, "/usr/bin/python -m merlin_tui.local_control daemon", True, False),
+    ],
+)
+def test_restart_orphan_verifies_daemon_identity(
+    monkeypatch, uid_offset, command, is_self, expected
+) -> None:
+    from merlin_tui.local_control import _verified_daemon_owner
+
+    pid = os.getpid() if is_self else os.getpid() + 100000
+    monkeypatch.setattr("merlin_tui.local_control._daemon_lock_owner", lambda _: pid)
+    monkeypatch.setattr(
+        "merlin_tui.local_control.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=f"{os.getuid() + uid_offset} {command}\n"
+        ),
+    )
+
+    assert _verified_daemon_owner(Path("/tmp/merlin-orphan-identity.sock")) is expected
+
+
+def test_restart_orphan_rechecks_lock_owner_after_process_identity(monkeypatch) -> None:
+    from merlin_tui.local_control import _verified_daemon_owner
+
+    owners = iter([os.getpid() + 100000, os.getpid() + 100001])
+    monkeypatch.setattr("merlin_tui.local_control._daemon_lock_owner", lambda _: next(owners))
+    monkeypatch.setattr(
+        "merlin_tui.local_control.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=f"{os.getuid()} /usr/bin/python -m merlin_tui.local_control daemon\n"
+        ),
+    )
+
+    assert not _verified_daemon_owner(Path("/tmp/merlin-orphan-changed-identity.sock"))
+
+
+@pytest.mark.asyncio
+async def test_ping_accepts_slow_live_daemon_response() -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import _ping
+
+    path = Path(f"/tmp/merlin-slow-ping-{uuid4().hex[:12]}.sock")
+    peers = []
+
+    async def slow_peer(reader, writer):
+        peers.append(asyncio.current_task())
+        try:
+            assert json.loads(await reader.readline()) == {"method": "ping"}
+            await asyncio.sleep(0.6)
+            writer.write(
+                (
+                    json.dumps({"type": "result", "value": "pong", "protocol": PROTOCOL_VERSION})
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+        finally:
+            await _close_writer(writer)
+
+    server = await asyncio.start_unix_server(slow_peer, path)
+    try:
+        assert await _ping(path)
+    finally:
+        server.close()
+        await server.wait_closed()
+        await asyncio.gather(*peers)
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_ping_closes_connection_after_probe_timeout(monkeypatch) -> None:
+    from merlin_tui.local_control import _ping
+
+    closed = []
+
+    class Writer:
+        def write(self, value):
+            assert json.loads(value) == {"method": "ping"}
+
+        async def drain(self):
+            return None
+
+    writer = Writer()
+
+    async def connect(*args, **kwargs):
+        return object(), writer
+
+    async def timeout_probe(awaitable, **kwargs):
+        assert kwargs["timeout"] == 5.0
+        awaitable.close()
+        raise TimeoutError
+
+    async def close_writer(value):
+        closed.append(value)
+
+    monkeypatch.setattr("merlin_tui.local_control.asyncio.open_unix_connection", connect)
+    monkeypatch.setattr("merlin_tui.local_control.asyncio.wait_for", timeout_probe)
+    monkeypatch.setattr("merlin_tui.local_control._close_writer", close_writer)
+
+    assert not await _ping(Path("/tmp/merlin-ping-timeout.sock"))
+    assert closed == [writer]

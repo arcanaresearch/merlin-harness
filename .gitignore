@@ -35,3 +35,7 @@ tmp
 *.sock.lock
 # Derived from the source packs by scripts/encrypt-builtin-packs.py
 *.rpk.enc
+
+# Browser workspace dependencies and packaged generated UI
+node_modules/
+/apps/merlin-web/src/merlin_web/static/

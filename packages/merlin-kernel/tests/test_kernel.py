@@ -4436,3 +4436,93 @@ async def test_orphan_tool_results_dropped_with_context_loader_projection() -> N
         message.role == "tool" and message.tool_call_id == "ghost-2"
         for message in store.messages[session]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_structured_question_pauses_then_continues_from_exact_answer(dynamic):
+    from merlin_contracts.user_input import (
+        InputRequest,
+        InputResponse,
+        answer_prompt,
+        pending_input,
+    )
+
+    request_value = InputRequest(
+        request_id="q1",
+        questions=[
+            {
+                "id": "auth",
+                "question": "Which authentication path?",
+                "options": [
+                    {"id": "saved", "label": "Saved session"},
+                    {"id": "browser", "label": "Browser sign-in"},
+                ],
+            }
+        ],
+    )
+    calls, invoked = [], []
+
+    class QuestionTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="request_user_input",
+                    description="Ask operator",
+                    input_schema={"type": "object"},
+                ),
+                ToolSpec(
+                    name="must_not_run", description="Must wait", input_schema={"type": "object"}
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            invoked.append(name)
+            value = {"status": "awaiting_input", "request": request_value.model_dump()}
+            return ToolResult(content=json.dumps(value), metadata=value)
+
+    class QuestionProvider:
+        async def stream(self, request):
+            calls.append(request)
+            if len(calls) == 1:
+                yield ToolCall(name="request_user_input", call_id="q1", arguments={})
+                yield ToolCall(name="must_not_run", call_id="deferred", arguments={})
+            else:
+                assert '"saved"' in request.messages[-1].content
+                yield TextDelta(text="Continuing with the saved session.")
+            yield ModelCompleted()
+
+    class DynamicQuestionProvider(QuestionProvider):
+        async def stream_with_tools(self, request, handler):
+            calls.append(request)
+            if len(calls) == 1:
+                await handler(ToolCall(name="request_user_input", call_id="q1", arguments={}))
+                pytest.fail("Provider must stop when question is saved")
+            else:
+                assert '"saved"' in request.messages[-1].content
+                yield TextDelta(text="Continuing with the saved session.")
+                yield ModelCompleted()
+
+    store = Store()
+    kernel = Kernel(
+        DynamicQuestionProvider() if dynamic else QuestionProvider(),
+        store,
+        QuestionTools(),
+        Settings(),
+    )
+    await kernel.start()
+    await kernel.submit("Inspect the existing target")
+    await kernel.wait_for_turn()
+    assert len(calls) == 1 and invoked == ["request_user_input"]
+    saved = await store.load_messages(kernel.session_id)
+    pending = pending_input(saved)
+    assert pending == request_value
+    # All batched calls have results, including the explicitly deferred call.
+    call_ids = {call["id"] for message in saved for call in message.tool_calls or []}
+    assert call_ids == {message.tool_call_id for message in saved if message.role == "tool"}
+    response = InputResponse(request_id="q1", answers={"auth": {"option_ids": ["saved"]}})
+    await kernel.submit(answer_prompt(pending, response))
+    await kernel.wait_for_turn()
+    assert len(calls) == 2
+    assert pending_input(await store.load_messages(kernel.session_id)) is None
+    assert not any(event.type == "error" for event in store.events)

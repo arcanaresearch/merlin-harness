@@ -313,6 +313,45 @@ class MessageRepository:
         )
         self.connection.commit()
 
+    def history_page(
+        self,
+        session_id: UUID | str,
+        *,
+        limit: int = 50,
+        before: int | None = None,
+        exclude_current_turn: bool = False,
+    ) -> dict[str, Any]:
+        """Read bounded original transcript rows using a stable sequence cursor."""
+        if not 1 <= limit <= 100 or (before is not None and before < 1):
+            raise ValueError("history requires limit 1-100 and a positive before cursor")
+        rows = self.connection.execute(
+            """WITH visible AS (
+                   SELECT m.* FROM merlin_storage.messages m
+                   JOIN merlin_storage.sessions s ON s.id = m.session_id
+                   WHERE m.session_id = %s AND m.role <> 'system'
+                     AND m.sequence <= COALESCE(s.projection_head, m.sequence)
+               )
+               SELECT sequence, id, role, content, name, reasoning_content, created_at
+               FROM visible
+               WHERE (%s::bigint IS NULL OR sequence < %s)
+                 AND (NOT %s OR sequence < (
+                     SELECT max(sequence) FROM visible WHERE role = 'user'
+                 ))
+               ORDER BY sequence DESC LIMIT %s""",
+            (session_id, before, before, exclude_current_turn, limit + 1),
+        ).fetchall()
+        more = len(rows) > limit
+        selected = list(reversed(rows[:limit]))
+        return {
+            "session_id": str(session_id),
+            "messages": [
+                {**row, "id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+                for row in selected
+            ],
+            "before": int(selected[0]["sequence"]) if selected else None,
+            "has_more": more,
+        }
+
     def provenance(self, session_id: UUID | str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """SELECT sequence, role, id, source_message_id

@@ -57,6 +57,7 @@ WRITE_OPERATIONS = (
     "decide_campaign_saturation",
     "export_campaign_report",
     "takeover_browser_context",
+    "resume_browser_context",
 )
 
 
@@ -276,7 +277,9 @@ class OperatorCommandTool:
                 "Translate their natural language into the documented command, resolve exact IDs "
                 "with read tools, and never guess ambiguous recipients. This queues the SAME TUI "
                 "command path after this response; menus and confirmations remain interactive. "
-                "The receipt means queued, not executed. Do not claim completion yet. Never use "
+                "The receipt means queued, not executed. Do not claim completion yet. Browser "
+                "resume must use operator_runtime resume_browser_context instead, so its result "
+                "returns in this turn and you can continue the pending work. Never use "
                 "this for shell commands. For campaign profiles/modes use campaign_configure, "
                 "then assessment_prepare and a fresh review. Available commands:\n"
                 + "\n".join(f"{c}: {self._hints.get(c, '')}" for c in self._commands)
@@ -298,6 +301,12 @@ class OperatorCommandTool:
             parts = shlex.split(command)
             if not parts or parts[0] not in self._roots:
                 raise ValueError("unknown Merlin command; consult the tool's available commands")
+            if parts[:2] == ["/browser", "resume"]:
+                raise ValueError(
+                    "Use operator_runtime with operation=resume_browser_context and "
+                    "arguments={context_id: CONTEXT}; await its result, then continue "
+                    "the pending work. Browser resume cannot be queued after this turn."
+                )
             if not context.call_id:
                 raise ValueError("a durable request identity is required")
             result = {"status": "queued", "command": command.strip(), "request_id": context.call_id}
@@ -338,8 +347,11 @@ class OperatorRuntimeTool:
                 "IDs or change scope. Provider credentials must use operator_command /setup, "
                 "which opens secure input. Profile/mode changes use campaign_configure and a new "
                 "review. Session switching, new session, and other interface operations use "
-                "operator_command. Report only the returned result. Available signatures:\n"
-                + signatures
+                "operator_command. For browser hand-back use resume_browser_context: await "
+                "the returned result, then verify the target session and continue the pending "
+                "work in this turn. If resume fails, explain the error and retain operator "
+                "control; never claim it succeeded. Report only observed results. "
+                "Available signatures:\n" + signatures
             ),
             input_schema={
                 "type": "object",

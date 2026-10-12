@@ -112,10 +112,13 @@ def main() -> None:
         print("running" if asyncio.run(_ping(_SOCKET)) else "stopped")
         return
     if sys.argv[1:] == ["restart"]:
-        from .local_control import ensure_daemon, stop_daemon
+        from .local_control import restart_daemon
 
-        asyncio.run(stop_daemon())
-        asyncio.run(ensure_daemon())
+        try:
+            asyncio.run(restart_daemon())
+        except (RuntimeError, TimeoutError) as error:
+            print(f"Merlin could not restart: {error}", file=sys.stderr)
+            raise SystemExit(1) from None
         print("Merlin daemon ready")
         return
     if sys.argv[1:] in (["storage", "stop"], ["storage", "purge"]):

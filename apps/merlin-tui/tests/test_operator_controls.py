@@ -279,3 +279,107 @@ async def test_production_chat_path_does_not_require_exact_profile_keywords():
     prompt = "Run a full redpen scan on https://target.test with a self-selected team"
     assert [event async for event in backend.stream(prompt)] == []
     assert kernel.submissions == [prompt]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_fails", [False, True])
+async def test_browser_handback_result_reaches_model_and_continues_same_turn(
+    resume_fails, monkeypatch
+):
+    monkeypatch.setattr("merlin_kernel.kernel._load_jev_client", lambda: None)
+    from merlin_contracts import ModelCompleted, TextDelta, ToolCall
+    from merlin_kernel import Kernel
+    from merlin_tools import ToolBroker
+
+    class Store:
+        def __init__(self):
+            self.messages = []
+
+        async def create_session(self, **kwargs):
+            return "session-test"
+
+        async def load_messages(self, session_id):
+            return self.messages
+
+        async def append_message(self, session_id, message):
+            self.messages.append(message)
+
+        async def append_event(self, session_id, event):
+            pass
+
+    calls = []
+    browser = SimpleNamespace(
+        resume=AsyncMock(
+            return_value={"context_id": "browser-exact", "worker_id": "agent:browser"},
+            side_effect=RuntimeError("Return to the target before resuming")
+            if resume_fails
+            else None,
+        ),
+        list_tabs=AsyncMock(return_value=[]),
+    )
+
+    class Provider:
+        async def stream(self, request):
+            calls.append(request)
+            if len(calls) == 1:
+                yield ToolCall(
+                    call_id="old-path",
+                    name="operator_command",
+                    arguments={"command": "/browser resume browser-exact"},
+                )
+            elif len(calls) == 2:
+                assert "resume_browser_context" in request.messages[-1].content
+                yield ToolCall(
+                    call_id="hand-back",
+                    name="operator_runtime",
+                    arguments={
+                        "operation": "resume_browser_context",
+                        "arguments": {"context_id": "browser-exact"},
+                    },
+                )
+            elif len(calls) == 3:
+                result = json.loads(request.messages[-1].content)
+                if resume_fails:
+                    assert result["status"] == "failed"
+                    yield TextDelta(text="Browser is still yours: return to the target first.")
+                else:
+                    assert result["status"] == "completed"
+                    assert result["result"]["owner"] == "agent:browser"
+                    yield ToolCall(call_id="verify-session", name="browser_snapshot", arguments={})
+            else:
+                assert request.messages[-1].content == "Authenticated target session observed"
+                yield TextDelta(text="Session verified; reconnaissance continues.")
+            yield ModelCompleted()
+
+    class Snapshot:
+        effect = "workspace_read"
+
+        def describe(self):
+            return ToolSpec(
+                name="browser_snapshot", description="Fixture observation", input_schema={}
+            )
+
+        async def invoke(self, ctx, args):
+            browser.resume.assert_awaited_once_with("session-test", "browser-exact")
+            return ToolResult(content="Authenticated target session observed")
+
+    broker, store = ToolBroker(), Store()
+    settings = SimpleNamespace(get_model=AsyncMock(return_value="fixture-model"))
+    kernel = Kernel(Provider(), store, broker, settings)
+    backend = KernelBackend(kernel, browser=browser, operator_controls=True)
+    broker.register(OperatorCommandTool(COMMANDS, COMMAND_HINTS))
+    broker.register(OperatorRuntimeTool(backend, read_only=False))
+    broker.register(Snapshot())
+    await kernel.start()
+    await kernel.submit("Signed in. Hand the browser back and continue reconnaissance.")
+    await kernel.wait_for_turn()
+    assert len(calls) == (3 if resume_fails else 4)
+    assert len([message for message in store.messages if message.role == "user"]) == 1
+    assert store.messages[-1].content == (
+        "Browser is still yours: return to the target first."
+        if resume_fails
+        else "Session verified; reconnaissance continues."
+    )
+    browser.resume.assert_awaited_once_with("session-test", "browser-exact")
+    if resume_fails:
+        browser.list_tabs.assert_not_awaited()

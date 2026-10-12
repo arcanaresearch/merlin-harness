@@ -9,6 +9,7 @@ from typing import Any
 from merlin_agents.swarm_snapshot import SwarmSnapshot
 from merlin_config import Config
 from merlin_contracts import AppEvent
+from merlin_contracts.user_input import ANSWER_PREFIX, InputResponse, pending_input
 from merlin_kernel import Kernel
 from merlin_readiness import ResourceCloser
 from merlin_readiness import sanitize as sanitize_readiness
@@ -223,6 +224,14 @@ class KernelBackend:
             await self.interrupt()
             yield StreamEvent(kind="status", text="Foreground interruption acknowledged.")
             return
+        pending = None
+        if hasattr(self.kernel, "_store") and self.kernel.session_id:
+            pending = pending_input(await self.kernel._store.load_messages(self.kernel.session_id))
+        if prompt.startswith(ANSWER_PREFIX):
+            if pending is None:
+                raise ValueError("This question is no longer pending; refresh before answering")
+            response = InputResponse.model_validate_json(prompt[len(ANSWER_PREFIX) :])
+            response.validate_for(pending)
         campaign_selection = False
         if prompt.strip() == "/new":
             self._pending_campaign_objective = None
@@ -324,6 +333,8 @@ class KernelBackend:
             )
             await self.kernel.wait_for_turn()
         await self.kernel.submit(prompt)
+        if pending is not None and not prompt.startswith("/"):
+            yield StreamEvent("user_input_resolved", pending.request_id)
         if campaign_selection:
             self._pending_campaign_objective = None
             self._pending_route_preflight = None
@@ -408,6 +419,11 @@ class KernelBackend:
                     ),
                 )
 
+        if prompt.strip().startswith("/resume ") and hasattr(self.kernel, "_store"):
+            pending = pending_input(await self.kernel._store.load_messages(self.kernel.session_id))
+            if pending is not None:
+                yield StreamEvent("user_input", pending.model_dump_json())
+
     async def _saved_campaign_review(
         self, campaign_id: str, manifest_digest: str
     ) -> Mapping[str, object] | None:
@@ -475,6 +491,8 @@ class KernelBackend:
 
     async def steer(self, text: str) -> bool:
         """Queue operator input without replacing the active event stream."""
+        if text.startswith(ANSWER_PREFIX):
+            raise ValueError("This answer cannot be sent as guidance; wait for the current turn")
         return await self.kernel.steer(text)
 
     async def interrupt(self) -> None:
@@ -1054,13 +1072,18 @@ class KernelBackend:
         session_id = self.kernel.session_id or ""
         return tuple(_finding_view(item) for item in await self._findings.list_findings(session_id))
 
-    async def list_reports(self) -> tuple[ReportView, ...]:
+    async def list_reports(self, *, session_only: bool = False) -> tuple[ReportView, ...]:
         durable: list[ReportView] = []
         if self._report_repository is not None and self._campaigns is not None:
             # Reports are durable campaign artifacts, not console-chat artifacts.
             # A daemon restart creates a new console session, but must not hide the
             # completed campaign's report from acceptance or the operator.
-            for campaign in await self._campaigns.list_all():
+            campaigns = (
+                await self._campaigns.list(self.kernel.session_id or "", limit=None)
+                if session_only
+                else await self._campaigns.list_all()
+            )
+            for campaign in campaigns:
                 revisions = await asyncio.to_thread(
                     self._report_repository.list, str(campaign["campaign_id"])
                 )
@@ -1260,6 +1283,15 @@ class KernelBackend:
         tabs = await self._browser.list_tabs(session_id, context_id)
         return _browser_context_view(context, tabs)
 
+    async def resume_browser_context(self, context_id: str) -> BrowserContextView:
+        """Hand control back within the tool turn so the model sees the outcome."""
+        if self._browser is None:
+            raise RuntimeError("browser support is not configured")
+        session_id = self.kernel.session_id or ""
+        context = await self._browser.resume(session_id, context_id)
+        tabs = await self._browser.list_tabs(session_id, context_id)
+        return _browser_context_view(context, tabs)
+
     async def list_memory_records(self, status: str | None = None) -> tuple[MemoryRecordView, ...]:
         if self._memory is None:
             return ()
@@ -1349,6 +1381,27 @@ class KernelBackend:
             str(page.get("query", query)),
         )
 
+    async def conversation_history(
+        self,
+        *,
+        limit: int = 50,
+        before: int | None = None,
+        session_id: str | None = None,
+        exclude_current_turn: bool = False,
+    ) -> Mapping[str, object]:
+        active = self.kernel.session_id or ""
+        if session_id is not None and session_id != active:
+            raise ValueError("The active session changed; reload its conversation")
+        loader = getattr(getattr(self.kernel, "_store", None), "load_history_page", None)
+        if loader is None or not active:
+            return {"session_id": active, "messages": [], "before": None, "has_more": False}
+        value = await loader(
+            active, limit=limit, before=before, exclude_current_turn=exclude_current_turn
+        )
+        if (self.kernel.session_id or "") != active:
+            raise ValueError("The active session changed; reload its conversation")
+        return dict(sanitize_readiness(value))
+
     async def conversation_context(self) -> Mapping[str, object]:
         if self._readiness is None or not hasattr(self._readiness, "context"):
             return {
@@ -1384,37 +1437,25 @@ class KernelBackend:
             self._report_history.append(view)
 
     async def _recover_agents(self) -> None:
-        # Campaign recovery first fences any scheduler left active behind a
-        # terminal campaign row. Generic scheduler recovery must never revive
-        # those workers before ownership reconciliation.
-        if self._campaigns is not None and not self._campaigns_recovered:
-            await self._campaigns.recover()
-            self._campaigns_recovered = True
+        if not self._campaigns_recovered or not self._agents_recovered:
+            await self.recover_background()
+
+    async def recover_background(self) -> None:
+        if self.kernel.session_id is None:
+            await self.kernel.start()
+        # The first pass pauses persisted target work before reopening any
+        # schedules. Explicit session/campaign resume restores execution. Later
+        # watchdog passes still repair supervisors started in this daemon.
+        if self._campaigns is not None:
+            await self._campaigns.recover(resume_execution=self._campaigns_recovered)
+        self._campaigns_recovered = True
         if not self._agents_recovered:
             if self._agent_store is not None:
                 await self._agent_store.recover()
             if self._agents is not None:
                 recover = getattr(self._agents, "recover", None)
                 if callable(recover):
-                    await recover()
-            self._agents_recovered = True
-
-    async def recover_background(self) -> None:
-        if self.kernel.session_id is None:
-            await self.kernel.start()
-        # Campaign supervision is a renewable ownership lease. Reconcile it on
-        # every watchdog pass so a coroutine that dies after daemon startup
-        # cannot leave an executing campaign permanently ownerless.
-        if self._campaigns is not None:
-            await self._campaigns.recover()
-            self._campaigns_recovered = True
-        if not self._agents_recovered:
-            if self._agent_store is not None:
-                await self._agent_store.recover()
-            elif self._agents is not None:
-                recover = getattr(self._agents, "recover", None)
-                if callable(recover):
-                    await recover()
+                    await recover(resume_execution=False)
             self._agents_recovered = True
 
     async def campaign_status(self, campaign_id: str) -> Mapping[str, object]:
@@ -1461,7 +1502,7 @@ class KernelBackend:
             return ()
         campaigns = []
         progress_reader = getattr(self._campaigns, "wave_progress", None)
-        for item in await self._campaigns.list_all():
+        for item in await self._campaigns.list(self.kernel.session_id, limit=None):
             if str(item["session_id"]) != self.kernel.session_id:
                 continue
             progress = {}
@@ -1587,6 +1628,13 @@ def event_to_stream(event: AppEvent) -> StreamEvent | None:
     if event.type == "tool":
         name = str(payload.get("name", "tool"))
         state = str(payload.get("state", "updated"))
+        if state == "completed" and name == "request_user_input":
+            try:
+                receipt = json.loads(text)
+                if receipt.get("status") == "awaiting_input":
+                    return StreamEvent("user_input", json.dumps(receipt["request"]))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                pass
         if state == "completed" and name in {"operator_command", "campaign_configure"}:
             try:
                 control = json.loads(text)

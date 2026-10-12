@@ -754,6 +754,8 @@ class BrowserSession:
             return
 
     async def _record_response(self, response: Response) -> None:
+        if self.owner.worker_id == "operator":
+            return  # Manual sign-in traffic is not reconnaissance evidence.
         parsed = urlsplit(response.url)
         event: dict[str, object] = {
             # A navigation response can arrive before Playwright has created its Frame.
@@ -794,6 +796,11 @@ class BrowserSession:
         self._route_installed = True
 
     async def _route_request(self, route: Route, request: Request) -> None:
+        if self.owner.worker_id == "operator" and urlsplit(request.url).scheme in {"http", "https"}:
+            # Takeover is manual browser control, including external OAuth.
+            # Tool acquisition remains blocked until explicit hand-back.
+            await route.continue_()
+            return
         denied = False
         try:
             self._require_url(request.url, allow_blank=True)

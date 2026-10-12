@@ -8689,3 +8689,58 @@ def test_browser_oracle_predicates_fail_closed_when_malformed() -> None:
     assert error is None
     assert len(predicates) == 1
     assert predicates[0]["purpose"] == "objective"
+
+
+@pytest.mark.asyncio
+async def test_operator_takeover_allows_external_login_and_restores_automation_bounds() -> None:
+    class MetadataStore:
+        def __init__(self):
+            self.items = {}
+
+        async def save_metadata(self, value):
+            self.items[value.context_id] = value
+
+        async def load_metadata(self, context_id):
+            return self.items.get(context_id)
+
+        async def list_metadata(self, session_id):
+            return [item for item in self.items.values() if item.owner.session_id == session_id]
+
+    async with web_fixture() as target, web_fixture(b"<h1>External login</h1>") as login:
+
+        async def targets(_):
+            return BrowserBounds(target_id="target", allowed_origins={target})
+
+        service = BrowserService(MetadataStore(), targets)
+        try:
+            session = await service.for_tool("s1")
+            tab = await session.new_tab(target)
+            page = session._tabs[tab]
+            with pytest.raises(Exception, match="ERR_BLOCKED_BY_CLIENT"):
+                await page.goto(login)
+            await page.close()
+            tab = await session.new_tab(target)
+            page = session._tabs[tab]
+            await service.takeover("s1", session.context_id)
+            with pytest.raises(BrowserBoundaryError, match="operator control"):
+                await service.for_tool("s1")
+            with pytest.raises(BrowserBoundaryError, match="operator control"):
+                await service._transfer_session_ownership("s2", session)
+            await page.goto(login)
+            assert await page.locator("h1").last.inner_text() == "External login"
+            with pytest.raises(OriginDenied):
+                await service.resume("s1", session.context_id)
+            assert session.owner.worker_id == "operator"
+            events_before = tuple(session._network_events)
+            # Response capture must not inspect or retain manual sign-in data.
+            await session._record_response(SimpleNamespace(url="https://login.test/token"))
+            assert tuple(session._network_events) == events_before
+            await page.goto(target)
+            await service.resume("s1", session.context_id)
+            assert await service.for_tool("s1") is session
+            assert session.owner.worker_id == "agent:browser"
+            assert session.bounds.allowed_origins == frozenset({target})
+            with pytest.raises(Exception, match="ERR_BLOCKED_BY_CLIENT"):
+                await page.goto(login)
+        finally:
+            await service.close()

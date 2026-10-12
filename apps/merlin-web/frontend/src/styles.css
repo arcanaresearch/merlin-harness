@@ -1,0 +1,880 @@
+@import 'tailwindcss';
+
+/**
+ * Pirateboys Scanner desktop renderer — design tokens (single source of truth).
+ *
+ * Architecture (adapted from the Hermes desktop system):
+ *   ~20 SEED vars per theme (`--pb-seed-*`, accent, base ink, neutrals) are the
+ *   only raw hex values. EVERY surface, text, stroke, and interaction token is
+ *   DERIVED from the seeds via color-mix(in srgb, …), so a theme is re-tuned by
+ *   moving a handful of seeds, never by editing call sites.
+ *
+ * Themes:
+ *   pirate-light (default — declared on :root, no attribute needed)
+ *   pirate-dark  (:root[data-theme='pirate-dark'])
+ * Switch with setTheme() from '@/shell/theme'; the attribute lives on
+ * document.documentElement.
+ *
+ * Tailwind 4 mapping: the @theme block below turns the --ui-* vars into utility
+ * classes (bg-surface-*, text-content-*, border-stroke-*, …). There is no
+ * tailwind.config — this file is the whole mapping. The overlay-elevation vars
+ * are named --pb-shadow-* (not --shadow-*) so the @theme keys --shadow-float /
+ * --shadow-menu can reference them without a self-reference cycle.
+ *
+ * Global rules that could affect other surfaces are scoped to `.pb-app`, the
+ * class the AppShell root carries. Portal content (menus, tooltips, dialogs,
+ * toasts) renders to <body> outside `.pb-app`; those primitives carry their own
+ * token classes via `.pb-portal`.
+ *
+ * Named contract: every token here is documented in ../DESIGN.md. If you
+ * add/rename/remove a token, update DESIGN.md in the same change.
+ */
+
+@theme {
+  /* ---------------------------------------------------------------------
+     Tailwind vocabulary → token vars. Values are var() references, so both
+     themes resolve at runtime from the same class names.
+
+     bg-surface-{chrome,sidebar,elevated,popover,primary..quinary,hover,active}
+     bg-surface-bar   bg-surface-{widget,code}   bg-bubble-user
+     bg-control-{hover,active}
+     text-content-{primary..quaternary,disabled}
+     border-stroke-{primary..quaternary}   (also bg-/text- where useful)
+     bg-accent / text-accent / bg-accent-soft / bg-accent-disabled /
+       text-accent-foreground / text-accent-disabled-foreground
+     {bg,text,border}-sev-{red,orange,yellow,green,cyan,blue,purple}(-soft)
+     text-sev-{...}-text   (readable pair for the matching -soft fill)
+     text-pb-{display,page,section,body,caption,micro}   (type scale)
+     rounded-{control,iconbtn,menu,dialog}
+     shadow-{float,menu,pb-sm}   border-(--stroke-float) for overlay hairlines
+     font-{pb,pbmono,kbd}
+     animate-{zoom-in,zoom-out,fade-in,fade-out,toast-in-top,toast-in-bottom,
+              toast-out,pulse-finite,skeleton-pulse}
+     ------------------------------------------------------------------ */
+
+  --color-surface-chrome: var(--ui-bg-chrome);
+  --color-surface-sidebar: var(--ui-bg-sidebar);
+  --color-surface-elevated: var(--ui-bg-elevated);
+  --color-surface-popover: var(--ui-bg-popover);
+  --color-surface-primary: var(--ui-bg-primary);
+  --color-surface-secondary: var(--ui-bg-secondary);
+  --color-surface-tertiary: var(--ui-bg-tertiary);
+  --color-surface-quaternary: var(--ui-bg-quaternary);
+  --color-surface-quinary: var(--ui-bg-quinary);
+  --color-surface-bar: var(--ui-bg-bar);
+  --color-surface-hover: var(--ui-row-hover-background);
+  --color-surface-active: var(--ui-row-active-background);
+  /* Content surfaces: chat/scan cards, inline code, the user's own bubble. */
+  --color-surface-widget: var(--ui-bg-widget);
+  --color-surface-code: var(--ui-bg-code);
+  --color-bubble-user: var(--ui-bubble-user);
+
+  --color-control-hover: var(--ui-control-hover-background);
+  --color-control-active: var(--ui-control-active-background);
+
+  --color-content-primary: var(--ui-text-primary);
+  --color-content-secondary: var(--ui-text-secondary);
+  --color-content-tertiary: var(--ui-text-tertiary);
+  --color-content-quaternary: var(--ui-text-quaternary);
+  --color-content-disabled: var(--ui-text-disabled);
+
+  --color-stroke-primary: var(--ui-stroke-primary);
+  --color-stroke-secondary: var(--ui-stroke-secondary);
+  --color-stroke-tertiary: var(--ui-stroke-tertiary);
+  --color-stroke-quaternary: var(--ui-stroke-quaternary);
+
+  --color-accent: var(--ui-accent);
+  --color-accent-soft: var(--ui-accent-soft);
+  --color-accent-disabled: var(--ui-accent-disabled);
+  --color-accent-disabled-foreground: var(--ui-accent-disabled-foreground);
+  --color-accent-foreground: var(--ui-accent-foreground);
+
+  --color-sev-red: var(--ui-red);
+  --color-sev-red-soft: var(--ui-red-soft);
+  --color-sev-orange: var(--ui-orange);
+  --color-sev-orange-soft: var(--ui-orange-soft);
+  --color-sev-yellow: var(--ui-yellow);
+  --color-sev-yellow-soft: var(--ui-yellow-soft);
+  --color-sev-green: var(--ui-green);
+  --color-sev-green-soft: var(--ui-green-soft);
+  --color-sev-cyan: var(--ui-cyan);
+  --color-sev-cyan-soft: var(--ui-cyan-soft);
+  --color-sev-blue: var(--ui-blue);
+  --color-sev-blue-soft: var(--ui-blue-soft);
+  --color-sev-purple: var(--ui-purple);
+  --color-sev-purple-soft: var(--ui-purple-soft);
+
+  /* Readable text ON a -soft fill of the same tone. See --pb-sev-text-mix. */
+  --color-sev-red-text: var(--ui-red-text);
+  --color-sev-orange-text: var(--ui-orange-text);
+  --color-sev-yellow-text: var(--ui-yellow-text);
+  --color-sev-green-text: var(--ui-green-text);
+  --color-sev-cyan-text: var(--ui-cyan-text);
+  --color-sev-blue-text: var(--ui-blue-text);
+  --color-sev-purple-text: var(--ui-purple-text);
+
+  --font-pb: var(--font-pb-sans);
+  --font-pbmono: var(--font-pb-mono);
+  --font-kbd: var(--font-pb-kbd);
+
+  /* ---------------------------------------------------------------------
+     Type scale — 5 steps + 1. Every readable string picks a step; ad-hoc
+     text-[Npx] on readable copy is a review blocker. 10px survives ONLY as
+     the uppercase eyebrow baked into PageHeader / section labels.
+     --text-pb-display is the "+1": hero and welcome moments only (intro
+     headline, onboarding step headlines, boot/pairing titles). Pair it with
+     tracking-[-0.02em]. A page title is text-pb-page, not display — if two
+     display headlines can be on screen at once, one of them is wrong.
+     ------------------------------------------------------------------ */
+  --text-pb-display: 24px;
+  --text-pb-display--line-height: 30px;
+  --text-pb-page: 17px;
+  --text-pb-page--line-height: 24px;
+  --text-pb-section: 13px;
+  --text-pb-section--line-height: 20px;
+  --text-pb-body: 13px;
+  --text-pb-body--line-height: 20px;
+  --text-pb-caption: 12px;
+  --text-pb-caption--line-height: 16px;
+  --text-pb-micro: 11px;
+  --text-pb-micro--line-height: 16px;
+
+  --radius-control: 2.5px;
+  --radius-iconbtn: 4px;
+  --radius-menu: 8px;
+  --radius-dialog: 12px;
+
+  --shadow-float: var(--pb-shadow-float);
+  --shadow-menu: var(--pb-shadow-menu);
+  --shadow-pb-sm: var(--pb-shadow-sm);
+
+  --animate-zoom-in: pb-zoom-in var(--pb-motion-overlay) var(--pb-ease-out);
+  --animate-fade-in: pb-fade-in var(--pb-motion-overlay) ease-out;
+  --animate-toast-in-top: pb-toast-in-top var(--pb-motion-overlay) var(--pb-ease-out);
+  --animate-toast-in-bottom: pb-toast-in-bottom var(--pb-motion-overlay) var(--pb-ease-out);
+  --animate-skeleton-pulse: pb-skeleton-pulse 1.6s ease-in-out infinite;
+
+  /* Exits. Every surface that animates in animates out; Radix primitives wire
+     these through data-[state=closed]. Exit is faster than entrance so
+     dismissal never feels like it lags the click. */
+  --animate-zoom-out: pb-zoom-out var(--pb-motion-exit) var(--pb-ease-out);
+  --animate-fade-out: pb-fade-out var(--pb-motion-exit) ease-out;
+  --animate-toast-out: pb-toast-out var(--pb-motion-exit) var(--pb-ease-out);
+  /* Attention beat for transient states. Finite by contract: 3 cycles, then
+     it rests at full opacity. Only genuinely live surfaces loop forever. */
+  --animate-pulse-finite: pb-pulse-finite 1.6s ease-in-out 3;
+}
+
+/* -----------------------------------------------------------------------
+   Overlay z ladder utilities. Tailwind 4 has no z theme namespace, so the
+   ladder rungs are explicit utilities over the --z-* vars. Floating surfaces
+   pick a rung; they never use ad-hoc z-index literals. Local stacking inside
+   one component stays on plain z-10/z-20.
+   --------------------------------------------------------------------- */
+@utility z-modal-backdrop {
+  z-index: var(--z-modal-backdrop);
+}
+@utility z-modal {
+  z-index: var(--z-modal);
+}
+@utility z-modal-popover {
+  z-index: var(--z-modal-popover);
+}
+@utility z-over-modal {
+  z-index: var(--z-over-modal);
+}
+@utility z-over-modal-content {
+  z-index: var(--z-over-modal-content);
+}
+@utility z-boot {
+  z-index: var(--z-boot);
+}
+@utility z-pairing {
+  z-index: var(--z-pairing);
+}
+@utility z-crash {
+  z-index: var(--z-crash);
+}
+
+:root {
+  color-scheme: light;
+
+  /* ---------------------------------------------------------------------
+     SEEDS — pirate-light. The only raw values in the system.
+     ------------------------------------------------------------------ */
+
+  /* Ink (foreground base) and accent. Accent: confident tool-console blue,
+     refined from the legacy #2B4BD8 — slightly deeper, slightly more violet. */
+  --pb-seed-base: #1b2434;
+  --pb-seed-accent: #2b47e0;
+  --pb-seed-accent-foreground: #fcfdff;
+
+  /* Surface seeds: near-white cool slate family. */
+  --pb-seed-background: #f2f4f6;
+  --pb-seed-sidebar: #dde1e9;
+  --pb-seed-elevated: #ffffff;
+  --pb-seed-neutral-chrome: #f2f4f6;
+  --pb-seed-neutral-sidebar: #dde1e9;
+  --pb-seed-neutral-elevated: #ffffff;
+
+  /* How much of each surface seed survives into the derived surface (rest is
+     the neutral). 100% = pure seed. */
+  --pb-mix-chrome: 100%;
+  --pb-mix-sidebar: 100%;
+  --pb-mix-elevated: 100%;
+
+  /* Fill ladder: how much ACCENT tints each fill level (over a faint base wash). */
+  --pb-fill-primary-accent-mix: 16%;
+  --pb-fill-secondary-accent-mix: 11%;
+  --pb-fill-tertiary-accent-mix: 8%;
+  --pb-fill-quaternary-accent-mix: 5%;
+  --pb-fill-quinary-accent-mix: 3%;
+
+  /* Stroke ladder: accent share of each hairline level. */
+  --pb-stroke-primary-accent-mix: 24%;
+  --pb-stroke-secondary-accent-mix: 16%;
+  --pb-stroke-tertiary-accent-mix: 10%;
+  --pb-stroke-quaternary-accent-mix: 6%;
+
+  /* Interaction washes. */
+  --pb-row-hover-accent-mix: 4%;
+  --pb-row-active-accent-mix: 8%;
+  --pb-control-hover-accent-mix: 6%;
+  --pb-control-active-accent-mix: 8%;
+
+  /* Input chrome knobs: resting border alpha (of base ink; hover doubles,
+     focus goes full) and recessed top inset shadow (removed on focus). */
+  --pb-input-border: 7%;
+  --pb-input-inset: inset 0 1px 1px color-mix(in srgb, #000 8%, transparent);
+
+  /* Selection. */
+  --pb-selection: color-mix(in srgb, var(--pb-seed-accent) 22%, transparent);
+
+  /* How much of a severity tone survives into its TEXT rung; the rest is base
+     ink. A tone that is legible as a 6px dot is not legible as 11px words on
+     a 12-16% wash of itself — so pill text pulls toward the ink until it
+     clears 4.5:1. One knob per theme retunes all seven tones. */
+  --pb-sev-text-mix: 54%;
+
+  /* Severity palette (light values; dark overrides below). */
+  --ui-red: #c43d4b;
+  --ui-orange: #c26a38;
+  --ui-yellow: #a67c1e;
+  --ui-green: #2f8a5b;
+  --ui-cyan: #357a8c;
+  --ui-blue: #2b47e0;
+  --ui-purple: #7c6bc9;
+
+  /* ---------------------------------------------------------------------
+     DERIVED — do not put raw hex below this line.
+     ------------------------------------------------------------------ */
+
+  --ui-base: var(--pb-seed-base);
+  --ui-accent: var(--pb-seed-accent);
+  --ui-accent-foreground: var(--pb-seed-accent-foreground);
+  /* Accent at fill-ladder strength, for selected/active accent surfaces. */
+  --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 11%, transparent);
+  /* A disabled primary button DESATURATES onto the chrome rather than going
+     translucent: opacity dimming keeps full chroma and still reads "press
+     me", which is the exact failure this token exists to prevent. 14% is
+     drained far enough that the fill sits 5.2:1 from the live accent (nobody
+     mistakes it for the primary) while staying 1.24:1 off the page, so it is
+     still legible AS a button. It was 40%, which measured only 3.3:1 from
+     the live accent and still read as a washed-out primary. */
+  --ui-accent-disabled: color-mix(in srgb, var(--ui-accent) 14%, var(--ui-bg-chrome));
+  /* The label ON that fill. Same relationship as --ui-accent-foreground has to
+     --ui-accent: it is keyed to the fill, not to a surface, so the pair
+     retunes together. One formula serves both themes because it is ink at a
+     fixed alpha — 70% lands 5.10:1 light / 6.26:1 dark on the disabled fill,
+     a hair below the live primary's own label (6.70 / 7.48) so it reads
+     muted-but-legible. Do NOT label a disabled primary with
+     --ui-text-disabled: that rung is keyed to ordinary surfaces and measures
+     only 3.09:1 here. A disabled control must still say what it does. */
+  --ui-accent-disabled-foreground: color-mix(in srgb, var(--ui-base) 70%, transparent);
+
+  /* Surfaces. */
+  --ui-bg-chrome: color-mix(in srgb, var(--pb-seed-background) var(--pb-mix-chrome), var(--pb-seed-neutral-chrome));
+  --ui-bg-sidebar: color-mix(in srgb, var(--pb-seed-sidebar) var(--pb-mix-sidebar), var(--pb-seed-neutral-sidebar));
+  --ui-bg-elevated: color-mix(in srgb, var(--pb-seed-elevated) var(--pb-mix-elevated), var(--pb-seed-neutral-elevated));
+  /* Popovers/menus float at 96% over a backdrop-blur. */
+  --ui-bg-popover: color-mix(in srgb, var(--ui-bg-elevated) 96%, transparent);
+
+  /* The bar plane — titlebar + statusbar. Chrome pulled 40% toward the
+     sidebar, so the shell reads as FOUR stepped planes (sidebar → bar → page
+     → elevated) instead of one fill separated by hairlines. Derived, so it
+     tracks any seed retune automatically. */
+  --ui-bg-bar: color-mix(in srgb, var(--ui-bg-sidebar) 40%, var(--ui-bg-chrome));
+
+  /* Content surfaces. These sit INSIDE a reading surface, so they are ink
+     washes, not accent washes — a scan card or a code span must not read as
+     a selected/active state. The one exception is the user's own chat
+     bubble, which is deliberately accent-tinted to mark authorship. */
+  --ui-bg-widget: color-mix(in srgb, var(--ui-base) 4%, var(--ui-bg-elevated));
+  --ui-bg-code: color-mix(in srgb, var(--ui-base) 6%, transparent);
+  --ui-bubble-user: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-bg-elevated));
+
+  /* Fill ladder — accent-tinted washes over a faint ink wash. */
+  --ui-bg-primary: color-mix(in srgb, var(--ui-accent) var(--pb-fill-primary-accent-mix), color-mix(in srgb, var(--ui-base) 10%, transparent));
+  --ui-bg-secondary: color-mix(in srgb, var(--ui-accent) var(--pb-fill-secondary-accent-mix), color-mix(in srgb, var(--ui-base) 7%, transparent));
+  --ui-bg-tertiary: color-mix(in srgb, var(--ui-accent) var(--pb-fill-tertiary-accent-mix), color-mix(in srgb, var(--ui-base) 5%, transparent));
+  --ui-bg-quaternary: color-mix(in srgb, var(--ui-accent) var(--pb-fill-quaternary-accent-mix), color-mix(in srgb, var(--ui-base) 4%, transparent));
+  --ui-bg-quinary: color-mix(in srgb, var(--ui-accent) var(--pb-fill-quinary-accent-mix), color-mix(in srgb, var(--ui-base) 3%, transparent));
+
+  /* Interaction washes. */
+  --ui-row-hover-background: color-mix(in srgb, var(--ui-accent) var(--pb-row-hover-accent-mix), color-mix(in srgb, var(--ui-base) 3%, transparent));
+  --ui-row-active-background: color-mix(in srgb, var(--ui-accent) var(--pb-row-active-accent-mix), color-mix(in srgb, var(--ui-base) 5%, transparent));
+  --ui-control-hover-background: color-mix(in srgb, var(--ui-accent) var(--pb-control-hover-accent-mix), color-mix(in srgb, var(--ui-base) 4%, transparent));
+  --ui-control-active-background: color-mix(in srgb, var(--ui-accent) var(--pb-control-active-accent-mix), color-mix(in srgb, var(--ui-base) 5%, transparent));
+
+  /* Text ladder — ink at descending alpha. Only the first three rungs are
+     for READABLE text (94/74/54% → 15.9 / 8.0 / 3.5:1 on light chrome).
+     --ui-text-quaternary is a GLYPH rung: 44% clears ~2.6:1 light / 3.9:1
+     dark, which is fine for a dot fill or a decorative chevron and is NOT
+     enough for a word. Anything a user has to read stops at tertiary.
+     --ui-text-disabled is the label of an UNAVAILABLE control. It is NOT
+     the dimmest rung — deliberately. A disabled button still has to say what
+     it does, so at 36% it was illegible (1.91:1 on the disabled fill). The
+     "disabled" signal is carried by the flat drained FILL, not by dimming
+     the text into nothing; 52% lands the label at 3.1:1 light / 4.2:1 dark
+     on that fill. Its closeness to tertiary is intentional and it is not a
+     duplicate: it is keyed to a different surface and retunes separately. */
+  --ui-text-primary: color-mix(in srgb, var(--ui-base) 94%, transparent);
+  --ui-text-secondary: color-mix(in srgb, var(--ui-base) 74%, transparent);
+  --ui-text-tertiary: color-mix(in srgb, var(--ui-base) 54%, transparent);
+  --ui-text-quaternary: color-mix(in srgb, var(--ui-base) 44%, transparent);
+  --ui-text-disabled: color-mix(in srgb, var(--ui-base) 52%, transparent);
+
+  /* Stroke ladder — accent-tinted hairlines in descending strength. */
+  --ui-stroke-primary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-primary-accent-mix), color-mix(in srgb, var(--ui-base) 13%, transparent));
+  --ui-stroke-secondary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-secondary-accent-mix), color-mix(in srgb, var(--ui-base) 9%, transparent));
+  --ui-stroke-tertiary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-tertiary-accent-mix), color-mix(in srgb, var(--ui-base) 7%, transparent));
+  --ui-stroke-quaternary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-quaternary-accent-mix), color-mix(in srgb, var(--ui-base) 4%, transparent));
+
+  --ui-selection-background: var(--pb-selection);
+
+  /* Severity soft fills (pill / banner backgrounds). */
+  --ui-red-soft: color-mix(in srgb, var(--ui-red) 12%, transparent);
+  --ui-orange-soft: color-mix(in srgb, var(--ui-orange) 12%, transparent);
+  --ui-yellow-soft: color-mix(in srgb, var(--ui-yellow) 14%, transparent);
+  --ui-green-soft: color-mix(in srgb, var(--ui-green) 12%, transparent);
+  --ui-cyan-soft: color-mix(in srgb, var(--ui-cyan) 12%, transparent);
+  --ui-blue-soft: color-mix(in srgb, var(--ui-blue) 10%, transparent);
+  --ui-purple-soft: color-mix(in srgb, var(--ui-purple) 12%, transparent);
+
+  /* Severity TEXT rungs — the readable pair for each -soft fill. Measured on
+     the worst surface of each theme: light 4.56-7.05:1, dark 4.59-5.80:1.
+     Pills/banners use {bg-sev-X-soft + text-sev-X-text}; never bg-sev-X-soft
+     with text-sev-X, which bottoms out at 2.99:1. */
+  --ui-red-text: color-mix(in srgb, var(--ui-red) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-orange-text: color-mix(in srgb, var(--ui-orange) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-yellow-text: color-mix(in srgb, var(--ui-yellow) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-green-text: color-mix(in srgb, var(--ui-green) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-cyan-text: color-mix(in srgb, var(--ui-cyan) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-blue-text: color-mix(in srgb, var(--ui-blue) var(--pb-sev-text-mix), var(--ui-base));
+  --ui-purple-text: color-mix(in srgb, var(--ui-purple) var(--pb-sev-text-mix), var(--ui-base));
+
+  /* ---------------------------------------------------------------------
+     Elevation — borderless. Floating surfaces (dialogs, overlays, toasts)
+     ride shadow-float (→ --pb-shadow-float) + the --stroke-float
+     currentColor hairline. shadow-float pools DOWNWARD: every layer
+     centered (x=0) with negative spread growing with blur, contact →
+     ambient falloff.
+     ------------------------------------------------------------------ */
+  --pb-shadow-float:
+    0 0.125rem 0.25rem -0.125rem color-mix(in srgb, #000 8%, transparent),
+    0 0.5rem 0.75rem -0.375rem color-mix(in srgb, #000 7%, transparent),
+    0 1.25rem 1.75rem -0.875rem color-mix(in srgb, #000 7%, transparent),
+    0 2.25rem 3rem -1.75rem color-mix(in srgb, #000 4%, transparent);
+  --stroke-float: color-mix(in srgb, currentColor 3%, transparent);
+  /* Menus/popovers: lighter lift + a secondary hairline. */
+  --pb-shadow-menu:
+    0 0 0 0.0625rem color-mix(in srgb, var(--ui-base) 8%, transparent),
+    0 0.25rem 1rem color-mix(in srgb, #000 8%, transparent),
+    0 1rem 2rem -1.5rem color-mix(in srgb, #000 18%, transparent);
+  /* In-flow lift for a raised element that has NOT left the layout — the
+     active pill of a SegmentedControl. Themed, because Tailwind's stock
+     shadow-sm is a black wash that vanishes on a dark track. Layer 1 is a
+     hairline ring (what actually separates the pill in dark), layer 2 the
+     soft drop. */
+  --pb-shadow-sm:
+    0 0 0 0.0625rem color-mix(in srgb, var(--ui-base) 8%, transparent),
+    0 0.125rem 0.5rem color-mix(in srgb, #000 6%, transparent);
+
+  /* Focus ring. */
+  --ui-focus-ring: color-mix(in srgb, var(--ui-accent) 55%, transparent);
+
+  /* ---------------------------------------------------------------------
+     Chrome geometry. Keep in sync with src/shell/layout-constants.ts.
+     ------------------------------------------------------------------ */
+  --pb-titlebar-height: 34px;
+  --pb-titlebar-control-size: 24px;
+  --pb-sidebar-width: 237px;
+
+  /* ---------------------------------------------------------------------
+     Overlay z ladder (see the @utility rungs above).
+     ------------------------------------------------------------------ */
+  /* INVARIANT: transient surfaces outrank task surfaces. A toast, tooltip,
+     menu or command palette must be visible from ANY surface that can
+     trigger it — including the opaque first-run wizard on the boot chain.
+     So the transient rungs sit ABOVE --z-pairing, not below it. Anything
+     that renders under --z-crash is a surface the user can still act on. */
+  --z-modal-backdrop: 120;
+  --z-modal: 130;
+  /* Boot chain, in the order they can stack. */
+  --z-boot: 1200; /* BootOverlay progress */
+  --z-pairing: 1300; /* PairingFailureOverlay / onboarding wizard */
+  --z-modal-popover: 1350; /* menus/selects opened from ANY surface */
+  --z-over-modal: 1400; /* toasts, tooltips, command palette */
+  --z-over-modal-content: 1410;
+  --z-crash: 1500; /* unrecoverable boot failure — nothing outranks it */
+
+  /* Typography. */
+  --font-pb-sans:
+    'Segoe WPC', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif,
+    'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  /* Key caps always use the native UI face. */
+  --font-pb-kbd: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  --font-pb-mono:
+    Menlo, Monaco, 'SF Mono', ui-monospace, monospace, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
+    'Noto Color Emoji';
+
+  /* Motion. Controls are 100ms; overlays 200ms zoom-95/fade in, 150ms out. */
+  --pb-motion-control: 100ms;
+  --pb-motion-overlay: 200ms;
+  --pb-motion-exit: 150ms;
+  --pb-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* -----------------------------------------------------------------------
+   pirate-dark — neutral navy, never pure black. The surface seeds are
+   deliberately STEPPED so the shell reads as four planes without a single
+   border: sidebar recedes, the bar sits above it, chrome is the ground,
+   elevated lifts. Relative luminance 0.0044 → 0.0129 → 0.0215 → 0.0298,
+   giving sidebar:page 1.314 and page:elevated 1.116 — above the 1.30 / 1.10
+   floors. The page and elevated seeds were LIFTED rather than driving the
+   sidebar toward black: satisfying the ratio from the old page alone needed
+   a near-black #05070b sidebar, which would have cost the navy identity for
+   a number. The sidebar still dropped a step (#0E1219 → #0B0E16) so the lift
+   above it stays moderate.
+   Accent lifts to #8EA0FF: 7.35:1 as text on chrome, and as a filled button
+   it carries the dark ink foreground at 7.48:1 — a filled primary reads
+   primary in dark instead of reading disabled.
+   --------------------------------------------------------------------- */
+:root[data-theme='pirate-dark'] {
+  color-scheme: dark;
+
+  --pb-seed-base: #e8edf6;
+  --pb-seed-accent: #8ea0ff;
+  --pb-seed-accent-foreground: #0d1526;
+
+  --pb-seed-background: #232837;
+  --pb-seed-sidebar: #0b0e16;
+  --pb-seed-elevated: #293042;
+  --pb-seed-neutral-chrome: #232837;
+  --pb-seed-neutral-sidebar: #0b0e16;
+  --pb-seed-neutral-elevated: #293042;
+
+  /* Fills need more accent in dark: an ink wash over a near-black ground is
+     almost invisible, so the tertiary/quaternary rungs (segmented tracks,
+     quiet pills, hover fills) are lifted until they separate. */
+  --pb-fill-tertiary-accent-mix: 12%;
+  --pb-fill-quaternary-accent-mix: 9%;
+
+  --pb-input-border: 5%;
+  --pb-input-inset: inset 0 1px 1px color-mix(in srgb, #000 36%, transparent);
+  --pb-selection: color-mix(in srgb, var(--pb-seed-accent) 32%, transparent);
+  /* Dark tones are already lifted, so they need far less ink pulled in. */
+  --pb-sev-text-mix: 64%;
+
+  /* Dark severity overrides — lifted so they read on dark chrome. */
+  --ui-red: #e06573;
+  --ui-orange: #d98a5c;
+  --ui-yellow: #cfa348;
+  --ui-green: #5aa883;
+  --ui-cyan: #6ba3b2;
+  --ui-blue: #8aa0ff;
+  --ui-purple: #a496e0;
+
+  /* Stroke ladder — dark needs a heavier ink wash than light. The accent
+     shares stay on the shared knobs; only the ink alpha rises (10/7/5/3% →
+     16/13/11/7%). A hairline that works over near-white does almost nothing
+     over a dark ground: the default in-panel divider measured 1.34:1 against
+     the page and read as absent in list-heavy screens (Targets, Reports).
+     Now 1.61:1 — still a hairline, but one you can see. Ordering preserved:
+     2.32 > 1.88 > 1.61 > 1.33 against the page. */
+  --ui-stroke-primary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-primary-accent-mix), color-mix(in srgb, var(--ui-base) 16%, transparent));
+  --ui-stroke-secondary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-secondary-accent-mix), color-mix(in srgb, var(--ui-base) 13%, transparent));
+  --ui-stroke-tertiary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-tertiary-accent-mix), color-mix(in srgb, var(--ui-base) 11%, transparent));
+  --ui-stroke-quaternary: color-mix(in srgb, var(--ui-accent) var(--pb-stroke-quaternary-accent-mix), color-mix(in srgb, var(--ui-base) 7%, transparent));
+
+  /* Soft severity fills carry to 16% in dark — a 12% tint of an already
+     desaturated hue disappears against the dark ground. */
+  --ui-red-soft: color-mix(in srgb, var(--ui-red) 16%, transparent);
+  --ui-orange-soft: color-mix(in srgb, var(--ui-orange) 16%, transparent);
+  --ui-yellow-soft: color-mix(in srgb, var(--ui-yellow) 16%, transparent);
+  --ui-green-soft: color-mix(in srgb, var(--ui-green) 16%, transparent);
+  --ui-cyan-soft: color-mix(in srgb, var(--ui-cyan) 16%, transparent);
+  --ui-blue-soft: color-mix(in srgb, var(--ui-blue) 16%, transparent);
+  --ui-purple-soft: color-mix(in srgb, var(--ui-purple) 16%, transparent);
+
+  --pb-shadow-float:
+    0 0.125rem 0.25rem -0.125rem color-mix(in srgb, #000 40%, transparent),
+    0 0.5rem 0.75rem -0.375rem color-mix(in srgb, #000 36%, transparent),
+    0 1.25rem 1.75rem -0.875rem color-mix(in srgb, #000 34%, transparent),
+    0 2.25rem 3rem -1.75rem color-mix(in srgb, #000 28%, transparent);
+  --stroke-float: color-mix(in srgb, currentColor 6%, transparent);
+  --pb-shadow-menu:
+    0 0 0 0.0625rem color-mix(in srgb, var(--ui-base) 10%, transparent),
+    0 0.25rem 1rem color-mix(in srgb, #000 36%, transparent),
+    0 1rem 2rem -1.5rem color-mix(in srgb, #000 48%, transparent);
+  /* Dark leans on the ring, not the drop: a black shadow on a near-black
+     ground is invisible, so the hairline does the separating. */
+  --pb-shadow-sm:
+    0 0 0 0.0625rem color-mix(in srgb, var(--ui-base) 12%, transparent),
+    0 0.125rem 0.5rem color-mix(in srgb, #000 24%, transparent);
+}
+
+/* -----------------------------------------------------------------------
+   .pb-app — the shell scope. App chrome, not a document: selection is
+   opt-in via .pb-selectable.
+
+   CASCADE LAYERS — read before adding anything here.
+
+   Tailwind's utilities live in `@layer utilities`. An UNLAYERED rule beats
+   every layered rule no matter how weak its selector, so an unlayered
+   `.pb-app button { font: inherit }` silently outranked `text-pb-*` and
+   `font-medium` on every Button in the app — buttons rendered at the
+   container's 13px/400 regardless of the classes on them. `font:` is a
+   shorthand, so it took font-size AND font-weight with it.
+
+   The rule this file follows:
+
+     DEFAULTS       → `@layer base` (below). A default is something a
+                      component may legitimately override with a utility:
+                      font, colour, link decoration, selection policy.
+     INVARIANTS     → unlayered (further down). An invariant is something a
+                      call site must NOT be able to switch off with a
+                      utility: the focus ring, the field outline reset, the
+                      input chrome. These are deliberately unlayered.
+
+   If you add an element-level typography or colour rule, it is a default.
+   Put it in the base layer. Never reach for !important.
+   --------------------------------------------------------------------- */
+
+@layer base {
+  .pb-app {
+    background: var(--ui-bg-chrome);
+    color: var(--ui-text-primary);
+    font-family: var(--font-pb-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* App chrome, not a document: selection is opt-in via .pb-selectable. */
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Portal content (menus, tooltips, dialogs, toasts) renders to <body>,
+     outside .pb-app; it still needs the base font/text color. */
+  .pb-portal {
+    color: var(--ui-text-primary);
+    font-family: var(--font-pb-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Underlines live on links in prose, never on controls. A link that needs
+     a token colour (`text-content-secondary`) or no underline can now say so
+     with a utility — unlayered, this rule outranked both. */
+  .pb-app a {
+    color: var(--ui-accent);
+    text-decoration: none;
+    text-underline-offset: 3px;
+  }
+  .pb-app a:hover {
+    text-decoration: underline;
+  }
+
+  /* Buttons inherit the app face/size by default. Tailwind's own preflight
+     already declares `button { font: inherit }` in this same layer, so this
+     is belt-and-braces rather than load-bearing — but it keeps the intent
+     explicit and scoped to the shell. In the base layer it can no longer
+     outrank a `text-pb-*` / `font-*` utility on the button itself. */
+  .pb-app button {
+    font: inherit;
+  }
+}
+
+/* Selection colour and the selectable opt-in stay UNLAYERED: `.pb-selectable`
+   has to beat `.pb-app`'s `user-select: none`, and selection colour is not
+   something a utility should switch off. */
+.pb-app ::selection,
+.pb-selectable ::selection {
+  background: var(--ui-selection-background);
+}
+
+.pb-selectable,
+.pb-app input,
+.pb-app textarea,
+.pb-portal input,
+.pb-portal textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Thin themed scrollbars inside the shell scope. 6px thumbs on a transparent
+   track — the scrollbar is a position cue, not chrome. Chromium honours
+   scrollbar-width/color; ::-webkit-scrollbar kept for older Electron.
+
+   .pb-scroll        always-visible thumb (long document surfaces: transcript,
+                     logs, report bodies — the user needs the position cue)
+   .pb-scroll-hover  thumb fades in on hover (navigation surfaces: the sidebar,
+                     menus — a resting rail should be quiet) */
+.pb-scroll,
+.pb-app :where(.pb-scroll-host *) {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ui-base) 14%, transparent) transparent;
+}
+.pb-scroll::-webkit-scrollbar,
+.pb-app :where(.pb-scroll-host *)::-webkit-scrollbar,
+.pb-scroll-hover::-webkit-scrollbar,
+.pb-app :where(.pb-scroll-hover *)::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.pb-scroll::-webkit-scrollbar-track,
+.pb-app :where(.pb-scroll-host *)::-webkit-scrollbar-track,
+.pb-scroll-hover::-webkit-scrollbar-track,
+.pb-app :where(.pb-scroll-hover *)::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pb-scroll::-webkit-scrollbar-thumb,
+.pb-app :where(.pb-scroll-host *)::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ui-base) 14%, transparent);
+  border-radius: 3px;
+}
+.pb-scroll::-webkit-scrollbar-thumb:hover,
+.pb-app :where(.pb-scroll-host *)::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ui-base) 24%, transparent);
+}
+
+/* Hover-revealed variant. The thumb is transparent at rest and fades in when
+   the pointer is anywhere over the scroll host. */
+.pb-scroll-hover,
+.pb-app :where(.pb-scroll-hover *) {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 150ms ease;
+}
+.pb-scroll-hover:hover,
+.pb-scroll-hover:focus-within,
+.pb-app :where(.pb-scroll-hover:hover *),
+.pb-app :where(.pb-scroll-hover:focus-within *) {
+  scrollbar-color: color-mix(in srgb, var(--ui-base) 14%, transparent) transparent;
+}
+.pb-scroll-hover::-webkit-scrollbar-thumb,
+.pb-app :where(.pb-scroll-hover *)::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+  transition: background 150ms ease;
+}
+.pb-scroll-hover:hover::-webkit-scrollbar-thumb,
+.pb-scroll-hover:focus-within::-webkit-scrollbar-thumb,
+.pb-app :where(.pb-scroll-hover:hover *)::-webkit-scrollbar-thumb,
+.pb-app :where(.pb-scroll-hover:focus-within *)::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ui-base) 14%, transparent);
+}
+.pb-scroll-hover:hover::-webkit-scrollbar-thumb:hover,
+.pb-app :where(.pb-scroll-hover:hover *)::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ui-base) 24%, transparent);
+}
+
+/* Input chrome — the ONE look shared by Input / SearchField / select triggers.
+   Padding-driven (no fixed heights), transparent fill, border alpha
+   7% → 14% on hover → full on focus; the recessed top inset is removed on
+   focus (the border carries the state). */
+.pb-input-chrome {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--ui-base) var(--pb-input-border), transparent);
+  box-shadow: var(--pb-input-inset);
+  transition:
+    border-color var(--pb-motion-control) ease,
+    box-shadow var(--pb-motion-control) ease;
+}
+.pb-input-chrome:hover {
+  border-color: color-mix(in srgb, var(--ui-base) calc(var(--pb-input-border) * 2), transparent);
+}
+.pb-input-chrome:focus,
+.pb-input-chrome:focus-visible,
+.pb-input-chrome[data-state='open'] {
+  border-color: var(--ui-accent);
+  box-shadow: none;
+  outline: none;
+}
+
+/* Focus ring for shell CONTROLS only. Text fields are deliberately excluded:
+   .pb-input-chrome already carries focus on its border/underline, and a ring
+   on top of that paints a double outline on every focused input. Keep this
+   list to things that have no other focus affordance. */
+.pb-app :is(button, [role='button'], [role='tab'], [role='menuitem'], [role='option'], a, summary):focus-visible,
+.pb-portal :is(button, [role='button'], [role='tab'], [role='menuitem'], [role='option'], a, summary):focus-visible {
+  outline: 2px solid var(--ui-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Fields carry focus on the border/underline — never a ring. Scoped through
+   .pb-app / .pb-portal so this matches the ring rule's specificity and still
+   wins on source order: a bare `.pb-input-chrome:focus-visible` would LOSE to
+   the ring rule above if the chrome were ever put on a <button> or a
+   [role=button] element. */
+.pb-app .pb-input-chrome:focus-visible,
+.pb-portal .pb-input-chrome:focus-visible,
+.pb-app input:focus-visible,
+.pb-app textarea:focus-visible,
+.pb-portal input:focus-visible,
+.pb-portal textarea:focus-visible {
+  outline: none;
+}
+
+/* -----------------------------------------------------------------------
+   Motion keyframes. Overlay entrances are 200ms zoom-in-95 + fade;
+   controls 100ms. Motion never delays state.
+   --------------------------------------------------------------------- */
+
+@keyframes pb-zoom-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes pb-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes pb-toast-in-top {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes pb-toast-in-bottom {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+/* Sonar sweep for the Loader: a rotating conic sweep + expanding rings. */
+@keyframes pb-sonar-sweep {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pb-sonar-ring {
+  0% {
+    opacity: 0.9;
+    transform: scale(0.25);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+@keyframes pb-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Exits mirror the entrances. Radix keeps content mounted through
+   data-[state=closed], so these run before unmount instead of the surface
+   vanishing between frames. */
+@keyframes pb-zoom-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+}
+@keyframes pb-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+/* Direction-neutral so one keyframe serves both toast stacks. */
+@keyframes pb-toast-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+/* Finite attention beat: three cycles, then it rests at full opacity.
+   Idle status never animates — a dot that pings forever is noise, not
+   information. Genuinely live surfaces opt into an infinite loop instead. */
+@keyframes pb-pulse-finite {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Sidebar collapse animates its width instead of unmounting, so the content
+   column slides rather than snapping. The aside stays mounted; the wrapper
+   owns the width. */
+.pb-sidebar-transition {
+  transition:
+    width 200ms var(--pb-ease-out),
+    opacity 200ms;
+}
+
+/* Motion is functional, never decorative gating. A user (or the E2E harness)
+   requesting reduced motion gets instant state everywhere. */
+@media (prefers-reduced-motion: reduce) {
+  .pb-app,
+  .pb-app *,
+  .pb-portal,
+  .pb-portal * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -214,7 +214,7 @@ async def test_resume_restores_only_paused_campaigns_owned_by_selected_session()
     resumed: list[str] = []
 
     class Campaigns:
-        async def recover(self) -> None:
+        async def recover(self, *, resume_execution=True) -> None:
             return None
 
         async def list_all(self):
@@ -244,6 +244,10 @@ async def test_resume_restores_only_paused_campaigns_owned_by_selected_session()
                     "status": "completed",
                 },
             )
+
+        async def list(self, session_id, *, limit):
+            assert limit is None
+            return tuple(row for row in await self.list_all() if row["session_id"] == session_id)
 
         async def resume(self, campaign_id: str) -> None:
             resumed.append(campaign_id)
@@ -792,7 +796,7 @@ async def test_backend_projects_durable_agents_and_schedules() -> None:
                 )
             }
 
-        async def recover(self):
+        async def recover(self, *, resume_execution=True):
             return None
 
     durable_agents = DurableAgents()
@@ -954,12 +958,12 @@ async def test_background_recovery_renews_campaign_ownership_but_recovers_agents
     calls = []
 
     class RecoverableAgents:
-        async def recover(self):
-            calls.append("agents")
+        async def recover(self, *, resume_execution=True):
+            calls.append(("agents", resume_execution))
 
     class RecoverableCampaigns:
-        async def recover(self):
-            calls.append("campaigns")
+        async def recover(self, *, resume_execution=True):
+            calls.append(("campaigns", resume_execution))
 
     backend = KernelBackend(  # type: ignore[arg-type]
         FakeKernel([]),
@@ -970,7 +974,7 @@ async def test_background_recovery_renews_campaign_ownership_but_recovers_agents
     await backend.recover_background()
     await backend.recover_background()
 
-    assert calls == ["campaigns", "agents", "campaigns"]
+    assert calls == [("campaigns", False), ("agents", False), ("campaigns", True)]
 
 
 class Findings:
@@ -1053,6 +1057,40 @@ async def test_durable_reports_are_daemon_wide_across_console_sessions() -> None
         ("campaign/historical", 1, 2)
     ]
     assert reports[0].output == "/workspace/target/reports/campaign-historical.html"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_campaign", [False, True])
+async def test_session_report_lookup_does_not_scan_historical_campaigns(has_campaign) -> None:
+    class Campaigns:
+        async def list_all(self):
+            raise AssertionError("Chat must not enumerate historical campaigns")
+
+        async def list(self, session_id, *, limit):
+            assert session_id == "new-console-session"
+            assert limit is None
+            return ({"campaign_id": "campaign/current"},) if has_campaign else ()
+
+    class Reports:
+        def list(self, campaign_id):
+            assert campaign_id == "campaign/current"
+            return [
+                SimpleNamespace(
+                    campaign_id=campaign_id,
+                    revision_id="r1",
+                    metadata={},
+                    stop_reason="saturated",
+                    cleanup_status="complete",
+                    findings=(),
+                    exchanges=(),
+                )
+            ]
+
+    kernel = FakeKernel([])
+    kernel.session_id = "new-console-session"
+    backend = KernelBackend(kernel, campaigns=Campaigns(), report_repository=Reports())
+    reports = await backend.list_reports(session_only=True)
+    assert [report.run for report in reports] == (["campaign/current"] if has_campaign else [])
 
 
 def test_finding_disposition_and_report_failure_events_are_clear() -> None:
@@ -1487,8 +1525,10 @@ async def test_campaign_list_is_daemon_wide_across_console_sessions() -> None:
                 },
             )
 
-        async def list(self, _session_id):
-            raise AssertionError("console campaign inventory must not be session-scoped")
+        async def list(self, session_id, *, limit):
+            assert session_id == "new-console-session"
+            assert limit is None
+            return tuple(row for row in await self.list_all() if row["session_id"] == session_id)
 
     kernel = FakeKernel([])
     kernel.session_id = "new-console-session"
@@ -1674,11 +1714,15 @@ async def test_resume_restores_exact_prepared_review_without_execution() -> None
             ]
 
     class Campaigns:
-        async def recover(self):
+        async def recover(self, *, resume_execution=True):
             pass
 
         async def list_all(self):
             return [dict(saved, session_id="session-1", status="prepared", profile="recommended")]
+
+        async def list(self, session_id, *, limit):
+            assert limit is None
+            return await self.list_all()
 
         async def execute(self, *args):
             raise AssertionError("Resume must not execute an unapproved plan")
@@ -1919,11 +1963,90 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
         async def wave_progress(self, campaign_id):
             return await service.wave_progress(campaign_id)
 
+        async def list(self, session_id, *, limit):
+            assert session_id == "session-1"
+            assert limit is None
+            return await self.list_all()
+
     backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())
     campaigns = await backend.list_campaigns()
     assert campaigns[0].wave_number == 2
     assert campaigns[0].wave_kind == "attack"
     assert campaigns[0].wave_status == "running"
+
+
+@pytest.mark.asyncio
+async def test_startup_and_new_session_do_not_resume_saved_work() -> None:
+    calls = []
+
+    class StartupKernel(FakeKernel):
+        async def start(self):
+            self.session_id = "startup-session"
+
+        async def submit(self, text):
+            if text == "/new":
+                self.session_id = "new-session"
+            await super().submit(text)
+
+    class Campaigns:
+        status = "executing"
+
+        async def recover(self, *, resume_execution=True):
+            calls.append(("campaigns", resume_execution))
+            if not resume_execution:
+                self.status = "paused"
+            elif self.status == "executing":
+                raise AssertionError("old campaign resumed without operator selection")
+
+    class Agents:
+        async def recover(self, *, resume_execution=True):
+            assert not resume_execution
+            calls.append(("agents", False))
+
+        async def list_schedules(self, session_id):
+            return ()
+
+    kernel = StartupKernel([])
+    kernel.session_id = None
+    campaigns = Campaigns()
+    backend = KernelBackend(kernel, campaigns=campaigns, agents=Agents())
+    await backend.recover_background()
+    assert campaigns.status == "paused"
+    await backend.list_schedules()
+    assert [event async for event in backend.stream("/new")] == []
+    await backend.recover_background()
+    assert kernel.session_id == "new-session"
+    assert campaigns.status == "paused"
+    assert calls == [("campaigns", False), ("agents", False), ("campaigns", True)]
+
+
+async def test_conversation_history_is_paged_sanitized_and_session_bound():
+    from unittest.mock import AsyncMock
+
+    kernel = FakeKernel([])
+    loader = AsyncMock(
+        return_value={
+            "session_id": "session-1",
+            "messages": [{"content": "Bearer private-key"}],
+            "before": 12,
+            "has_more": True,
+        }
+    )
+    kernel._store = SimpleNamespace(load_history_page=loader)
+    backend = KernelBackend(kernel)
+    page = await backend.conversation_history(before=50, session_id="session-1")
+    loader.assert_awaited_once_with("session-1", limit=50, before=50, exclude_current_turn=False)
+    assert page["messages"] == [{"content": "Bearer [redacted]"}]
+    with pytest.raises(ValueError, match="active session changed"):
+        await backend.conversation_history(session_id="other")
+
+    async def switching(*args, **kwargs):
+        kernel.session_id = "session-2"
+        return {}
+
+    kernel._store.load_history_page = switching
+    with pytest.raises(ValueError, match="active session changed"):
+        await backend.conversation_history(session_id="session-1")
 
 
 @pytest.mark.asyncio

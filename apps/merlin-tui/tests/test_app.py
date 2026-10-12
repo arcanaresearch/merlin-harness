@@ -68,7 +68,10 @@ def _safe_command(command: str) -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", COMMANDS, ids=COMMANDS)
-async def test_every_documented_command_is_keyboard_submittable(command: str) -> None:
+async def test_every_documented_command_is_keyboard_submittable(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_module.webbrowser, "open", lambda _url: True)
     app = MerlinApp(DemoBackend())
     async with app.run_test() as pilot:
         composer = app.query_one("#composer")

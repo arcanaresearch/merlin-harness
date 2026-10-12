@@ -21,6 +21,11 @@ with clear evidence status and coverage gaps.
 
 ![Merlin coordinated security assessment](assets/merlin-hero.png)
 
+## Optional browser workspace
+
+A pb2-style web workspace is available from source for chat, campaign review, agents, coverage,
+reports, setup and advanced controls. See [run the browser workspace](docs/web-interface.md).
+
 ## Watch the CLI walkthrough
 
 [![Watch the 106-second Merlin CLI walkthrough](assets/merlin-cli-walkthrough.jpg)](https://github.com/triwiz-ai/merlin-harness/releases/download/v0.2.0/merlin-cli-walkthrough-v2.mp4)

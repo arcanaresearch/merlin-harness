@@ -1,0 +1,14 @@
+[project]
+name = "merlin-web"
+version = "0.2.0"
+description = "Local browser operator workspace for Merlin"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+dependencies = ["merlin-tui", "aiohttp>=3.12,<4"]
+[tool.uv.sources]
+merlin-tui = { workspace = true }
+[project.scripts]
+merlin-web = "merlin_web.server:main"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

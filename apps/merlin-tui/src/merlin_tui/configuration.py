@@ -396,6 +396,9 @@ class ProviderConfiguration:
         endpoints = provider_values.get("model_endpoints", {})
         endpoint_values = dict(endpoints) if isinstance(endpoints, Mapping) else {}
         endpoint: dict[str, str] = {"base_url": base_url}
+        previous = endpoint_values.get(model, {})
+        if isinstance(previous, Mapping) and previous.get("base_url") == base_url:
+            endpoint.update({str(k): str(v) for k, v in previous.items()})
         if api_key is not None and api_key.strip():
             endpoint["api_key"] = api_key.strip()
         if output_token_parameter is not None:

@@ -77,6 +77,10 @@ class BrowserService:
             )
         if restartable:
             restored = restartable[0]
+            if restored.owner.worker_id == "operator":
+                raise BrowserBoundaryError(
+                    "browser context is under operator control; resume it explicitly"
+                )
             await self.resume(session_id, restored.context_id)
             return self._live[restored.context_id]
         if bounds.requires_persistent_profile and self._persistent_profile is None:
@@ -111,6 +115,8 @@ class BrowserService:
         conversation must seal subsequent actions and reconnaissance handoffs
         under its own session id.
         """
+        if session.owner.worker_id == "operator":
+            raise BrowserBoundaryError("browser context is under operator control")
         context_id = session.context_id
         for prior_session, owned_context in tuple(self._session_context.items()):
             if owned_context == context_id and prior_session != session_id:
@@ -139,6 +145,8 @@ class BrowserService:
         context_id = self._shared_origin_context.get(bounds.allowed_origins)
         if context_id is not None and context_id in self._live:
             session = self._live[context_id]
+            if session.owner.worker_id == "operator":
+                raise BrowserBoundaryError("browser context is under operator control")
             if session.bounds.max_tabs > bounds.max_tabs:
                 raise BrowserBoundaryError(
                     "live persistent context exceeds the reviewed browser tab bound"
@@ -302,6 +310,11 @@ class BrowserService:
             self._live[context_id] = session
         else:
             session = existing
+        if session.owner.worker_id == "operator":
+            for page in session.context.pages:
+                if not page.is_closed():
+                    session._require_url(page.url, allow_blank=True)
+            session.owner = session.owner.model_copy(update={"worker_id": "agent:browser"})
         self._session_context[session_id] = context_id
         await self._store.save_metadata(session.metadata(restart=True))
         return self._context_row(session.metadata(restart=True))

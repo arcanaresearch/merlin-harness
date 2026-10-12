@@ -109,6 +109,7 @@ _INTERNAL_NON_CAMPAIGN_TOOL_IDS = frozenset(
         "agent_message",
         "agent_list",
         "campaign_configure",
+        "request_user_input",
         "operator_command",
         "operator_inspect",
         "operator_runtime",
@@ -9327,6 +9328,9 @@ def build_backend(
                 lambda: settings.use_role_model("campaign-lead", "lead"),
             )
         )
+        from .user_input_tool import RequestUserInputTool
+
+        tool_broker.register(RequestUserInputTool())
         tool_broker.register(OperatorCommandTool(COMMANDS, COMMAND_HINTS))
         from merlin_agents.operator_campaign_tools import CampaignMessageTool
         from merlin_agents.worker_operator_tools import AgentListTool, AgentMessageTool

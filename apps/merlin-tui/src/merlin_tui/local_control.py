@@ -104,6 +104,7 @@ _ALLOWED = {
     "list_resume_sessions",
     "list_resume_session_page",
     "conversation_context",
+    "conversation_history",
     "export_safe_config",
     "interrupt",
     "steer",
@@ -879,6 +880,61 @@ def _legacy_foreground_pid(socket_path: Path) -> int:
     return frontends[0]
 
 
+def _resume_stopped_foreground(socket_path: Path) -> None:
+    """Let a verified, suspended frontend process its pending close notification."""
+    try:
+        pid = _legacy_foreground_pid(socket_path)
+        state = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        if state.startswith("T"):
+            os.kill(pid, signal.SIGCONT)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        # Normal frontends and unsupported discovery platforms still use the
+        # existing close notification and bounded cleanup wait.
+        return
+
+
+def _verified_daemon_owner(socket_path: Path) -> bool:
+    """Require a same-user daemon identity before automatic orphan recovery."""
+    pid = _daemon_lock_owner(socket_path)
+    if pid is None or pid == os.getpid():
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "uid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        identity = result.stdout.strip().split(maxsplit=1)
+        if len(identity) != 2 or identity[0] != str(os.getuid()):
+            return False
+        argv = shlex.split(identity[1])
+        source = len(argv) == 4 and argv[1:] == ["-m", "merlin_tui.local_control", "daemon"]
+        frozen = (
+            len(argv) == 2
+            and Path(argv[0]).name in {"merlin", "merlin-runtime"}
+            and argv[1] == "daemon"
+        )
+        return (source or frozen) and _daemon_lock_owner(socket_path) == pid
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+async def _recover_restart_orphan(socket_path: Path) -> None:
+    if not await asyncio.to_thread(_verified_daemon_owner, socket_path):
+        raise RuntimeError(
+            "Could not verify the unreachable Merlin daemon owner; refusing recovery"
+        )
+    await stop_daemon(socket_path, force=True)
+
+
 class LocalControlClient:
     def __init__(
         self,
@@ -941,7 +997,7 @@ class LocalControlClient:
                 raise RuntimeError("Unexpected foreground session notification")
             return
 
-    async def replace_foreground(self) -> None:
+    async def replace_foreground(self, *, restart: bool = False) -> None:
         """Ask the existing window to quit, then wait for owned-resource cleanup."""
         writer: asyncio.StreamWriter | None = None
         try:
@@ -950,7 +1006,11 @@ class LocalControlClient:
             )
             channel = _Channel(reader, writer)
             await channel.send({"method": "close_foreground"})
-            response = await channel.receive()
+            response = await channel.receive(
+                deadline_seconds=_configured_daemon_timeout("daemon_shutdown_seconds", 30)
+                if restart
+                else None
+            )
             value = response.get("value")
             if response.get("type") == "error":
                 error = str(response.get("error", "Could not close the existing session"))
@@ -968,9 +1028,14 @@ class LocalControlClient:
                 value = "legacy"
             if value not in {"closing", "no_owner", "legacy"}:
                 raise RuntimeError("The existing session did not acknowledge the close request")
+        except TimeoutError as error:
+            raise TimeoutError("The existing Merlin session did not respond to restart") from error
         except (OSError, ConnectionError):
             if not await asyncio.to_thread(_daemon_lock_released, self._socket_path):
-                await stop_daemon(self._socket_path, force=True)
+                if restart:
+                    await _recover_restart_orphan(self._socket_path)
+                else:
+                    await stop_daemon(self._socket_path, force=True)
             value = "no_owner"
         finally:
             if writer is not None:
@@ -985,6 +1050,7 @@ class LocalControlClient:
                 pass
             value = "closing"
         if value == "closing":
+            await asyncio.to_thread(_resume_stopped_foreground, self._socket_path)
             seconds = _configured_daemon_timeout("daemon_shutdown_seconds", 30)
             deadline = asyncio.get_running_loop().time() + seconds
             while asyncio.get_running_loop().time() < deadline:
@@ -992,7 +1058,17 @@ class LocalControlClient:
                     break
                 await asyncio.sleep(0.05)
             else:
-                raise TimeoutError("The existing session is still closing. Try again shortly.")
+                if restart and not await asyncio.to_thread(self._socket_path.exists):
+                    await _recover_restart_orphan(self._socket_path)
+                else:
+                    raise TimeoutError("The existing session is still closing. Try again shortly.")
+        elif restart:
+            try:
+                await stop_daemon(self._socket_path)
+            except TimeoutError:
+                if await asyncio.to_thread(self._socket_path.exists):
+                    raise
+                await _recover_restart_orphan(self._socket_path)
         self._owns_daemon = bool(await ensure_daemon(self._socket_path))
 
     async def stream(self, prompt: str):
@@ -1285,16 +1361,18 @@ def _daemon_command() -> list[str]:
 
 
 async def _ping(socket_path: Path) -> bool:
+    writer: asyncio.StreamWriter | None = None
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path, limit=_MAX_FRAME_BYTES + 1)
         channel = _Channel(reader, writer)
         await channel.send({"method": "ping"})
-        response = await asyncio.wait_for(channel.receive(), timeout=0.5)
-        writer.close()
-        await writer.wait_closed()
+        response = await asyncio.wait_for(channel.receive(), timeout=5.0)
         return response.get("value") == "pong" and response.get("protocol") == PROTOCOL_VERSION
     except (OSError, TimeoutError, ConnectionError, ValueError):
         return False
+    finally:
+        if writer is not None:
+            await _close_writer(writer)
 
 
 def _daemon_lock_released(socket_path: Path) -> bool:
@@ -1305,6 +1383,11 @@ def _daemon_lock_released(socket_path: Path) -> bool:
         return False
     handle.close()
     return True
+
+
+async def restart_daemon(socket_path: Path = _SOCKET) -> None:
+    """Close the owning TUI and wait for resource cleanup before starting anew."""
+    await LocalControlClient(socket_path=socket_path).replace_foreground(restart=True)
 
 
 async def stop_daemon(

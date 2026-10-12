@@ -70,6 +70,22 @@ class PostgresSessionStore:
     async def load_messages(self, session_id: str) -> Sequence[ChatMessage]:
         return await self._call(self._messages.list_chat, session_id)
 
+    async def load_history_page(
+        self,
+        session_id: str,
+        *,
+        limit: int = 50,
+        before: int | None = None,
+        exclude_current_turn: bool = False,
+    ) -> Mapping[str, Any]:
+        return await self._call(
+            self._messages.history_page,
+            session_id,
+            limit=limit,
+            before=before,
+            exclude_current_turn=exclude_current_turn,
+        )
+
     async def load_context(self, session_id: str, identity: ChatMessage) -> ContextProjection:
         return await self._call(self._messages.projection, session_id, identity)
 

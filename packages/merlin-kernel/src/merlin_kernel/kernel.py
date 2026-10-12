@@ -481,6 +481,10 @@ def _is_orphan_tool_result(message: ChatMessage, orphan_ids: frozenset[str]) -> 
     )
 
 
+class _AwaitingUserInput(Exception):
+    """A durable question suspends the foreground until the operator responds."""
+
+
 class Kernel:
     """Owns one active conversation and exposes ordered events to the UI."""
 
@@ -1098,6 +1102,8 @@ class Kernel:
                             **failure_event_payload(failure_category),
                         )
                     )
+                    if call.name == "request_user_input" and not result.is_error:
+                        raise _AwaitingUserInput
                     next_tool = result.metadata.get("preferred_next_tool")
                     if not result.is_error and isinstance(next_tool, str):
                         preferred_next_tool_name = next_tool
@@ -1626,6 +1632,8 @@ class Kernel:
                             reasoning = ""
                             continue
                         break
+        except _AwaitingUserInput:
+            return
         except asyncio.CancelledError:
             if assistant:
                 await self._save_assistant(
@@ -1766,6 +1774,17 @@ class Kernel:
                     **failure_event_payload(failure_category),
                 )
             )
+            if event.name == "request_user_input" and not result.is_error:
+                # Every call in the assistant batch must have a terminal receipt.
+                # Calls after a question are deferred, never executed on guessed input.
+                for deferred in events[position + 1 :]:
+                    await self._append_tool_terminal(
+                        session_id,
+                        name=deferred.name,
+                        call_id=deferred.call_id,
+                        content="Not executed: waiting for the operator's structured answer.",
+                    )
+                raise _AwaitingUserInput
             next_tool = result.metadata.get("preferred_next_tool")
             if not result.is_error and isinstance(next_tool, str):
                 preferred_next_tool = next_tool

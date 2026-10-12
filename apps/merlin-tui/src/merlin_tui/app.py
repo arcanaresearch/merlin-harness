@@ -68,6 +68,7 @@ from .client_state import ClientState, TranscriptEntry
 
 COMMANDS = (
     "/help",
+    "/web",
     "/setup",
     "/setup endpoint",
     "/setup jev",
@@ -211,6 +212,7 @@ def _activity_detail_view(text: str) -> str:
 
 COMMAND_HINTS = {
     "/help": "show commands and keyboard shortcuts",
+    "/web": "open this session in the local browser (keep this terminal running)",
     "/setup": "configure the provider securely",
     "/setup endpoint": "add a provider endpoint and key for another model",
     "/setup jev": "set or update the JEV judgment API key",
@@ -3926,6 +3928,10 @@ class MerlinApp(App[None]):
         composer = self.query_one("#composer", Composer)
         text = composer.text.strip()
         composer.remember_submission(text)
+        if text == "/web":
+            composer.clear()
+            await self._run_command(text)
+            return
         if text and self._pending_choice:
             answers = {value.lower() for _, value in self._pending_choice}
             answers.update(str(i) for i in range(1, len(self._pending_choice) + 1))
@@ -3940,7 +3946,9 @@ class MerlinApp(App[None]):
             composer.clear()
             await self.action_interrupt()
             return
-        stream_task = self._stream_task
+        console = getattr(self, "_web_console", None)
+        web_turn = console.workspace.turn if console else None
+        stream_task = self._stream_task or web_turn
         if text and not text.startswith("/") and stream_task and not stream_task.done():
             steer = getattr(self.backend, "steer", None)
             if callable(steer):
@@ -4052,6 +4060,8 @@ class MerlinApp(App[None]):
         user_row.append(text)
         transcript.write(user_row)
         self._remember("user", text)
+        if console:
+            console.workspace.emit("user", text)
         # Activating the transcript changes layout from ``display: none``. Start the provider
         # only after Textual has rendered the operator row, so the replaceable reasoning tail
         # is anchored immediately after it rather than racing deferred RichLog writes.
@@ -4072,6 +4082,9 @@ class MerlinApp(App[None]):
             transcript.write(_transcript_text("✕ Campaign execution failed: ", exc, "bold red"))
             self._remember("error", _scrub_secrets(f"Campaign execution failed: {exc}"))
             return
+        console = getattr(self, "_web_console", None)
+        if console:
+            console.workspace.latest_review = None
         transcript.write(
             Text(
                 f"\nCampaign started: {campaign_id}\nMonitor: /campaign status {campaign_id}",
@@ -4098,6 +4111,7 @@ class MerlinApp(App[None]):
         pending_render: Callable[[], None] | None = None
         render_timer: Any | None = None
         operator_commands: list[tuple[str, str]] = []
+        input_request = None
 
         def cancel_render() -> None:
             nonlocal pending_render, render_timer
@@ -4166,6 +4180,13 @@ class MerlinApp(App[None]):
 
         try:
             async for event in self.backend.stream(prompt):
+                if event.kind == "campaign_review":
+                    self._web_review = event.text
+                console = getattr(self, "_web_console", None)
+                if console:
+                    if event.kind == "status" and event.text in {"new session", "session resumed"}:
+                        console.workspace.emit("session_reset", None)
+                    console.workspace.emit(event.kind, event.text)
                 if event.kind == "content":
                     flush_thinking()
                     self._work_label = "Responding"
@@ -4195,6 +4216,28 @@ class MerlinApp(App[None]):
                 elif event.kind == "tool":
                     self._record_activity(f"↳ Tool · {event.text}")
                     transcript.write(_transcript_text("↳ Tool · ", event.text, "dim"))
+                elif event.kind == "user_input":
+                    from merlin_contracts.user_input import InputRequest
+
+                    self._clear_pending_decision()
+                    input_request = InputRequest.model_validate_json(event.text)
+                    self._remember("user_input", event.text)
+                    transcript.write(
+                        Text(
+                            "Waiting for your answer: "
+                            + " · ".join(question.question for question in input_request.questions),
+                            style="cyan",
+                        )
+                    )
+                elif event.kind == "user_input_resolved":
+                    from .user_input_screen import UserInputScreen
+
+                    if (
+                        isinstance(self.screen, UserInputScreen)
+                        and self.screen.request.request_id == event.text
+                    ):
+                        self.screen.dismiss(None)
+                    self._remember("user_input_resolved", event.text)
                 elif event.kind == "campaign_configure":
                     self._clear_pending_decision()
                     self._operator_preparing_session = self._active_session_id
@@ -4307,7 +4350,8 @@ class MerlinApp(App[None]):
                     transcript.write(_transcript_text("✕ ", event.text, "bold red"))
             flush_thinking()
             flush_content()
-            self._offer_structured_choice("".join(turn_content))
+            if input_request is None:
+                self._offer_structured_choice("".join(turn_content))
         except asyncio.CancelledError:
             operator_commands.clear()
             if not self._unmounting:
@@ -4329,6 +4373,32 @@ class MerlinApp(App[None]):
             self._set_status(f"ready{self._usage_suffix()}")
             if prompt.strip() == "/new" or prompt.strip().lower().startswith("/resume "):
                 await self._sync_active_session()
+        if input_request is not None:
+            from .user_input_screen import UserInputScreen
+
+            async def answered(value: str | None) -> None:
+                if value is not None:
+                    from merlin_contracts.user_input import ANSWER_PREFIX, InputResponse
+
+                    response = InputResponse.model_validate_json(value[len(ANSWER_PREFIX) :])
+                    labels = {
+                        question.id: {option.id: option.label for option in question.options}
+                        for question in input_request.questions
+                    }
+                    chosen = " · ".join(
+                        ", ".join(
+                            [
+                                *(labels[question_id][identity] for identity in answer.option_ids),
+                                answer.text,
+                            ]
+                        ).strip(", ")
+                        for question_id, answer in response.answers.items()
+                    )
+                    transcript.write(Text("● " + chosen, style="cyan"))
+                    self._remember("user", value)
+                    await self._start_backend(value, show_assistant=True)
+
+            self.push_screen(UserInputScreen(input_request), answered)
         for request_id, command in operator_commands:
             marker = f"Operator command dispatched: {request_id}"
             dispatched = getattr(self, "_operator_command_ids", set())
@@ -4404,6 +4474,20 @@ class MerlinApp(App[None]):
 
     async def _run_command(self, command_line: str) -> None:
         command = command_line.split(maxsplit=1)[0]
+        if command_line.strip() == "/web":
+            try:
+                from merlin_web.tui_bridge import open_workspace
+
+                await open_workspace(self)
+                self.notify("Current session opened in browser. Keep this terminal running.")
+            except ImportError:
+                self.notify(
+                    "Web package unavailable. Install merlin-web and build its frontend.",
+                    severity="error",
+                )
+            except Exception as exc:
+                self.notify(f"Could not open web workspace: {exc}", severity="error")
+            return
         if command_line.strip() == "/quit":
             self.exit()
             return
@@ -5840,6 +5924,9 @@ class MerlinApp(App[None]):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        console = getattr(self, "_web_console", None)
+        if console:
+            await console.close()
         shutdown = getattr(self.backend, "shutdown", None)
         cleanup = shutdown if callable(shutdown) else self.backend.close
         cleanup_task = asyncio.create_task(cleanup())

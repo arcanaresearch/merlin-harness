@@ -517,6 +517,51 @@ def test_lead_task_snapshot_demotes_oldest_terminal_tasks_to_digest_manifest() -
     assert len(projected_ids) + manifest["omitted_terminal_task_count"] == len(tasks)
 
 
+def test_lead_task_snapshot_compacts_oversized_specialist_ownership_projection() -> None:
+    from merlin_tui.bootstrap import _lead_task_rows
+
+    technique_ids = tuple(
+        f"case:family-{index % 69:02d}@lang=language-{index:05d}@variant=mixed"
+        for index in range(12_765)
+    )
+    control_task = SimpleNamespace(
+        id="campaign-1/lead-control/specialist_composition_get",
+        status="completed",
+        objective="Read-only Campaign Lead control-plane projection",
+        technique_ids=(),
+        result=json.dumps(
+            {
+                "specialist_composition": "autonomous",
+                "composition_pending": True,
+                "sealed_technique_ids": technique_ids,
+                "orphaned_technique_ids": technique_ids,
+                "double_owned_technique_ids": technique_ids,
+                "initial_composition_request": "cover every sealed id exactly once",
+            }
+        ),
+    )
+
+    snapshot = _lead_task_rows(
+        (control_task,),
+        campaign_id="campaign-1",
+        profile="recommended",
+        attempt=0,
+        per_result_chars=65_536,
+    )
+
+    assert len(json.dumps(snapshot, separators=(",", ":")).encode("utf-8")) <= 65_536
+    composition = snapshot["tasks"][0]["result"]
+    assert "sealed_technique_ids" not in composition
+    assert "orphaned_technique_ids" not in composition
+    assert "double_owned_technique_ids" not in composition
+    assert composition["sealed_technique_manifest"]["count"] == 12_765
+    assert composition["sealed_technique_manifest"]["family_count"] == 69
+    assert len(composition["sealed_technique_manifest"]["sample_ids"]) == 8
+    assert composition["sealed_technique_manifest"]["digest"].startswith("sha256:")
+    assert composition["initial_composition_required"] is False
+    assert composition["initial_composition_deferred"] is True
+
+
 def test_authenticated_browser_profile_treats_inferred_anonymous_label_as_advisory() -> None:
     assert (
         _validated_browser_authentication(

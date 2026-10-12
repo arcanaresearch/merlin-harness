@@ -473,3 +473,16 @@ def test_save_jev_token_preserves_other_judgments_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Jev API key is required"):
         configuration.save_jev_token("   ")
+
+
+def test_endpoint_edit_preserves_key_only_for_same_destination(tmp_path):
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save_model_endpoint("one", "https://one.test/v1", "key-one")
+    configuration.save_model_endpoint("two", "https://two.test/v1", "key-two")
+    configuration.save_model_endpoint("one", "https://one.test/v1")
+    routes = load_config(paths, environ={}).provider_model_endpoints
+    assert routes["one"]["api_key"] == "key-one"
+    assert routes["two"]["api_key"] == "key-two"
+    configuration.save_model_endpoint("one", "https://new.test/v1")
+    assert "api_key" not in load_config(paths, environ={}).provider_model_endpoints["one"]

@@ -2017,3 +2017,81 @@ def test_campaign_approve_rejects_changed_composition(monkeypatch) -> None:
         main()
 
     assert not any(prompt.startswith("Approve and execute") for prompt, _ in calls)
+
+
+def test_restart_explains_foreground_ownership_without_traceback(monkeypatch, capsys):
+    from merlin_tui import local_control
+
+    async def refused():
+        raise RuntimeError("clean shutdown is reserved for the foreground owner")
+
+    async def unexpected_start():
+        pytest.fail("must not start another daemon after shutdown was refused")
+
+    monkeypatch.setattr(sys, "argv", ["merlin", "restart"])
+    monkeypatch.setattr(local_control, "restart_daemon", refused)
+    monkeypatch.setattr(local_control, "ensure_daemon", unexpected_start)
+    with pytest.raises(SystemExit) as failure:
+        main()
+    assert failure.value.code == 1
+    message = capsys.readouterr().err
+    assert "foreground owner" in message
+    assert "Traceback" not in message
+
+
+def test_restart_stops_before_starting(monkeypatch, capsys):
+    from merlin_tui import local_control
+
+    calls = []
+
+    async def restart():
+        calls.append("restart")
+
+    monkeypatch.setattr(sys, "argv", ["merlin", "restart"])
+    monkeypatch.setattr(local_control, "restart_daemon", restart)
+    main()
+    assert calls == ["restart"]
+    assert "Merlin daemon ready" in capsys.readouterr().out
+
+
+def test_restart_delegates_to_coordinated_lifecycle(monkeypatch, capsys) -> None:
+    calls = []
+
+    async def restart() -> None:
+        calls.append("restart")
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("restart must use the coordinated lifecycle")
+
+    monkeypatch.setattr("merlin_tui.local_control.restart_daemon", restart)
+    monkeypatch.setattr("merlin_tui.local_control.stop_daemon", unexpected)
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", unexpected)
+    monkeypatch.setattr(sys, "argv", ["merlin", "restart"])
+
+    main()
+
+    assert calls == ["restart"]
+    captured = capsys.readouterr()
+    assert captured.out == "Merlin daemon ready\n"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_restart_reports_coordination_failure_without_traceback(
+    monkeypatch, capsys, error_type
+) -> None:
+    async def restart() -> None:
+        raise error_type("The existing session is still closing. Try again shortly.")
+
+    monkeypatch.setattr("merlin_tui.local_control.restart_daemon", restart)
+    monkeypatch.setattr(sys, "argv", ["merlin", "restart"])
+
+    with pytest.raises(SystemExit) as stopped:
+        main()
+
+    assert stopped.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "Merlin could not restart: The existing session is still closing. Try again shortly.\n"
+    )
