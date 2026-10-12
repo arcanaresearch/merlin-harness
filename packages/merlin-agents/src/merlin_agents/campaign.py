@@ -90,9 +90,7 @@ def language_frontier_spec(language_policy: object) -> LanguageFrontierSpec | No
     if not planned:
         return None
     return LanguageFrontierSpec(
-        default_language=str(language_policy.get("default_language", "und"))
-        .strip()
-        .casefold(),
+        default_language=str(language_policy.get("default_language", "und")).strip().casefold(),
         planned_languages=planned,
         code_switching=bool(language_policy.get("code_switching", False)),
     )
@@ -168,8 +166,15 @@ def materialize_language_technique(
         else replace(technique, comparison_supported=True, comparison_block_reason=None)
     )
     if reference.id == technique.id:
+        strategy_contract = dict(normalized.strategy_contract)
+        pre_materialized_bounded_child = bool(
+            "protocol-bounded-child" in normalized.tags
+            and strategy_contract.get("bounded_child_parent_id")
+            and strategy_contract.get("bounded_child_payload_sha256")
+        )
         if (
             normalized.strategy_id in {"crescendo", "goat", "hydra-select"}
+            and not pre_materialized_bounded_child
             or normalized.language.casefold() != reference.requested_language
             or normalized.transform_id != reference.variant_id
             or normalized.language.casefold() not in frontier.planned_languages

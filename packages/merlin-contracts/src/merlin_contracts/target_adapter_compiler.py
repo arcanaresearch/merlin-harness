@@ -18,6 +18,13 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from .request_bindings import RequestValueGenerator, validate_request_bindings
+from .target_capabilities import (
+    RequestConstraint,
+    StateCapabilities,
+    StructuredConstraintRejection,
+    request_constraints_semantic_projection,
+    state_capabilities_semantic_projection,
+)
 
 COMPILED_TARGET_ADAPTER_VERSION = "merlin.compiled-target-adapter.v1"
 ADAPTER_COMPILATION_VERSION = "merlin.target-adapter-compilation.v1"
@@ -105,6 +112,7 @@ class AdapterAdvisory(AdapterContract):
 class HttpApiStep(AdapterContract):
     kind: Literal["http_api"] = "http_api"
     role: AdapterStepRole
+    step_id: str | None = Field(default=None, min_length=1, exclude_if=lambda value: value is None)
     endpoint: str = Field(min_length=1)
     method: str = Field(min_length=1)
     request_template: object
@@ -113,6 +121,9 @@ class HttpApiStep(AdapterContract):
     repeat: int = Field(default=1, ge=1)
     idempotency_key: str | None = None
     replay_after_ambiguous_result: bool = False
+    structured_constraint_rejections: tuple[StructuredConstraintRejection, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
 
     @model_validator(mode="after")
     def validate_bindings(self) -> Self:
@@ -123,6 +134,7 @@ class HttpApiStep(AdapterContract):
 class BrowserStep(AdapterContract):
     kind: Literal["browser"] = "browser"
     role: AdapterStepRole
+    step_id: str | None = Field(default=None, min_length=1, exclude_if=lambda value: value is None)
     tool: Literal["browser_fill", "browser_click", "browser_press"]
     arguments: dict[str, object]
     repeat: int = Field(default=1, ge=1)
@@ -150,6 +162,21 @@ class ProviderChat(AdapterContract):
     target_delivery: TargetDelivery | None = TargetDelivery.DIRECT_USER_CHANNEL
     delivery_resolution: DeliveryResolution = DeliveryResolution.RESOLVED
     cleanup_lifecycle: CleanupLifecycle = CleanupLifecycle.UNKNOWN
+    request_constraints: tuple[RequestConstraint, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    state_capabilities: StateCapabilities | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_capability_steps(self) -> Self:
+        _validate_capability_step_ids(
+            self.request_constraints,
+            self.state_capabilities,
+            available_steps={"provider-chat": (AdapterStepRole.INTERACTION, 0)},
+        )
+        return self
 
 
 class HttpApi(AdapterContract):
@@ -166,6 +193,25 @@ class HttpApi(AdapterContract):
     delivery_resolution: DeliveryResolution = DeliveryResolution.UNSPECIFIED
     cleanup_lifecycle: CleanupLifecycle = CleanupLifecycle.UNKNOWN
     steps: tuple[HttpApiStep, ...] = Field(min_length=1)
+    request_constraints: tuple[RequestConstraint, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    state_capabilities: StateCapabilities | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_capability_steps(self) -> Self:
+        _validate_capability_step_ids(
+            self.request_constraints,
+            self.state_capabilities,
+            available_steps={
+                step.step_id: (step.role, index)
+                for index, step in enumerate(self.steps)
+                if step.step_id is not None
+            },
+        )
+        return self
 
 
 class BrowserChat(AdapterContract):
@@ -182,6 +228,25 @@ class BrowserChat(AdapterContract):
     cleanup_lifecycle: CleanupLifecycle = CleanupLifecycle.UNKNOWN
     steps: tuple[BrowserStep, ...] = Field(min_length=1)
     interaction: BrowserInteraction
+    request_constraints: tuple[RequestConstraint, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    state_capabilities: StateCapabilities | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_capability_steps(self) -> Self:
+        _validate_capability_step_ids(
+            self.request_constraints,
+            self.state_capabilities,
+            available_steps={
+                step.step_id: (step.role, index)
+                for index, step in enumerate(self.steps)
+                if step.step_id is not None
+            },
+        )
+        return self
 
 
 type CompiledTargetAdapter = Annotated[
@@ -189,12 +254,116 @@ type CompiledTargetAdapter = Annotated[
     Field(discriminator="kind"),
 ]
 _COMPILED_ADAPTER = TypeAdapter(CompiledTargetAdapter)
+_REQUEST_CONSTRAINTS = TypeAdapter(tuple[RequestConstraint, ...])
 
 
 class AdapterCompilation(AdapterContract):
     schema_version: Literal["merlin.target-adapter-compilation.v1"] = ADAPTER_COMPILATION_VERSION
     executable: CompiledTargetAdapter
     advisories: tuple[AdapterAdvisory, ...] = ()
+
+
+def _capability_step_ids(
+    constraints: tuple[RequestConstraint, ...], capabilities: StateCapabilities | None
+) -> set[str]:
+    result = {item.step_id for item in constraints}
+    if capabilities is None:
+        return result
+    if capabilities.identity is not None:
+        result.add(capabilities.identity.baseline_selector.step_id)
+        if capabilities.identity.result_selector is not None:
+            result.add(capabilities.identity.result_selector.step_id)
+    for observation in capabilities.observations:
+        result.add(observation.baseline_selector.step_id)
+        result.add(observation.result_selector.step_id)
+    result.update(item.selector.step_id for item in capabilities.freshness_rules)
+    result.update(item.step_id for item in capabilities.affordances)
+    return result
+
+
+def _validate_capability_step_ids(
+    constraints: tuple[RequestConstraint, ...],
+    capabilities: StateCapabilities | None,
+    *,
+    available_steps: Mapping[str, tuple[AdapterStepRole, int]],
+) -> None:
+    unknown = _capability_step_ids(constraints, capabilities) - set(available_steps)
+    if unknown:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities",
+            "capability selectors reference unknown adapter step IDs: "
+            + ", ".join(sorted(unknown)),
+        )
+    if capabilities is None:
+        return
+    if capabilities.observations and capabilities.identity is None:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities.observations",
+            "authoritative state observations require reviewed physical-state identity",
+        )
+    setup_only_ids = {item.selector.step_id for item in capabilities.freshness_rules} | {
+        item.step_id for item in capabilities.affordances
+    }
+    incompatible = sorted(
+        step_id
+        for step_id in setup_only_ids
+        if available_steps.get(step_id, (None, -1))[0] is not AdapterStepRole.SETUP
+    )
+    if incompatible:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities",
+            "freshness rules and state-management affordances require setup steps: "
+            + ", ".join(incompatible),
+        )
+    paired_selectors = (
+        [
+            (
+                "state_capabilities.identity",
+                capabilities.identity.baseline_selector,
+                capabilities.identity.result_selector,
+            )
+        ]
+        if capabilities.identity is not None
+        else []
+    )
+    paired_selectors.extend(
+        (
+            f"state_capabilities.observations[{index}]",
+            observation.baseline_selector,
+            observation.result_selector,
+        )
+        for index, observation in enumerate(capabilities.observations)
+    )
+    for path, baseline, result in paired_selectors:
+        if result is None:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                path,
+                f"{path} requires both baseline_selector and result_selector",
+            )
+        baseline_role, baseline_index = available_steps[baseline.step_id]
+        result_role, result_index = available_steps[result.step_id]
+        if baseline_role is not AdapterStepRole.SETUP:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                f"{path}.baseline_selector",
+                f"{path}.baseline_selector must reference a setup step",
+            )
+        if result_role is not AdapterStepRole.INTERACTION:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                f"{path}.result_selector",
+                f"{path}.result_selector must reference an interaction step",
+            )
+        if baseline_index >= result_index:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                path,
+                f"{path} baseline must be observed before its interaction result",
+            )
 
 
 _INTERFACE_ALIASES = {
@@ -223,6 +392,7 @@ _STEP_EVALUATION_KEYS = (
     "oracle_predicate",
     "oracle_predicates",
     "response_selector",
+    "structured_constraint_rejections",
     "success_witness",
     "terminal_response_contract",
 )
@@ -604,6 +774,7 @@ def _compile_http_steps(
     base: str,
     authorized_origins: tuple[str, ...],
     advisories: list[AdapterAdvisory],
+    include_step_ids: bool = False,
 ) -> tuple[HttpApiStep, ...]:
     raw_steps = raw.get("api_steps")
     if not isinstance(raw_steps, (list, tuple)) or not raw_steps:
@@ -615,6 +786,7 @@ def _compile_http_steps(
     compiled: list[HttpApiStep] = []
     prior_captures: set[str] = set()
     input_binding_failed = False
+    seen_step_ids: set[str] = set()
     for index, item in enumerate(raw_steps):
         path = f"api_steps[{index}]"
         if not isinstance(item, Mapping):
@@ -630,6 +802,13 @@ def _compile_http_steps(
                 AdapterCompileFailureKind.NON_EXECUTABLE_CLEANUP,
                 path,
                 f"{path} cannot preserve both interaction and cleanup roles",
+            )
+        step_id = str(item.get("step_id") or "").strip()
+        if include_step_ids and (not step_id or step_id in seen_step_ids):
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                f"{path}.step_id",
+                "capability-bound API steps require unique non-empty step_id values",
             )
         method = str(item.get("method") or "").strip().upper()
         if not method:
@@ -740,6 +919,7 @@ def _compile_http_steps(
         compiled.append(
             HttpApiStep(
                 role=_step_role(item),
+                step_id=step_id if include_step_ids else None,
                 endpoint=endpoint,
                 method=method,
                 request_template=request_template,
@@ -748,8 +928,11 @@ def _compile_http_steps(
                 repeat=repeat,
                 idempotency_key=idempotency_key,
                 replay_after_ambiguous_result=replay,
+                structured_constraint_rejections=item.get("structured_constraint_rejections", ()),
             )
         )
+        if include_step_ids:
+            seen_step_ids.add(step_id)
         prior_captures.update(captures)
     if not any(step.role is AdapterStepRole.INTERACTION for step in compiled):
         raise AdapterCompileError(
@@ -773,6 +956,7 @@ def _compile_browser_steps(
     *,
     interaction: Mapping[str, object],
     advisories: list[AdapterAdvisory],
+    include_step_ids: bool = False,
 ) -> tuple[tuple[BrowserStep, ...], dict[str, object]]:
     raw_steps = raw.get("browser_steps")
     if not isinstance(raw_steps, (list, tuple)) or not raw_steps:
@@ -782,6 +966,7 @@ def _compile_browser_steps(
             "browser requires at least one executable browser step",
         )
     compiled: list[BrowserStep] = []
+    seen_step_ids: set[str] = set()
     input_locator = (
         str(interaction["input_locator"]).strip()
         if _locator_present(interaction.get("input_locator"))
@@ -807,6 +992,13 @@ def _compile_browser_steps(
                 AdapterCompileFailureKind.NON_EXECUTABLE_CLEANUP,
                 path,
                 f"{path} cannot preserve both interaction and cleanup roles",
+            )
+        step_id = str(item.get("step_id") or "").strip()
+        if include_step_ids and (not step_id or step_id in seen_step_ids):
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                f"{path}.step_id",
+                "capability-bound browser steps require unique non-empty step_id values",
             )
         tool = item.get("tool")
         arguments = item.get("arguments")
@@ -881,6 +1073,7 @@ def _compile_browser_steps(
         compiled.append(
             BrowserStep(
                 role=role,
+                step_id=step_id if include_step_ids else None,
                 tool=tool,
                 arguments=normalized_arguments,
                 repeat=repeat,
@@ -891,6 +1084,8 @@ def _compile_browser_steps(
                 ),
             )
         )
+        if include_step_ids:
+            seen_step_ids.add(step_id)
     if not any(step.tool == "browser_fill" for step in compiled):
         raise AdapterCompileError(
             AdapterCompileFailureKind.NON_EXECUTABLE_STEPS,
@@ -971,8 +1166,21 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
         )
     credential_handle = credential.strip() if isinstance(credential, str) else None
     advisories = _common_advisories(raw)
+    request_constraints = _REQUEST_CONSTRAINTS.validate_python(raw.get("request_constraints") or ())
+    raw_state_capabilities = raw.get("state_capabilities")
+    state_capabilities = (
+        StateCapabilities.model_validate(raw_state_capabilities)
+        if raw_state_capabilities is not None
+        else None
+    )
+    include_step_ids = bool(request_constraints or state_capabilities is not None)
 
     if kind is CompiledAdapterKind.PROVIDER_CHAT:
+        _validate_capability_step_ids(
+            request_constraints,
+            state_capabilities,
+            available_steps={"provider-chat": (AdapterStepRole.INTERACTION, 0)},
+        )
         delivery, delivery_resolution = _delivery(
             raw, actor=TargetActor.TARGET_CHAT, advisories=advisories
         )
@@ -993,6 +1201,8 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             target_delivery=delivery,
             delivery_resolution=delivery_resolution,
             cleanup_lifecycle=cleanup_lifecycle,
+            request_constraints=request_constraints,
+            state_capabilities=state_capabilities,
         )
     elif kind is CompiledAdapterKind.HTTP_API:
         delivery, delivery_resolution = _delivery(
@@ -1011,6 +1221,16 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             base=endpoint,
             authorized_origins=authorized_origins,
             advisories=advisories,
+            include_step_ids=include_step_ids,
+        )
+        _validate_capability_step_ids(
+            request_constraints,
+            state_capabilities,
+            available_steps={
+                step.step_id: (step.role, index)
+                for index, step in enumerate(steps)
+                if step.step_id is not None
+            },
         )
         cleanup_lifecycle = _cleanup_lifecycle(
             raw,
@@ -1026,6 +1246,8 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             delivery_resolution=delivery_resolution,
             cleanup_lifecycle=cleanup_lifecycle,
             steps=steps,
+            request_constraints=request_constraints,
+            state_capabilities=state_capabilities,
         )
     else:
         delivery, delivery_resolution = _delivery(
@@ -1033,7 +1255,21 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
         )
         contract = raw.get("interaction_contract")
         contract = contract if isinstance(contract, Mapping) else {}
-        steps, contract = _compile_browser_steps(raw, interaction=contract, advisories=advisories)
+        steps, contract = _compile_browser_steps(
+            raw,
+            interaction=contract,
+            advisories=advisories,
+            include_step_ids=include_step_ids,
+        )
+        _validate_capability_step_ids(
+            request_constraints,
+            state_capabilities,
+            available_steps={
+                step.step_id: (step.role, index)
+                for index, step in enumerate(steps)
+                if step.step_id is not None
+            },
+        )
         cleanup_lifecycle = _cleanup_lifecycle(
             raw,
             roles=tuple(step.role for step in steps),
@@ -1052,6 +1288,8 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
                 submit_action=contract.get("submit_action"),
                 frame_context=contract.get("frame_context"),
             ),
+            request_constraints=request_constraints,
+            state_capabilities=state_capabilities,
         )
     return AdapterCompilation(executable=executable, advisories=tuple(advisories))
 
@@ -1093,11 +1331,27 @@ def compiled_target_adapter_digest(value: AdapterCompilation | CompiledTargetAda
     """Hash only normalized executable semantics, never advisory interpretation."""
     executable = value.executable if isinstance(value, AdapterCompilation) else value
     payload = executable.model_dump(mode="json")
+    constraints = executable.request_constraints
+    capabilities = executable.state_capabilities
+    payload.pop("request_constraints", None)
+    payload.pop("state_capabilities", None)
+    if constraints:
+        payload["request_constraints"] = request_constraints_semantic_projection(constraints)
+    if capabilities is not None:
+        state_projection = state_capabilities_semantic_projection(capabilities)
+        if state_projection:
+            payload["state_capabilities"] = state_projection
     # Optional bindings must not invalidate already-reviewed legacy adapters.
     if isinstance(executable, HttpApi):
         for step in payload["steps"]:
+            if step.get("step_id") is None:
+                step.pop("step_id", None)
             if not step.get("request_bindings"):
                 step.pop("request_bindings", None)
+    elif isinstance(executable, BrowserChat):
+        for step in payload["steps"]:
+            if step.get("step_id") is None:
+                step.pop("step_id", None)
     encoded = json.dumps(
         payload,
         sort_keys=True,

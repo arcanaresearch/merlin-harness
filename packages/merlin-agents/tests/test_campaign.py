@@ -1180,9 +1180,7 @@ def test_language_frontier_preserves_authored_cell_identity_without_rematerializ
         comparison_block_reason="advisory metadata was unavailable",
     )
     neutral = AssignmentTechnique("neutral", "Exercise the neutral behavior", frozenset(), ())
-    frontier = language_frontier_spec(
-        {"default_language": "en", "planned_languages": ("en", "ms")}
-    )
+    frontier = language_frontier_spec({"default_language": "en", "planned_languages": ("en", "ms")})
     assert frontier is not None
 
     references = enumerate_language_candidate_references((authored, neutral), frontier)

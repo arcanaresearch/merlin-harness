@@ -254,6 +254,8 @@ class CampaignArmStore:
                 language_evidence_status=LanguageEvidenceStatus.OBSERVED,
                 language_evidence_source="committed target receipt",
                 outcome=outcome,
+                attempt_disposition=observation.get("attempt_disposition") or "uncertain",
+                outcome_authority=observation.get("outcome_authority") or "none",
                 counters=CampaignCounters(
                     target_calls=int(observation.get("target_calls") or 0),
                     model_steps=max(1, int(observation.get("model_steps") or 0)),
@@ -474,6 +476,7 @@ class CampaignArmStore:
             """SELECT outcome.surface_id, outcome.technique_id, outcome.controller_id,
                       outcome.mutation_id, outcome.actual_language, outcome.state_id,
                       outcome.outcome, outcome.signal, outcome.distance_to_success,
+                      outcome.attempt_disposition, outcome.outcome_authority,
                       outcome.latency_ms, outcome.model_cost_usd, outcome.usage,
                       counter.infrastructure_failure_category, arm.source
                FROM merlin_storage.campaign_arm_outcomes AS outcome
@@ -506,6 +509,14 @@ class CampaignArmStore:
                     )
                 },
                 "outcome": outcome_map[str(row["outcome"])],
+                "attempt_disposition": (
+                    "uncertain"
+                    if row["attempt_disposition"] is None
+                    else str(row["attempt_disposition"])
+                ),
+                "outcome_authority": (
+                    "none" if row["outcome_authority"] is None else str(row["outcome_authority"])
+                ),
                 "partial_signal": (
                     float(row["signal"])
                     if row["signal"] is not None

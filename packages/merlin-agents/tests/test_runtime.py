@@ -5155,6 +5155,340 @@ def test_target_receipt_projects_only_target_owned_objective_outcome(
 
 
 @pytest.mark.parametrize(
+    ("state_outcome", "terminal_outcome"),
+    [
+        ("confirmed", "confirmed"),
+        ("refuted", "refuted"),
+        ("progress", None),
+        ("regression", None),
+        ("unclear", None),
+    ],
+)
+def test_target_receipt_projects_reviewed_state_transition_without_model_judgment(
+    state_outcome: str, terminal_outcome: str | None
+) -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    transition = {
+        "schema": "merlin.target-state-transition.v1",
+        "authority": "target",
+        "identity_match": True,
+        "outcome": state_outcome,
+        "observations": [
+            {
+                "name": "objective_score",
+                "role": "score",
+                "before_value": 10,
+                "after_value": 12,
+                "preferred_direction": "increase",
+            }
+        ],
+    }
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-state", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "attempt_disposition": "valid",
+                "target_state_transition": transition,
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-state"]
+    assert receipt["attempt_disposition"] == "valid"
+    assert receipt["target_state_transition"] == transition
+    assert receipt["target_authoritative_state_outcome"] == state_outcome
+    if terminal_outcome is None:
+        assert "target_authoritative_outcome" not in receipt
+        assert "outcome_authority" not in receipt
+    else:
+        assert receipt["target_authoritative_outcome"] == terminal_outcome
+        assert receipt["outcome_authority"] == "target"
+
+
+@pytest.mark.parametrize(
+    ("disposition", "is_error"),
+    [
+        ("contaminated", False),
+        ("protocol_invalid", True),
+        ("infrastructure_failed", True),
+        ("uncertain", False),
+    ],
+)
+def test_non_valid_attempt_cannot_emit_clean_target_verdict(
+    disposition: str, is_error: bool
+) -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-invalid", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            is_error=is_error,
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "attempt_disposition": disposition,
+                "target_authoritative_outcome": "confirmed",
+                "target_state_transition": {
+                    "authority": "target",
+                    "identity_match": disposition != "contaminated",
+                    "outcome": "confirmed",
+                    "observations": [],
+                },
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-invalid"]
+    assert receipt["attempt_disposition"] == disposition
+    assert receipt["target_state_transition"]["outcome"] == "unclear"
+    assert "target_authoritative_outcome" not in receipt
+    assert "target_authoritative_state_outcome" not in receipt
+    assert "outcome_authority" not in receipt
+
+
+def test_protocol_invalid_receipt_preserves_exact_regeneration_input_and_parent() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    parent = CompletionCandidateIdentity(
+        campaign_id="campaign/one",
+        target_id="target-1",
+        target_generation="generation-1",
+        scenario_fingerprint="scenario-1",
+        technique_id="candidate/source",
+        controller_id="direct",
+        payload_family="native",
+        requested_language="en",
+        mutation_id="native",
+    )
+    worker_handoff = replace(handoff(), candidate_identity=parent)
+    constraint = {
+        "schema": "merlin.request-constraint-observation.v1",
+        "step_id": "send",
+        "evaluation_root": "request_body",
+        "path": "/json/message",
+        "kind": "string_length",
+        "maximum": 8,
+        "unit": "unicode_characters",
+        "observed": 18,
+        "satisfied": False,
+        "binding_digest": "sha256:constraint",
+    }
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        worker_handoff,
+        ToolCall(call_id="target-call-invalid", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content="rendered request violates reviewed constraints",
+            is_error=True,
+            metadata={
+                "attempt_disposition": "protocol_invalid",
+                "request_constraint_observations": [constraint],
+                "target_exchanges": [
+                    {
+                        "interaction": True,
+                        "cleanup": False,
+                        "outcome": "request_constraint_violation",
+                        "request": {"json": {"message": "complete source text"}},
+                    }
+                ],
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-invalid"]
+    assert receipt["attempt_disposition"] == "protocol_invalid"
+    assert receipt["disposition_reason"] == (
+        "fully rendered target input violated a reviewed protocol constraint"
+    )
+    assert receipt["protocol_invalid_request"] == {
+        "rendered_input": "complete source text",
+        "rendered_input_sha256": hashlib.sha256(b"complete source text").hexdigest(),
+        "constraint": constraint,
+        "parent_candidate_id": "candidate/source",
+        "parent_identity": parent.projection(),
+    }
+
+
+def test_state_identity_mismatch_forces_contaminated_disposition() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-mismatch", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "attempt_disposition": "valid",
+                "state_identity_match": False,
+                "target_authoritative_outcome": "refuted",
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-mismatch"]
+    assert receipt["attempt_disposition"] == "contaminated"
+    assert "target_authoritative_outcome" not in receipt
+    assert "outcome_authority" not in receipt
+
+
+def test_target_receipt_preserves_typed_physical_state_identity() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    identity = {
+        "selected_digest": "sha256:" + "1" * 64,
+        "selected_value": "run-1",
+        "binding_digest": "sha256:" + "2" * 64,
+    }
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-identity", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "physical_state_identity": identity,
+                "state_identity_match": True,
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-identity"]
+    assert receipt["physical_state_identity"] == identity
+    assert receipt["state_identity_match"] is True
+
+
+def test_target_receipt_preserves_bounded_child_and_constraint_evidence() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    child = {
+        "parent_candidate_id": "candidate/parent",
+        "candidate_id": "candidate/child",
+        "variant": "bounded payload",
+    }
+    observations = [
+        {
+            "path": "/message",
+            "kind": "string_length",
+            "maximum": 500,
+            "observed": 640,
+            "satisfied": False,
+        }
+    ]
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-bounded", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content="rendered request violated reviewed constraint",
+            is_error=True,
+            metadata={
+                "attempt_disposition": "protocol_invalid",
+                "disposition_reason": "rendered input exceeded reviewed limit",
+                "bounded_child_candidate": child,
+                "request_constraint_observations": observations,
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-bounded"]
+    assert receipt["attempt_disposition"] == "protocol_invalid"
+    assert receipt["disposition_reason"] == "rendered input exceeded reviewed limit"
+    assert receipt["bounded_child_candidate"] == child
+    assert receipt["request_constraint_observations"] == observations
+    assert "target_authoritative_outcome" not in receipt
+
+
+@pytest.mark.parametrize(
+    ("raw_outcome", "statuses"),
+    [
+        ("confirmed", ("success", "failure")),
+        ("progress", ("progress", "regression")),
+    ],
+)
+def test_conflicting_target_state_observations_settle_unclear(
+    raw_outcome: str, statuses: tuple[str, str]
+) -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-conflict", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "attempt_disposition": "valid",
+                "target_state_transition": {
+                    "authority": "target",
+                    "identity_match": True,
+                    "outcome": raw_outcome,
+                    "observations": [
+                        {"name": f"signal_{index}", "status": status}
+                        for index, status in enumerate(statuses)
+                    ],
+                },
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-conflict"]
+    assert receipt["attempt_disposition"] == "uncertain"
+    assert receipt["target_state_transition"]["outcome"] == "unclear"
+    assert receipt["target_state_transition"]["conflict"] is True
+    assert "target_authoritative_outcome" not in receipt
+    assert "target_authoritative_state_outcome" not in receipt
+    assert "outcome_authority" not in receipt
+
+
+def test_unproven_reviewed_state_identity_cannot_authorize_transition() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-unproven", name="target_request", arguments={"input": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "attempt_disposition": "valid",
+                "state_observations": [
+                    {
+                        "name": "physical_state_identity",
+                        "role": "state_identity",
+                        "phase": "baseline",
+                        "selected_digest": None,
+                    }
+                ],
+                "state_identity_match": None,
+                "target_state_transition": {
+                    "authority": "target",
+                    "identity_match": None,
+                    "outcome": "confirmed",
+                    "observations": [{"name": "terminal", "status": "success"}],
+                },
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-unproven"]
+    assert receipt["attempt_disposition"] == "uncertain"
+    assert receipt["target_state_transition"]["outcome"] == "unclear"
+    assert "target_authoritative_outcome" not in receipt
+    assert "target_authoritative_state_outcome" not in receipt
+    assert "outcome_authority" not in receipt
+
+
+@pytest.mark.parametrize(
     "volatile_key",
     [
         "timestamp",

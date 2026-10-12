@@ -4642,6 +4642,139 @@ async def test_exhausted_retryable_infrastructure_keeps_attempt_open() -> None:
     assert tasks[assignment.id].status == "failed"
 
 
+async def test_exhausted_protocol_invalid_attempt_preserves_regeneration_input() -> None:
+    identity = {
+        "campaign_id": "campaign/protocol-invalid",
+        "target_id": "target",
+        "target_generation": "generation-1",
+        "scenario_fingerprint": "scenario-1",
+        "technique_id": "technique/one",
+        "controller_id": "direct",
+        "payload_family": "baseline",
+        "requested_language": "und",
+        "mutation_id": "baseline",
+    }
+    rendered_input = "payload that exceeds the reviewed target limit"
+    constraint = {
+        "kind": "string_length",
+        "path": "/input",
+        "maximum": 12,
+        "actual": len(rendered_input),
+        "satisfied": False,
+    }
+
+    class ProtocolProvider(Provider):
+        async def stream(self, request):
+            if request.messages[-1].role == "tool":
+                yield TextDelta(text='{"outcome":"request rejected by protocol"}')
+                yield ModelCompleted()
+                return
+            yield ToolCall(
+                call_id=f"protocol-invalid-{request.budget_id}",
+                name="target_request",
+                arguments={"input": rendered_input},
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    class ProtocolTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="target_request",
+                    description="target",
+                    input_schema={"type": "object"},
+                    interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                ),
+            )
+
+        def effect(self, name):
+            return "target_network"
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="request input exceeds maximum length",
+                is_error=True,
+                metadata={
+                    "attempt_disposition": "protocol_invalid",
+                    "disposition_reason": "rendered request exceeded reviewed maximum",
+                    "no_target_effect": True,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "request_constraint_observations": [constraint],
+                    "target_exchanges": [
+                        {
+                            "interaction": False,
+                            "cleanup": False,
+                            "outcome": "request_constraint_violation",
+                            "request": dict(arguments),
+                        }
+                    ],
+                },
+            )
+
+    class AttemptStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalizations = []
+
+        def bind_technique_attempt(self, *args, **metadata):
+            return "technique-attempt-1"
+
+        def terminalize_technique_attempt(self, attempt_id, state, **metadata):
+            self.terminalizations.append((attempt_id, state, metadata))
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            del applied_message_ids
+            lease = self.attempts[attempt_id]
+            assert lease.generation == generation
+            partials = self.results.setdefault(lease.schedule_id, {})
+            partials[f"partial:{attempt_id}:{len(partials)}"] = {
+                "node_id": lease.node_id,
+                "generation": generation,
+                "schema_id": "schema/partial-result",
+                "payload": result,
+            }
+
+    assignment = WorkerAssignment(
+        id="campaign/protocol-invalid/worker",
+        objective=(
+            "execute\n\nSealed candidate identities: "
+            + json.dumps([identity], sort_keys=True, separators=(",", ":"))
+        ),
+        profile_id="injection",
+        target_profile_id="target",
+        technique_ids=("technique/one",),
+        guidance_ids=(),
+        tool_ids=("target_request",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_seconds=60),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    store = AttemptStore()
+    service = DurableAgentService(ProtocolProvider(), ProtocolTools(), store, model="test")
+
+    live = await service.submit(
+        "session-protocol-invalid", (assignment,), max_workers=1, minimum_workers=1
+    )
+    assert live.execution is not None
+    await live.execution
+
+    assert len(store.terminalizations) == 1
+    attempt_id, state, metadata = store.terminalizations[0]
+    assert attempt_id == "technique-attempt-1"
+    assert state == "blocked"
+    assert metadata["disposition"] == "protocol_invalid"
+    assert metadata["disposition_reason"] == "rendered request exceeded reviewed maximum"
+    protocol_invalid_request = metadata["strategy_state"]["protocol_invalid_request"]
+    assert protocol_invalid_request["rendered_input"] == rendered_input
+    assert protocol_invalid_request["constraint"] == constraint
+    assert protocol_invalid_request["parent_candidate_id"] == "technique/one"
+    assert metadata["evidence_refs"]
+
+
 async def test_durable_provider_failure_finalizes_receipt_without_replaying_target() -> None:
     class PartialStore(Store):
         def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
@@ -7550,6 +7683,9 @@ async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome
                     "call_id": "target-call-1",
                     "technique_attempt_id": "technique-attempt-1",
                     "outcome_authority": "target",
+                    "attempt_disposition": "valid",
+                    "physical_state_identity": {"selected_digest": "sha256:state-1"},
+                    "state_identity_match": True,
                     "target_authoritative_outcome": outcome,
                 }
             ]
@@ -7564,6 +7700,10 @@ async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome
                 "reason": f"target-owned {outcome} outcome",
                 "evidence_refs": ("sha256:direct-evidence",),
                 "usage": {"total_tokens": 7},
+                "disposition": "valid",
+                "disposition_reason": "target-authored outcome matched the reviewed oracle",
+                "physical_state_identity": "sha256:state-1",
+                "state_identity_match": True,
                 "strategy_state": {
                     "agenda_id": "agenda/one",
                     "execution_stage": "direct",
@@ -7574,7 +7714,174 @@ async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome
                         "evidence_refs": ["sha256:direct-evidence"],
                         "target_call_ids": ["target-call-1"],
                     },
+                    "attempt_disposition": {
+                        "kind": "valid",
+                        "reason": "target-authored outcome matched the reviewed oracle",
+                    },
+                    "physical_state_identity": "sha256:state-1",
+                    "state_identity_match": True,
                 },
+            },
+        )
+    ]
+
+
+async def test_contaminated_target_receipt_terminalizes_retryably_without_quality() -> None:
+    class TerminalStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalizations = []
+
+        def terminalize_technique_attempt(self, attempt_id, state, **metadata):
+            self.terminalizations.append((attempt_id, state, metadata))
+
+    store = TerminalStore()
+    observations: list[dict[str, object]] = []
+    service = DurableAgentService(
+        Provider(),
+        Tools(),
+        store,
+        model="test",
+        arm_outcome_recorder=observations.append,
+    )
+    assignment = SimpleNamespace(
+        id="campaign/one/direct",
+        agenda_id="agenda/one",
+        execution_stage="direct",
+        strategy_id="direct",
+        target_profile_id="target",
+        planned_language="und",
+        requested_language="und",
+        requested_transform_id="baseline",
+        semantic_technique_id="technique/one",
+        technique_ids=("technique/one",),
+        objective="ordinary execution",
+    )
+
+    await service._terminalize_observed_technique_attempt(  # noqa: SLF001
+        SimpleNamespace(id="schedule-1"),
+        assignment,
+        "technique-attempt-1",
+        digest="sha256:contaminated-evidence",
+        usage={"total_tokens": 7},
+        checkpoint={
+            "target_evidence": [
+                {
+                    "call_id": "target-call-clean",
+                    "technique_attempt_id": "technique-attempt-1",
+                    "outcome_authority": "target",
+                    "attempt_disposition": "valid",
+                    "target_authoritative_outcome": "confirmed",
+                },
+                {
+                    "call_id": "target-call-1",
+                    "technique_attempt_id": "technique-attempt-1",
+                    "outcome_authority": "target",
+                    "attempt_disposition": "contaminated",
+                    "target_authoritative_outcome": "refuted",
+                },
+            ]
+        },
+    )
+
+    assert store.terminalizations == [
+        (
+            "technique-attempt-1",
+            "ambiguous",
+            {
+                "reason": "target attempt ended with contaminated evidence",
+                "evidence_refs": ("sha256:contaminated-evidence",),
+                "usage": {"total_tokens": 7},
+                "strategy_state": {
+                    "agenda_id": "agenda/one",
+                    "execution_stage": "direct",
+                    "attempt_disposition": {
+                        "kind": "contaminated",
+                        "reason": "target attempt ended with contaminated evidence",
+                    },
+                },
+                "disposition": "contaminated",
+                "disposition_reason": "target attempt ended with contaminated evidence",
+                "physical_state_identity": None,
+                "state_identity_match": None,
+            },
+        )
+    ]
+    assert observations == []
+
+
+async def test_protocol_invalid_attempt_persists_bounded_child_without_quality_credit() -> None:
+    class TerminalStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalizations = []
+
+        def terminalize_technique_attempt(self, attempt_id, state, **metadata):
+            self.terminalizations.append((attempt_id, state, metadata))
+
+    store = TerminalStore()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    assignment = SimpleNamespace(
+        id="campaign/one/direct",
+        agenda_id="agenda/one",
+        execution_stage="direct",
+        strategy_id="direct",
+        target_profile_id="target",
+        planned_language="und",
+        requested_language="und",
+        requested_transform_id="baseline",
+        semantic_technique_id="technique/one",
+        technique_ids=("technique/one",),
+        objective="ordinary execution",
+    )
+    child = {
+        "id": "candidate/child",
+        "variant_id": "bounded-1",
+        "variant": "short payload",
+        "reason": "target accepts at most 500 characters",
+        "parent_candidate_id": "candidate/parent",
+    }
+
+    await service._terminalize_observed_technique_attempt(  # noqa: SLF001
+        SimpleNamespace(id="schedule-1"),
+        assignment,
+        "technique-attempt-1",
+        digest="sha256:protocol-evidence",
+        usage={"total_tokens": 7},
+        checkpoint={
+            "target_evidence": [
+                {
+                    "call_id": "target-call-1",
+                    "technique_attempt_id": "technique-attempt-1",
+                    "attempt_disposition": "protocol_invalid",
+                    "disposition_reason": "rendered request exceeded reviewed maximum",
+                    "bounded_child_candidate": child,
+                }
+            ]
+        },
+    )
+
+    assert store.terminalizations == [
+        (
+            "technique-attempt-1",
+            "ambiguous",
+            {
+                "reason": "rendered request exceeded reviewed maximum",
+                "evidence_refs": ("sha256:protocol-evidence",),
+                "usage": {"total_tokens": 7},
+                "strategy_state": {
+                    "agenda_id": "agenda/one",
+                    "execution_stage": "direct",
+                    "attempt_disposition": {
+                        "kind": "protocol_invalid",
+                        "reason": "rendered request exceeded reviewed maximum",
+                    },
+                    "bounded_child_candidate": child,
+                },
+                "disposition": "protocol_invalid",
+                "disposition_reason": "rendered request exceeded reviewed maximum",
+                "physical_state_identity": None,
+                "state_identity_match": None,
             },
         )
     ]
@@ -7656,6 +7963,7 @@ async def test_terminalized_attempt_upserts_arm_outcome_with_pinned_cost() -> No
                     "call_id": "target-call-1",
                     "technique_attempt_id": "technique-attempt-1",
                     "outcome_authority": "target",
+                    "attempt_disposition": "valid",
                     "target_authoritative_outcome": "confirmed",
                 }
             ]
@@ -7668,6 +7976,8 @@ async def test_terminalized_attempt_upserts_arm_outcome_with_pinned_cost() -> No
     assert observation["arm_id"] == "arm-1"
     assert observation["technique_attempt_id"] == "technique-attempt-1"
     assert observation["outcome"] == "authoritative_success"
+    assert observation["attempt_disposition"] == "valid"
+    assert observation["outcome_authority"] == "target"
     assert observation["target_calls"] == 1
     assert observation["evidence_refs"] == ("sha256:direct-evidence",)
     assert observation["model_cost_usd"] == pytest.approx(0.002)

@@ -1494,6 +1494,37 @@ def test_pg0_campaign_worker_binds_authoritative_technique_attempt(tmp_path: Pat
                     mutation_id="mutation/rot13-v1",
                     strategy_state={"candidate_identity": candidate_identity},
                 )
+            physical_identity = "sha256:" + "b" * 64
+            scheduler.terminalize_technique_attempt(
+                technique_attempt_id,
+                "confirmed",
+                reason="target-owned confirmed outcome",
+                evidence_refs=("receipt:one",),
+                usage={"target_calls": 1},
+                strategy_state={
+                    "candidate_identity": candidate_identity,
+                    "outcome_authority": {
+                        "kind": "target",
+                        "outcome": "confirmed",
+                        "evidence_refs": ["receipt:one"],
+                    },
+                },
+                disposition="valid",
+                disposition_reason="target-authored outcome matched the reviewed oracle",
+                physical_state_identity=physical_identity,
+                state_identity_match=True,
+            )
+            terminal = scheduler.get_technique_attempt(technique_attempt_id)
+            assert terminal is not None
+            assert terminal.state.value == "confirmed"
+            assert terminal.disposition is not None
+            assert terminal.disposition.value == "valid"
+            assert terminal.disposition_reason == (
+                "target-authored outcome matched the reviewed oracle"
+            )
+            assert terminal.physical_state_identity == physical_identity
+            assert terminal.state_identity_match is True
+            assert terminal.strategy_state["outcome_authority"]["kind"] == "target"
             expired_lease = scheduler.claim(
                 schedule_id,
                 expired_node_id,

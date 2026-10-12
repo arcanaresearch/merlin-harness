@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from math import log, sqrt
 from typing import Literal
 
+from merlin_contracts import AttemptDisposition, OutcomeAuthority
+
 from .jev import JevClient
 from .telemetry import emit_judgment
 
@@ -274,6 +276,8 @@ class ArmObservation:
     cost_microusd: int | None = None
     transform_credit_eligible: bool = True
     evaluation_uncertainties: tuple[Mapping[str, object], ...] = ()
+    attempt_disposition: AttemptDisposition | None = None
+    outcome_authority: OutcomeAuthority | None = None
 
     def __post_init__(self) -> None:
         if not self.outcome.strip():
@@ -294,6 +298,15 @@ class ArmObservation:
             self.partial_signal > 0 or self.generalized_win or self.boundary_signal
         ):
             raise ValueError("infrastructure failures cannot carry attack-quality signal")
+        if self.attempt_disposition == AttemptDisposition.VALID and self.outcome_authority not in {
+            OutcomeAuthority.TARGET,
+            OutcomeAuthority.VALIDATOR,
+        }:
+            raise ValueError("valid ARM observations require target or validator authority")
+        if self.attempt_disposition not in {None, AttemptDisposition.VALID} and (
+            self.outcome_authority in {OutcomeAuthority.TARGET, OutcomeAuthority.VALIDATOR}
+        ):
+            raise ValueError("non-valid ARM observations cannot claim authoritative evidence")
         # A transform-attribution disagreement does not erase what the target did.
         # ``aggregate_observations`` withholds that evidence from the transform-specific
         # arm while the raw observation remains available to base-technique learning.
@@ -301,6 +314,14 @@ class ArmObservation:
     @property
     def is_infrastructure_failure(self) -> bool:
         return self.infrastructure_failure or self.outcome in _INFRASTRUCTURE_OUTCOMES
+
+    @property
+    def quality_eligible(self) -> bool:
+        """Whether the observation may update quality ranking or lifecycle."""
+        return self.attempt_disposition == AttemptDisposition.VALID and self.outcome_authority in {
+            OutcomeAuthority.TARGET,
+            OutcomeAuthority.VALIDATOR,
+        }
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ArmObservation:
@@ -342,6 +363,16 @@ class ArmObservation:
             cost_microusd=_optional_int(value.get("cost_microusd"), "cost_microusd"),
             transform_credit_eligible=bool(transform_credit_eligible),
             evaluation_uncertainties=tuple(dict(item) for item in raw_uncertainties),
+            attempt_disposition=(
+                None
+                if value.get("attempt_disposition") is None
+                else AttemptDisposition(str(value["attempt_disposition"]))
+            ),
+            outcome_authority=(
+                None
+                if value.get("outcome_authority") is None
+                else OutcomeAuthority(str(value["outcome_authority"]))
+            ),
         )
 
 
@@ -542,8 +573,10 @@ def aggregate_observations(
         if item.is_infrastructure_failure:
             bucket["infrastructure_failures"] = int(bucket["infrastructure_failures"]) + 1
             continue
-        quality_eligible = item.transform_credit_eligible and (
-            item.outcome in _QUALITY_OUTCOMES or item.partial_signal > 0
+        quality_eligible = (
+            item.quality_eligible
+            and item.transform_credit_eligible
+            and (item.outcome in _QUALITY_OUTCOMES or item.partial_signal > 0)
         )
         if not quality_eligible:
             continue

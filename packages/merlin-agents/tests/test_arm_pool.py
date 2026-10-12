@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from merlin_agents.arm_pool import load_ranked_pool, novel_arms, rank_frontier, rank_pool
 from merlin_agents.discovery import ArmIdentity, ArmObservation
+from merlin_contracts import AttemptDisposition, OutcomeAuthority
 
 
 def _arm(technique: str, objective: str, **measurements: float) -> dict[str, object]:
@@ -13,6 +14,16 @@ def _arm(technique: str, objective: str, **measurements: float) -> dict[str, obj
         "status": "trial",
         **measurements,
     }
+
+
+def _valid(identity: ArmIdentity, outcome: str, **metadata: object) -> ArmObservation:
+    return ArmObservation(
+        identity,
+        outcome,
+        attempt_disposition=AttemptDisposition.VALID,
+        outcome_authority=OutcomeAuthority.TARGET,
+        **metadata,
+    )
 
 
 def test_novelty_is_rank_evidence_and_never_suppresses_distinct_arms() -> None:
@@ -39,10 +50,10 @@ def test_rank_pool_wires_signals_and_reversibly_downranks_zero_signal_history() 
         },
     )
     dead_id, live_id = ArmIdentity.from_mapping(dead), ArmIdentity.from_mapping(live)
-    history = tuple(ArmObservation(dead_id, "negative_result") for _ in range(5)) + (
+    history = tuple(_valid(dead_id, "negative_result") for _ in range(5)) + (
         ArmObservation(live_id, "provider_failure", infrastructure_failure=True),
-        ArmObservation(live_id, "near_miss", partial_signal=0.6, boundary_signal=True),
-        ArmObservation(live_id, "win", generalized_win=True),
+        _valid(live_id, "near_miss", partial_signal=0.6, boundary_signal=True),
+        _valid(live_id, "win", generalized_win=True),
     )
     ranked = rank_pool((dead, live), history)
     assert [item.arm["technique_id"] for item in ranked] == ["live", "dead"]
@@ -69,7 +80,7 @@ def test_rank_pool_restores_priority_when_language_or_mutation_changes() -> None
         mutation_changed=1.0,
     )
     history = tuple(
-        ArmObservation(ArmIdentity.from_mapping(arm), "negative_result")
+        _valid(ArmIdentity.from_mapping(arm), "negative_result")
         for arm in (unchanged,) * 5 + (changed,) * 5
     )
 
@@ -115,15 +126,11 @@ def test_ambiguous_and_cancelled_rows_never_advance_retirement_attempts() -> Non
 
     assert ranked[0].ranking.lifecycle == "trial"
     uncertainty = next(
-        item
-        for item in ranked[0].ranking.components
-        if item.name == "portfolio_exploration_bonus"
+        item for item in ranked[0].ranking.components if item.name == "portfolio_exploration_bonus"
     )
     pristine = rank_pool((arm,), ())[0]
     pristine_uncertainty = next(
-        item
-        for item in pristine.ranking.components
-        if item.name == "portfolio_exploration_bonus"
+        item for item in pristine.ranking.components if item.name == "portfolio_exploration_bonus"
     )
     assert uncertainty.measured_value == pristine_uncertainty.measured_value
 

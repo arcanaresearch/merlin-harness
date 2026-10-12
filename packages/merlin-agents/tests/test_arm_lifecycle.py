@@ -25,7 +25,7 @@ from merlin_agents.arm_lifecycle import (
 )
 from merlin_agents.campaign_service import CampaignPreparation
 from merlin_agents.discovery import ArmIdentity, AttemptStats
-from merlin_contracts import AgentTask
+from merlin_contracts import AgentTask, AttemptDisposition, OutcomeAuthority
 
 
 def _stats(
@@ -224,7 +224,14 @@ def _identity_observations(arm: dict[str, object], outcome: str, count: int, sig
         )
     }
     return [
-        {"identity": identity, "outcome": outcome, "partial_signal": signal} for _ in range(count)
+        {
+            "identity": identity,
+            "outcome": outcome,
+            "partial_signal": signal,
+            "attempt_disposition": AttemptDisposition.VALID,
+            "outcome_authority": OutcomeAuthority.TARGET,
+        }
+        for _ in range(count)
     ]
 
 

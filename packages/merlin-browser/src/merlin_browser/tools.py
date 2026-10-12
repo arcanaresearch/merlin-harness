@@ -757,6 +757,7 @@ class _DerivedApiHandoff:
     creation_transition_evidence: tuple[tuple[str, dict[str, object]], ...]
     terminal_evidence: tuple[tuple[str, dict[str, object]], ...]
     cleanup_evidence: tuple[tuple[str, dict[str, object]], ...]
+    capability_evidence: tuple[tuple[str, dict[str, object]], ...]
     stateful_reuse_is_unsafe: bool
 
 
@@ -2498,6 +2499,12 @@ class CompiledApiReconHandoffTool:
                 "two distinct harmless messages within the authorized recon budget when needed; "
                 "never treat a session ID, credential, server-issued token, or merely UUID-shaped "
                 "constant as a request nonce. Unknown semantics remain recorded uncertainty."
+                " Describe request constraints and target-authored state observations only when "
+                "an exact captured response proves them; Merlin verifies their evidence selectors "
+                "and binds durable evidence references. Field names are target data, never "
+                "hardcoded runtime semantics. Declare state_identity only for a target-authored "
+                "physical mutable-state identifier observed before and after interaction; never "
+                "promote a cookie, lease, credential, or logical session token."
             ),
             input_schema={
                 "type": "object",
@@ -2711,6 +2718,162 @@ class CompiledApiReconHandoffTool:
                         "required": ["precondition", "postcondition"],
                         "additionalProperties": False,
                     },
+                    "request_constraints": {
+                        "type": "array",
+                        "description": (
+                            "Optional input constraints established by an exact captured response. "
+                            "The evidence selector is used only during reconnaissance and is "
+                            "replaced by durable evidence references in the sealed adapter."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "pattern": "^/"},
+                                "step_id": {"const": "observed-message-exchange"},
+                                "evaluation_root": {"const": "request_body"},
+                                "kind": {"const": "string_length"},
+                                "maximum": {"type": "integer", "minimum": 1},
+                                "unit": {"const": "unicode_characters"},
+                                "source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "server_validation_response",
+                                        "openapi_schema",
+                                        "client_validation",
+                                    ],
+                                },
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "evidence_selector": {
+                                    "type": "object",
+                                    "properties": {
+                                        "method": {"type": "string"},
+                                        "url": {"type": "string", "minLength": 1},
+                                        "status_codes": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "integer",
+                                                "minimum": 100,
+                                                "maximum": 599,
+                                            },
+                                            "minItems": 1,
+                                            "uniqueItems": True,
+                                        },
+                                        "pointer": {"type": "string", "pattern": "^(?:|/.*)$"},
+                                        "match_values": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": [
+                                                    "string",
+                                                    "number",
+                                                    "integer",
+                                                    "boolean",
+                                                    "null",
+                                                ]
+                                            },
+                                            "minItems": 1,
+                                            "uniqueItems": True,
+                                        },
+                                    },
+                                    "required": ["status_codes", "pointer", "match_values"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "required": [
+                                "path",
+                                "step_id",
+                                "evaluation_root",
+                                "kind",
+                                "maximum",
+                                "unit",
+                                "source",
+                                "confidence",
+                                "evidence_selector",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "state_observations": {
+                        "type": "array",
+                        "description": (
+                            "Optional target-authored state fields. Each pointer must exist in the "
+                            "captured response for its declared lifecycle step."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "minLength": 1},
+                                "role": {
+                                    "type": "string",
+                                    "enum": [
+                                        "state_identity",
+                                        "progress_ordinal",
+                                        "score",
+                                        "budget_remaining",
+                                        "terminal_status",
+                                        "custom",
+                                    ],
+                                },
+                                "baseline_selector": {"$ref": "#/$defs/state_selector"},
+                                "result_selector": {"$ref": "#/$defs/state_selector"},
+                                "preferred_direction": {
+                                    "type": "string",
+                                    "enum": ["increase", "decrease"],
+                                },
+                                "success_values": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": [
+                                            "string",
+                                            "number",
+                                            "integer",
+                                            "boolean",
+                                            "null",
+                                        ]
+                                    },
+                                    "uniqueItems": True,
+                                },
+                                "failure_values": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": [
+                                            "string",
+                                            "number",
+                                            "integer",
+                                            "boolean",
+                                            "null",
+                                        ]
+                                    },
+                                    "uniqueItems": True,
+                                },
+                            },
+                            "required": [
+                                "name",
+                                "role",
+                                "baseline_selector",
+                                "result_selector",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "$defs": {
+                    "state_selector": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": {
+                                "type": "string",
+                                "enum": [
+                                    "observed-session-setup",
+                                    "observed-message-exchange",
+                                    "observed-cleanup-exchange",
+                                ],
+                            },
+                            "evaluation_root": {"const": "response_body"},
+                            "pointer": {"type": "string", "pattern": "^/"},
+                        },
+                        "required": ["step_id", "evaluation_root", "pointer"],
+                        "additionalProperties": False,
+                    }
                 },
                 "required": [
                     "method",
@@ -2809,6 +2972,7 @@ class CompiledApiReconHandoffTool:
                     (response_evidence_ref, derived.response_evidence),
                     *derived.terminal_evidence,
                     *derived.cleanup_evidence,
+                    *derived.capability_evidence,
                 )
             }
             for evidence_ref, payload in evidence_records.items():
@@ -4155,6 +4319,188 @@ class CompiledApiReconHandoffTool:
                 _captured_api_evidence(session, cleanup_event, "response"),
             )
         cleanup_evidence_refs = [reference for reference, _ in cleanup_evidence]
+        capability_evidence_by_ref: dict[str, dict[str, object]] = {}
+        request_constraints: list[dict[str, object]] = []
+        for raw_constraint in arguments.get("request_constraints", []):
+            if not isinstance(raw_constraint, Mapping):
+                continue
+            try:
+                constraint_path = _normalize_json_pointer(raw_constraint.get("path"))
+            except ValueError:
+                constraint_path = ""
+            selector = raw_constraint.get("evidence_selector")
+            if constraint_path != input_pointer or not isinstance(selector, Mapping):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.request_constraints",
+                        "A request constraint did not describe the reviewed input path and was "
+                        "retained only as uncertainty.",
+                    )
+                )
+                continue
+            selector_method = str(selector.get("method") or method).upper()
+            selector_url = str(selector.get("url") or url)
+            selector_statuses = selector.get("status_codes")
+            selector_pointer = selector.get("pointer")
+            selector_values = selector.get("match_values")
+            matching_constraint_events: list[Mapping[str, Any]] = []
+            if (
+                isinstance(selector_statuses, list)
+                and isinstance(selector_pointer, str)
+                and isinstance(selector_values, list)
+                and any(
+                    type(value) is int and value == raw_constraint.get("maximum")
+                    for value in selector_values
+                )
+            ):
+                for candidate in all_context_exchanges:
+                    observed_value = _json_pointer_value_or_missing(
+                        candidate.get("response_json"), selector_pointer
+                    )
+                    if (
+                        str(candidate.get("method") or "").upper() == selector_method
+                        and candidate.get("url") == selector_url
+                        and candidate.get("status") in selector_statuses
+                        and any(
+                            type(observed_value) is type(expected) and observed_value == expected
+                            for expected in selector_values
+                        )
+                    ):
+                        matching_constraint_events.append(candidate)
+            if not matching_constraint_events:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.request_constraints",
+                        "A declared request constraint had no exact captured response matching "
+                        "its evidence selector and was not made executable.",
+                    )
+                )
+                continue
+            constraint_evidence_refs: list[str] = []
+            constraint_binding_refs: list[str] = []
+            for constraint_event in matching_constraint_events:
+                request_ref, request_payload = _captured_api_evidence(
+                    session, constraint_event, "request"
+                )
+                response_ref, response_payload = _captured_api_evidence(
+                    session, constraint_event, "response"
+                )
+                for evidence_ref, payload in (
+                    (request_ref, request_payload),
+                    (response_ref, response_payload),
+                ):
+                    capability_evidence_by_ref[evidence_ref] = payload
+                    constraint_evidence_refs.append(evidence_ref)
+                constraint_binding_refs.append(response_ref)
+            request_constraints.append(
+                {
+                    "path": constraint_path,
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "request_body",
+                    "kind": str(raw_constraint["kind"]),
+                    "maximum": int(raw_constraint["maximum"]),
+                    "unit": str(raw_constraint["unit"]),
+                    "source": str(raw_constraint["source"]),
+                    "evidence_refs": list(dict.fromkeys(constraint_evidence_refs)),
+                    "evidence_bindings": [
+                        {
+                            "evidence_ref": evidence_ref,
+                            "observed_maximum": int(raw_constraint["maximum"]),
+                        }
+                        for evidence_ref in dict.fromkeys(constraint_binding_refs)
+                    ],
+                    "confidence": float(raw_constraint["confidence"]),
+                }
+            )
+
+        state_observations: list[dict[str, object]] = []
+        reviewed_state_identities: list[dict[str, object]] = []
+        state_evidence_by_step_id: dict[
+            str,
+            tuple[
+                Mapping[str, Any] | None,
+                tuple[tuple[str, dict[str, object]], ...],
+            ],
+        ] = {
+            "observed-session-setup": (setup_event, setup_evidence),
+            "observed-message-exchange": (
+                event,
+                (
+                    (request_evidence_ref, request_evidence),
+                    (response_evidence_ref, response_evidence),
+                ),
+            ),
+            "observed-cleanup-exchange": (cleanup_event, cleanup_evidence),
+        }
+        for raw_observation in arguments.get("state_observations", []):
+            if not isinstance(raw_observation, Mapping):
+                continue
+            selectors: dict[str, dict[str, str]] = {}
+            observation_evidence_refs: list[str] = []
+            for selector_name in ("baseline_selector", "result_selector"):
+                raw_selector = raw_observation.get(selector_name)
+                if not isinstance(raw_selector, Mapping):
+                    break
+                step_id = raw_selector.get("step_id")
+                pointer = raw_selector.get("pointer")
+                observed_event, observed_evidence = state_evidence_by_step_id.get(
+                    str(step_id), (None, ())
+                )
+                observed_value = (
+                    _json_pointer_value_or_missing(observed_event.get("response_json"), pointer)
+                    if observed_event is not None and isinstance(pointer, str)
+                    else _MISSING
+                )
+                if observed_value is _MISSING:
+                    break
+                selectors[selector_name] = {
+                    "step_id": str(step_id),
+                    "evaluation_root": "response_body",
+                    "pointer": str(pointer),
+                }
+                observation_evidence_refs.extend(reference for reference, _ in observed_evidence)
+                capability_evidence_by_ref.update(dict(observed_evidence))
+            if set(selectors) != {"baseline_selector", "result_selector"}:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_observations",
+                        "A state observation selector was absent from its exact captured "
+                        "lifecycle response and was not made executable.",
+                    )
+                )
+                continue
+            observation = {
+                "name": str(raw_observation["name"]),
+                "role": str(raw_observation["role"]),
+                **selectors,
+                "evidence_refs": list(dict.fromkeys(observation_evidence_refs)),
+            }
+            for optional_key in ("preferred_direction", "success_values", "failure_values"):
+                if optional_key in raw_observation:
+                    value = raw_observation[optional_key]
+                    observation[optional_key] = list(value) if isinstance(value, list) else value
+            state_observations.append(observation)
+            if observation["role"] == "state_identity":
+                reviewed_state_identities.append(
+                    {
+                        "identity_scope": "physical_state",
+                        "baseline_selector": dict(observation["baseline_selector"]),
+                        "result_selector": dict(observation["result_selector"]),
+                        "evidence_refs": list(observation["evidence_refs"]),
+                    }
+                )
+        reviewed_state_identity = (
+            reviewed_state_identities[0] if len(reviewed_state_identities) == 1 else None
+        )
+        if len(reviewed_state_identities) > 1:
+            evaluation_uncertainties.append(
+                _evaluation_uncertainty(
+                    "browser_compile_api_handoff.state_identity",
+                    "Multiple physical-state identity observations were declared; no identity "
+                    "capability was sealed.",
+                )
+            )
+        capability_evidence = tuple(capability_evidence_by_ref.items())
         message_step: dict[str, object] = {
             "step_id": "observed-message-exchange",
             "endpoint": url,
@@ -4300,6 +4646,23 @@ class CompiledApiReconHandoffTool:
                 else []
             ),
         }
+        if request_constraints:
+            adapter["request_constraints"] = request_constraints
+            adapter["observed_evidence"] = list(
+                dict.fromkeys([*adapter["observed_evidence"], *capability_evidence_by_ref])
+            )
+        if state_observations:
+            adapter["state_capabilities"] = {
+                "observations": state_observations,
+                **(
+                    {"identity": reviewed_state_identity}
+                    if reviewed_state_identity is not None
+                    else {}
+                ),
+            }
+            adapter["observed_evidence"] = list(
+                dict.fromkeys([*adapter["observed_evidence"], *capability_evidence_by_ref])
+            )
         if setup_step is not None:
             cleanup_discovery_status = (
                 "satisfied" if cleanup_event is not None else "required_before_target_execution"
@@ -4358,6 +4721,33 @@ class CompiledApiReconHandoffTool:
                             )
                         ),
                     }
+            state_capabilities = adapter.get("state_capabilities")
+            if (
+                isinstance(state_capabilities, dict)
+                and reviewed_state_identity is not None
+                and "session_freshness_predicate" in adapter
+            ):
+                freshness = adapter["session_freshness_predicate"]
+                assert isinstance(freshness, Mapping)
+                state_capabilities["affordances"] = [
+                    {
+                        "kind": "provision_fresh_state",
+                        "step_id": "observed-session-setup",
+                        "evaluation_root": "response_body",
+                        "evidence_refs": list(freshness["evidence_refs"]),
+                    }
+                ]
+                state_capabilities["freshness_rules"] = [
+                    {
+                        "selector": {
+                            "step_id": "observed-session-setup",
+                            "evaluation_root": "response_body",
+                            "pointer": freshness["pointer"],
+                        },
+                        "match_values": list(freshness["match_values"]),
+                        "evidence_refs": list(freshness["evidence_refs"]),
+                    }
+                ]
         # Captured request/response evidence is sufficient to seal the executable
         # transport. A second target call is not routine admission bureaucracy;
         # live execution records any state drift as retryable infrastructure evidence.
@@ -4391,6 +4781,7 @@ class CompiledApiReconHandoffTool:
             creation_transition_evidence=creation_transition_evidence,
             terminal_evidence=terminal_evidence,
             cleanup_evidence=cleanup_evidence,
+            capability_evidence=capability_evidence,
             stateful_reuse_is_unsafe=setup_step is not None
             and (
                 cleanup_event is None

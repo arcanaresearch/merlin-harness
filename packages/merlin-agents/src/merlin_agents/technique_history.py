@@ -66,9 +66,7 @@ def concrete_cell_parts(
 
     normalized_seed = str(mutation_seed or "").strip()
     mutation_id = (
-        "none"
-        if not normalized_seed
-        else "sha256:" + sha256(normalized_seed.encode()).hexdigest()
+        "none" if not normalized_seed else "sha256:" + sha256(normalized_seed.encode()).hexdigest()
     )
     return (
         str(technique_id),

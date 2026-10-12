@@ -158,6 +158,132 @@ def test_api_sessions_are_isolated_by_assignment_scope_and_enumerable(tmp_path: 
             assert untouched.pending_step is None
 
 
+def test_physical_state_history_and_target_execution_fence_cross_scopes(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-physical-state")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaign_id = "campaign/physical-state"
+            _prepare_campaign(connection, campaign_id)
+            sessions = CampaignApiSessionRepository(connection)
+            for scope in ("assignment:first", "assignment:second", "assignment:third"):
+                sessions.create(campaign_id, "target-1", "sha256:adapter", session_scope_id=scope)
+
+            execution_claim = sessions.claim_target_execution(
+                campaign_id,
+                target_id="target-1",
+                session_scope_id="assignment:first",
+                claimant_id="invocation:first",
+                lease_seconds=30,
+                maximum_parallel_states=2,
+            )
+            assert execution_claim is not None
+            parallel_claim = sessions.claim_target_execution(
+                campaign_id,
+                target_id="target-1",
+                session_scope_id="assignment:second",
+                claimant_id="invocation:parallel",
+                lease_seconds=30,
+                maximum_parallel_states=2,
+            )
+            assert parallel_claim is not None
+            assert (
+                sessions.claim_target_execution(
+                    campaign_id,
+                    target_id="target-1",
+                    session_scope_id="assignment:third",
+                    claimant_id="invocation:third",
+                    lease_seconds=30,
+                    maximum_parallel_states=2,
+                )
+                is None
+            )
+            assert sessions.release_target_execution(parallel_claim, "invocation:parallel")
+            assert (
+                sessions.claim_target_execution(
+                    campaign_id,
+                    target_id="target-1",
+                    session_scope_id="assignment:second",
+                    claimant_id="invocation:second",
+                    lease_seconds=30,
+                )
+                is None
+            )
+            first = sessions.claim_physical_state(
+                campaign_id,
+                "sha256:physical-run-a",
+                target_id="target-1",
+                session_scope_id="assignment:first",
+            )
+            assert not first.previously_observed
+            assert first.session.physical_state_identity == "sha256:physical-run-a"
+            sessions.release_remote_session(
+                campaign_id,
+                target_id="target-1",
+                session_scope_id="assignment:first",
+                remote_session_id="sha256:physical-run-a",
+            )
+            assert sessions.release_target_execution(execution_claim, "invocation:first")
+
+            second_claim = sessions.claim_target_execution(
+                campaign_id,
+                target_id="target-1",
+                session_scope_id="assignment:second",
+                claimant_id="invocation:second",
+                lease_seconds=30,
+            )
+            assert second_claim is not None
+            second = sessions.claim_physical_state(
+                campaign_id,
+                "sha256:physical-run-a",
+                target_id="target-1",
+                session_scope_id="assignment:second",
+            )
+            assert second.previously_observed
+            assert second.prior_session_scope_ids == ("assignment:first",)
+            assert sessions.validate_target_execution(second_claim, "invocation:second")
+            assert sessions.renew_target_execution(second_claim, "invocation:second", 30)
+            assert not sessions.release_target_execution(second_claim, "invocation:first")
+            assert sessions.release_target_execution(second_claim, "invocation:second")
+
+            crashed_claim = sessions.claim_target_execution(
+                campaign_id,
+                target_id="target-1",
+                session_scope_id="assignment:first",
+                claimant_id="invocation:crashed",
+                lease_seconds=30,
+            )
+            assert crashed_claim is not None
+            with database.connect() as competing_connection:
+                competing = CampaignApiSessionRepository(competing_connection)
+                assert (
+                    competing.claim_target_execution(
+                        campaign_id,
+                        target_id="target-1",
+                        session_scope_id="assignment:second",
+                        claimant_id="invocation:takeover",
+                        lease_seconds=30,
+                    )
+                    is None
+                )
+                competing_connection.execute(
+                    """UPDATE merlin_storage.target_execution_leases
+                       SET expires_at = now() - interval '1 second'
+                       WHERE claim_id = %s""",
+                    (crashed_claim,),
+                )
+                competing_connection.commit()
+                takeover = competing.claim_target_execution(
+                    campaign_id,
+                    target_id="target-1",
+                    session_scope_id="assignment:second",
+                    claimant_id="invocation:takeover",
+                    lease_seconds=30,
+                )
+                assert takeover is not None and takeover != crashed_claim
+                assert not competing.renew_target_execution(crashed_claim, "invocation:crashed", 30)
+                assert competing.release_target_execution(takeover, "invocation:takeover")
+
+
 def test_scoped_api_session_state_survives_postgres_restart(tmp_path: Path) -> None:
     data_dir = tmp_path / "postgres-scoped-restart"
     campaign_id = "campaign/scoped-restart"

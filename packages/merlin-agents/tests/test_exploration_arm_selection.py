@@ -4,6 +4,7 @@ from merlin_agents.exploration import (
     select_exploration_frontier,
     select_exploration_seeds,
 )
+from merlin_contracts import AttemptDisposition, OutcomeAuthority
 
 
 def _arm(technique: str, objective: str, *, novelty: float) -> dict[str, object]:
@@ -22,7 +23,14 @@ def _arm(technique: str, objective: str, *, novelty: float) -> dict[str, object]
 def test_selector_is_ranked_not_fifo_and_exposes_audit() -> None:
     low = _arm("low", "Probe one distinct condition", novelty=0.1)
     high = _arm("high", "Investigate an unrelated state transition", novelty=1.0)
-    low_history = (ArmObservation(ArmIdentity.from_mapping(low), "negative_result"),)
+    low_history = (
+        ArmObservation(
+            ArmIdentity.from_mapping(low),
+            "negative_result",
+            attempt_disposition=AttemptDisposition.VALID,
+            outcome_authority=OutcomeAuthority.TARGET,
+        ),
+    )
     selection = select_exploration_arms((low, high), low_history, maximum=1)
     assert selection.selected[0]["technique_id"] == "high"
     assert selection.deferred_keys == (ArmIdentity.from_mapping(low).key,)

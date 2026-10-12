@@ -513,19 +513,145 @@ class CampaignStore:
                     candidate["variant"],
                     candidate["priority"],
                 )
-                actual = None if stored is None else (
-                    str(stored["family_id"]),
-                    int(stored["ordinal"]),
-                    str(stored["requested_language"]),
-                    str(stored["variant_id"]),
-                    dict(stored["variant"]),
-                    None if stored["priority"] is None else float(stored["priority"]),
+                actual = (
+                    None
+                    if stored is None
+                    else (
+                        str(stored["family_id"]),
+                        int(stored["ordinal"]),
+                        str(stored["requested_language"]),
+                        str(stored["variant_id"]),
+                        dict(stored["variant"]),
+                        None if stored["priority"] is None else float(stored["priority"]),
+                    )
                 )
                 if actual != expected:
                     raise ValueError(
                         f"frontier candidate {candidate['id']!r} conflicts with durable state"
                     )
         return self.frontier_counts(campaign_id)
+
+    def register_frontier_child(
+        self,
+        campaign_id: str,
+        parent_candidate_id: str,
+        child_id: str,
+        variant_id: str,
+        variant: Mapping[str, object],
+        *,
+        reason: str,
+        family_document: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable regenerated child without changing its parent."""
+
+        parent_id = parent_candidate_id.strip()
+        candidate_id = child_id.strip()
+        child_variant_id = variant_id.strip()
+        lineage_reason = reason.strip()
+        if not all((parent_id, candidate_id, child_variant_id, lineage_reason)):
+            raise ValueError("frontier child identity, variant, and reason cannot be empty")
+        normalized_family = None if family_document is None else dict(family_document)
+        family_digest = (
+            None
+            if normalized_family is None
+            else sha256(
+                json.dumps(normalized_family, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+        with self.connection.transaction():
+            campaign = self.connection.execute(
+                "SELECT id FROM merlin_storage.assessment_campaigns WHERE id = %s FOR UPDATE",
+                (campaign_id,),
+            ).fetchone()
+            if campaign is None:
+                raise KeyError(campaign_id)
+            existing = self.connection.execute(
+                """SELECT * FROM merlin_storage.campaign_frontier_candidates
+                   WHERE campaign_id = %s AND id = %s""",
+                (campaign_id, candidate_id),
+            ).fetchone()
+            parent = self.connection.execute(
+                """SELECT family_id, requested_language, priority
+                   FROM merlin_storage.campaign_frontier_candidates
+                   WHERE campaign_id = %s AND id = %s""",
+                (campaign_id, parent_id),
+            ).fetchone()
+            if parent is None:
+                raise KeyError(parent_candidate_id)
+            child_family_id = (
+                candidate_id if normalized_family is not None else str(parent["family_id"])
+            )
+            if normalized_family is not None:
+                self.connection.execute(
+                    """INSERT INTO merlin_storage.campaign_frontier_families
+                           (campaign_id, id, document, document_digest)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (campaign_id, id) DO NOTHING""",
+                    (campaign_id, child_family_id, Jsonb(normalized_family), family_digest),
+                )
+                stored_family = self.connection.execute(
+                    """SELECT document, document_digest
+                       FROM merlin_storage.campaign_frontier_families
+                       WHERE campaign_id = %s AND id = %s""",
+                    (campaign_id, child_family_id),
+                ).fetchone()
+                if stored_family is None or (
+                    dict(stored_family["document"]),
+                    str(stored_family["document_digest"]),
+                ) != (normalized_family, family_digest):
+                    raise ValueError("frontier child family conflicts with durable state")
+            if existing is None:
+                ordinal_row = self.connection.execute(
+                    """SELECT coalesce(max(ordinal), -1) + 1 AS ordinal
+                       FROM merlin_storage.campaign_frontier_candidates
+                       WHERE campaign_id = %s""",
+                    (campaign_id,),
+                ).fetchone()
+                self.connection.execute(
+                    """INSERT INTO merlin_storage.campaign_frontier_candidates
+                           (campaign_id, id, family_id, ordinal, requested_language,
+                            variant_id, variant, priority, state,
+                            parent_candidate_id, lineage_reason)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)""",
+                    (
+                        campaign_id,
+                        candidate_id,
+                        child_family_id,
+                        int(ordinal_row["ordinal"]),
+                        parent["requested_language"],
+                        child_variant_id,
+                        Jsonb(dict(variant)),
+                        parent["priority"],
+                        parent_id,
+                        lineage_reason,
+                    ),
+                )
+                existing = self.connection.execute(
+                    """SELECT * FROM merlin_storage.campaign_frontier_candidates
+                       WHERE campaign_id = %s AND id = %s""",
+                    (campaign_id, candidate_id),
+                ).fetchone()
+            expected = (
+                child_family_id,
+                str(parent["requested_language"]),
+                child_variant_id,
+                dict(variant),
+                parent_id,
+                lineage_reason,
+            )
+            actual = (
+                str(existing["family_id"]),
+                str(existing["requested_language"]),
+                str(existing["variant_id"]),
+                dict(existing["variant"]),
+                None
+                if existing["parent_candidate_id"] is None
+                else str(existing["parent_candidate_id"]),
+                None if existing["lineage_reason"] is None else str(existing["lineage_reason"]),
+            )
+            if actual != expected:
+                raise ValueError("frontier child identity conflicts with durable state")
+            return {**dict(existing), "variant": dict(existing["variant"])}
 
     def update_frontier_priorities(
         self, campaign_id: str, priorities: Mapping[str, float | None]
@@ -605,8 +731,95 @@ class CampaignStore:
             )
         return cursor.rowcount
 
+    def claim_frontier_transition(
+        self, campaign_id: str, claimant_id: str, lease_seconds: int
+    ) -> str | None:
+        """Claim or renew exclusive campaign-frontier transition ownership."""
+
+        claimant = claimant_id.strip()
+        if not claimant or lease_seconds < 1:
+            raise ValueError("frontier transition claims require a claimant and positive lease")
+        claim_id = str(uuid4())
+        with self.connection.transaction():
+            campaign = self.connection.execute(
+                "SELECT id FROM merlin_storage.assessment_campaigns WHERE id = %s FOR UPDATE",
+                (campaign_id,),
+            ).fetchone()
+            if campaign is None:
+                raise KeyError(campaign_id)
+            row = self.connection.execute(
+                """INSERT INTO merlin_storage.campaign_frontier_transition_leases
+                       (campaign_id, claim_id, claimant_id, expires_at)
+                   VALUES (%s, %s, %s, now() + make_interval(secs => %s))
+                   ON CONFLICT (campaign_id) DO UPDATE
+                   SET claim_id = CASE
+                           WHEN campaign_frontier_transition_leases.claimant_id =
+                                EXCLUDED.claimant_id
+                             THEN campaign_frontier_transition_leases.claim_id
+                           ELSE EXCLUDED.claim_id
+                       END,
+                       claimant_id = EXCLUDED.claimant_id,
+                       expires_at = EXCLUDED.expires_at,
+                       updated_at = now()
+                   WHERE campaign_frontier_transition_leases.claimant_id = EXCLUDED.claimant_id
+                      OR campaign_frontier_transition_leases.expires_at <= now()
+                   RETURNING claim_id""",
+                (campaign_id, claim_id, claimant, lease_seconds),
+            ).fetchone()
+            return None if row is None else str(row["claim_id"])
+
+    def renew_frontier_transition(
+        self, claim_id: str, claimant_id: str, lease_seconds: int
+    ) -> bool:
+        """Renew a live transition lease only for its current claimant."""
+
+        claimant = claimant_id.strip()
+        if not claim_id.strip() or not claimant or lease_seconds < 1:
+            raise ValueError("frontier transition renewal requires a claim, claimant, and lease")
+        with self.connection.transaction():
+            row = self.connection.execute(
+                """UPDATE merlin_storage.campaign_frontier_transition_leases
+                   SET expires_at = now() + make_interval(secs => %s), updated_at = now()
+                   WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()
+                   RETURNING claim_id""",
+                (lease_seconds, claim_id, claimant),
+            ).fetchone()
+            return row is not None
+
+    def validate_frontier_transition(self, claim_id: str, claimant_id: str) -> bool:
+        """Return whether a claimant still owns an unexpired transition lease."""
+
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        row = self.connection.execute(
+            """SELECT 1 FROM merlin_storage.campaign_frontier_transition_leases
+               WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()""",
+            (claim_id, claimant_id.strip()),
+        ).fetchone()
+        return row is not None
+
+    def release_frontier_transition(self, claim_id: str, claimant_id: str) -> bool:
+        """Release a transition lease only for its current claimant."""
+
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        with self.connection.transaction():
+            row = self.connection.execute(
+                """DELETE FROM merlin_storage.campaign_frontier_transition_leases
+                   WHERE claim_id = %s AND claimant_id = %s RETURNING claim_id""",
+                (claim_id, claimant_id.strip()),
+            ).fetchone()
+            return row is not None
+
     def claim_frontier_batch(
-        self, campaign_id: str, wave: int, batch_id: str, limit: int
+        self,
+        campaign_id: str,
+        wave: int,
+        batch_id: str,
+        limit: int,
+        *,
+        claim_id: str | None = None,
+        claimant_id: str | None = None,
     ) -> dict[str, Any]:
         """Atomically claim one deterministic, bounded candidate batch."""
 
@@ -619,6 +832,7 @@ class CampaignStore:
             ).fetchone()
             if campaign is None:
                 raise KeyError(campaign_id)
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
             existing = self.connection.execute(
                 """SELECT id, wave FROM merlin_storage.campaign_frontier_batches
                    WHERE campaign_id = %s AND id = %s""",
@@ -644,9 +858,7 @@ class CampaignStore:
                 (campaign_id, limit),
             ).fetchall()
             candidate_ids = tuple(str(row["id"]) for row in rows)
-            digest = sha256(
-                json.dumps(candidate_ids, separators=(",", ":")).encode()
-            ).hexdigest()
+            digest = sha256(json.dumps(candidate_ids, separators=(",", ":")).encode()).hexdigest()
             state = "claimed" if candidate_ids else "settled"
             self.connection.execute(
                 """INSERT INTO merlin_storage.campaign_frontier_batches
@@ -679,6 +891,9 @@ class CampaignStore:
         wave: int,
         batch_id: str,
         candidate_ids: Sequence[str],
+        *,
+        claim_id: str | None = None,
+        claimant_id: str | None = None,
     ) -> dict[str, Any]:
         """Atomically claim an adaptively ranked ordered set of queued candidates."""
 
@@ -701,6 +916,7 @@ class CampaignStore:
             ).fetchone()
             if campaign is None:
                 raise KeyError(campaign_id)
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
             existing = self.connection.execute(
                 """SELECT wave, candidate_digest
                    FROM merlin_storage.campaign_frontier_batches
@@ -755,9 +971,7 @@ class CampaignStore:
                 raise RuntimeError("exact frontier claim lost candidate ownership")
             return self._frontier_batch(campaign_id, batch_id)
 
-    def resize_frontier_batch(
-        self, campaign_id: str, batch_id: str, limit: int
-    ) -> dict[str, Any]:
+    def resize_frontier_batch(self, campaign_id: str, batch_id: str, limit: int) -> dict[str, Any]:
         """Shrink an unbound claim and requeue the released suffix."""
 
         if limit < 0:
@@ -843,11 +1057,55 @@ class CampaignStore:
             )
             return self._frontier_batch(campaign_id, batch_id)
 
+    def bind_frontier_batch_fenced(
+        self,
+        campaign_id: str,
+        batch_id: str,
+        schedule_id: str,
+        *,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Bind a frontier batch while holding its recovery transition lease."""
+
+        with self.connection.transaction():
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
+            batch = self.connection.execute(
+                """SELECT state, schedule_id
+                   FROM merlin_storage.campaign_frontier_batches
+                   WHERE campaign_id = %s AND id = %s FOR UPDATE""",
+                (campaign_id, batch_id),
+            ).fetchone()
+            if batch is None:
+                raise KeyError(batch_id)
+            if str(batch["state"]) == "scheduled":
+                if str(batch["schedule_id"]) != schedule_id:
+                    raise ValueError("frontier batch is already bound to a different schedule")
+                return self._frontier_batch(campaign_id, batch_id)
+            if str(batch["state"]) != "claimed":
+                raise ValueError("only a claimed frontier batch can be bound")
+            self.connection.execute(
+                """UPDATE merlin_storage.campaign_frontier_batches
+                   SET state = 'scheduled', schedule_id = %s, updated_at = now()
+                   WHERE campaign_id = %s AND id = %s""",
+                (schedule_id, campaign_id, batch_id),
+            )
+            self.connection.execute(
+                """UPDATE merlin_storage.campaign_frontier_candidates
+                   SET state = 'scheduled', updated_at = now()
+                   WHERE campaign_id = %s AND active_batch_id = %s AND state = 'claimed'""",
+                (campaign_id, batch_id),
+            )
+            return self._frontier_batch(campaign_id, batch_id)
+
     def settle_frontier_batch(
         self,
         campaign_id: str,
         batch_id: str,
         dispositions: Mapping[str, str | Mapping[str, object]],
+        *,
+        claim_id: str | None = None,
+        claimant_id: str | None = None,
     ) -> dict[str, int]:
         """Settle every claimed candidate as terminal or safely queued again."""
 
@@ -867,6 +1125,7 @@ class CampaignStore:
             normalized[str(candidate_id)] = (disposition, reason)
 
         with self.connection.transaction():
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
             batch = self.connection.execute(
                 """SELECT state FROM merlin_storage.campaign_frontier_batches
                    WHERE campaign_id = %s AND id = %s FOR UPDATE""",
@@ -935,9 +1194,7 @@ class CampaignStore:
                WHERE campaign_id = %s GROUP BY state""",
             (campaign_id,),
         ).fetchall()
-        counts = {
-            state: 0 for state in ("dormant", "queued", "claimed", "scheduled", "terminal")
-        }
+        counts = {state: 0 for state in ("dormant", "queued", "claimed", "scheduled", "terminal")}
         counts.update({str(row["state"]): int(row["count"]) for row in rows})
         counts["total"] = sum(counts.values())
         return counts
@@ -949,6 +1206,18 @@ class CampaignStore:
             """SELECT id FROM merlin_storage.campaign_frontier_batches
                WHERE campaign_id = %s AND state IN ('claimed', 'scheduled')""",
             (campaign_id,),
+        ).fetchone()
+        return None if row is None else self._frontier_batch(campaign_id, str(row["id"]))
+
+    def load_frontier_batch_for_schedule(
+        self, campaign_id: str, schedule_id: str
+    ) -> dict[str, Any] | None:
+        """Load the frontier batch durably bound to one scheduler graph."""
+
+        row = self.connection.execute(
+            """SELECT id FROM merlin_storage.campaign_frontier_batches
+               WHERE campaign_id = %s AND schedule_id = %s""",
+            (campaign_id, schedule_id),
         ).fetchone()
         return None if row is None else self._frontier_batch(campaign_id, str(row["id"]))
 
@@ -1251,9 +1520,7 @@ class CampaignStore:
         ).fetchall()
         return {
             **dict(batch),
-            "schedule_id": (
-                None if batch["schedule_id"] is None else str(batch["schedule_id"])
-            ),
+            "schedule_id": (None if batch["schedule_id"] is None else str(batch["schedule_id"])),
             "candidates": tuple(
                 {
                     **dict(row),
@@ -1263,6 +1530,28 @@ class CampaignStore:
                 for row in rows
             ),
         }
+
+    def _require_frontier_transition(
+        self,
+        campaign_id: str,
+        claim_id: str | None,
+        claimant_id: str | None,
+    ) -> None:
+        """Fence a frontier mutation when the caller supplies lease authority."""
+
+        if claim_id is None and claimant_id is None:
+            return
+        if not (claim_id or "").strip() or not (claimant_id or "").strip():
+            raise ValueError("frontier transition fencing requires claim and claimant together")
+        row = self.connection.execute(
+            """SELECT 1 FROM merlin_storage.campaign_frontier_transition_leases
+               WHERE campaign_id = %s AND claim_id = %s AND claimant_id = %s
+                 AND expires_at > now()
+               FOR UPDATE""",
+            (campaign_id, claim_id, claimant_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("frontier transition lease is missing, expired, or owned elsewhere")
 
     def reserve_budget(
         self,
@@ -1740,8 +2029,18 @@ class CampaignStore:
             for row in rows
         ]
 
-    def add_wave(self, campaign_id: str, wave: int, kind: str, schedule_id: str) -> dict[str, Any]:
+    def add_wave(
+        self,
+        campaign_id: str,
+        wave: int,
+        kind: str,
+        schedule_id: str,
+        *,
+        claim_id: str | None = None,
+        claimant_id: str | None = None,
+    ) -> dict[str, Any]:
         with self.connection.transaction():
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
             row = self.connection.execute(
                 """INSERT INTO merlin_storage.campaign_waves
                        (campaign_id, wave, kind, schedule_id, status)
@@ -1759,12 +2058,41 @@ class CampaignStore:
                     raise ValueError("campaign wave conflicts with deterministic schedule")
         return dict(row)
 
+    def add_wave_fenced(
+        self,
+        campaign_id: str,
+        wave: int,
+        kind: str,
+        schedule_id: str,
+        *,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Add a frontier wave while holding its transition lease."""
+
+        return self.add_wave(
+            campaign_id,
+            wave,
+            kind,
+            schedule_id,
+            claim_id=claim_id,
+            claimant_id=claimant_id,
+        )
+
     def finish_wave(
-        self, campaign_id: str, wave: int, status: str, summary: Mapping[str, object]
+        self,
+        campaign_id: str,
+        wave: int,
+        status: str,
+        summary: Mapping[str, object],
+        *,
+        claim_id: str | None = None,
+        claimant_id: str | None = None,
     ) -> dict[str, Any]:
         if status not in {"completed", "failed", "cancelled"}:
             raise ValueError("invalid terminal wave status")
         with self.connection.transaction():
+            self._require_frontier_transition(campaign_id, claim_id, claimant_id)
             row = self.connection.execute(
                 """UPDATE merlin_storage.campaign_waves
                    SET status = %s, summary = %s, updated_at = now()
@@ -1775,6 +2103,27 @@ class CampaignStore:
         if row is None:
             raise ValueError("campaign wave is not running")
         return dict(row)
+
+    def finish_wave_fenced(
+        self,
+        campaign_id: str,
+        wave: int,
+        status: str,
+        summary: Mapping[str, object],
+        *,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Finish a frontier wave while holding its transition lease."""
+
+        return self.finish_wave(
+            campaign_id,
+            wave,
+            status,
+            summary,
+            claim_id=claim_id,
+            claimant_id=claimant_id,
+        )
 
     def append_lead(
         self, campaign_id: str, wave: int, payload: Mapping[str, object]

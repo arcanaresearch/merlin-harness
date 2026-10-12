@@ -160,6 +160,8 @@ def test_arm_observation_retains_target_signal_when_transform_attribution_is_unc
             "reference": "receipt:one",
             "digest": "sha256:" + "a" * 64,
             "target_call_ids": ("call:one",),
+            "attempt_disposition": "valid",
+            "outcome_authority": "target",
         },
     )
 
@@ -185,6 +187,8 @@ def test_worker_partial_outcome_without_valid_signal_is_ambiguous() -> None:
         "attempt_id": "attempt:one",
         "reference": "receipt:one",
         "digest": "sha256:" + "a" * 64,
+        "attempt_disposition": "valid",
+        "outcome_authority": "target",
     }
 
     for document in (

@@ -1,7 +1,10 @@
+import hashlib
+
 import pytest
 from merlin_agents.arm_mutation import (
     MUTATION_OUTPUT_SCHEMA,
     build_mutation_prompt,
+    generate_bounded_child_candidate,
     generate_mutations,
 )
 
@@ -168,3 +171,79 @@ def test_generate_mutations_rejects_non_positive_maximum() -> None:
             direction="encoding",
             maximum=0,
         )
+
+
+def test_bounded_child_uses_complete_model_rewrite_and_preserves_parent_lineage() -> None:
+    rejected = "Keep every semantic instruction in this deliberately oversized target input."
+    captured: list[str] = []
+
+    def generator(prompt: str) -> list[dict[str, str]]:
+        captured.append(prompt)
+        return [{"input_text": "Preserve all intent.", "rationale": "Equivalent concise wording"}]
+
+    result = generate_bounded_child_candidate(
+        parent_candidate_id="candidate/source",
+        parent_identity={"technique_id": "technique/source", "requested_language": "en"},
+        rejected_input=rejected,
+        constraint={
+            "schema": "merlin.request-constraint-observation.v1",
+            "step_id": "send",
+            "evaluation_root": "request_body",
+            "path": "/message",
+            "kind": "string_length",
+            "maximum": 20,
+            "unit": "unicode_characters",
+            "binding_digest": "sha256:constraint",
+        },
+        generator=generator,
+    )
+
+    assert result is not None
+    assert captured and rejected in captured[0]
+    assert result["id"].startswith("candidate/source@bounded=")
+    assert result["variant_id"].startswith("bounded:")
+    assert result["variant"] == {
+        "schema": "merlin.bounded-child-candidate.v1",
+        "kind": "bounded_child",
+        "input_text": "Preserve all intent.",
+        "parent_candidate_id": "candidate/source",
+        "parent_identity": {
+            "technique_id": "technique/source",
+            "requested_language": "en",
+        },
+        "constraint": {
+            "schema": "merlin.request-constraint-observation.v1",
+            "step_id": "send",
+            "evaluation_root": "request_body",
+            "path": "/message",
+            "kind": "string_length",
+            "maximum": 20,
+            "unit": "unicode_characters",
+            "binding_digest": "sha256:constraint",
+        },
+        "source_input_sha256": hashlib.sha256(rejected.encode()).hexdigest(),
+        "semantic_preservation": {
+            "source": "model_mutation",
+            "rationale": "Equivalent concise wording",
+        },
+    }
+
+
+def test_bounded_child_rejects_unchanged_or_oversized_generator_output() -> None:
+    source = "This exact complete source is too long."
+    result = generate_bounded_child_candidate(
+        parent_candidate_id="candidate/source",
+        parent_identity={"technique_id": "technique/source"},
+        rejected_input=source,
+        constraint={
+            "kind": "string_length",
+            "maximum": 5,
+            "unit": "utf8_bytes",
+        },
+        generator=lambda _prompt: [
+            {"input_text": source, "rationale": "unchanged"},
+            {"input_text": "ééé", "rationale": "six UTF-8 bytes"},
+        ],
+    )
+
+    assert result is None

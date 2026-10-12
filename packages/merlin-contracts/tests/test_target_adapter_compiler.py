@@ -1,3 +1,5 @@
+import hashlib
+import json
 from copy import deepcopy
 
 import pytest
@@ -191,6 +193,332 @@ def test_executable_request_change_changes_digest() -> None:
     assert compiled_target_adapter_digest(compile_target_adapter(original)) != (
         compiled_target_adapter_digest(compile_target_adapter(changed))
     )
+
+
+def test_generic_constraints_and_state_capabilities_compile_as_executable_semantics() -> None:
+    raw = _http_adapter()
+    raw["request_constraints"] = [
+        {
+            "kind": "string_length",
+            "step_id": "message-label",
+            "evaluation_root": "request_body",
+            "path": "/message",
+            "maximum": 500,
+            "unit": "unicode_characters",
+            "source": "server_validation_response",
+            "evidence_refs": ["evidence:limit"],
+            "evidence_bindings": [{"evidence_ref": "evidence:limit", "observed_maximum": 500}],
+            "confidence": 1.0,
+        }
+    ]
+    raw["state_capabilities"] = {
+        "identity": {
+            "identity_scope": "physical_state",
+            "baseline_selector": {
+                "pointer": "/run/id",
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+            },
+            "result_selector": {
+                "pointer": "/run/id",
+                "step_id": "message-label",
+                "evaluation_root": "response_body",
+            },
+            "evidence_refs": ["evidence:setup"],
+        },
+        "observations": [
+            {
+                "name": "progress_stage",
+                "role": "progress_ordinal",
+                "baseline_selector": {
+                    "step_id": "setup-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/stage",
+                },
+                "result_selector": {
+                    "step_id": "message-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/stage",
+                },
+                "preferred_direction": "increase",
+                "evidence_refs": ["evidence:interaction"],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "evidence_refs": ["evidence:setup"],
+            }
+        ],
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "setup-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/resumed",
+                },
+                "match_values": [False],
+                "evidence_refs": ["evidence:setup"],
+            }
+        ],
+        "maximum_parallel_states": 2,
+    }
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.request_constraints[0].maximum == 500
+    assert compiled.executable.state_capabilities is not None
+    assert compiled.executable.state_capabilities.identity is not None
+    assert compiled.executable.state_capabilities.identity.baseline_selector.pointer == "/run/id"
+    assert compiled.executable.state_capabilities.observations[0].role == "progress_ordinal"
+
+
+def test_capability_provenance_does_not_change_executable_digest() -> None:
+    first = _http_adapter()
+    first["request_constraints"] = [
+        {
+            "path": "/message",
+            "step_id": "message-label",
+            "evaluation_root": "request_body",
+            "maximum": 500,
+            "source": "dom_attribute",
+            "evidence_refs": ["evidence:first"],
+            "evidence_bindings": [{"evidence_ref": "evidence:first", "observed_maximum": 500}],
+            "confidence": 0.8,
+        }
+    ]
+    first["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "pointer": "/run/id",
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+            },
+            "result_selector": {
+                "pointer": "/run/id",
+                "step_id": "message-label",
+                "evaluation_root": "response_body",
+            },
+            "evidence_refs": ["evidence:first"],
+        },
+        "affordances": [
+            {
+                "kind": "provision_state",
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "evidence_refs": ["evidence:first"],
+            }
+        ],
+    }
+    second = deepcopy(first)
+    second["request_constraints"][0]["source"] = "server_validation_response"  # type: ignore[index]
+    second["request_constraints"][0]["evidence_refs"] = ["evidence:second"]  # type: ignore[index]
+    second["request_constraints"][0]["confidence"] = 1.0  # type: ignore[index]
+    second["request_constraints"][0]["evidence_bindings"][0]["evidence_ref"] = (  # type: ignore[index]
+        "evidence:second"
+    )
+    second["state_capabilities"]["identity"]["evidence_refs"] = [  # type: ignore[index]
+        "evidence:second"
+    ]
+    second["state_capabilities"]["affordances"][0]["evidence_refs"] = [  # type: ignore[index]
+        "evidence:second"
+    ]
+
+    assert compiled_target_adapter_digest(compile_target_adapter(first)) == (
+        compiled_target_adapter_digest(compile_target_adapter(second))
+    )
+
+
+def test_capability_semantics_change_executable_digest() -> None:
+    original = _http_adapter()
+    original["request_constraints"] = [
+        {
+            "step_id": "message-label",
+            "evaluation_root": "request_body",
+            "path": "/message",
+            "maximum": 500,
+            "evidence_bindings": [{"evidence_ref": "evidence:limit", "observed_maximum": 500}],
+        }
+    ]
+    changed = deepcopy(original)
+    changed["request_constraints"][0]["maximum"] = 499  # type: ignore[index]
+    changed["request_constraints"][0]["evidence_bindings"][0][  # type: ignore[index]
+        "observed_maximum"
+    ] = 499
+
+    assert compiled_target_adapter_digest(compile_target_adapter(original)) != (
+        compiled_target_adapter_digest(compile_target_adapter(changed))
+    )
+
+
+def test_capability_selector_must_reference_an_exact_compiled_step() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "missing-step",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            }
+        }
+    }
+
+    with pytest.raises(AdapterCompileError, match="unknown adapter step IDs") as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_state_management_affordance_must_bind_a_setup_step() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "affordances": [
+            {
+                "kind": "reset_state",
+                "step_id": "message-label",
+                "evaluation_root": "response_body",
+            }
+        ]
+    }
+
+    with pytest.raises(AdapterCompileError, match="require setup steps") as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_physical_identity_requires_baseline_and_interaction_result() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            }
+        }
+    }
+
+    with pytest.raises(AdapterCompileError, match="requires both baseline_selector") as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_authoritative_result_selector_must_bind_the_interaction_response() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "cleanup-label",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        }
+    }
+
+    with pytest.raises(AdapterCompileError, match="must reference an interaction step") as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_observation_baseline_must_precede_its_interaction_result() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    steps.append(
+        {
+            "step_id": "late-baseline",
+            "endpoint": "/late-baseline",
+            "method": "GET",
+            "request_template": {},
+            "captures": {},
+        }
+    )
+    raw["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message-label",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "step_id": "late-baseline",
+                    "evaluation_root": "response_body",
+                    "pointer": "/score",
+                },
+                "result_selector": {
+                    "step_id": "message-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/score",
+                },
+                "preferred_direction": "increase",
+            }
+        ],
+    }
+
+    with pytest.raises(AdapterCompileError, match="baseline must be observed before") as caught:
+        compile_target_adapter(raw)
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+
+
+def test_authoritative_observations_require_reviewed_physical_identity() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "step_id": "setup-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/score",
+                },
+                "result_selector": {
+                    "step_id": "message-label",
+                    "evaluation_root": "response_body",
+                    "pointer": "/score",
+                },
+                "preferred_direction": "increase",
+            }
+        ]
+    }
+
+    with pytest.raises(AdapterCompileError, match="require reviewed physical-state identity"):
+        compile_target_adapter(raw)
+
+
+def test_absent_capabilities_preserve_legacy_compiled_digest_shape() -> None:
+    compiled = compile_target_adapter(_http_adapter()).executable
+    payload = compiled.model_dump(mode="json")
+
+    assert compiled.request_constraints == ()
+    assert compiled.state_capabilities is None
+    assert "request_constraints" not in payload
+    assert "state_capabilities" not in payload
+    for step in payload["steps"]:
+        assert "step_id" not in step
+        if not step.get("request_bindings"):
+            step.pop("request_bindings", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    legacy_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    assert compiled_target_adapter_digest(compiled) == legacy_digest
 
 
 def test_conflicting_interaction_cleanup_roles_are_rejected_for_state_integrity() -> None:

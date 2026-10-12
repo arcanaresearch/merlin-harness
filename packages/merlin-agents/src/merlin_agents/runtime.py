@@ -300,6 +300,90 @@ def _target_limit_interaction_count(result: ToolResult) -> int:
     return _target_interaction_count(result)
 
 
+def _protocol_invalid_request(
+    metadata: Mapping[str, object], handoff: WorkerHandoff
+) -> dict[str, object] | None:
+    """Project the exact rejected input needed for semantic regeneration."""
+
+    raw_constraints = metadata.get("request_constraint_observations")
+    if not isinstance(raw_constraints, Sequence) or isinstance(raw_constraints, (str, bytes)):
+        return None
+    constraint = next(
+        (
+            dict(item)
+            for item in raw_constraints
+            if isinstance(item, Mapping)
+            and item.get("satisfied") is False
+            and item.get("kind") == "string_length"
+            and isinstance(item.get("path"), str)
+        ),
+        None,
+    )
+    if constraint is None:
+        return None
+    raw_exchanges = metadata.get("current_target_exchanges", metadata.get("target_exchanges"))
+    if not isinstance(raw_exchanges, Sequence) or isinstance(raw_exchanges, (str, bytes)):
+        return None
+    rejected = next(
+        (
+            item
+            for item in reversed(raw_exchanges)
+            if isinstance(item, Mapping)
+            and item.get("outcome") == "request_constraint_violation"
+            and "request" in item
+        ),
+        None,
+    )
+    if rejected is None:
+        return None
+    selected = _json_pointer_value(rejected["request"], str(constraint["path"]))
+    if not isinstance(selected, str):
+        return None
+    parent_identity = (
+        handoff.candidate_identity.projection() if handoff.candidate_identity is not None else {}
+    )
+    parent_candidate_id = str(
+        parent_identity.get("technique_id")
+        or (
+            handoff.assignment.technique_ids[0]
+            if len(handoff.assignment.technique_ids) == 1
+            else ""
+        )
+    )
+    if not parent_candidate_id:
+        return None
+    return {
+        "rendered_input": selected,
+        "rendered_input_sha256": hashlib.sha256(selected.encode("utf-8")).hexdigest(),
+        "constraint": constraint,
+        "parent_candidate_id": parent_candidate_id,
+        "parent_identity": parent_identity,
+    }
+
+
+def _json_pointer_value(document: object, pointer: str) -> object:
+    if pointer == "":
+        return document
+    if not pointer.startswith("/"):
+        return None
+    current = document
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            if token not in current:
+                return None
+            current = current[token]
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            try:
+                index = int(token)
+                current = current[index]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return current
+
+
 def _capability_probe_http_transport_failure(
     result: ToolResult,
     *,
@@ -7405,14 +7489,55 @@ class WorkerRuntime:
             "limit_interaction_count": limit_interaction_count,
             "target_call_budget_charge": target_call_budget_charge,
         }
-        authoritative_outcome, authoritative_conflict = cls._target_authoritative_outcome(
-            result.metadata
+        attempt_disposition = cls._target_attempt_disposition(
+            result.metadata, is_error=result.is_error
         )
-        if authoritative_outcome is not None:
-            receipt_body["target_authoritative_outcome"] = authoritative_outcome
-            receipt_body["outcome_authority"] = "target"
-        elif authoritative_conflict:
-            receipt_body["target_authoritative_conflict"] = True
+        receipt_body["attempt_disposition"] = attempt_disposition
+        disposition_reason = result.metadata.get("disposition_reason")
+        if isinstance(disposition_reason, str) and disposition_reason:
+            receipt_body["disposition_reason"] = disposition_reason
+        bounded_child_candidate = result.metadata.get("bounded_child_candidate")
+        if isinstance(bounded_child_candidate, Mapping):
+            receipt_body["bounded_child_candidate"] = dict(bounded_child_candidate)
+        raw_constraint_observations = result.metadata.get("request_constraint_observations")
+        if (
+            isinstance(raw_constraint_observations, Sequence)
+            and not isinstance(raw_constraint_observations, (str, bytes))
+            and all(isinstance(item, Mapping) for item in raw_constraint_observations)
+        ):
+            receipt_body["request_constraint_observations"] = [
+                dict(item) for item in raw_constraint_observations
+            ]
+        if attempt_disposition == "protocol_invalid":
+            receipt_body.setdefault(
+                "disposition_reason",
+                "fully rendered target input violated a reviewed protocol constraint",
+            )
+            protocol_invalid_request = _protocol_invalid_request(result.metadata, handoff)
+            if protocol_invalid_request is not None:
+                receipt_body["protocol_invalid_request"] = protocol_invalid_request
+        physical_state_identity = result.metadata.get("physical_state_identity")
+        if isinstance(physical_state_identity, Mapping):
+            receipt_body["physical_state_identity"] = cls._semantic_value(physical_state_identity)
+        state_identity_match = result.metadata.get("state_identity_match")
+        if isinstance(state_identity_match, bool):
+            receipt_body["state_identity_match"] = state_identity_match
+        state_transition, state_outcome = cls._target_state_transition(result.metadata)
+        if state_transition is not None:
+            if attempt_disposition != "valid" and state_transition.get("outcome") != "unclear":
+                state_transition = {**state_transition, "outcome": "unclear"}
+            receipt_body["target_state_transition"] = state_transition
+        if attempt_disposition == "valid":
+            authoritative_outcome, authoritative_conflict = cls._target_authoritative_outcome(
+                result.metadata
+            )
+            if authoritative_outcome is not None:
+                receipt_body["target_authoritative_outcome"] = authoritative_outcome
+                receipt_body["outcome_authority"] = "target"
+            elif authoritative_conflict:
+                receipt_body["target_authoritative_conflict"] = True
+            if state_outcome is not None:
+                receipt_body["target_authoritative_state_outcome"] = state_outcome
         latest_status = next(
             (
                 item.get("status_code")
@@ -7461,8 +7586,109 @@ class WorkerRuntime:
         except Exception:  # noqa: BLE001 - telemetry must never reach the worker path
             _logger.debug("target exchange telemetry failed", exc_info=True)
 
+    @classmethod
+    def _target_attempt_disposition(
+        cls, metadata: Mapping[str, object], *, is_error: bool
+    ) -> Literal["valid", "contaminated", "protocol_invalid", "infrastructure_failed", "uncertain"]:
+        """Classify whether target evidence may affect attack-quality learning."""
+
+        explicit = str(metadata.get("attempt_disposition") or "").strip().casefold()
+        allowed = {
+            "valid",
+            "contaminated",
+            "protocol_invalid",
+            "infrastructure_failed",
+            "uncertain",
+        }
+        transition = metadata.get("target_state_transition")
+        identity_mismatch = metadata.get("state_identity_match") is False or (
+            isinstance(transition, Mapping) and transition.get("identity_match") is False
+        )
+        if identity_mismatch:
+            return "contaminated"
+        if metadata.get("infrastructure_failure_category") or (
+            is_error and explicit not in {"contaminated", "protocol_invalid", "uncertain"}
+        ):
+            return "infrastructure_failed"
+        if explicit in allowed and explicit != "valid":
+            return explicit  # type: ignore[return-value]
+        projected_transition, _ = cls._target_state_transition(metadata)
+        if projected_transition is not None and (
+            projected_transition.get("conflict") is True
+            or (
+                cls._target_state_identity_required(metadata)
+                and projected_transition.get("identity_match") is not True
+            )
+        ):
+            return "uncertain"
+        return "valid"
+
     @staticmethod
+    def _target_state_identity_required(metadata: Mapping[str, object]) -> bool:
+        """Return whether the reviewed contract supplied a physical-state identity."""
+
+        if isinstance(metadata.get("physical_state_identity"), Mapping):
+            return True
+        observations = metadata.get("state_observations")
+        return (
+            isinstance(observations, Sequence)
+            and not isinstance(observations, (str, bytes))
+            and any(
+                isinstance(item, Mapping) and item.get("role") == "state_identity"
+                for item in observations
+            )
+        )
+
+    @classmethod
+    def _target_state_transition(
+        cls, metadata: Mapping[str, object]
+    ) -> tuple[
+        dict[str, object] | None,
+        Literal["confirmed", "refuted", "progress", "regression", "unclear"] | None,
+    ]:
+        """Project a reviewed target-authored state delta without model judgment."""
+
+        raw = metadata.get("target_state_transition")
+        if not isinstance(raw, Mapping) or raw.get("authority") != "target":
+            return None, None
+        identity_match = raw.get("identity_match")
+        raw_outcome = str(raw.get("outcome") or "").strip().casefold()
+        outcome = (
+            raw_outcome
+            if raw_outcome in {"confirmed", "refuted", "progress", "regression", "unclear"}
+            else "unclear"
+        )
+        observations = raw.get("observations")
+        projected_observations = (
+            cls._semantic_value(observations)
+            if isinstance(observations, Sequence) and not isinstance(observations, (str, bytes))
+            else []
+        )
+        statuses = {
+            str(item.get("status") or "").strip().casefold()
+            for item in projected_observations
+            if isinstance(item, Mapping)
+        }
+        conflict = {"success", "failure"} <= statuses or {
+            "progress",
+            "regression",
+        } <= statuses
+        identity_required = cls._target_state_identity_required(metadata)
+        if conflict or (identity_required and identity_match is not True):
+            outcome = "unclear"
+        projected: dict[str, object] = {
+            "schema": str(raw.get("schema") or "merlin.target-state-transition.v1"),
+            "authority": "target",
+            "identity_match": identity_match if isinstance(identity_match, bool) else None,
+            "outcome": outcome,
+            "observations": projected_observations,
+            **({"conflict": True} if conflict else {}),
+        }
+        return projected, outcome  # type: ignore[return-value]
+
+    @classmethod
     def _target_authoritative_outcome(
+        cls,
         metadata: Mapping[str, object],
     ) -> tuple[Literal["confirmed", "refuted"] | None, bool]:
         """Project only adapter-authored target authority, never evaluator hints."""
@@ -7475,6 +7701,11 @@ class WorkerRuntime:
             outcomes.add("refuted")
         if metadata.get("target_authoritative_success") is True:
             outcomes.add("confirmed")
+        transition, transition_outcome = cls._target_state_transition(metadata)
+        if transition is not None and transition.get("conflict") is True:
+            return None, True
+        if transition_outcome in {"confirmed", "refuted"}:
+            outcomes.add(transition_outcome)
 
         observations: list[object] = []
         if isinstance(metadata.get("oracle_observation"), Mapping):
