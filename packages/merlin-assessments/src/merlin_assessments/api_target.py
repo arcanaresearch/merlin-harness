@@ -1610,7 +1610,13 @@ class ReviewedApiTargetTool:
                     interaction=step.interaction,
                 ) from error
             try:
-                observed = _select(response_json, step.response_pointer, step.id)
+                observed = (
+                    _select_with_text_siblings(
+                        response_json, step.response_pointer, step.id
+                    )
+                    if step.interaction
+                    else _select(response_json, step.response_pointer, step.id)
+                )
             except _ResponsePointerMissing as error:
                 error.interaction = step.interaction
                 observed = response_json
@@ -1658,7 +1664,13 @@ class ReviewedApiTargetTool:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 response_json = response.text
             try:
-                observed = _select(response_json, step.response_pointer, step.id)
+                observed = (
+                    _select_with_text_siblings(
+                        response_json, step.response_pointer, step.id
+                    )
+                    if step.interaction
+                    else _select(response_json, step.response_pointer, step.id)
+                )
             except _ResponsePointerMissing as error:
                 error.interaction = step.interaction
                 observed = response_json
@@ -2372,6 +2384,51 @@ def _select(value: object, pointer: str, step_id: str) -> object:
         else:
             raise _ResponsePointerMissing(step_id, pointer, body)
     return value
+
+
+def _select_with_text_siblings(value: object, pointer: str, step_id: str) -> object:
+    """Expose every text item when a selector points into a repeated response list.
+
+    Recon often seals the first observed chat item, for example ``/bubbles/0``
+    or ``/messages/0/content``. Later turns can contain several assistant
+    messages in that same list. Preserve the exact selector for captures and
+    oracle evaluation, but give the worker all homogeneous sibling texts so a
+    multi-message response is not silently reduced to its first item.
+    """
+
+    selected = _select(value, pointer, step_id)
+    if not isinstance(selected, str) or not pointer:
+        return selected
+
+    encoded_tokens = pointer[1:].split("/")
+    for index in range(len(encoded_tokens) - 1, -1, -1):
+        if not encoded_tokens[index].isdigit():
+            continue
+        parent_pointer = (
+            "" if index == 0 else "/" + "/".join(encoded_tokens[:index])
+        )
+        try:
+            siblings = _select(value, parent_pointer, step_id)
+        except _ResponsePointerMissing:
+            continue
+        if not isinstance(siblings, list) or len(siblings) < 2:
+            continue
+
+        suffix_tokens = encoded_tokens[index + 1 :]
+        suffix_pointer = "" if not suffix_tokens else "/" + "/".join(suffix_tokens)
+        sibling_texts: list[str] = []
+        for sibling in siblings:
+            try:
+                sibling_value = _select(sibling, suffix_pointer, step_id)
+            except _ResponsePointerMissing:
+                break
+            if not isinstance(sibling_value, str):
+                break
+            sibling_texts.append(sibling_value)
+        else:
+            return sibling_texts
+
+    return selected
 
 
 def _campaign_id(assignment_id: str) -> str | None:

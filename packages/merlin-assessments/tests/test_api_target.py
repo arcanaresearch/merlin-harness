@@ -948,6 +948,62 @@ async def test_reviewed_api_tool_does_not_infer_http_failure_from_json_body(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_body", "selector", "expected"),
+    (
+        (
+            {"bubbles": ["first reply", "second reply"]},
+            "/bubbles/0",
+            ["first reply", "second reply"],
+        ),
+        (
+            {
+                "messages": [
+                    {"role": "assistant", "content": "first reply"},
+                    {"role": "assistant", "content": "second reply"},
+                ]
+            },
+            "/messages/0/content",
+            ["first reply", "second reply"],
+        ),
+        ({"bubbles": ["only reply"]}, "/bubbles/0", "only reply"),
+    ),
+)
+async def test_reviewed_api_tool_exposes_all_selected_text_siblings(
+    tmp_path: Path,
+    response_body: dict[str, object],
+    selector: str,
+    expected: object,
+) -> None:
+    adapter = _adapter()
+    adapter["api_steps"][1]["response_selector"] = selector  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "session-multi-message"})
+        return httpx.Response(200, json=response_body)
+
+    campaign_id = "campaign/api-multi-message-response"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(_context(campaign_id), {"input": "probe"})
+
+    assert result.is_error is False
+    assert json.loads(result.content) == expected
+    exchange = result.metadata["current_target_exchanges"][-1]
+    assert exchange["response"] == expected
+    assert exchange["response_body"] == response_body
+
+
+@pytest.mark.asyncio
 async def test_reviewed_api_tool_preserves_actual_http_500_in_target_exchange(
     tmp_path: Path,
 ) -> None:
