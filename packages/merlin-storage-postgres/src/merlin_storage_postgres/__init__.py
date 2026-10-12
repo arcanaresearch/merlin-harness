@@ -51,6 +51,7 @@ from .scheduler_store import (
     AttemptLease,
     DurableSchedulerStore,
     MailboxMessage,
+    ScheduleArtifactTooLarge,
     StaleLeaseError,
 )
 from .session_store import PostgresSessionStore
@@ -104,6 +105,7 @@ __all__ = [
     "ToolEffectRepository",
     "PostgresSessionStore",
     "SessionRepository",
+    "ScheduleArtifactTooLarge",
     "StaleLeaseError",
     "TargetProfileRepository",
     "TechniqueAttemptRepository",

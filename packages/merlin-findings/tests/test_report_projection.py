@@ -900,6 +900,190 @@ def _completion_seal(campaign_id: str, *, stop_reason: str = "capped"):
     return receipt, receipt_digest
 
 
+class FrontierSnapshotProvider:
+    def __init__(self, campaign_id: str, snapshot_id: str, rows) -> None:
+        self.campaign_id = campaign_id
+        self.snapshot_id = snapshot_id
+        self.rows = tuple(dict(row) for row in rows)
+        self.page_limits = []
+        outcomes = {
+            key: sum(row["outcome"] == key for row in self.rows)
+            for key in (
+                "confirmed",
+                "refuted",
+                "partial",
+                "unclear",
+                "blocked",
+                "retryable",
+                "unattempted",
+            )
+        }
+        states = {
+            key: sum(row["state"] == key for row in self.rows)
+            for key in ("queued", "claimed", "scheduled", "terminal")
+        }
+        normalized = [
+            {
+                "position": index,
+                "candidate_id": row["candidate_id"],
+                "state": row["state"],
+                "outcome": row["outcome"],
+                "attempt_id": row.get("attempt_id"),
+                "task_id": row.get("task_id"),
+                "evidence_refs": list(row.get("evidence_refs", ())),
+                "disposition_reason": row.get("disposition_reason"),
+            }
+            for index, row in enumerate(self.rows)
+        ]
+        self.rows = tuple(normalized)
+        self.header = {
+            "id": snapshot_id,
+            "kind": "final",
+            "wave": None,
+            "row_digest": hashlib.sha256(
+                json.dumps(
+                    {"schema_version": 1, "rows": normalized},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            "total_count": len(normalized),
+            "counts": {"states": states, "outcomes": outcomes},
+        }
+
+    def get_frontier_completion_snapshot(self, campaign_id, snapshot_id):
+        if (campaign_id, snapshot_id) != (self.campaign_id, self.snapshot_id):
+            return None
+        return self.header
+
+    def frontier_completion_counts(self, campaign_id, snapshot_id):
+        return self.get_frontier_completion_snapshot(campaign_id, snapshot_id)
+
+    def list_frontier_completion_page(
+        self, campaign_id, snapshot_id, *, limit=100, after_position=-1
+    ):
+        assert (campaign_id, snapshot_id) == (self.campaign_id, self.snapshot_id)
+        self.page_limits.append(limit)
+        return tuple(
+            row
+            for row in self.rows
+            if row["position"] > after_position
+        )[:limit]
+
+
+def _completion_seal_v2(provider: FrontierSnapshotProvider, *, stop_reason="capped"):
+    campaign_id = provider.campaign_id
+    document = {
+        "schema": "merlin.campaign-completion.v2",
+        "campaign_id": campaign_id,
+        "manifest_digest": "sha256:" + "a" * 64,
+        "target_id": "target-1",
+        "profile": "recommended",
+        "frontier_snapshot": {
+            **provider.header,
+            "reference": f"merlin-frontier-snapshot:{campaign_id}:{provider.snapshot_id}",
+            "sample": provider.rows[:2],
+        },
+        "waves": (),
+        "receipts": (),
+        "findings": (),
+        "cleanup": {"expected": (), "states": (), "authority": {"target_id": "target-1"}},
+        "saturation": {"ready": stop_reason == "saturated"},
+    }
+    authority_digest = "sha256:" + hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt = {
+        "kind": "campaign_completion",
+        "schema": "merlin.campaign-completion.v2",
+        "completion_digest": authority_digest,
+        "terminal_status": "completed",
+        "stop_reason": stop_reason,
+        "document": document,
+    }
+    receipt_digest = "sha256:" + hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return receipt, receipt_digest
+
+
+def test_v2_completion_snapshot_is_paged_verified_and_projected() -> None:
+    rows = tuple(
+        {
+            "candidate_id": f"technique-{index}@lang=en@variant=native",
+            "state": "terminal" if index < 2 else "queued",
+            "outcome": ("confirmed", "refuted", "retryable")[index % 3],
+            "attempt_id": f"attempt-{index}" if index < 2 else None,
+            "task_id": f"task-{index}" if index < 2 else None,
+            "evidence_refs": (f"evidence-{index}",) if index < 2 else (),
+            "disposition_reason": "provider timeout" if index >= 2 else None,
+        }
+        for index in range(1_201)
+    )
+    provider = FrontierSnapshotProvider("campaign-v2", "completion/final", rows)
+    receipt, receipt_digest = _completion_seal_v2(provider)
+    service = DurableReportService(
+        Repository(), frontier_snapshot_provider=provider
+    )
+    report = service.create(
+        "campaign-v2",
+        stop_reason="capped",
+        cleanup_status="completed",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"manifest_digest": "sha256:" + "a" * 64, "profile": "recommended"},
+        completion_document=receipt,
+        completion_digest=receipt_digest,
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    rendered = service.export(report.revision_id, "markdown")
+
+    assert "Attack techniques selected: 1201" in rendered
+    assert "Confirmed findings: 401" in rendered
+    assert "Clear negatives: 400" in rendered
+    assert "Retryable infrastructure failures: 400" in rendered
+    assert provider.page_limits
+    assert max(provider.page_limits) <= 500
+    assert report.frontier_snapshot_rows == ()
+
+
+def test_v2_completion_snapshot_fails_closed_without_provider_or_on_drift() -> None:
+    provider = FrontierSnapshotProvider(
+        "campaign-v2-drift",
+        "completion/final",
+        (
+            {
+                "candidate_id": "technique-1",
+                "state": "terminal",
+                "outcome": "confirmed",
+            },
+        ),
+    )
+    receipt, receipt_digest = _completion_seal_v2(provider)
+    kwargs = {
+        "stop_reason": "capped",
+        "cleanup_status": "completed",
+        "findings": (),
+        "tasks": (),
+        "evidence": (),
+        "usage": {},
+        "metadata": {"manifest_digest": "sha256:" + "a" * 64, "profile": "recommended"},
+        "completion_document": receipt,
+        "completion_digest": receipt_digest,
+    }
+    with pytest.raises(ValueError, match="snapshot provider"):
+        DurableReportService(Repository()).create("campaign-v2-drift", **kwargs)
+
+    provider.rows = ({**provider.rows[0], "outcome": "refuted"},)
+    with pytest.raises(ValueError, match="counts do not match|row digest"):
+        DurableReportService(
+            Repository(), frontier_snapshot_provider=provider
+        ).create("campaign-v2-drift", **kwargs)
+
+
 def test_sealed_report_rejects_receipt_projection_and_stored_revision_drift() -> None:
     repository = Repository()
     service = DurableReportService(repository)

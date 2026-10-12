@@ -49,6 +49,37 @@ _ATTEMPT_FAILURE_KINDS = frozenset(
     }
 )
 
+_MAX_SCHEDULE_JSONB_BYTES = 64 * 1024 * 1024
+
+
+class ScheduleArtifactTooLarge(ValueError):
+    """A JSONB scheduler artifact exceeded the database safety backstop."""
+
+    def __init__(self, *, artifact: str, actual_bytes: int, limit_bytes: int) -> None:
+        self.artifact = artifact
+        self.actual_bytes = actual_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(
+            f"schedule {artifact} serializes to {actual_bytes:,} bytes, exceeding Merlin's "
+            f"{limit_bytes:,}-byte safety limit; reduce the execution batch and reference "
+            "shared immutable context instead of copying it per worker"
+        )
+
+
+def _bounded_schedule_jsonb(value: object, *, artifact: str) -> tuple[Jsonb, str]:
+    """Build a bounded JSONB parameter and digest from one canonical serialization."""
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    size = len(encoded)
+    if size > _MAX_SCHEDULE_JSONB_BYTES:
+        raise ScheduleArtifactTooLarge(
+            artifact=artifact,
+            actual_bytes=size,
+            limit_bytes=_MAX_SCHEDULE_JSONB_BYTES,
+        )
+    return Jsonb(value), sha256(encoded).hexdigest()
+
 
 def _serialized(method: Any) -> Any:
     @wraps(method)
@@ -309,8 +340,10 @@ class DurableSchedulerStore:
         identifier = schedule_id or str(uuid4())
         if initial_status not in {"running", "paused"}:
             raise ValueError("initial schedule status must be running or paused")
-        graph_digest = _digest(graph)
-        checkpoint_digest = _digest(checkpoint)
+        graph_jsonb, graph_digest = _bounded_schedule_jsonb(graph, artifact="graph")
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         ready = set(ready_nodes)
         if (parent_schedule_id is None) != (parent_attempt_id is None):
             raise ValueError("parent schedule and attempt must be provided together")
@@ -326,9 +359,9 @@ class DurableSchedulerStore:
                 (
                     identifier,
                     session_id,
-                    Jsonb(graph),
+                    graph_jsonb,
                     graph_digest,
-                    Jsonb(checkpoint),
+                    checkpoint_jsonb,
                     checkpoint_digest,
                     self._zero_digest,
                     initial_status,
@@ -594,7 +627,7 @@ class DurableSchedulerStore:
         ]
 
     @_serialized
-    def list_active_schedules(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_active_schedules(self, *, limit: int | None = 50) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """SELECT id, session_id, graph, graph_digest, checkpoint, checkpoint_digest,
                       event_count, last_event_digest, status, parent_schedule_id,
@@ -3337,6 +3370,9 @@ class DurableSchedulerStore:
         """Atomically expose pending nodes and advance the checkpoint/event head."""
         if not node_ids:
             raise ValueError("at least one node must become ready")
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             schedule = self.connection.execute(
                 """SELECT event_count FROM merlin_storage.scheduler_schedules
@@ -3365,12 +3401,11 @@ class DurableSchedulerStore:
                     (schedule_id, requested),
                 ).fetchall()
             ]
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -3394,6 +3429,9 @@ class DurableSchedulerStore:
         """Atomically terminalize pending nodes whose prerequisites cannot succeed."""
         if not failures:
             raise ValueError("at least one pending node must fail")
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             schedule = self.connection.execute(
                 """SELECT event_count FROM merlin_storage.scheduler_schedules
@@ -3419,12 +3457,11 @@ class DurableSchedulerStore:
                 ).fetchone()
                 if transitioned is not None:
                     failed_ids.append(node_id)
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -3666,6 +3703,9 @@ class DurableSchedulerStore:
         if failure_kind is not None and failure_kind not in _ATTEMPT_FAILURE_KINDS:
             raise ValueError("attempt failure kind is unknown")
         target_session_id = _target_session_id(target_session_id)
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             cancelled = self.connection.execute(
                 """SELECT attempt.schedule_id, attempt.node_id
@@ -3717,12 +3757,11 @@ class DurableSchedulerStore:
                 ),
             )
             self._release_message_claims(attempt_id, generation)
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -3747,6 +3786,9 @@ class DurableSchedulerStore:
         expected_event_count: int,
     ) -> None:
         """Requeue one failed or infrastructure-quarantined node preserving history."""
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             schedule = self.connection.execute(
                 """SELECT event_count FROM merlin_storage.scheduler_schedules
@@ -3763,7 +3805,6 @@ class DurableSchedulerStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("scheduler node is unknown or not retryable")
-            checkpoint_digest = _digest(checkpoint)
             checkpoint_nodes = checkpoint.get("nodes")
             retry_state = (
                 dict(checkpoint_nodes.get(node_id) or {})
@@ -3774,7 +3815,7 @@ class DurableSchedulerStore:
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -3797,6 +3838,9 @@ class DurableSchedulerStore:
     ) -> None:
         """Cancel ordinary work while preserving cleanup nodes as dispatchable."""
         cleanup = list(set(cleanup_node_ids))
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             schedule = self.connection.execute(
                 """SELECT status FROM merlin_storage.scheduler_schedules
@@ -3848,12 +3892,11 @@ class DurableSchedulerStore:
                          AND state IN ('pending', 'ready')""",
                     (schedule_id, cleanup),
                 )
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET status = 'cancelled', checkpoint = %s, checkpoint_digest = %s,
                        updated_at = now() WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -3935,6 +3978,9 @@ class DurableSchedulerStore:
         idempotency_key: str | None = None,
     ) -> bool:
         """Cancel one non-terminal node without closing its containing schedule."""
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             if idempotency_key is not None:
                 existing = self.connection.execute(
@@ -3983,12 +4029,11 @@ class DurableSchedulerStore:
                    WHERE schedule_id = %s AND node_id = %s""",
                 (schedule_id, node_id),
             )
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,
@@ -4056,6 +4101,9 @@ class DurableSchedulerStore:
         """Atomically commit result, completion, messages, node state, and checkpoint."""
         target_session_id = _target_session_id(target_session_id)
         result_digest = _digest(result)
+        checkpoint_jsonb, checkpoint_digest = _bounded_schedule_jsonb(
+            checkpoint, artifact="checkpoint"
+        )
         with self.connection.transaction():
             attempt = self._lock_attempt(attempt_id, generation)
             schedule_id = str(attempt["schedule_id"])
@@ -4118,12 +4166,11 @@ class DurableSchedulerStore:
             self._record_baseline_stage(
                 schedule_id, node_id, attempt_id, result_digest, target_session_id
             )
-            checkpoint_digest = _digest(checkpoint)
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET checkpoint = %s, checkpoint_digest = %s, updated_at = now()
                    WHERE id = %s""",
-                (Jsonb(checkpoint), checkpoint_digest, schedule_id),
+                (checkpoint_jsonb, checkpoint_digest, schedule_id),
             )
             self._append_event(
                 schedule_id,

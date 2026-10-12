@@ -186,6 +186,50 @@ async def test_lead_retry_prompt_quotes_the_daemon_rejection_reason(
             await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_lead_retry_feedback_has_a_fixed_byte_ceiling_for_huge_id_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _LeadProvider.requests = []
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(tmp_path, monkeypatch, database.url)
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-feedback-bounded"
+            _prepare_campaign(backend, campaign_id, session_id)
+            identifiers = [f"candidate-{index:05d}" for index in range(12_765)]
+            reason = f"orphaned={identifiers}; double_owned={identifiers}"
+            backend._campaigns._store.append_lead(  # noqa: SLF001
+                campaign_id,
+                0,
+                {
+                    "kind": "lead_decision_rejected",
+                    "attempt": 0,
+                    "reason": reason,
+                    "retryable": True,
+                },
+            )
+
+            await backend._campaigns._lead_runner(  # noqa: SLF001
+                campaign_id,
+                CampaignProfile.RECOMMENDED,
+                1,
+                (AgentTask(id="task-1", objective="Assess", status="completed"),),
+            )
+
+            feedback = next(
+                message.content
+                for message in _LeadProvider.requests[0].messages
+                if message.content.startswith("Daemon feedback:")
+            )
+            assert len(feedback.encode("utf-8")) <= 4_096
+            assert "[truncated bytes=" in feedback
+            assert "sha256:" in feedback
+            assert identifiers[-1] not in feedback
+        finally:
+            await backend.close()
+
+
 class _DynamicLeadProvider:
     """Lead that emits a single dynamic-specialist followup."""
 

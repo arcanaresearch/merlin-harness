@@ -383,9 +383,10 @@ async def _export_and_check_report(
         assert len(revisions) == 1
         internal = backend._report_repository.get(revisions[-1].revision_id)  # type: ignore[attr-defined]
         customer = json.loads(
-            DurableReportService(backend._report_repository).export(  # type: ignore[attr-defined]
-                revisions[-1].revision_id, "json", "customer"
-            )
+            DurableReportService(
+                backend._report_repository,  # type: ignore[attr-defined]
+                frontier_snapshot_provider=backend._campaigns._store,  # type: ignore[attr-defined]
+            ).export(revisions[-1].revision_id, "json", "customer")
         )
     finally:
         merlin_config.load_config = original_load_config

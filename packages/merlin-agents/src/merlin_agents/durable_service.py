@@ -115,6 +115,7 @@ from .swarm_snapshot import (
 from .telemetry import emit_judgment
 
 _MAX_PREDECESSOR_HANDOFF_BYTES = 24_000
+_MAX_SCHEDULE_JSONB_BYTES = 16 * 1024 * 1024
 _LEASE_EXPIRY_GRACE_SECONDS = 0.05
 _READY_STALE_LEASE_RETRIES = 6
 _TRANSPORT_RETRY_JITTER = 0.25
@@ -130,6 +131,39 @@ _JEV_SEVERITY_QUESTION = (
 )
 _JEV_SEVERITY_DISPUTE_MIN_LEVEL_GAP = 2
 _JEV_SEVERITY_DISPUTE_MIN_CONFIDENCE = 0.8
+
+
+class ScheduleArtifactTooLarge(ValueError):
+    """A durable scheduler artifact exceeded its preflight storage budget."""
+
+    def __init__(self, *, artifact: str, actual_bytes: int, limit_bytes: int) -> None:
+        self.artifact = artifact
+        self.actual_bytes = actual_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(
+            f"schedule {artifact} serializes to {actual_bytes:,} bytes, exceeding Merlin's "
+            f"{limit_bytes:,}-byte safety limit; reduce the execution batch and reference "
+            "shared immutable context instead of copying it per worker"
+        )
+
+
+def _bounded_schedule_json(value: object, *, artifact: str) -> int:
+    """Reject scheduler artifacts before a database adapter can serialize them.
+
+    PostgreSQL rejects a single JSONB value near 256 MiB.  Keep a substantial
+    safety margin for driver and JSONB overhead, and fail while the caller can
+    still reduce the execution batch instead of surfacing a database error.
+    """
+    size = len(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    )
+    if size > _MAX_SCHEDULE_JSONB_BYTES:
+        raise ScheduleArtifactTooLarge(
+            artifact=artifact,
+            actual_bytes=size,
+            limit_bytes=_MAX_SCHEDULE_JSONB_BYTES,
+        )
+    return size
 
 
 def _transport_retry_backoff_seconds(
@@ -333,7 +367,7 @@ class DurableSchedulerStore(Protocol):
     def list_swarm_snapshot_rows(
         self, session_id: str, *, campaign_id: str | None = None
     ) -> list[dict[str, Any]]: ...
-    def list_active_schedules(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
+    def list_active_schedules(self, *, limit: int | None = 50) -> list[dict[str, Any]]: ...
     def list_nodes(self, schedule_id: str) -> list[dict[str, Any]]: ...
     def list_attempts(self, schedule_id: str) -> list[dict[str, Any]]: ...
     def get_message(self, message_id: str) -> Any | None: ...
@@ -896,11 +930,14 @@ class DurableAgentService:
                 for assignment_id, profile in (dynamic_profiles or {}).items()
             },
         }
+        checkpoint = scheduler.checkpoint()
+        _bounded_schedule_json(document, artifact="graph")
+        _bounded_schedule_json(checkpoint, artifact="checkpoint")
         schedule_id = await self._call(
             self._store.create_schedule,
             session_id,
             document,
-            scheduler.checkpoint(),
+            checkpoint,
             list(scheduler.states),
             ready_nodes=scheduler.ready_nodes(),
             schedule_id=schedule_id,
@@ -1033,14 +1070,16 @@ class DurableAgentService:
             live.execution = asyncio.create_task(self._resume(live, running, restored_max_workers))
         return live
 
-    async def recover(self) -> int:
+    async def recover(self, *, resume_execution: bool = True) -> int:
         """Reopen every durable active schedule exactly once after daemon replacement."""
         recovered = 0
-        for row in await self._call(self._store.list_active_schedules):
+        for row in await self._call(self._store.list_active_schedules, limit=None):
             schedule_id = str(row["id"])
             if schedule_id in self._live:
                 continue
             try:
+                if not resume_execution and row["status"] == "running":
+                    await self.pause_schedule(schedule_id, reason="daemon-restart-awaiting-resume")
                 await self.reopen(schedule_id)
             except (KeyError, TypeError, ValueError) as error:
                 await self.reject_persisted_schedule(

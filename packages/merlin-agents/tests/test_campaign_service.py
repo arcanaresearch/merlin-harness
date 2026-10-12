@@ -53,6 +53,7 @@ from merlin_agents.campaign_service import (
     _attempted_technique_outcomes,
     _bind_recon_applicability_evidence,
     _bind_validation_equivalence,
+    _bounded_frontier_projection,
     _campaign_list_projection,
     _candidate_identity,
     _capability_probe_budget,
@@ -107,9 +108,10 @@ from merlin_agents.capability_probes import (
 )
 from merlin_agents.completion_frontier import CompletionScope
 from merlin_agents.discovery import ArmIdentity, ArmObservation
+from merlin_agents.durable_service import ScheduleArtifactTooLarge
 from merlin_agents.jev import JevClient
 from merlin_agents.judgments import RefusalJudgment, RefusalVerdict
-from merlin_agents.specialists import DynamicSpecialistPolicy
+from merlin_agents.specialists import DynamicSpecialistPolicy, LanguageFrontierSpec
 from merlin_agents.technique_history import entries_for_completion, technique_cell_parts
 from merlin_agents.transforms import materialize_transform_envelope
 from merlin_contracts import AgentTask, ProviderFailureKind, ToolContext
@@ -2526,6 +2528,433 @@ async def test_recovery_replaces_finished_supervisor_for_executing_campaign() ->
     assert await service.recover() == 1
     await service.wait(prepared.manifest.id)
     assert events == [("reopen", "schedule-1"), ("supervise", 1, False)]
+
+
+async def test_recovery_starts_next_frontier_batch_after_settlement_crash_window() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events = []
+
+    class FrontierStore:
+        def list_executing(self):
+            return [
+                {
+                    "id": prepared.manifest.id,
+                    "manifest": {
+                        "manifest": asdict(prepared.manifest),
+                        "assignment_context": asdict(prepared.assignment_context),
+                    },
+                }
+            ]
+
+        def list_waves(self, _campaign_id):
+            return [
+                {
+                    "wave": 7,
+                    "kind": "frontier",
+                    "schedule_id": "schedule-7",
+                    "status": "completed",
+                }
+            ]
+
+        def frontier_counts(self, campaign_id):
+            assert campaign_id == prepared.manifest.id
+            return {"queued": 11, "total": 15}
+
+        def load_active_frontier_batch(self, campaign_id):
+            assert campaign_id == prepared.manifest.id
+            return None
+
+        def list_report_retryable(self):
+            return []
+
+    class RecoveryService(CampaignService):
+        async def _claim_execution_frontier_context(
+            self, campaign_id, manifest, context, wave
+        ):
+            events.append(("claim", campaign_id, wave))
+            return context, {"id": "batch-8"}
+
+        async def _start_wave(
+            self, campaign_id, manifest, wave, kind, compiled, **kwargs
+        ):
+            events.append(
+                ("start", campaign_id, wave, kind, kwargs.get("frontier_batch_id"))
+            )
+            return SimpleNamespace(id="schedule-8", execution=None)
+
+        async def _supervise(self, *_args, **kwargs):
+            events.append(("supervise", kwargs["initial_wave"]))
+
+    service = RecoveryService(FrontierStore(), object(), None)  # type: ignore[arg-type]
+
+    assert await service.recover() == 1
+    await service.wait(prepared.manifest.id)
+    assert events == [
+        ("claim", prepared.manifest.id, 8),
+        ("start", prepared.manifest.id, 8, "frontier", "batch-8"),
+        ("supervise", 8),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("batch_state", "bound", "wave_persisted"),
+    (
+        ("claimed", False, False),
+        ("scheduled", True, False),
+        ("scheduled", True, True),
+    ),
+)
+async def test_recovery_completes_active_frontier_bind_wave_and_start_crash_windows(
+    batch_state, bound, wave_persisted
+) -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events = []
+    deterministic_schedule_id = ""
+
+    class FrontierStore:
+        def list_executing(self):
+            return [
+                {
+                    "id": prepared.manifest.id,
+                    "manifest": {
+                        "manifest": asdict(prepared.manifest),
+                        "assignment_context": asdict(prepared.assignment_context),
+                    },
+                }
+            ]
+
+        def list_waves(self, _campaign_id):
+            return (
+                [
+                    {
+                        "wave": 4,
+                        "kind": "frontier",
+                        "schedule_id": deterministic_schedule_id,
+                        "status": "running",
+                    }
+                ]
+                if wave_persisted
+                else []
+            )
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return {
+                "id": "batch-4",
+                "wave": 4,
+                "state": batch_state,
+                "schedule_id": deterministic_schedule_id if bound else None,
+                "candidates": ({"id": "prompt", "family_id": "prompt"},),
+            }
+
+        def bind_frontier_batch(self, campaign_id, batch_id, schedule_id):
+            events.append(("bind", campaign_id, batch_id, schedule_id))
+
+        def add_wave(self, campaign_id, wave, kind, schedule_id):
+            events.append(("add", campaign_id, wave, kind, schedule_id))
+
+        def list_report_retryable(self):
+            return []
+
+    live = SimpleNamespace(
+        id="",
+        execution=None,
+        assignments=(
+            compile_attack_campaign(
+                prepared.manifest, prepared.assignment_context
+            ).assignments[0],
+        ),
+    )
+
+    class RecoveryAgents:
+        async def reopen(self, schedule_id, *, resume_execution=True):
+            assert resume_execution is False
+            events.append(("reopen", schedule_id))
+            live.id = schedule_id
+            return live
+
+        async def list_schedule_tasks(self, schedule_id):
+            assert schedule_id == deterministic_schedule_id
+            return (
+                AgentTask(
+                    id="task-1",
+                    objective="queued",
+                    status="queued",
+                    technique_ids=("prompt",),
+                ),
+            )
+
+        def start_execution(self, recovered, *, max_workers):
+            assert recovered is live
+            recovered.execution = SimpleNamespace()
+            events.append(("start", max_workers))
+
+    class RecoveryService(CampaignService):
+        async def _supervise(self, *_args, **kwargs):
+            events.append(("supervise", kwargs["initial_wave"], kwargs["wave_running"]))
+
+    service = RecoveryService(FrontierStore(), RecoveryAgents(), None)  # type: ignore[arg-type]
+    deterministic_schedule_id = service._campaign_wave_schedule_id(  # noqa: SLF001
+        prepared.manifest.id, 4
+    )
+
+    assert await service.recover() == 1
+    await service.wait(prepared.manifest.id)
+    assert events == [
+        ("reopen", deterministic_schedule_id),
+        ("bind", prepared.manifest.id, "batch-4", deterministic_schedule_id),
+        ("add", prepared.manifest.id, 4, "frontier", deterministic_schedule_id),
+        ("start", 1),
+        ("supervise", 4, True),
+    ]
+
+
+async def test_active_wave_one_recovery_uses_persisted_frontier_kind() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events = []
+
+    class FrontierStore:
+        def bind_frontier_batch(self, *_args):
+            return None
+
+        def add_wave(self, _campaign_id, _wave, kind, _schedule_id):
+            events.append(kind)
+
+    live = SimpleNamespace(id="", execution=SimpleNamespace(), assignments=())
+
+    class Agents:
+        async def reopen(self, schedule_id, *, resume_execution=True):
+            assert resume_execution is False
+            live.id = schedule_id
+            return live
+
+        async def list_schedule_tasks(self, _schedule_id):
+            return ()
+
+    service = CampaignService(FrontierStore(), Agents(), None)  # type: ignore[arg-type]
+    schedule_id = service._campaign_wave_schedule_id(prepared.manifest.id, 1)  # noqa: SLF001
+
+    await service._recover_active_frontier_batch(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        {
+            "id": "batch-1",
+            "wave": 1,
+            "schedule_id": schedule_id,
+            "candidates": ({"id": "prompt", "family_id": "prompt"},),
+        },
+        (
+            {
+                "wave": 1,
+                "kind": "frontier",
+                "schedule_id": schedule_id,
+                "status": "running",
+            },
+        ),
+    )
+
+    assert events == ["frontier"]
+
+
+@pytest.mark.parametrize(
+    ("prior_profile", "expected_kind"),
+    (("recon", "initial"), ("adversarial-explorer", "frontier")),
+)
+async def test_active_batch_pre_add_infers_kind_from_prior_schedule(
+    prior_profile, expected_kind
+) -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events = []
+    prior_assignment = replace(
+        compile_recon_campaign(
+            prepared.manifest, prepared.assignment_context
+        ).assignments[0],
+        profile_id=prior_profile,
+    )
+
+    class FrontierStore:
+        pass
+
+    class Agents:
+        async def reopen(self, schedule_id, *, resume_execution=True):
+            assert resume_execution is False
+            if schedule_id == "schedule-0":
+                return SimpleNamespace(id=schedule_id, assignments=(prior_assignment,))
+            raise KeyError(schedule_id)
+
+        async def list_schedule_tasks(self, _schedule_id):
+            return ()
+
+    class RecoveryService(CampaignService):
+        async def _compile_initial_attack_ownership(self, *args, **kwargs):
+            return compile_attack_campaign(args[1], args[2])
+
+        async def _start_wave(self, _campaign_id, _manifest, _wave, kind, *_args, **_kwargs):
+            events.append(kind)
+            return SimpleNamespace(id="schedule-1", execution=None)
+
+    service = RecoveryService(FrontierStore(), Agents(), None)  # type: ignore[arg-type]
+    await service._recover_active_frontier_batch(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        {
+            "id": "batch-1",
+            "wave": 1,
+            "schedule_id": None,
+            "candidates": ({"id": "prompt", "family_id": "prompt"},),
+        },
+        (
+            {
+                "wave": 0,
+                "kind": "initial",
+                "schedule_id": "schedule-0",
+                "status": "completed",
+            },
+        ),
+    )
+
+    assert events == [expected_kind]
+
+
+async def test_recovery_pauses_when_the_only_candidate_exceeds_scheduler_limit() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events = []
+
+    class FrontierStore:
+        def list_executing(self):
+            return [
+                {
+                    "id": prepared.manifest.id,
+                    "manifest": {
+                        "manifest": asdict(prepared.manifest),
+                        "assignment_context": asdict(prepared.assignment_context),
+                    },
+                }
+            ]
+
+        def list_waves(self, _campaign_id):
+            return []
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return {
+                "id": "batch-0",
+                "wave": 0,
+                "schedule_id": None,
+                "candidates": ({"id": "prompt", "family_id": "prompt"},),
+            }
+
+        def resize_frontier_batch(self, _campaign_id, batch_id, limit):
+            events.append(("resize", batch_id, limit))
+            return {"id": batch_id, "state": "settled", "candidates": ()}
+
+        def update_frontier_priorities(self, *_args):
+            return 1
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(("lead", payload["kind"]))
+
+        def pause(self, _campaign_id):
+            events.append(("pause",))
+
+        def list_report_retryable(self):
+            return []
+
+    class Agents:
+        async def reopen(self, schedule_id, *, resume_execution=True):
+            raise KeyError(schedule_id)
+
+    class RecoveryService(CampaignService):
+        async def _compile_initial_attack_ownership(self, *args, **kwargs):
+            return compile_attack_campaign(args[1], args[2])
+
+        async def _start_wave(self, *_args, **_kwargs):
+            raise ScheduleArtifactTooLarge(
+                artifact="graph", actual_bytes=17_000_000, limit_bytes=16_000_000
+            )
+
+        async def _claim_execution_frontier_context(self, *_args, **_kwargs):
+            return prepared.assignment_context, {
+                "id": "batch-retry",
+                "wave": 0,
+                "candidates": ({"id": "prompt", "family_id": "prompt"},),
+            }
+
+    service = RecoveryService(FrontierStore(), Agents(), None)  # type: ignore[arg-type]
+
+    assert await service.recover() == 1
+    assert ("pause",) in events
+    assert ("resize", "batch-retry", 0) in events
+    assert ("lead", "frontier_schedule_blocked_paused") in events
+    assert prepared.manifest.id not in service._supervisors  # noqa: SLF001
+
+
+async def test_initial_recovery_reapplies_admitted_ownership_after_oversize_shrink() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    compile_calls = []
+    starts = 0
+    recon_assignment = compile_recon_campaign(
+        prepared.manifest, prepared.assignment_context
+    ).assignments[0]
+
+    class Agents:
+        async def reopen(self, schedule_id, *, resume_execution=True):
+            if schedule_id == "schedule-0":
+                return SimpleNamespace(id=schedule_id, assignments=(recon_assignment,))
+            raise KeyError(schedule_id)
+
+        async def list_schedule_tasks(self, _schedule_id):
+            return ()
+
+    class RecoveryService(CampaignService):
+        async def _compile_initial_attack_ownership(
+            self, campaign_id, manifest, context, *args, **kwargs
+        ):
+            compile_calls.append(tuple(item.id for item in context.techniques))
+            return compile_attack_campaign(manifest, context)
+
+        async def _start_wave(self, *_args, **_kwargs):
+            nonlocal starts
+            starts += 1
+            if starts == 1:
+                raise ScheduleArtifactTooLarge(
+                    artifact="graph", actual_bytes=17_000_000, limit_bytes=16_000_000
+                )
+            return SimpleNamespace(id="schedule-1", execution=None)
+
+        async def _shrink_execution_frontier_context(
+            self, _campaign_id, _manifest, context, _wave, _batch, _error
+        ):
+            smaller = replace(context, techniques=context.techniques[:1])
+            return smaller, {
+                "id": "batch-small",
+                "wave": 1,
+                "candidates": ({"id": smaller.techniques[0].id},),
+            }
+
+    service = RecoveryService(object(), Agents(), None)  # type: ignore[arg-type]
+    await service._recover_active_frontier_batch(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        {
+            "id": "batch-large",
+            "wave": 1,
+            "schedule_id": None,
+            "candidates": ({"id": "prompt", "family_id": "prompt"},),
+        },
+        (
+            {
+                "wave": 0,
+                "kind": "initial",
+                "schedule_id": "schedule-0",
+                "status": "completed",
+            },
+        ),
+    )
+
+    assert len(compile_calls) == 2
+    assert compile_calls[1] == tuple(item.id for item in prepared.assignment_context.techniques[:1])
 
 
 async def test_replaced_supervisor_cannot_orphan_its_replacement_on_exit() -> None:
@@ -7817,7 +8246,7 @@ async def test_probe_observed_language_admits_matching_language_cell() -> None:
     # Igbo cell on the next campaign for this target.
     store = SignalStore(record)
     service = CampaignService(store, Agents(store), factory)  # type: ignore[arg-type]
-    admitted, skipped, partial = await service._apply_technique_skip(  # noqa: SLF001
+    admitted, skipped, partial, _priors = await service._apply_technique_skip(  # noqa: SLF001
         prepared, adapter_generation
     )
     assert skipped == ()
@@ -7827,17 +8256,14 @@ async def test_probe_observed_language_admits_matching_language_cell() -> None:
         exotic.id,
     }
 
-    # Without any observation the same cell stays deferred, not dropped.
+    # Missing observations affect priority, never eligibility.
     store = SignalStore(None)
     service = CampaignService(store, Agents(store), factory)  # type: ignore[arg-type]
-    admitted, skipped, partial = await service._apply_technique_skip(  # noqa: SLF001
+    admitted, skipped, partial, _priors = await service._apply_technique_skip(
         prepared, adapter_generation
     )
-    assert [item.id for item in admitted.assignment_context.techniques] == [baseline.id]
-    assert len(skipped) == 1
-    assert skipped[0]["technique_id"] == exotic.id
-    assert skipped[0]["language_id"] == "ig"
-    assert skipped[0]["outcome"] == "deferred"
+    assert {item.id for item in admitted.assignment_context.techniques} == {baseline.id, exotic.id}
+    assert skipped == ()
 
 
 class _FakeJevClient:
@@ -7891,7 +8317,7 @@ async def _jev_triage_prepared(probabilities, history=None):
     client = _FakeJevClient(probabilities)
     service._jev_client = client  # type: ignore[attr-defined] # noqa: SLF001
     service._jev_client_checked = True  # noqa: SLF001
-    admitted, skipped, partial = await service._apply_technique_skip(  # noqa: SLF001
+    admitted, skipped, partial, _priors = await service._apply_technique_skip(  # noqa: SLF001
         prepared, adapter_generation
     )
     return prepared, client, admitted, skipped, partial
@@ -7920,9 +8346,9 @@ async def test_jev_cell_triage_unavailable_or_uncertain_keeps_cells_runnable() -
     assert client.states == []
 
 
-async def test_jev_cell_triage_never_revisits_deterministic_skips() -> None:
-    # A terminal prior is a deterministic plan_skip row: Jev is never asked
-    # about the cell and cannot un-skip it, even with a high probability.
+async def test_jev_cell_triage_keeps_terminal_history_eligible_without_model_admission() -> None:
+    # A terminal prior is exact ranking/revalidation evidence. It remains
+    # eligible, and Jev is never asked to make an admission decision.
     jailbreak = AssignmentTechnique(
         "jailbreak",
         "Test jailbreak resilience",
@@ -7953,13 +8379,9 @@ async def test_jev_cell_triage_never_revisits_deterministic_skips() -> None:
         {"jailbreak": 0.9},
         history=history,
     )
-    baseline_id = prepared.assignment_context.techniques[0].id
-
-    assert [item.id for item in admitted.assignment_context.techniques] == [baseline_id]
-    assert len(skipped) == 1
-    assert skipped[0]["technique_id"] == "jailbreak"
-    assert skipped[0]["outcome"] == "confirmed"
-    # Conclusive history remains attributable; preparation makes no Jev calls.
+    assert admitted.assignment_context.techniques == prepared.assignment_context.techniques
+    assert skipped == ()
+    assert partial == ()
     assert client.states == []
 
 
@@ -18091,6 +18513,44 @@ async def test_arm_generator_usage_drain_skips_generators_without_buffer() -> No
     await service._journal_arm_generator_usage("campaign-1")  # noqa: SLF001
 
 
+async def test_restart_recovery_pauses_recon_before_reopening_workers() -> None:
+    calls = []
+
+    class Store:
+        status = "executing"
+
+        def list_executing(self):
+            return [{"id": "campaign/recon"}] if self.status == "executing" else []
+
+        def get(self, campaign_id):
+            assert campaign_id == "campaign/recon"
+            return {"status": self.status}
+
+        def list_waves(self, campaign_id):
+            return [{"wave": 0, "status": "running", "schedule_id": "recon-schedule"}]
+
+        def pause(self, campaign_id):
+            self.status = "paused"
+
+        def append_lead(self, *args):
+            calls.append("paused-receipt")
+
+    class Agents:
+        async def pause_schedule(self, schedule_id, *, reason):
+            calls.append(("pause", schedule_id))
+
+        async def reopen(self, *args, **kwargs):
+            raise AssertionError("startup must not reopen recon for execution")
+
+    store = Store()
+    service = CampaignService(store, Agents(), preparation)
+    assert await service.recover(resume_execution=False) == 1
+    assert store.status == "paused"
+    assert calls == [("pause", "recon-schedule"), "paused-receipt"]
+    assert not service._supervisors
+    assert await service.recover() == 0
+
+
 async def test_execution_priority_scores_shortlist_in_parallel_without_removing_candidates():
     manifest, context = await _api_probe_manifest(
         (_api_adapter_document([_text_message_step()]), _memory_probe_plan())
@@ -18192,3 +18652,716 @@ async def test_execution_priority_is_applied_at_initial_dispatch_not_preparation
     )
     assert len(client.states) == 1
     assert ranked.techniques == admitted.assignment_context.techniques
+
+
+async def test_normalized_frontier_registers_12765_compact_candidates_and_claims_one_batch():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = tuple(
+        replace(base, id=f"family/{index}", objective=f"Technique family {index}")
+        for index in range(69)
+    )
+    languages = tuple(
+        f"{first}{second}"
+        for first in "abcdefghijklmnopqrstuvwxyz"
+        for second in "abcdefghijklmnopqrstuvwxyz"
+    )[:47]
+    context = replace(
+        prepared.assignment_context,
+        techniques=techniques,
+        language_frontier=LanguageFrontierSpec(
+            default_language=languages[0],
+            planned_languages=languages,
+            code_switching=True,
+        ),
+    )
+    prepared = replace(prepared, assignment_context=context)
+
+    class FrontierStore(Store):
+        families = ()
+        candidates = ()
+
+        def register_frontier(self, campaign_id, families, candidates):
+            assert campaign_id == prepared.manifest.id
+            self.families = tuple(families)
+            self.candidates = tuple(candidates)
+            return {"queued": len(self.candidates), "total": len(self.candidates)}
+
+        def frontier_counts(self, campaign_id):
+            assert campaign_id == prepared.manifest.id
+            return {"queued": len(self.candidates), "total": len(self.candidates)}
+
+        def claim_frontier_batch(self, campaign_id, wave, batch_id, limit):
+            assert campaign_id == prepared.manifest.id
+            assert wave == 1
+            assert limit == 4
+            family_documents = {
+                str(item["id"]): dict(item["document"]) for item in self.families
+            }
+            return {
+                "id": batch_id,
+                "state": "claimed",
+                "candidates": tuple(
+                    {
+                        **candidate,
+                        "state": "claimed",
+                        "claim_generation": 1,
+                        "family_document": family_documents[str(candidate["family_id"])],
+                    }
+                    for candidate in self.candidates[:limit]
+                ),
+            }
+
+    store = FrontierStore()
+    service = CampaignService(  # type: ignore[arg-type]
+        store, Agents(store), None, max_worker_concurrency=2
+    )
+    await service._register_execution_frontier(prepared)  # noqa: SLF001
+
+    assert len(store.families) == 69
+    assert len(store.candidates) == 12_765
+    assert all("objective" not in candidate for candidate in store.candidates)
+    batch_context, batch = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 1
+    )
+    assert batch is not None
+    assert len(batch_context.techniques) == 4
+    assert tuple(item.id for item in batch_context.techniques) == tuple(
+        str(item["id"]) for item in store.candidates[:4]
+    )
+    assert len(context.techniques) == 69
+
+
+async def test_prepare_review_projects_lazy_language_frontier_without_rich_expansion():
+    source = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = source.assignment_context.techniques[0]
+    languages = tuple(
+        f"{first}{second}"
+        for first in "abcdefghijklmnopqrstuvwxyz"
+        for second in "abcdefghijklmnopqrstuvwxyz"
+    )[:47]
+    prepared = replace(
+        source,
+        assignment_context=replace(
+            source.assignment_context,
+            techniques=tuple(
+                replace(base, id=f"family/{index}", objective=f"Family {index}")
+                for index in range(69)
+            ),
+            language_frontier=LanguageFrontierSpec(
+                default_language=languages[0],
+                planned_languages=languages,
+                code_switching=True,
+            ),
+        ),
+    )
+
+    async def factory(*_args, **_kwargs):
+        return prepared
+
+    store = Store()
+    service = CampaignService(store, Agents(store), factory)  # type: ignore[arg-type]
+    review = await service.prepare("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+
+    coverage = review["review"]["admitted_coverage"]
+    language_plan = review["review"]["language_plan"]
+    assert coverage["variant_count"] == 12_765
+    assert len(coverage["variant_ids"]) == 32
+    assert coverage["variant_ids_omitted"] == 12_733
+    assert language_plan["planned_languages"] == languages
+    assert len(language_plan["language_evasion_cells"]) == 32
+    assert language_plan["language_evasion_cells_omitted"] == 12_733
+    assert len(prepared.assignment_context.techniques) == 69
+
+
+async def test_lazy_frontier_status_and_receipt_projection_stay_bounded_at_12765():
+    source = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = source.assignment_context.techniques[0]
+    languages = tuple(
+        f"{first}{second}"
+        for first in "abcdefghijklmnopqrstuvwxyz"
+        for second in "abcdefghijklmnopqrstuvwxyz"
+    )[:47]
+    prepared = replace(
+        source,
+        assignment_context=replace(
+            source.assignment_context,
+            techniques=tuple(
+                replace(base, id=f"family/{index}", objective=f"Family {index}")
+                for index in range(69)
+            ),
+            language_frontier=LanguageFrontierSpec(
+                default_language=languages[0],
+                planned_languages=languages,
+                code_switching=True,
+            ),
+        ),
+    )
+
+    recorded_snapshots = []
+    snapshot_header = None
+
+    class StatusStore(Store):
+        def list_waves(self, _campaign_id):
+            return []
+
+        def list_lead(self, _campaign_id):
+            return []
+
+        def record_frontier_completion_snapshot(
+            self, campaign_id, snapshot_id, rows, *, wave=None
+        ):
+            assert wave is None
+            recorded_snapshots.append((campaign_id, snapshot_id, tuple(rows)))
+            assert snapshot_header is not None
+            return snapshot_header
+
+    store = StatusStore()
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+    store.prepare(
+        prepared.manifest.id,
+        prepared.manifest.session_id,
+        {
+            "manifest": _json_value(asdict(prepared.manifest)),
+            "assignment_context": _json_value(asdict(prepared.assignment_context)),
+        },
+        "sha256:reviewed",
+    )
+
+    projected = await service.status(prepared.manifest.id)
+    document = projected["completion_document"]
+    snapshot = document["frontier_projection"]
+    snapshot_header = {
+        "id": f"frontier-final/{prepared.manifest.id}/{snapshot['row_digest']}",
+        "row_digest": snapshot["row_digest"],
+        "total_count": snapshot["total_count"],
+        "counts": snapshot["counts"],
+    }
+
+    assert document["schema"] == "merlin.campaign-completion.live.v2"
+    assert "frontier_snapshot" not in document
+    assert "reference" not in snapshot
+    assert snapshot["sealed"] is False
+    assert snapshot["total_count"] == 12_765
+    assert snapshot["counts"]["outcomes"]["unattempted"] == 12_765
+    assert len(snapshot["sample"]) == 32
+    assert [item["position"] for item in snapshot["sample"]] == list(range(32))
+    assert document["unsearched_frontier_projection"]["count"] == 12_765
+    assert len(document["unsearched_frontier"]) == 32
+    assert projected["saturation"]["completion_frontier_projection"]["count"] == 12_765
+    assert len(projected["saturation"]["completion_frontier"]) == 32
+    assert len(json.dumps(_json_value(document))) < 250_000
+
+    sealed = await service.status(prepared.manifest.id, seal_frontier_snapshot=True)
+    assert len(recorded_snapshots) == 1
+    assert len(recorded_snapshots[0][2]) == 12_765
+    assert sealed["completion_document"]["schema"] == "merlin.campaign-completion.v2"
+    assert sealed["completion_document"]["frontier_snapshot"]["reference"].startswith(
+        f"merlin-frontier-snapshot:{prepared.manifest.id}:"
+    )
+
+
+async def test_frontier_settlement_requeues_infrastructure_failures_without_retiring_them():
+    settled = {}
+
+    class FrontierStore(Store):
+        def load_active_frontier_batch(self, campaign_id):
+            assert campaign_id == "campaign-1"
+            return {
+                "id": "batch-1",
+                "schedule_id": "schedule-1",
+                "candidates": (
+                    {"id": "cell/completed", "claim_generation": 1},
+                    {"id": "cell/failed", "claim_generation": 2},
+                ),
+            }
+
+        def settle_frontier_batch(self, campaign_id, batch_id, dispositions):
+            settled.update(dispositions)
+            return {"queued": 1, "terminal": 1, "total": 2}
+
+    class OutcomeAgents:
+        async def technique_attempts(self, schedule_id):
+            assert schedule_id == "schedule-1"
+            return (
+                {
+                    "task_id": "task/completed",
+                    "technique_id": "cell/completed",
+                    "state": "confirmed",
+                    "strategy_state": {},
+                },
+                {
+                    "task_id": "task/failed",
+                    "technique_id": "cell/failed",
+                    "state": "inconclusive",
+                    "strategy_state": {},
+                },
+            )
+
+    service = CampaignService(FrontierStore(), OutcomeAgents(), None)  # type: ignore[arg-type]
+    counts = await service._settle_execution_frontier_batch(  # noqa: SLF001
+        "campaign-1",
+        SimpleNamespace(id="schedule-1"),
+        (
+            AgentTask(
+                id="task/completed",
+                objective="completed",
+                status="completed",
+                technique_ids=("cell/completed",),
+            ),
+            AgentTask(
+                id="task/failed",
+                objective="failed",
+                status="failed",
+                technique_ids=("cell/failed",),
+            ),
+        ),
+    )
+    assert settled["cell/completed"]["disposition"] == "terminal"
+    assert settled["cell/failed"]["disposition"] == "retryable"
+    assert counts == {
+        "queued": 1,
+        "terminal": 1,
+        "total": 2,
+        "max_claim_generation": 2,
+        "retryable_claims_below_cap": 1,
+        "retry_exhausted_candidates": 0,
+    }
+
+
+async def test_completed_worker_without_terminal_typed_outcome_requeues_candidate():
+    settled = {}
+    candidate_ids = (
+        "cell/confirmed",
+        "cell/refuted",
+        "cell/partial",
+        "cell/inconclusive",
+        "cell/no-effect",
+        "cell/missing",
+        "cell/conflict",
+    )
+
+    class FrontierStore(Store):
+        def load_active_frontier_batch(self, _campaign_id):
+            return {
+                "id": "batch-1",
+                "schedule_id": "schedule-1",
+                "candidates": tuple(
+                    {"id": candidate_id, "claim_generation": 1}
+                    for candidate_id in candidate_ids
+                ),
+            }
+
+        def settle_frontier_batch(self, _campaign_id, _batch_id, dispositions):
+            settled.update(dispositions)
+            return {"queued": 5, "terminal": 2, "total": 7}
+
+    class OutcomeAgents:
+        async def technique_attempts(self, _schedule_id):
+            return tuple(
+                {
+                    "task_id": f"task/{name}",
+                    "technique_id": f"cell/{name}",
+                    "state": state,
+                    "strategy_state": {},
+                }
+                for name, state in (
+                    ("confirmed", "confirmed"),
+                    ("refuted", "refuted"),
+                    ("partial", "observed"),
+                    ("inconclusive", "inconclusive"),
+                    ("no-effect", "no_effect"),
+                )
+            ) + (
+                {
+                    "task_id": "task/conflict",
+                    "technique_id": "cell/conflict",
+                    "state": "confirmed",
+                    "strategy_state": {},
+                },
+                {
+                    "task_id": "task/conflict",
+                    "technique_id": "cell/conflict",
+                    "state": "refuted",
+                    "strategy_state": {},
+                },
+            )
+
+    tasks = tuple(
+        AgentTask(
+            id=f"task/{candidate_id.removeprefix('cell/')}",
+            objective="completed worker",
+            status="completed",
+            technique_ids=(candidate_id,),
+        )
+        for candidate_id in candidate_ids
+    )
+    service = CampaignService(FrontierStore(), OutcomeAgents(), None)  # type: ignore[arg-type]
+    await service._settle_execution_frontier_batch(  # noqa: SLF001
+        "campaign-1", SimpleNamespace(id="schedule-1"), tasks
+    )
+
+    assert settled["cell/confirmed"]["disposition"] == "terminal"
+    assert settled["cell/refuted"]["disposition"] == "terminal"
+    assert {
+        candidate_id: settled[candidate_id]["disposition"]
+        for candidate_id in candidate_ids[2:]
+    } == {candidate_id: "retryable" for candidate_id in candidate_ids[2:]}
+
+
+async def test_missing_normalized_frontier_never_falls_back_to_full_context():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    context = replace(
+        prepared.assignment_context,
+        language_frontier=LanguageFrontierSpec(
+            default_language="en",
+            planned_languages=("en", "es"),
+            code_switching=True,
+        ),
+    )
+
+    class FrontierStore(Store):
+        def frontier_counts(self, campaign_id):
+            assert campaign_id == prepared.manifest.id
+            return {"queued": 0, "total": 0}
+
+        def claim_frontier_batch(self, *args, **kwargs):
+            raise AssertionError("missing normalized state must fail before claiming")
+
+    service = CampaignService(FrontierStore(), object(), None)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="normalized campaign frontier is missing"):
+        await service._claim_execution_frontier_context(  # noqa: SLF001
+            prepared.manifest.id, prepared.manifest, context, 1
+        )
+
+
+async def test_oversized_frontier_batch_is_halved_and_suffix_remains_queued():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = tuple(replace(base, id=f"cell/{index}") for index in range(4))
+    context = replace(prepared.assignment_context, techniques=techniques)
+    resized_calls = []
+
+    class FrontierStore(Store):
+        def resize_frontier_batch(self, campaign_id, batch_id, limit):
+            resized_calls.append((campaign_id, batch_id, limit))
+            return {
+                "id": batch_id,
+                "state": "claimed",
+                "candidates": tuple(
+                    {
+                        "id": technique.id,
+                        "family_id": technique.id,
+                        "ordinal": index,
+                        "requested_language": technique.language,
+                        "variant_id": technique.transform_id,
+                        "claim_generation": 1,
+                    }
+                    for index, technique in enumerate(techniques[:limit])
+                ),
+            }
+
+    service = CampaignService(FrontierStore(), object(), None)  # type: ignore[arg-type]
+    batch = {
+        "id": "batch-1",
+        "candidates": tuple(
+            {"id": technique.id, "family_id": technique.id}
+            for technique in techniques
+        ),
+    }
+    resized_context, resized_batch = await service._shrink_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        context,
+        1,
+        batch,
+        ScheduleArtifactTooLarge(
+            artifact="graph", actual_bytes=17_000_000, limit_bytes=16_000_000
+        ),
+    )
+    assert resized_calls == [(prepared.manifest.id, "batch-1", 2)]
+    assert tuple(item.id for item in resized_context.techniques) == ("cell/0", "cell/1")
+    assert len(resized_batch["candidates"]) == 2
+
+
+async def test_single_oversized_candidate_is_requeued_behind_untried_candidates():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = tuple(
+        replace(base, id=candidate_id)
+        for candidate_id in ("cell/oversized", "cell/next-1", "cell/next-2")
+    )
+    context = replace(prepared.assignment_context, techniques=techniques)
+    events = []
+
+    class FrontierStore(Store):
+        def __init__(self):
+            super().__init__()
+            self.priorities = {}
+
+        def resize_frontier_batch(self, _campaign_id, batch_id, limit):
+            events.append(("resize", batch_id, limit))
+            return {"id": batch_id, "state": "settled", "candidates": ()}
+
+        def update_frontier_priorities(self, _campaign_id, priorities):
+            self.priorities.update(priorities)
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(("lead", payload))
+
+        def frontier_counts(self, _campaign_id):
+            return {"queued": 3, "total": 3}
+
+        def claim_frontier_batch(self, *_args):
+            raise AssertionError("exact claim expected")
+
+        def list_frontier_shortlist(self, _campaign_id, _limit, *, after_ordinal=None):
+            assert after_ordinal is None
+            return tuple(
+                {
+                    "id": item.id,
+                    "family_id": item.id,
+                    "ordinal": index,
+                    "requested_language": "und",
+                    "variant_id": "baseline",
+                    "variant": {},
+                    "priority": self.priorities.get(item.id),
+                    "claim_generation": 0 if index else 1,
+                }
+                for index, item in enumerate(techniques)
+            )
+
+        def claim_frontier_batch_exact(
+            self, _campaign_id, wave, batch_id, candidate_ids
+        ):
+            return {
+                "id": batch_id,
+                "wave": wave,
+                "state": "claimed",
+                "candidates": tuple(
+                    {
+                        "id": candidate_id,
+                        "family_id": candidate_id,
+                        "ordinal": index,
+                        "requested_language": "und",
+                        "variant_id": "baseline",
+                        "claim_generation": 1,
+                    }
+                    for index, candidate_id in enumerate(candidate_ids)
+                ),
+            }
+
+    store = FrontierStore()
+    service = CampaignService(store, object(), None, max_worker_concurrency=1)  # type: ignore[arg-type]
+    next_context, next_batch = await service._shrink_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        context,
+        3,
+        {
+            "id": "batch-oversized",
+            "candidates": ({"id": "cell/oversized", "family_id": "cell/oversized"},),
+        },
+        ScheduleArtifactTooLarge(
+            artifact="graph", actual_bytes=17_000_000, limit_bytes=16_000_000
+        ),
+    )
+
+    assert store.priorities["cell/oversized"] == -1.0
+    assert tuple(item.id for item in next_context.techniques) == (
+        "cell/next-1",
+        "cell/next-2",
+    )
+    assert tuple(item["id"] for item in next_batch["candidates"]) == (
+        "cell/next-1",
+        "cell/next-2",
+    )
+    assert events[0] == ("resize", "batch-oversized", 0)
+    assert events[1][0] == "lead"
+
+
+def test_frontier_projection_is_bounded_and_digest_covers_every_candidate():
+    values = tuple(f"cell/{index}" for index in range(12_765))
+    projection = _bounded_frontier_projection(values)
+    assert projection["count"] == 12_765
+    assert projection["sample"] == values[:32]
+    assert projection["omitted"] == 12_733
+    assert projection["digest"] == "sha256:" + hashlib.sha256(
+        json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+async def test_adaptive_frontier_claim_scores_before_selection_and_keeps_rest_queued():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = tuple(replace(base, id=f"cell/{index}") for index in range(7))
+    context = replace(prepared.assignment_context, techniques=techniques)
+
+    class AdaptiveStore(Store):
+        def __init__(self):
+            super().__init__()
+            self.queued = [item.id for item in techniques]
+            self.priorities = {}
+            self.claims = []
+
+        def frontier_counts(self, _campaign_id):
+            return {"queued": len(self.queued), "total": len(techniques)}
+
+        def claim_frontier_batch(self, *_args):
+            raise AssertionError("adaptive selection must use the exact claim API")
+
+        def list_frontier_shortlist(self, _campaign_id, limit, *, after_ordinal=None):
+            assert after_ordinal is None
+            return tuple(
+                {
+                    "id": candidate_id,
+                    "family_id": candidate_id,
+                    "ordinal": int(candidate_id.split("/")[1]),
+                    "requested_language": "und",
+                    "variant_id": "baseline",
+                    "variant": {},
+                    "priority": self.priorities.get(candidate_id),
+                    "claim_generation": 0,
+                }
+                for candidate_id in self.queued[:limit]
+            )
+
+        def update_frontier_priorities(self, _campaign_id, priorities):
+            self.priorities.update(priorities)
+
+        def claim_frontier_batch_exact(
+            self, _campaign_id, wave, batch_id, candidate_ids
+        ):
+            selected = tuple(candidate_ids)
+            self.claims.append(selected)
+            self.queued = [item for item in self.queued if item not in selected]
+            return {
+                "id": batch_id,
+                "wave": wave,
+                "state": "claimed",
+                "candidates": tuple(
+                    {
+                        "id": candidate_id,
+                        "family_id": candidate_id,
+                        "ordinal": int(candidate_id.split("/")[1]),
+                        "requested_language": "und",
+                        "variant_id": "baseline",
+                        "claim_generation": 1,
+                    }
+                    for candidate_id in selected
+                ),
+            }
+
+    class Client:
+        timeout_seconds = 1.0
+
+        async def noul(self, state, *_args, **_kwargs):
+            candidate_id = json.loads(state)["technique_cell"]["technique_id"]
+            return {
+                "cell/1": 0.1,
+                "cell/2": 0.9,
+                "cell/3": 0.2,
+                "cell/4": 0.8,
+            }.get(candidate_id, 0.0)
+
+    store = AdaptiveStore()
+    service = CampaignService(store, object(), None, max_worker_concurrency=1)  # type: ignore[arg-type]
+    service._jev_client = Client()  # noqa: SLF001
+    service._jev_client_checked = True  # noqa: SLF001
+
+    first, _ = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 1
+    )
+    second, _ = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 2
+    )
+
+    assert tuple(item.id for item in first.techniques) == ("cell/0", "cell/2")
+    assert tuple(item.id for item in second.techniques) == ("cell/3", "cell/4")
+    assert store.claims == [("cell/0", "cell/2"), ("cell/3", "cell/4")]
+    assert store.queued == ["cell/1", "cell/5", "cell/6"]
+    assert store.priorities["cell/1"] == 0.1
+    assert store.priorities["cell/2"] == 0.9
+
+
+async def test_prepare_persists_campaign_and_frontier_atomically_when_store_supports_it():
+    calls = []
+
+    class AtomicStore(Store):
+        def prepare(self, *_args):
+            raise AssertionError("atomic frontier stores must not prepare separately")
+
+        def register_frontier(self, *_args):
+            raise AssertionError("atomic frontier stores must not register separately")
+
+        def prepare_with_frontier(
+            self,
+            campaign_id,
+            session_id,
+            manifest,
+            manifest_digest,
+            families,
+            candidates,
+        ):
+            calls.append(
+                (
+                    campaign_id,
+                    session_id,
+                    manifest_digest,
+                    tuple(families),
+                    tuple(candidates),
+                )
+            )
+            return {
+                "id": campaign_id,
+                "session_id": session_id,
+                "manifest": manifest,
+                "manifest_digest": manifest_digest,
+                "status": "prepared",
+            }
+
+    store = AtomicStore()
+    service = CampaignService(store, Agents(store), preparation)  # type: ignore[arg-type]
+    review = await service.prepare(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    assert review["campaign_id"] == "campaign-1"
+    assert len(calls) == 1
+    _campaign_id, _session_id, _digest, families, candidates = calls[0]
+    assert tuple(item["id"] for item in families) == ("prompt",)
+    assert tuple(item["id"] for item in candidates) == ("prompt",)
+
+
+async def test_saturation_keeps_language_variants_as_distinct_exact_candidates():
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    variants = tuple(
+        f"prompt@lang=es@variant={variant}"
+        for variant in ("native", "translated", "mixed", "script-switching")
+    )
+    service = CampaignService(Store(), object(), None)  # type: ignore[arg-type]
+    saturation = service._project_saturation_evidence(  # noqa: SLF001
+        prepared.manifest,
+        [],
+        [
+            {
+                "wave": 1,
+                "kind": "initial",
+                "status": "completed",
+                "tasks": (
+                    {
+                        "id": "task-1",
+                        "status": "completed",
+                        "technique_outcomes": {variants[0]: "refuted"},
+                    },
+                ),
+            }
+        ],
+        admitted_technique_ids={
+            candidate_id: ("prompt", candidate_id) for candidate_id in variants
+        },
+        awaiting_validation=0,
+    )
+
+    assert saturation is not None
+    assert set(saturation.untested_concrete_ids) == set(variants[1:])

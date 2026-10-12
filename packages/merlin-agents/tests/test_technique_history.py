@@ -17,12 +17,16 @@ from merlin_agents import (
     ContextDocument,
     ReviewedTargetAdapter,
 )
-from merlin_agents.campaign import scenario_fingerprint_for
+from merlin_agents.campaign import (
+    enumerate_language_candidate_references,
+    scenario_fingerprint_for,
+)
 from merlin_agents.campaign_service import (
     CampaignPreparation,
     _deferred_coverage_rows,
     _json_value,
 )
+from merlin_agents.specialists import LanguageFrontierSpec
 from merlin_agents.technique_history import (
     entries_for_completion,
     plan_skip,
@@ -236,8 +240,7 @@ def test_plan_skip_distinguishes_language_and_mutation_variants() -> None:
         }
     }
 
-    # A clean refusal is not language signal: the sibling language and mutation
-    # variants are deferred until lzh/sw show engagement evidence.
+    # A conclusive cell does not exclude its sibling language or mutation.
     runnable, skipped = plan_skip(
         (conclusive, different_language, different_mutation),
         history,
@@ -250,19 +253,14 @@ def test_plan_skip_distinguishes_language_and_mutation_variants() -> None:
     assert str(skipped[0]["mutation_id"]).startswith("sha256:")
 
 
-def test_plan_skip_defers_exotic_language_cells_without_signal() -> None:
+def test_plan_skip_retains_unknown_language_cells_without_signal() -> None:
     baseline = _technique("cell/a@lang=en@variant=native", language="en")
     exotic = _technique("cell/a@lang=ig@variant=native", language="ig")
 
     runnable, skipped = plan_skip((baseline, exotic), {})
 
-    assert runnable == (baseline,)
-    assert len(skipped) == 1
-    deferral = skipped[0]
-    assert deferral["technique_id"] == exotic.id
-    assert deferral["language_id"] == "ig"
-    assert deferral["outcome"] == "deferred"
-    assert "no recorded evidence" in str(deferral["reason"])
+    assert runnable == (baseline, exotic)
+    assert skipped == ()
 
 
 def test_plan_skip_admits_language_cell_with_attempt_signal() -> None:
@@ -293,9 +291,8 @@ def test_plan_skip_admits_language_cell_with_probe_signal() -> None:
 
 
 def test_plan_skip_admits_top_ten_languages_without_signal() -> None:
-    # LLM-backed targets engage in the ten most-spoken languages with
-    # near-certainty; the profile cell cap bounds the spend, so these cells
-    # are never deferred for missing engagement evidence.
+    # Common languages, like the long tail, require no engagement evidence
+    # to remain eligible.
     cells = tuple(
         _technique(f"cell/a@lang={language}@variant=native", language=language)
         for language in ("zh", "ru", "fr", "bn", "pt", "ur")
@@ -307,15 +304,13 @@ def test_plan_skip_admits_top_ten_languages_without_signal() -> None:
     assert skipped == ()
 
 
-def test_plan_skip_still_defers_long_tail_languages_without_signal() -> None:
+def test_plan_skip_retains_long_tail_languages_without_signal() -> None:
     javanese = _technique("cell/a@lang=jv@variant=native", language="jv")
 
     runnable, skipped = plan_skip((javanese,), {})
 
-    assert runnable == ()
-    assert len(skipped) == 1
-    assert skipped[0]["language_id"] == "jv"
-    assert skipped[0]["outcome"] == "deferred"
+    assert runnable == (javanese,)
+    assert skipped == ()
 
 
 def test_plan_skip_refusal_and_infra_failure_are_not_language_signal() -> None:
@@ -335,9 +330,8 @@ def test_plan_skip_refusal_and_infra_failure_are_not_language_signal() -> None:
 
     runnable, skipped = plan_skip((exotic, refused, infra_failed), history)
 
-    assert runnable == ()
-    outcomes = {item["technique_id"]: item["outcome"] for item in skipped}
-    assert outcomes == {refused.id: "refuted", infra_failed.id: "deferred", exotic.id: "deferred"}
+    assert runnable == (exotic, infra_failed)
+    assert {item["technique_id"]: item["outcome"] for item in skipped} == {refused.id: "refuted"}
 
 
 def test_completion_does_not_guess_between_legacy_duplicate_variant_ids() -> None:
@@ -523,6 +517,7 @@ def _preparation(
     *,
     catalogue: tuple[ContextDocument, ...] | None = None,
     campaign_id: str = "campaign-1",
+    language_frontier: LanguageFrontierSpec | None = None,
 ) -> CampaignPreparation:
     budget = AssignmentBudget(256, 1_048_576, 14_400)
     manifest = CampaignManifest.create(
@@ -550,6 +545,7 @@ def _preparation(
         budget=budget,
         input_schema="input/v1",
         output_schema="output/v1",
+        language_frontier=language_frontier,
     )
     return CampaignPreparation(manifest, context)
 
@@ -634,6 +630,200 @@ class _HistoryStore:
         ]
 
 
+async def test_lazy_frontier_history_never_drops_family_or_sibling_candidates() -> None:
+    base = _technique("cell/a", mutation_seed="stable-seed")
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "es"),
+        code_switching=True,
+    )
+    prepared = _preparation((base,), language_frontier=frontier)
+    generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
+    references = enumerate_language_candidate_references((base,), frontier)
+    terminal = references[0]
+    assert terminal.id == "cell/a@lang=en@variant=native"
+    terminal_cell = (
+        terminal.id,
+        base.strategy_id,
+        terminal.variant_id,
+        terminal.requested_language,
+        technique_cell_parts(base)[4],
+    )
+    store = _HistoryStore(
+        [
+            {
+                "target_id": "target-1",
+                "adapter_generation": generation,
+                "technique_id": terminal_cell[0],
+                "controller_id": terminal_cell[1],
+                "payload_family": terminal_cell[2],
+                "language_id": terminal_cell[3],
+                "mutation_id": terminal_cell[4],
+                "outcome": "refuted",
+                "source_campaign_id": "campaign-prior",
+            }
+        ]
+    )
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+
+    admitted, skipped, partial, priors = await service._apply_technique_skip(  # noqa: SLF001
+        prepared, generation
+    )
+
+    assert admitted.assignment_context.techniques == (base,)
+    assert partial == ()
+    assert skipped == ()
+    assert priors == (
+        {
+            "candidate_id": terminal.id,
+            "outcome": "refuted",
+            "source_campaign_id": "campaign-prior",
+            "priority": 0.2,
+            "policy": "ranking and selective revalidation only; candidate remains queued",
+        },
+    )
+    looked_up = set(store.lookups[-1][2])
+    assert len(looked_up) == 5
+    assert terminal_cell in looked_up
+    assert {reference.id for reference in references} == {cell[0] for cell in looked_up}
+    _families, candidate_rows = service._execution_frontier_rows(  # noqa: SLF001
+        prepared, priors
+    )
+    row_by_id = {str(row["id"]): row for row in candidate_rows}
+    assert row_by_id[terminal.id]["state"] == "queued"
+    assert row_by_id[terminal.id]["priority"] == 0.2
+    assert all(row_by_id[reference.id]["priority"] is None for reference in references[1:])
+
+
+async def test_lazy_frontier_completion_records_reusable_exact_history_dimensions() -> None:
+    base = _technique("cell/a", mutation_seed="stable-seed")
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "es"),
+        code_switching=True,
+    )
+    prepared = _preparation((base,), language_frontier=frontier)
+    generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
+    concrete = next(
+        reference
+        for reference in enumerate_language_candidate_references((base,), frontier)
+        if reference.requested_language == "es" and reference.variant_id == "translated"
+    )
+    envelope = {
+        "manifest": _json_value(asdict(prepared.manifest)),
+        "assignment_context": _json_value(asdict(prepared.assignment_context)),
+        "adapter_generation": generation,
+        "technique_skips": [],
+    }
+    store = _HistoryStore()
+    store.rows["campaign-1"] = {"id": "campaign-1", "manifest": envelope}
+    document = {
+        "schema": "merlin.campaign-completion.v1",
+        "cells": (("task-1", concrete.id, "confirmed"),),
+    }
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+
+    await service._record_technique_history("campaign-1", document)  # noqa: SLF001
+
+    assert len(store.history) == 1
+    row = store.history[0]
+    assert row["technique_id"] == concrete.id
+    assert row["controller_id"] == "direct"
+    assert row["payload_family"] == "translated"
+    assert row["language_id"] == "es"
+    assert row["mutation_id"] == technique_cell_parts(base)[4]
+    assert row["outcome"] == "confirmed"
+
+    next_prepared, skipped, partial, priors = await service._apply_technique_skip(  # noqa: SLF001
+        prepared, generation
+    )
+    assert next_prepared.assignment_context.techniques == (base,)
+    assert partial == ()
+    assert skipped == ()
+    assert priors[0]["candidate_id"] == concrete.id
+    assert priors[0]["priority"] == 0.2
+
+
+async def test_v2_frontier_snapshot_pages_record_only_concrete_outcome_history() -> None:
+    base = _technique("cell/a", mutation_seed="stable-seed")
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "es"),
+        code_switching=True,
+    )
+    prepared = _preparation((base,), language_frontier=frontier)
+    generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
+    references = enumerate_language_candidate_references((base,), frontier)
+    concrete = next(
+        reference
+        for reference in references
+        if reference.requested_language == "es" and reference.variant_id == "mixed"
+    )
+    snapshot_rows = [
+        {
+            "position": position,
+            "candidate_id": reference.id,
+            "state": "terminal" if reference.id == concrete.id else "queued",
+            "outcome": "confirmed" if reference.id == concrete.id else "unattempted",
+            "attempt_id": None,
+            "task_id": "task-confirmed" if reference.id == concrete.id else None,
+            "evidence_refs": ["evidence:confirmed"] if reference.id == concrete.id else [],
+            "disposition_reason": None,
+        }
+        for position, reference in enumerate(references)
+    ]
+    row_digest = hashlib.sha256(
+        json.dumps(
+            {"schema_version": 1, "rows": snapshot_rows},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    class SnapshotStore(_HistoryStore):
+        def list_frontier_completion_page(
+            self, campaign_id, snapshot_id, *, limit=100, after_position=-1
+        ):
+            assert campaign_id == "campaign-1"
+            assert snapshot_id == "snapshot-1"
+            return tuple(
+                row
+                for row in snapshot_rows
+                if int(row["position"]) > after_position
+            )[:limit]
+
+    store = SnapshotStore()
+    store.rows["campaign-1"] = {
+        "id": "campaign-1",
+        "manifest": {
+            "manifest": _json_value(asdict(prepared.manifest)),
+            "assignment_context": _json_value(asdict(prepared.assignment_context)),
+            "adapter_generation": generation,
+            "technique_skips": [],
+        },
+    }
+    document = {
+        "schema": "merlin.campaign-completion.v2",
+        "frontier_snapshot": {
+            "id": "snapshot-1",
+            "reference": "merlin-frontier-snapshot:campaign-1:snapshot-1",
+            "row_digest": row_digest,
+            "total_count": len(snapshot_rows),
+            "counts": {},
+            "sample": (),
+        },
+    }
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+
+    await service._record_technique_history("campaign-1", document)  # noqa: SLF001
+
+    assert len(store.history) == 1
+    assert store.history[0]["technique_id"] == concrete.id
+    assert store.history[0]["payload_family"] == "mixed"
+    assert store.history[0]["language_id"] == "es"
+    assert store.history[0]["outcome"] == "confirmed"
+
+
 async def test_partial_repeat_guidance_survives_review_resume_and_worker_compilation():
     from merlin_agents.campaign import compile_attack_campaign, compile_baseline_agenda
     from merlin_agents.campaign_service import _assignment_context, _manifest
@@ -673,8 +863,12 @@ async def test_partial_repeat_guidance_survives_review_resume_and_worker_compila
     context = _assignment_context(envelope["assignment_context"])
     manifest.validate()
     assert scenario_fingerprint_for(manifest.target, manifest.catalogue) == generation
-    assert [technique.id for technique in context.techniques] == ["cell/new", "cell/partial"]
-    assert len(review["review"]["technique_skips"]) == 1
+    assert [technique.id for technique in context.techniques] == [
+        "cell/new",
+        "cell/partial",
+        "cell/resolved",
+    ]
+    assert not review["review"]["technique_skips"]
     guidance = next(
         document
         for document in manifest.catalogue
@@ -686,14 +880,17 @@ async def test_partial_repeat_guidance_survives_review_resume_and_worker_compila
     assert "strategy_plan.thought" in prior["policy"]
     assert context.techniques[0].guidance_ids == ()
     assert guidance.id in context.techniques[1].guidance_ids
+    assert context.techniques[2].guidance_ids == ()
     agenda = compile_baseline_agenda(manifest, context, compile_attack_campaign(manifest, context))
-    assert len(agenda.assignments) == 2
+    assert len(agenda.assignments) == 3
     assert [assignment.technique_ids for assignment in agenda.assignments] == [
         ("cell/new",),
         ("cell/partial",),
+        ("cell/resolved",),
     ]
-    assert guidance in agenda.worker_contexts[1].guidance
     assert guidance not in agenda.worker_contexts[0].guidance
+    assert guidance in agenda.worker_contexts[1].guidance
+    assert guidance not in agenda.worker_contexts[2].guidance
 
 
 async def test_semantic_triage_cannot_retire_partial_repeat(monkeypatch):
@@ -739,7 +936,7 @@ def test_partial_repeat_context_keeps_variant_histories_separate():
     )
 
 
-async def test_second_campaign_skips_executed_cells_and_cites_source() -> None:
+async def test_second_campaign_keeps_prior_terminal_cells_eligible() -> None:
     techniques = (_technique("cell/a"), _technique("cell/b"))
     prepared = _preparation(techniques)
     generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
@@ -767,24 +964,12 @@ async def test_second_campaign_skips_executed_cells_and_cites_source() -> None:
 
     envelope = store.rows["campaign-1"]["manifest"]
     assert envelope["adapter_generation"] == generation
-    assert envelope["technique_skips"] == [
-        {
-            "technique_id": "cell/a",
-            "controller_id": "direct",
-            "payload_family": "baseline",
-            "language_id": "und",
-            "mutation_id": "none",
-            "outcome": "refuted",
-            "source_campaign_id": "campaign-0",
-        }
-    ]
+    assert envelope["technique_skips"] == []
     remaining = envelope["assignment_context"]["techniques"]
-    assert [item["id"] for item in remaining] == ["cell/b"]
-    assert review["review"]["technique_skips"][0]["source_campaign_id"] == "campaign-0"
+    assert [item["id"] for item in remaining] == ["cell/b", "cell/a"]
+    assert not review["review"]["technique_skips"]
     skip_journal = [item for item in store.journal if item["payload"]["kind"] == "technique_skip"]
-    assert len(skip_journal) == 1
-    assert skip_journal[0]["payload"]["skips"][0]["technique_id"] == "cell/a"
-    assert skip_journal[0]["payload"]["skips"][0]["source_campaign_id"] == "campaign-0"
+    assert not skip_journal
 
 
 async def test_adapter_generation_bump_reruns_everything() -> None:
@@ -896,10 +1081,10 @@ async def test_partial_cells_rerun_deprioritized_and_reported_at_prepare() -> No
     assert [item["id"] for item in persisted] == ["cell/untried", "cell/partial"]
 
 
-async def test_terminal_gate_outcome_recorded_at_seal_skips_at_next_prepare() -> None:
+async def test_terminal_gate_outcome_is_reusable_but_remains_eligible_next_prepare() -> None:
     """Settlement flow: a cell gated to refuted in the sealed completion (with
     an inconclusive sibling attempt) lands in history as refuted, and the next
-    prepare skips it."""
+    prepare keeps it queued for selective revalidation."""
     techniques = (_technique("cell/a"), _technique("cell/b"))
     prepared = _preparation(techniques)
     generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
@@ -934,9 +1119,9 @@ async def test_terminal_gate_outcome_recorded_at_seal_skips_at_next_prepare() ->
         "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
     )
 
-    assert [item["technique_id"] for item in review["review"]["technique_skips"]] == ["cell/a"]
+    assert not review["review"]["technique_skips"]
     remaining = store.rows["campaign-1"]["manifest"]["assignment_context"]["techniques"]
-    assert [item["id"] for item in remaining] == ["cell/b"]
+    assert [item["id"] for item in remaining] == ["cell/a", "cell/b"]
 
 
 async def test_finish_campaign_records_cell_history_from_completion() -> None:
@@ -1037,7 +1222,7 @@ def _scenario_contract_document(
     )
 
 
-async def test_reworded_recon_prose_keeps_generation_and_skip_fires() -> None:
+async def test_reworded_recon_prose_keeps_generation_and_history_reusable() -> None:
     """Same endpoints/methods with reworded LLM prose keep the generation.
 
     Regression for run8k/run11: recon rewrites oracle match_values wording,
@@ -1093,9 +1278,9 @@ async def test_reworded_recon_prose_keeps_generation_and_skip_fires() -> None:
         "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
     )
 
-    assert [item["technique_id"] for item in review["review"]["technique_skips"]] == ["cell/a"]
+    assert not review["review"]["technique_skips"]
     remaining = store.rows["campaign-1"]["manifest"]["assignment_context"]["techniques"]
-    assert [item["id"] for item in remaining] == ["cell/b"]
+    assert [item["id"] for item in remaining] == ["cell/b", "cell/a"]
     assert not [
         item for item in store.journal if item["payload"]["kind"] == "technique_skip_inapplicable"
     ]
@@ -1177,7 +1362,7 @@ def test_prepare_helper_uses_distinct_generations() -> None:
     ) != scenario_fingerprint_for(second.manifest.target, second.manifest.catalogue)
 
 
-async def test_prepare_refuses_when_terminal_history_skips_every_cell() -> None:
+async def test_prepare_keeps_every_cell_eligible_when_all_have_terminal_history() -> None:
     techniques = (_technique("cell/a"), _technique("cell/b"))
     prepared = _preparation(techniques)
     generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
@@ -1200,19 +1385,17 @@ async def test_prepare_refuses_when_terminal_history_skips_every_cell() -> None:
         return prepared
 
     service = CampaignService(store, object(), factory)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="no runnable reviewed technique cells remain"):
-        await service.prepare(
-            "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
-        )
+    review = await service.prepare(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
 
-    # The refusal happens before any campaign row is sealed.
-    assert store.rows == {}
+    assert not review["review"]["technique_skips"]
+    persisted = store.rows["campaign-1"]["manifest"]["assignment_context"]["techniques"]
+    assert [item["id"] for item in persisted] == ["cell/a", "cell/b"]
 
 
-async def test_prepare_defers_exotic_language_cells_and_journals_reason() -> None:
-    """A non-baseline language cell without target signal is deferred coverage:
-    it leaves the runnable set, is journaled with its reason, and lands in the
-    envelope ``technique_skips`` the completion document lists as skipped cells."""
+async def test_prepare_keeps_unknown_language_cells_eligible() -> None:
+    """Missing language evidence must not shrink the sealed frontier."""
     baseline = _technique("cell/a@lang=en@variant=native", language="en")
     exotic = _technique("cell/a@lang=ig@variant=native", language="ig")
     prepared = _preparation((baseline, exotic))
@@ -1226,17 +1409,11 @@ async def test_prepare_defers_exotic_language_cells_and_journals_reason() -> Non
         "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
     )
 
-    skips = review["review"]["technique_skips"]
-    assert [item["technique_id"] for item in skips] == [exotic.id]
-    assert skips[0]["outcome"] == "deferred"
-    assert "ig" in str(skips[0]["reason"])
+    assert not review["review"]["technique_skips"]
+    assert review["review"]["language_plan"]["baseline"] == "und"
     remaining = store.rows["campaign-1"]["manifest"]["assignment_context"]["techniques"]
-    assert [item["id"] for item in remaining] == [baseline.id]
-    skip_journal = [item for item in store.journal if item["payload"]["kind"] == "technique_skip"]
-    assert len(skip_journal) == 1
-    journaled = skip_journal[0]["payload"]["skips"][0]
-    assert journaled["outcome"] == "deferred"
-    assert "no recorded evidence" in str(journaled["reason"])
+    assert {item["id"] for item in remaining} == {baseline.id, exotic.id}
+    assert not [item for item in store.journal if item["payload"]["kind"] == "technique_skip"]
 
 
 def _escalation_envelope(
@@ -1419,3 +1596,12 @@ async def test_escalated_cells_leave_deferred_accounting() -> None:
         {"cell/a@lang=sw@variant=native"},
     )
     assert [row["technique_id"] for row in remaining] == ["cell/a@lang=ig@variant=native"]
+
+
+def test_language_evidence_orders_but_never_excludes_unknown_cells():
+    unknown = _technique("cell/unknown@lang=ig", language="ig")
+    observed = _technique("cell/observed@lang=sw", language="sw")
+    baseline = _technique("cell/baseline@lang=en", language="en")
+    runnable, skipped = plan_skip((unknown, observed, baseline), {}, signal_languages=("sw",))
+    assert runnable == (observed, baseline, unknown)
+    assert skipped == ()

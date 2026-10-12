@@ -41,6 +41,9 @@ from merlin_agents.campaign import (
     _recon_output_schema,
     compile_baseline_agenda,
     compile_execution_agenda,
+    enumerate_language_candidate_references,
+    language_frontier_spec,
+    materialize_language_technique,
     profile_grant,
     project_by_effects,
     reconcile_techniques_for_surfaces,
@@ -1117,6 +1120,90 @@ def test_language_plan_expands_techniques_into_distinct_comparable_cells() -> No
         item.transform_spec is not None
         and item.transform_spec.metamorphic_oracle_digest is not None
         for item in expanded
+    )
+
+
+def test_language_frontier_references_are_compact_deterministic_and_materialize_exactly() -> None:
+    bases = tuple(
+        AssignmentTechnique(
+            f"technique-{index}",
+            f"Exercise reviewed behavior {index}",
+            frozenset({"direct-user-channel"}),
+            (),
+            strategy_id=("direct", "crescendo", "goat", "hydra-select")[index % 4],
+            strategy_contract=(("language", "en"),),
+        )
+        for index in range(69)
+    )
+    policy = {
+        "default_language": "en",
+        "planned_languages": ("en", *tuple(f"aa-{index}" for index in range(46))),
+        "code_switching": True,
+    }
+    frontier = language_frontier_spec(policy)
+    assert frontier is not None
+
+    references = enumerate_language_candidate_references(bases, frontier)
+
+    assert len(references) == 12_765
+    assert len(bases) == 69
+    assert all(base.transform_spec is None for base in bases)
+    assert references[0].id == "technique-0@lang=en@variant=native"
+    assert references[68].id == "technique-68@lang=en@variant=native"
+    assert references[69].id == "technique-0@lang=aa-0@variant=native"
+    assert references[-1].ordinal == 12_764
+    assert references == enumerate_language_candidate_references(bases, frontier)
+
+    # Cover every variant across direct and all adaptive strategies, plus both
+    # ends of the deterministic frontier.
+    selected = (references[0], *references[69:85], references[-1])
+    by_id = {base.id: base for base in bases}
+    lazily_materialized = tuple(
+        materialize_language_technique(by_id[reference.family_id], frontier, reference)
+        for reference in selected
+    )
+    eagerly_materialized = expand_language_techniques(bases, policy)
+    eager_by_id = {item.id: item for item in eagerly_materialized}
+
+    assert lazily_materialized == tuple(eager_by_id[reference.id] for reference in selected)
+
+
+def test_language_frontier_preserves_authored_cell_identity_without_rematerializing_it() -> None:
+    authored = AssignmentTechnique(
+        "authored-ms",
+        "Exercise the authored Malay behavior",
+        frozenset({"language:ms", "language-variant:native"}),
+        (),
+        language="ms",
+        transform_id="native",
+        comparison_supported=False,
+        comparison_block_reason="advisory metadata was unavailable",
+    )
+    neutral = AssignmentTechnique("neutral", "Exercise the neutral behavior", frozenset(), ())
+    frontier = language_frontier_spec(
+        {"default_language": "en", "planned_languages": ("en", "ms")}
+    )
+    assert frontier is not None
+
+    references = enumerate_language_candidate_references((authored, neutral), frontier)
+    materialized = tuple(
+        materialize_language_technique(
+            authored if reference.family_id == authored.id else neutral,
+            frontier,
+            reference,
+        )
+        for reference in references
+    )
+
+    assert references[0].id == authored.id
+    assert materialized[0] == replace(
+        authored,
+        comparison_supported=True,
+        comparison_block_reason=None,
+    )
+    assert materialized == expand_language_techniques(
+        (authored, neutral),
+        {"default_language": "en", "planned_languages": ("en", "ms")},
     )
 
 

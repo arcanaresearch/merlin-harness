@@ -19,6 +19,10 @@ from merlin_agents import (
     ReviewedTargetAdapter,
     compile_initial_campaign,
 )
+from merlin_agents.campaign import (
+    enumerate_language_candidate_references,
+    materialize_language_technique,
+)
 from merlin_agents.campaign_service import _json_value
 from merlin_agents.transforms import materialize_transform_envelope
 from merlin_assessments import ReviewedApiTargetTool
@@ -1592,55 +1596,34 @@ Preserve attributable evidence and reviewed authority.
                 for item in prepared.assignment_context.techniques
                 if not item.comparison_supported
             )
-            assert {item.language for item in eligible} == {
-                "en",
-                "zh",
-                "hi",
-                "es",
-                "ar",
-                "fr",
-                "bn",
-                "pt",
-                "ru",
-                "ur",
-                "id",
-                "de",
-                "ja",
-                "mr",
-                "te",
-                "tr",
-                "ta",
-                "vi",
-                "ko",
-                "yue",
-                "it",
-                "jv",
-                "pa",
-                "fa",
-                "gu",
-                "kn",
-                "ml",
-                "th",
-                "my",
-                "uk",
-                "pl",
-                "nl",
-                "ro",
-                "tl",
-                "ha",
-                "si",
-                "km",
-                "ne",
-                "az",
-                "uz",
-                "sw",
-                "am",
-                "yo",
-                "ig",
-                "lzh",
-                "la",
-                "tok",
-            }
+            assert len(prepared.assignment_context.techniques) == 69
+            language_frontier = prepared.assignment_context.language_frontier
+            assert language_frontier is not None
+            assert len(language_frontier.planned_languages) == 47
+            language_references = enumerate_language_candidate_references(
+                prepared.assignment_context.techniques,
+                language_frontier,
+            )
+            assert len(language_references) == 12_765
+            assert language_references[0].id.endswith("@lang=en@variant=native")
+            assert language_references[-1].ordinal == 12_764
+            assert all(item.transform_spec is None for item in eligible)
+            reviewed_contract = next(
+                item
+                for item in prepared.manifest.catalogue
+                if item.id == "target:reviewed-interaction-contract"
+            )
+            reviewed_contract_value = json.loads(reviewed_contract.content.split("\n", 1)[1])
+            reviewed_language_policy = reviewed_contract_value["language_policy"]
+            assert tuple(reviewed_language_policy["planned_languages"]) == (
+                language_frontier.planned_languages
+            )
+            assert reviewed_language_policy["code_switching"] is True
+            assert reviewed_language_policy["supported_languages"] == ["en"]
+            assert reviewed_language_policy["evidence_refs"] == [
+                "request-reviewed",
+                "response-reviewed",
+            ]
             assert not blocked
             preparation_uncertainty = next(
                 item
@@ -1648,24 +1631,38 @@ Preserve attributable evidence and reviewed authority.
                 if item.id == "coverage:evaluation-uncertainties"
             )
             assert "handoff_metadata_changed" in preparation_uncertainty.content
-            adaptive_cells = tuple(
+            adaptive_families = tuple(
                 item
                 for item in prepared.assignment_context.techniques
                 if item.strategy_id in {"crescendo", "goat", "hydra-select"}
             )
-            assert {item.strategy_id for item in adaptive_cells} == {
+            assert {item.strategy_id for item in adaptive_families} == {
                 "crescendo",
                 "goat",
                 "hydra-select",
             }
-            assert all(item.comparison_supported for item in adaptive_cells)
+            assert all(item.comparison_supported for item in adaptive_families)
+            adaptive_by_id = {item.id: item for item in adaptive_families}
+            selected_adaptive_references = tuple(
+                reference
+                for reference in language_references
+                if reference.family_id in adaptive_by_id
+                and reference.requested_language == "es"
+                and reference.variant_id == "translated"
+            )
+            adaptive_cells = tuple(
+                materialize_language_technique(
+                    adaptive_by_id[reference.family_id],
+                    language_frontier,
+                    reference,
+                )
+                for reference in selected_adaptive_references
+            )
+            assert adaptive_cells
             assert all(item.strategy_contract for item in adaptive_cells)
             assert all(
                 dict(item.strategy_contract)["language"] == item.language for item in adaptive_cells
             )
-            assert {item.language for item in adaptive_cells} <= {
-                item.language for item in eligible
-            }
             assert all(
                 any(
                     uncertainty.get("kind") == "evaluation_uncertain"

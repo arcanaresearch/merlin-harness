@@ -1209,6 +1209,62 @@ _LEAD_RESULT_BUDGET_CEILING_CHARS = 65_536
 _LEAD_RESULT_BUDGET_FALLBACK_WINDOW_TOKENS = 32_768
 _LEAD_SNAPSHOT_CEILING_BYTES = 65_536
 _LEAD_OBJECTIVE_CEILING_CHARS = 256
+_LEAD_COMPOSITION_EXACT_ID_LIMIT = 128
+_LEAD_COMPOSITION_ID_SAMPLE_LIMIT = 8
+_LEAD_REJECTION_HISTORY_LIMIT = 32
+_LEAD_REJECTION_DROP_LIMIT = 4
+_LEAD_REJECTION_REASON_CEILING_BYTES = 768
+_LEAD_REJECTION_FEEDBACK_CEILING_BYTES = 4_096
+
+
+def _bounded_utf8_text(value: object, max_bytes: int) -> str:
+    """Render text within an exact UTF-8 budget with attributable truncation."""
+    rendered = str(value or "")
+    encoded = rendered.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return rendered
+    digest = hashlib.sha256(encoded).hexdigest()
+    suffix = f"\n[truncated bytes={len(encoded)} sha256:{digest}]"
+    suffix_bytes = suffix.encode("utf-8")
+    prefix_budget = max(0, max_bytes - len(suffix_bytes))
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    return prefix + suffix
+
+
+def _compact_identifier_projection(
+    values: object,
+    *,
+    exact_limit: int = _LEAD_COMPOSITION_EXACT_ID_LIMIT,
+) -> tuple[tuple[str, ...] | None, dict[str, object]]:
+    """Project a possibly huge identifier set as exact IDs or a compact manifest."""
+    identifiers = tuple(str(item) for item in values) if isinstance(values, (list, tuple)) else ()
+    canonical = tuple(sorted(set(identifiers)))
+    digest = "sha256:" + hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+    manifest: dict[str, object] = {
+        "count": len(identifiers),
+        "unique_count": len(canonical),
+        "digest": digest,
+    }
+    if len(identifiers) <= exact_limit:
+        return identifiers, manifest
+    family_counts: dict[str, int] = {}
+    for identifier in identifiers:
+        family = identifier.split("@lang=", 1)[0]
+        family_counts[family] = family_counts.get(family, 0) + 1
+    ranked_families = sorted(family_counts.items(), key=lambda item: (-item[1], item[0]))
+    manifest.update(
+        {
+            "sample_ids": canonical[:_LEAD_COMPOSITION_ID_SAMPLE_LIMIT],
+            "family_count": len(family_counts),
+            "family_samples": tuple(
+                {"family_id": family, "candidate_count": count}
+                for family, count in ranked_families[:_LEAD_COMPOSITION_ID_SAMPLE_LIMIT]
+            ),
+            "omitted_family_count": max(0, len(family_counts) - _LEAD_COMPOSITION_ID_SAMPLE_LIMIT),
+            "projection": "count-digest-sample",
+        }
+    )
+    return None, manifest
 
 
 def _lead_result_char_budget(
@@ -1365,6 +1421,19 @@ def _lead_task_rows(
                 omit_history(value, "waves", "omitted_wave_count", history_keep)
                 omit_history(value, "directives", "omitted_directive_count", history_keep)
             elif name == "specialist_composition_get":
+                for field in (
+                    "sealed_technique_ids",
+                    "orphaned_technique_ids",
+                    "double_owned_technique_ids",
+                ):
+                    exact_ids, identifier_manifest = _compact_identifier_projection(
+                        value.get(field, ())
+                    )
+                    value[f"{field.removesuffix('_ids')}_manifest"] = identifier_manifest
+                    if exact_ids is None:
+                        value.pop(field, None)
+                    else:
+                        value[field] = exact_ids
                 if "initial_composition_request" in value:
                     request = value.pop("initial_composition_request")
                     value["initial_composition_required"] = bool(request)
@@ -1380,7 +1449,15 @@ def _lead_task_rows(
                         ],
                         "ownership": "each sealed technique exactly once",
                         "limits_source": "reviewed specialist caps in this projection",
+                        "exact_ids_required": "sealed_technique_ids",
                     }
+                    if bool(request) and "sealed_technique_ids" not in value:
+                        value["initial_composition_required"] = False
+                        value["initial_composition_deferred"] = True
+                        value["initial_composition_deferred_reason"] = (
+                            "the active batch exceeded the exact ownership projection ceiling; "
+                            "the daemon must shrink the batch before requesting composition"
+                        )
 
     # Canonicalize duplicated control-plane structures before applying a byte
     # budget. Keep a small recent history initially; all omission counts remain
@@ -3488,10 +3565,8 @@ def build_backend(
         WorkerProfile,
         WorkerRuntime,
         admit_techniques_for_surfaces,
-        bound_recommended_techniques,
         campaign_learning_priority,
         comparable_attempt_dimensions,
-        expand_language_techniques,
         exploration_source_summary,
         is_dynamic_specialist_label,
         new_campaign_id,
@@ -3512,6 +3587,7 @@ def build_backend(
         AutomationRequest,
         AutomationStep,
     )
+    from merlin_agents.campaign import language_frontier_spec
     from merlin_agents.campaign_service import _dynamic_specialist_proposal, _json_value
     from merlin_agents.capability_probes import (
         CapabilityProbeKind,
@@ -3725,7 +3801,10 @@ def build_backend(
         effect_store = PostgresToolEffectStore(effect_repository)
         report_connection = database.connect()
         report_repository = PostgresReportRevisionStore(report_connection)
-        durable_reports = DurableReportService(report_repository)
+        durable_reports = DurableReportService(
+            report_repository,
+            frontier_snapshot_provider=campaign_store,
+        )
         automatic_report_directory = Path(workspace_root).resolve() / "target" / "reports"
 
         def export_latest_campaign_report(
@@ -4903,6 +4982,9 @@ def build_backend(
                     "evidence_expectation; do not answer the composition with recon, "
                     "injection, adversarial-researcher, novelty-critic, experiment-planner, "
                     "or any other fixed worker profile. "
+                    "If the projection says initial_composition_deferred, do not invent or "
+                    "expand identifiers from its digest or samples; return no initial-"
+                    "composition followups so the daemon can shrink and retry the batch. "
                     "After each wave, use durable receipts to propose needed dynamic specialist "
                     "changes. If an interaction "
                     "prerequisite is blocked but recoverable, route the followup to "
@@ -4949,26 +5031,44 @@ def build_backend(
                         ),
                     )
                 )
-            rejection_feedback = tuple(
-                row["payload"]
-                for row in lead_rows
-                if isinstance(row.get("payload"), dict)
-                and row["payload"].get("kind")
-                in {
+            rejection_feedback_rows: list[dict[str, object]] = []
+            for row in reversed(lead_rows):
+                payload = row.get("payload")
+                if not isinstance(payload, dict) or payload.get("kind") not in {
                     "lead_decision_rejected",
                     "lead_followup_dropped",
                     "dynamic_specialist_rejected",
-                }
-            )
+                }:
+                    continue
+                rejection_feedback_rows.append(payload)
+                if len(rejection_feedback_rows) >= _LEAD_REJECTION_HISTORY_LIMIT:
+                    break
+            rejection_feedback = tuple(reversed(rejection_feedback_rows))
             if rejection_feedback:
 
                 def _feedback_line(item: dict) -> str:
                     if item.get("kind") == "lead_followup_dropped":
-                        drops = "; ".join(
-                            f"{drop.get('profile_id') or 'followup'}: {drop.get('reason')}"
-                            for drop in item.get("drops", ())
-                            if isinstance(drop, dict)
+                        drop_rows = item.get("drops", ())
+                        bounded_drops: list[str] = []
+                        if isinstance(drop_rows, (list, tuple)):
+                            for drop in drop_rows[:_LEAD_REJECTION_DROP_LIMIT]:
+                                if not isinstance(drop, dict):
+                                    continue
+                                bounded_drops.append(
+                                    f"{drop.get('profile_id') or 'followup'}: "
+                                    + _bounded_utf8_text(
+                                        drop.get("reason"),
+                                        _LEAD_REJECTION_REASON_CEILING_BYTES,
+                                    )
+                                )
+                        omitted = (
+                            max(0, len(drop_rows) - _LEAD_REJECTION_DROP_LIMIT)
+                            if isinstance(drop_rows, (list, tuple))
+                            else 0
                         )
+                        drops = "; ".join(bounded_drops)
+                        if omitted:
+                            drops += f"; {omitted} additional drops omitted"
                         return (
                             f"- attempt {item.get('attempt')}: followups dropped before "
                             f"admission ({drops})"
@@ -4977,9 +5077,14 @@ def build_backend(
                         return (
                             f"- dynamic specialist "
                             f"{item.get('label') or item.get('proposal_digest') or 'proposal'} "
-                            f"rejected: {item.get('reason')}"
+                            "rejected: "
+                            + _bounded_utf8_text(
+                                item.get("reason"), _LEAD_REJECTION_REASON_CEILING_BYTES
+                            )
                         )
-                    return f"- attempt {item.get('attempt')}: {item.get('reason')}"
+                    return f"- attempt {item.get('attempt')}: " + _bounded_utf8_text(
+                        item.get("reason"), _LEAD_REJECTION_REASON_CEILING_BYTES
+                    )
 
                 # Identical rejection rows accumulate across attempts; replay each
                 # distinct reason once (most recent window) instead of re-reading
@@ -4987,15 +5092,29 @@ def build_backend(
                 # differs per row, so dedupe on the reason text, not the line.
                 def _feedback_key(item: dict) -> object:
                     if item.get("kind") == "lead_followup_dropped":
+                        drops = item.get("drops", ())
                         return (
                             item.get("kind"),
                             tuple(
-                                (drop.get("profile_id"), drop.get("reason"))
-                                for drop in item.get("drops", ())
+                                (
+                                    drop.get("profile_id"),
+                                    hashlib.sha256(
+                                        str(drop.get("reason") or "").encode("utf-8")
+                                    ).hexdigest(),
+                                )
+                                for drop in (
+                                    drops[:_LEAD_REJECTION_DROP_LIMIT]
+                                    if isinstance(drops, (list, tuple))
+                                    else ()
+                                )
                                 if isinstance(drop, dict)
                             ),
                         )
-                    return (item.get("kind"), item.get("label"), item.get("reason"))
+                    return (
+                        item.get("kind"),
+                        item.get("label"),
+                        hashlib.sha256(str(item.get("reason") or "").encode("utf-8")).hexdigest(),
+                    )
 
                 feedback_by_reason: dict[object, str] = {}
                 for item in rejection_feedback:
@@ -5019,17 +5138,29 @@ def build_backend(
                     if specialist_rejected
                     else ""
                 )
+                feedback_header = (
+                    "Daemon feedback: your previous decision or specialist "
+                    "proposal was rejected. Correct the "
+                    "exact rejection reasons below and return a complete decision as "
+                    "a single JSON object only — no Markdown fences, no commentary, "
+                    "no prose before or after the JSON:\n"
+                )
+                fixed_feedback_bytes = len((feedback_header + gate_note).encode("utf-8"))
+                feedback_line_budget = max(
+                    256,
+                    _LEAD_REJECTION_FEEDBACK_CEILING_BYTES - fixed_feedback_bytes,
+                )
+                feedback_content = (
+                    feedback_header
+                    + _bounded_utf8_text("\n".join(feedback_lines[-3:]), feedback_line_budget)
+                    + gate_note
+                )
                 messages.append(
                     ChatMessage(
                         role="user",
-                        content=(
-                            "Daemon feedback: your previous decision or specialist "
-                            "proposal was rejected. Correct the "
-                            "exact rejection reasons below and return a complete decision as "
-                            "a single JSON object only — no Markdown fences, no commentary, "
-                            "no prose before or after the JSON:\n"
-                            + "\n".join(feedback_lines[-3:])
-                            + gate_note
+                        content=_bounded_utf8_text(
+                            feedback_content,
+                            _LEAD_REJECTION_FEEDBACK_CEILING_BYTES,
                         ),
                     )
                 )
@@ -6195,9 +6326,16 @@ def build_backend(
                 "planned_languages": planned_language_candidates,
                 "code_switching": True,
             }
-            techniques = expand_language_techniques(techniques, security_language_policy)
-            if profile is CampaignProfile.RECOMMENDED:
-                techniques = bound_recommended_techniques(techniques)
+            language_frontier = language_frontier_spec(security_language_policy)
+            if language_frontier is None:
+                raise ValueError("security language frontier must contain planned languages")
+            # Keep the reviewed policy visible in the durable interaction contract while
+            # retaining one rich object per authored technique. Candidate identities are
+            # enumerated compactly and materialized only when the scheduler claims them.
+            reviewed_adapter = {
+                **dict(reviewed_adapter),
+                "language_policy": security_language_policy,
+            }
             adaptive_uncertainties = tuple(
                 {
                     "kind": "adaptive_evaluator_fallback",
@@ -6533,6 +6671,7 @@ def build_backend(
                     ),
                     provider_model_catalogue_pricing=catalogue_pricing_entries(),
                     provider_model_cache_read_pricing=cache_read_pricing_entries(),
+                    language_frontier=language_frontier,
                 ),
             )
 

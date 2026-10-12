@@ -338,6 +338,74 @@ class WorkerAssignment:
             raise ValueError("only finding-review roles can receive findings")
 
 
+_LANGUAGE_TOKEN = re.compile(r"[a-z]{2,8}(?:-[a-z0-9]{1,8})*")
+
+
+@dataclass(frozen=True, slots=True)
+class LanguageFrontierSpec:
+    """Compact, reviewed recipe for the campaign's logical language frontier."""
+
+    default_language: str = "und"
+    planned_languages: tuple[str, ...] = ()
+    code_switching: bool = False
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        default = self.default_language.strip().casefold()
+        planned = tuple(language.strip().casefold() for language in self.planned_languages)
+        if self.schema_version != 1:
+            raise ValueError("language frontier schema version must be 1")
+        if _LANGUAGE_TOKEN.fullmatch(default) is None:
+            raise ValueError("default language must use a canonical BCP-47-like token")
+        if any(_LANGUAGE_TOKEN.fullmatch(language) is None for language in planned):
+            raise ValueError("planned languages must use canonical BCP-47-like tokens")
+        if len(set(planned)) != len(planned):
+            raise ValueError("planned languages must be unique")
+        if default != self.default_language or planned != self.planned_languages:
+            raise ValueError("language frontier tokens must already be normalized")
+
+    def variants_for(self, language: str) -> tuple[str, ...]:
+        """Return the deterministic transform variants admitted for one language."""
+
+        normalized = language.strip().casefold()
+        if normalized not in self.planned_languages:
+            raise ValueError("language is outside the reviewed frontier")
+        if normalized == self.default_language:
+            return ("native",)
+        return (
+            ("native", "translated", "mixed", "script-switching")
+            if self.code_switching
+            else ("native", "translated")
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LanguageCandidateReference:
+    """Lightweight identity for one lazily materialized language candidate."""
+
+    id: str
+    family_id: str
+    ordinal: int
+    requested_language: str
+    variant_id: str
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.family_id.strip():
+            raise ValueError("language candidate identity cannot be blank")
+        if self.ordinal < 0:
+            raise ValueError("language candidate ordinal must be non-negative")
+        if _LANGUAGE_TOKEN.fullmatch(self.requested_language) is None:
+            raise ValueError("requested language must use a canonical BCP-47-like token")
+        if not self.variant_id.strip():
+            raise ValueError("language candidate variant cannot be blank")
+
+    @property
+    def variant(self) -> str:
+        """Storage-facing alias for the transform variant."""
+
+        return self.variant_id
+
+
 @dataclass(frozen=True, slots=True)
 class AssignmentTechnique:
     """One enabled pack case made available to deterministic swarm planning."""
@@ -439,6 +507,7 @@ class AssignmentContext:
     # Optional cache-read input rates (per-million USD). A missing or ``None``
     # rate bills cache reads at the full input rate — a documented upper bound.
     provider_model_cache_read_pricing: tuple[tuple[str, float | None], ...] = ()
+    language_frontier: LanguageFrontierSpec | None = None
 
     @staticmethod
     def route_category(profile_id: str) -> str:

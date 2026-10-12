@@ -19,6 +19,7 @@ from merlin_agents import (
     PortableMemoryQuery,
     PortableMemoryRecord,
     RetryFailureKind,
+    ScheduleArtifactTooLarge,
     WorkerAssignment,
     WorkerProfile,
     WorkerResult,
@@ -2445,6 +2446,40 @@ async def test_cancel_schedule_updates_live_task_projection_before_persisting() 
         if node_id.startswith("worker:")
     }
     assert set(worker_states.values()) == {"canceled"}
+
+
+async def test_submit_rejects_oversized_schedule_before_calling_store(monkeypatch) -> None:
+    monkeypatch.setattr("merlin_agents.durable_service._MAX_SCHEDULE_JSONB_BYTES", 1_024)
+    store = Store()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    assignment = WorkerAssignment(
+        id="campaign/oversized",
+        objective="x" * 2_000,
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+
+    with pytest.raises(ScheduleArtifactTooLarge, match="reduce the execution batch") as raised:
+        await service.submit(
+            "session",
+            (assignment,),
+            max_workers=1,
+            minimum_workers=1,
+            start_immediately=False,
+        )
+
+    assert raised.value.artifact == "graph"
+    assert raised.value.actual_bytes > raised.value.limit_bytes == 1_024
+    assert store.schedules == {}
 
 
 async def test_reject_persisted_schedule_does_not_hydrate_obsolete_assignment() -> None:
@@ -9386,3 +9421,36 @@ async def test_delivery_retry_cleans_owned_session_before_replacement(cleanup_fa
     assert task.status == ("failed" if cleanup_fails else "completed"), (task, events)
     assert events[:2] == ["request", "cleanup"]
     assert events.count("request") == (1 if cleanup_fails else 2)
+
+
+async def test_restart_recovery_pauses_all_target_schedules_until_explicit_resume() -> None:
+    store = Store()
+    creator = DurableAgentService(Provider(), Tools(), store, model="test")
+    assignments = await creator._plan("Assess target", 2)
+    # More than the inventory page size: startup must fence every schedule.
+    schedule_ids = []
+    for index in range(51):
+        live = await creator.submit(
+            f"session-{index}",
+            assignments,
+            start_immediately=False,
+            minimum_workers=1,
+            schedule_id=str(uuid4()),
+        )
+        store.schedules[live.id]["status"] = "running"
+        schedule_ids.append(live.id)
+    recovered = DurableAgentService(Provider(), Tools(), store, model="test")
+    assert await recovered.recover(resume_execution=False) == 51
+    await asyncio.sleep(0)
+    assert all(store.schedules[key]["status"] == "paused" for key in schedule_ids)
+    assert all(live.execution is None for live in recovered._live.values())
+    assert store.attempts == {}
+    assert await recovered.recover() == 0
+    assert store.attempts == {}
+
+    # Explicit resume starts only the requested schedule; others stay dormant.
+    resumed = await recovered.resume_schedule(schedule_ids[0])
+    assert resumed.execution is not None
+    await asyncio.wait_for(resumed.execution, timeout=2)
+    assert all(store.schedules[key]["status"] == "paused" for key in schedule_ids[1:])
+    assert all(attempt.schedule_id == schedule_ids[0] for attempt in store.attempts.values())

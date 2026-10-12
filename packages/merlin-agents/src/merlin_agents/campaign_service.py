@@ -13,7 +13,7 @@ import traceback
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urljoin, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -61,8 +61,10 @@ from .campaign import (
     compile_recon_campaign,
     compile_target_brief,
     compile_worker_context,
+    enumerate_language_candidate_references,
     expand_language_techniques,
     manifest_with_target_brief,
+    materialize_language_technique,
     profile_grant,
     project_by_effects,
     reconcile_techniques_for_surfaces,
@@ -100,7 +102,11 @@ from .completion_frontier import (
     project_completion_frontier,
 )
 from .discovery import ArmIdentity, aggregate_observations, classify_lifecycle
-from .durable_service import DurableAgentService, InitialCompositionAdmitter
+from .durable_service import (
+    DurableAgentService,
+    InitialCompositionAdmitter,
+    ScheduleArtifactTooLarge,
+)
 from .evidence_graph import (
     EvidenceEdge,
     EvidenceEdgeKind,
@@ -151,6 +157,8 @@ from .specialists import (
     AssignmentTechnique,
     DynamicSpecialistPolicy,
     DynamicSpecialistProposal,
+    LanguageCandidateReference,
+    LanguageFrontierSpec,
     WorkerAssignment,
     WorkerProfile,
     compile_dynamic_specialist,
@@ -160,8 +168,8 @@ from .specialists import (
 from .technique_history import (
     LANGUAGE_DEFERRAL_OUTCOME,
     entries_for_completion,
+    language_reference_cell_parts,
     normalize_outcome,
-    plan_skip,
     technique_cell_parts,
 )
 from .telemetry import emit_arm_outcome, emit_judgment
@@ -182,6 +190,194 @@ QUICKSCAN_INITIAL_CELL_LIMIT = 20
 # Quickscan also bounds how many follow-up waves the Lead may drive after the
 # initial wave, so the whole campaign stays inside the fast-iteration budget.
 QUICKSCAN_FOLLOWUP_WAVE_LIMIT = 3
+
+# Operator reviews and Lead journals must stay proportional to a human-sized
+# sample rather than the logical frontier. The persisted campaign/frontier
+# digests remain the exact approval authority.
+FRONTIER_PROJECTION_SAMPLE_LIMIT = 32
+
+
+def _bounded_frontier_projection(values: Sequence[object]) -> dict[str, object]:
+    """Return a bounded sample plus an exact digest for canonical persisted values."""
+
+    canonical = tuple(_json_value(value) for value in values)
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    return {
+        "count": len(canonical),
+        "digest": f"sha256:{digest}",
+        "sample": canonical[:FRONTIER_PROJECTION_SAMPLE_LIMIT],
+        "omitted": max(0, len(canonical) - FRONTIER_PROJECTION_SAMPLE_LIMIT),
+    }
+
+
+def _frontier_overflow_fields(
+    name: str, projection: Mapping[str, object]
+) -> dict[str, object]:
+    """Expose digest metadata only when a human-facing sequence was truncated."""
+
+    if not projection["omitted"]:
+        return {}
+    return {
+        f"{name}_digest": projection["digest"],
+        f"{name}_omitted": projection["omitted"],
+    }
+
+
+def _bounded_sequence_field(
+    document: dict[str, object], name: str, values: Sequence[object]
+) -> None:
+    """Keep a canonical sequence reviewable without embedding its full row set."""
+
+    projection = _bounded_frontier_projection(values)
+    document[name] = projection["sample"]
+    document[f"{name}_projection"] = {
+        key: projection[key] for key in ("count", "digest", "omitted")
+    }
+
+
+def _frontier_snapshot_rows(
+    references: Sequence[LanguageCandidateReference],
+    projected_waves: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Project exact normalized candidate outcomes for durable paged storage."""
+
+    observations: dict[str, dict[str, object]] = {}
+    for wave in projected_waves:
+        for task in wave.get("tasks", ()):
+            if not isinstance(task, Mapping):
+                continue
+            task_id = str(task.get("id") or "")
+            evidence_refs = tuple(
+                sorted(
+                    str(value)
+                    for value in task.get("evidence_references", ())
+                    if isinstance(value, str) and value.strip()
+                )
+            )
+            for candidate_id, outcome_value in _mapping_items(task.get("technique_outcomes")):
+                candidate_id = str(candidate_id)
+                outcome = str(outcome_value)
+                observed = observations.setdefault(
+                    candidate_id,
+                    {"outcomes": set(), "task_ids": set(), "evidence_refs": set()},
+                )
+                cast(set[str], observed["outcomes"]).add(outcome)
+                if task_id:
+                    cast(set[str], observed["task_ids"]).add(task_id)
+                cast(set[str], observed["evidence_refs"]).update(evidence_refs)
+
+    rows: list[dict[str, object]] = []
+    for reference in references:
+        observed = observations.get(reference.id)
+        outcomes = (
+            set() if observed is None else set(cast(set[str], observed["outcomes"]))
+        )
+        clear = outcomes & {"confirmed", "refuted"}
+        if len(clear) == 1:
+            outcome = next(iter(clear))
+            state = "terminal"
+            reason = "authoritative current-campaign outcome"
+        elif len(clear) > 1:
+            outcome = "retryable"
+            state = "queued"
+            reason = "conflicting authoritative outcomes require reproduction"
+        elif "partial" in outcomes:
+            outcome = "partial"
+            state = "queued"
+            reason = "partial progress remains eligible"
+        elif "unclear" in outcomes:
+            outcome = "unclear"
+            state = "queued"
+            reason = "inconclusive outcome remains eligible"
+        elif "blocked" in outcomes or "blocked_terminal" in outcomes:
+            outcome = "blocked"
+            state = "queued"
+            reason = "blocked attempt remains eligible"
+        elif outcomes:
+            outcome = "retryable"
+            state = "queued"
+            reason = "attempt produced no authoritative outcome"
+        else:
+            outcome = "unattempted"
+            state = "queued"
+            reason = "candidate has not been attempted"
+        task_ids = () if observed is None else sorted(cast(set[str], observed["task_ids"]))
+        evidence_refs = (
+            () if observed is None else sorted(cast(set[str], observed["evidence_refs"]))
+        )
+        rows.append(
+            {
+                "candidate_id": reference.id,
+                "state": state,
+                "outcome": outcome,
+                "task_id": task_ids[-1] if task_ids else None,
+                "evidence_refs": tuple(evidence_refs),
+                "disposition_reason": reason,
+            }
+        )
+    return tuple(rows)
+
+
+def _frontier_snapshot_header(
+    campaign_id: str,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    snapshot_id: str | None = None,
+) -> dict[str, object]:
+    """Build the same bounded header and row digest as CampaignStore."""
+
+    states = {state: 0 for state in ("queued", "claimed", "scheduled", "terminal")}
+    outcomes = {
+        outcome: 0
+        for outcome in (
+            "confirmed",
+            "refuted",
+            "partial",
+            "unclear",
+            "blocked",
+            "retryable",
+            "unattempted",
+        )
+    }
+    normalized = []
+    for position, source in enumerate(rows):
+        state = str(source["state"])
+        outcome = str(source["outcome"])
+        states[state] += 1
+        outcomes[outcome] += 1
+        normalized.append(
+            {
+                "position": position,
+                "candidate_id": str(source["candidate_id"]),
+                "state": state,
+                "outcome": outcome,
+                "attempt_id": source.get("attempt_id"),
+                "task_id": source.get("task_id"),
+                "evidence_refs": list(source.get("evidence_refs", ())),
+                "disposition_reason": source.get("disposition_reason"),
+            }
+        )
+    row_digest = hashlib.sha256(
+        json.dumps(
+            {"schema_version": 1, "rows": normalized},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    resolved_id = snapshot_id or f"frontier-final/{campaign_id}/{row_digest}"
+    sample = tuple(normalized[:FRONTIER_PROJECTION_SAMPLE_LIMIT])
+    return {
+        "id": resolved_id,
+        "reference": f"merlin-frontier-snapshot:{campaign_id}:{resolved_id}",
+        "row_digest": row_digest,
+        "total_count": len(rows),
+        "counts": {"states": states, "outcomes": outcomes},
+        "sample": sample,
+        "sample_count": len(sample),
+        "omitted": max(0, len(normalized) - FRONTIER_PROJECTION_SAMPLE_LIMIT),
+    }
 
 
 def _expected_target_calls(assignment: WorkerAssignment) -> int:
@@ -679,6 +875,14 @@ class _OperatorDrainComplete(Exception):
     """Running work and cleanup finished after a durable operator stop decision."""
 
 
+class _FrontierScheduleBlocked(Exception):
+    """The sole runnable candidate cannot fit a bounded scheduler artifact."""
+
+    def __init__(self, candidate_id: str) -> None:
+        super().__init__(f"frontier candidate {candidate_id!r} exceeds scheduler limits")
+        self.candidate_id = candidate_id
+
+
 @dataclass(frozen=True, slots=True)
 class SaturationEvidence:
     """Deterministic exhaustive-frontier evidence; model prose cannot satisfy it."""
@@ -899,35 +1103,81 @@ class CampaignService:
         CampaignPreparation,
         tuple[Mapping[str, object], ...],
         tuple[Mapping[str, object], ...],
+        tuple[Mapping[str, object], ...],
     ]:
-        """Drop catalog cells already terminally executed on this target generation.
+        """Apply exact same-target history without collapsing lazy candidate families.
 
-        Cells with a terminal prior outcome (confirmed/refuted/blocked) are
-        skipped; misses and ``unclear`` priors re-run. ``partial`` priors also
-        re-run — deprioritized by plan_skip, never suppressed — and are
-        returned as the third element so the prepare review can report graded
-        cross-campaign signals. Stores without history support prepare
-        unchanged.
+        Compact and legacy materialized contexts keep every candidate queued:
+        prior outcomes provide per-candidate ranking and selective-revalidation
+        evidence only. Legacy contexts preserve their old exploration ordering
+        by placing untried cells before cells with exact prior history.
+        ``partial`` priors are returned separately so the prepare review can
+        report graded cross-campaign signals. Stores without history support
+        prepare unchanged.
         """
         lookup = getattr(self._store, "lookup_technique_history", None)
         techniques = prepared.assignment_context.techniques
         if lookup is None or not techniques:
-            return prepared, (), ()
+            return prepared, (), (), ()
+        language_frontier = prepared.assignment_context.language_frontier
+        if language_frontier is not None:
+            references = enumerate_language_candidate_references(techniques, language_frontier)
+            families = {technique.id: technique for technique in techniques}
+            parts_by_id = {
+                reference.id: language_reference_cell_parts(
+                    families[reference.family_id], reference
+                )
+                for reference in references
+            }
+            history = await asyncio.to_thread(
+                lookup,
+                prepared.manifest.target.id,
+                adapter_generation,
+                tuple(parts_by_id.values()),
+            )
+            # Keep prior processing compact even if a prior exhaustive campaign
+            # populated every logical candidate. Rich prompt envelopes are only
+            # materialized for a claimed batch or a completed concrete outcome.
+            historical = tuple(
+                (reference, history[parts_by_id[reference.id]])
+                for reference in references
+                if parts_by_id[reference.id] in history
+            )
+            partial_priors = tuple(
+                {
+                    "technique_id": reference.id,
+                    "source_campaign_id": str(row.get("source_campaign_id", "")),
+                    **(
+                        {"partial_signal": dict(row["partial_signal"])}
+                        if isinstance(row.get("partial_signal"), Mapping)
+                        else {}
+                    ),
+                }
+                for reference, row in historical
+                if normalize_outcome(row.get("outcome")) == "partial"
+            )
+            exact_priors = tuple(
+                {
+                    "candidate_id": reference.id,
+                    "outcome": outcome,
+                    "source_campaign_id": str(row.get("source_campaign_id", "")),
+                    "priority": {
+                        "confirmed": 0.2,
+                        "refuted": 0.2,
+                        "partial": 0.35,
+                        "unclear": 0.45,
+                    }.get(outcome, 0.5),
+                    "policy": "ranking and selective revalidation only; candidate remains queued",
+                }
+                for reference, row in historical
+                if (outcome := normalize_outcome(row.get("outcome")))
+            )
+            return prepared, (), partial_priors, exact_priors
         history = await asyncio.to_thread(
             lookup,
             prepared.manifest.target.id,
             adapter_generation,
             tuple(technique_cell_parts(item) for item in techniques),
-        )
-        # Probe-observed languages feed the evidence gate: a durable capability
-        # observation of the target engaging in a language admits that
-        # language's cells without a prior attack attempt.
-        signal_languages = await self._probe_observed_signal_languages(prepared.manifest)
-        runnable, skipped = plan_skip(techniques, history, signal_languages=signal_languages)
-        print(
-            f"PREPARE_STAGE plan_skip techniques={len(techniques)} runnable={len(runnable)}",
-            file=sys.stderr,
-            flush=True,
         )
         partial_priors = tuple(
             {
@@ -943,15 +1193,32 @@ class CampaignService:
             if (row := history.get(technique_cell_parts(technique))) is not None
             and normalize_outcome(row.get("outcome")) == "partial"
         )
-        if not skipped and not partial_priors:
-            return prepared, (), ()
+        exact_priors = tuple(
+            {
+                "candidate_id": technique.id,
+                "outcome": outcome,
+                "source_campaign_id": str(row.get("source_campaign_id", "")),
+                "priority": {
+                    "confirmed": 0.2,
+                    "refuted": 0.2,
+                    "partial": 0.35,
+                    "unclear": 0.45,
+                }.get(outcome, 0.5),
+                "policy": "ranking and selective revalidation only; candidate remains queued",
+            }
+            for technique in techniques
+            if (row := history.get(technique_cell_parts(technique))) is not None
+            if (outcome := normalize_outcome(row.get("outcome")))
+        )
+        if not exact_priors:
+            return prepared, (), (), ()
         repeat_documents = partial_repeat_documents(prepared.assignment_context, history)
         if repeat_documents:
             prepared = CampaignPreparation(
                 reseal_repeat_manifest(prepared.manifest, tuple(repeat_documents.values())),
                 prepared.assignment_context,
             )
-            runnable = tuple(
+            techniques = tuple(
                 replace(
                     technique,
                     guidance_ids=tuple(
@@ -965,15 +1232,25 @@ class CampaignService:
                 )
                 if technique_cell_parts(technique) in repeat_documents
                 else technique
-                for technique in runnable
+                for technique in techniques
             )
+        # Legacy contexts are already fully materialized, so reflect the same
+        # exploration-first ranking in their persisted assignment order. Keep
+        # relative catalogue order within the untried and historical groups.
+        techniques = tuple(
+            sorted(
+                techniques,
+                key=lambda technique: technique_cell_parts(technique) in history,
+            )
+        )
         return (
             CampaignPreparation(
                 prepared.manifest,
-                replace(prepared.assignment_context, techniques=runnable),
+                replace(prepared.assignment_context, techniques=techniques),
             ),
-            skipped,
+            (),
             partial_priors,
+            exact_priors,
         )
 
     async def _prioritize_execution_candidates(
@@ -1057,6 +1334,16 @@ class CampaignService:
             return index, probability
 
         scores = await asyncio.gather(*(score(i, item) for i, item in enumerate(shortlist)))
+        priority_writer = getattr(self._store, "update_frontier_priorities", None)
+        durable_priorities = {
+            str(getattr(shortlist[index], "id", "") or _followup_digest(shortlist[index])): value
+            for index, value in scores
+            if value is not None
+        }
+        if callable(priority_writer) and durable_priorities:
+            await asyncio.to_thread(
+                priority_writer, campaign_id, durable_priorities
+            )
         # Missing scores are neutral. Equal scores retain the authoritative
         # incoming order, including the all-low/all-unavailable cases.
         ordered = sorted(scores, key=lambda item: (-(0.5 if item[1] is None else item[1]), item[0]))
@@ -1091,6 +1378,599 @@ class CampaignService:
             *(shortlist[index] for index, _ in ordered),
             *candidates[1 + len(shortlist) :],
         )
+
+    async def _register_execution_frontier(
+        self,
+        prepared: CampaignPreparation,
+        history_priors: Sequence[Mapping[str, object]] = (),
+    ) -> None:
+        """Persist the complete logical frontier without rich per-candidate copies."""
+
+        register = getattr(self._store, "register_frontier", None)
+        if not callable(register):
+            return
+        families, candidates = self._execution_frontier_rows(prepared, history_priors)
+        await asyncio.to_thread(register, prepared.manifest.id, families, candidates)
+
+    @staticmethod
+    def _execution_frontier_rows(
+        prepared: CampaignPreparation,
+        history_priors: Sequence[Mapping[str, object]] = (),
+    ) -> tuple[tuple[Mapping[str, object], ...], tuple[Mapping[str, object], ...]]:
+        """Build normalized family/candidate rows without rich candidate copies."""
+
+        context = prepared.assignment_context
+        spec = context.language_frontier
+        priority_by_id = {
+            str(item.get("candidate_id") or ""): float(item["priority"])
+            for item in history_priors
+            if item.get("candidate_id")
+            and isinstance(item.get("priority"), (int, float))
+        }
+        families = tuple(
+            {"id": technique.id, "document": _json_value(asdict(technique))}
+            for technique in context.techniques
+        )
+        if spec is None:
+            candidates = tuple(
+                {
+                    "id": technique.id,
+                    "family_id": technique.id,
+                    "ordinal": ordinal,
+                    "requested_language": technique.language,
+                    "variant_id": technique.transform_id,
+                    "variant": {},
+                    "priority": priority_by_id.get(technique.id),
+                    "state": "queued",
+                }
+                for ordinal, technique in enumerate(context.techniques)
+            )
+        else:
+            candidates = tuple(
+                {
+                    "id": reference.id,
+                    "family_id": reference.family_id,
+                    "ordinal": reference.ordinal,
+                    "requested_language": reference.requested_language,
+                    "variant_id": reference.variant_id,
+                    "variant": {},
+                    "priority": priority_by_id.get(reference.id),
+                    "state": "queued",
+                }
+                for reference in enumerate_language_candidate_references(
+                    context.techniques, spec
+                )
+            )
+        return families, candidates
+
+    def _frontier_batch_limit(self, manifest: CampaignManifest) -> int:
+        limit = max(1, self._max_worker_concurrency * 2)
+        return min(limit, QUICKSCAN_INITIAL_CELL_LIMIT) if (
+            manifest.profile is CampaignProfile.QUICKSCAN
+        ) else limit
+
+    async def _claim_execution_frontier_context(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        wave: int,
+    ) -> tuple[AssignmentContext, Mapping[str, object] | None]:
+        """Claim and materialize one restart-stable bounded execution batch."""
+
+        claim = getattr(self._store, "claim_frontier_batch", None)
+        if not callable(claim):
+            return await self._cap_quickscan_attack_context(
+                campaign_id, manifest, context, wave
+            ), None
+        counter = getattr(self._store, "frontier_counts", None)
+        counts = (
+            await asyncio.to_thread(counter, campaign_id) if callable(counter) else None
+        )
+        if isinstance(counts, Mapping) and int(counts.get("total", 0)) == 0:
+            if context.language_frontier is not None:
+                raise RuntimeError(
+                    "normalized campaign frontier is missing; retry campaign preparation "
+                    "before executing any target work"
+                )
+            # Legacy prepared campaigns embedded their reviewed frontier before
+            # normalized frontier registration existed.
+            return await self._cap_quickscan_attack_context(
+                campaign_id, manifest, context, wave
+            ), None
+        batch_id = str(
+            uuid5(NAMESPACE_URL, f"merlin.frontier-batch.v1\n{campaign_id}\n{wave}")
+        )
+        batch_limit = self._frontier_batch_limit(manifest)
+        shortlist_loader = getattr(self._store, "list_frontier_shortlist", None)
+        exact_claim = getattr(self._store, "claim_frontier_batch_exact", None)
+        preselected = False
+        if callable(shortlist_loader) and callable(exact_claim):
+            shortlist_rows = tuple(
+                await asyncio.to_thread(
+                    shortlist_loader,
+                    campaign_id,
+                    min(1024, max(batch_limit + 1, batch_limit * 4)),
+                )
+            )
+            shortlist_rows = tuple(
+                sorted(
+                    shortlist_rows,
+                    key=lambda row: (
+                        int(row.get("claim_generation", 0))
+                        if isinstance(row, Mapping)
+                        else 0,
+                        -(
+                            float(row["priority"])
+                            if isinstance(row, Mapping)
+                            and isinstance(row.get("priority"), (int, float))
+                            else 0.5
+                        ),
+                        int(row.get("ordinal", 0)) if isinstance(row, Mapping) else 0,
+                        str(row.get("id") or "") if isinstance(row, Mapping) else "",
+                    ),
+                )
+            )
+            if not shortlist_rows:
+                return replace(context, techniques=()), {
+                    "id": batch_id,
+                    "state": "settled",
+                    "candidates": (),
+                }
+            shortlist = self._materialize_frontier_batch(
+                context, {"candidates": shortlist_rows}
+            )
+            prioritized = await self._prioritize_execution_candidates(
+                campaign_id, manifest, shortlist, wave
+            )
+            selected_ids = tuple(item.id for item in prioritized[:batch_limit])
+            shortlist_by_id = {
+                str(row.get("id") or ""): row
+                for row in shortlist_rows
+                if isinstance(row, Mapping)
+            }
+            selection_generation = tuple(
+                (
+                    candidate_id,
+                    int(shortlist_by_id[candidate_id].get("claim_generation", 0)),
+                )
+                for candidate_id in selected_ids
+            )
+            batch_id = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    "merlin.frontier-batch.v2\n"
+                    + campaign_id
+                    + f"\n{wave}\n"
+                    + json.dumps(selection_generation, separators=(",", ":")),
+                )
+            )
+            batch = await asyncio.to_thread(
+                exact_claim,
+                campaign_id,
+                wave,
+                batch_id,
+                selected_ids,
+            )
+            preselected = True
+        else:
+            batch = await asyncio.to_thread(
+                claim,
+                campaign_id,
+                wave,
+                batch_id,
+                batch_limit,
+            )
+        rows = tuple(batch.get("candidates", ())) if isinstance(batch, Mapping) else ()
+        if not rows:
+            return replace(context, techniques=()), batch
+        materialized = self._materialize_frontier_batch(context, batch)
+        prioritized = (
+            materialized
+            if preselected
+            else await self._prioritize_execution_candidates(
+                campaign_id, manifest, materialized, wave
+            )
+        )
+        return replace(context, techniques=prioritized), batch
+
+    @staticmethod
+    def _materialize_frontier_batch(
+        context: AssignmentContext, batch: Mapping[str, object]
+    ) -> tuple[AssignmentTechnique, ...]:
+        """Restore rich techniques only for the currently claimed small batch."""
+
+        rows = tuple(batch.get("candidates", ()))
+        spec = context.language_frontier
+        base_by_id = {technique.id: technique for technique in context.techniques}
+        materialized: list[AssignmentTechnique] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError("frontier batch contains a malformed candidate")
+            if spec is None:
+                candidate_id = str(row.get("id") or "")
+                technique = base_by_id.get(candidate_id)
+                if technique is None:
+                    document = row.get("family_document")
+                    if not isinstance(document, Mapping):
+                        raise ValueError("frontier candidate has no reviewed family document")
+                    technique = _assignment_technique(document)
+                materialized.append(technique)
+                continue
+            family_id = str(row.get("family_id") or "")
+            base = base_by_id.get(family_id)
+            if base is None:
+                document = row.get("family_document")
+                if not isinstance(document, Mapping):
+                    raise ValueError("frontier candidate references an unknown family")
+                base = _assignment_technique(document)
+            reference = LanguageCandidateReference(
+                id=str(row.get("id") or ""),
+                family_id=family_id,
+                ordinal=int(row.get("ordinal", -1)),
+                requested_language=str(row.get("requested_language") or ""),
+                variant_id=str(row.get("variant_id") or ""),
+            )
+            materialized.append(materialize_language_technique(base, spec, reference))
+        return tuple(materialized)
+
+    async def _shrink_execution_frontier_context(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        wave: int,
+        batch: Mapping[str, object],
+        error: ScheduleArtifactTooLarge,
+    ) -> tuple[AssignmentContext, Mapping[str, object]]:
+        """Halve an oversized unbound batch and return its suffix to the queue."""
+
+        resize = getattr(self._store, "resize_frontier_batch", None)
+        if not callable(resize):
+            raise RuntimeError("frontier store cannot shrink an oversized scheduler batch")
+        candidates = tuple(batch.get("candidates", ()))
+        if len(candidates) <= 1:
+            oversized_id = (
+                str(candidates[0].get("id") or "")
+                if candidates and isinstance(candidates[0], Mapping)
+                else ""
+            )
+            await asyncio.to_thread(resize, campaign_id, str(batch["id"]), 0)
+            priority_writer = getattr(self._store, "update_frontier_priorities", None)
+            if callable(priority_writer) and oversized_id:
+                await asyncio.to_thread(
+                    priority_writer, campaign_id, {oversized_id: -1.0}
+                )
+            append_lead = getattr(self._store, "append_lead", None)
+            if callable(append_lead):
+                await asyncio.to_thread(
+                    append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "frontier_candidate_schedule_blocked",
+                        "candidate_id": oversized_id,
+                        "artifact": error.artifact,
+                        "actual_bytes": error.actual_bytes,
+                        "limit_bytes": error.limit_bytes,
+                        "disposition": "retryable",
+                        "reason": (
+                            "one candidate exceeds the scheduler artifact limit; "
+                            "it remains queued behind untried candidates"
+                        ),
+                    },
+                )
+            next_context, next_batch = await self._claim_execution_frontier_context(
+                campaign_id, manifest, context, wave
+            )
+            if (
+                next_batch is None
+                or not next_context.techniques
+                or tuple(item.id for item in next_context.techniques) == (oversized_id,)
+            ):
+                if isinstance(next_batch, Mapping) and next_batch.get("candidates"):
+                    await asyncio.to_thread(
+                        resize, campaign_id, str(next_batch["id"]), 0
+                    )
+                pause_campaign = getattr(self._store, "pause", None)
+                paused = False
+                if callable(pause_campaign):
+                    try:
+                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    except ValueError:
+                        # Initial execution preflight can still be in prepared
+                        # state. No live supervisor exists in that case.
+                        pass
+                    else:
+                        paused = True
+                if callable(append_lead):
+                    await asyncio.to_thread(
+                        append_lead,
+                        campaign_id,
+                        wave,
+                        {
+                            "kind": "frontier_schedule_blocked_paused",
+                            "candidate_id": oversized_id,
+                            "state": "paused" if paused else "prepared",
+                            "artifact": error.artifact,
+                            "actual_bytes": error.actual_bytes,
+                            "limit_bytes": error.limit_bytes,
+                            "reason": (
+                                "the sole queued candidate exceeds the scheduler artifact "
+                                "limit; it remains queued for an explicit resume after the "
+                                "limit or candidate representation changes"
+                            ),
+                            "retryable": True,
+                        },
+                    )
+                raise _FrontierScheduleBlocked(oversized_id) from error
+            return next_context, next_batch
+        resized = await asyncio.to_thread(
+            resize, campaign_id, str(batch["id"]), max(1, len(candidates) // 2)
+        )
+        materialized = self._materialize_frontier_batch(context, resized)
+        prioritized = await self._prioritize_execution_candidates(
+            campaign_id, manifest, materialized, wave
+        )
+        return replace(context, techniques=prioritized), resized
+
+    async def _settle_execution_frontier_batch(
+        self,
+        campaign_id: str,
+        live: Any,
+        tasks: tuple[AgentTask, ...],
+    ) -> Mapping[str, int] | None:
+        """Settle the active batch; infrastructure failures return candidates to queue."""
+
+        load = getattr(self._store, "load_active_frontier_batch", None)
+        settle = getattr(self._store, "settle_frontier_batch", None)
+        if not (callable(load) and callable(settle)):
+            return None
+        batch = await asyncio.to_thread(load, campaign_id)
+        if not isinstance(batch, Mapping) or str(batch.get("schedule_id") or "") != str(live.id):
+            return None
+        attempt_loader = getattr(self._agents, "technique_attempts", None)
+        attempts = (
+            tuple(await attempt_loader(str(live.id)))
+            if callable(attempt_loader)
+            else ()
+        )
+        authoritative_outcomes: dict[str, set[str]] = {}
+        task_ids = {task.id for task in tasks}
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping) or attempt.get("task_id") not in task_ids:
+                continue
+            state = str(attempt.get("state") or "")
+            technique_id = attempt.get("technique_id")
+            if state in {"confirmed", "refuted"} and isinstance(technique_id, str):
+                authoritative_outcomes.setdefault(technique_id, set()).add(state)
+        for task in tasks:
+            for technique_id, outcome in _technique_attempt_outcomes(
+                attempts, task.id
+            ).items():
+                if not authoritative_outcomes.get(technique_id):
+                    authoritative_outcomes.setdefault(technique_id, set()).add(outcome)
+        candidates = tuple(batch.get("candidates", ()))
+        dispositions = {}
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping) or not candidate.get("id"):
+                continue
+            candidate_id = str(candidate["id"])
+            outcomes = authoritative_outcomes.get(candidate_id, set())
+            clear_outcomes = outcomes & {"confirmed", "refuted"}
+            terminal = len(clear_outcomes) == 1
+            dispositions[candidate_id] = (
+                {
+                    "disposition": "terminal",
+                    "reason": (
+                        "authoritative typed attempt outcome: "
+                        + ",".join(sorted(clear_outcomes))
+                    ),
+                }
+                if terminal
+                else {
+                    "disposition": "retryable",
+                    "reason": (
+                        "typed attempt outcome remains retryable: "
+                        + (",".join(sorted(outcomes)) if outcomes else "missing")
+                    ),
+                }
+            )
+        counts = await asyncio.to_thread(
+            settle, campaign_id, str(batch["id"]), dispositions
+        )
+        retry_generations = tuple(
+            int(candidate.get("claim_generation", 0))
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            and candidate.get("id")
+            and dispositions.get(str(candidate["id"]), {}).get("disposition")
+            == "retryable"
+        )
+        return {
+            **counts,
+            "max_claim_generation": max(
+                (
+                    int(candidate.get("claim_generation", 0))
+                    for candidate in candidates
+                    if isinstance(candidate, Mapping)
+                ),
+                default=0,
+            ),
+            "retryable_claims_below_cap": sum(
+                generation < 3 for generation in retry_generations
+            ),
+            "retry_exhausted_candidates": sum(
+                generation >= 3 for generation in retry_generations
+            ),
+        }
+
+    async def _recover_active_frontier_batch(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        batch: Mapping[str, object],
+        waves: Sequence[Mapping[str, object]],
+    ) -> Any:
+        """Finish the idempotent bind/wave/start sequence for an active batch."""
+
+        wave = int(batch["wave"])
+        batch_id = str(batch["id"])
+        schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+        persisted_wave = next(
+            (
+                item
+                for item in waves
+                if int(item.get("wave", -1)) == wave
+            ),
+            None,
+        )
+        prior = next(
+            (item for item in waves if int(item.get("wave", -1)) == wave - 1),
+            None,
+        )
+        prior_live = None
+        if persisted_wave is not None:
+            if str(persisted_wave.get("schedule_id") or "") != schedule_id:
+                raise RuntimeError(
+                    "persisted frontier wave is bound to a non-deterministic schedule id"
+                )
+            kind = str(persisted_wave.get("kind") or "frontier")
+        elif wave == 0:
+            kind = "initial"
+        elif prior is not None:
+            prior_live = await self._agents.reopen(
+                str(prior["schedule_id"]), resume_execution=False
+            )
+            prior_assignments = tuple(getattr(prior_live, "assignments", ()))
+            kind = (
+                "initial"
+                if prior_assignments
+                and all(item.profile_id == "recon" for item in prior_assignments)
+                else "frontier"
+            )
+        else:
+            kind = "frontier"
+        bound_schedule_id = str(batch.get("schedule_id") or "")
+        if bound_schedule_id and bound_schedule_id != schedule_id:
+            raise RuntimeError(
+                "active frontier batch is bound to a non-deterministic schedule id"
+            )
+        recon_tasks: tuple[AgentTask, ...] = ()
+        applicability: Mapping[str, object] | None = None
+        recon_source: AgentTask | None = None
+        committed_recon_evidence: Mapping[str, object] | None = None
+        if kind == "initial" and wave > 0:
+            if prior is not None:
+                if prior_live is None:
+                    prior_live = await self._agents.reopen(
+                        str(prior["schedule_id"]), resume_execution=False
+                    )
+                recon_tasks = tuple(
+                    await self._agents.list_schedule_tasks(prior_live.id)
+                )
+                recon_source = next(
+                    (task for task in recon_tasks if task.id.endswith("/recon")), None
+                )
+                applicability = _recon_applicability_partition(
+                    "" if recon_source is None else recon_source.result or "",
+                    tuple(item.id for item in context.techniques),
+                )
+                verifier = getattr(self._agents, "committed_task_result_evidence", None)
+                committed_recon_evidence = (
+                    None
+                    if recon_source is None or verifier is None
+                    else await verifier(prior_live.id, recon_source)
+                )
+        try:
+            live = await self._agents.reopen(schedule_id, resume_execution=False)
+        except (KeyError, TypeError, ValueError):
+            if bound_schedule_id:
+                raise
+            batch_context = replace(
+                context,
+                techniques=await self._prioritize_execution_candidates(
+                    campaign_id,
+                    manifest,
+                    self._materialize_frontier_batch(context, batch),
+                    wave,
+                ),
+            )
+            while True:
+                compiled = (
+                    await self._compile_initial_attack_ownership(
+                        campaign_id,
+                        manifest,
+                        batch_context,
+                        max(0, wave - 1),
+                        recon_tasks,
+                        recon_source,
+                        committed_recon_evidence,
+                    )
+                    if kind == "initial"
+                    else compile_attack_campaign(manifest, batch_context)
+                )
+                compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                compiled = _seal_compilation_candidate_identities(
+                    manifest, batch_context, compiled
+                )
+                try:
+                    return await self._start_wave(
+                        campaign_id,
+                        manifest,
+                        wave,
+                        kind,
+                        compiled,
+                        frontier_batch_id=batch_id,
+                        recon_tasks=recon_tasks,
+                        recon_applicability=applicability,
+                    )
+                except ScheduleArtifactTooLarge as error:
+                    batch_context, batch = (
+                        await self._shrink_execution_frontier_context(
+                            campaign_id,
+                            manifest,
+                            context,
+                            wave,
+                            batch,
+                            error,
+                        )
+                    )
+                    batch_id = str(batch["id"])
+
+        binder = getattr(self._store, "bind_frontier_batch", None)
+        if callable(binder):
+            await asyncio.to_thread(binder, campaign_id, batch_id, schedule_id)
+        await asyncio.to_thread(
+            self._store.add_wave, campaign_id, wave, kind, schedule_id
+        )
+        if recon_tasks:
+            await self._publish_recon_guidance_to_assignments(
+                campaign_id,
+                manifest,
+                wave - 1,
+                recon_tasks,
+                tuple(getattr(live, "assignments", ())),
+                schedule_id=schedule_id,
+                applicability=applicability,
+            )
+        task_loader = getattr(self._agents, "list_schedule_tasks", None)
+        tasks = () if task_loader is None else tuple(await task_loader(schedule_id))
+        nonterminal = bool(getattr(live, "assignments", ())) if not tasks else any(
+            task.status not in {"completed", "failed", "quarantined", "cancelled"}
+            for task in tasks
+        )
+        if getattr(live, "execution", None) is None and nonterminal:
+            self._agents.start_execution(
+                live,
+                max_workers=_reviewed_worker_concurrency(
+                    manifest,
+                    self._max_worker_concurrency,
+                    len(tuple(getattr(live, "assignments", ()))),
+                ),
+            )
+        return live
 
     async def _arm_lifecycle_counts(
         self, target_id: str, scenario_fingerprint: str
@@ -1314,9 +2194,12 @@ class CampaignService:
         adapter_generation = scenario_fingerprint_for(
             prepared.manifest.target, prepared.manifest.catalogue
         )
-        prepared, technique_skips, partial_priors = await self._apply_technique_skip(
-            prepared, adapter_generation
-        )
+        (
+            prepared,
+            technique_skips,
+            partial_priors,
+            exact_history_priors,
+        ) = await self._apply_technique_skip(prepared, adapter_generation)
         _prepare_mark = _prepare_stage("apply_technique_skip", _prepare_mark)
         if not prepared.assignment_context.techniques:
             # Zero runnable reviewed cells means every catalog cell on this
@@ -1349,13 +2232,29 @@ class CampaignService:
         reviewed_digest = _reviewed_preparation_digest(
             prepared.manifest, prepared.assignment_context
         )
-        await asyncio.to_thread(
-            self._store.prepare,
-            prepared.manifest.id,
-            session_id,
-            envelope,
-            reviewed_digest,
-        )
+        prepare_with_frontier = getattr(self._store, "prepare_with_frontier", None)
+        if callable(prepare_with_frontier):
+            families, candidates = self._execution_frontier_rows(
+                prepared, exact_history_priors
+            )
+            await asyncio.to_thread(
+                prepare_with_frontier,
+                prepared.manifest.id,
+                session_id,
+                envelope,
+                reviewed_digest,
+                families,
+                candidates,
+            )
+        else:
+            await asyncio.to_thread(
+                self._store.prepare,
+                prepared.manifest.id,
+                session_id,
+                envelope,
+                reviewed_digest,
+            )
+            await self._register_execution_frontier(prepared, exact_history_priors)
         _prepare_stage("store_prepare", _prepare_mark)
         if technique_skips:
             journal = getattr(self._store, "commit_lead_decision", None)
@@ -1392,12 +2291,28 @@ class CampaignService:
                 for guidance_id in item.guidance_ids
             )
         )
-        language_cells = tuple(
+        language_references = (
+            enumerate_language_candidate_references(
+                prepared.assignment_context.techniques,
+                prepared.assignment_context.language_frontier,
+            )
+            if prepared.assignment_context.language_frontier is not None
+            else ()
+        )
+        language_cells = tuple(reference.id for reference in language_references) or tuple(
             item.id for item in prepared.assignment_context.techniques if "@lang=" in item.id
         )
-        planned_languages = tuple(
-            dict.fromkeys(item.split("@lang=", 1)[1].split("@", 1)[0] for item in language_cells)
+        planned_languages = (
+            prepared.assignment_context.language_frontier.planned_languages
+            if prepared.assignment_context.language_frontier is not None
+            else tuple(
+                dict.fromkeys(
+                    item.split("@lang=", 1)[1].split("@", 1)[0]
+                    for item in language_cells
+                )
+            )
         )
+        technique_ids = language_cells or technique_ids
         benign_controls = tuple(
             item.id
             for item in prepared.assignment_context.techniques
@@ -1510,16 +2425,22 @@ class CampaignService:
         worker_concurrency = _reviewed_worker_concurrency(
             prepared.manifest, self._max_worker_concurrency, len(compiled.assignments)
         )
+        direct_technique_ids = tuple(
+            item.id
+            for item in prepared.assignment_context.techniques
+            if item.execution_role == "direct"
+        )
+        direct_technique_projection = _bounded_frontier_projection(direct_technique_ids)
         pair_oracle_predicates = tuple(
             {
                 "step_id": str(step.get("step_id", "")),
                 **dict(predicate),
-                "eligible_technique_ids": tuple(
-                    item.id
-                    for item in prepared.assignment_context.techniques
-                    if item.execution_role == "direct"
+                "eligible_technique_ids": direct_technique_projection["sample"],
+                **_frontier_overflow_fields(
+                    "eligible_technique_ids", direct_technique_projection
                 ),
-                "evaluation_uncertainties": tuple(
+                "evaluation_uncertainties": _bounded_frontier_projection(
+                    tuple(
                     {
                         "technique_id": item.id,
                         "reason": reason,
@@ -1536,7 +2457,8 @@ class CampaignService:
                         )
                     )
                     is not None
-                ),
+                    )
+                )["sample"],
             }
             for step in api_steps
             if isinstance(step, Mapping)
@@ -1635,6 +2557,14 @@ class CampaignService:
                 or "selected_count" in dict(technique.strategy_contract)
             )
         )
+        semantic_projection = _bounded_frontier_projection(semantic_ids)
+        variant_projection = _bounded_frontier_projection(technique_ids)
+        language_projection = _bounded_frontier_projection(language_cells)
+        skip_projection = _bounded_frontier_projection(technique_skips)
+        partial_projection = _bounded_frontier_projection(partial_priors)
+        learning_projection = _bounded_frontier_projection(learning_decisions)
+        control_projection = _bounded_frontier_projection(benign_controls)
+        guidance_projection = _bounded_frontier_projection(guidance_ids)
         return {
             "campaign_id": prepared.manifest.id,
             "manifest_digest": reviewed_digest,
@@ -1654,11 +2584,14 @@ class CampaignService:
                 "preflight_estimate": dict(preflight_estimate),
                 "admitted_coverage": {
                     "technique_count": len(semantic_ids),
-                    "technique_ids": semantic_ids,
+                    "technique_ids": semantic_projection["sample"],
+                    **_frontier_overflow_fields("technique_ids", semantic_projection),
                     "variant_count": len(technique_ids),
-                    "variant_ids": technique_ids,
+                    "variant_ids": variant_projection["sample"],
+                    **_frontier_overflow_fields("variant_ids", variant_projection),
                 },
-                "technique_skips": technique_skips,
+                "technique_skips": skip_projection["sample"],
+                **_frontier_overflow_fields("technique_skips", skip_projection),
                 "cross_campaign_learning": {
                     "skipped": sum(
                         str(item.get("decision", "")) == "historical_exact_match"
@@ -1672,7 +2605,8 @@ class CampaignService:
                     # Graded partial signals from prior campaigns: not skipped,
                     # but deprioritized behind untried and unclear cells.
                     "partial": len(partial_priors),
-                    "partial_cells": partial_priors,
+                    "partial_cells": partial_projection["sample"],
+                    **_frontier_overflow_fields("partial_cells", partial_projection),
                     # ARM pool lifecycle: trial arms are still earning their
                     # graded signal budget; active arms ranked ahead of trials;
                     # retired arms (no_signal_after_trial) no longer consume
@@ -1682,7 +2616,8 @@ class CampaignService:
                             prepared.manifest.target.id, adapter_generation
                         )
                     ),
-                    "decisions": learning_decisions,
+                    "decisions": learning_projection["sample"],
+                    **_frontier_overflow_fields("decisions", learning_projection),
                 },
                 "exploration": (
                     None
@@ -1701,9 +2636,16 @@ class CampaignService:
                     }
                 ),
                 "language_plan": {
-                    "baseline": planned_languages[0] if planned_languages else "und",
+                    "baseline": (
+                        str(adapter_review["language_policy"].get("default_language") or "und")
+                        if isinstance(adapter_review.get("language_policy"), Mapping)
+                        else "und"
+                    ),
                     "planned_languages": planned_languages,
-                    "language_evasion_cells": language_cells,
+                    "language_evasion_cells": language_projection["sample"],
+                    **_frontier_overflow_fields(
+                        "language_evasion_cells", language_projection
+                    ),
                     "policy": (
                         "Every listed technique/language cell is independently admitted and "
                         "must retain the same semantic objective and oracle."
@@ -1749,11 +2691,28 @@ class CampaignService:
                     "input_limit": interaction.get("input_limit"),
                     "lifecycle": interaction.get("lifecycle"),
                 },
-                "benign_controls": benign_controls,
+                "benign_controls": control_projection["sample"],
+                **_frontier_overflow_fields("benign_controls", control_projection),
                 "specialist_routing": {
-                    profile: tuple(techniques)
+                    profile: _bounded_frontier_projection(tuple(techniques))["sample"]
                     for profile, techniques in sorted(specialist_routing.items())
                 },
+                **(
+                    {
+                        "specialist_routing_projection": {
+                            profile: projection
+                            for profile, techniques in sorted(specialist_routing.items())
+                            if (
+                                projection := _bounded_frontier_projection(tuple(techniques))
+                            )["omitted"]
+                        }
+                    }
+                    if any(
+                        len(techniques) > FRONTIER_PROJECTION_SAMPLE_LIMIT
+                        for techniques in specialist_routing.values()
+                    )
+                    else {}
+                ),
                 "hypothesis_reserve": {
                     "required_cells": hypothesis_reserve,
                     "basis": "planned_pre_recon_maximum",
@@ -1764,7 +2723,8 @@ class CampaignService:
                     "rule": "typed surface + assertion + oracle + novelty basis",
                 },
                 "capability_projection": {
-                    "packs": guidance_ids,
+                    "packs": guidance_projection["sample"],
+                    **_frontier_overflow_fields("packs", guidance_projection),
                     "skills": tuple(item.id for item in prepared.manifest.skill_documents),
                     "mcp_tools": mcp_tools,
                     "tools": prepared.manifest.tool_ids,
@@ -1858,7 +2818,9 @@ class CampaignService:
                 preflight_estimate,
                 approve_over_budget=approve_over_budget,
             )
-        if _specialist_composition(manifest) == "opinionated":
+        if _specialist_composition(manifest) == "opinionated" and not callable(
+            getattr(self._store, "claim_frontier_batch", None)
+        ):
             await self._admit_wave0_specialist_composition(campaign_id, manifest, context)
         fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
         latest_loader = getattr(self._store, "latest_recon_result", None)
@@ -1885,6 +2847,8 @@ class CampaignService:
             and bool(reused_applicability.get("applicable_ids"))
         )
         supervision_context = context
+        execution_context = context
+        frontier_batch: Mapping[str, object] | None = None
         observations_reused = False
         if reusable:
             applicable = set(str(item) for item in reused_applicability["applicable_ids"])
@@ -1935,22 +2899,22 @@ class CampaignService:
                 "reference": str(latest["id"]),
                 "source": "reused_reconnaissance",
             }
-            supervision_context = await self._cap_quickscan_attack_context(
-                campaign_id, manifest, supervision_context, 0
+            execution_context, frontier_batch = await self._claim_execution_frontier_context(
+                campaign_id, manifest, context, 0
             )
             compiled = await self._compile_initial_attack_ownership(
                 campaign_id,
                 manifest,
-                supervision_context,
+                execution_context,
                 0,
                 (reused_recon_source,),
                 reused_recon_source,
                 reused_recon_evidence,
             )
-            compiled = compile_execution_agenda(manifest, supervision_context, compiled)
+            compiled = compile_execution_agenda(manifest, execution_context, compiled)
             compiled = _seal_compilation_candidate_identities(
                 manifest,
-                supervision_context,
+                execution_context,
                 compiled,
             )
         else:
@@ -2004,16 +2968,64 @@ class CampaignService:
             if reusable or observations_reused
             else _capability_probe_wave_concurrency(self._max_worker_concurrency, worker_count)
         )
-        live = await self._agents.submit(
-            session_id,
-            compiled.assignments,
-            max_workers=execution_width,
-            worker_contexts={item.assignment_id: item for item in compiled.worker_contexts},
-            start_immediately=False,
-            minimum_workers=1,
-            schedule_id=self._campaign_wave_schedule_id(campaign_id, 0),
-            grants=_schedule_grant_universe(compiled.assignments),
-        )
+        while True:
+            try:
+                live = await self._agents.submit(
+                    session_id,
+                    compiled.assignments,
+                    max_workers=execution_width,
+                    worker_contexts={
+                        item.assignment_id: item for item in compiled.worker_contexts
+                    },
+                    start_immediately=False,
+                    minimum_workers=1,
+                    schedule_id=self._campaign_wave_schedule_id(campaign_id, 0),
+                    grants=_schedule_grant_universe(compiled.assignments),
+                )
+                break
+            except ScheduleArtifactTooLarge as error:
+                if not reusable or frontier_batch is None:
+                    raise
+                try:
+                    execution_context, frontier_batch = (
+                        await self._shrink_execution_frontier_context(
+                            campaign_id,
+                            manifest,
+                            context,
+                            0,
+                            frontier_batch,
+                            error,
+                        )
+                    )
+                except _FrontierScheduleBlocked as blocked:
+                    return {
+                        "campaign_id": campaign_id,
+                        "status": "prepared",
+                        "blocked_candidate_id": blocked.candidate_id,
+                    }
+                compiled = await self._compile_initial_attack_ownership(
+                    campaign_id,
+                    manifest,
+                    execution_context,
+                    0,
+                    (reused_recon_source,),
+                    reused_recon_source,
+                    reused_recon_evidence,
+                )
+                compiled = compile_execution_agenda(manifest, execution_context, compiled)
+                compiled = _seal_compilation_candidate_identities(
+                    manifest, execution_context, compiled
+                )
+                worker_count = len(compiled.assignments)
+                execution_width = _reviewed_worker_concurrency(
+                    manifest, self._max_worker_concurrency, worker_count
+                )
+        if frontier_batch is not None:
+            binder = getattr(self._store, "bind_frontier_batch", None)
+            if callable(binder):
+                await asyncio.to_thread(
+                    binder, campaign_id, str(frontier_batch["id"]), live.id
+                )
         try:
             await asyncio.to_thread(
                 self._store.begin_execution, campaign_id, manifest_digest, live.id
@@ -2165,8 +3177,8 @@ class CampaignService:
                 await self._record_recon_result(manifest, applicability)
                 # Advertised/observed capabilities are evidence, not attack
                 # admission. Unknown surfaces remain eligible for safe probing.
-                attack_context = await self._cap_quickscan_attack_context(
-                    campaign_id, manifest, context, initial_wave
+                attack_context, frontier_batch = await self._claim_execution_frontier_context(
+                    campaign_id, manifest, context, initial_wave + 1
                 )
                 # The initial attack wave's workers are the wave-0 admitted
                 # dynamic specialists plus the structural lanes compiled here.
@@ -2187,19 +3199,58 @@ class CampaignService:
                     attack_context,
                     attack,
                 )
-                attack_live = await self._start_wave(
-                    campaign_id,
-                    manifest,
-                    initial_wave + 1,
-                    "initial",
-                    attack,
-                    recon_tasks=recon_tasks,
-                    recon_applicability=applicability,
-                )
+                while True:
+                    try:
+                        attack_live = await self._start_wave(
+                            campaign_id,
+                            manifest,
+                            initial_wave + 1,
+                            "initial",
+                            attack,
+                            frontier_batch_id=(
+                                None
+                                if frontier_batch is None
+                                else str(frontier_batch["id"])
+                            ),
+                            recon_tasks=recon_tasks,
+                            recon_applicability=applicability,
+                        )
+                        break
+                    except ScheduleArtifactTooLarge as error:
+                        if frontier_batch is None:
+                            raise
+                        try:
+                            attack_context, frontier_batch = (
+                                await self._shrink_execution_frontier_context(
+                                    campaign_id,
+                                    manifest,
+                                    context,
+                                    initial_wave + 1,
+                                    frontier_batch,
+                                    error,
+                                )
+                            )
+                        except _FrontierScheduleBlocked:
+                            return
+                        attack = await self._compile_initial_attack_ownership(
+                            campaign_id,
+                            manifest,
+                            attack_context,
+                            initial_wave,
+                            recon_tasks,
+                            recon,
+                            committed_evidence,
+                        )
+                        attack = compile_execution_agenda(
+                            manifest, attack_context, attack
+                        )
+                        attack = _seal_compilation_candidate_identities(
+                            manifest, attack_context, attack
+                        )
                 await self._supervise(
                     campaign_id,
                     manifest,
-                    attack_context,
+                    context,
                     attack_live,
                     initial_wave=initial_wave + 1,
                 )
@@ -2330,6 +3381,129 @@ class CampaignService:
             # Wave-0 specialists run in this wave alongside the structural lanes;
             # retire terminal ones exactly like follow-up-wave specialists.
             await self._retire_terminal_dynamic_specialists(campaign_id, initial_wave, tasks)
+            frontier_counts = await self._settle_execution_frontier_batch(
+                campaign_id, live, tasks
+            )
+            frontier_retry_available = bool(
+                frontier_counts is not None
+                and (
+                    int(frontier_counts.get("retryable_claims_below_cap", 0)) > 0
+                    or int(frontier_counts.get("queued", 0))
+                    > int(frontier_counts.get("retry_exhausted_candidates", 0))
+                )
+            )
+            continue_frontier = bool(
+                frontier_counts is not None
+                and frontier_counts.get("queued", 0) > 0
+                and (summary["completed"] > 0 or frontier_retry_available)
+                and not budget_capped
+                and not (
+                    manifest.profile is CampaignProfile.QUICKSCAN
+                    and initial_wave >= QUICKSCAN_FOLLOWUP_WAVE_LIMIT
+                )
+            )
+            if (
+                frontier_counts is not None
+                and frontier_counts.get("queued", 0) > 0
+                and not continue_frontier
+                and not budget_capped
+            ):
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    initial_wave,
+                    {
+                        "kind": "frontier_execution_pending",
+                        "queued": frontier_counts.get("queued", 0),
+                        "max_claim_generation": frontier_counts.get(
+                            "max_claim_generation", 0
+                        ),
+                        "reason": (
+                            "the bounded batch exhausted its infrastructure retry policy; "
+                            "candidates remain queued and eligible for explicit recovery"
+                        ),
+                        "retryable": True,
+                    },
+                )
+                pause_campaign = getattr(self._store, "pause", None)
+                if callable(pause_campaign):
+                    await asyncio.to_thread(pause_campaign, campaign_id)
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        initial_wave,
+                        {
+                            "kind": "frontier_retry_cap_paused",
+                            "state": "paused",
+                            "queued": frontier_counts.get("queued", 0),
+                            "reason": (
+                                "per-candidate infrastructure retry cap reached; "
+                                "unresolved candidates remain durably queued for "
+                                "operator continuation"
+                            ),
+                            "retryable": True,
+                        },
+                    )
+                    return
+            if continue_frontier:
+                candidate_wave = initial_wave + 1
+                batch_context, frontier_batch = await self._claim_execution_frontier_context(
+                    campaign_id, manifest, context, candidate_wave
+                )
+                if batch_context.techniques:
+                    compiled = compile_attack_campaign(manifest, batch_context)
+                    compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                    compiled = _seal_compilation_candidate_identities(
+                        manifest, batch_context, compiled
+                    )
+                    while True:
+                        try:
+                            next_live = await self._start_wave(
+                                campaign_id,
+                                manifest,
+                                candidate_wave,
+                                "frontier",
+                                compiled,
+                                frontier_batch_id=(
+                                    None
+                                    if frontier_batch is None
+                                    else str(frontier_batch["id"])
+                                ),
+                            )
+                            break
+                        except ScheduleArtifactTooLarge as error:
+                            if frontier_batch is None:
+                                raise
+                            try:
+                                batch_context, frontier_batch = (
+                                    await self._shrink_execution_frontier_context(
+                                        campaign_id,
+                                        manifest,
+                                        context,
+                                        candidate_wave,
+                                        frontier_batch,
+                                        error,
+                                    )
+                                )
+                            except _FrontierScheduleBlocked:
+                                return
+                            compiled = compile_attack_campaign(manifest, batch_context)
+                            compiled = compile_execution_agenda(
+                                manifest, batch_context, compiled
+                            )
+                            compiled = _seal_compilation_candidate_identities(
+                                manifest, batch_context, compiled
+                            )
+                    self._supervisors[campaign_id] = asyncio.create_task(
+                        self._supervise(
+                            campaign_id,
+                            manifest,
+                            context,
+                            next_live,
+                            initial_wave=candidate_wave,
+                        )
+                    )
+                    return
             assessment = live_assessment or await self._assess_and_journal(
                 campaign_id, manifest, initial_wave, tasks
             )
@@ -6445,7 +7619,12 @@ class CampaignService:
         )
         if not production_completion_store:
             return None
-        projection = await self.status(campaign_id)
+        status_projection = self.status
+        projection = (
+            await status_projection(campaign_id, seal_frontier_snapshot=True)
+            if "seal_frontier_snapshot" in inspect.signature(status_projection).parameters
+            else await status_projection(campaign_id)
+        )
         document = projection.get("completion_document")
         digest = projection.get("completion_digest")
         if not isinstance(document, Mapping) or not isinstance(digest, str):
@@ -6471,7 +7650,7 @@ class CampaignService:
         wave = int(waves[-1]["wave"]) if waves else 0
         receipt = {
             "kind": "campaign_completion",
-            "schema": "merlin.campaign-completion.v1",
+            "schema": str(document.get("schema") or "merlin.campaign-completion.v1"),
             "completion_digest": digest,
             "terminal_status": status,
             "stop_reason": reason,
@@ -6494,7 +7673,12 @@ class CampaignService:
         # receipt or generate a production report.
         digest = await self._seal_completion_receipt(campaign_id, status, reason)
         if digest is not None:
-            projection = await self.status(campaign_id)
+            status_projection = self.status
+            projection = (
+                await status_projection(campaign_id, seal_frontier_snapshot=True)
+                if "seal_frontier_snapshot" in inspect.signature(status_projection).parameters
+                else await status_projection(campaign_id)
+            )
             document = projection["completion_document"]
             await self._record_technique_history(campaign_id, document)
         await self._retire_campaign_terminal_dynamic_specialists(campaign_id)
@@ -6522,10 +7706,116 @@ class CampaignService:
             or scenario_fingerprint_for(manifest.target, manifest.catalogue)
         )
         cells = _cells_excluding_advisory_judgments(document)
+        snapshot = document.get("frontier_snapshot")
+        if isinstance(snapshot, Mapping):
+            snapshot_id = str(snapshot.get("id") or "").strip()
+            expected_reference = f"merlin-frontier-snapshot:{campaign_id}:{snapshot_id}"
+            if not snapshot_id or str(snapshot.get("reference") or "") != expected_reference:
+                raise RuntimeError("campaign completion frontier snapshot reference is invalid")
+            page_loader = getattr(self._store, "list_frontier_completion_page", None)
+            if not callable(page_loader):
+                raise RuntimeError(
+                    "campaign completion frontier snapshot cannot be read by this store"
+                )
+            snapshot_rows: list[Mapping[str, object]] = []
+            cursor = -1
+            while True:
+                page = tuple(
+                    await asyncio.to_thread(
+                        page_loader,
+                        campaign_id,
+                        snapshot_id,
+                        limit=500,
+                        after_position=cursor,
+                    )
+                )
+                if not page:
+                    break
+                positions = tuple(int(item["position"]) for item in page)
+                if positions != tuple(range(cursor + 1, cursor + 1 + len(page))):
+                    raise RuntimeError(
+                        "campaign completion frontier snapshot page is not contiguous"
+                    )
+                snapshot_rows.extend(page)
+                cursor = positions[-1]
+            if len(snapshot_rows) != int(snapshot.get("total_count", -1)):
+                raise RuntimeError("campaign completion frontier snapshot row count is invalid")
+            normalized_snapshot_rows = [
+                {
+                    "position": int(item["position"]),
+                    "candidate_id": str(item["candidate_id"]),
+                    "state": str(item["state"]),
+                    "outcome": str(item["outcome"]),
+                    "attempt_id": (
+                        None if item.get("attempt_id") is None else str(item["attempt_id"])
+                    ),
+                    "task_id": None if item.get("task_id") is None else str(item["task_id"]),
+                    "evidence_refs": [str(value) for value in item.get("evidence_refs", ())],
+                    "disposition_reason": (
+                        None
+                        if item.get("disposition_reason") is None
+                        else str(item["disposition_reason"])
+                    ),
+                }
+                for item in snapshot_rows
+            ]
+            actual_row_digest = hashlib.sha256(
+                json.dumps(
+                    {"schema_version": 1, "rows": normalized_snapshot_rows},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if actual_row_digest != str(snapshot.get("row_digest") or ""):
+                raise RuntimeError("campaign completion frontier snapshot digest is invalid")
+            cells = tuple(
+                (
+                    str(item.get("task_id") or item.get("attempt_id") or snapshot_id),
+                    str(item["candidate_id"]),
+                    str(item["outcome"]),
+                    *(
+                        (
+                            {
+                                "engaged_attempts": 1,
+                                "evidence_refs": tuple(item.get("evidence_refs", ())),
+                                "graded_by": "frontier_completion_snapshot",
+                            },
+                        )
+                        if str(item["outcome"]) == "partial"
+                        else ()
+                    ),
+                )
+                for item in snapshot_rows
+                if str(item["outcome"])
+                in {"confirmed", "refuted", "partial", "unclear", "blocked"}
+            )
+        history_techniques = context.techniques
+        if context.language_frontier is not None and isinstance(cells, (list, tuple)):
+            completed_ids = {
+                str(cell[1])
+                for cell in cells
+                if isinstance(cell, (list, tuple)) and len(cell) >= 3
+            }
+            families = {technique.id: technique for technique in context.techniques}
+            references = (
+                reference
+                for reference in enumerate_language_candidate_references(
+                    context.techniques, context.language_frontier
+                )
+                if reference.id in completed_ids
+            )
+            history_techniques = tuple(
+                materialize_language_technique(
+                    families[reference.family_id],
+                    context.language_frontier,
+                    reference,
+                )
+                for reference in references
+            )
         escalated: list[AssignmentTechnique] = []
         list_lead = getattr(self._store, "list_lead", None)
         if list_lead is not None:
-            known_ids = {item.id for item in context.techniques}
+            known_ids = {item.id for item in history_techniques}
             for lead_row in await asyncio.to_thread(list_lead, campaign_id):
                 payload = lead_row.get("payload") if isinstance(lead_row, Mapping) else None
                 if not isinstance(payload, Mapping) or payload.get("kind") != "language_escalation":
@@ -6542,7 +7832,7 @@ class CampaignService:
         entries = entries_for_completion(
             manifest.target.id,
             adapter_generation,
-            (*context.techniques, *escalated),
+            (*history_techniques, *escalated),
             cells if isinstance(cells, (list, tuple)) else (),
             campaign_id,
         )
@@ -8064,6 +9354,7 @@ class CampaignService:
         kind: str,
         compiled: CampaignCompilation,
         *,
+        frontier_batch_id: str | None = None,
         recon_tasks: tuple[AgentTask, ...] = (),
         recon_applicability: Mapping[str, object] | None = None,
     ) -> Any:
@@ -8084,6 +9375,12 @@ class CampaignService:
             schedule_id=self._campaign_wave_schedule_id(campaign_id, wave),
             grants=_schedule_grant_universe(assignments),
         )
+        if frontier_batch_id is not None:
+            binder = getattr(self._store, "bind_frontier_batch", None)
+            if callable(binder):
+                await asyncio.to_thread(
+                    binder, campaign_id, frontier_batch_id, live.id
+                )
         await asyncio.to_thread(self._store.add_wave, campaign_id, wave, kind, live.id)
         if recon_tasks:
             guidance_ready = await self._publish_recon_guidance_to_assignments(
@@ -10925,7 +12222,7 @@ class CampaignService:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._supervisors.clear()
 
-    async def recover(self) -> int:
+    async def recover(self, *, resume_execution: bool = True) -> int:
         # A process/database failure can terminalize the campaign row before
         # its scheduler cancellation commits. Fence those workers before the
         # generic scheduler recovery is allowed to reopen active schedules.
@@ -10940,6 +12237,12 @@ class CampaignService:
         recovered = 0
         for row in rows:
             campaign_id = str(row["id"])
+            if not resume_execution:
+                # A daemon replacement restores checkpoints, not operator intent
+                # to restart target work before a session has been selected.
+                await self.pause(campaign_id)
+                recovered += 1
+                continue
             supervisor = self._supervisors.get(campaign_id)
             if supervisor is not None:
                 if not supervisor.done():
@@ -10953,6 +12256,35 @@ class CampaignService:
                     pass
                 self._supervisors.pop(campaign_id, None)
             waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+            envelope = row["manifest"]
+            manifest = _manifest(envelope["manifest"])
+            context = _assignment_context(envelope["assignment_context"])
+            frontier_loader = getattr(self._store, "load_active_frontier_batch", None)
+            active_frontier = (
+                await asyncio.to_thread(frontier_loader, campaign_id)
+                if callable(frontier_loader)
+                else None
+            )
+            if isinstance(active_frontier, Mapping):
+                try:
+                    live = await self._recover_active_frontier_batch(
+                        campaign_id, manifest, context, active_frontier, waves
+                    )
+                except _FrontierScheduleBlocked:
+                    recovered += 1
+                    continue
+                self._supervisors[campaign_id] = asyncio.create_task(
+                    self._supervise(
+                        campaign_id,
+                        manifest,
+                        context,
+                        live,
+                        initial_wave=int(active_frontier["wave"]),
+                        wave_running=True,
+                    )
+                )
+                recovered += 1
+                continue
             if not waves:
                 continue
             latest = waves[-1]
@@ -10970,9 +12302,76 @@ class CampaignService:
                     raise RuntimeError(
                         "validation/remediation recovery requires its originating campaign wave"
                     )
-            envelope = row["manifest"]
-            manifest = _manifest(envelope["manifest"])
-            context = _assignment_context(envelope["assignment_context"])
+            frontier_counter = getattr(self._store, "frontier_counts", None)
+            frontier_counts = (
+                await asyncio.to_thread(frontier_counter, campaign_id)
+                if callable(frontier_counter)
+                else None
+            )
+            # A process can stop after settling a completed batch and before
+            # installing the successor supervisor. No schedule is active in
+            # that window, so deterministically claim and start the next wave
+            # instead of reopening the already-settled predecessor forever.
+            if (
+                isinstance(frontier_counts, Mapping)
+                and int(frontier_counts.get("queued", 0)) > 0
+                and not isinstance(active_frontier, Mapping)
+                and str(supervision_wave.get("status")) in {"completed", "failed"}
+            ):
+                candidate_wave = max(int(item["wave"]) for item in waves) + 1
+                batch_context, frontier_batch = await self._claim_execution_frontier_context(
+                    campaign_id, manifest, context, candidate_wave
+                )
+                if batch_context.techniques and frontier_batch is not None:
+                    compiled = compile_attack_campaign(manifest, batch_context)
+                    compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                    compiled = _seal_compilation_candidate_identities(
+                        manifest, batch_context, compiled
+                    )
+                    try:
+                        while True:
+                            try:
+                                live = await self._start_wave(
+                                    campaign_id,
+                                    manifest,
+                                    candidate_wave,
+                                    "frontier",
+                                    compiled,
+                                    frontier_batch_id=str(frontier_batch["id"]),
+                                )
+                                break
+                            except ScheduleArtifactTooLarge as error:
+                                batch_context, frontier_batch = (
+                                    await self._shrink_execution_frontier_context(
+                                        campaign_id,
+                                        manifest,
+                                        context,
+                                        candidate_wave,
+                                        frontier_batch,
+                                        error,
+                                    )
+                                )
+                                compiled = compile_attack_campaign(manifest, batch_context)
+                                compiled = compile_execution_agenda(
+                                    manifest, batch_context, compiled
+                                )
+                                compiled = _seal_compilation_candidate_identities(
+                                    manifest, batch_context, compiled
+                                )
+                    except _FrontierScheduleBlocked:
+                        recovered += 1
+                        continue
+                    self._supervisors[campaign_id] = asyncio.create_task(
+                        self._supervise(
+                            campaign_id,
+                            manifest,
+                            context,
+                            live,
+                            initial_wave=candidate_wave,
+                        )
+                    )
+                    recovered += 1
+                    continue
             release_active_budget = getattr(self._store, "release_active_budget", None)
             if release_active_budget is not None:
                 await asyncio.to_thread(release_active_budget, campaign_id)
@@ -11042,11 +12441,36 @@ class CampaignService:
                 if applicability is None:
                     raise RuntimeError("reviewed campaign recovery has no technique frontier")
                 reviewed_techniques = {item.id for item in context.techniques}
-                if scheduled_techniques - reviewed_techniques:
+                active_frontier_loader = getattr(
+                    self._store, "load_active_frontier_batch", None
+                )
+                active_frontier = (
+                    await asyncio.to_thread(active_frontier_loader, campaign_id)
+                    if callable(active_frontier_loader)
+                    else None
+                )
+                active_frontier_ids = {
+                    str(candidate.get("id") or "")
+                    for candidate in (
+                        active_frontier.get("candidates", ())
+                        if isinstance(active_frontier, Mapping)
+                        else ()
+                    )
+                    if isinstance(candidate, Mapping)
+                }
+                if active_frontier_ids and (
+                    str(active_frontier.get("schedule_id") or "")
+                    != str(supervision_wave["schedule_id"])
+                    or not active_frontier_ids <= scheduled_techniques
+                ):
+                    raise RuntimeError(
+                        "recovered attack schedule differs from its claimed frontier batch"
+                    )
+                if not active_frontier_ids and scheduled_techniques - reviewed_techniques:
                     raise RuntimeError(
                         "attack schedule does not match sealed reconnaissance applicability"
                     )
-                if reviewed_techniques - scheduled_techniques:
+                if reviewed_techniques - scheduled_techniques and not active_frontier_ids:
                     append_lead = getattr(self._store, "append_lead", None)
                     if append_lead is not None:
                         await asyncio.to_thread(
@@ -11314,7 +12738,9 @@ class CampaignService:
                 unresolved.add(technique_id)
         return outcomes, tuple(sorted(unresolved)), tuple(receipts)
 
-    async def status(self, campaign_id: str) -> Mapping[str, object]:
+    async def status(
+        self, campaign_id: str, *, seal_frontier_snapshot: bool = False
+    ) -> Mapping[str, object]:
         row = await asyncio.to_thread(self._store.get, campaign_id)
         if row is None:
             raise KeyError(f"unknown campaign {campaign_id!r}")
@@ -11595,6 +13021,7 @@ class CampaignService:
                             if outcomes.get(technique_id) == "partial"
                         },
                         "evaluation_uncertainties": transport_uncertainties,
+                        "evidence_references": tuple(sorted(trusted_refs or ())),
                     }
                 )
             projected_waves.append(
@@ -11617,6 +13044,31 @@ class CampaignService:
         # Recon/capability observations describe what was seen. They cannot
         # shrink the reviewed attack denominator or retire unknown surfaces.
         status_techniques = assignment_context.techniques
+        technique_by_id = {item.id: item for item in status_techniques}
+        language_references = (
+            enumerate_language_candidate_references(
+                status_techniques, assignment_context.language_frontier
+            )
+            if assignment_context.language_frontier is not None
+            else ()
+        )
+        admitted_technique_identities = (
+            {
+                reference.id: (
+                    technique_by_id[reference.family_id].resolved_semantic_id,
+                    reference.id,
+                )
+                for reference in language_references
+            }
+            if language_references
+            else {
+                item.id: (
+                    item.resolved_semantic_id,
+                    item.id,
+                )
+                for item in status_techniques
+            }
+        )
         completion_findings: list[Mapping[str, object]] = []
         if self._finding_reader is not None:
             durable_findings = await self._finding_reader(manifest.session_id)
@@ -11740,13 +13192,7 @@ class CampaignService:
             manifest,
             lead,
             projected_waves,
-            admitted_technique_ids={
-                item.id: (
-                    item.resolved_semantic_id,
-                    _saturation_cell_id(item.resolved_semantic_id, item.language),
-                )
-                for item in status_techniques
-            },
+            admitted_technique_ids=admitted_technique_identities,
             finding_waves=finding_waves,
             awaiting_validation=awaiting_validation,
             cleanup_obligations=len(expected_cleanup_nodes),
@@ -11769,6 +13215,19 @@ class CampaignService:
             scenario_fingerprint=scenario_fingerprint,
         )
         manifest_candidates = tuple(
+            {
+                "campaign_id": campaign_id,
+                "target_id": manifest.target.id,
+                "target_generation": target_generation,
+                "scenario_fingerprint": scenario_fingerprint,
+                "technique_id": reference.id,
+                "controller_id": technique_by_id[reference.family_id].strategy_id or "direct",
+                "payload_family": reference.variant_id or "baseline",
+                "requested_language": reference.requested_language or "und",
+                "mutation_id": reference.variant_id or "baseline",
+            }
+            for reference in language_references
+        ) or tuple(
             {
                 "campaign_id": campaign_id,
                 "target_id": manifest.target.id,
@@ -11935,13 +13394,27 @@ class CampaignService:
             }
             for item in completion_frontier.entries
         )
+        frontier_projection = _bounded_frontier_projection(frontier_document)
+        if language_references:
+            candidate_sample = tuple(
+                item for item in frontier_document if item.get("kind") == "candidate"
+            )[:FRONTIER_PROJECTION_SAMPLE_LIMIT]
+            noncandidate_frontier = tuple(
+                item for item in frontier_document if item.get("kind") != "candidate"
+            )
+            projected_frontier_document = noncandidate_frontier + candidate_sample
+        else:
+            projected_frontier_document = frontier_document
         saturation_document = asdict(saturation) | {
             "ready": saturation.ready and completion_frontier.may_complete,
             "execution_complete": (
                 saturation.execution_complete and completion_frontier.may_complete
             ),
             "frontier_exhausted": completion_frontier.may_complete,
-            "completion_frontier": frontier_document,
+            "completion_frontier": projected_frontier_document,
+            "completion_frontier_projection": {
+                key: frontier_projection[key] for key in ("count", "digest", "omitted")
+            },
             "frontier_runnable": sum(
                 item.state is FrontierState.RUNNABLE for item in completion_frontier.entries
             ),
@@ -11957,6 +13430,59 @@ class CampaignService:
                 completion_frontier.ignored_out_of_scope_records
             ),
         }
+        if language_references:
+            for field_name in (
+                "untested_technique_ids",
+                "untested_cell_ids",
+                "untested_concrete_ids",
+                "catalogue_cell_owners",
+                "catalogue_unresolved_cell_ids",
+                "catalogue_unresolved_technique_ids",
+                "catalogue_terminal_blocked_cell_ids",
+            ):
+                field_values = cast(Sequence[object], saturation_document.get(field_name, ()))
+                _bounded_sequence_field(saturation_document, field_name, field_values)
+
+        frontier_snapshot: dict[str, object] | None = None
+        frontier_live_projection: dict[str, object] | None = None
+        if language_references:
+            snapshot_rows = _frontier_snapshot_rows(language_references, projected_waves)
+            projected_snapshot = _frontier_snapshot_header(campaign_id, snapshot_rows)
+            recorder = getattr(self._store, "record_frontier_completion_snapshot", None)
+            if seal_frontier_snapshot:
+                if not callable(recorder):
+                    raise RuntimeError(
+                        "normalized frontier completion requires durable snapshot storage"
+                    )
+                persisted = await asyncio.to_thread(
+                    recorder,
+                    campaign_id,
+                    str(projected_snapshot["id"]),
+                    snapshot_rows,
+                )
+                frontier_snapshot = {
+                    **projected_snapshot,
+                    "id": str(persisted["id"]),
+                    "row_digest": str(persisted["row_digest"]),
+                    "total_count": int(persisted["total_count"]),
+                    "counts": dict(persisted["counts"]),
+                    "reference": (
+                        f"merlin-frontier-snapshot:{campaign_id}:{persisted['id']}"
+                    ),
+                }
+            else:
+                frontier_live_projection = {
+                    key: projected_snapshot[key]
+                    for key in (
+                        "row_digest",
+                        "total_count",
+                        "counts",
+                        "sample",
+                        "sample_count",
+                        "omitted",
+                    )
+                }
+                frontier_live_projection["sealed"] = False
         attempted_cell_ids = {
             str(technique_id)
             for wave in projected_waves
@@ -11964,7 +13490,13 @@ class CampaignService:
             for technique_id in task["technique_outcomes"]
         }
         completion_document = {
-            "schema": "merlin.campaign-completion.v1",
+            "schema": (
+                "merlin.campaign-completion.v2"
+                if frontier_snapshot is not None
+                else "merlin.campaign-completion.live.v2"
+                if frontier_live_projection is not None
+                else "merlin.campaign-completion.v1"
+            ),
             "campaign_id": campaign_id,
             "manifest_digest": str(row["manifest_digest"]),
             "target_id": manifest.target.id,
@@ -12108,6 +13640,17 @@ class CampaignService:
             ),
             "saturation": saturation_document,
         }
+        if frontier_snapshot is not None:
+            completion_document["frontier_snapshot"] = frontier_snapshot
+        elif frontier_live_projection is not None:
+            completion_document["frontier_projection"] = frontier_live_projection
+        if frontier_snapshot is not None or frontier_live_projection is not None:
+            for field_name in ("limitations", "unsearched_frontier", "cells"):
+                _bounded_sequence_field(
+                    completion_document,
+                    field_name,
+                    cast(Sequence[object], completion_document[field_name]),
+                )
         completion_digest = (
             "sha256:"
             + hashlib.sha256(
@@ -12469,8 +14012,10 @@ class CampaignService:
             catalogue_terminal_blocked_cell_ids=tuple(sorted(terminal_blocked_cell_ids)),
         )
 
-    async def list(self, session_id: str) -> tuple[Mapping[str, object], ...]:
-        rows = await asyncio.to_thread(self._store.list, session_id)
+    async def list(
+        self, session_id: str, *, limit: int | None = 50
+    ) -> tuple[Mapping[str, object], ...]:
+        rows = await asyncio.to_thread(self._store.list, session_id, limit=limit)
         return tuple(_campaign_list_projection(row) for row in rows)
 
     async def list_all(self) -> tuple[Mapping[str, object], ...]:
@@ -12802,6 +14347,33 @@ class CampaignService:
             else:
                 raise ValueError("paused campaign has no paused wave")
             latest = boundary
+            frontier_counter = getattr(self._store, "frontier_counts", None)
+            frontier_counts = (
+                await asyncio.to_thread(frontier_counter, campaign_id)
+                if callable(frontier_counter)
+                else None
+            )
+            if (
+                isinstance(frontier_counts, Mapping)
+                and int(frontier_counts.get("queued", 0)) > 0
+            ):
+                await asyncio.to_thread(self._store.resume, campaign_id)
+                await self._stop_supervisor(campaign_id)
+                if await self.recover() < 1:
+                    raise RuntimeError(
+                        "queued frontier continuation could not reclaim campaign ownership"
+                    )
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    int(latest["wave"]),
+                    {
+                        "state": "executing",
+                        "reason": "operator-frontier-retry-continuation",
+                        "queued": frontier_counts.get("queued", 0),
+                    },
+                )
+                return {"campaign_id": campaign_id, "status": "executing"}
             live = await self._agents.reopen(str(latest["schedule_id"]), resume_execution=False)
             await asyncio.to_thread(self._store.resume, campaign_id)
             envelope = row["manifest"]
@@ -14330,6 +15902,19 @@ def _assignment_technique(item: Mapping[str, Any]) -> AssignmentTechnique:
 
 
 def _assignment_context(value: Mapping[str, Any]) -> AssignmentContext:
+    frontier_value = value.get("language_frontier")
+    frontier = (
+        LanguageFrontierSpec(
+            default_language=str(frontier_value.get("default_language") or "und"),
+            planned_languages=tuple(
+                str(item) for item in frontier_value.get("planned_languages", ())
+            ),
+            code_switching=bool(frontier_value.get("code_switching", False)),
+            schema_version=int(frontier_value.get("schema_version", 1)),
+        )
+        if isinstance(frontier_value, Mapping)
+        else None
+    )
     return AssignmentContext(
         target_profile_id=value["target_profile_id"],
         techniques=tuple(_assignment_technique(item) for item in value["techniques"]),
@@ -14383,6 +15968,7 @@ def _assignment_context(value: Mapping[str, Any]) -> AssignmentContext:
             (str(item[0]), None if item[1] is None else float(item[1]))
             for item in value.get("provider_model_cache_read_pricing", ())
         ),
+        language_frontier=frontier,
     )
 
 
@@ -16846,6 +18432,22 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
     )
     document = status.get("completion_document")
     document = document if isinstance(document, Mapping) else {}
+    snapshot = document.get("frontier_snapshot") or document.get("frontier_projection")
+    snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+    snapshot_counts = snapshot.get("counts")
+    snapshot_states = (
+        snapshot_counts.get("states", {}) if isinstance(snapshot_counts, Mapping) else {}
+    )
+    if isinstance(snapshot_states, Mapping) and snapshot.get("row_digest"):
+        unresolved_count = sum(
+            int(snapshot_states.get(state, 0))
+            for state in ("queued", "claimed", "scheduled")
+        )
+        snapshot_marker = f"frontier-snapshot:{snapshot['row_digest']}"
+        if unresolved_count:
+            unresolved = frozenset({*unresolved, snapshot_marker})
+        else:
+            resolved = frozenset({*resolved, snapshot_marker})
     evidence: set[str] = set()
     target_calls: set[str] = set()
     for receipt in document.get("receipts", ()):
@@ -16902,6 +18504,11 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
         "frontier": tuple(
             (item.get("key"), item.get("state"), item.get("outcome")) for item in frontier_rows
         ),
+        "frontier_snapshot": (
+            snapshot.get("row_digest"),
+            snapshot.get("total_count"),
+            snapshot.get("counts"),
+        ),
     }
     semantic_fingerprint = (
         "sha256:"
@@ -16915,7 +18522,7 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
         unresolved_frontier=unresolved,
         durably_resolved=resolved,
         semantic_fingerprint=semantic_fingerprint,
-        frontier_exhausted=bool(frontier_rows) and not unresolved,
+        frontier_exhausted=bool(saturation.get("frontier_exhausted")) and not unresolved,
         provider_health=(
             ProviderHealth.DEGRADED if infrastructure_failures else ProviderHealth.HEALTHY
         ),
@@ -16946,7 +18553,15 @@ def _coverage_frontier_signature(
         "catalogue_terminal_blocked_cell_ids",
         "adaptive_unresolved",
     )
-    return tuple(tuple(sorted(str(item) for item in saturation.get(key) or ())) for key in keys)
+    return tuple(
+        (
+            str(projection.get("digest")),
+            str(projection.get("count")),
+        )
+        if isinstance((projection := saturation.get(f"{key}_projection")), Mapping)
+        else tuple(sorted(str(item) for item in saturation.get(key) or ()))
+        for key in keys
+    )
 
 
 def _saturation_cell_id(semantic_id: str, language: str) -> str:

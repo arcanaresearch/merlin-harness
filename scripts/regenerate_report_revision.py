@@ -26,7 +26,11 @@ from merlin_findings import (
     FindingService,
 )
 from merlin_findings.projection import _digest
-from merlin_storage_postgres import PostgresFindingStore, PostgresReportRevisionStore
+from merlin_storage_postgres import (
+    CampaignStore,
+    PostgresFindingStore,
+    PostgresReportRevisionStore,
+)
 from psycopg.rows import dict_row
 
 DATABASE_URL = os.environ.get(
@@ -137,7 +141,10 @@ async def main() -> int:
     revision_id = (stored or projection).revision_id
     print(f"sealed revision {revision_id} with {len(findings_json)} findings", flush=True)
 
-    content = DurableReportService(report_store).export(revision_id, "html", "internal")
+    content = DurableReportService(
+        report_store,
+        frontier_snapshot_provider=CampaignStore(connection),
+    ).export(revision_id, "html", "internal")
     await asyncio.to_thread(
         Path(output).write_bytes, content if isinstance(content, bytes) else content.encode()
     )

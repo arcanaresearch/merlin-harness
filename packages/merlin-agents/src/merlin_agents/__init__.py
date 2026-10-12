@@ -46,7 +46,12 @@ from .coordination import (
     LeadDirective,
     WorkerCoordinationState,
 )
-from .durable_service import DurableAgentService, DurableSchedulerStore, FindingDraftSink
+from .durable_service import (
+    DurableAgentService,
+    DurableSchedulerStore,
+    FindingDraftSink,
+    ScheduleArtifactTooLarge,
+)
 from .exploration import (
     EXPLORATION_POLICY,
     CriticConfidence,
@@ -225,6 +230,7 @@ __all__ = [
     "DeliveryBoundary",
     "DeliveryMode",
     "DurableAgentService",
+    "ScheduleArtifactTooLarge",
     "DurableSchedulerStore",
     "FindingDraftSink",
     "DirectiveError",

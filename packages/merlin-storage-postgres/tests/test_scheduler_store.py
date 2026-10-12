@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import merlin_storage_postgres.scheduler_store as scheduler_store_module
 import pytest
 from merlin_agents import (
     AssignmentBudget,
@@ -31,12 +32,54 @@ from merlin_storage_postgres import (
     DurableSchedulerStore,
     MigrationRunner,
     PostgresToolEffectStore,
+    ScheduleArtifactTooLarge,
     SessionRepository,
     StaleLeaseError,
     ToolEffectRepository,
 )
 from merlin_tools import ToolBroker
 from psycopg.errors import ForeignKeyViolation
+
+
+@pytest.mark.parametrize("artifact", ("graph", "checkpoint"))
+def test_scheduler_rejects_oversized_artifact_before_opening_transaction(
+    monkeypatch, artifact: str
+) -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.transaction_opened = False
+            self.execute_called = False
+
+        def transaction(self):
+            self.transaction_opened = True
+            raise AssertionError("oversized schedule reached PostgreSQL")
+
+        def execute(self, *_args, **_kwargs):
+            self.execute_called = True
+            raise AssertionError("oversized schedule reached PostgreSQL")
+
+    monkeypatch.setattr(scheduler_store_module, "_MAX_SCHEDULE_JSONB_BYTES", 128)
+    connection = Connection()
+    store = DurableSchedulerStore(connection)
+    graph = {"payload": "x" * 256} if artifact == "graph" else {"nodes": ["worker"]}
+    checkpoint = {"payload": "x" * 256} if artifact == "checkpoint" else {"nodes": {}}
+
+    with pytest.raises(
+        ScheduleArtifactTooLarge,
+        match=rf"schedule {artifact}.*reduce the execution batch",
+    ) as raised:
+        store.create_schedule(
+            "00000000-0000-0000-0000-000000000001",
+            graph,
+            checkpoint,
+            ["worker"],
+            ready_nodes=["worker"],
+        )
+
+    assert raised.value.artifact == artifact
+    assert raised.value.actual_bytes > raised.value.limit_bytes == 128
+    assert connection.transaction_opened is False
+    assert connection.execute_called is False
 
 
 def test_pg0_scheduler_fences_stale_attempt_and_commits_reducer_atomically(
@@ -2431,3 +2474,87 @@ def test_pg0_expanded_worker_transcript_keeps_all_messages_and_enforces_session_
             assert rows[0]["payload"]["worker_checkpoint"]["messages"] == messages
             assert store.get_assignment_transcript_rows(other.id, "assignment-1") == []
             assert store.get_assignment_transcript_rows(session.id, "missing") == []
+
+
+@pytest.mark.asyncio
+async def test_pg0_daemon_restart_keeps_recon_dormant_until_explicit_resume(tmp_path: Path) -> None:
+    import asyncio
+
+    class NoTools:
+        def describe(self):
+            return ()
+
+        async def invoke(self, *args):
+            raise AssertionError("restart must not invoke browser tools")
+
+    class Provider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            yield TextDelta(text='{"finding":"done"}')
+            yield ModelCompleted()
+
+    assignments = tuple(
+        WorkerAssignment(
+            id=f"recon-{index}",
+            objective="Inspect",
+            profile_id="recon",
+            target_profile_id="target",
+            technique_ids=(),
+            guidance_ids=(),
+            tool_ids=(),
+            skill_ids=(),
+            provider_id="provider",
+            authority_ids=(),
+            budget=AssignmentBudget(),
+            input_schema='{"type":"object"}',
+            output_schema='{"type":"object"}',
+        )
+        for index in range(2)
+    )
+    data_dir = tmp_path / "restart-recon"
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            store = DurableSchedulerStore(connection)
+            creator = DurableAgentService(Provider(), NoTools(), store, model="fixture")
+            schedule_ids = []
+            for index in range(2):
+                session = SessionRepository(connection).create(f"saved recon {index}")
+                live = await creator.submit(str(session.id), assignments, start_immediately=False)
+                schedule_ids.append(live.id)
+            # A lease left by the previous daemon must also be fenced.
+            ready_node = next(
+                node["node_id"]
+                for node in store.list_nodes(schedule_ids[0])
+                if node["state"] == "ready"
+            )
+            store.claim(
+                schedule_ids[0],
+                ready_node,
+                "old-daemon",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+            )
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            store = DurableSchedulerStore(connection)
+            provider = Provider()
+            replacement = DurableAgentService(provider, NoTools(), store, model="fixture")
+            assert await replacement.recover(resume_execution=False) == 2
+            await asyncio.sleep(0)
+            assert provider.requests == []
+            assert all(store.load_schedule(key)["status"] == "paused" for key in schedule_ids)
+            assert store.list_attempts(schedule_ids[0])[0]["state"] == "expired"
+            assert all(live.execution is None for live in replacement._live.values())
+            assert await replacement.recover() == 0
+            assert provider.requests == []
+
+            resumed = await replacement.resume_schedule(schedule_ids[0])
+            assert resumed.execution is not None
+            await asyncio.wait_for(resumed.execution, timeout=5)
+            assert provider.requests
+            assert store.load_schedule(schedule_ids[1])["status"] == "paused"
+            assert store.list_attempts(schedule_ids[1]) == []

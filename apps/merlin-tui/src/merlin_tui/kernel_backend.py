@@ -1113,8 +1113,14 @@ class KernelBackend:
         if source.suffix.lower() != ".html":
             raise ValueError("This saved revision has no HTML export location")
         output = source.with_suffix(suffix)
+        frontier_snapshot_provider = getattr(self._campaigns, "_store", None)
         content = await asyncio.to_thread(
-            DurableReportService(self._report_repository).export, revision.revision_id, format
+            DurableReportService(
+                self._report_repository,
+                frontier_snapshot_provider=frontier_snapshot_provider,
+            ).export,
+            revision.revision_id,
+            format,
         )
         if isinstance(content, bytes):
             await asyncio.to_thread(output.write_bytes, content)

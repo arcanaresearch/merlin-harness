@@ -37,6 +37,8 @@ from .specialists import (
     AssignmentContext,
     AssignmentTechnique,
     DynamicSpecialistPolicy,
+    LanguageCandidateReference,
+    LanguageFrontierSpec,
     WorkerAssignment,
     WorkerProfile,
 )
@@ -73,12 +75,11 @@ def reconcile_techniques_for_surfaces(
     return admit_techniques_for_surfaces(techniques, observed_surfaces)
 
 
-def expand_language_techniques(
-    techniques: tuple[AssignmentTechnique, ...], language_policy: object
-) -> tuple[AssignmentTechnique, ...]:
-    """Project an operator-reviewed language plan into explicit coverage cells."""
+def language_frontier_spec(language_policy: object) -> LanguageFrontierSpec | None:
+    """Normalize a reviewed language policy into a compact frontier recipe."""
+
     if not isinstance(language_policy, dict):
-        return techniques
+        return None
     planned = tuple(
         dict.fromkeys(
             str(item).strip().casefold()
@@ -87,14 +88,25 @@ def expand_language_techniques(
         )
     )
     if not planned:
-        return techniques
-    if any(re.fullmatch(r"[a-z]{2,8}(?:-[a-z0-9]{1,8})*", item) is None for item in planned):
-        raise ValueError("planned languages must use canonical BCP-47-like tokens")
+        return None
+    return LanguageFrontierSpec(
+        default_language=str(language_policy.get("default_language", "und"))
+        .strip()
+        .casefold(),
+        planned_languages=planned,
+        code_switching=bool(language_policy.get("code_switching", False)),
+    )
+
+
+def enumerate_language_candidate_references(
+    techniques: tuple[AssignmentTechnique, ...],
+    frontier: LanguageFrontierSpec,
+) -> tuple[LanguageCandidateReference, ...]:
+    """Enumerate stable candidate identities without constructing prompt envelopes."""
+
     if any("@lang=" in item.id or "@variant=" in item.id for item in techniques):
         raise ValueError("source technique ids contain reserved transform delimiters")
-    default = str(language_policy.get("default_language", "und")).strip().casefold()
-    code_switching = bool(language_policy.get("code_switching", False))
-    techniques = tuple(
+    normalized = tuple(
         item
         if item.comparison_supported and item.comparison_block_reason is None
         else replace(item, comparison_supported=True, comparison_block_reason=None)
@@ -102,156 +114,206 @@ def expand_language_techniques(
     )
     adaptive = tuple(
         item
-        for item in techniques
+        for item in normalized
         if item.comparison_supported and item.strategy_id in {"crescendo", "goat", "hydra-select"}
     )
     explicit = tuple(
         item
-        for item in techniques
+        for item in normalized
         if item.comparison_supported
         if item not in adaptive
         if (item.language.casefold() != "und" or item.transform_id != "baseline")
-        and item.language.casefold() in planned
+        and item.language.casefold() in frontier.planned_languages
     )
     expandable = tuple(
-        item for item in techniques if item.comparison_supported and item not in explicit
+        item for item in normalized if item.comparison_supported and item not in explicit
     )
-    cells = []
-    for language in planned:
-        variants = ["native"]
-        if language != default:
-            variants.append("translated")
-            if code_switching:
-                variants.extend(("mixed", "script-switching"))
+    references = [
+        LanguageCandidateReference(
+            id=item.id,
+            family_id=item.id,
+            ordinal=ordinal,
+            requested_language=item.language.casefold(),
+            variant_id=item.transform_id,
+        )
+        for ordinal, item in enumerate(explicit)
+    ]
+    for language in frontier.planned_languages:
         for technique in expandable:
-            for variant in variants:
-                metamorphic_oracle_digest = (
-                    "sha256:"
-                    + hashlib.sha256(
-                        json.dumps(
-                            {
-                                "source_id": technique.id,
-                                "oracle_digest": technique.oracle_digest,
-                                "control_oracle_digest": technique.control_oracle_digest,
-                                "comparison_policy": technique.comparison_policy,
-                                "language": language,
-                                "variant": variant,
-                                "claim": (
-                                    "language transformation preserves the reviewed "
-                                    "comparison oracle"
-                                ),
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest()
-                )
-                objective, transform_spec = materialize_transform_envelope(
-                    technique.id,
-                    technique.objective,
-                    transform_id=variant,
-                    default_language=default,
-                    target_language=language,
-                    metamorphic_oracle_digest=metamorphic_oracle_digest,
-                )
-                strategy_contract = dict(technique.strategy_contract)
-                strategy_uncertainties = list(technique.evaluation_uncertainties)
-                if technique.strategy_id in {"crescendo", "goat", "hydra-select"}:
-                    repaired_fields = {"language": language}
-                    if technique.strategy_id in {"goat", "hydra-select"}:
-                        repaired_fields["goal_digest"] = _digest(objective)
-                    changed = tuple(
-                        key
-                        for key, value in repaired_fields.items()
-                        if strategy_contract.get(key) != value
-                    )
-                    projected = (*changed, "transform")
-                    strategy_contract.update(repaired_fields)
-                    if projected:
-                        strategy_uncertainties.append(
-                            {
-                                "kind": "evaluation_uncertain",
-                                "source": "campaign.language_expansion",
-                                "reason": (
-                                    "adaptive evaluator metadata was projected onto the concrete "
-                                    f"language cell: {', '.join(projected)}"
-                                ),
-                                "confidence": 0.0,
-                                "affects": ["evaluation"],
-                            }
-                        )
-                cells.append(
-                    AssignmentTechnique(
+            for variant in frontier.variants_for(language):
+                references.append(
+                    LanguageCandidateReference(
                         id=f"{technique.id}@lang={language}@variant={variant}",
-                        objective=objective,
-                        tags=frozenset(
-                            (
-                                *technique.tags,
-                                "language",
-                                f"language:{language}",
-                                f"language-variant:{variant}",
-                                *(("multilingual",) if language != default else ()),
-                                *(
-                                    ("code-switching",)
-                                    if variant in {"mixed", "script-switching"}
-                                    else ()
-                                ),
-                            )
-                        ),
-                        guidance_ids=technique.guidance_ids,
-                        derived_from_ids=technique.derived_from_ids,
-                        combination_source_ids=technique.combination_source_ids,
-                        semantic_id=technique.resolved_semantic_id,
-                        strategy_id=technique.strategy_id,
-                        transform_id=variant,
-                        transform_spec=transform_spec,
-                        language=language,
-                        domain_id=technique.domain_id,
-                        hypothesis_id=technique.hypothesis_id,
-                        equivalence_key=technique.equivalence_key,
-                        execution_role=technique.execution_role,
-                        control_technique_id=(
-                            f"{technique.control_technique_id}@lang={language}@variant={variant}"
-                            if technique.control_technique_id
-                            else None
-                        ),
-                        oracle_digest=technique.oracle_digest,
-                        control_objective=(
-                            None
-                            if technique.control_objective is None
-                            else f"{technique.control_objective}\n\nLanguage cell: {language}; "
-                            f"transformation: {variant}. Preserve benign semantics."
-                        ),
-                        control_guidance_ids=technique.control_guidance_ids,
-                        control_oracle_digest=technique.control_oracle_digest,
-                        comparison_policy=technique.comparison_policy,
-                        comparison_supported=technique.comparison_supported,
-                        comparison_block_reason=technique.comparison_block_reason,
-                        evaluation_uncertainties=tuple(strategy_uncertainties),
-                        strategy_contract=tuple(sorted(strategy_contract.items())),
-                        max_target_exchanges=technique.max_target_exchanges,
-                        max_control_target_exchanges=technique.max_control_target_exchanges,
-                        mutation_seed=technique.mutation_seed,
+                        family_id=technique.id,
+                        ordinal=len(references),
+                        requested_language=language,
+                        variant_id=variant,
                     )
                 )
+    return tuple(references)
+
+
+def materialize_language_technique(
+    technique: AssignmentTechnique,
+    frontier: LanguageFrontierSpec,
+    reference: LanguageCandidateReference,
+) -> AssignmentTechnique:
+    """Materialize one reviewed language candidate from its compact identity."""
+
+    if reference.family_id != technique.id:
+        raise ValueError("language candidate does not belong to the supplied technique family")
+    normalized = (
+        technique
+        if technique.comparison_supported and technique.comparison_block_reason is None
+        else replace(technique, comparison_supported=True, comparison_block_reason=None)
+    )
+    if reference.id == technique.id:
+        if (
+            normalized.strategy_id in {"crescendo", "goat", "hydra-select"}
+            or normalized.language.casefold() != reference.requested_language
+            or normalized.transform_id != reference.variant_id
+            or normalized.language.casefold() not in frontier.planned_languages
+        ):
+            raise ValueError("explicit language candidate does not match its reviewed family")
+        return normalized
+    expected_id = (
+        f"{technique.id}@lang={reference.requested_language}@variant={reference.variant_id}"
+    )
+    if reference.id != expected_id:
+        raise ValueError("language candidate id does not match its reviewed dimensions")
+    if reference.variant_id not in frontier.variants_for(reference.requested_language):
+        raise ValueError("language candidate variant is outside the reviewed frontier")
+    language = reference.requested_language
+    variant = reference.variant_id
+    metamorphic_oracle_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "source_id": normalized.id,
+                    "oracle_digest": normalized.oracle_digest,
+                    "control_oracle_digest": normalized.control_oracle_digest,
+                    "comparison_policy": normalized.comparison_policy,
+                    "language": language,
+                    "variant": variant,
+                    "claim": "language transformation preserves the reviewed comparison oracle",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    objective, transform_spec = materialize_transform_envelope(
+        normalized.id,
+        normalized.objective,
+        transform_id=variant,
+        default_language=frontier.default_language,
+        target_language=language,
+        metamorphic_oracle_digest=metamorphic_oracle_digest,
+    )
+    strategy_contract = dict(normalized.strategy_contract)
+    strategy_uncertainties = list(normalized.evaluation_uncertainties)
+    if normalized.strategy_id in {"crescendo", "goat", "hydra-select"}:
+        repaired_fields = {"language": language}
+        if normalized.strategy_id in {"goat", "hydra-select"}:
+            repaired_fields["goal_digest"] = _digest(objective)
+        changed = tuple(
+            key for key, value in repaired_fields.items() if strategy_contract.get(key) != value
+        )
+        projected = (*changed, "transform")
+        strategy_contract.update(repaired_fields)
+        if projected:
+            strategy_uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "campaign.language_expansion",
+                    "reason": (
+                        "adaptive evaluator metadata was projected onto the concrete "
+                        f"language cell: {', '.join(projected)}"
+                    ),
+                    "confidence": 0.0,
+                    "affects": ["evaluation"],
+                }
+            )
+    cell = AssignmentTechnique(
+        id=reference.id,
+        objective=objective,
+        tags=frozenset(
+            (
+                *normalized.tags,
+                "language",
+                f"language:{language}",
+                f"language-variant:{variant}",
+                *(("multilingual",) if language != frontier.default_language else ()),
+                *(("code-switching",) if variant in {"mixed", "script-switching"} else ()),
+            )
+        ),
+        guidance_ids=normalized.guidance_ids,
+        derived_from_ids=normalized.derived_from_ids,
+        combination_source_ids=normalized.combination_source_ids,
+        semantic_id=normalized.resolved_semantic_id,
+        strategy_id=normalized.strategy_id,
+        transform_id=variant,
+        transform_spec=transform_spec,
+        language=language,
+        domain_id=normalized.domain_id,
+        hypothesis_id=normalized.hypothesis_id,
+        equivalence_key=normalized.equivalence_key,
+        execution_role=normalized.execution_role,
+        control_technique_id=(
+            f"{normalized.control_technique_id}@lang={language}@variant={variant}"
+            if normalized.control_technique_id
+            else None
+        ),
+        oracle_digest=normalized.oracle_digest,
+        control_objective=(
+            None
+            if normalized.control_objective is None
+            else f"{normalized.control_objective}\n\nLanguage cell: {language}; "
+            f"transformation: {variant}. Preserve benign semantics."
+        ),
+        control_guidance_ids=normalized.control_guidance_ids,
+        control_oracle_digest=normalized.control_oracle_digest,
+        comparison_policy=normalized.comparison_policy,
+        comparison_supported=normalized.comparison_supported,
+        comparison_block_reason=normalized.comparison_block_reason,
+        evaluation_uncertainties=tuple(strategy_uncertainties),
+        strategy_contract=tuple(sorted(strategy_contract.items())),
+        max_target_exchanges=normalized.max_target_exchanges,
+        max_control_target_exchanges=normalized.max_control_target_exchanges,
+        mutation_seed=normalized.mutation_seed,
+    )
+    verify_transform_envelope(
+        transform_spec,
+        source_id=normalized.id,
+        source_prompt=normalized.objective,
+        envelope_prompt=cell.objective,
+    )
+    return cell
+
+
+def expand_language_techniques(
+    techniques: tuple[AssignmentTechnique, ...], language_policy: object
+) -> tuple[AssignmentTechnique, ...]:
+    """Compatibility wrapper that eagerly materializes a compact language frontier."""
+
+    frontier = language_frontier_spec(language_policy)
+    if frontier is None:
+        return techniques
+    references = enumerate_language_candidate_references(techniques, frontier)
+    techniques_by_id = {item.id: item for item in techniques}
+    cells = tuple(
+        materialize_language_technique(techniques_by_id[reference.family_id], frontier, reference)
+        for reference in references
+    )
     identities: dict[str, str] = {}
     for cell in cells:
-        spec = cell.transform_spec
-        if spec is None:
-            raise ValueError("language transform is missing its sealed specification")
-        prior = identities.setdefault(cell.id, spec.spec_digest)
-        if prior != spec.spec_digest:
+        if cell.transform_spec is None:
+            continue
+        prior = identities.setdefault(cell.id, cell.transform_spec.spec_digest)
+        if prior != cell.transform_spec.spec_digest:
             raise ValueError(f"colliding language transform cell: {cell.id}")
-        source = next((item for item in techniques if item.id == spec.source_id), None)
-        if source is None:
-            raise ValueError("language transform source is not admitted")
-        verify_transform_envelope(
-            spec,
-            source_id=source.id,
-            source_prompt=source.objective,
-            envelope_prompt=cell.objective,
-        )
-    return (*explicit, *cells)
+    return cells
 
 
 def bound_recommended_techniques(

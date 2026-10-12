@@ -32,19 +32,11 @@ CELL_OUTCOMES = frozenset(
 # cells, so cross-campaign learning ranks it instead of starving on it.
 PARTIAL_CELL_OUTCOME = "partial"
 
-# Non-baseline language cells are deferred until the language shows target
-# signal. ``confirmed``, ``partial``, and ``unclear`` mean the target produced
-# something other than a clean refusal (``refuted``) or an infrastructure
-# failure (``blocked``/``blocked_terminal``), so the language is worth its
-# budget.
-LANGUAGE_SIGNAL_OUTCOMES = frozenset({"confirmed", "partial", "unclear"})
+# Legacy journals may still contain this outcome; new plans do not emit it.
 LANGUAGE_DEFERRAL_OUTCOME = "deferred"
 
-# The ten most-spoken languages (front of _SECURITY_LANGUAGE_FRONTIER in the
-# TUI bootstrap). LLM-backed targets engage in them with near-certainty, and
-# the profile cell cap bounds the spend, so these run without per-target
-# engagement evidence. The long tail stays probe/evidence-gated.
-UNCONDITIONAL_LANGUAGES = frozenset({"en", "zh", "hi", "es", "ar", "fr", "bn", "pt", "ru", "ur"})
+# Language evidence guides ordering; it never removes an authorized cell.
+LANGUAGE_SIGNAL_OUTCOMES = frozenset({"confirmed", "partial", "unclear"})
 
 CellParts = tuple[str, str, str, str, str]
 """Technique, controller, transform, language, and mutation variant identity."""
@@ -53,16 +45,51 @@ CellParts = tuple[str, str, str, str, str]
 def technique_cell_parts(technique: Any) -> CellParts:
     """Project one assignment technique onto its stable history-cell identity."""
 
-    mutation_seed = str(getattr(technique, "mutation_seed", None) or "").strip()
+    return concrete_cell_parts(
+        technique_id=technique.id,
+        controller_id=technique.strategy_id,
+        payload_family=technique.transform_id,
+        language_id=getattr(technique, "language", "und"),
+        mutation_seed=getattr(technique, "mutation_seed", None),
+    )
+
+
+def concrete_cell_parts(
+    *,
+    technique_id: object,
+    controller_id: object,
+    payload_family: object,
+    language_id: object,
+    mutation_seed: object,
+) -> CellParts:
+    """Build one exact history identity without materializing a rich candidate."""
+
+    normalized_seed = str(mutation_seed or "").strip()
     mutation_id = (
-        "none" if not mutation_seed else "sha256:" + sha256(mutation_seed.encode()).hexdigest()
+        "none"
+        if not normalized_seed
+        else "sha256:" + sha256(normalized_seed.encode()).hexdigest()
     )
     return (
-        str(technique.id),
-        str(technique.strategy_id),
-        str(technique.transform_id),
-        str(getattr(technique, "language", "und")),
+        str(technique_id),
+        str(controller_id),
+        str(payload_family),
+        str(language_id),
         mutation_id,
+    )
+
+
+def language_reference_cell_parts(family: Any, reference: Any) -> CellParts:
+    """Project a compact language reference onto its exact durable history key."""
+
+    if str(reference.family_id) != str(family.id):
+        raise ValueError("language candidate does not belong to its history family")
+    return concrete_cell_parts(
+        technique_id=reference.id,
+        controller_id=family.strategy_id,
+        payload_family=reference.variant_id,
+        language_id=reference.requested_language,
+        mutation_seed=getattr(family, "mutation_seed", None),
     )
 
 
@@ -100,18 +127,9 @@ def plan_skip(
     variant never revokes a conclusive result. Selective validation that
     genuinely requires another exchange must be represented as its own cell.
 
-    Language admission is evidence-gated for the long tail: baseline-language
-    cells (the campaign default language or unmarked ``und``) always run first,
-    and the ten most-spoken languages (``UNCONDITIONAL_LANGUAGES``) run
-    unconditionally — LLM-backed targets engage in them with near-certainty
-    and the profile cell cap bounds the spend. Any other non-baseline language
-    cell is admitted only when that language already
-    has signal for this target — a prior attempt whose outcome was anything
-    other than a clean refusal or an infrastructure failure, or an explicit
-    ``signal_languages`` entry (e.g. from a capability probe that observed
-    the target engaging in that language). Ungated cells are deferred, not
-    dropped: each deferral is journaled with its reason so the completion
-    document lists it as deferred coverage.
+    Baseline and observed-language cells rank first. Missing engagement
+    evidence, a clean refusal, or infrastructure failure never excludes a
+    different language cell from the runnable plan.
     """
 
     skipped_by_cell: dict[CellParts, dict[str, object]] = {}
@@ -152,41 +170,14 @@ def plan_skip(
             if language:
                 signalled.add(language)
     baseline = {"und", default_language.strip().casefold() or "en"}
-    for technique in techniques:
-        if str(technique.id).startswith("hypothesis:"):
-            continue
-        cell_parts = technique_cell_parts(technique)
-        if cell_parts in skipped_by_cell:
-            continue
-        _, controller_id, payload_family, language_id, mutation_id = cell_parts
-        language = language_id.strip().casefold()
-        if not language or language in baseline or language in signalled:
-            continue
-        if language in UNCONDITIONAL_LANGUAGES:
-            continue
-        skipped_by_cell[cell_parts] = {
-            "technique_id": str(technique.id),
-            "controller_id": controller_id,
-            "payload_family": payload_family,
-            "language_id": language_id,
-            "mutation_id": mutation_id,
-            "outcome": LANGUAGE_DEFERRAL_OUTCOME,
-            "source_campaign_id": "",
-            "reason": (
-                f"language cell deferred: no recorded evidence that this target engages "
-                f"in {language_id!r} (no capability-probe confirmation and no prior "
-                "attempt with an outcome other than a clean refusal or infrastructure "
-                "failure); baseline-language cells run first"
-            ),
-        }
 
-    def _priority(technique: Any) -> int:
+    def _priority(technique: Any) -> tuple[int, int]:
         row = history.get(technique_cell_parts(technique))
-        if row is None:
-            return 0
-        # Partial priors rank behind untried and unclear/blocked cells; every
-        # other non-terminal outcome keeps its original catalogue order.
-        return 1 if normalize_outcome(row.get("outcome")) == PARTIAL_CELL_OUTCOME else 0
+        partial = int(
+            row is not None and normalize_outcome(row.get("outcome")) == PARTIAL_CELL_OUTCOME
+        )
+        language = str(getattr(technique, "language", "und")).strip().casefold()
+        return partial, int(language not in baseline and language not in signalled)
 
     runnable = tuple(
         sorted(

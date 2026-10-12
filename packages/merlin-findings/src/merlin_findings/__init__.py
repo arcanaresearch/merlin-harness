@@ -4,6 +4,7 @@ from .projection import (
     CampaignReportProjection,
     DurableReportService,
     EvidenceCitation,
+    FrontierSnapshotProvider,
     ReportRevisionRepository,
 )
 from .reporting import ReportFormat, accepted_findings, export_json, export_markdown, export_report
@@ -29,6 +30,7 @@ __all__ = [
     "CampaignReportProjection",
     "DurableReportService",
     "EvidenceCitation",
+    "FrontierSnapshotProvider",
     "ReportRevisionRepository",
     "Severity",
     "accepted_findings",

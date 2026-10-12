@@ -68,12 +68,21 @@ class CampaignReportProjection:
     completion_document: Mapping[str, Any] | None = None
     source_seal_state: Literal["sealed", "legacy_unsealed"] = "legacy_unsealed"
     digest_schema: Literal["v1", "v2"] = "v2"
+    # Loaded only while validating or rendering a v2 completion snapshot. These
+    # rows are deliberately excluded from the immutable report projection and
+    # its digest so the stored completion document remains bounded.
+    frontier_snapshot_rows: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
         object.__setattr__(self, "coverage", dict(self.coverage or {}))
         if self.completion_document is not None:
             object.__setattr__(self, "completion_document", dict(self.completion_document))
+        object.__setattr__(
+            self,
+            "frontier_snapshot_rows",
+            tuple(dict(row) for row in self.frontier_snapshot_rows),
+        )
 
 
 class ReportRevisionRepository(Protocol):
@@ -81,6 +90,27 @@ class ReportRevisionRepository(Protocol):
     def save(self, projection: CampaignReportProjection) -> CampaignReportProjection | None: ...
     def get(self, revision_id: str) -> CampaignReportProjection | None: ...
     def list(self, campaign_id: str) -> Sequence[CampaignReportProjection]: ...
+
+
+class FrontierSnapshotProvider(Protocol):
+    """Read an immutable completion frontier without embedding it in the seal."""
+
+    def get_frontier_completion_snapshot(
+        self, campaign_id: str, snapshot_id: str
+    ) -> Mapping[str, Any] | None: ...
+
+    def frontier_completion_counts(
+        self, campaign_id: str, snapshot_id: str
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_frontier_completion_page(
+        self,
+        campaign_id: str,
+        snapshot_id: str,
+        *,
+        limit: int = 100,
+        after_position: int = -1,
+    ) -> Sequence[Mapping[str, Any]]: ...
 
 
 FailureInjector = Callable[[str], None]
@@ -104,6 +134,38 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _normalize_frontier_snapshot_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild the canonical row shape used by campaign snapshot sealing."""
+    refs = row.get("evidence_refs", ())
+    if not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)):
+        raise ValueError("v2 completion frontier snapshot evidence refs are invalid")
+    normalized = {
+        "position": row.get("position"),
+        "candidate_id": str(row.get("candidate_id") or "").strip(),
+        "state": str(row.get("state") or "").strip(),
+        "outcome": str(row.get("outcome") or "").strip(),
+        "attempt_id": None
+        if row.get("attempt_id") is None
+        else str(row.get("attempt_id")).strip() or None,
+        "task_id": None
+        if row.get("task_id") is None
+        else str(row.get("task_id")).strip() or None,
+        "evidence_refs": [str(value).strip() for value in refs],
+        "disposition_reason": None
+        if row.get("disposition_reason") is None
+        else str(row.get("disposition_reason")).strip() or None,
+    }
+    if type(normalized["position"]) is not int or normalized["position"] < 0:
+        raise ValueError("v2 completion frontier snapshot position is invalid")
+    if not normalized["candidate_id"] or not normalized["state"] or not normalized["outcome"]:
+        raise ValueError("v2 completion frontier snapshot row is incomplete")
+    if any(not value for value in normalized["evidence_refs"]) or len(
+        set(normalized["evidence_refs"])
+    ) != len(normalized["evidence_refs"]):
+        raise ValueError("v2 completion frontier snapshot evidence refs are invalid")
+    return normalized
+
+
 class DurableReportService:
     """Create immutable report revisions from one explicit durable-state projection."""
 
@@ -112,9 +174,11 @@ class DurableReportService:
         repository: ReportRevisionRepository,
         *,
         failure_injector: FailureInjector | None = None,
+        frontier_snapshot_provider: FrontierSnapshotProvider | None = None,
     ) -> None:
         self._repository = repository
         self._inject = failure_injector or (lambda stage: None)
+        self._frontier_snapshots = frontier_snapshot_provider
 
     def create(
         self,
@@ -199,10 +263,11 @@ class DurableReportService:
                 raise ValueError("report completion seal requires a full SHA-256 digest")
             if completion_digest != _digest(sealed_completion):
                 raise ValueError("report completion seal digest does not match its document")
-            if (
-                sealed_completion.get("kind") != "campaign_completion"
-                or sealed_completion.get("schema") != "merlin.campaign-completion.v1"
-            ):
+            completion_schema = sealed_completion.get("schema")
+            if sealed_completion.get("kind") != "campaign_completion" or completion_schema not in {
+                "merlin.campaign-completion.v1",
+                "merlin.campaign-completion.v2",
+            }:
                 raise ValueError("report requires a supported campaign completion seal")
             if sealed_completion.get("stop_reason") != stop_reason:
                 raise ValueError("report stop reason conflicts with the completion seal")
@@ -210,19 +275,25 @@ class DurableReportService:
             sealed_document = sealed_completion.get("document")
             if not isinstance(sealed_document, Mapping) or inner_digest != _digest(sealed_document):
                 raise ValueError("report completion seal contains an invalid authority document")
+            if sealed_document.get("schema") != completion_schema:
+                raise ValueError("report completion seal schema conflicts with its authority document")
             required_fields = {
                 "schema",
                 "campaign_id",
                 "manifest_digest",
                 "target_id",
                 "profile",
-                "cells",
                 "waves",
                 "receipts",
                 "findings",
                 "cleanup",
                 "saturation",
             }
+            required_fields.add(
+                "cells"
+                if completion_schema == "merlin.campaign-completion.v1"
+                else "frontier_snapshot"
+            )
             if not required_fields.issubset(sealed_document):
                 raise ValueError("report completion authority document is incomplete")
             if sealed_document.get("campaign_id") != campaign_id:
@@ -231,6 +302,8 @@ class DurableReportService:
                 raise ValueError("report manifest conflicts with the completion seal")
             if (metadata or {}).get("profile") != sealed_document.get("profile"):
                 raise ValueError("report profile conflicts with the completion seal")
+            if completion_schema == "merlin.campaign-completion.v2":
+                self._load_frontier_snapshot(campaign_id, sealed_document)
             saturation = sealed_document.get("saturation")
             if stop_reason == "saturated" and (
                 not isinstance(saturation, Mapping) or saturation.get("ready") is not True
@@ -451,7 +524,117 @@ class DurableReportService:
                 projection.completion_document
             ):
                 raise ValueError("stored report completion seal drifted after publication")
+        sealed = projection.completion_document
+        document = sealed.get("document") if isinstance(sealed, Mapping) else None
+        if (
+            isinstance(sealed, Mapping)
+            and sealed.get("schema") == "merlin.campaign-completion.v2"
+            and isinstance(document, Mapping)
+        ):
+            projection = replace(
+                projection,
+                frontier_snapshot_rows=self._load_frontier_snapshot(
+                    projection.campaign_id, document
+                ),
+            )
         return projection
+
+    def _load_frontier_snapshot(
+        self, campaign_id: str, authority_document: Mapping[str, Any]
+    ) -> tuple[Mapping[str, Any], ...]:
+        header = authority_document.get("frontier_snapshot")
+        if not isinstance(header, Mapping):
+            raise ValueError("v2 completion seal lacks a frontier snapshot header")
+        if not {"id", "reference", "row_digest", "total_count", "counts", "sample"}.issubset(
+            header
+        ):
+            raise ValueError("v2 completion frontier snapshot header is incomplete")
+        snapshot_id = str(header.get("id") or "").strip()
+        reference = str(header.get("reference") or "").strip()
+        expected_reference = f"merlin-frontier-snapshot:{campaign_id}:{snapshot_id}"
+        if not snapshot_id or reference != expected_reference:
+            raise ValueError("v2 completion seal has an invalid frontier snapshot reference")
+        provider = self._frontier_snapshots
+        if provider is None:
+            raise ValueError("v2 completion seal requires a frontier snapshot provider")
+        stored_header = provider.get_frontier_completion_snapshot(campaign_id, snapshot_id)
+        stored_counts = provider.frontier_completion_counts(campaign_id, snapshot_id)
+        if stored_header is None or stored_counts is None:
+            raise ValueError("v2 completion frontier snapshot is unavailable")
+        if str(stored_header.get("id") or "") != snapshot_id:
+            raise ValueError("v2 completion frontier snapshot identity conflicts with storage")
+        for key in ("row_digest", "total_count", "counts"):
+            if _json_value(header.get(key)) != _json_value(stored_header.get(key)):
+                raise ValueError(f"v2 completion frontier snapshot {key} conflicts with storage")
+            if _json_value(header.get(key)) != _json_value(stored_counts.get(key)):
+                raise ValueError(f"v2 completion frontier snapshot {key} count projection drifted")
+
+        total_count = header.get("total_count")
+        if type(total_count) is not int or total_count < 0:
+            raise ValueError("v2 completion frontier snapshot total count is invalid")
+        rows: list[Mapping[str, Any]] = []
+        after_position = -1
+        while len(rows) < total_count:
+            page = tuple(
+                provider.list_frontier_completion_page(
+                    campaign_id,
+                    snapshot_id,
+                    limit=min(500, total_count - len(rows)),
+                    after_position=after_position,
+                )
+            )
+            if not page:
+                raise ValueError("v2 completion frontier snapshot ended before its declared count")
+            normalized = tuple(_normalize_frontier_snapshot_row(row) for row in page)
+            positions = tuple(row["position"] for row in normalized)
+            if positions[0] != after_position + 1 or positions != tuple(
+                range(positions[0], positions[0] + len(positions))
+            ):
+                raise ValueError("v2 completion frontier snapshot positions are not contiguous")
+            rows.extend(normalized)
+            after_position = positions[-1]
+        extra = provider.list_frontier_completion_page(
+            campaign_id, snapshot_id, limit=1, after_position=after_position
+        )
+        if extra:
+            raise ValueError("v2 completion frontier snapshot exceeds its declared count")
+        candidate_ids = tuple(str(row["candidate_id"]) for row in rows)
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("v2 completion frontier snapshot candidate ids are not unique")
+        actual_counts = {
+            "states": {
+                state: sum(row["state"] == state for row in rows)
+                for state in ("queued", "claimed", "scheduled", "terminal")
+            },
+            "outcomes": {
+                outcome: sum(row["outcome"] == outcome for row in rows)
+                for outcome in (
+                    "confirmed",
+                    "refuted",
+                    "partial",
+                    "unclear",
+                    "blocked",
+                    "retryable",
+                    "unattempted",
+                )
+            },
+        }
+        if actual_counts != _json_value(header.get("counts")):
+            raise ValueError("v2 completion frontier snapshot counts do not match its rows")
+        calculated = _digest({"schema_version": 1, "rows": rows}).removeprefix("sha256:")
+        declared_digest = str(header.get("row_digest") or "").removeprefix("sha256:")
+        if not re.fullmatch(r"[0-9a-f]{64}", declared_digest) or calculated != declared_digest:
+            raise ValueError("v2 completion frontier snapshot row digest does not match")
+        sample = header.get("sample", ())
+        if not isinstance(sample, Sequence) or isinstance(sample, (str, bytes)) or len(sample) > 32:
+            raise ValueError("v2 completion frontier snapshot sample is invalid")
+        normalized_sample = tuple(
+            _normalize_frontier_snapshot_row(row) if isinstance(row, Mapping) else None
+            for row in sample
+        )
+        if any(row is None for row in normalized_sample) or tuple(rows[: len(sample)]) != normalized_sample:
+            raise ValueError("v2 completion frontier snapshot sample conflicts with its rows")
+        return tuple(rows)
 
 
 def _recorded_cost_details(
@@ -1451,6 +1634,24 @@ def _candidate_ledger(value: CampaignReportProjection) -> tuple[_CandidateLedger
                             },
                         )
                     )
+    source_rows.extend(
+        (
+            "completion",
+            {
+                "id": row["candidate_id"],
+                "candidate_id": row["candidate_id"],
+                "technique_id": row["candidate_id"],
+                "outcome": row["outcome"],
+                "status": row["state"],
+                "attempt_id": row.get("attempt_id"),
+                "task_id": row.get("task_id"),
+                "evidence_references": tuple(row.get("evidence_refs", ())),
+                "reason": row.get("disposition_reason"),
+                "retryable": row["outcome"] == "retryable",
+            },
+        )
+        for row in value.frontier_snapshot_rows
+    )
     skips = value.metadata.get("technique_skips", ())
     if isinstance(skips, (tuple, list)):
         source_rows.extend(
