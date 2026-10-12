@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from merlin_contracts import (
     GOAT_TOOLBOX_CATALOG_DIGEST,
     HYDRA_SELECT_CATALOG_DIGEST,
+    AttemptDisposition,
     TechniqueAttempt,
     TechniqueAttemptControlKind,
     TechniqueAttemptState,
@@ -68,9 +69,7 @@ class ScheduleArtifactTooLarge(ValueError):
 
 def _bounded_schedule_jsonb(value: object, *, artifact: str) -> tuple[Jsonb, str]:
     """Build a bounded JSONB parameter and digest from one canonical serialization."""
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode()
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     size = len(encoded)
     if size > _MAX_SCHEDULE_JSONB_BYTES:
         raise ScheduleArtifactTooLarge(
@@ -4900,6 +4899,10 @@ class DurableSchedulerStore:
         evidence_refs: Sequence[str] = (),
         usage: Mapping[str, object] | None = None,
         strategy_state: Mapping[str, object] | None = None,
+        disposition: str | None = None,
+        disposition_reason: str | None = None,
+        physical_state_identity: str | None = None,
+        state_identity_match: bool | None = None,
     ) -> None:
         TechniqueAttemptRepository(self.connection).terminalize(
             attempt_id,
@@ -4908,6 +4911,10 @@ class DurableSchedulerStore:
             evidence_refs=tuple(evidence_refs),
             usage=usage,
             strategy_state=strategy_state,
+            disposition=None if disposition is None else AttemptDisposition(disposition),
+            disposition_reason=disposition_reason,
+            physical_state_identity=physical_state_identity,
+            state_identity_match=state_identity_match,
         )
 
     def list_technique_attempts(self, schedule_id: str) -> tuple[TechniqueAttempt, ...]:

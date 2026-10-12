@@ -27,6 +27,16 @@ class TechniqueAttemptControlKind(StrEnum):
     VALIDATION = "validation"
 
 
+class AttemptDisposition(StrEnum):
+    """Whether one execution is eligible to teach attack-quality learning."""
+
+    VALID = "valid"
+    CONTAMINATED = "contaminated"
+    PROTOCOL_INVALID = "protocol_invalid"
+    INFRASTRUCTURE_FAILED = "infrastructure_failed"
+    UNCERTAIN = "uncertain"
+
+
 TERMINAL_TECHNIQUE_ATTEMPT_STATES = frozenset(
     {
         TechniqueAttemptState.CONFIRMED,
@@ -68,6 +78,10 @@ class TechniqueAttempt(BaseModel):
     provider: str | None = None
     model: str | None = None
     usage: dict[str, object] = Field(default_factory=dict)
+    physical_state_identity: str | None = Field(default=None, min_length=1)
+    state_identity_match: bool | None = None
+    disposition: AttemptDisposition | None = None
+    disposition_reason: str | None = None
     terminal_reason: str | None = None
     created_at: datetime | None = None
     activated_at: datetime | None = None
@@ -85,6 +99,14 @@ class TechniqueAttempt(BaseModel):
             raise ValueError("terminal technique-attempt state and terminal_at must agree")
         if terminal != bool((self.terminal_reason or "").strip()):
             raise ValueError("terminal technique-attempt state requires one terminal reason")
+        if (self.disposition is None) != (self.disposition_reason is None):
+            raise ValueError("technique-attempt disposition and reason must be recorded together")
+        if self.disposition_reason is not None and not self.disposition_reason.strip():
+            raise ValueError("technique-attempt disposition reason cannot be empty")
+        if self.disposition is not None and not terminal:
+            raise ValueError("technique-attempt disposition is valid only for terminal attempts")
+        if self.state_identity_match is not None and self.physical_state_identity is None:
+            raise ValueError("state identity comparison requires a physical state identity")
         if self.state != TechniqueAttemptState.PLANNED and self.activated_at is None:
             raise ValueError("a started technique attempt requires activated_at")
         return self

@@ -252,6 +252,33 @@ def test_technique_attempt_observes_without_claiming_verdict(
             assert observed.terminal_reason is None
 
 
+def test_terminal_attempt_persists_validity_and_physical_state_identity(tmp_path: Path) -> None:
+    identifier = str(uuid4())
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-disposition")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            repository = TechniqueAttemptRepository(connection)
+            repository.begin(_attempt(identifier))
+            repository.transition(
+                identifier,
+                TechniqueAttemptState.PLANNED,
+                TechniqueAttemptState.ACTIVE,
+            )
+            terminal = repository.terminalize(
+                identifier,
+                TechniqueAttemptState.REFUTED,
+                reason="target-authored state regressed",
+                disposition="valid",
+                disposition_reason="reviewed target state comparison",
+                physical_state_identity="sha256:physical-run-a",
+                state_identity_match=True,
+            )
+            assert terminal.disposition.value == "valid"
+            assert terminal.disposition_reason == "reviewed target state comparison"
+            assert terminal.physical_state_identity == "sha256:physical-run-a"
+            assert terminal.state_identity_match is True
+
+
 def test_authoritative_terminalization_persists_exact_identity_and_authority(
     tmp_path: Path,
 ) -> None:

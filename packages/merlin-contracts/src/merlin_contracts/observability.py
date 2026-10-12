@@ -5,6 +5,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .attempts import AttemptDisposition
+
 
 class InfrastructureFailureCategory(StrEnum):
     ADAPTER_TIMEOUT = "adapter_timeout"
@@ -29,6 +31,15 @@ class ArmOutcomeKind(StrEnum):
     CLEAN_NEGATIVE = "clean_negative"
     INFRASTRUCTURE_FAILURE = "infrastructure_failure"
     AMBIGUOUS = "ambiguous"
+
+
+class OutcomeAuthority(StrEnum):
+    """Source allowed to establish an attack-quality result."""
+
+    TARGET = "target"
+    VALIDATOR = "validator"
+    ADVISORY = "advisory"
+    NONE = "none"
 
 
 class LanguageEvidenceStatus(StrEnum):
@@ -175,6 +186,8 @@ class ArmOutcome(BaseModel):
     language_evidence_status: LanguageEvidenceStatus
     language_evidence_source: str = Field(min_length=1)
     outcome: ArmOutcomeKind
+    attempt_disposition: AttemptDisposition | None = None
+    outcome_authority: OutcomeAuthority | None = None
     counters: CampaignCounters
     evidence_refs: tuple[str, ...] = Field(min_length=1)
     signal: float | None = None
@@ -201,4 +214,21 @@ class ArmOutcome(BaseModel):
             raise ValueError(
                 "infrastructure failure outcomes require an infrastructure-failure count"
             )
+        if self.attempt_disposition == AttemptDisposition.VALID and self.outcome_authority not in {
+            OutcomeAuthority.TARGET,
+            OutcomeAuthority.VALIDATOR,
+        }:
+            raise ValueError("valid ARM outcomes require target or validator authority")
+        if self.attempt_disposition not in {None, AttemptDisposition.VALID} and (
+            self.outcome_authority in {OutcomeAuthority.TARGET, OutcomeAuthority.VALIDATOR}
+        ):
+            raise ValueError("non-valid ARM outcomes cannot claim authoritative quality evidence")
         return self
+
+    @property
+    def learning_eligible(self) -> bool:
+        """Return whether this outcome may update ARM quality or lifecycle."""
+        return self.attempt_disposition == AttemptDisposition.VALID and self.outcome_authority in {
+            OutcomeAuthority.TARGET,
+            OutcomeAuthority.VALIDATOR,
+        }

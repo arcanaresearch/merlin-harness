@@ -786,11 +786,9 @@ async def test_v2_frontier_snapshot_pages_record_only_concrete_outcome_history()
         ):
             assert campaign_id == "campaign-1"
             assert snapshot_id == "snapshot-1"
-            return tuple(
-                row
-                for row in snapshot_rows
-                if int(row["position"]) > after_position
-            )[:limit]
+            return tuple(row for row in snapshot_rows if int(row["position"]) > after_position)[
+                :limit
+            ]
 
     store = SnapshotStore()
     store.rows["campaign-1"] = {

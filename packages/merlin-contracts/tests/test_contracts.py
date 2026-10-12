@@ -10,6 +10,7 @@ from merlin_contracts import (
     AttackCase,
     AttackPack,
     AttackPathStep,
+    AttemptDisposition,
     AttemptProjection,
     CampaignObservation,
     ChatMessage,
@@ -71,6 +72,38 @@ def test_tool_context_distinguishes_scheduler_and_technique_attempts() -> None:
 
     assert context.attempt_id == "scheduler-attempt-1"
     assert context.technique_attempt_id == "technique-attempt-1"
+
+
+def test_terminal_attempt_records_auditable_retryable_disposition() -> None:
+    attempt = TechniqueAttempt(
+        id="00000000-0000-0000-0000-000000000003",
+        campaign_id="campaign-1",
+        wave=1,
+        task_id="worker-1",
+        technique_id="prompt-injection/direct",
+        strategy_id="direct",
+        control_kind="attack",
+        oracle_digest="sha256:" + "a" * 64,
+        state=TechniqueAttemptState.AMBIGUOUS,
+        physical_state_identity="run/shared-1",
+        state_identity_match=False,
+        disposition=AttemptDisposition.CONTAMINATED,
+        disposition_reason="physical target state was shared with another attempt",
+        terminal_reason="result cannot be attributed to this candidate",
+        terminal_at=datetime(2030, 1, 1, tzinfo=UTC),
+        activated_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    assert attempt.disposition == AttemptDisposition.CONTAMINATED
+    assert attempt.state_identity_match is False
+
+    with pytest.raises(ValidationError, match="comparison requires"):
+        TechniqueAttempt(
+            **{
+                **attempt.model_dump(),
+                "physical_state_identity": None,
+            }
+        )
 
 
 def test_chat_request_rejects_unknown_roles() -> None:

@@ -10,6 +10,7 @@ from .api_session_store import (
     CampaignApiSession,
     CampaignApiSessionRepository,
     CleanupDisposition,
+    PhysicalStateClaim,
     RemoteSessionClaimConflict,
 )
 from .automation_store import PostgresAutomationJournal
@@ -67,6 +68,7 @@ __all__ = [
     "CampaignApiSessionRepository",
     "CleanupDisposition",
     "LEGACY_API_SESSION_SCOPE_ID",
+    "PhysicalStateClaim",
     "BrowserRepository",
     "CampaignStore",
     "CampaignObservabilityRepository",

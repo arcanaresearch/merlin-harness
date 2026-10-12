@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Literal
+from uuid import uuid4
 
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
@@ -44,6 +45,7 @@ class CampaignApiSession:
     generation: int = 1
     session_scope_id: str = LEGACY_API_SESSION_SCOPE_ID
     remote_session_id: str | None = None
+    physical_state_identity: str | None = None
     cleanup_disposition: CleanupDisposition | None = None
 
     @property
@@ -56,6 +58,19 @@ class CampaignApiSession:
             f"api:{self.campaign_id}:{self.target_id}:scope:{self.session_scope_id}:"
             f"generation:{self.generation}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalStateClaim:
+    """Active ownership plus durable evidence of earlier physical-state aliases."""
+
+    session: CampaignApiSession
+    prior_session_scope_ids: tuple[str, ...] = ()
+    prior_cleanup_dispositions: tuple[CleanupDisposition | None, ...] = ()
+
+    @property
+    def previously_observed(self) -> bool:
+        return bool(self.prior_session_scope_ids)
 
 
 class CampaignApiSessionRepository:
@@ -102,6 +117,111 @@ class CampaignApiSessionRepository:
                 (campaign_id,),
             ).fetchall()
         return tuple(self._record(row) for row in rows)
+
+    def record_request_constraint(
+        self,
+        campaign_id: str,
+        *,
+        target_id: str,
+        adapter_digest: str,
+        constraint: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Persist an evidence-bound structured target rejection as preflight state."""
+        value = dict(constraint)
+        if value.get("schema") != "merlin.request-constraint-observation.v1":
+            raise ValueError("request constraint observation schema is invalid")
+        if value.get("source") != "structured_target_rejection":
+            raise ValueError("request constraint must come from a structured target rejection")
+        required_strings = {
+            "step_id": value.get("step_id"),
+            "path": value.get("path"),
+            "kind": value.get("kind"),
+            "unit": value.get("unit"),
+            "binding_digest": value.get("binding_digest"),
+        }
+        if any(not isinstance(item, str) or not item for item in required_strings.values()):
+            raise ValueError("request constraint identity is incomplete")
+        maximum = value.get("maximum")
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+            raise ValueError("request constraint maximum must be a positive integer")
+        if value.get("satisfied") is not False:
+            raise ValueError("only observed request constraint violations may be persisted")
+        evidence_refs = value.get("evidence_refs")
+        evidence_bindings = value.get("evidence_bindings")
+        if not isinstance(evidence_refs, list) or not evidence_refs:
+            raise ValueError("request constraint requires evidence references")
+        if not isinstance(evidence_bindings, list) or not evidence_bindings:
+            raise ValueError("request constraint requires evidence bindings")
+        if required_strings["unit"] not in {"unicode_characters", "utf8_bytes"}:
+            raise ValueError("request constraint unit is invalid")
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """INSERT INTO merlin_storage.target_constraints
+                       (campaign_id, target_id, adapter_digest, step_id, request_path,
+                        constraint_kind, unit, maximum, binding_digest, evidence)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (
+                       campaign_id, target_id, adapter_digest, step_id, request_path,
+                       constraint_kind, unit
+                   ) DO UPDATE
+                   SET maximum = LEAST(
+                           merlin_storage.target_constraints.maximum,
+                           EXCLUDED.maximum
+                       ),
+                       binding_digest = CASE
+                           WHEN EXCLUDED.maximum < merlin_storage.target_constraints.maximum
+                           THEN EXCLUDED.binding_digest
+                           ELSE merlin_storage.target_constraints.binding_digest
+                       END,
+                       evidence = CASE
+                           WHEN EXCLUDED.maximum < merlin_storage.target_constraints.maximum
+                           THEN EXCLUDED.evidence
+                           ELSE merlin_storage.target_constraints.evidence
+                       END,
+                       updated_at = now()
+                   RETURNING *""",
+                (
+                    campaign_id,
+                    target_id,
+                    adapter_digest,
+                    required_strings["step_id"],
+                    required_strings["path"],
+                    required_strings["kind"],
+                    required_strings["unit"],
+                    maximum,
+                    required_strings["binding_digest"],
+                    Jsonb(value),
+                ),
+            ).fetchone()
+        assert row is not None
+        stored = dict(row["evidence"])
+        stored["maximum"] = int(row["maximum"])
+        stored["binding_digest"] = str(row["binding_digest"])
+        return stored
+
+    def list_request_constraints(
+        self,
+        campaign_id: str,
+        *,
+        target_id: str,
+        adapter_digest: str,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return effective runtime constraints for one reviewed adapter."""
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT maximum, binding_digest, evidence
+                   FROM merlin_storage.target_constraints
+                   WHERE campaign_id = %s AND target_id = %s AND adapter_digest = %s
+                   ORDER BY step_id, request_path, constraint_kind, unit""",
+                (campaign_id, target_id, adapter_digest),
+            ).fetchall()
+        constraints: list[Mapping[str, object]] = []
+        for row in rows:
+            value = dict(row["evidence"])
+            value["maximum"] = int(row["maximum"])
+            value["binding_digest"] = str(row["binding_digest"])
+            constraints.append(value)
+        return tuple(constraints)
 
     def create(
         self,
@@ -174,6 +294,139 @@ class CampaignApiSessionRepository:
                 raise ValueError("campaign API session adapter identity changed")
             return record
 
+    def claim_target_execution(
+        self,
+        campaign_id: str,
+        *,
+        target_id: str,
+        session_scope_id: str,
+        claimant_id: str,
+        lease_seconds: int,
+        maximum_parallel_states: int = 1,
+    ) -> str | None:
+        """Claim one bounded setup-to-observation slot across daemon processes."""
+
+        claimant = claimant_id.strip()
+        if not claimant or lease_seconds < 1 or maximum_parallel_states < 1:
+            raise ValueError(
+                "target execution claims require a claimant, positive lease, and capacity"
+            )
+        claim_id = str(uuid4())
+        with self._lock, self.connection.transaction():
+            session = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.campaign_api_sessions
+                   WHERE campaign_id = %s AND target_id = %s AND session_scope_id = %s""",
+                (campaign_id, target_id, session_scope_id),
+            ).fetchone()
+            if session is None:
+                raise KeyError((campaign_id, target_id, session_scope_id))
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (target_id,),
+            )
+            self.connection.execute(
+                """DELETE FROM merlin_storage.target_execution_leases
+                   WHERE target_id = %s AND expires_at <= now()""",
+                (target_id,),
+            )
+            existing = self.connection.execute(
+                """UPDATE merlin_storage.target_execution_leases
+                   SET expires_at = now() + make_interval(secs => %s), updated_at = now()
+                   WHERE target_id = %s AND campaign_id = %s
+                     AND session_scope_id = %s AND claimant_id = %s
+                   RETURNING claim_id""",
+                (
+                    lease_seconds,
+                    target_id,
+                    campaign_id,
+                    session_scope_id,
+                    claimant,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["claim_id"])
+            active = self.connection.execute(
+                """SELECT count(*) AS count
+                   FROM merlin_storage.target_execution_leases
+                   WHERE target_id = %s""",
+                (target_id,),
+            ).fetchone()
+            if active is not None and int(active["count"]) >= maximum_parallel_states:
+                return None
+            available = self.connection.execute(
+                """SELECT candidate.slot_index
+                   FROM generate_series(0, %s - 1) AS candidate(slot_index)
+                   LEFT JOIN merlin_storage.target_execution_leases AS lease
+                     ON lease.target_id = %s
+                    AND lease.slot_index = candidate.slot_index
+                   WHERE lease.claim_id IS NULL
+                   ORDER BY candidate.slot_index
+                   LIMIT 1""",
+                (maximum_parallel_states, target_id),
+            ).fetchone()
+            if available is None:
+                return None
+            row = self.connection.execute(
+                """INSERT INTO merlin_storage.target_execution_leases
+                       (target_id, slot_index, claim_id, campaign_id, session_scope_id,
+                        claimant_id, expires_at)
+                   VALUES (%s, %s, %s, %s, %s, %s,
+                           now() + make_interval(secs => %s))
+                   RETURNING claim_id""",
+                (
+                    target_id,
+                    int(available["slot_index"]),
+                    claim_id,
+                    campaign_id,
+                    session_scope_id,
+                    claimant,
+                    lease_seconds,
+                ),
+            ).fetchone()
+            return None if row is None else str(row["claim_id"])
+
+    def renew_target_execution(self, claim_id: str, claimant_id: str, lease_seconds: int) -> bool:
+        """Renew live target execution ownership for its exact claimant."""
+
+        claimant = claimant_id.strip()
+        if not claim_id.strip() or not claimant or lease_seconds < 1:
+            raise ValueError("target execution renewal requires a claim, claimant, and lease")
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """UPDATE merlin_storage.target_execution_leases
+                   SET expires_at = now() + make_interval(secs => %s), updated_at = now()
+                   WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()
+                   RETURNING claim_id""",
+                (lease_seconds, claim_id, claimant),
+            ).fetchone()
+            return row is not None
+
+    def validate_target_execution(self, claim_id: str, claimant_id: str) -> bool:
+        """Return whether an exact claimant still owns its target execution fence."""
+
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.target_execution_leases
+                   WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()""",
+                (claim_id, claimant_id.strip()),
+            ).fetchone()
+        return row is not None
+
+    def release_target_execution(self, claim_id: str, claimant_id: str) -> bool:
+        """Release target execution ownership only for its exact claimant."""
+
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """DELETE FROM merlin_storage.target_execution_leases
+                   WHERE claim_id = %s AND claimant_id = %s RETURNING claim_id""",
+                (claim_id, claimant_id.strip()),
+            ).fetchone()
+            return row is not None
+
     def claim_remote_session(
         self,
         campaign_id: str,
@@ -217,6 +470,71 @@ class CampaignApiSessionRepository:
             raise RemoteSessionClaimConflict(
                 target_id=target_id,
                 remote_session_id=remote_session_id,
+                owner_session_scope_id=(None if owner is None else str(owner["session_scope_id"])),
+            ) from error
+
+    def claim_physical_state(
+        self,
+        campaign_id: str,
+        physical_state_identity: str,
+        *,
+        target_id: str,
+        session_scope_id: str,
+    ) -> PhysicalStateClaim:
+        """Claim reviewed physical state while retaining sequential alias history."""
+
+        identity = physical_state_identity.strip()
+        if not identity:
+            raise ValueError("physical state identity cannot be empty")
+        try:
+            with self._lock, self.connection.transaction():
+                prior = self.connection.execute(
+                    """SELECT session_scope_id, cleanup_disposition
+                       FROM merlin_storage.campaign_api_sessions
+                       WHERE target_id = %s AND physical_state_identity = %s
+                         AND NOT (
+                             campaign_id = %s AND session_scope_id = %s
+                         )
+                       ORDER BY updated_at, campaign_id, session_scope_id""",
+                    (target_id, identity, campaign_id, session_scope_id),
+                ).fetchall()
+                row = self.connection.execute(
+                    """UPDATE merlin_storage.campaign_api_sessions
+                       SET remote_session_id = %s, physical_state_identity = %s,
+                           updated_at = now()
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND session_scope_id = %s
+                         AND state IN ('active', 'ambiguous')
+                         AND (remote_session_id IS NULL OR remote_session_id = %s)
+                       RETURNING *""",
+                    (
+                        identity,
+                        identity,
+                        campaign_id,
+                        target_id,
+                        session_scope_id,
+                        identity,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("campaign API session cannot claim physical state")
+                return PhysicalStateClaim(
+                    session=self._record(row),
+                    prior_session_scope_ids=tuple(str(item["session_scope_id"]) for item in prior),
+                    prior_cleanup_dispositions=tuple(item["cleanup_disposition"] for item in prior),
+                )
+        except UniqueViolation as error:
+            with self._lock:
+                owner = self.connection.execute(
+                    """SELECT session_scope_id
+                       FROM merlin_storage.campaign_api_sessions
+                       WHERE target_id = %s AND remote_session_id = %s
+                         AND state <> 'cleaned' LIMIT 1""",
+                    (target_id, identity),
+                ).fetchone()
+            raise RemoteSessionClaimConflict(
+                target_id=target_id,
+                remote_session_id=identity,
                 owner_session_scope_id=(None if owner is None else str(owner["session_scope_id"])),
             ) from error
 
@@ -601,6 +919,11 @@ class CampaignApiSessionRepository:
             session_scope_id=str(value.get("session_scope_id") or LEGACY_API_SESSION_SCOPE_ID),
             remote_session_id=(
                 None if value.get("remote_session_id") is None else str(value["remote_session_id"])
+            ),
+            physical_state_identity=(
+                None
+                if value.get("physical_state_identity") is None
+                else str(value["physical_state_identity"])
             ),
             cleanup_disposition=value.get("cleanup_disposition"),
         )

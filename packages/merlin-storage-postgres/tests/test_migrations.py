@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from merlin_storage_postgres import (
@@ -12,7 +13,7 @@ from merlin_storage_postgres import (
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 82))
+    assert [migration.version for migration in migrations] == list(range(1, 84))
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -86,6 +87,8 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "'cleanup_requirement_unestablished'" in migrations[71].sql
     assert "ALTER COLUMN ttl_waves DROP NOT NULL" in migrations[72].sql
     assert "CREATE TABLE merlin_storage.campaign_capability_observations" in migrations[73].sql
+    assert "CREATE TABLE merlin_storage.campaign_frontier_transition_leases" in migrations[81].sql
+    assert "CREATE TABLE merlin_storage.target_constraints" in migrations[82].sql
     evidence = next(migration for migration in migrations if migration.version == 17)
     assert "CREATE TABLE merlin_storage.campaign_observations" in evidence.sql
     assert "CREATE TABLE IF NOT EXISTS merlin_storage.report_revisions" in migrations[17].sql
@@ -126,6 +129,61 @@ def test_api_session_scope_migration_reserves_legacy_rows(tmp_path: Path) -> Non
                 "session_scope_id": "legacy:campaign",
                 "remote_session_id": None,
             }
+
+
+def test_stateful_target_migration_preserves_legacy_attempts_conservatively(tmp_path: Path) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-stateful-legacy")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:81])
+            session = SessionRepository(connection).create("legacy stateful attempts")
+            CampaignStore(connection).prepare(
+                "campaign/legacy-stateful", str(session.id), {}, "sha256:legacy"
+            )
+            for identifier, technique_id, strategy_state in (
+                (
+                    "00000000-0000-0000-0000-000000000081",
+                    "technique/model-judged",
+                    {},
+                ),
+                (
+                    "00000000-0000-0000-0000-000000000082",
+                    "technique/target-authored",
+                    {"outcome_authority": {"kind": "target"}},
+                ),
+            ):
+                connection.execute(
+                    """INSERT INTO merlin_storage.campaign_technique_attempts
+                           (id, campaign_id, wave, task_id, technique_id, strategy_id,
+                            control_kind, oracle_digest, state, strategy_state,
+                            terminal_reason, activated_at, terminal_at)
+                       VALUES (%s, 'campaign/legacy-stateful', 0, %s, %s, 'direct',
+                               'attack', %s, 'refuted', %s::jsonb,
+                               'legacy terminal result', now(), now())""",
+                    (
+                        identifier,
+                        "worker/" + technique_id.rsplit("/", 1)[-1],
+                        technique_id,
+                        "sha256:" + "a" * 64,
+                        json.dumps(strategy_state),
+                    ),
+                )
+            connection.commit()
+
+            runner.apply(migrations[81:])
+
+            rows = connection.execute(
+                """SELECT technique_id, disposition, disposition_reason
+                   FROM merlin_storage.campaign_technique_attempts
+                   WHERE campaign_id = 'campaign/legacy-stateful'
+                   ORDER BY technique_id"""
+            ).fetchall()
+            assert [(row["technique_id"], row["disposition"]) for row in rows] == [
+                ("technique/model-judged", "uncertain"),
+                ("technique/target-authored", "valid"),
+            ]
+            assert all(row["disposition_reason"] for row in rows)
 
 
 def test_observability_migration_discards_only_partial_arm_learning_rows(tmp_path: Path) -> None:

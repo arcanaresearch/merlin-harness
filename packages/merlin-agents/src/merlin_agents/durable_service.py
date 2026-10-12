@@ -154,9 +154,7 @@ def _bounded_schedule_json(value: object, *, artifact: str) -> int:
     safety margin for driver and JSONB overhead, and fail while the caller can
     still reduce the execution batch instead of surfacing a database error.
     """
-    size = len(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-    )
+    size = len(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
     if size > _MAX_SCHEDULE_JSONB_BYTES:
         raise ScheduleArtifactTooLarge(
             artifact=artifact,
@@ -530,6 +528,21 @@ class DurableSchedulerStore(Protocol):
     ) -> bool: ...
 
     def complete_schedule(self, schedule_id: str) -> None: ...
+
+    def terminalize_technique_attempt(
+        self,
+        attempt_id: str,
+        state: str,
+        *,
+        reason: str,
+        evidence_refs: Sequence[str] = (),
+        usage: Mapping[str, object] | None = None,
+        strategy_state: Mapping[str, object] | None = None,
+        disposition: str | None = None,
+        disposition_reason: str | None = None,
+        physical_state_identity: str | None = None,
+        state_identity_match: bool | None = None,
+    ) -> None: ...
 
 
 class FindingDraftSink(Protocol):
@@ -3281,6 +3294,8 @@ class DurableAgentService:
                         reason="worker completed without an acknowledged target effect",
                         evidence_refs=(digest,),
                         usage=result.usage,
+                        disposition="uncertain",
+                        disposition_reason="no acknowledged target effect was available",
                     )
                     await self._record_terminal_arm_outcome(
                         assignment,
@@ -3290,10 +3305,15 @@ class DurableAgentService:
                         usage=result.usage,
                         evidence_refs=(digest,),
                         target_calls=0,
+                        attempt_disposition="uncertain",
+                        outcome_authority="none",
                     )
         else:
             failure_kind = self._retry_failure_kind(result)
             reason = result.error or result.status
+            worker_checkpoint = (
+                result.checkpoint if isinstance(result.checkpoint, Mapping) else None
+            )
             if result.error_code == "target_adapter_unhealthy":
                 reason = f"target adapter unhealthy: {reason}"
             elif result.infrastructure_failure_category is not None:
@@ -3313,8 +3333,12 @@ class DurableAgentService:
                 or result.usage
                 or result.infrastructure_failure_category
             ):
-                worker_checkpoint = await self._latest_worker_checkpoint(live.id, handle.node_id)
-                if worker_checkpoint is None and isinstance(result.checkpoint, Mapping):
+                stored_worker_checkpoint = await self._latest_worker_checkpoint(
+                    live.id, handle.node_id
+                )
+                if stored_worker_checkpoint is not None:
+                    worker_checkpoint = stored_worker_checkpoint
+                elif worker_checkpoint is None and isinstance(result.checkpoint, Mapping):
                     # In-memory and lightweight stores may not expose partial-result
                     # rows. The terminal worker result still carries the exact
                     # receipt/evaluation checkpoint that must survive settlement.
@@ -3444,6 +3468,9 @@ class DurableAgentService:
                     )
                 await self._retry_failed_node(live, handle.node_id)
             elif technique_attempt_id is not None:
+                receipt_projection = _nonvalid_attempt_receipt_projection(
+                    worker_checkpoint or {}, technique_attempt_id
+                )
                 retryable_infrastructure = failure_kind in {
                     RetryFailureKind.PROVIDER_TRUNCATED,
                     RetryFailureKind.PROVIDER_TRANSIENT,
@@ -3480,13 +3507,41 @@ class DurableAgentService:
                             evidence_refs=receipt_refs,
                             usage=result.usage,
                         )
-                elif (
-                    not retryable_infrastructure
-                    and (
-                        terminalizer := getattr(self._store, "terminalize_technique_attempt", None)
+                elif (receipt_projection is not None or not retryable_infrastructure) and (
+                    terminalizer := getattr(self._store, "terminalize_technique_attempt", None)
+                ) is not None:
+                    attempt_disposition = (
+                        str(receipt_projection["disposition"])
+                        if receipt_projection is not None
+                        else "infrastructure_failed"
+                        if result.infrastructure_failure_category is not None
+                        else "uncertain"
                     )
-                    is not None
-                ):
+                    disposition_reason = (
+                        str(receipt_projection["reason"])
+                        if receipt_projection is not None
+                        else reason
+                    )
+                    strategy_state = (
+                        dict(receipt_projection["strategy_state"])
+                        if receipt_projection is not None
+                        else {}
+                    )
+                    physical_state_identity = (
+                        receipt_projection["physical_state_identity"]
+                        if receipt_projection is not None
+                        else None
+                    )
+                    state_identity_match = (
+                        receipt_projection["state_identity_match"]
+                        if receipt_projection is not None
+                        else None
+                    )
+                    evidence_refs = (
+                        tuple(receipt_projection["evidence_refs"])
+                        if receipt_projection is not None and receipt_projection["evidence_refs"]
+                        else (f"technique-attempt:{technique_attempt_id}",)
+                    )
                     await self._call(
                         terminalizer,
                         technique_attempt_id,
@@ -3497,17 +3552,29 @@ class DurableAgentService:
                             if result.status == "quarantined"
                             else "blocked"
                         ),
-                        reason=reason,
+                        reason=disposition_reason,
+                        evidence_refs=evidence_refs,
                         usage=result.usage,
+                        strategy_state=strategy_state,
+                        disposition=attempt_disposition,
+                        disposition_reason=disposition_reason,
+                        physical_state_identity=physical_state_identity,
+                        state_identity_match=state_identity_match,
                     )
                     await self._record_terminal_arm_outcome(
                         assignment,
                         technique_attempt_id,
                         outcome="ambiguous",
-                        reason=reason,
+                        reason=disposition_reason,
                         usage=result.usage,
-                        evidence_refs=(f"technique-attempt:{technique_attempt_id}",),
-                        target_calls=0,
+                        evidence_refs=evidence_refs,
+                        target_calls=(
+                            int(receipt_projection["target_calls"])
+                            if receipt_projection is not None
+                            else 0
+                        ),
+                        attempt_disposition=attempt_disposition,
+                        outcome_authority="none",
                     )
 
     async def _await_worker_batch(
@@ -4882,23 +4949,168 @@ class DurableAgentService:
             if isinstance(raw_receipts, Sequence) and not isinstance(raw_receipts, (str, bytes))
             else ()
         )
-        authoritative = tuple(
+        attempt_receipts = tuple(
             item
             for item in receipts
             if isinstance(item, Mapping)
             and item.get("technique_attempt_id") == technique_attempt_id
-            and item.get("outcome_authority") == "target"
+            and isinstance(item.get("call_id"), str)
+            and bool(item.get("call_id"))
+        )
+        authoritative = tuple(
+            item
+            for item in attempt_receipts
+            if item.get("outcome_authority") == "target"
+            and item.get("attempt_disposition") == "valid"
             and item.get("target_authoritative_outcome") in {"confirmed", "refuted"}
             and isinstance(item.get("call_id"), str)
             and bool(item.get("call_id"))
         )
+        nonvalid_dispositions = {
+            str(item.get("attempt_disposition"))
+            for item in attempt_receipts
+            if item.get("attempt_disposition")
+            in {"contaminated", "protocol_invalid", "infrastructure_failed", "uncertain"}
+        }
         outcomes = {str(item["target_authoritative_outcome"]) for item in authoritative}
-        if len(outcomes) != 1:
+        if nonvalid_dispositions or len(outcomes) != 1:
+            if nonvalid_dispositions:
+                disposition = next(
+                    value
+                    for value in (
+                        "contaminated",
+                        "protocol_invalid",
+                        "infrastructure_failed",
+                        "uncertain",
+                    )
+                    if value in nonvalid_dispositions
+                )
+                matching = tuple(
+                    item
+                    for item in attempt_receipts
+                    if item.get("attempt_disposition") == disposition
+                )
+                reason = next(
+                    (
+                        str(item["disposition_reason"])
+                        for item in matching
+                        if isinstance(item.get("disposition_reason"), str)
+                        and bool(str(item["disposition_reason"]).strip())
+                    ),
+                    f"target attempt ended with {disposition} evidence",
+                )
+                child_candidates = {
+                    json.dumps(child, sort_keys=True, separators=(",", ":")): dict(child)
+                    for item in matching
+                    if isinstance((child := item.get("bounded_child_candidate")), Mapping)
+                    and isinstance(child.get("id"), str)
+                    and bool(child.get("id"))
+                }
+                constraint_observations = tuple(
+                    dict(observation)
+                    for item in matching
+                    for observation in (
+                        item.get("request_constraint_observations")
+                        if isinstance(item.get("request_constraint_observations"), Sequence)
+                        and not isinstance(
+                            item.get("request_constraint_observations"), (str, bytes)
+                        )
+                        else ()
+                    )
+                    if isinstance(observation, Mapping)
+                )
+                identities = {
+                    str(identity["selected_digest"])
+                    for item in matching
+                    if isinstance((identity := item.get("physical_state_identity")), Mapping)
+                    and isinstance(identity.get("selected_digest"), str)
+                    and bool(identity.get("selected_digest"))
+                }
+                physical_state_identity = next(iter(identities)) if len(identities) == 1 else None
+                identity_matches = {
+                    item["state_identity_match"]
+                    for item in matching
+                    if isinstance(item.get("state_identity_match"), bool)
+                }
+                state_identity_match = (
+                    next(iter(identity_matches))
+                    if physical_state_identity is not None and len(identity_matches) == 1
+                    else None
+                )
+                strategy_state = {
+                    "agenda_id": assignment.agenda_id or "",
+                    "execution_stage": assignment.execution_stage or "",
+                    "attempt_disposition": {"kind": disposition, "reason": reason},
+                    **(
+                        {"bounded_child_candidate": next(iter(child_candidates.values()))}
+                        if len(child_candidates) == 1
+                        else {}
+                    ),
+                    **(
+                        {"request_constraint_observations": list(constraint_observations)}
+                        if constraint_observations
+                        else {}
+                    ),
+                    **(
+                        {"physical_state_identity": physical_state_identity}
+                        if physical_state_identity is not None
+                        else {}
+                    ),
+                    **(
+                        {"state_identity_match": state_identity_match}
+                        if state_identity_match is not None
+                        else {}
+                    ),
+                }
+                await self._call(
+                    terminalizer,
+                    technique_attempt_id,
+                    "ambiguous",
+                    reason=reason,
+                    evidence_refs=(digest,),
+                    usage=usage,
+                    strategy_state=strategy_state,
+                    disposition=disposition,
+                    disposition_reason=reason,
+                    physical_state_identity=physical_state_identity,
+                    state_identity_match=state_identity_match,
+                )
+                await self._record_terminal_arm_outcome(
+                    assignment,
+                    technique_attempt_id,
+                    outcome="ambiguous",
+                    reason=reason,
+                    usage=usage,
+                    evidence_refs=(digest,),
+                    target_calls=len({str(item["call_id"]) for item in attempt_receipts}),
+                    attempt_disposition=disposition,
+                    outcome_authority="none",
+                )
             # Deterministic evaluator gates cannot retire an experiment. It remains
             # observed until target-owned evidence or a validator witness resolves it.
             return
         terminal_state = next(iter(outcomes))
         target_call_ids = tuple(sorted({str(item["call_id"]) for item in authoritative}))
+        physical_state_identities = {
+            str(identity["selected_digest"])
+            for item in authoritative
+            if isinstance((identity := item.get("physical_state_identity")), Mapping)
+            and isinstance(identity.get("selected_digest"), str)
+            and bool(identity.get("selected_digest"))
+        }
+        physical_state_identity = (
+            next(iter(physical_state_identities)) if len(physical_state_identities) == 1 else None
+        )
+        state_identity_matches = {
+            item["state_identity_match"]
+            for item in authoritative
+            if isinstance(item.get("state_identity_match"), bool)
+        }
+        state_identity_match = (
+            next(iter(state_identity_matches))
+            if physical_state_identity is not None and len(state_identity_matches) == 1
+            else None
+        )
         technique_id = assignment.semantic_technique_id or (
             assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None
         )
@@ -4933,6 +5145,20 @@ class DurableAgentService:
                 "evidence_refs": [digest],
                 "target_call_ids": list(target_call_ids),
             },
+            "attempt_disposition": {
+                "kind": "valid",
+                "reason": "target-authored outcome matched the reviewed oracle",
+            },
+            **(
+                {"physical_state_identity": physical_state_identity}
+                if physical_state_identity is not None
+                else {}
+            ),
+            **(
+                {"state_identity_match": state_identity_match}
+                if state_identity_match is not None
+                else {}
+            ),
         }
         await self._call(
             terminalizer,
@@ -4942,6 +5168,10 @@ class DurableAgentService:
             evidence_refs=(digest,),
             usage=usage,
             strategy_state=strategy_state,
+            disposition="valid",
+            disposition_reason="target-authored outcome matched the reviewed oracle",
+            physical_state_identity=physical_state_identity,
+            state_identity_match=state_identity_match,
         )
         await self._record_terminal_arm_outcome(
             assignment,
@@ -4953,6 +5183,8 @@ class DurableAgentService:
             usage=usage,
             evidence_refs=(digest,),
             target_calls=len(target_call_ids),
+            attempt_disposition="valid",
+            outcome_authority="target",
         )
 
     async def _record_terminal_arm_outcome(
@@ -4965,6 +5197,8 @@ class DurableAgentService:
         usage: Mapping[str, object] | None,
         evidence_refs: tuple[str, ...],
         target_calls: int,
+        attempt_disposition: str,
+        outcome_authority: str,
     ) -> None:
         """Upsert the durable ARM outcome with usage and pinned-price model cost.
 
@@ -5009,6 +5243,8 @@ class DurableAgentService:
             "requested_language": str(arm.get("requested_language") or identity["actual_language"]),
             "actual_language": identity["actual_language"],
             "outcome": outcome,
+            "attempt_disposition": attempt_disposition,
+            "outcome_authority": outcome_authority,
             "target_calls": target_calls,
             "model_steps": int(_numeric_usage(costed.get("model_steps"))),
             "latency_ms": 0,
@@ -6577,6 +6813,134 @@ def _result_text(row: dict[str, object] | None) -> str | None:
     if isinstance(payload, dict) and isinstance(payload.get("content"), str):
         return payload["content"]
     return json.dumps(payload, sort_keys=True)
+
+
+def _nonvalid_attempt_receipt_projection(
+    checkpoint: Mapping[str, object], technique_attempt_id: str
+) -> dict[str, object] | None:
+    """Project a non-learning target receipt into durable attempt metadata.
+
+    Constraint rejection and contamination can finish through the generic
+    worker-failure path before an acknowledged target effect exists. Preserve
+    those receipts so settlement can retry or regenerate the exact candidate,
+    while keeping them out of attack-quality learning.
+    """
+    raw_receipts = checkpoint.get("target_evidence")
+    receipts = (
+        raw_receipts
+        if isinstance(raw_receipts, Sequence) and not isinstance(raw_receipts, (str, bytes))
+        else ()
+    )
+    attempt_receipts = tuple(
+        item
+        for item in receipts
+        if isinstance(item, Mapping) and item.get("technique_attempt_id") == technique_attempt_id
+    )
+    dispositions = {
+        str(item.get("attempt_disposition"))
+        for item in attempt_receipts
+        if item.get("attempt_disposition")
+        in {"contaminated", "protocol_invalid", "infrastructure_failed", "uncertain"}
+    }
+    if not dispositions:
+        return None
+    disposition = next(
+        value
+        for value in ("contaminated", "protocol_invalid", "infrastructure_failed", "uncertain")
+        if value in dispositions
+    )
+    matching = tuple(
+        item for item in attempt_receipts if item.get("attempt_disposition") == disposition
+    )
+    reason = next(
+        (
+            str(item["disposition_reason"])
+            for item in matching
+            if isinstance(item.get("disposition_reason"), str)
+            and bool(str(item["disposition_reason"]).strip())
+        ),
+        f"target attempt ended with {disposition} evidence",
+    )
+
+    def unique_mappings(key: str) -> tuple[dict[str, object], ...]:
+        values = {
+            json.dumps(value, sort_keys=True, separators=(",", ":")): dict(value)
+            for item in matching
+            if isinstance((value := item.get(key)), Mapping)
+        }
+        return tuple(values[key] for key in sorted(values))
+
+    protocol_invalid_requests = unique_mappings("protocol_invalid_request")
+    bounded_child_candidates = unique_mappings("bounded_child_candidate")
+    constraint_observations = tuple(
+        dict(observation)
+        for item in matching
+        for observation in (
+            item.get("request_constraint_observations")
+            if isinstance(item.get("request_constraint_observations"), Sequence)
+            and not isinstance(item.get("request_constraint_observations"), (str, bytes))
+            else ()
+        )
+        if isinstance(observation, Mapping)
+    )
+    identities = {
+        str(identity["selected_digest"])
+        for item in matching
+        if isinstance((identity := item.get("physical_state_identity")), Mapping)
+        and isinstance(identity.get("selected_digest"), str)
+        and bool(identity.get("selected_digest"))
+    }
+    physical_state_identity = next(iter(identities)) if len(identities) == 1 else None
+    identity_matches = {
+        item["state_identity_match"]
+        for item in matching
+        if isinstance(item.get("state_identity_match"), bool)
+    }
+    state_identity_match = (
+        next(iter(identity_matches))
+        if physical_state_identity is not None and len(identity_matches) == 1
+        else None
+    )
+    evidence_refs = tuple(
+        dict.fromkeys(
+            str(item.get("reference") or item.get("receipt_sha256"))
+            for item in matching
+            if str(item.get("reference") or item.get("receipt_sha256") or "")
+        )
+    )
+    target_calls = len(
+        {
+            str(item["call_id"])
+            for item in attempt_receipts
+            if isinstance(item.get("call_id"), str) and bool(item.get("call_id"))
+        }
+    )
+    strategy_state: dict[str, object] = {
+        "attempt_disposition": {"kind": disposition, "reason": reason}
+    }
+    if len(protocol_invalid_requests) == 1:
+        strategy_state["protocol_invalid_request"] = protocol_invalid_requests[0]
+    elif protocol_invalid_requests:
+        strategy_state["protocol_invalid_requests"] = list(protocol_invalid_requests)
+    if len(bounded_child_candidates) == 1:
+        strategy_state["bounded_child_candidate"] = bounded_child_candidates[0]
+    elif bounded_child_candidates:
+        strategy_state["bounded_child_candidates"] = list(bounded_child_candidates)
+    if constraint_observations:
+        strategy_state["request_constraint_observations"] = list(constraint_observations)
+    if physical_state_identity is not None:
+        strategy_state["physical_state_identity"] = physical_state_identity
+    if state_identity_match is not None:
+        strategy_state["state_identity_match"] = state_identity_match
+    return {
+        "disposition": disposition,
+        "reason": reason,
+        "strategy_state": strategy_state,
+        "physical_state_identity": physical_state_identity,
+        "state_identity_match": state_identity_match,
+        "evidence_refs": evidence_refs,
+        "target_calls": target_calls,
+    }
 
 
 def _receipt_arm_execution_context(

@@ -6,6 +6,15 @@ import hashlib
 import json
 from collections.abc import Mapping
 
+from pydantic import ValidationError
+
+from .target_capabilities import (
+    RequestConstraint,
+    StateCapabilities,
+    request_constraints_semantic_projection,
+    state_capabilities_semantic_projection,
+)
+
 EXECUTABLE_ADAPTER_IDENTITY_VERSION = "merlin.executable-adapter.v1"
 _TARGET_DELIVERIES = frozenset({"direct-user-channel", "inter-agent-message"})
 _CLEANUP_LIFECYCLES = frozenset({"required", "not_required", "unknown"})
@@ -177,6 +186,25 @@ def executable_adapter_projection(adapter: Mapping[str, object]) -> dict[str, ob
                 creation_transition.get("postcondition")
             ),
         }
+    try:
+        request_constraints = tuple(
+            RequestConstraint.model_validate(item)
+            for item in adapter.get("request_constraints", ())
+        )
+        if request_constraints:
+            projection["request_constraints"] = request_constraints_semantic_projection(
+                request_constraints
+            )
+        raw_capabilities = adapter.get("state_capabilities")
+        if isinstance(raw_capabilities, Mapping):
+            state_projection = state_capabilities_semantic_projection(
+                StateCapabilities.model_validate(raw_capabilities)
+            )
+            if state_projection:
+                projection["state_capabilities"] = state_projection
+    except (TypeError, ValidationError):
+        # The legacy v1 projection remains total for advisory or malformed additions.
+        pass
     return projection
 
 

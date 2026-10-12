@@ -22,6 +22,7 @@ from .agents import (
 from .app import AppCommand, AppEvent
 from .attempts import (
     TERMINAL_TECHNIQUE_ATTEMPT_STATES,
+    AttemptDisposition,
     TechniqueAttempt,
     TechniqueAttemptControlKind,
     TechniqueAttemptState,
@@ -91,6 +92,7 @@ from .observability import (
     HypothesisState,
     InfrastructureFailureCategory,
     LanguageEvidenceStatus,
+    OutcomeAuthority,
     TechniqueLanguageEvidence,
 )
 from .packs import (
@@ -161,6 +163,7 @@ __all__ = [
     "AgentSummary",
     "AgentTask",
     "AttemptProjection",
+    "AttemptDisposition",
     "CapabilityGrant",
     "CancelDirective",
     "AttackCase",
@@ -214,6 +217,7 @@ __all__ = [
     "ModelWarning",
     "NodeProjection",
     "ObservationOutcome",
+    "OutcomeAuthority",
     "PackOutcome",
     "PackRun",
     "PackRunStatus",

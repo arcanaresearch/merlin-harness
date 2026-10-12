@@ -8,12 +8,14 @@ from typing import Any, Protocol
 from merlin_contracts import (
     ArmIdentity,
     ArmOutcome,
+    AttemptDisposition,
     CampaignCounterEvent,
     CampaignCounters,
     HypothesisRecord,
     HypothesisState,
     InfrastructureFailureCategory,
     LanguageEvidenceStatus,
+    OutcomeAuthority,
     TechniqueLanguageEvidence,
 )
 from psycopg.types.json import Jsonb
@@ -396,6 +398,13 @@ class CampaignObservabilityRepository:
         return CampaignCounters.model_validate(row)
 
     def record_arm_outcome(self, outcome: ArmOutcome) -> ArmOutcome:
+        if outcome.attempt_disposition is None or outcome.outcome_authority is None:
+            outcome = outcome.model_copy(
+                update={
+                    "attempt_disposition": AttemptDisposition.UNCERTAIN,
+                    "outcome_authority": OutcomeAuthority.NONE,
+                }
+            )
         event = CampaignCounterEvent(
             id=outcome.id,
             campaign_id=outcome.campaign_id,
@@ -454,15 +463,18 @@ class CampaignObservabilityRepository:
                         technique_id, controller_id, mutation_id, actual_language, state_id,
                         requested_language, language_evidence_status,
                         language_evidence_source,
-                        outcome, counter_event_id, evidence_refs, signal, distance_to_success,
+                        outcome, attempt_disposition, outcome_authority,
+                        counter_event_id, evidence_refs, signal, distance_to_success,
                         latency_ms, model_cost_usd, usage, reason)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           %s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (campaign_id, arm_id, technique_attempt_id) DO UPDATE SET
                        requested_language = EXCLUDED.requested_language,
                        language_evidence_status = EXCLUDED.language_evidence_status,
                        language_evidence_source = EXCLUDED.language_evidence_source,
                        outcome = EXCLUDED.outcome,
+                       attempt_disposition = EXCLUDED.attempt_disposition,
+                       outcome_authority = EXCLUDED.outcome_authority,
                        evidence_refs = EXCLUDED.evidence_refs,
                        signal = EXCLUDED.signal,
                        distance_to_success = EXCLUDED.distance_to_success,
@@ -490,6 +502,16 @@ class CampaignObservabilityRepository:
                     outcome.language_evidence_status.value,
                     outcome.language_evidence_source,
                     outcome.outcome.value,
+                    (
+                        None
+                        if outcome.attempt_disposition is None
+                        else outcome.attempt_disposition.value
+                    ),
+                    (
+                        None
+                        if outcome.outcome_authority is None
+                        else outcome.outcome_authority.value
+                    ),
                     event.id,
                     list(outcome.evidence_refs),
                     outcome.signal,
@@ -616,6 +638,12 @@ class CampaignObservabilityRepository:
             language_evidence_status=str(row["language_evidence_status"]),
             language_evidence_source=str(row["language_evidence_source"]),
             outcome=str(row["outcome"]),
+            attempt_disposition=(
+                None if row["attempt_disposition"] is None else str(row["attempt_disposition"])
+            ),
+            outcome_authority=(
+                None if row["outcome_authority"] is None else str(row["outcome_authority"])
+            ),
             counters=CampaignCounters(
                 target_calls=int(row["target_calls"]),
                 model_steps=int(row["model_steps"]),

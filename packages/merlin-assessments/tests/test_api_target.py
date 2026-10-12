@@ -7,11 +7,25 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from merlin_assessments import ReviewedApiTargetTool
+from merlin_agents.arm_mutation import generate_bounded_child_candidate
+from merlin_agents.bounded_children import materialize_bounded_child_family
+from merlin_agents.completion_frontier import CompletionCandidateIdentity
+from merlin_agents.runtime import WorkerHandoff, _protocol_invalid_request
+from merlin_agents.specialists import (
+    AssignmentBudget,
+    AssignmentTechnique,
+    WorkerAssignment,
+    WorkerProfile,
+)
+from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
 from merlin_assessments.api_target import (
+    _augment_target_state_metadata,
     _infrastructure_failure_category,
     _ResponsePointerMissing,
     _reviewed_session_scope_id,
+    _structured_constraint_rejection_observations,
+    _target_parallel_capacity,
+    _target_state_transition,
     _TargetCleanupUnverified,
 )
 from merlin_contracts import (
@@ -196,6 +210,19 @@ def test_infrastructure_failure_category_uses_typed_errors_not_prose() -> None:
     )
 
 
+def test_runtime_constraint_discovery_does_not_parse_rejection_prose() -> None:
+    assert (
+        _structured_constraint_rejection_observations(
+            SimpleNamespace(compiled_digest="sha256:adapter"),
+            SimpleNamespace(id="message", structured_constraint_rejections=()),
+            {"message": "too long"},
+            422,
+            {"error": "message must be at most 7 characters"},
+        )
+        == []
+    )
+
+
 def test_cleanup_unverified_exposes_typed_downstream_marker() -> None:
     error = _TargetCleanupUnverified("cleanup lifecycle was not established")
 
@@ -269,6 +296,150 @@ def _sealed_context(campaign_id: str, adapter: dict[str, object]) -> ToolContext
             "compiled_adapter_digest": compiled_target_adapter_digest(compilation),
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_structured_runtime_limit_regenerates_child_for_next_batch(
+    tmp_path: Path,
+) -> None:
+    """Persist a rejection across restart, preflight its parent, then run its child."""
+
+    campaign_id = "campaign/runtime-discovered-limit"
+    parent_id = "technique/runtime-limit@lang=en@variant=native"
+    postgres_dir = tmp_path / "postgres-runtime-limit"
+    async with StatefulTargetFixtureServer(input_limit=7, advertise_input_limit=False) as target:
+        adapter = target.adapter()
+        assert "request_constraints" not in adapter
+        with Database(DatabaseConfig(data_dir=postgres_dir)) as database:
+            with database.connect() as connection:
+                MigrationRunner(connection).apply()
+                sessions = _prepare(connection, campaign_id)
+                async with httpx.AsyncClient() as client:
+                    tool = ReviewedApiTargetTool(
+                        sessions,
+                        lambda _campaign_id: adapter,
+                        {},
+                        client=client,
+                    )
+                    rejected = await tool.invoke(
+                        _sealed_context(campaign_id, adapter),
+                        {"input": "twelve chars"},
+                    )
+        initial_target_calls = len(target.http_log)
+        identity = CompletionCandidateIdentity(
+            campaign_id=campaign_id,
+            target_id="target-refund",
+            target_generation="generation-1",
+            scenario_fingerprint="scenario-1",
+            technique_id=parent_id,
+            controller_id="direct",
+            payload_family="native",
+            requested_language="en",
+            mutation_id="baseline",
+        )
+        assignment = WorkerAssignment(
+            id=f"{campaign_id}/injection",
+            objective="exercise the reviewed candidate",
+            profile_id="injection",
+            target_profile_id="target-refund",
+            technique_ids=(parent_id,),
+            guidance_ids=(),
+            tool_ids=("target_request",),
+            skill_ids=(),
+            provider_id="provider",
+            authority_ids=("target:reviewed",),
+            budget=AssignmentBudget(max_seconds=60),
+            input_schema='{"type":"object"}',
+            output_schema='{"type":"object"}',
+        )
+        handoff = WorkerHandoff(
+            session_id="00000000-0000-0000-0000-000000000001",
+            workspace_root="/workspace",
+            model="test",
+            profile=WorkerProfile(
+                id="injection",
+                version=1,
+                summary="test",
+                instructions="test",
+                specialty_tags=frozenset(),
+            ),
+            assignment=assignment,
+            candidate_identity=identity,
+        )
+        protocol_request = _protocol_invalid_request(rejected.metadata, handoff)
+        assert protocol_request is not None
+        child = generate_bounded_child_candidate(
+            parent_candidate_id=parent_id,
+            parent_identity=protocol_request["parent_identity"],
+            rejected_input=protocol_request["rendered_input"],
+            constraint=protocol_request["constraint"],
+            generator=lambda _prompt: (
+                {
+                    "input_text": "short",
+                    "rationale": "preserves the bounded fixture probe",
+                },
+            ),
+        )
+        assert child is not None
+        materialized = materialize_bounded_child_family(
+            AssignmentTechnique(
+                id="technique/runtime-limit",
+                objective="exercise the reviewed candidate",
+                tags=frozenset({"injection"}),
+                guidance_ids=(),
+                semantic_id="technique/runtime-limit",
+                strategy_id="direct",
+                transform_id="baseline",
+                language="en",
+            ),
+            child,
+        )
+
+        # Reopen the same PostgreSQL data directory and use a new assignment
+        # scope. The campaign-wide constraint must reject the immutable parent
+        # before setup or interaction reaches the target.
+        with Database(DatabaseConfig(data_dir=postgres_dir)) as restarted:
+            with restarted.connect() as connection:
+                MigrationRunner(connection).apply()
+                sessions = CampaignApiSessionRepository(connection)
+                async with httpx.AsyncClient() as client:
+                    tool = ReviewedApiTargetTool(
+                        sessions,
+                        lambda _campaign_id: adapter,
+                        {},
+                        client=client,
+                    )
+                    retry_context = _sealed_context(campaign_id, adapter).model_copy(
+                        update={
+                            "call_id": "call-parent-retry",
+                            "agent_id": f"{campaign_id}/retry",
+                        }
+                    )
+                    parent_retry = await tool.invoke(
+                        retry_context,
+                        {"input": "twelve chars"},
+                    )
+                    assert len(target.http_log) == initial_target_calls
+                    accepted = await tool.invoke(
+                        retry_context.model_copy(update={"call_id": "call-child"}),
+                        {"input": materialized.mutation_seed},
+                    )
+
+    assert rejected.is_error is True
+    assert rejected.metadata["attempt_disposition"] == "protocol_invalid"
+    observations = rejected.metadata["request_constraint_observations"]
+    assert observations[0]["source"] == "structured_target_rejection"
+    assert observations[0]["maximum"] == 7
+    assert observations[0]["evidence_bindings"][0]["observed_maximum"] == 7
+    assert protocol_request["rendered_input"] == "twelve chars"
+    assert parent_retry.is_error is True
+    assert parent_retry.metadata["attempt_disposition"] == "protocol_invalid"
+    assert parent_retry.metadata["target_call_budget_charge"] == 0
+    durable_observations = parent_retry.metadata["request_constraint_observations"]
+    assert durable_observations[0]["preflight_source"] == ("durable_structured_target_rejection")
+    assert child["variant"]["parent_identity"]["technique_id"] == parent_id
+    assert materialized.mutation_seed == "short"
+    assert accepted.is_error is False
 
 
 @pytest.mark.asyncio
@@ -3245,3 +3416,479 @@ async def test_api_error_retains_target_identity_when_transport_is_unavailable(t
     assert result.metadata["compiled_adapter_digest"] == compiled_target_adapter_digest(
         compile_target_adapter(adapter)
     )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_request_constraint_rejects_rendered_input_before_target_call(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    adapter["request_constraints"] = [
+        {
+            "step_id": "message",
+            "evaluation_root": "request_body",
+            "path": "/userMessage",
+            "kind": "string_length",
+            "maximum": 5,
+            "unit": "unicode_characters",
+            "source": "server_validation_response",
+            "evidence_refs": ["exchange/limit"],
+            "evidence_bindings": [{"evidence_ref": "exchange/limit", "observed_maximum": 5}],
+        }
+    ]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(500, json={"error": "must not be called"})
+
+    campaign_id = "campaign/request-constraint"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(_sealed_context(campaign_id, adapter), {"input": "too long"})
+
+    assert result.is_error is True
+    assert calls == []
+    assert result.metadata["attempt_disposition"] == "protocol_invalid"
+    assert result.metadata["retryable"] is True
+    assert result.metadata["acknowledged_capability_evidence"] is False
+    assert result.metadata["target_effect_attempted"] is False
+    assert result.metadata["target_call_budget_charge"] == 0
+    observation = result.metadata["request_constraint_observations"][0]
+    assert observation["step_id"] == "message"
+    assert observation["observed"] == 8
+    assert observation["satisfied"] is False
+
+
+@pytest.mark.asyncio
+async def test_reviewed_state_contract_emits_attributable_authoritative_transition(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "evidence_refs": ["exchange/run-id"],
+        },
+        "observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "result_selector": {
+                    "step_id": "message",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "preferred_direction": "increase",
+            }
+        ],
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/fresh",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "maximum_parallel_states": 4,
+    }
+
+    interaction_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interaction_calls
+        if request.url.path.endswith("/start"):
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": "logical-session",
+                    "run": {"id": "physical-run", "score": 10, "fresh": True},
+                },
+            )
+        interaction_calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "reply": "advanced",
+                "run": {"id": "physical-run", "score": 25},
+            },
+        )
+
+    campaign_id = "campaign/state-transition"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                result = await tool.invoke(
+                    _sealed_context(campaign_id, adapter), {"input": "probe"}
+                )
+                aliased_result = await tool.invoke(
+                    _sealed_context(campaign_id, adapter).model_copy(
+                        update={
+                            "agent_id": f"{campaign_id}/candidate-2",
+                            "call_id": "call-2",
+                        }
+                    ),
+                    {"input": "second probe"},
+                )
+
+    assert result.is_error is False
+    assert result.metadata["attempt_disposition"] == "valid"
+    assert result.metadata["state_identity_match"] is True
+    assert result.metadata["physical_state_identity"]["selected_value"] == "physical-run"
+    transition = result.metadata["target_state_transition"]
+    assert transition["authority"] == "target"
+    assert transition["outcome"] == "progress"
+    assert transition["observations"] == [
+        {
+            "name": "score",
+            "role": "score",
+            "status": "progress",
+            "before_digest": transition["observations"][0]["before_digest"],
+            "after_digest": transition["observations"][0]["after_digest"],
+            "before_value": 10,
+            "after_value": 25,
+            "preferred_direction": "increase",
+            "baseline_binding_digest": transition["observations"][0]["baseline_binding_digest"],
+            "result_binding_digest": transition["observations"][0]["result_binding_digest"],
+        }
+    ]
+    assert aliased_result.is_error is True
+    assert aliased_result.metadata["attempt_disposition"] == "contaminated"
+    assert aliased_result.metadata["state_identity_match"] is False
+    assert aliased_result.metadata["acknowledged_capability_evidence"] is False
+    assert aliased_result.metadata["target_state_transition"]["outcome"] == "unclear"
+    assert aliased_result.metadata["limit_interaction_count"] == 0
+    assert interaction_calls == 1
+
+
+def test_target_parallel_capacity_enforces_caps_and_reset_is_not_concurrent_isolation() -> None:
+    capped = _adapter()
+    capped["state_capabilities"] = {"maximum_parallel_states": 3}
+    assert (
+        _target_parallel_capacity(
+            ReviewedApiTargetTool(  # type: ignore[arg-type]
+                SimpleNamespace(), lambda _campaign_id: capped, {}
+            )._adapter("campaign", "target-refund")
+        )
+        == 3
+    )  # noqa: SLF001
+
+    reset_only = _adapter()
+    reset_only["state_capabilities"] = {
+        "affordances": [
+            {
+                "kind": "reset_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+    }
+    reset_adapter = ReviewedApiTargetTool(
+        SimpleNamespace(), lambda _campaign_id: reset_only, {}
+    )._adapter("campaign", "target-refund")  # noqa: SLF001
+    assert _target_parallel_capacity(reset_adapter) == 1
+
+
+def test_target_state_transition_keeps_conflicting_or_missing_identity_unclear() -> None:
+    conflicting = _target_state_transition(
+        [
+            {
+                "name": "win",
+                "role": "terminal_status",
+                "phase": "baseline",
+                "selected_digest": "before-win",
+                "selected_value": "active",
+                "success_values": ["won"],
+            },
+            {
+                "name": "win",
+                "role": "terminal_status",
+                "phase": "result",
+                "selected_digest": "after-win",
+                "selected_value": "won",
+                "success_values": ["won"],
+            },
+            {
+                "name": "loss",
+                "role": "terminal_status",
+                "phase": "baseline",
+                "selected_digest": "before-loss",
+                "selected_value": "active",
+                "failure_values": ["lost"],
+            },
+            {
+                "name": "loss",
+                "role": "terminal_status",
+                "phase": "result",
+                "selected_digest": "after-loss",
+                "selected_value": "lost",
+                "failure_values": ["lost"],
+            },
+        ]
+    )
+    assert conflicting["outcome"] == "unclear"
+
+    no_identity = _target_state_transition(
+        [
+            {
+                "name": "score",
+                "role": "score",
+                "phase": "baseline",
+                "selected_digest": "before",
+                "selected_value": 1,
+                "preferred_direction": "increase",
+            },
+            {
+                "name": "score",
+                "role": "score",
+                "phase": "result",
+                "selected_digest": "after",
+                "selected_value": 2,
+                "preferred_direction": "increase",
+            },
+        ]
+    )
+    assert no_identity["identity_match"] is None
+    assert no_identity["outcome"] == "unclear"
+
+    missing_identity = _target_state_transition(
+        [
+            {
+                "name": "physical_state_identity",
+                "role": "state_identity",
+                "phase": "baseline",
+                "selected_digest": None,
+            },
+            {
+                "name": "score",
+                "role": "score",
+                "phase": "baseline",
+                "selected_digest": "before",
+                "selected_value": 1,
+                "preferred_direction": "increase",
+            },
+            {
+                "name": "score",
+                "role": "score",
+                "phase": "result",
+                "selected_digest": "after",
+                "selected_value": 2,
+                "preferred_direction": "increase",
+            },
+        ]
+    )
+    assert missing_identity["identity_match"] is None
+    assert missing_identity["outcome"] == "unclear"
+
+
+def test_state_metadata_without_physical_identity_is_never_authoritative() -> None:
+    metadata: dict[str, object] = {
+        "current_target_exchanges": [
+            {
+                "state_observations": [
+                    {
+                        "name": "score",
+                        "role": "score",
+                        "phase": "baseline",
+                        "selected_digest": "before",
+                        "selected_value": 1,
+                        "preferred_direction": "increase",
+                    },
+                    {
+                        "name": "score",
+                        "role": "score",
+                        "phase": "result",
+                        "selected_digest": "after",
+                        "selected_value": 2,
+                        "preferred_direction": "increase",
+                    },
+                ]
+            }
+        ]
+    }
+
+    _augment_target_state_metadata(metadata)
+
+    assert metadata["state_identity_match"] is None
+    assert metadata["evaluation_uncertain"] is True
+    transition = metadata["target_state_transition"]
+    assert isinstance(transition, dict)
+    assert transition["outcome"] == "unclear"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reviewed_reset", [False, True], ids=["shared-state", "reset"])
+async def test_serial_reviewed_reset_allows_learning_eligible_physical_state_reuse(
+    tmp_path: Path,
+    reviewed_reset: bool,
+) -> None:
+    adapter = _adapter()
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "result_selector": {
+                    "step_id": "message",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "preferred_direction": "increase",
+            }
+        ],
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/restored",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "reset_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "maximum_parallel_states": 1,
+    }
+    state_capabilities = adapter["state_capabilities"]
+    assert isinstance(state_capabilities, dict)
+    if not reviewed_reset:
+        state_capabilities.pop("freshness_rules")
+        state_capabilities.pop("affordances")
+    interaction_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interaction_calls
+        if request.url.path.endswith("/start"):
+            baseline_score = 10 if reviewed_reset else 10 + interaction_calls * 10
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": "logical-session",
+                    "run": {
+                        "id": "shared-physical-run",
+                        "score": baseline_score,
+                        "restored": True,
+                    },
+                },
+            )
+        interaction_calls += 1
+        result_score = 20 if reviewed_reset else 10 + interaction_calls * 10
+        return httpx.Response(
+            200,
+            json={
+                "reply": "advanced",
+                "run": {"id": "shared-physical-run", "score": result_score},
+            },
+        )
+
+    campaign_id = f"campaign/serial-reuse-{reviewed_reset}"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                first = await tool.invoke(_sealed_context(campaign_id, adapter), {"input": "first"})
+                second = await tool.invoke(
+                    _sealed_context(campaign_id, adapter).model_copy(
+                        update={
+                            "agent_id": f"{campaign_id}/candidate-2",
+                            "call_id": "call-2",
+                        }
+                    ),
+                    {"input": "second"},
+                )
+
+    assert first.metadata["attempt_disposition"] == "valid"
+    assert second.metadata["attempt_disposition"] == "valid"
+    assert second.metadata["target_state_transition"]["outcome"] == "progress"
+    assert second.metadata["acknowledged_capability_evidence"] is True
+    assert second.metadata["session_freshness"] == "not_observed"
+    assert second.metadata["current_target_exchanges"][0]["physical_state_sequential_reuse"] is True
+    assert interaction_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_target_execution_renewal_failure_cancels_the_owner() -> None:
+    sessions = SimpleNamespace(renew_target_execution=lambda *_args: False)
+    tool = ReviewedApiTargetTool(sessions, lambda _campaign_id: None, {})
+
+    async def owner() -> None:
+        await tool._renew_target_execution_lease(  # noqa: SLF001
+            "claim-id",
+            "claimant-id",
+            1,
+            asyncio.current_task(),
+        )
+        await asyncio.sleep(0)
+
+    task = asyncio.create_task(owner())
+    with pytest.raises(asyncio.CancelledError):
+        await task

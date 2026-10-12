@@ -6,6 +6,7 @@ from typing import Any
 
 from merlin_contracts import (
     TERMINAL_TECHNIQUE_ATTEMPT_STATES,
+    AttemptDisposition,
     TechniqueAttempt,
     TechniqueAttemptState,
 )
@@ -105,6 +106,10 @@ class TechniqueAttemptRepository:
         provider: str | None = None,
         model: str | None = None,
         usage: Mapping[str, object] | None = None,
+        disposition: AttemptDisposition | None = None,
+        disposition_reason: str | None = None,
+        physical_state_identity: str | None = None,
+        state_identity_match: bool | None = None,
         terminal_reason: str | None = None,
     ) -> TechniqueAttempt:
         allowed = _TRANSITIONS.get(expected_state, frozenset())
@@ -113,6 +118,16 @@ class TechniqueAttemptRepository:
         terminal = state in TERMINAL_TECHNIQUE_ATTEMPT_STATES
         if terminal != bool((terminal_reason or "").strip()):
             raise ValueError("terminal transitions require exactly one terminal reason")
+        if terminal and disposition is None:
+            disposition = AttemptDisposition.UNCERTAIN
+        elif disposition is not None:
+            disposition = AttemptDisposition(disposition)
+        if terminal and disposition_reason is None:
+            disposition_reason = terminal_reason
+        if (disposition is None) != (disposition_reason is None):
+            raise ValueError("attempt disposition and reason must be recorded together")
+        if state_identity_match is not None and not (physical_state_identity or "").strip():
+            raise ValueError("state identity comparison requires a physical state identity")
         if evidence_refs is not None and len(set(evidence_refs)) != len(evidence_refs):
             raise ValueError("technique attempt evidence references must be unique")
         with self.connection.transaction():
@@ -124,7 +139,11 @@ class TechniqueAttemptRepository:
                        strategy_state = coalesce(%s, strategy_state),
                        evidence_refs = coalesce(%s, evidence_refs),
                        provider = coalesce(%s, provider), model = coalesce(%s, model),
-                       usage = coalesce(%s, usage), terminal_reason = %s,
+                       usage = coalesce(%s, usage),
+                       disposition = %s, disposition_reason = %s,
+                       physical_state_identity = coalesce(%s, physical_state_identity),
+                       state_identity_match = coalesce(%s, state_identity_match),
+                       terminal_reason = %s,
                        activated_at = coalesce(activated_at, now()),
                        updated_at = now(), terminal_at = CASE WHEN %s THEN now() ELSE NULL END
                    WHERE id = %s AND state = %s RETURNING id""",
@@ -137,6 +156,10 @@ class TechniqueAttemptRepository:
                     provider,
                     model,
                     None if usage is None else Jsonb(dict(usage)),
+                    None if disposition is None else disposition.value,
+                    disposition_reason,
+                    physical_state_identity,
+                    state_identity_match,
                     terminal_reason,
                     terminal,
                     attempt_id,
@@ -221,6 +244,10 @@ class TechniqueAttemptRepository:
         evidence_refs: tuple[str, ...] = (),
         usage: Mapping[str, object] | None = None,
         strategy_state: Mapping[str, object] | None = None,
+        disposition: AttemptDisposition | None = None,
+        disposition_reason: str | None = None,
+        physical_state_identity: str | None = None,
+        state_identity_match: bool | None = None,
     ) -> TechniqueAttempt:
         """Apply one immutable terminal disposition to a live experiment."""
 
@@ -240,6 +267,10 @@ class TechniqueAttemptRepository:
             evidence_refs=evidence_refs,
             usage=usage,
             strategy_state=strategy_state,
+            disposition=disposition,
+            disposition_reason=disposition_reason,
+            physical_state_identity=physical_state_identity,
+            state_identity_match=state_identity_match,
             terminal_reason=reason,
         )
 
@@ -334,6 +365,18 @@ class TechniqueAttemptRepository:
             provider=None if row["provider"] is None else str(row["provider"]),
             model=None if row["model"] is None else str(row["model"]),
             usage=dict(row["usage"]),
+            disposition=None if row["disposition"] is None else str(row["disposition"]),
+            disposition_reason=(
+                None if row["disposition_reason"] is None else str(row["disposition_reason"])
+            ),
+            physical_state_identity=(
+                None
+                if row["physical_state_identity"] is None
+                else str(row["physical_state_identity"])
+            ),
+            state_identity_match=(
+                None if row["state_identity_match"] is None else bool(row["state_identity_match"])
+            ),
             terminal_reason=(
                 None if row["terminal_reason"] is None else str(row["terminal_reason"])
             ),

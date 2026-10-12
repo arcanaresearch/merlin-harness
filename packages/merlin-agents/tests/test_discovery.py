@@ -12,6 +12,7 @@ from merlin_agents.discovery import (
     jaccard_3gram,
     rank_tasks_by_ucb,
 )
+from merlin_contracts import AttemptDisposition, OutcomeAuthority
 
 
 def _identity(**changes: str) -> ArmIdentity:
@@ -25,6 +26,16 @@ def _identity(**changes: str) -> ArmIdentity:
     }
     values.update(changes)
     return ArmIdentity(**values)
+
+
+def _valid_observation(identity: ArmIdentity, outcome: str, **metadata: object) -> ArmObservation:
+    return ArmObservation(
+        identity,
+        outcome,
+        attempt_disposition=AttemptDisposition.VALID,
+        outcome_authority=OutcomeAuthority.TARGET,
+        **metadata,
+    )
 
 
 def test_novelty_is_cjk_safe_and_hard_thresholded() -> None:
@@ -79,9 +90,9 @@ def test_aggregate_excludes_infrastructure_and_keeps_partial_signal() -> None:
     stats = aggregate_observations(
         (
             ArmObservation(identity, "timeout", infrastructure_failure=True, latency_ms=99_000),
-            ArmObservation(identity, "successful_setup"),
-            ArmObservation(identity, "near_miss", partial_signal=0.7, boundary_signal=True),
-            ArmObservation(identity, "negative_result"),
+            _valid_observation(identity, "successful_setup"),
+            _valid_observation(identity, "near_miss", partial_signal=0.7, boundary_signal=True),
+            _valid_observation(identity, "negative_result"),
         )
     )[identity.key]
     assert stats.attempts == 2
@@ -94,11 +105,62 @@ def test_aggregate_excludes_infrastructure_and_keeps_partial_signal() -> None:
 def test_aggregate_withholds_credit_for_unverified_transform() -> None:
     identity = _identity()
     stats = aggregate_observations(
-        (ArmObservation(identity, "win", transform_credit_eligible=False),)
+        (_valid_observation(identity, "win", transform_credit_eligible=False),)
     )[identity.key]
     assert stats.attempts == 0
     assert stats.wins == 0
     assert stats.infrastructure_failures == 0
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    (
+        AttemptDisposition.CONTAMINATED,
+        AttemptDisposition.PROTOCOL_INVALID,
+        AttemptDisposition.INFRASTRUCTURE_FAILED,
+        AttemptDisposition.UNCERTAIN,
+    ),
+)
+def test_aggregate_withholds_quality_learning_for_retryable_dispositions(
+    disposition: AttemptDisposition,
+) -> None:
+    identity = _identity()
+    observation = ArmObservation(
+        identity,
+        "clean_negative",
+        attempt_disposition=disposition,
+        outcome_authority=OutcomeAuthority.ADVISORY,
+    )
+
+    stats = aggregate_observations((observation,))[identity.key]
+
+    assert stats.attempts == 0
+    assert stats.clean_negatives == 0
+    assert stats.signal == 0
+
+
+def test_aggregate_accepts_only_valid_authoritative_quality() -> None:
+    identity = _identity()
+    stats = aggregate_observations(
+        (
+            ArmObservation(
+                identity,
+                "clean_negative",
+                attempt_disposition=AttemptDisposition.VALID,
+                outcome_authority=OutcomeAuthority.TARGET,
+            ),
+            ArmObservation(
+                identity,
+                "win",
+                attempt_disposition=AttemptDisposition.VALID,
+                outcome_authority=OutcomeAuthority.VALIDATOR,
+            ),
+        )
+    )[identity.key]
+
+    assert stats.attempts == 2
+    assert stats.clean_negatives == 1
+    assert stats.wins == 1
 
 
 def test_ranking_exposes_all_components_and_rewards_near_miss() -> None:

@@ -15,6 +15,7 @@ from merlin_agents.exploration import (
     select_exploration_seeds,
 )
 from merlin_agents.specialists import AssignmentTechnique
+from merlin_contracts import AttemptDisposition, OutcomeAuthority
 
 
 def _technique(identifier: str, *tags: str) -> AssignmentTechnique:
@@ -394,7 +395,15 @@ def test_admission_rejects_neighbour_candidates_without_material_difference() ->
 def test_seed_selection_retires_dead_arms_with_history() -> None:
     direct, state = _execution_arm("direct"), _execution_arm("state")
     direct_id = ArmIdentity.from_mapping(direct)
-    history = tuple(ArmObservation(direct_id, "negative_result") for _ in range(5))
+    history = tuple(
+        ArmObservation(
+            direct_id,
+            "negative_result",
+            attempt_disposition=AttemptDisposition.VALID,
+            outcome_authority=OutcomeAuthority.TARGET,
+        )
+        for _ in range(5)
+    )
     seeds = select_exploration_seeds((direct, state), history)
     assert [seed.technique_id for seed in seeds] == ["state", "direct"]
     assert "zero signal lowers priority reversibly" in seeds[1].reason

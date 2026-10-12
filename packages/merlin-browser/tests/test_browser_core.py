@@ -1518,6 +1518,203 @@ def _compile_arguments() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabilities() -> None:
+    captured = (
+        {
+            "method": "POST",
+            "url": "https://target.test/api/message",
+            "status": 400,
+            "request_json": {"sessionId": "old", "message": "x" * 501},
+            "response_json": {"error": {"code": "input_too_long", "maximum": 500}},
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/start",
+            "status": 200,
+            "request_json": {"scenario": "reviewed"},
+            "response_json": {
+                "sessionId": "state-1",
+                "resumed": False,
+                "state": {
+                    "physicalId": "physical-1",
+                    "stage": 1,
+                    "quality": 75,
+                    "status": "active",
+                },
+            },
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/message",
+            "status": 200,
+            "request_json": {"sessionId": "state-1", "message": "harmless probe"},
+            "response_json": {
+                "reply": "observed response",
+                "state": {
+                    "stage": 1,
+                    "physicalId": "physical-1",
+                    "quality": 77,
+                    "remaining": 24,
+                    "status": "active",
+                },
+            },
+        },
+    )
+
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = owner()
+
+        def api_exchange_events(self):
+            return captured
+
+    class Recorder:
+        handoff = None
+        evidence: list[tuple[object, ...]] = []
+
+        async def reviewed_native_input_receipt(self, context_id, _event, input_pointer):
+            return {
+                "context_id": context_id,
+                "target_id": "target",
+                "input_pointer": input_pointer,
+                "evidence_ref": "native-request:sha256:" + "f" * 64,
+            }
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    arguments = {
+        **_compile_arguments(),
+        "request_constraints": [
+            {
+                "path": "/message",
+                "step_id": "observed-message-exchange",
+                "evaluation_root": "request_body",
+                "kind": "string_length",
+                "maximum": 500,
+                "unit": "unicode_characters",
+                "source": "server_validation_response",
+                "confidence": 1.0,
+                "evidence_selector": {
+                    "status_codes": [400],
+                    "pointer": "/error/maximum",
+                    "match_values": [500],
+                },
+            }
+        ],
+        "state_observations": [
+            {
+                "name": "remote_state_id",
+                "role": "state_identity",
+                "baseline_selector": {
+                    "pointer": "/state/physicalId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/physicalId",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+            },
+            {
+                "name": "progress_stage",
+                "role": "progress_ordinal",
+                "baseline_selector": {
+                    "pointer": "/state/stage",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/stage",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "preferred_direction": "increase",
+            },
+            {
+                "name": "objective_score",
+                "role": "score",
+                "baseline_selector": {
+                    "pointer": "/state/quality",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/quality",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "preferred_direction": "increase",
+            },
+            {
+                "name": "terminal_state",
+                "role": "terminal_status",
+                "baseline_selector": {
+                    "pointer": "/state/status",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/status",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "success_values": ["complete"],
+                "failure_values": ["failed"],
+            },
+        ],
+    }
+    recorder = Recorder()
+    tool = next(
+        item
+        for item in browser_tools(lambda _: Session(), recorder)
+        if item.describe().name == "browser_compile_api_handoff"
+    )
+
+    result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    adapter = json.loads(recorder.handoff.adapter)
+    constraint = adapter["request_constraints"][0]
+    assert constraint | {"evidence_refs": []} == {
+        "path": "/message",
+        "step_id": "observed-message-exchange",
+        "evaluation_root": "request_body",
+        "kind": "string_length",
+        "maximum": 500,
+        "unit": "unicode_characters",
+        "source": "server_validation_response",
+        "evidence_refs": [],
+        "evidence_bindings": constraint["evidence_bindings"],
+        "confidence": 1.0,
+    }
+    assert len(constraint["evidence_refs"]) == 2
+    assert {item["observed_maximum"] for item in constraint["evidence_bindings"]} == {500}
+    capabilities = adapter["state_capabilities"]
+    identity_selector = capabilities["identity"]["baseline_selector"]
+    assert capabilities["identity"]["identity_scope"] == "physical_state"
+    assert identity_selector["pointer"] == "/state/physicalId"
+    assert identity_selector["step_id"] == "observed-session-setup"
+    assert identity_selector["evaluation_root"] == "response_body"
+    assert {item["name"] for item in capabilities["observations"]} == {
+        "progress_stage",
+        "objective_score",
+        "terminal_state",
+        "remote_state_id",
+    }
+    assert capabilities.get("affordances", []) == []
+    assert capabilities.get("freshness_rules", []) == []
+    recorded_refs = {item[1] for item in recorder.evidence}
+    assert set(constraint["evidence_refs"]).issubset(recorded_refs)
+
+
+@pytest.mark.asyncio
 async def test_compiled_api_handoff_routes_only_success_to_assessment_prepare() -> None:
     class Session:
         context_id = "browser-context"
@@ -4829,6 +5026,8 @@ async def test_api_handoff_seals_multi_turn_from_session_lifecycle_evidence() ->
     assert setup_step["captures"] == {"session_id": "/sessionId"}
     assert message_step["interaction"] is True
     assert message_step["request_template"]["sessionId"] == "{{capture:session_id}}"
+    # A reusable logical session token is not proof of one physical target state.
+    assert "state_capabilities" not in adapter
     # The declared single-turn prose is overridden by the captured evidence of a
     # session value binding repeated turns into one lifecycle.
     assert message_step["oracle_predicate"]["turn"] == "multi"

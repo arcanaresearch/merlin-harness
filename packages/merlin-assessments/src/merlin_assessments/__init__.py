@@ -18,6 +18,7 @@ from .neighbours import (
 )
 from .runner import AssessmentProgress, AssessmentResult, AssessmentRunner, ProgressCallback
 from .service import AssessmentService, SelectedTargetTool
+from .stateful_fixture_target import StatefulTargetFixtureServer
 
 __all__ = [
     "AssessmentProgress",
@@ -34,6 +35,7 @@ __all__ = [
     "WIN_MARKER",
     "AssessmentService",
     "SelectedTargetTool",
+    "StatefulTargetFixtureServer",
     "ProgressCallback",
     "derive_case_relationships",
     "receipt_from_mapping",
