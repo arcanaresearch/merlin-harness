@@ -6291,7 +6291,11 @@ def build_backend(
                     if surface in observed_surface_values
                 },
                 advertised_languages=target_advertised_languages,
-                candidate_languages=planned_language_candidates,
+                # Language coverage is already reviewed and persisted in the
+                # adaptive frontier below. Dedicated Wave 0 language probes would
+                # duplicate that coverage and gate the first attack batch on the
+                # size of the language catalogue.
+                candidate_languages=(),
             )
             documents = (
                 *documents,

@@ -2918,7 +2918,9 @@ class CampaignService:
                 compiled,
             )
         else:
-            reused_observations = await self._reusable_capability_observations(manifest)
+            reused_observations = await self._reusable_capability_observations(
+                manifest, context
+            )
             if reused_observations is not None:
                 # A prior campaign already observed this exact target + reviewed
                 # adapter + probe plan; wave 0 schedules no observation workers
@@ -3137,7 +3139,7 @@ class CampaignService:
                     manifest, context, live.id, recon_tasks
                 )
                 await self._record_capability_probe_results(
-                    manifest, campaign_id, initial_wave, probe_results
+                    manifest, context, campaign_id, initial_wave, probe_results
                 )
                 recon_failed = applicability is None
                 if recon_failed:
@@ -6457,7 +6459,9 @@ class CampaignService:
                 promising.setdefault(technique_id, technique)
         if not promising:
             return ()
-        signal_languages = set(await self._probe_observed_signal_languages(manifest))
+        signal_languages = set(
+            await self._probe_observed_signal_languages(manifest, context)
+        )
 
         def rank(row: Mapping[str, object]) -> tuple[int, int, str]:
             language = str(row.get("language_id") or "").strip().casefold()
@@ -8810,7 +8814,7 @@ class CampaignService:
         )
 
     async def _reusable_capability_observations(
-        self, manifest: CampaignManifest
+        self, manifest: CampaignManifest, context: AssignmentContext
     ) -> tuple[tuple[CapabilityProbeResult, ...], Mapping[str, object]] | None:
         """Load still-valid capability observations from an earlier campaign.
 
@@ -8821,7 +8825,10 @@ class CampaignService:
         loader = getattr(self._store, "latest_capability_observations", None)
         if loader is None:
             return None
-        plan_digest = _capability_probe_plan_digest(manifest)
+        plan_digest = _capability_probe_plan_digest(
+            manifest,
+            deferred_languages=_deferred_probe_languages(context),
+        )
         adapter_digest = _reviewed_adapter_digest(manifest)
         if plan_digest is None or adapter_digest == _LEGACY_REVIEWED_ADAPTER_DIGEST:
             return None
@@ -8832,14 +8839,16 @@ class CampaignService:
         assert isinstance(record, Mapping)
         return results, record
 
-    async def _probe_observed_signal_languages(self, manifest: CampaignManifest) -> tuple[str, ...]:
+    async def _probe_observed_signal_languages(
+        self, manifest: CampaignManifest, context: AssignmentContext
+    ) -> tuple[str, ...]:
         """Languages a capability probe durably observed this target engaging in.
 
         Reads the cross-campaign capability-observation cache; only conclusive
         engaging outcomes (observed / unexpectedly accepted) on language probes
         count as signal, matching plan_skip's evidence gate.
         """
-        reused = await self._reusable_capability_observations(manifest)
+        reused = await self._reusable_capability_observations(manifest, context)
         if reused is None:
             return ()
         results, _record = reused
@@ -8924,7 +8933,7 @@ class CampaignService:
         tasks: tuple[AgentTask, ...],
     ) -> tuple[CapabilityProbeResult, ...]:
         """Classify planned probes exclusively from committed durable receipts."""
-        reused = await self._reusable_capability_observations(manifest)
+        reused = await self._reusable_capability_observations(manifest, context)
         if reused is not None:
             # Wave 0 scheduled no observation workers; the cached conclusive
             # observations stand in for receipt classification.
@@ -8974,6 +8983,7 @@ class CampaignService:
     async def _record_capability_probe_results(
         self,
         manifest: CampaignManifest,
+        context: AssignmentContext,
         campaign_id: str,
         wave: int,
         results: tuple[CapabilityProbeResult, ...],
@@ -9021,7 +9031,10 @@ class CampaignService:
             # Inconclusive observations (including missing durable receipts and
             # flaky target behavior) must not suppress re-probing later.
             return
-        plan_digest = _capability_probe_plan_digest(manifest)
+        plan_digest = _capability_probe_plan_digest(
+            manifest,
+            deferred_languages=_deferred_probe_languages(context),
+        )
         adapter_digest = _reviewed_adapter_digest(manifest)
         if plan_digest is None or adapter_digest == _LEGACY_REVIEWED_ADAPTER_DIGEST:
             return
@@ -12426,7 +12439,11 @@ class CampaignService:
                     manifest, context, prior_live.id, recon_tasks
                 )
                 await self._record_capability_probe_results(
-                    manifest, campaign_id, int(prior["wave"]), probe_results
+                    manifest,
+                    context,
+                    campaign_id,
+                    int(prior["wave"]),
+                    probe_results,
                 )
                 context = replace(
                     context,
@@ -16435,25 +16452,51 @@ def _explicit_target_session_interaction_limit(session_constraint: str | None) -
     return min(limits) if limits else None
 
 
+def _deferred_probe_languages(context: AssignmentContext) -> tuple[str, ...]:
+    """Languages whose dedicated probes are covered by the durable frontier."""
+    frontier = context.language_frontier
+    return () if frontier is None else frontier.planned_languages
+
+
 def _initial_capability_probe_plan(
     plan: CapabilityProbePlan,
     *,
     session_constraint: str | None,
+    deferred_languages: Collection[str] = (),
 ) -> CapabilityProbePlan:
-    """Reserve finite target-session interactions for actual attack execution.
+    """Keep dedicated Wave 0 discovery small and reserve attacks for execution.
 
-    Capability discovery is advisory: deferred probes remain unresolved and eligible
-    for later attack/discovery waves.  When reconnaissance has attributable evidence
-    of a finite session, wave 0 may spend at most one quarter of that session on the
-    dedicated probe suite, after reserving one interaction for reconnaissance itself.
+    When a durable language frontier exists, non-advertised languages are real attack
+    dimensions there. Testing each one with a separate reconnaissance worker would
+    duplicate that coverage and gate the first attack batch on catalogue size, so Wave
+    0 leaves those probes to adaptive execution. Legacy plans without such a frontier
+    retain their language probes. Other capability discovery remains advisory:
+    deferred probes stay unresolved and eligible for later discovery. When
+    reconnaissance has attributable evidence of a finite session, Wave 0 may spend at
+    most one quarter of that session on the dedicated probe suite, after reserving one
+    interaction for reconnaissance itself.
     """
+    deferred = frozenset(
+        language.strip().casefold() for language in deferred_languages if language.strip()
+    )
+    wave_zero = CapabilityProbePlan(
+        tuple(
+            probe
+            for probe in plan.probes
+            if not (
+                probe.language is not None
+                and probe.kind is CapabilityProbeKind.NON_ADVERTISED_LANGUAGE
+                and probe.language.strip().casefold() in deferred
+            )
+        )
+    )
     session_limit = _explicit_target_session_interaction_limit(session_constraint)
     if session_limit is None:
-        return plan
+        return wave_zero
     probe_interactions = max(0, session_limit // 4 - 1)
     selected: list[CapabilityProbe] = []
     remaining = probe_interactions
-    for probe in plan.schedulable:
+    for probe in wave_zero.schedulable:
         interaction_cost = 2 if probe.kind is CapabilityProbeKind.MEMORY else 1
         if interaction_cost > remaining:
             continue
@@ -16472,7 +16515,9 @@ _LEGACY_REVIEWED_ADAPTER_DIGEST = "sha256:" + "0" * 64
 _DEFAULT_ESCALATION_LANGUAGES = ("lzh", "sw")
 
 
-def _capability_probe_plan_digest(manifest: CampaignManifest) -> str | None:
+def _capability_probe_plan_digest(
+    manifest: CampaignManifest, *, deferred_languages: Collection[str]
+) -> str | None:
     """Digest the reviewed wave-0 probe plan so reuse keys on the exact plan."""
     plan_document = next(
         (
@@ -16487,6 +16532,7 @@ def _capability_probe_plan_digest(manifest: CampaignManifest) -> str | None:
     plan = _initial_capability_probe_plan(
         capability_probe_plan_from_document(plan_document.content),
         session_constraint=manifest.target.session_constraint,
+        deferred_languages=deferred_languages,
     )
     return (
         "sha256:"
@@ -16575,6 +16621,7 @@ def _compile_capability_probe_recon(
     plan = _initial_capability_probe_plan(
         capability_probe_plan_from_document(plan_document.content),
         session_constraint=manifest.target.session_constraint,
+        deferred_languages=_deferred_probe_languages(context),
     )
     recon_tools = tuple(
         dict.fromkeys(

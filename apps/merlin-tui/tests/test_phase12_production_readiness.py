@@ -1688,63 +1688,16 @@ Preserve attributable evidence and reviewed authority.
                 if item.id == "recon:capability-probe-plan"
             )
             probes = json.loads(probe_document.content.split("\n", 1)[1])
-            assert {item["kind"] for item in probes} >= {
+            assert {item["kind"] for item in probes} == {
                 "upload_document",
                 "rag_retrieval",
                 "memory",
                 "multimodal",
                 "tools",
                 "agent_messaging",
-                "non_advertised_language",
             }
-            assert {item["language"] for item in probes if item["language"]} == {
-                "es",
-                "ar",
-                "hi",
-                "am",
-                "yo",
-                "ig",
-                "sw",
-                "lzh",
-                "la",
-                "tok",
-                "bn",
-                "de",
-                "fr",
-                "id",
-                "ja",
-                "ko",
-                "mr",
-                "pt",
-                "ru",
-                "ta",
-                "te",
-                "tr",
-                "ur",
-                "vi",
-                "yue",
-                "zh",
-                "it",
-                "jv",
-                "pa",
-                "fa",
-                "gu",
-                "kn",
-                "ml",
-                "th",
-                "my",
-                "uk",
-                "pl",
-                "nl",
-                "ro",
-                "tl",
-                "ha",
-                "si",
-                "km",
-                "ne",
-                "az",
-                "uz",
-            }
+            assert len(probes) == 6
+            assert all(item["language"] is None for item in probes)
             assert all(item["state"] == "planned" for item in probes)
             assert all(item["outcome"] is None and item["evidence_ids"] == [] for item in probes)
             recon_decision = next(
