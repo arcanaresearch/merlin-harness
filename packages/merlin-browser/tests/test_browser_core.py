@@ -1488,6 +1488,23 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
     scope_store = _StateScopeFixtureStore(events)
     browser_owner = owner()
 
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
     class Session:
         context_id = "raw-browser-context"
         bounds = BrowserBounds(
@@ -1518,15 +1535,66 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
         def api_exchange_events(self):
             return ()
 
+    recorder = Recorder()
     tools = {
+        tool.name: tool
+        for tool in _production_browser_tools(
+            lambda _: Session(),
+            recorder,  # type: ignore[arg-type]
+            state_scope_store=scope_store,
+        )
+    }
+    unrecorded_tools = {
         tool.name: tool
         for tool in _production_browser_tools(
             lambda _: Session(),
             state_scope_store=scope_store,
         )
     }
-    missing_campaign = await tools["browser_open_tab"].invoke(
+    unrecorded = await unrecorded_tools["browser_open_tab"].invoke(
         ToolContext(session_id="s1", workspace_root="/tmp"),
+        {"url": "https://target.example", "step": 0},
+    )
+    assert unrecorded.is_error is True
+    assert unrecorded.metadata["failure_code"] == "reconnaissance_recorder_required"
+    assert events == []
+
+    wrong_owner = await tools["browser_open_tab"].invoke(
+        ToolContext(session_id="other-session", workspace_root="/tmp"),
+        {"url": "https://target.example", "step": 0},
+    )
+    assert wrong_owner.is_error is True
+    assert wrong_owner.metadata["failure_code"] == "browser_session_owner_mismatch"
+    assert events == []
+
+    reconnaissance = await tools["browser_open_tab"].invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {"url": "https://target.example", "step": 0},
+    )
+    assert reconnaissance.is_error is False
+    assert reconnaissance.metadata["state_owner_kind"] == "session_browser_context"
+    assert reconnaissance.metadata["state_owner_id"] == "browser:raw-browser-context"
+    assert reconnaissance.metadata["state_evidence_durable"] is True
+    assert len(recorder.actions) == 1
+    assert len(recorder.observations) == 1
+    assert events == ["target"]
+
+    events.clear()
+    unavailable_snapshot = await tools["browser_snapshot"].invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {"tab_ref": "missing-tab", "step": 1},
+    )
+    assert unavailable_snapshot.is_error is True
+    assert unavailable_snapshot.metadata["failure_code"] == "state_scope_before_unavailable"
+    assert unavailable_snapshot.metadata["target_effect_attempted"] is False
+    assert events == []
+
+    missing_campaign = await tools["browser_open_tab"].invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            technique_attempt_id="candidate:1",
+        ),
         {"url": "https://target.example", "step": 0},
     )
     assert missing_campaign.is_error is True
@@ -9339,7 +9407,11 @@ async def test_owned_session_cleanup_clicks_only_exact_visible_ending_control() 
             recorder = Recorder()
             cleanup = next(
                 tool
-                for tool in browser_tools(lambda _: session, recorder)
+                for tool in browser_tools(
+                    lambda _: session,
+                    recorder,
+                    state_scope_store=_StateScopeFixtureStore(),
+                )
                 if tool.name == "browser_end_owned_session"
             )
             result = await cleanup.invoke(
@@ -9352,6 +9424,9 @@ async def test_owned_session_cleanup_clicks_only_exact_visible_ending_control() 
             assert result.metadata["cleanup_control"] == "Forfeit"
             assert result.metadata["owned_remote_session_id"] == "owned-bank-session"
             assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
+            assert result.metadata["state_owner_kind"] == "session_browser_context"
+            assert result.metadata["state_owner_id"] == f"browser:{session.context_id}"
+            assert result.metadata["state_evidence_durable"] is True
             assert len(recorder.actions) == 1
             assert recorder.actions[0].kind == "click"
             assert [item.kind for item in recorder.observations] == ["snapshot", "snapshot"]

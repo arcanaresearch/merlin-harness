@@ -507,52 +507,92 @@ class BrowserTool:
                 },
             )
         state_scope: _BrowserStateScope | None = None
+        session_recon_scope = False
         before_refs: tuple[str, ...] = ()
         if self._state_scope_store is not None:
             if context.campaign_id is None:
-                return ToolResult(
-                    content=(
-                        "browser target action requires a durable campaign state scope; "
-                        "the target was not called"
-                    ),
-                    is_error=True,
-                    metadata={
-                        "effect": self.effect,
-                        "failure_code": "state_scope_campaign_required",
-                        "retryable": True,
-                        "target_effect_attempted": False,
-                        "target_call_budget_charge": 0,
-                    },
+                action_kind = _browser_action_kind(context, kind)
+                if action_kind not in {
+                    StateScopeActionKind.RECONNAISSANCE,
+                    StateScopeActionKind.CLEANUP,
+                }:
+                    return ToolResult(
+                        content=(
+                            "candidate and checkpoint browser actions require a durable "
+                            "campaign state scope; the target was not called"
+                        ),
+                        is_error=True,
+                        metadata={
+                            "effect": self.effect,
+                            "failure_code": "state_scope_campaign_required",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                if context.session_id != session.owner.session_id:
+                    return ToolResult(
+                        content=(
+                            "session-scoped browser reconnaissance rejected: browser session "
+                            "owner does not match"
+                        ),
+                        is_error=True,
+                        metadata={
+                            "effect": self.effect,
+                            "failure_code": "browser_session_owner_mismatch",
+                            "retryable": False,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                if self._recorder is None:
+                    return ToolResult(
+                        content=(
+                            "session-scoped browser reconnaissance requires durable action and "
+                            "observation recording; the target was not called"
+                        ),
+                        is_error=True,
+                        metadata={
+                            "effect": self.effect,
+                            "failure_code": "reconnaissance_recorder_required",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                session_recon_scope = True
+            else:
+                action_id = str(context.call_id or uuid4())
+                state_scope = await _BrowserStateScope.open(
+                    self._state_scope_store,
+                    campaign_id=context.campaign_id,
+                    target_authority=_browser_action_authority(session, action),
+                    action_id=action_id,
+                    candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
+                    action_kind=_browser_action_kind(context, kind),
+                    equivalence_key="conservative-shared-state",
                 )
-            action_id = str(context.call_id or uuid4())
-            state_scope = await _BrowserStateScope.open(
-                self._state_scope_store,
-                campaign_id=context.campaign_id,
-                target_authority=_browser_action_authority(session, action),
-                action_id=action_id,
-                candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
-                action_kind=_browser_action_kind(context, kind),
-                equivalence_key="conservative-shared-state",
-            )
             if state_scope is None:
-                return ToolResult(
-                    content="reviewed browser state is already owned by another execution",
-                    is_error=True,
-                    metadata={
-                        "effect": self.effect,
-                        "failure_code": "physical_state_unavailable",
-                        "retryable": True,
-                        "target_effect_attempted": False,
-                        "target_call_budget_charge": 0,
-                    },
-                )
+                if not session_recon_scope:
+                    return ToolResult(
+                        content="reviewed browser state is already owned by another execution",
+                        is_error=True,
+                        metadata={
+                            "effect": self.effect,
+                            "failure_code": "physical_state_unavailable",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
             if action.tab_ref and kind != "open_tab":
                 try:
                     before = await session.snapshot(
                         action.tab_ref, action.frame_ref, step=action.step
                     )
                 except Exception:
-                    await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
+                    if state_scope is not None:
+                        await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
                     return ToolResult(
                         content="browser state could not be observed before the target action",
                         is_error=True,
@@ -569,10 +609,11 @@ class BrowserTool:
                     try:
                         await self._recorder.append_observation(before)
                     except BaseException:
-                        await state_scope.pause(
-                            MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                            before_refs=before_refs,
-                        )
+                        if state_scope is not None:
+                            await state_scope.pause(
+                                MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                                before_refs=before_refs,
+                            )
                         raise
         try:
             if kind == "fill" and await session.fill_requires_redaction(
@@ -835,6 +876,14 @@ class BrowserTool:
                 cleanup_disposition=("released" if kind == "close_tab" else "retained"),
             )
             metadata["state_scope_id"] = state_scope.lifecycle.scope_id
+        elif session_recon_scope:
+            metadata.update(
+                {
+                    "state_owner_kind": "session_browser_context",
+                    "state_owner_id": f"browser:{session.context_id}",
+                    "state_evidence_durable": True,
+                }
+            )
         return ToolResult(content=content, metadata=metadata)
 
 
@@ -935,21 +984,6 @@ class BrowserOwnedSessionCleanupTool:
                 is_error=True,
                 metadata={**metadata, "campaign_scoped": True},
             )
-        if self._state_scope_store is not None and context.campaign_id is None:
-            return ToolResult(
-                content=(
-                    "owned session cleanup requires a durable campaign state scope; "
-                    "the target was not called"
-                ),
-                is_error=True,
-                metadata={
-                    **metadata,
-                    "failure_code": "state_scope_campaign_required",
-                    "retryable": True,
-                    "target_effect_attempted": False,
-                    "target_call_budget_charge": 0,
-                },
-            )
         allowed = {"step", "timeout_ms"}
         if set(arguments) - allowed:
             return ToolResult(
@@ -975,8 +1009,7 @@ class BrowserOwnedSessionCleanupTool:
             )
         tab_ref = open_tabs[0]
         state_scope: _BrowserStateScope | None = None
-        if self._state_scope_store is not None:
-            assert context.campaign_id is not None
+        if self._state_scope_store is not None and context.campaign_id is not None:
             action_id = str(context.call_id or uuid4())
             state_scope = await _BrowserStateScope.open(
                 self._state_scope_store,
@@ -1161,6 +1194,15 @@ class BrowserOwnedSessionCleanupTool:
                     **(
                         {"preferred_next_tool": "browser_compile_api_handoff"}
                         if not result.is_error
+                        else {}
+                    ),
+                    **(
+                        {
+                            "state_owner_kind": "session_browser_context",
+                            "state_owner_id": f"browser:{session.context_id}",
+                            "state_evidence_durable": True,
+                        }
+                        if context.campaign_id is None
                         else {}
                     ),
                 }
