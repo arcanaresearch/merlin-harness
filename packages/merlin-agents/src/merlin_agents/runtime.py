@@ -1393,10 +1393,15 @@ class WorkerHandoff:
     effect_attempt_lineage: tuple[str, ...] = ()
     technique_attempt_id: str | None = None
     candidate_identity: CompletionCandidateIdentity | None = None
+    schedule_id: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str):
+            object.__setattr__(self, "session_id", str(self.session_id))
         if self.attempt_id is not None and not isinstance(self.attempt_id, str):
             object.__setattr__(self, "attempt_id", str(self.attempt_id))
+        if self.schedule_id is not None and not isinstance(self.schedule_id, str):
+            object.__setattr__(self, "schedule_id", str(self.schedule_id))
         if not self.session_id or not self.model:
             raise ValueError("worker handoff requires a session and model")
         if self.profile.id != self.assignment.profile_id:

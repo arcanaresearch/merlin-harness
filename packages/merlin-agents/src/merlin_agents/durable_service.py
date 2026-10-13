@@ -4543,6 +4543,7 @@ class DurableAgentService:
                                 if candidate_identity is not None
                                 else None
                             ),
+                            schedule_id=live.id,
                         ),
                         control,
                         checkpoint=restored_checkpoint,

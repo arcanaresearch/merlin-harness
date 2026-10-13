@@ -10080,6 +10080,51 @@ def test_api_handoff_requires_adapter_or_explicit_dom_fallback() -> None:
         ApiReconHandoff(**values, adapter="openapi")
 
 
+def test_api_handoff_normalizes_legacy_compiled_adapter_defaults() -> None:
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    adapter = {
+        "interface": "http_api",
+        "endpoint": "https://target.test/chat",
+        "api_steps": [
+            {
+                "method": "POST",
+                "interaction": True,
+                "request_template": {"message": "{{input}}"},
+            }
+        ],
+    }
+    compilation = compile_target_adapter(adapter)
+    legacy_compiled = compilation.model_dump(mode="json")
+    for step in legacy_compiled["executable"]["steps"]:
+        step.pop("request_bindings")
+    legacy_serialized = json.dumps(legacy_compiled, sort_keys=True, separators=(",", ":"))
+    canonical_serialized = json.dumps(
+        compilation.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    handoff = ApiReconHandoff(
+        id="handoff-legacy-compiled",
+        context_id="context-1",
+        target_id="target",
+        owner=owner(),
+        method="POST",
+        url="https://target.test/chat",
+        request_evidence_ref="evidence://request",
+        response_evidence_ref="evidence://response",
+        adapter=json.dumps(adapter, sort_keys=True, separators=(",", ":")),
+        compiled_adapter=legacy_serialized,
+        compiled_adapter_digest=compiled_target_adapter_digest(compilation),
+    )
+
+    assert handoff.compiled_adapter == canonical_serialized
+
+
 @pytest.mark.asyncio
 async def test_compiled_chat_exchange_records_adaptive_exchange_with_typed_oracle() -> None:
     import hashlib

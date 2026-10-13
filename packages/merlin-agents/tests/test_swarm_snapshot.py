@@ -198,6 +198,24 @@ def test_rejects_conflicting_duplicate_assignment_rows() -> None:
         project_swarm_snapshots([row, replace(row, assignment_lifecycle=NodeLifecycle.COMPLETED)])
 
 
+def test_repeated_assignment_ids_from_different_schedules_remain_distinct() -> None:
+    first = _record()
+    second = replace(
+        first,
+        schedule_id="schedule/2",
+        assignment_lifecycle=NodeLifecycle.COMPLETED,
+    )
+
+    (snapshot,) = project_swarm_snapshots([first, second])
+
+    assignments = snapshot.specialists[0].assignments
+    assert tuple(item.schedule_id for item in assignments) == ("schedule/1", "schedule/2")
+    assert tuple(item.lifecycle for item in assignments) == (
+        NodeLifecycle.RUNNING,
+        NodeLifecycle.COMPLETED,
+    )
+
+
 def test_rejects_conflicting_specialist_aggregate_lifecycle() -> None:
     first = _record()
     second = replace(

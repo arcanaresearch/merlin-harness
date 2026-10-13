@@ -991,6 +991,50 @@ class Store:
 
 
 @pytest.mark.asyncio
+async def test_provider_authorizer_receives_exact_owning_schedule_id() -> None:
+    seen_schedule_ids: list[str | None] = []
+
+    async def authorize(handoff):
+        seen_schedule_ids.append(handoff.schedule_id)
+        return True
+
+    assignment = WorkerAssignment(
+        id="campaign/provider-scope/worker",
+        objective="Return a bounded result.",
+        profile_id="injection",
+        target_profile_id="target",
+        technique_ids=("technique",),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:target",),
+        budget=AssignmentBudget(max_turns=1, max_tokens=1_000, max_seconds=30),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    service = DurableAgentService(
+        Provider(),
+        Tools(),
+        Store(),
+        model="test",
+        provider_authorizer=authorize,
+    )
+
+    live = await service.submit(
+        "session",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+        schedule_id="schedule/provider-scope",
+    )
+    assert live.execution is not None
+    await live.execution
+
+    assert seen_schedule_ids == ["schedule/provider-scope"]
+
+
+@pytest.mark.asyncio
 async def test_snapshot_read_is_one_scoped_store_call_and_keeps_result_separate() -> None:
     class SnapshotStore(Store):
         def __init__(self) -> None:

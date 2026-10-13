@@ -195,7 +195,12 @@ class ApiReconHandoff(BrowserModel):
                 separators=(",", ":"),
             )
             if self.compiled_adapter != canonical:
-                raise ValueError("compiled adapter must use canonical JSON encoding")
+                # Older sealed handoffs can omit fields that were later added
+                # with deterministic defaults (for example request_bindings).
+                # ``read_target_adapter`` has already validated the contract;
+                # normalize that legacy spelling before checking its semantic
+                # digest so durable reconnaissance remains reusable.
+                object.__setattr__(self, "compiled_adapter", canonical)
             observed_digest = compiled_target_adapter_digest(compilation)
             if self.compiled_adapter_digest != observed_digest:
                 raise ValueError("compiled adapter digest does not match executable semantics")

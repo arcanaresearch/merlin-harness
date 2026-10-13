@@ -258,7 +258,7 @@ def _project_assignments(
 ) -> tuple[AssignmentSnapshot, ...]:
     assignments: list[AssignmentSnapshot] = []
     for assignment_key, assignment_rows_iter in groupby(
-        records, key=lambda row: (row.assignment_id, row.candidate)
+        records, key=lambda row: (row.schedule_id, row.assignment_id, row.candidate)
     ):
         assignment_rows = tuple(assignment_rows_iter)
         first = assignment_rows[0]
@@ -315,6 +315,7 @@ def _record_sort_key(record: SwarmProjectionRecord) -> tuple[object, ...]:
         campaign_id or "",
         provenance,
         record.specialist_instance_id,
+        record.schedule_id,
         record.assignment_id,
         record.candidate,
     )

@@ -4308,6 +4308,7 @@ def build_backend(
             session_id: str,
             agent_id: str | None,
             grant_digest: str | None,
+            schedule_id: str | None = None,
         ) -> tuple[Mapping[str, object], Mapping[str, object]] | None:
             if not (campaign_id and agent_id and grant_digest):
                 return None
@@ -4315,11 +4316,16 @@ def build_backend(
             if (
                 campaign is None
                 or campaign["status"] != "executing"
-                or str(campaign["session_id"]) != session_id
+                or str(campaign["session_id"]) != str(session_id)
             ):
                 return None
             waves = await asyncio.to_thread(campaign_store.list_waves, campaign_id)
-            for wave in reversed(waves):
+            matching_waves = (
+                tuple(wave for wave in waves if str(wave.get("schedule_id") or "") == schedule_id)
+                if schedule_id
+                else tuple(reversed(waves))
+            )
+            for wave in matching_waves:
                 schedule = await asyncio.to_thread(
                     scheduler_store.load_schedule, str(wave["schedule_id"])
                 )
@@ -4663,6 +4669,7 @@ def build_backend(
                 handoff.session_id,
                 assignment.id,
                 worker_context.digest if worker_context is not None else None,
+                handoff.schedule_id,
             )
             if admitted is None or admitted[0].get("provider_id") != assignment.provider_id:
                 return False

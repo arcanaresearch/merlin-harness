@@ -3087,6 +3087,15 @@ async def test_provider_permission_is_checked_before_each_model_call() -> None:
     assert provider.requests == []
 
 
+def test_worker_handoff_normalizes_uuid_session_identity() -> None:
+    session_id = uuid4()
+
+    worker_handoff = handoff()
+    normalized = replace(worker_handoff, session_id=session_id)
+
+    assert normalized.session_id == str(session_id)
+
+
 async def test_assignment_token_budget_is_cumulative_and_sent_to_provider() -> None:
     provider = Provider(
         [
