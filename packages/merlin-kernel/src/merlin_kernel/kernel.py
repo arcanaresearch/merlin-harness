@@ -738,7 +738,6 @@ class Kernel:
         provider_failures = 0
         recovery_tool_name: str | None = None
         recovery_reasoning: Literal["enabled", "disabled"] | None = None
-        recovery_reasoning_sticky = False
         preferred_next_tool_name: str | None = None
         blocked_recovery_tools: set[str] = set()
         repair_messages: list[ChatMessage] = []
@@ -824,9 +823,7 @@ class Kernel:
                 # turn behind that tool's schema or repair instruction.
                 request_recovery_tool_name = recovery_tool_name
                 recovery_tool_name = None
-                request_recovery_reasoning = (
-                    "disabled" if recovery_reasoning_sticky else recovery_reasoning
-                )
+                request_recovery_reasoning = recovery_reasoning
                 recovery_reasoning = None
                 request_preferred_tool_name = preferred_next_tool_name
                 request_repair_messages = repair_messages
@@ -1210,13 +1207,10 @@ class Kernel:
                             if malformed_tool_call:
                                 # The model already decided to call a tool. Spend the repair
                                 # attempt's output budget on the call arguments instead of a
-                                # second reasoning trace that can truncate them again. Keep the
-                                # remainder of this provider turn in the same mode: DeepSeek's
-                                # thinking protocol rejects a later thinking-enabled request
-                                # when the repaired assistant tool message has no
-                                # ``reasoning_content`` to replay.
+                                # second reasoning trace that can truncate them again. Providers
+                                # with transcript replay requirements enforce them against the
+                                # exact projected messages on subsequent requests.
                                 recovery_reasoning = "disabled"
-                                recovery_reasoning_sticky = True
                             failed_tool_name = event.tool_name or request_recovery_tool_name
                             if (
                                 malformed_tool_call

@@ -4017,6 +4017,9 @@ def build_backend(
             output_token_parameter=provider_runtime.output_token_parameter,  # type: ignore[arg-type]
             reasoning_parameter=provider_runtime.reasoning_parameter,  # type: ignore[arg-type]
             reasoning_effort=provider_runtime.effort,  # type: ignore[arg-type]
+            requires_reasoning_content_for_tool_calls=(
+                provider_runtime.requires_reasoning_content_for_tool_calls
+            ),
         )
         default_provider = OpenAICompatibleProvider(provider_config)
         transport_state = ConfigPaths.default().directory / "provider-transports"
@@ -4039,6 +4042,10 @@ def build_backend(
                         ]
                     if endpoint_override.get("reasoning_parameter"):
                         shared["reasoning_parameter"] = endpoint_override["reasoning_parameter"]
+                    if "requires_reasoning_content_for_tool_calls" in endpoint_override:
+                        shared["requires_reasoning_content_for_tool_calls"] = endpoint_override[
+                            "requires_reasoning_content_for_tool_calls"
+                        ]
                 transport_routes[routed_model] = OpenAICompatibleProvider(ProviderConfig(**shared))
             elif transport == "codex_app_server":
                 transport_routes[routed_model] = CodexAppServerProvider(

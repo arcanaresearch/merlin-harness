@@ -1791,6 +1791,200 @@ def test_deepseek_effort_uses_native_thinking_toggle_on_the_streaming_path() -> 
     assert "reasoning_effort" not in observed
 
 
+def test_deepseek_disables_thinking_for_incomplete_reasoning_replay() -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            "https://api.deepseek.com/v1",
+            "secret",
+            "deepseek-chat",
+            reasoning_parameter="thinking",
+        )
+    )
+    request = ChatRequest(
+        model="deepseek-chat",
+        messages=[
+            ChatMessage(role="user", content="first"),
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ChatMessage(
+                role="tool",
+                content="result",
+                name="read_file",
+                tool_call_id="call-1",
+            ),
+            ChatMessage(role="user", content="second"),
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {"type": "object"}},
+            }
+        ],
+    )
+
+    assert provider._payload(request)["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_keeps_thinking_when_all_retained_reasoning_is_replayable() -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            "https://api.deepseek.com/v1",
+            "secret",
+            "deepseek-chat",
+            reasoning_parameter="thinking",
+        )
+    )
+    request = ChatRequest(
+        model="deepseek-chat",
+        messages=[
+            ChatMessage(role="user", content="first"),
+            ChatMessage(
+                role="assistant",
+                content="plain answer",
+                reasoning_content="reasoned answer",
+            ),
+            ChatMessage(role="user", content="second"),
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {"type": "object"}},
+            }
+        ],
+    )
+
+    payload = provider._payload(request)
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["messages"][1]["reasoning_content"] == "reasoned answer"
+
+
+def test_deepseek_reenables_thinking_after_incompatible_history_leaves_projection() -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            "https://api.deepseek.com/v1",
+            "secret",
+            "deepseek-chat",
+            reasoning_parameter="thinking",
+        )
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}},
+        }
+    ]
+
+    incompatible = ChatRequest(
+        model="deepseek-chat",
+        messages=[ChatMessage(role="assistant", content="missing reasoning")],
+        tools=tools,
+    )
+    compacted = ChatRequest(
+        model="deepseek-chat",
+        messages=[
+            ChatMessage(role="system", content="Compacted conversation summary"),
+            ChatMessage(role="user", content="continue"),
+        ],
+        tools=tools,
+    )
+
+    assert provider._payload(incompatible)["thinking"] == {"type": "disabled"}
+    assert provider._payload(compacted)["thinking"] == {"type": "enabled"}
+
+
+@pytest.mark.parametrize(
+    ("base_url", "compatibility", "tools", "expected"),
+    [
+        ("https://models.example/v1", False, True, "enabled"),
+        ("https://api.deepseek.com/v1", False, True, "enabled"),
+        ("https://proxy.example/v1", True, True, "disabled"),
+        ("https://api.deepseek.com/v1", None, False, "enabled"),
+    ],
+)
+def test_reasoning_replay_guard_is_route_and_tool_gated(
+    base_url: str,
+    compatibility: bool | None,
+    tools: bool,
+    expected: str,
+) -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            base_url,
+            "secret",
+            "model",
+            reasoning_parameter="thinking",
+            reasoning_effort="high",
+            requires_reasoning_content_for_tool_calls=compatibility,
+        )
+    )
+    request = ChatRequest(
+        model="model",
+        messages=[ChatMessage(role="assistant", content="missing reasoning")],
+        tools=(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "read_file", "parameters": {"type": "object"}},
+                }
+            ]
+            if tools
+            else []
+        ),
+    )
+
+    assert provider._payload(request)["thinking"] == {"type": expected}
+
+
+def test_deepseek_reports_when_thinking_is_disabled_for_replay() -> None:
+    stream = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=stream)
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://api.deepseek.com/v1",
+                    "secret",
+                    "deepseek-chat",
+                    reasoning_parameter="thinking",
+                ),
+                client=client,
+            )
+            return [
+                event
+                async for event in provider.stream(
+                    ChatRequest(
+                        model="deepseek-chat",
+                        messages=[ChatMessage(role="assistant", content="missing reasoning")],
+                        tools=[
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                    )
+                )
+            ]
+
+    events = asyncio.run(run())
+    warning = next(event for event in events if isinstance(event, ModelWarning))
+    assert warning.code == "reasoning_replay_incomplete"
+
+
 def test_output_token_parameter_uses_configured_default_when_request_is_unbounded() -> None:
     observed = {}
     stream = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'

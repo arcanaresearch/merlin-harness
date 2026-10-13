@@ -95,6 +95,7 @@ class ProviderConfig:
     output_token_parameter: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     reasoning_parameter: Literal["none", "thinking"] = "none"
     reasoning_effort: Literal["default", "minimal", "low", "medium", "high", "xhigh"] = "default"
+    requires_reasoning_content_for_tool_calls: bool | None = None
     required_capabilities: frozenset[Literal["streaming", "tools", "usage_in_stream"]] = frozenset(
         {"streaming"}
     )
@@ -139,6 +140,13 @@ class ProviderConfig:
         value = self.total_timeout if self.total_timeout is not None else self.timeout
         assert value is not None
         return value
+
+    @property
+    def effective_requires_reasoning_content_for_tool_calls(self) -> bool:
+        configured = self.requires_reasoning_content_for_tool_calls
+        if configured is not None:
+            return configured
+        return httpx.URL(self.base_url).host == "api.deepseek.com"
 
 
 class ProviderError(RuntimeError):
@@ -522,6 +530,15 @@ class OpenAICompatibleProvider:
         tools: dict[tuple[int, int], dict[str, Any]] = {}
         dsml_text: list[str] = []
         dsml_enabled = self.config.model.lower().startswith("deepseek-v4") and bool(request.tools)
+        _, reasoning_disabled_for_replay = self._effective_reasoning(request)
+        if reasoning_disabled_for_replay:
+            yield ModelWarning(
+                code="reasoning_replay_incomplete",
+                message=(
+                    "thinking was disabled for this request because the retained tool-enabled "
+                    "transcript contains an assistant message without reasoning_content"
+                ),
+            )
         finish, done, refused = None, False, False
         timeout = httpx.Timeout(
             connect=self.config.connect_timeout,
@@ -1145,9 +1162,7 @@ class OpenAICompatibleProvider:
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if self.config.reasoning_parameter == "thinking":
-            reasoning = request.reasoning
-            if reasoning is None and self.config.reasoning_effort != "default":
-                reasoning = "enabled"
+            reasoning, _ = self._effective_reasoning(request)
             if reasoning is not None:
                 payload["thinking"] = {"type": reasoning}
         payload[self.config.output_token_parameter] = (
@@ -1156,6 +1171,26 @@ class OpenAICompatibleProvider:
             else self.config.default_max_output_tokens
         )
         return payload
+
+    def _effective_reasoning(self, request: ChatRequest) -> tuple[str | None, bool]:
+        reasoning = request.reasoning
+        if self.config.reasoning_parameter != "thinking":
+            return reasoning, False
+        requires_replay = self.config.effective_requires_reasoning_content_for_tool_calls
+        if reasoning is None and (self.config.reasoning_effort != "default" or requires_replay):
+            reasoning = "enabled"
+        incomplete_replay = (
+            reasoning == "enabled"
+            and bool(request.tools)
+            and requires_replay
+            and any(
+                message.role == "assistant" and message.reasoning_content is None
+                for message in request.messages
+            )
+        )
+        if incomplete_replay:
+            return "disabled", True
+        return reasoning, False
 
     def _redact(self, message: str) -> str:
         return (

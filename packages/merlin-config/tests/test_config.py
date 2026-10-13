@@ -500,6 +500,32 @@ def test_provider_output_token_parameter_is_explicit_and_validated(tmp_path: Pat
         load_config(paths, {})
 
 
+def test_provider_reasoning_replay_compatibility_is_boolean_and_preserved(tmp_path: Path) -> None:
+    paths = ConfigPaths(tmp_path)
+    paths.config.write_text(
+        "[provider]\nrequires_reasoning_content_for_tool_calls=false\n"
+        "[provider.model_endpoints.deepseek]\n"
+        "base_url='https://proxy.example/v1'\n"
+        "requires_reasoning_content_for_tool_calls=true\n",
+        encoding="utf-8",
+    )
+    paths.config.chmod(0o600)
+
+    config = load_config(paths, {})
+    assert config.provider_runtime.requires_reasoning_content_for_tool_calls is False
+    assert (
+        config.provider_model_endpoints["deepseek"]["requires_reasoning_content_for_tool_calls"]
+        is True
+    )
+
+    paths.config.write_text(
+        "[provider]\nrequires_reasoning_content_for_tool_calls='false'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(TypeError, match="requires_reasoning_content_for_tool_calls"):
+        load_config(paths, {})
+
+
 def test_provider_escalation_models_are_validated(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path)
     paths.config.write_text(

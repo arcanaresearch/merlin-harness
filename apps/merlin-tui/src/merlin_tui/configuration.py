@@ -384,6 +384,7 @@ class ProviderConfiguration:
         *,
         output_token_parameter: str | None = None,
         reasoning_parameter: str | None = None,
+        requires_reasoning_content_for_tool_calls: bool | None = None,
     ) -> None:
         """Persist a per-model provider endpoint override and its optional key."""
         model = model.strip()
@@ -395,10 +396,10 @@ class ProviderConfiguration:
         provider_values = dict(provider) if isinstance(provider, Mapping) else {}
         endpoints = provider_values.get("model_endpoints", {})
         endpoint_values = dict(endpoints) if isinstance(endpoints, Mapping) else {}
-        endpoint: dict[str, str] = {"base_url": base_url}
+        endpoint: dict[str, object] = {"base_url": base_url}
         previous = endpoint_values.get(model, {})
         if isinstance(previous, Mapping) and previous.get("base_url") == base_url:
-            endpoint.update({str(k): str(v) for k, v in previous.items()})
+            endpoint.update({str(k): v for k, v in previous.items()})
         if api_key is not None and api_key.strip():
             endpoint["api_key"] = api_key.strip()
         if output_token_parameter is not None:
@@ -409,6 +410,10 @@ class ProviderConfiguration:
             if reasoning_parameter not in {"none", "thinking"}:
                 raise ValueError("reasoning parameter is unsupported")
             endpoint["reasoning_parameter"] = reasoning_parameter
+        if requires_reasoning_content_for_tool_calls is not None:
+            endpoint["requires_reasoning_content_for_tool_calls"] = (
+                requires_reasoning_content_for_tool_calls
+            )
         endpoint_values[model] = endpoint
         provider_values["model_endpoints"] = endpoint_values
         values["provider"] = provider_values

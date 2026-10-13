@@ -200,6 +200,7 @@ def test_model_endpoint_persists_deepseek_native_protocol_controls(tmp_path: Pat
         "deepseek-secret",
         output_token_parameter="max_tokens",
         reasoning_parameter="thinking",
+        requires_reasoning_content_for_tool_calls=False,
     )
 
     provider = load_config(paths, environ={}).values["provider"]
@@ -208,7 +209,19 @@ def test_model_endpoint_persists_deepseek_native_protocol_controls(tmp_path: Pat
         "api_key": "deepseek-secret",
         "output_token_parameter": "max_tokens",
         "reasoning_parameter": "thinking",
+        "requires_reasoning_content_for_tool_calls": False,
     }
+
+    configuration.save_model_endpoint(
+        "deepseek-chat",
+        "https://api.deepseek.com/v1",
+        "rotated-secret",
+    )
+    provider = load_config(paths, environ={}).values["provider"]
+    assert (
+        provider["model_endpoints"]["deepseek-chat"]["requires_reasoning_content_for_tool_calls"]
+        is False
+    )
 
 
 def test_missing_route_credentials_flags_only_unresolvable_routes() -> None:

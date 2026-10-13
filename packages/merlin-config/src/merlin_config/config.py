@@ -226,6 +226,11 @@ class Config:
             ),
             reasoning_parameter=str(value.get("reasoning_parameter", "none")),
             effort=str(value.get("effort", "default")),
+            requires_reasoning_content_for_tool_calls=(
+                value.get("requires_reasoning_content_for_tool_calls")
+                if isinstance(value.get("requires_reasoning_content_for_tool_calls"), bool)
+                else None
+            ),
         )
 
     @property
@@ -262,7 +267,7 @@ class Config:
         return MappingProxyType({str(model): str(route) for model, route in routes.items()})
 
     @property
-    def provider_model_endpoints(self) -> Mapping[str, Mapping[str, str]]:
+    def provider_model_endpoints(self) -> Mapping[str, Mapping[str, object]]:
         """Return per-model endpoint overrides (base_url and optional api_key).
 
         Missing entries deliberately fall back to the shared [provider] endpoint
@@ -274,7 +279,7 @@ class Config:
         assert isinstance(endpoints, Mapping)
         return MappingProxyType(
             {
-                str(model): MappingProxyType({str(k): str(v) for k, v in endpoint.items()})
+                str(model): MappingProxyType({str(k): v for k, v in endpoint.items()})
                 for model, endpoint in endpoints.items()
                 if isinstance(endpoint, Mapping)
             }
@@ -572,6 +577,7 @@ class ProviderRuntimeTuning:
     output_token_parameter: str = "max_completion_tokens"
     reasoning_parameter: str = "none"
     effort: str = "default"
+    requires_reasoning_content_for_tool_calls: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,6 +750,7 @@ def _validate(values: Mapping[str, object]) -> None:
             "cache_read_input_cost_per_million",
             "output_token_parameter",
             "reasoning_parameter",
+            "requires_reasoning_content_for_tool_calls",
             "effort",
             "role_models",
             "model_efforts",
@@ -769,6 +776,9 @@ def _validate(values: Mapping[str, object]) -> None:
             )
         if provider.get("reasoning_parameter", "none") not in {"none", "thinking"}:
             raise ValueError("provider.reasoning_parameter must be 'none' or 'thinking'")
+        replay_requirement = provider.get("requires_reasoning_content_for_tool_calls")
+        if replay_requirement is not None and not isinstance(replay_requirement, bool):
+            raise TypeError("provider.requires_reasoning_content_for_tool_calls must be a boolean")
         if provider.get("effort", "default") not in {
             "default",
             "minimal",
@@ -831,6 +841,7 @@ def _validate(values: Mapping[str, object]) -> None:
                 "api_key",
                 "output_token_parameter",
                 "reasoning_parameter",
+                "requires_reasoning_content_for_tool_calls",
             }
             if unknown_endpoint_keys:
                 raise ValueError(
@@ -863,6 +874,12 @@ def _validate(values: Mapping[str, object]) -> None:
                 raise ValueError(
                     f"provider.model_endpoints.{endpoint_model}.reasoning_parameter must be "
                     "'none' or 'thinking'"
+                )
+            replay_requirement = endpoint.get("requires_reasoning_content_for_tool_calls")
+            if replay_requirement is not None and not isinstance(replay_requirement, bool):
+                raise TypeError(
+                    "provider.model_endpoints."
+                    f"{endpoint_model}.requires_reasoning_content_for_tool_calls must be a boolean"
                 )
         model_pricing = provider.get("model_pricing", {})
         if not isinstance(model_pricing, Mapping):
