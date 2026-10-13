@@ -13,7 +13,7 @@
     "untested": 1
   },
   "created_at": "2026-09-14T03:04:05+00:00",
-  "digest": "sha256:c7c662e2b2a1a35928378723cd7bb0e48edd25ccd6b034209d843067f8d6ed71",
+  "digest": "sha256:8b59ff7f6198ff7bd79dd717ae7d5713a2347813f12d50b96da8d5741b6921c4",
   "digest_schema": "v2",
   "evidence": [
     {
@@ -317,9 +317,9 @@
   },
   "report_state": "provisional",
   "revision": 1,
-  "revision_id": "sample-policy-refund-campaign:r1:c7c662e2b2a1",
+  "revision_id": "sample-policy-refund-campaign:r1:8b59ff7f6198",
   "source_seal_state": "sealed",
-  "stop_reason": "completed_with_limitations",
+  "stop_reason": "frontier_exhausted",
   "tasks": [
     {
       "id": "task-recon",

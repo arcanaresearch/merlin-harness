@@ -17,7 +17,11 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
-from .request_bindings import RequestValueGenerator, validate_request_bindings
+from .request_bindings import (
+    RequestValueGenerator,
+    validate_capture_binding,
+    validate_request_bindings,
+)
 from .target_capabilities import (
     RequestConstraint,
     StateCapabilities,
@@ -210,6 +214,11 @@ class HttpApi(AdapterContract):
                 for index, step in enumerate(self.steps)
                 if step.step_id is not None
             },
+            request_documents={
+                step.step_id: step.request_template
+                for step in self.steps
+                if step.step_id is not None
+            },
         )
         return self
 
@@ -245,6 +254,9 @@ class BrowserChat(AdapterContract):
                 for index, step in enumerate(self.steps)
                 if step.step_id is not None
             },
+            request_documents={
+                step.step_id: step.arguments for step in self.steps if step.step_id is not None
+            },
         )
         return self
 
@@ -276,8 +288,20 @@ def _capability_step_ids(
     for observation in capabilities.observations:
         result.add(observation.baseline_selector.step_id)
         result.add(observation.result_selector.step_id)
+    for rule in capabilities.identity_equivalence_rules:
+        result.add(rule.left_selector.step_id)
+        result.add(rule.right_selector.step_id)
+    for ownership in capabilities.resource_ownership:
+        result.add(ownership.principal_selector.step_id)
+        if ownership.reset_selector is not None:
+            result.add(ownership.reset_selector.step_id)
     result.update(item.selector.step_id for item in capabilities.freshness_rules)
     result.update(item.step_id for item in capabilities.affordances)
+    if capabilities.checkpoint is not None:
+        result.add(capabilities.checkpoint.capture_selector.step_id)
+        result.add(capabilities.checkpoint.restore_step_id)
+    result.update(item.step_id for item in capabilities.resource_controls)
+    result.update(item.step_id for item in capabilities.supported_modalities)
     return result
 
 
@@ -286,6 +310,7 @@ def _validate_capability_step_ids(
     capabilities: StateCapabilities | None,
     *,
     available_steps: Mapping[str, tuple[AdapterStepRole, int]],
+    request_documents: Mapping[str, object] | None = None,
 ) -> None:
     unknown = _capability_step_ids(constraints, capabilities) - set(available_steps)
     if unknown:
@@ -297,6 +322,60 @@ def _validate_capability_step_ids(
         )
     if capabilities is None:
         return
+    if capabilities.checkpoint is not None:
+        checkpoint = capabilities.checkpoint
+        capture_role = available_steps[checkpoint.capture_selector.step_id][0]
+        restore_role = available_steps[checkpoint.restore_step_id][0]
+        required_capture_role = (
+            AdapterStepRole.INTERACTION
+            if checkpoint.capture_timing == "post_success_response"
+            else AdapterStepRole.SETUP
+        )
+        if capture_role is not required_capture_role:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                "state_capabilities.checkpoint.capture_selector",
+                "post-success checkpoint capture requires an interaction response; "
+                "a reviewed live handle requires a setup response",
+            )
+        if restore_role is not AdapterStepRole.SETUP:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                "state_capabilities.checkpoint.restore_step_id",
+                "checkpoint restore must reference a setup step",
+            )
+        restore_documents = request_documents or {}
+        if checkpoint.restore_step_id not in restore_documents:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                "state_capabilities.checkpoint.restore_step_id",
+                "checkpoint restore step has no reviewable request document",
+            )
+        try:
+            validate_capture_binding(
+                restore_documents[checkpoint.restore_step_id],
+                checkpoint.restore_request_pointer,
+                checkpoint.binding_name,
+            )
+        except ValueError as exc:
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                "state_capabilities.checkpoint.restore_request_pointer",
+                str(exc),
+            ) from exc
+    modality_documents = request_documents or {}
+    for modality in capabilities.supported_modalities:
+        request_document = modality_documents.get(modality.step_id)
+        if (
+            available_steps[modality.step_id][0] is not AdapterStepRole.INTERACTION
+            or request_document is None
+            or not _json_pointer_exists(request_document, modality.request_pointer)
+        ):
+            raise AdapterCompileError(
+                AdapterCompileFailureKind.CONTRACT_VALIDATION,
+                "state_capabilities.supported_modalities",
+                "supported modality must reference an existing interaction request value",
+            )
     if capabilities.observations and capabilities.identity is None:
         raise AdapterCompileError(
             AdapterCompileFailureKind.CONTRACT_VALIDATION,
@@ -304,7 +383,7 @@ def _validate_capability_step_ids(
             "authoritative state observations require reviewed physical-state identity",
         )
     setup_only_ids = {item.selector.step_id for item in capabilities.freshness_rules} | {
-        item.step_id for item in capabilities.affordances
+        item.step_id for item in capabilities.affordances if item.kind.value != "cleanup_state"
     }
     incompatible = sorted(
         step_id
@@ -317,6 +396,40 @@ def _validate_capability_step_ids(
             "state_capabilities",
             "freshness rules and state-management affordances require setup steps: "
             + ", ".join(incompatible),
+        )
+    cleanup_ids = {
+        item.step_id for item in capabilities.affordances if item.kind.value == "cleanup_state"
+    }
+    incompatible_cleanup_ids = sorted(
+        step_id
+        for step_id in cleanup_ids
+        if available_steps.get(step_id, (None, -1))[0] is not AdapterStepRole.CLEANUP
+    )
+    if incompatible_cleanup_ids:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities.affordances",
+            "cleanup_state affordances require cleanup steps: "
+            + ", ".join(incompatible_cleanup_ids),
+        )
+    resource_setup_ids = {
+        ownership.principal_selector.step_id for ownership in capabilities.resource_ownership
+    } | {
+        ownership.reset_selector.step_id
+        for ownership in capabilities.resource_ownership
+        if ownership.reset_selector is not None
+    }
+    incompatible_resource_ids = sorted(
+        step_id
+        for step_id in resource_setup_ids
+        if available_steps.get(step_id, (None, -1))[0] is not AdapterStepRole.SETUP
+    )
+    if incompatible_resource_ids:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities.resource_ownership",
+            "resource principal and reset selectors require setup steps: "
+            + ", ".join(incompatible_resource_ids),
         )
     paired_selectors = (
         [
@@ -336,6 +449,14 @@ def _validate_capability_step_ids(
             observation.result_selector,
         )
         for index, observation in enumerate(capabilities.observations)
+    )
+    paired_selectors.extend(
+        (
+            f"state_capabilities.identity_equivalence_rules[{index}]",
+            rule.left_selector,
+            rule.right_selector,
+        )
+        for index, rule in enumerate(capabilities.identity_equivalence_rules)
     )
     for path, baseline, result in paired_selectors:
         if result is None:
@@ -511,6 +632,22 @@ def _capture_dependencies(value: object) -> frozenset[str]:
 
 def _valid_json_pointer(value: object) -> bool:
     return isinstance(value, str) and (not value or value.startswith("/"))
+
+
+def _json_pointer_exists(value: object, pointer: str) -> bool:
+    if not pointer:
+        return True
+    current = value
+    for raw_part in pointer.removeprefix("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+            continue
+        return False
+    return True
 
 
 def _locator_present(value: object) -> bool:
@@ -1018,8 +1155,7 @@ def _compile_browser_steps(
             if _locator_present(arguments.get("locator"))
             else None
         )
-        locator = submit_locator if tool == "browser_click" else input_locator
-        locator = locator or step_locator
+        locator = step_locator or (submit_locator if tool == "browser_click" else input_locator)
         if tool == "browser_fill" and locator is None:
             _unsupported_step(
                 advisories,
@@ -1231,6 +1367,9 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
                 for index, step in enumerate(steps)
                 if step.step_id is not None
             },
+            request_documents={
+                step.step_id: step.request_template for step in steps if step.step_id is not None
+            },
         )
         cleanup_lifecycle = _cleanup_lifecycle(
             raw,
@@ -1268,6 +1407,9 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
                 step.step_id: (step.role, index)
                 for index, step in enumerate(steps)
                 if step.step_id is not None
+            },
+            request_documents={
+                step.step_id: step.arguments for step in steps if step.step_id is not None
             },
         )
         cleanup_lifecycle = _cleanup_lifecycle(

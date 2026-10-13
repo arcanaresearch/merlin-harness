@@ -1628,7 +1628,11 @@ def test_pg0_terminal_campaign_without_report_is_discoverable_even_before_error_
                 "sha256:reviewed",
             )
             campaigns.begin_execution("campaign/report-retry", "sha256:reviewed", schedule_id)
-            campaigns.finish("campaign/report-retry", "failed", stop_reason="failed")
+            campaigns.finish(
+                "campaign/report-retry",
+                "failed",
+                stop_reason="infrastructure_blocked_after_retry_policy",
+            )
 
             assert [row["id"] for row in campaigns.list_report_retryable()] == [
                 "campaign/report-retry"
@@ -1654,7 +1658,11 @@ def test_pg0_legacy_terminal_campaign_without_compiled_context_is_not_reportable
                 "sha256:reviewed",
             )
             campaigns.begin_execution("campaign/legacy-terminal", "sha256:reviewed", schedule_id)
-            campaigns.finish("campaign/legacy-terminal", "failed", stop_reason="failed")
+            campaigns.finish(
+                "campaign/legacy-terminal",
+                "failed",
+                stop_reason="infrastructure_blocked_after_retry_policy",
+            )
 
             assert campaigns.list_report_retryable() == []
 
@@ -1679,7 +1687,11 @@ def test_pg0_nonretryable_terminal_report_error_is_not_rediscovered(tmp_path: Pa
                 "sha256:reviewed",
             )
             campaigns.begin_execution("campaign/malformed-report", "sha256:reviewed", schedule_id)
-            campaigns.finish("campaign/malformed-report", "failed", stop_reason="failed")
+            campaigns.finish(
+                "campaign/malformed-report",
+                "failed",
+                stop_reason="infrastructure_blocked_after_retry_policy",
+            )
             assert [row["id"] for row in campaigns.list_report_retryable()] == [
                 "campaign/malformed-report"
             ]
@@ -1710,7 +1722,11 @@ def test_pg0_terminal_campaign_with_running_schedule_is_reconciled(tmp_path: Pat
                 "sha256:reviewed",
             )
             campaigns.begin_execution("campaign/terminal-schedule", "sha256:reviewed", schedule_id)
-            campaigns.finish("campaign/terminal-schedule", "failed", stop_reason="failed")
+            campaigns.finish(
+                "campaign/terminal-schedule",
+                "failed",
+                stop_reason="infrastructure_blocked_after_retry_policy",
+            )
 
             assert [row["id"] for row in campaigns.list_terminal_active_schedules()] == [
                 "campaign/terminal-schedule"

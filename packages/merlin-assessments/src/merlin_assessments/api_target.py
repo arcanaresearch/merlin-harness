@@ -6,9 +6,11 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from merlin_contracts import (
@@ -17,9 +19,18 @@ from merlin_contracts import (
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    build_state_observation,
+    evaluate_objective_gate_predicate,
+    evaluate_state_transition,
     executable_adapter_digest,
 )
 from merlin_contracts.request_bindings import RequestValueGenerator, bind_request_values
+from merlin_contracts.state_isolation import resolve_state_isolation
+from merlin_contracts.state_scope_runtime import (
+    CheckpointVault,
+    ObjectiveCheckpointStore,
+    StateScopeLifecycle,
+)
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompilation,
     AdapterCompileError,
@@ -32,7 +43,10 @@ from merlin_contracts.target_adapter_compiler import (
 )
 from merlin_contracts.target_capabilities import (
     RequestConstraint,
+    ResourceControl,
+    ResourceOwnership,
     StateCapabilities,
+    StateCheckpoint,
     StateObservation,
     StateSelector,
     StructuredConstraintRejection,
@@ -128,6 +142,18 @@ class _RequestConstraintViolation(ValueError):
             f"rendered request violates reviewed constraints at step {step_id}; "
             "the target was not called"
         )
+
+    def include_completed_exchanges(self, exchanges: Sequence[Mapping[str, object]]) -> None:
+        self.exchanges[:0] = [dict(item) for item in exchanges]
+
+
+class _TargetResourceBlocked(ValueError):
+    """A shared principal resource denied delivery until its durable wake time."""
+
+    def __init__(self, status: Mapping[str, object]) -> None:
+        self.status = dict(status)
+        self.exchanges: list[dict[str, object]] = []
+        super().__init__("reviewed target resource is unavailable before delivery")
 
     def include_completed_exchanges(self, exchanges: Sequence[Mapping[str, object]]) -> None:
         self.exchanges[:0] = [dict(item) for item in exchanges]
@@ -304,6 +330,21 @@ class _ApiAdapter:
     state_capabilities: StateCapabilities | None = None
 
 
+@dataclass(slots=True)
+class _StateScopeLease:
+    claimant_id: str
+    lease_seconds: int
+    lifecycle: StateScopeLifecycle
+    claim_id: str | None = None
+    equivalence_key: str | None = None
+    principal_key: str | None = None
+    checkpoint_restore_gate_id: str | None = None
+    checkpoint_receipt: Mapping[str, object] | None = None
+    pending_checkpoint_secret: str | None = None
+    pending_checkpoint_exchange_ref: str | None = None
+    checkpoint_restore_secret: str | None = None
+
+
 class ReviewedApiTargetTool:
     """Execute one reviewed stateful HTTP adapter through a durable campaign session."""
 
@@ -316,6 +357,8 @@ class ReviewedApiTargetTool:
         credentials: Mapping[str, str],
         *,
         browser_api_requester: BrowserApiRequester | None = None,
+        checkpoint_store: ObjectiveCheckpointStore | None = None,
+        checkpoint_vault: CheckpointVault | None = None,
         timeout_seconds: float = 30,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -325,6 +368,8 @@ class ReviewedApiTargetTool:
         self._adapter_resolver = adapter_resolver
         self._credentials = credentials
         self._browser_api_requester = browser_api_requester
+        self._checkpoint_store = checkpoint_store
+        self._checkpoint_vault = checkpoint_vault
         self._timeout = timeout_seconds
         self._client = client
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -567,6 +612,10 @@ class ReviewedApiTargetTool:
                         )
                 except _RequestConstraintViolation as error:
                     return resolved(_request_constraint_violation_result(error))
+                except _TargetResourceBlocked as error:
+                    return resolved(
+                        _target_resource_blocked_result(None, error.status, error.exchanges)
+                    )
                 except (
                     ValueError,
                     httpx.HTTPError,
@@ -796,15 +845,6 @@ class ReviewedApiTargetTool:
         if state.state == "cleaned":
             raise _TargetSessionStateError("campaign API session is already cleaned")
         parallel_capacity = _target_parallel_capacity(adapter)
-        if parallel_capacity is None:
-            return await self._invoke_under_execution_lease(
-                context,
-                text,
-                pointer_miss_retries,
-                session_scope_id,
-                adapter,
-                state,
-            )
         claimant_id = _target_execution_claimant_id(context.campaign_id, session_scope_id, text)
         lease_seconds = max(60, int(self._timeout * 4))
         claim_id = await asyncio.to_thread(
@@ -818,22 +858,94 @@ class ReviewedApiTargetTool:
         )
         if claim_id is None:
             return _target_execution_busy_result(state)
+        lifecycle = await StateScopeLifecycle.create(
+            self._sessions,
+            campaign_id=context.campaign_id,
+            target_authority=_target_authority(adapter),
+            attempt_id=session_scope_id,
+            action_id=claimant_id,
+            candidate_id=context.agent_id,
+        )
+        state_scope_lease = _StateScopeLease(
+            claimant_id=claimant_id,
+            lease_seconds=lease_seconds,
+            lifecycle=lifecycle,
+        )
+        scope_claimed = await self._claim_state_scope_lease(
+            state_scope_lease,
+            adapter,
+            equivalence_key="conservative-shared-state",
+        )
+        if not scope_claimed:
+            await asyncio.to_thread(self._sessions.release_target_execution, claim_id, claimant_id)
+            await lifecycle.pause_unclaimed(
+                isolation_disposition=("shared_serialized" if parallel_capacity == 1 else "unknown")
+            )
+            return _physical_state_unavailable_result(
+                state,
+                [],
+                reason="the reviewed physical state is already owned by another execution",
+            )
         owner = asyncio.current_task()
         heartbeat = asyncio.create_task(
-            self._renew_target_execution_lease(claim_id, claimant_id, lease_seconds, owner)
+            self._renew_target_execution_lease(
+                claim_id,
+                claimant_id,
+                lease_seconds,
+                owner,
+                state_scope_lease,
+            )
         )
         try:
-            result = await self._invoke_under_execution_lease(
-                context,
-                text,
-                pointer_miss_retries,
-                session_scope_id,
-                adapter,
-                state,
+            try:
+                result = await self._invoke_under_execution_lease(
+                    context,
+                    text,
+                    pointer_miss_retries,
+                    session_scope_id,
+                    adapter,
+                    state,
+                    state_scope_lease,
+                )
+            except BaseException:
+                await self._release_checkpoint_restore(context, state_scope_lease)
+                if lifecycle.acknowledged:
+                    await lifecycle.settle(
+                        before_refs=(),
+                        action_refs=(),
+                        response_refs=(),
+                        after_refs=(),
+                        transition_disposition="infrastructure_failure",
+                        isolation_disposition=(
+                            "shared_serialized" if parallel_capacity == 1 else "unknown"
+                        ),
+                        cleanup_disposition="pending",
+                    )
+                else:
+                    await lifecycle.pause(
+                        reason="transport_failed",
+                        retryable=True,
+                        isolation_disposition=(
+                            "shared_serialized" if parallel_capacity == 1 else "unknown"
+                        ),
+                    )
+                raise
+            await self._release_checkpoint_restore(context, state_scope_lease)
+            await _finish_state_scope_lifecycle(
+                lifecycle,
+                result,
+                adapter=adapter,
+                parallel_capacity=parallel_capacity,
             )
             still_owned = await asyncio.to_thread(
                 self._sessions.validate_target_execution, claim_id, claimant_id
             )
+            if state_scope_lease.claim_id is not None:
+                still_owned = still_owned and await asyncio.to_thread(
+                    self._sessions.validate_state_scope_lease,
+                    state_scope_lease.claim_id,
+                    claimant_id,
+                )
             if not still_owned:
                 return _target_execution_lease_lost_result(result)
             if _allows_serial_state_reuse(adapter):
@@ -859,7 +971,69 @@ class ReviewedApiTargetTool:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+            if state_scope_lease.claim_id is not None:
+                await asyncio.to_thread(
+                    self._sessions.release_state_scope_lease,
+                    state_scope_lease.claim_id,
+                    claimant_id,
+                )
             await asyncio.to_thread(self._sessions.release_target_execution, claim_id, claimant_id)
+
+    async def _claim_state_scope_lease(
+        self,
+        lease: _StateScopeLease,
+        adapter: _ApiAdapter,
+        *,
+        equivalence_key: str,
+    ) -> bool:
+        principal_key = lease.lifecycle.principal_key
+        if (
+            lease.claim_id is not None
+            and lease.equivalence_key == equivalence_key
+            and lease.principal_key == principal_key
+        ):
+            return True
+        if lease.claim_id is not None:
+            rekey = getattr(self._sessions, "rekey_state_scope_lease", None)
+            if callable(rekey):
+                changed = await asyncio.to_thread(
+                    rekey,
+                    lease.claim_id,
+                    lease.claimant_id,
+                    principal_key=principal_key,
+                    equivalence_key=equivalence_key,
+                )
+                if not changed:
+                    return False
+                lease.equivalence_key = equivalence_key
+                lease.principal_key = principal_key
+                return True
+            await asyncio.to_thread(
+                self._sessions.release_state_scope_lease,
+                lease.claim_id,
+                lease.claimant_id,
+            )
+            lease.claim_id = None
+            lease.equivalence_key = None
+            lease.principal_key = None
+            lease.lifecycle.unbind_lease()
+        claim_id = await asyncio.to_thread(
+            self._sessions.claim_state_scope_lease,
+            lease.lifecycle.scope_id,
+            target_authority=_target_authority(adapter),
+            principal_key=principal_key,
+            equivalence_key=equivalence_key,
+            claimant_id=lease.claimant_id,
+            lease_seconds=lease.lease_seconds,
+        )
+        if claim_id is None:
+            await lease.lifecycle.pause_unclaimed(isolation_disposition="unknown")
+            return False
+        lease.claim_id = claim_id
+        lease.equivalence_key = equivalence_key
+        lease.principal_key = principal_key
+        lease.lifecycle.bind_lease(claim_id, lease.claimant_id)
+        return True
 
     async def _renew_target_execution_lease(
         self,
@@ -867,6 +1041,7 @@ class ReviewedApiTargetTool:
         claimant_id: str,
         lease_seconds: int,
         owner: asyncio.Task[object] | None,
+        state_scope_lease: _StateScopeLease | None = None,
     ) -> None:
         while True:
             await asyncio.sleep(max(1, lease_seconds // 3))
@@ -880,6 +1055,17 @@ class ReviewedApiTargetTool:
                 if owner is not None:
                     owner.cancel()
                 return
+            if state_scope_lease is not None and state_scope_lease.claim_id is not None:
+                renewed = await asyncio.to_thread(
+                    self._sessions.renew_state_scope_lease,
+                    state_scope_lease.claim_id,
+                    state_scope_lease.claimant_id,
+                    state_scope_lease.lease_seconds,
+                )
+                if not renewed:
+                    if owner is not None:
+                        owner.cancel()
+                    return
 
     async def _invoke_under_execution_lease(
         self,
@@ -889,8 +1075,21 @@ class ReviewedApiTargetTool:
         session_scope_id: str,
         adapter: _ApiAdapter,
         state: CampaignApiSession,
+        state_scope_lease: _StateScopeLease,
     ) -> ToolResult:
         variables = dict(state.variables)
+        checkpoint = _objective_checkpoint_contract(context, adapter)
+        if context.objective_phase_checkpoint_intent is not None:
+            self._checkpoint_dependencies()
+        if checkpoint is not None and context.objective_phase_checkpoint_intent == "restore":
+            state_scope_lease.checkpoint_restore_secret = await self._claim_checkpoint_restore(
+                context,
+                state_scope_lease,
+            )
+            variables[checkpoint.binding_name] = state_scope_lease.checkpoint_restore_secret
+        resource_block = await self._preflight_resource_block(adapter, variables, state_scope_lease)
+        if resource_block is not None:
+            return _target_resource_blocked_result(state, resource_block, ())
         list_constraints = getattr(self._sessions, "list_request_constraints", None)
         durable_constraints: Sequence[Mapping[str, object]] = ()
         if callable(list_constraints):
@@ -919,8 +1118,32 @@ class ReviewedApiTargetTool:
         completed = set(_string_list(variables.get("__completed_steps", ())))
         session_reused = bool(completed)
         exchanges: list[dict[str, object]] = []
+        isolation_plan = resolve_state_isolation(adapter.state_capabilities)
+        isolation_affordance_steps = {
+            item.step_id
+            for item in (
+                adapter.state_capabilities.affordances
+                if adapter.state_capabilities is not None
+                else ()
+            )
+            if item.kind.value in {"provision_fresh_state", "restore_checkpoint", "clone_state"}
+        }
         for step in adapter.steps:
             if step.cleanup or step.interaction or step.id in completed:
+                continue
+            if (
+                context.objective_phase_checkpoint_intent is None
+                and isolation_plan.affordance_step_id is not None
+                and step.id in isolation_affordance_steps
+                and step.id != isolation_plan.affordance_step_id
+            ):
+                continue
+            if checkpoint is not None and (
+                step.id == checkpoint.restore_step_id
+                and context.objective_phase_checkpoint_intent == "capture"
+                or step.id == checkpoint.capture_selector.step_id
+                and context.objective_phase_checkpoint_intent == "restore"
+            ):
                 continue
             _, variables, exchange = await self._execute(
                 context.campaign_id,
@@ -929,8 +1152,58 @@ class ReviewedApiTargetTool:
                 variables,
                 session_scope_id=session_scope_id,
                 input_text=text,
+                state_scope_lease=state_scope_lease,
+                secret_request_pointer=(
+                    checkpoint.restore_request_pointer
+                    if checkpoint is not None
+                    and context.objective_phase_checkpoint_intent == "restore"
+                    and step.id == checkpoint.restore_step_id
+                    else None
+                ),
             )
+            if state_scope_lease.checkpoint_restore_secret is not None:
+                _redact_checkpoint_capture(
+                    exchange,
+                    state_scope_lease.checkpoint_restore_secret,
+                )
             exchanges.append(exchange)
+            if 200 <= int(exchange["status_code"]) <= 299 and checkpoint is not None:
+                if (
+                    context.objective_phase_checkpoint_intent == "capture"
+                    and isinstance(variables.get(checkpoint.binding_name), str)
+                    and variables[checkpoint.binding_name]
+                ):
+                    secret = str(variables[checkpoint.binding_name])
+                    state_scope_lease.pending_checkpoint_secret = secret
+                    if (
+                        checkpoint.capture_timing == "live_handle"
+                        and step.id == checkpoint.capture_selector.step_id
+                    ):
+                        state_scope_lease.pending_checkpoint_exchange_ref = _target_exchange_ref(
+                            exchange
+                        )
+                    _redact_checkpoint_capture(exchanges, secret)
+                    variables.pop(checkpoint.binding_name, None)
+                elif (
+                    context.objective_phase_checkpoint_intent == "restore"
+                    and step.id == checkpoint.restore_step_id
+                ):
+                    await state_scope_lease.lifecycle.acknowledge(
+                        before_refs=(),
+                        action_refs=(_target_exchange_ref(exchange),),
+                    )
+                    state_scope_lease.checkpoint_receipt = await self._complete_checkpoint_restore(
+                        context,
+                        exchange,
+                        state_scope_lease,
+                    )
+                    variables.pop(checkpoint.binding_name, None)
+            if (
+                checkpoint is not None
+                and context.objective_phase_checkpoint_intent == "restore"
+                and step.id == checkpoint.restore_step_id
+            ):
+                variables.pop(checkpoint.binding_name, None)
             if not 200 <= int(exchange["status_code"]) <= 299:
                 state = await asyncio.to_thread(
                     self._sessions.finish_step,
@@ -973,6 +1246,7 @@ class ReviewedApiTargetTool:
                     adapter,
                     exchange,
                     exchanges=exchanges,
+                    state_scope_lease=state_scope_lease,
                 )
                 if _has_reviewed_physical_identity(adapter)
                 else await self._claim_remote_session(
@@ -1011,6 +1285,17 @@ class ReviewedApiTargetTool:
                 continue
             repeat_index = 0
             while repeat_index < step.repeat:
+                if (
+                    checkpoint is not None
+                    and state_scope_lease.checkpoint_restore_secret is not None
+                ):
+                    variables[checkpoint.binding_name] = state_scope_lease.checkpoint_restore_secret
+                elif (
+                    checkpoint is not None
+                    and context.objective_phase_checkpoint_intent == "capture"
+                    and state_scope_lease.pending_checkpoint_secret is not None
+                ):
+                    variables[checkpoint.binding_name] = state_scope_lease.pending_checkpoint_secret
                 try:
                     item, variables, exchange = await self._execute(
                         context.campaign_id,
@@ -1019,6 +1304,8 @@ class ReviewedApiTargetTool:
                         variables,
                         session_scope_id=session_scope_id,
                         input_text=text,
+                        resource_attempt_id=context.call_id,
+                        state_scope_lease=state_scope_lease,
                     )
                 except _TargetSessionTerminal as error:
                     error.exchanges[:0] = exchanges
@@ -1032,6 +1319,47 @@ class ReviewedApiTargetTool:
                 except _RequestConstraintViolation as error:
                     error.include_completed_exchanges(exchanges)
                     raise
+                except _TargetResourceBlocked as error:
+                    error.include_completed_exchanges(exchanges)
+                    raise
+                if state_scope_lease.checkpoint_restore_secret is not None:
+                    _redact_checkpoint_capture(
+                        exchange,
+                        state_scope_lease.checkpoint_restore_secret,
+                    )
+                exchanges.append(exchange)
+                if 200 <= int(exchange["status_code"]) <= 299:
+                    await state_scope_lease.lifecycle.acknowledge(
+                        before_refs=_state_observation_refs(exchanges, phase="baseline"),
+                        action_refs=(_target_exchange_ref(exchange),),
+                    )
+                    if (
+                        checkpoint is not None
+                        and context.objective_phase_checkpoint_intent == "capture"
+                        and step.id == checkpoint.capture_selector.step_id
+                    ):
+                        source = (
+                            exchange.get("response_body")
+                            if checkpoint.capture_selector.evaluation_root == "response_body"
+                            else variables
+                        )
+                        secret = _select(
+                            source,
+                            checkpoint.capture_selector.pointer,
+                            checkpoint.capture_selector.step_id,
+                        )
+                        if not isinstance(secret, str) or not secret:
+                            raise ValueError(
+                                "reviewed checkpoint selector did not yield a non-empty string"
+                            )
+                        state_scope_lease.pending_checkpoint_exchange_ref = _target_exchange_ref(
+                            exchange
+                        )
+                        state_scope_lease.pending_checkpoint_secret = secret
+                        _redact_checkpoint_capture(exchanges, secret)
+                        variables.pop(checkpoint.binding_name, None)
+                if checkpoint is not None:
+                    variables.pop(checkpoint.binding_name, None)
                 state = await asyncio.to_thread(
                     self._sessions.finish_step,
                     context.campaign_id,
@@ -1040,7 +1368,6 @@ class ReviewedApiTargetTool:
                     session_scope_id=session_scope_id,
                 )
                 variables = dict(state.variables)
-                exchanges.append(exchange)
                 if (
                     session_reused
                     and _has_state_contract(adapter)
@@ -1090,6 +1417,7 @@ class ReviewedApiTargetTool:
                             variables,
                             session_scope_id=session_scope_id,
                             exchanges=exchanges,
+                            state_scope_lease=state_scope_lease,
                         )
                         exchanges.extend(restart_exchanges)
                         if restart_failure is not None:
@@ -1108,6 +1436,22 @@ class ReviewedApiTargetTool:
                 break
         if not observed:
             raise ValueError("reviewed API adapter has no interaction step")
+        if state_scope_lease.pending_checkpoint_secret is not None:
+            if _objective_checkpoint_gate_succeeded(
+                context,
+                adapter,
+                exchanges,
+                session_reused=session_reused,
+            ):
+                state_scope_lease.checkpoint_receipt = await self._capture_checkpoint(
+                    context,
+                    state_scope_lease.pending_checkpoint_secret,
+                    state_scope_lease.pending_checkpoint_exchange_ref,
+                    state_scope_lease,
+                )
+            state_scope_lease.pending_checkpoint_secret = None
+            state_scope_lease.pending_checkpoint_exchange_ref = None
+        state_scope_lease.checkpoint_restore_secret = None
         payload: object = observed[0] if len(observed) == 1 else observed
         remote_target_session_id = variables.get("session_id")
         metadata: dict[str, object] = {
@@ -1171,6 +1515,8 @@ class ReviewedApiTargetTool:
         if session_terminal:
             metadata["target_session_terminal"] = True
             metadata["exact_replay_retryable"] = False
+        if state_scope_lease.checkpoint_receipt is not None:
+            metadata["objective_phase_checkpoint"] = dict(state_scope_lease.checkpoint_receipt)
         metadata["target_call_budget_charge"] = sum(
             int(exchange.get("target_call_budget_charge", 1))
             for exchange in exchanges
@@ -1183,6 +1529,360 @@ class ReviewedApiTargetTool:
         )
         return ToolResult(content=json.dumps(payload, sort_keys=True), metadata=metadata)
 
+    async def _claim_checkpoint_restore(
+        self,
+        context: ToolContext,
+        state_scope_lease: _StateScopeLease,
+    ) -> str:
+        store, vault = self._checkpoint_dependencies()
+        assert context.campaign_id is not None
+        assert context.objective_phase_gate_id is not None
+        assert context.objective_phase_gate_recipe_digest is not None
+        assert context.objective_phase_manifest_digest is not None
+        assert context.objective_phase_checkpoint_reference is not None
+        claim_id = state_scope_lease.claim_id
+        if claim_id is None:
+            raise RuntimeError("checkpoint restore requires an active state-scope lease")
+        row = await asyncio.to_thread(
+            store.claim_objective_gate_checkpoint_restore,
+            context.campaign_id,
+            context.objective_phase_gate_id,
+            scope_id=state_scope_lease.lifecycle.scope_id,
+            claim_id=claim_id,
+            claimant_id=state_scope_lease.claimant_id,
+        )
+        durable_reference = row.get("checkpoint_handle")
+        if (
+            row.get("manifest_digest") != context.objective_phase_manifest_digest
+            or row.get("recipe_digest") != context.objective_phase_gate_recipe_digest
+            or durable_reference != context.objective_phase_checkpoint_reference
+        ):
+            await asyncio.to_thread(
+                store.release_objective_gate_checkpoint_restore,
+                context.campaign_id,
+                context.objective_phase_gate_id,
+                scope_id=state_scope_lease.lifecycle.scope_id,
+                claim_id=claim_id,
+                claimant_id=state_scope_lease.claimant_id,
+            )
+            raise ValueError("durable checkpoint does not match the sealed restore contract")
+        reference_id = context.objective_phase_checkpoint_reference.get("reference_id")
+        if not isinstance(reference_id, str) or not reference_id:
+            raise ValueError("sealed checkpoint reference is invalid")
+        state_scope_lease.checkpoint_restore_gate_id = context.objective_phase_gate_id
+        return await asyncio.to_thread(vault.resolve_checkpoint, reference_id)
+
+    async def _capture_checkpoint(
+        self,
+        context: ToolContext,
+        secret: str,
+        exchange_ref: str | None,
+        state_scope_lease: _StateScopeLease,
+    ) -> Mapping[str, object]:
+        store, vault = self._checkpoint_dependencies()
+        if exchange_ref is None:
+            raise RuntimeError("checkpoint capture is missing its acknowledged exchange")
+        assert context.campaign_id is not None
+        assert context.objective_phase_gate_id is not None
+        assert context.objective_phase_gate_recipe_digest is not None
+        assert context.objective_phase_manifest_digest is not None
+        entry = await asyncio.to_thread(
+            vault.store_checkpoint,
+            secret,
+            campaign_id=context.campaign_id,
+            gate_id=context.objective_phase_gate_id,
+        )
+        evidence_digest = _checkpoint_evidence_digest(exchange_ref, entry.digest)
+        claim_id = state_scope_lease.claim_id
+        if claim_id is None:
+            raise RuntimeError("checkpoint capture requires an active state-scope lease")
+        reference = dict(entry.opaque_reference())
+        await asyncio.to_thread(
+            store.record_objective_gate_checkpoint,
+            context.campaign_id,
+            context.objective_phase_gate_id,
+            manifest_digest=context.objective_phase_manifest_digest,
+            recipe_digest=context.objective_phase_gate_recipe_digest,
+            checkpoint_handle=reference,
+            evidence_digest=evidence_digest,
+            scope_id=state_scope_lease.lifecycle.scope_id,
+            claim_id=claim_id,
+            claimant_id=state_scope_lease.claimant_id,
+        )
+        return {
+            "schema": "merlin.objective-phase-checkpoint.v1",
+            "gate_id": context.objective_phase_gate_id,
+            "recipe_digest": context.objective_phase_gate_recipe_digest,
+            "checkpoint_reference": reference,
+            "evidence_digest": evidence_digest,
+            "captured": True,
+        }
+
+    async def _complete_checkpoint_restore(
+        self,
+        context: ToolContext,
+        exchange: Mapping[str, object],
+        state_scope_lease: _StateScopeLease,
+    ) -> Mapping[str, object]:
+        store, _ = self._checkpoint_dependencies()
+        assert context.campaign_id is not None
+        assert context.objective_phase_gate_id is not None
+        assert context.objective_phase_gate_recipe_digest is not None
+        assert context.objective_phase_checkpoint_reference is not None
+        claim_id = state_scope_lease.claim_id
+        if claim_id is None:
+            raise RuntimeError("checkpoint restore requires an active state-scope lease")
+        evidence_digest = _checkpoint_evidence_digest(_target_exchange_ref(exchange), claim_id)
+        await asyncio.to_thread(
+            store.mark_objective_gate_checkpoint_restored,
+            context.campaign_id,
+            context.objective_phase_gate_id,
+            scope_id=state_scope_lease.lifecycle.scope_id,
+            claim_id=claim_id,
+            claimant_id=state_scope_lease.claimant_id,
+            evidence_digest=evidence_digest,
+        )
+        state_scope_lease.checkpoint_restore_gate_id = None
+        return {
+            "schema": "merlin.objective-phase-checkpoint.v1",
+            "gate_id": context.objective_phase_gate_id,
+            "recipe_digest": context.objective_phase_gate_recipe_digest,
+            "checkpoint_reference": dict(context.objective_phase_checkpoint_reference),
+            "evidence_digest": evidence_digest,
+            "restored": True,
+        }
+
+    def _checkpoint_dependencies(self) -> tuple[ObjectiveCheckpointStore, CheckpointVault]:
+        if self._checkpoint_store is None or self._checkpoint_vault is None:
+            raise RuntimeError("objective checkpoint storage is unavailable")
+        return self._checkpoint_store, self._checkpoint_vault
+
+    async def _release_checkpoint_restore(
+        self,
+        context: ToolContext,
+        state_scope_lease: _StateScopeLease,
+    ) -> None:
+        gate_id = state_scope_lease.checkpoint_restore_gate_id
+        claim_id = state_scope_lease.claim_id
+        if gate_id is None or claim_id is None or context.campaign_id is None:
+            return
+        store, _ = self._checkpoint_dependencies()
+        await asyncio.to_thread(
+            store.release_objective_gate_checkpoint_restore,
+            context.campaign_id,
+            gate_id,
+            scope_id=state_scope_lease.lifecycle.scope_id,
+            claim_id=claim_id,
+            claimant_id=state_scope_lease.claimant_id,
+        )
+        state_scope_lease.checkpoint_restore_gate_id = None
+
+    async def _preflight_resource_block(
+        self,
+        adapter: _ApiAdapter,
+        variables: Mapping[str, object],
+        state_scope_lease: _StateScopeLease,
+    ) -> Mapping[str, object] | None:
+        status_reader = getattr(self._sessions, "resource_status", None)
+        if not callable(status_reader):
+            return None
+        for control, ownership in _resource_controls(adapter):
+            retained = variables.get("__principal_identities")
+            retained_identity = (
+                retained.get(ownership.name) if isinstance(retained, Mapping) else None
+            )
+            if state_scope_lease.lifecycle.principal_identity is None and isinstance(
+                retained_identity, Mapping
+            ):
+                state_scope_lease.lifecycle.bind_safe_identities(
+                    principal_identity=retained_identity
+                )
+                equivalence_key = state_scope_lease.equivalence_key or "conservative-shared-state"
+                if not await self._claim_state_scope_lease(
+                    state_scope_lease,
+                    adapter,
+                    equivalence_key=equivalence_key,
+                ):
+                    return {
+                        "state": "principal_lease_conflict",
+                        "retryable": True,
+                    }
+            try:
+                principal_key = _resource_principal_key(
+                    ownership, variables, state_scope_lease.lifecycle
+                )
+            except _TargetResourceBlocked:
+                principal_identity = await self._prior_resource_principal_identity(
+                    adapter,
+                    ownership,
+                    campaign_id=state_scope_lease.lifecycle.campaign_id,
+                )
+                if principal_identity is None:
+                    # A target with no prior reviewed binding still has to learn
+                    # its principal from the exact setup selector. Reservation
+                    # remains the authoritative pre-interaction check.
+                    continue
+                state_scope_lease.lifecycle.bind_safe_identities(
+                    principal_identity=principal_identity
+                )
+                equivalence_key = state_scope_lease.equivalence_key or "conservative-shared-state"
+                if not await self._claim_state_scope_lease(
+                    state_scope_lease,
+                    adapter,
+                    equivalence_key=equivalence_key,
+                ):
+                    return {
+                        "state": "principal_lease_conflict",
+                        "retryable": True,
+                    }
+                principal_key = state_scope_lease.lifecycle.principal_key
+            status = await asyncio.to_thread(
+                status_reader,
+                _target_authority(adapter),
+                principal_key,
+                ownership.resource_kind.value,
+                control.window_key,
+            )
+            if isinstance(status, Mapping) and _resource_status_blocks(status):
+                return status
+        return None
+
+    async def _prior_resource_principal_identity(
+        self,
+        adapter: _ApiAdapter,
+        ownership: ResourceOwnership,
+        *,
+        campaign_id: str,
+    ) -> Mapping[str, object] | None:
+        """Reuse one unambiguous reviewed campaign principal before target setup."""
+
+        list_sessions = getattr(self._sessions, "list_for_campaign", None)
+        if not callable(list_sessions):
+            return None
+        sessions = await asyncio.to_thread(list_sessions, campaign_id)
+        identities: dict[str, Mapping[str, object]] = {}
+        for session in sessions:
+            if (
+                session.target_id != adapter.target_id
+                or session.adapter_digest != adapter.compiled_digest
+            ):
+                continue
+            retained = session.variables.get("__principal_identities")
+            if not isinstance(retained, Mapping):
+                continue
+            identity = retained.get(ownership.name)
+            if not isinstance(identity, Mapping):
+                continue
+            try:
+                key = _secret_safe_identity_key(identity)
+            except ValueError:
+                continue
+            identities[key] = dict(identity)
+        if len(identities) != 1:
+            return None
+        return next(iter(identities.values()))
+
+    async def _reserve_step_resources(
+        self,
+        campaign_id: str,
+        adapter: _ApiAdapter,
+        step: _ApiStep,
+        *,
+        session_scope_id: str,
+        attempt_id: str,
+        variables: Mapping[str, object],
+        state_scope_lease: _StateScopeLease,
+    ) -> list[tuple[str, ResourceControl, ResourceOwnership]]:
+        reserve = getattr(self._sessions, "reserve_resource", None)
+        release = getattr(self._sessions, "release_resource", None)
+        if not callable(reserve):
+            return []
+        reservations: list[tuple[str, ResourceControl, ResourceOwnership]] = []
+        for control, ownership in _resource_controls(adapter, step_id=step.id):
+            reservation_id = _resource_reservation_id(
+                campaign_id,
+                session_scope_id,
+                attempt_id,
+                ownership.name,
+                step.id,
+            )
+            status = await asyncio.to_thread(
+                reserve,
+                state_scope_lease.lifecycle.scope_id,
+                reservation_id,
+                target_authority=_target_authority(adapter),
+                principal_key=_resource_principal_key(
+                    ownership, variables, state_scope_lease.lifecycle
+                ),
+                resource_kind=ownership.resource_kind.value,
+                amount=control.reservation_amount,
+                limit=control.limit,
+                window_key=control.window_key,
+                claim_id=state_scope_lease.claim_id,
+                claimant_id=state_scope_lease.claimant_id,
+            )
+            if not isinstance(status, Mapping) or status.get("admitted") is not True:
+                if callable(release):
+                    for active_id, _, _ in reservations:
+                        await asyncio.to_thread(
+                            release,
+                            active_id,
+                            claim_id=state_scope_lease.claim_id,
+                            claimant_id=state_scope_lease.claimant_id,
+                        )
+                raise _TargetResourceBlocked(
+                    status if isinstance(status, Mapping) else {"state": "unavailable"}
+                )
+            reservations.append((reservation_id, control, ownership))
+        return reservations
+
+    async def _settle_step_resources(
+        self,
+        reservations: Sequence[tuple[str, ResourceControl, ResourceOwnership]],
+        *,
+        actual_calls: int,
+        blocks: Mapping[str, Mapping[str, object]],
+        state_scope_lease: _StateScopeLease | None,
+    ) -> None:
+        settle = getattr(self._sessions, "settle_resource", None)
+        if not callable(settle):
+            return
+        if reservations and state_scope_lease is None:
+            raise RuntimeError("resource settlement requires an active state-scope lease")
+        for reservation_id, control, ownership in reservations:
+            assert state_scope_lease is not None
+            block = blocks.get(ownership.name)
+            await asyncio.to_thread(
+                settle,
+                reservation_id,
+                actual_amount=actual_calls * control.reservation_amount,
+                terminal_block=block is not None,
+                wake_at=None if block is None else block.get("wake_at"),
+                evidence=None if block is None else block.get("evidence"),
+                claim_id=state_scope_lease.claim_id,
+                claimant_id=state_scope_lease.claimant_id,
+            )
+
+    async def _acknowledge_step_resources(
+        self,
+        reservations: Sequence[tuple[str, ResourceControl, ResourceOwnership]],
+        *,
+        state_scope_lease: _StateScopeLease | None,
+    ) -> None:
+        acknowledge = getattr(self._sessions, "acknowledge_resource", None)
+        if not callable(acknowledge):
+            return
+        if reservations and state_scope_lease is None:
+            raise RuntimeError("resource acknowledgement requires an active state-scope lease")
+        for reservation_id, _, _ in reservations:
+            assert state_scope_lease is not None
+            await asyncio.to_thread(
+                acknowledge,
+                reservation_id,
+                claim_id=state_scope_lease.claim_id,
+                claimant_id=state_scope_lease.claimant_id,
+            )
+
     async def _restart_session_locked(
         self,
         campaign_id: str,
@@ -1191,6 +1891,7 @@ class ReviewedApiTargetTool:
         *,
         session_scope_id: str,
         exchanges: list[dict[str, object]],
+        state_scope_lease: _StateScopeLease,
     ) -> tuple[dict[str, object], list[dict[str, object]], ToolResult | None]:
         """Run the reviewed start action once after the no-active-session signal.
 
@@ -1232,6 +1933,7 @@ class ReviewedApiTargetTool:
                 variables,
                 session_scope_id=session_scope_id,
                 input_text="",
+                state_scope_lease=state_scope_lease,
             )
             exchange["infrastructure_receipt"] = "session_restart"
             restart_exchanges.append(exchange)
@@ -1270,6 +1972,7 @@ class ReviewedApiTargetTool:
                     adapter,
                     exchange,
                     exchanges=[*exchanges, *restart_exchanges],
+                    state_scope_lease=state_scope_lease,
                 )
                 if _has_reviewed_physical_identity(adapter)
                 else await self._claim_remote_session(
@@ -1289,8 +1992,10 @@ class ReviewedApiTargetTool:
         exchange: dict[str, object],
         *,
         exchanges: list[dict[str, object]],
+        state_scope_lease: _StateScopeLease,
     ) -> ToolResult | None:
         capabilities = adapter.state_capabilities
+        isolation_plan = resolve_state_isolation(capabilities)
         identity_contract = capabilities.identity if capabilities is not None else None
         if identity_contract is None or identity_contract.baseline_selector.step_id != exchange.get(
             "id"
@@ -1306,7 +2011,17 @@ class ReviewedApiTargetTool:
             ),
             None,
         )
-        if identity is None:
+        safe_bindings = exchange.get("safe_state_bindings")
+        safe_bindings = safe_bindings if isinstance(safe_bindings, Mapping) else {}
+        physical = safe_bindings.get("physical_identity")
+        physical_identity = dict(physical) if isinstance(physical, Mapping) else None
+        equivalence_identities = [
+            dict(item["identity"])
+            for item in _mapping_values(safe_bindings.get("identity_equivalence"))
+            if item.get("side") == "left" and isinstance(item.get("identity"), Mapping)
+        ]
+        lease_identity = equivalence_identities[0] if equivalence_identities else physical_identity
+        if identity is None or lease_identity is None:
             exchange["attempt_disposition"] = "contaminated"
             exchange["retryable"] = True
             exchange["acknowledged_capability_evidence"] = False
@@ -1320,8 +2035,54 @@ class ReviewedApiTargetTool:
                     ),
                 )
             )
+            if isolation_plan.isolated:
+                return _physical_state_unavailable_result(
+                    state,
+                    exchanges,
+                    reason=(
+                        "the reviewed physical-state identity was absent before isolated "
+                        "candidate delivery"
+                    ),
+                )
             return None
-        claim_key = "physical-state:" + str(identity["selected_digest"]).removeprefix("sha256:")
+        if isolation_plan.isolated:
+            if not _exchange_proves_fresh_state(adapter, exchange):
+                exchange["attempt_disposition"] = "contaminated"
+                exchange["retryable"] = True
+                exchange["acknowledged_capability_evidence"] = False
+                exchange["evaluation_uncertain"] = True
+                exchange.setdefault("evaluation_uncertainties", []).append(
+                    _evaluation_uncertainty(
+                        "api_target.physical_state_freshness",
+                        (
+                            "the setup response did not prove an independent fresh physical "
+                            "state, so the candidate was not delivered"
+                        ),
+                    )
+                )
+                return _physical_state_unavailable_result(
+                    state,
+                    exchanges,
+                    reason="the reviewed independent-state freshness proof did not match",
+                )
+            scope_claimed = await self._claim_state_scope_lease(
+                state_scope_lease,
+                adapter,
+                equivalence_key=_secret_safe_identity_key(lease_identity),
+            )
+            if not scope_claimed:
+                exchange["physical_state_alias_detected"] = True
+                exchange["attempt_disposition"] = "contaminated"
+                exchange["retryable"] = True
+                exchange["acknowledged_capability_evidence"] = False
+                return _physical_state_unavailable_result(
+                    state,
+                    exchanges,
+                    reason=("the reviewed physical state is leased by another target execution"),
+                )
+            exchange["global_physical_state_lease"] = True
+        state_scope_lease.lifecycle.bind_safe_identities(physical_state_identity=lease_identity)
+        claim_key = "physical-state:" + _secret_safe_identity_key(lease_identity)
         if state.physical_state_identity == claim_key:
             exchange["physical_state_claimed"] = True
             return None
@@ -1661,10 +2422,31 @@ class ReviewedApiTargetTool:
         *,
         session_scope_id: str,
         input_text: str,
+        resource_attempt_id: str | None = None,
+        state_scope_lease: _StateScopeLease | None = None,
+        secret_request_pointer: str | None = None,
     ) -> tuple[object, dict[str, object], dict[str, object]]:
         request = bind_request_values(
             _render(step.request, variables, input_text), step.request_bindings
         )
+        recorded_request = (
+            _redacted_json_pointer_copy(request, secret_request_pointer)
+            if secret_request_pointer is not None
+            else request
+        )
+        checkpoint_transport_secret = (
+            None
+            if state_scope_lease is None
+            else state_scope_lease.checkpoint_restore_secret
+            or state_scope_lease.pending_checkpoint_secret
+        )
+        if checkpoint_transport_secret is not None:
+            if recorded_request is request:
+                recorded_request = deepcopy(request)
+            _redact_checkpoint_capture(
+                recorded_request,
+                checkpoint_transport_secret,
+            )
         request_constraint_observations = _request_constraint_observations(adapter, step, request)
         protocol_invalid = any(
             item.get("satisfied") is False for item in request_constraint_observations
@@ -1672,15 +2454,36 @@ class ReviewedApiTargetTool:
         if protocol_invalid:
             raise _RequestConstraintViolation(
                 step.id,
-                request,
+                recorded_request,
                 request_constraint_observations,
             )
+        resource_reservations = (
+            await self._reserve_step_resources(
+                campaign_id,
+                adapter,
+                step,
+                session_scope_id=session_scope_id,
+                attempt_id=resource_attempt_id,
+                variables=variables,
+                state_scope_lease=state_scope_lease,
+            )
+            if (
+                step.interaction
+                and resource_attempt_id is not None
+                and state_scope_lease is not None
+            )
+            else []
+        )
         await asyncio.to_thread(
             self._sessions.begin_step,
             campaign_id,
-            _pending_step(step, request),
+            _pending_step(step, recorded_request),
             target_id=adapter.target_id,
             session_scope_id=session_scope_id,
+        )
+        await self._acknowledge_step_resources(
+            resource_reservations,
+            state_scope_lease=state_scope_lease,
         )
         started = time.monotonic()
         try:
@@ -1697,7 +2500,17 @@ class ReviewedApiTargetTool:
             ValueError,
             BrowserApiTransportError,
             _TargetTransportFailure,
-        ):
+        ) as error:
+            await self._settle_step_resources(
+                resource_reservations,
+                actual_calls=(
+                    error.target_call_budget_charge
+                    if isinstance(error, _TargetTransportFailure)
+                    else 1
+                ),
+                blocks={},
+                state_scope_lease=state_scope_lease,
+            )
             await asyncio.to_thread(
                 self._sessions.mark_ambiguous,
                 campaign_id,
@@ -1706,6 +2519,13 @@ class ReviewedApiTargetTool:
             )
             raise
         latency_ms = max(0, int((time.monotonic() - started) * 1_000))
+        resource_blocks = _structured_resource_blocks(adapter, step, status_code, response_json)
+        await self._settle_step_resources(
+            resource_reservations,
+            actual_calls=attempt_count,
+            blocks=resource_blocks,
+            state_scope_lease=state_scope_lease,
+        )
         evaluation_uncertainties = list(step.evaluation_uncertainties)
         response_state_observations = _state_observations(adapter, step, response_json, variables)
         freshness_observations = _freshness_observations(adapter, step, response_json, variables)
@@ -1763,7 +2583,7 @@ class ReviewedApiTargetTool:
                     "id": step.id,
                     "interaction": step.interaction,
                     "cleanup": step.cleanup,
-                    "request": request,
+                    "request": recorded_request,
                     "response": observed,
                     "response_body": response_json,
                     "status_code": status_code,
@@ -1774,6 +2594,16 @@ class ReviewedApiTargetTool:
                         else "target_delivery_rejected"
                     ),
                     "target_delivery_rejected": not protocol_invalid,
+                    **(
+                        {
+                            "resource_blocks": {
+                                name: dict(block["evidence"])
+                                for name, block in resource_blocks.items()
+                            }
+                        }
+                        if resource_blocks
+                        else {}
+                    ),
                     "session_health": "unknown",
                     "retryable": True,
                     **(
@@ -1843,7 +2673,7 @@ class ReviewedApiTargetTool:
                         "id": step.id,
                         "interaction": step.interaction,
                         "cleanup": step.cleanup,
-                        "request": request,
+                        "request": recorded_request,
                         "response": observed,
                         "response_body": response_json,
                         "status_code": status_code,
@@ -1860,6 +2690,15 @@ class ReviewedApiTargetTool:
                 error.target_call_budget_charge += attempt_count
                 error.limit_interaction_count += 1 if step.interaction else 0
                 raise
+        safe_state_bindings = await self._safe_state_bindings(
+            adapter, step, response_json, variables
+        )
+        if state_scope_lease is not None and safe_state_bindings:
+            await self._adopt_safe_state_bindings(adapter, state_scope_lease, safe_state_bindings)
+        equivalence_mismatch = any(
+            item.get("matched") is False
+            for item in _mapping_values(safe_state_bindings.get("identity_equivalence"))
+        )
         freshness_observations = _freshness_observations(adapter, step, response_json, variables)
         freshness_unproven = any(item.get("matched") is not True for item in freshness_observations)
         oracle_observations = _oracle_observation(adapter, step, response_json)
@@ -1884,7 +2723,7 @@ class ReviewedApiTargetTool:
             "id": step.id,
             "interaction": step.interaction,
             "cleanup": step.cleanup,
-            "request": request,
+            "request": recorded_request,
             "response": observed,
             "response_body": response_json,
             "status_code": status_code,
@@ -1898,6 +2737,18 @@ class ReviewedApiTargetTool:
                 else {}
             ),
             **({"state_observations": state_observations} if state_observations else {}),
+            **({"safe_state_bindings": safe_state_bindings} if safe_state_bindings else {}),
+            **(
+                {
+                    "attempt_disposition": "contaminated",
+                    "retryable": True,
+                    "acknowledged_capability_evidence": False,
+                    "evaluation_uncertain": True,
+                    "identity_equivalence_mismatch": True,
+                }
+                if equivalence_mismatch
+                else {}
+            ),
             **(
                 {"freshness_observations": freshness_observations} if freshness_observations else {}
             ),
@@ -1956,6 +2807,127 @@ class ReviewedApiTargetTool:
             ),
         }
         return observed, variables, exchange
+
+    async def _safe_state_bindings(
+        self,
+        adapter: _ApiAdapter,
+        step: _ApiStep,
+        response_body: object,
+        captures: dict[str, object],
+    ) -> dict[str, object]:
+        """Evaluate reviewed identity selectors and retain only keyed digests."""
+
+        capabilities = adapter.state_capabilities
+        vault = self._checkpoint_vault
+        if capabilities is None or vault is None:
+            return {}
+        principals: dict[str, Mapping[str, str]] = {}
+        for ownership in capabilities.resource_ownership:
+            selector = ownership.principal_selector
+            if selector.step_id != step.id:
+                continue
+            selected = _select_state_binding(selector, step, response_body, captures)
+            if selected is None:
+                continue
+            principals[ownership.name] = await asyncio.to_thread(
+                vault.digest_identity,
+                selected,
+                purpose=f"principal:{_target_authority(adapter)}:{ownership.name}",
+            )
+        if principals:
+            retained = captures.setdefault("__principal_identities", {})
+            if not isinstance(retained, dict):
+                retained = {}
+                captures["__principal_identities"] = retained
+            retained.update({name: dict(identity) for name, identity in principals.items()})
+        physical_identity: Mapping[str, str] | None = None
+        if capabilities.identity is not None:
+            selectors = (
+                capabilities.identity.baseline_selector,
+                capabilities.identity.result_selector,
+            )
+            for selector in selectors:
+                if selector is None or selector.step_id != step.id:
+                    continue
+                selected = _select_state_binding(selector, step, response_body, captures)
+                if selected is not None:
+                    physical_identity = await asyncio.to_thread(
+                        vault.digest_identity,
+                        selected,
+                        purpose=f"physical-state:{_target_authority(adapter)}",
+                    )
+                    break
+        equivalence: dict[str, dict[str, object]] = {}
+        durable = captures.setdefault("__identity_equivalence", {})
+        if not isinstance(durable, dict):
+            durable = {}
+            captures["__identity_equivalence"] = durable
+        for rule in capabilities.identity_equivalence_rules:
+            for side, selector in (("left", rule.left_selector), ("right", rule.right_selector)):
+                if selector.step_id != step.id:
+                    continue
+                selected = _select_state_binding(selector, step, response_body, captures)
+                if selected is None:
+                    equivalence[rule.name] = {"side": side, "available": False}
+                    continue
+                identity = await asyncio.to_thread(
+                    vault.digest_identity,
+                    selected,
+                    purpose=f"physical-equivalence:{_target_authority(adapter)}:{rule.name}",
+                )
+                prior = durable.get(rule.name)
+                matched = None
+                if side == "left":
+                    durable[rule.name] = dict(identity)
+                elif isinstance(prior, Mapping):
+                    matched = prior.get("digest") == identity.get("digest")
+                equivalence[rule.name] = {
+                    "side": side,
+                    "available": True,
+                    "identity": dict(identity),
+                    "matched": matched,
+                }
+        return {
+            **({"principals": principals} if principals else {}),
+            **(
+                {"physical_identity": dict(physical_identity)}
+                if physical_identity is not None
+                else {}
+            ),
+            **({"identity_equivalence": equivalence} if equivalence else {}),
+        }
+
+    async def _adopt_safe_state_bindings(
+        self,
+        adapter: _ApiAdapter,
+        lease: _StateScopeLease,
+        bindings: Mapping[str, object],
+    ) -> None:
+        principals = bindings.get("principals")
+        principal_identity: Mapping[str, object] | None = None
+        if isinstance(principals, Mapping) and principals:
+            identities = [
+                dict(value) for _, value in sorted(principals.items()) if isinstance(value, Mapping)
+            ]
+            if len(identities) == 1:
+                principal_identity = identities[0]
+            elif identities and self._checkpoint_vault is not None:
+                principal_identity = await asyncio.to_thread(
+                    self._checkpoint_vault.digest_identity,
+                    identities,
+                    purpose=f"principal-set:{_target_authority(adapter)}",
+                )
+        physical = bindings.get("physical_identity")
+        physical_identity = dict(physical) if isinstance(physical, Mapping) else None
+        lease.lifecycle.bind_safe_identities(
+            principal_identity=principal_identity,
+            physical_state_identity=physical_identity,
+        )
+        if principal_identity is not None and lease.equivalence_key is not None:
+            if not await self._claim_state_scope_lease(
+                lease, adapter, equivalence_key=lease.equivalence_key
+            ):
+                raise _TargetResourceBlocked({"state": "principal_lease_conflict"})
 
     async def _request(
         self,
@@ -2692,6 +3664,19 @@ def _state_observations(
     return observations
 
 
+def _select_state_binding(
+    selector: StateSelector,
+    step: _ApiStep,
+    response_body: object,
+    captures: Mapping[str, object],
+) -> object | None:
+    root = response_body if selector.evaluation_root == "response_body" else captures
+    try:
+        return _select(root, selector.pointer, step.id)
+    except _ResponsePointerMissing:
+        return None
+
+
 def _configured_state_observation(
     adapter: _ApiAdapter,
     step: _ApiStep,
@@ -2710,6 +3695,15 @@ def _configured_state_observation(
         "success_values": observation.success_values,
         "failure_values": observation.failure_values,
         "evidence_refs": observation.evidence_refs,
+        "value_type": observation.value_type.value if observation.value_type is not None else None,
+        "minimum_value": observation.minimum_value,
+        "maximum_value": observation.maximum_value,
+        "monotonicity": (
+            observation.monotonicity.value if observation.monotonicity is not None else None
+        ),
+        "trust_class": (
+            observation.trust_class.value if observation.trust_class is not None else None
+        ),
     }
     return [
         *_bound_state_observation(
@@ -2747,49 +3741,47 @@ def _bound_state_observation(
     success_values: Sequence[object] = (),
     failure_values: Sequence[object] = (),
     evidence_refs: Sequence[str] = (),
+    value_type: str | None = None,
+    minimum_value: int | float | None = None,
+    maximum_value: int | float | None = None,
+    monotonicity: str | None = None,
+    trust_class: str | None = None,
 ) -> list[dict[str, object]]:
     if selector.step_id != step.id:
         return []
     root = response_body if selector.evaluation_root == "response_body" else captures
-    binding = {
+    binding_context = {
         "adapter_digest": adapter.digest,
         "compiled_adapter_digest": adapter.compiled_digest,
-        "step_id": selector.step_id,
-        "evaluation_root": selector.evaluation_root,
-        "pointer": selector.pointer,
-        "phase": phase,
     }
     try:
         selected = _select(root, selector.pointer, step.id)
     except _ResponsePointerMissing:
-        selected_digest: str | None = None
-        selected_value: object = None
+        selected_available = False
         selected = None
     else:
-        selected_digest = _digest_json(selected)
-        selected_value = selected if _json_scalar(selected) else None
-    result: dict[str, object] = {
-        "schema": "merlin.target-state-observation.v1",
-        "authority": "target",
-        "name": name,
-        "role": role,
-        "phase": phase,
-        "step_id": selector.step_id,
-        "evaluation_root": selector.evaluation_root,
-        "pointer": selector.pointer,
-        "binding_digest": _digest_json(binding),
-        "selected_digest": selected_digest,
-        **(
-            {"selected_value": selected_value}
-            if selected_digest is not None and _json_scalar(selected)
-            else {}
-        ),
-        **({"preferred_direction": preferred_direction} if preferred_direction is not None else {}),
-        **({"success_values": list(success_values)} if success_values else {}),
-        **({"failure_values": list(failure_values)} if failure_values else {}),
-        **({"evidence_refs": list(evidence_refs)} if evidence_refs else {}),
-    }
-    return [{**result, "observation_digest": _digest_json(result)}]
+        selected_available = True
+    result = build_state_observation(
+        name=name,
+        role=role,
+        phase=phase,
+        step_id=selector.step_id,
+        evaluation_root=selector.evaluation_root,
+        pointer=selector.pointer,
+        binding_context=binding_context,
+        selected_value=selected,
+        selected_available=selected_available,
+        preferred_direction=preferred_direction,
+        success_values=success_values,
+        failure_values=failure_values,
+        evidence_refs=evidence_refs,
+        value_type=value_type,
+        minimum_value=minimum_value,
+        maximum_value=maximum_value,
+        monotonicity=monotonicity,
+        trust_class=trust_class,
+    )
+    return [result]
 
 
 def _freshness_observations(
@@ -3122,11 +4114,16 @@ def _with_adapter_identity(result: ToolResult, adapter: _ApiAdapter) -> ToolResu
     metadata.setdefault("target_profile_id", adapter.target_id)
     metadata.setdefault("adapter_digest", adapter.digest)
     metadata["compiled_adapter_digest"] = adapter.compiled_digest
+    capabilities = adapter.state_capabilities
+    if capabilities is not None and capabilities.corroboration_rules:
+        metadata["state_corroboration_rules"] = [
+            item.model_dump(mode="json") for item in capabilities.corroboration_rules
+        ]
     _augment_target_state_metadata(metadata)
     disposition = _attempt_disposition(metadata, is_error=result.is_error)
     metadata["attempt_disposition"] = disposition
     metadata["acknowledged_capability_evidence"] = disposition == "valid"
-    return result.model_copy(update={"metadata": metadata})
+    return _secret_safe_result_projection(result.model_copy(update={"metadata": metadata}))
 
 
 def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
@@ -3134,6 +4131,7 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
     exchanges = exchanges_value if isinstance(exchanges_value, list) else []
     state_observations: list[dict[str, object]] = []
     constraint_observations: list[dict[str, object]] = []
+    equivalence_matches: list[bool] = []
     contaminated = bool(metadata.get("session_reused"))
     for exchange in exchanges:
         if not isinstance(exchange, Mapping):
@@ -3142,16 +4140,35 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
         constraint_observations.extend(
             _mapping_list(exchange.get("request_constraint_observations"))
         )
+        safe_bindings = exchange.get("safe_state_bindings")
+        if isinstance(safe_bindings, Mapping):
+            equivalence_matches.extend(
+                bool(item["matched"])
+                for item in _mapping_values(safe_bindings.get("identity_equivalence"))
+                if isinstance(item.get("matched"), bool)
+            )
         contaminated = contaminated or exchange.get("attempt_disposition") == "contaminated"
     if state_observations:
         metadata["state_observations"] = state_observations
-        transition = _target_state_transition(state_observations)
+        transition = _target_state_transition(
+            state_observations,
+            _mapping_list(metadata.get("state_corroboration_rules")),
+        )
+        if equivalence_matches and all(equivalence_matches):
+            transition["identity_match"] = True
+            transition["identity_equivalence_proven"] = True
+        elif any(match is False for match in equivalence_matches):
+            contaminated = True
         if contaminated:
             transition["identity_match"] = False
             transition["outcome"] = "unclear"
         metadata["target_state_transition"] = transition
         metadata["state_identity_match"] = transition["identity_match"]
-        if transition["identity_match"] is not True:
+        if (
+            transition["identity_match"] is not True
+            or transition["outcome"] == "unclear"
+            or transition.get("conflict") is True
+        ):
             metadata["evaluation_uncertain"] = True
             metadata["evaluation_uncertainties"] = _dedupe_uncertainties(
                 [
@@ -3189,118 +4206,9 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
 
 def _target_state_transition(
     observations: Sequence[Mapping[str, object]],
+    corroboration_rules: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
-    identity_baselines = [
-        item
-        for item in observations
-        if item.get("role") == "state_identity" and item.get("phase") == "baseline"
-    ]
-    identity_results = [
-        item
-        for item in observations
-        if item.get("role") == "state_identity" and item.get("phase") == "result"
-    ]
-    baseline_digest = identity_baselines[0].get("selected_digest") if identity_baselines else None
-    result_digest = identity_results[-1].get("selected_digest") if identity_results else None
-    if baseline_digest is None:
-        identity_match: bool | None = None
-    elif identity_results:
-        identity_match = result_digest is not None and baseline_digest == result_digest
-    else:
-        # The reviewed baseline identity is claimed before interaction and its
-        # lease spans the result observation; a second selector is optional.
-        identity_match = True
-
-    by_name: dict[str, dict[str, Mapping[str, object]]] = {}
-    for item in observations:
-        name = item.get("name")
-        phase = item.get("phase")
-        if item.get("role") == "state_identity" or not isinstance(name, str):
-            continue
-        if phase in {"baseline", "result"}:
-            by_name.setdefault(name, {})[str(phase)] = item
-
-    compared: list[dict[str, object]] = []
-    for name, phases in by_name.items():
-        baseline = phases.get("baseline")
-        result = phases.get("result")
-        compared.append(_compare_state_observation(name, baseline, result))
-    statuses = {str(item["status"]) for item in compared}
-    outcome = (
-        "unclear"
-        if {"success", "failure"} <= statuses or {"progress", "regression"} <= statuses
-        else "confirmed"
-        if "success" in statuses
-        else "refuted"
-        if "failure" in statuses
-        else "progress"
-        if "progress" in statuses
-        else "regression"
-        if "regression" in statuses
-        else "unclear"
-    )
-    if identity_match is not True and compared:
-        outcome = "unclear"
-    return {
-        "authority": "target",
-        "identity_match": identity_match,
-        "outcome": outcome,
-        "observations": compared,
-    }
-
-
-def _compare_state_observation(
-    name: str,
-    baseline: Mapping[str, object] | None,
-    result: Mapping[str, object] | None,
-) -> dict[str, object]:
-    exemplar = result or baseline or {}
-    before_digest = baseline.get("selected_digest") if baseline is not None else None
-    after_digest = result.get("selected_digest") if result is not None else None
-    before_value = baseline.get("selected_value") if baseline is not None else None
-    after_value = result.get("selected_value") if result is not None else None
-    success_values = tuple(exemplar.get("success_values", ()))
-    failure_values = tuple(exemplar.get("failure_values", ()))
-    preferred_direction = exemplar.get("preferred_direction")
-    if after_digest is None or before_digest is None:
-        status = "unclear"
-    elif any(_typed_equal(after_value, expected) for expected in success_values):
-        status = "success"
-    elif any(_typed_equal(after_value, expected) for expected in failure_values):
-        status = "failure"
-    elif _typed_equal(before_value, after_value):
-        status = "unchanged"
-    elif (
-        preferred_direction in {"increase", "decrease"}
-        and isinstance(before_value, (int, float))
-        and not isinstance(before_value, bool)
-        and isinstance(after_value, (int, float))
-        and not isinstance(after_value, bool)
-    ):
-        moved_preferred = (
-            after_value > before_value
-            if preferred_direction == "increase"
-            else after_value < before_value
-        )
-        status = "progress" if moved_preferred else "regression"
-    else:
-        status = "unclear"
-    return {
-        "name": name,
-        "role": exemplar.get("role", "custom"),
-        "status": status,
-        "before_digest": before_digest,
-        "after_digest": after_digest,
-        **({"before_value": before_value} if before_digest is not None else {}),
-        **({"after_value": after_value} if after_digest is not None else {}),
-        **({"preferred_direction": preferred_direction} if preferred_direction is not None else {}),
-        **(
-            {"baseline_binding_digest": baseline.get("binding_digest")}
-            if baseline is not None
-            else {}
-        ),
-        **({"result_binding_digest": result.get("binding_digest")} if result is not None else {}),
-    }
+    return evaluate_state_transition(observations, corroboration_rules)
 
 
 def _attempt_disposition(metadata: Mapping[str, object], *, is_error: bool) -> str:
@@ -3337,6 +4245,264 @@ def _mapping_list(value: object) -> list[dict[str, object]]:
     return [dict(item) for item in value if isinstance(item, Mapping)]
 
 
+def _target_exchange_ref(exchange: Mapping[str, object]) -> str:
+    safe_exchange, _ = _secret_safe_exchange_projection(exchange)
+    return "target-exchange:" + _digest_json(safe_exchange).removeprefix("sha256:")
+
+
+def _secret_safe_result_projection(result: ToolResult) -> ToolResult:
+    """Remove target-issued identities and full wire bodies from the public effect."""
+
+    metadata = deepcopy(dict(result.metadata))
+    identity_replacements: dict[str, str] = {}
+    physical_identity: Mapping[str, object] | None = None
+    projected_exchanges: dict[str, list[dict[str, object]]] = {}
+    for key in ("target_exchanges", "current_target_exchanges"):
+        value = metadata.get(key)
+        if not isinstance(value, (list, tuple)):
+            continue
+        safe_rows: list[dict[str, object]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            safe, replacements = _secret_safe_exchange_projection(item)
+            safe_rows.append(safe)
+            identity_replacements.update(replacements)
+            bindings = safe.get("safe_state_bindings")
+            if isinstance(bindings, Mapping):
+                candidate = bindings.get("physical_identity")
+                if isinstance(candidate, Mapping):
+                    physical_identity = dict(candidate)
+        projected_exchanges[key] = safe_rows
+
+    remote_identity = metadata.pop("remote_target_session_id", None)
+    if isinstance(remote_identity, str) and remote_identity:
+        identity_replacements.setdefault(remote_identity, "[target-identity-redacted]")
+        identity_replacements.setdefault(
+            _digest_json(remote_identity),
+            "sha256:" + hashlib.sha256(b"secret-safe-target-identity").hexdigest(),
+        )
+        metadata["remote_target_session"] = {
+            "kind": "opaque_reference",
+            "namespace": "state",
+            "reference_id": str(metadata.get("target_session_id", "unavailable")),
+        }
+    metadata.pop("remote_session_id_sha256", None)
+    metadata.pop("physical_state_identity", None)
+    metadata = _replace_sensitive_identities(metadata, identity_replacements)
+    if physical_identity is not None:
+        metadata["physical_state_identity"] = dict(physical_identity)
+    metadata.update(projected_exchanges)
+    content = str(result.content)
+    for secret, replacement in sorted(
+        identity_replacements.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        content = content.replace(secret, replacement)
+    return result.model_copy(update={"content": content, "metadata": metadata})
+
+
+def _secret_safe_exchange_projection(
+    exchange: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, str]]:
+    """Return the durable/model-safe summary for one completed wire exchange."""
+
+    safe = deepcopy(dict(exchange))
+    replacements: dict[str, str] = {}
+    physical = None
+    bindings = safe.get("safe_state_bindings")
+    if isinstance(bindings, Mapping):
+        candidate = bindings.get("physical_identity")
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("digest"), str):
+            physical = str(candidate["digest"])
+    observations = safe.get("state_observations")
+    if isinstance(observations, list):
+        for observation in observations:
+            if not isinstance(observation, dict) or observation.get("role") != "state_identity":
+                continue
+            selected = observation.pop("selected_value", None)
+            replacement_digest = (
+                "sha256:" + physical
+                if physical is not None
+                else "sha256:" + hashlib.sha256(b"redacted-target-identity").hexdigest()
+            )
+            if selected is not None:
+                if isinstance(selected, str) and selected:
+                    replacements[selected] = "[target-identity-redacted]"
+                replacements[_digest_json(selected)] = replacement_digest
+            observation["selected_digest"] = replacement_digest
+            unsigned = {
+                key: value for key, value in observation.items() if key != "observation_digest"
+            }
+            observation["observation_digest"] = _digest_json(unsigned)
+    request_projection = _constraint_request_projection(safe)
+    for payload_field in ("request", "response", "response_body"):
+        if payload_field not in safe:
+            continue
+        safe[f"{payload_field}_summary"] = _payload_summary(safe.pop(payload_field))
+    if request_projection is not None:
+        safe["request"] = request_projection
+    safe.pop("response_digest", None)
+    safe = _replace_sensitive_identities(safe, replacements)
+    return safe, replacements
+
+
+def _constraint_request_projection(exchange: Mapping[str, object]) -> object | None:
+    """Retain only reviewed invalid payload fields needed for bounded regeneration."""
+
+    if exchange.get("outcome") != "request_constraint_violation":
+        return None
+    request = exchange.get("request")
+    observations = exchange.get("request_constraint_observations")
+    if not isinstance(observations, (list, tuple)):
+        return None
+    projection: dict[str, object] = {}
+    for observation in observations:
+        if not isinstance(observation, Mapping) or observation.get("satisfied") is not False:
+            continue
+        path = observation.get("path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            continue
+        try:
+            selected = _select(request, path, "constraint-projection")
+        except _ResponsePointerMissing:
+            continue
+        target = projection
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
+        for part in parts[:-1]:
+            child = target.setdefault(part, {})
+            if not isinstance(child, dict):
+                break
+            target = child
+        else:
+            if parts:
+                target[parts[-1]] = selected
+    return projection or None
+
+
+def _payload_summary(value: object) -> dict[str, object]:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    summary: dict[str, object] = {
+        "kind": (
+            "object"
+            if isinstance(value, Mapping)
+            else "array"
+            if isinstance(value, (list, tuple))
+            else type(value).__name__
+        ),
+        "utf8_bytes": len(encoded.encode("utf-8")),
+    }
+    if isinstance(value, Mapping):
+        summary["fields"] = sorted(str(key) for key in value)
+        summary["item_count"] = len(value)
+    elif isinstance(value, (list, tuple)):
+        summary["item_count"] = len(value)
+    return summary
+
+
+def _replace_sensitive_identities(value: object, replacements: Mapping[str, str]) -> object:
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, list):
+        return [_replace_sensitive_identities(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_sensitive_identities(item, replacements) for item in value)
+    if isinstance(value, Mapping):
+        omitted = {"selected_value"} if value.get("role") == "state_identity" else set()
+        return {
+            str(key): _replace_sensitive_identities(item, replacements)
+            for key, item in value.items()
+            if key not in omitted
+        }
+    return value
+
+
+def _state_observation_refs(
+    exchanges: Sequence[Mapping[str, object]],
+    *,
+    phase: str,
+) -> tuple[str, ...]:
+    return tuple(
+        str(observation["observation_digest"])
+        for exchange in exchanges
+        for observation in _mapping_list(exchange.get("state_observations"))
+        if observation.get("phase") == phase
+        and isinstance(observation.get("observation_digest"), str)
+    )
+
+
+async def _finish_state_scope_lifecycle(
+    lifecycle: StateScopeLifecycle,
+    result: ToolResult,
+    *,
+    adapter: _ApiAdapter,
+    parallel_capacity: int,
+) -> None:
+    exchange_values = result.metadata.get("current_target_exchanges", ())
+    if not isinstance(exchange_values, (list, tuple)):
+        exchange_values = ()
+    exchanges = [dict(item) for item in exchange_values if isinstance(item, Mapping)]
+    interaction_exchanges = [item for item in exchanges if item.get("interaction") is True]
+    action_refs = tuple(_target_exchange_ref(item) for item in interaction_exchanges)
+    before_refs = _state_observation_refs(exchanges, phase="baseline")
+    after_refs = _state_observation_refs(exchanges, phase="result")
+    if not lifecycle.acknowledged:
+        await lifecycle.pause(
+            before_refs=before_refs,
+            action_refs=action_refs,
+            reason=("target_omitted" if exchanges else "not_yet_observed"),
+            retryable=bool(result.metadata.get("retryable")),
+            isolation_disposition=(
+                "contaminated"
+                if any(item.get("attempt_disposition") == "contaminated" for item in exchanges)
+                else "shared_serialized"
+                if parallel_capacity == 1
+                else "unknown"
+            ),
+        )
+        return
+    projected = dict(result.metadata)
+    capabilities = adapter.state_capabilities
+    if capabilities is not None and capabilities.corroboration_rules:
+        projected["state_corroboration_rules"] = [
+            item.model_dump(mode="json") for item in capabilities.corroboration_rules
+        ]
+    _augment_target_state_metadata(projected)
+    transition = projected.get("target_state_transition")
+    outcome = transition.get("outcome") if isinstance(transition, Mapping) else None
+    transition_disposition = {
+        "confirmed": "terminal_success",
+        "refuted": "terminal_failure",
+        "progress": "progress",
+        "regression": "regression",
+        "unchanged": "unchanged",
+    }.get(str(outcome), "ambiguous")
+    if result.metadata.get("infrastructure_failure_category") is not None:
+        transition_disposition = "infrastructure_failure"
+    contaminated = any(item.get("attempt_disposition") == "contaminated" for item in exchanges)
+    isolation_plan = resolve_state_isolation(adapter.state_capabilities)
+    isolation_disposition = (
+        "contaminated"
+        if contaminated
+        else isolation_plan.isolation_disposition
+        if isolation_plan.isolated
+        else "shared_serialized"
+        if parallel_capacity == 1
+        else "unknown"
+    )
+    await lifecycle.settle(
+        before_refs=before_refs,
+        action_refs=action_refs,
+        response_refs=action_refs,
+        after_refs=after_refs,
+        after_missing_reason=("selector_unavailable" if _has_state_contract(adapter) else None),
+        transition_disposition=transition_disposition,
+        isolation_disposition=isolation_disposition,
+        cleanup_disposition=(
+            "pending" if any(step.cleanup for step in adapter.steps) else "not_required"
+        ),
+    )
+
+
 def _has_state_contract(adapter: _ApiAdapter) -> bool:
     capabilities = adapter.state_capabilities
     return capabilities is not None and (
@@ -3349,17 +4515,177 @@ def _has_reviewed_physical_identity(adapter: _ApiAdapter) -> bool:
     return capabilities is not None and capabilities.identity is not None
 
 
-def _target_parallel_capacity(adapter: _ApiAdapter) -> int | None:
+def _target_authority(adapter: _ApiAdapter) -> str:
+    parsed = urlsplit(adapter.endpoint)
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = (parsed.scheme == "http" and parsed.port == 80) or (
+        parsed.scheme == "https" and parsed.port == 443
+    )
+    port = "" if parsed.port is None or default_port else f":{parsed.port}"
+    return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
+
+
+def _resource_principal_key(
+    ownership: ResourceOwnership,
+    variables: Mapping[str, object],
+    lifecycle: StateScopeLifecycle,
+) -> str:
+    identities = variables.get("__principal_identities")
+    if isinstance(identities, Mapping):
+        identity = identities.get(ownership.name)
+        if isinstance(identity, Mapping):
+            return _secret_safe_identity_key(identity)
+    if lifecycle.principal_identity is not None:
+        return lifecycle.principal_key
+    raise _TargetResourceBlocked(
+        {
+            "state": "principal_unavailable",
+            "ownership_name": ownership.name,
+            "retryable": True,
+        }
+    )
+
+
+def _secret_safe_identity_key(identity: Mapping[str, object]) -> str:
+    if identity.get("kind") == "keyed_digest":
+        return ":".join(
+            (
+                "keyed_digest",
+                str(identity.get("algorithm", "")),
+                str(identity.get("key_id", "")),
+                str(identity.get("digest", "")),
+            )
+        )
+    if identity.get("kind") == "opaque_reference":
+        return ":".join(
+            (
+                "opaque_reference",
+                str(identity.get("namespace", "")),
+                str(identity.get("reference_id", "")),
+            )
+        )
+    raise ValueError("reviewed identity is not secret-safe")
+
+
+def _mapping_values(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, Mapping):
+        return []
+    return [item for item in value.values() if isinstance(item, Mapping)]
+
+
+def _resource_controls(
+    adapter: _ApiAdapter,
+    *,
+    step_id: str | None = None,
+) -> list[tuple[ResourceControl, ResourceOwnership]]:
     capabilities = adapter.state_capabilities
     if capabilities is None:
-        return None
-    if capabilities.maximum_parallel_states is not None:
-        return capabilities.maximum_parallel_states
-    affordances = {item.kind.value for item in capabilities.affordances}
-    if affordances & {"restore_checkpoint", "reset_state"}:
-        return 1
-    can_isolate = "provision_fresh_state" in affordances
-    return 1 if capabilities.identity is not None and not can_isolate else None
+        return []
+    ownership = {item.name: item for item in capabilities.resource_ownership}
+    return [
+        (control, ownership[control.ownership_name])
+        for control in capabilities.resource_controls
+        if (step_id is None or control.step_id == step_id) and control.ownership_name in ownership
+    ]
+
+
+def _resource_reservation_id(
+    campaign_id: str,
+    session_scope_id: str,
+    attempt_id: str,
+    ownership_name: str,
+    step_id: str,
+) -> str:
+    value = "\0".join((campaign_id, session_scope_id, attempt_id, ownership_name, step_id)).encode()
+    return "target-resource:" + hashlib.sha256(value).hexdigest()
+
+
+def _resource_status_blocks(status: Mapping[str, object]) -> bool:
+    if status.get("admitted") is False or status.get("available") is False:
+        return True
+    return status.get("state") in {"suspended", "exhausted", "blocked"}
+
+
+def _structured_resource_blocks(
+    adapter: _ApiAdapter,
+    step: _ApiStep,
+    status_code: int,
+    response_body: object,
+) -> dict[str, Mapping[str, object]]:
+    now = datetime.now(UTC)
+    result: dict[str, Mapping[str, object]] = {}
+    for control, ownership in _resource_controls(adapter, step_id=step.id):
+        for signal in control.structured_blocks:
+            if status_code not in signal.status_codes:
+                continue
+            try:
+                if signal.retry_after_seconds_pointer is not None:
+                    raw_wake = _select(
+                        response_body,
+                        signal.retry_after_seconds_pointer,
+                        step.id,
+                    )
+                    if isinstance(raw_wake, bool) or not isinstance(raw_wake, (int, float)):
+                        continue
+                    wake_at = now + timedelta(seconds=max(0.0, float(raw_wake)))
+                else:
+                    assert signal.wake_at_pointer is not None
+                    raw_wake = _select(response_body, signal.wake_at_pointer, step.id)
+                    if not isinstance(raw_wake, str):
+                        continue
+                    wake_at = datetime.fromisoformat(raw_wake.replace("Z", "+00:00"))
+                    if wake_at.tzinfo is None:
+                        continue
+                    wake_at = wake_at.astimezone(UTC)
+            except (_ResponsePointerMissing, ValueError):
+                continue
+            if wake_at <= now:
+                continue
+            evidence = {
+                "schema": "merlin.target-resource-block.v1",
+                "ownership_name": ownership.name,
+                "resource_kind": ownership.resource_kind.value,
+                "step_id": step.id,
+                "status_code": status_code,
+                "wake_at": wake_at.isoformat(),
+                "response_digest": _digest_json(response_body),
+                "evidence_refs": list(signal.evidence_refs),
+            }
+            result[ownership.name] = {
+                "wake_at": wake_at,
+                "evidence": evidence,
+            }
+            break
+    return result
+
+
+def _exchange_proves_fresh_state(
+    adapter: _ApiAdapter,
+    exchange: Mapping[str, object],
+) -> bool:
+    if not _has_reviewed_independent_state_capacity(adapter):
+        return False
+    observations = _mapping_list(exchange.get("freshness_observations"))
+    capabilities = adapter.state_capabilities
+    assert capabilities is not None
+    bound_rules = [
+        rule for rule in capabilities.freshness_rules if rule.selector.step_id == exchange.get("id")
+    ]
+    return (
+        bool(bound_rules)
+        and len(observations) == len(bound_rules)
+        and all(item.get("matched") is True for item in observations)
+    )
+
+
+def _target_parallel_capacity(adapter: _ApiAdapter) -> int:
+    return resolve_state_isolation(adapter.state_capabilities).maximum_parallel_states
+
+
+def _has_reviewed_independent_state_capacity(adapter: _ApiAdapter) -> bool:
+    return resolve_state_isolation(adapter.state_capabilities).isolated
 
 
 def _reviewed_state_reuse_isolated(
@@ -3371,7 +4697,7 @@ def _reviewed_state_reuse_isolated(
         capabilities is not None
         and capabilities.identity is not None
         and capabilities.identity.result_selector is not None
-        and _target_parallel_capacity(adapter) == 1
+        and not resolve_state_isolation(capabilities).isolated
         and exchange.get("physical_state_claimed") is True
     )
 
@@ -3381,7 +4707,7 @@ def _allows_serial_state_reuse(adapter: _ApiAdapter) -> bool:
     return (
         capabilities is not None
         and capabilities.identity is not None
-        and _target_parallel_capacity(adapter) == 1
+        and not resolve_state_isolation(capabilities).isolated
     )
 
 
@@ -3414,6 +4740,125 @@ def _render(value: object, variables: Mapping[str, object], input_text: str) -> 
         if name in variables:
             return variables[name]
     raise ValueError("reviewed API request references an unavailable placeholder")
+
+
+def _objective_checkpoint_contract(
+    context: ToolContext,
+    adapter: _ApiAdapter,
+) -> StateCheckpoint | None:
+    capabilities = adapter.state_capabilities
+    checkpoint = capabilities.checkpoint if capabilities is not None else None
+    intent = context.objective_phase_checkpoint_intent
+    if intent is None:
+        return checkpoint
+    if checkpoint is None:
+        raise ValueError("objective checkpoint intent requires a reviewed checkpoint contract")
+    required = (
+        context.campaign_id,
+        context.objective_phase_gate_id,
+        context.objective_phase_gate_recipe_digest,
+        context.objective_phase_manifest_digest,
+    )
+    if any(not isinstance(value, str) or not value for value in required):
+        raise ValueError("objective checkpoint intent is missing its sealed campaign binding")
+    if intent == "capture" and context.objective_phase_checkpoint_reference is not None:
+        raise ValueError("checkpoint capture cannot carry a restore reference")
+    if intent == "restore" and not _opaque_state_reference(
+        context.objective_phase_checkpoint_reference
+    ):
+        raise ValueError("checkpoint restore requires an opaque state reference")
+    return checkpoint
+
+
+def _opaque_state_reference(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("kind") == "opaque_reference"
+        and value.get("namespace") == "state"
+        and isinstance(value.get("reference_id"), str)
+        and str(value["reference_id"]).strip()
+    )
+
+
+def _checkpoint_evidence_digest(exchange_ref: str, secret_safe_digest: str) -> str:
+    encoded = json.dumps(
+        {"exchange_ref": exchange_ref, "secret_safe_digest": secret_safe_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _objective_checkpoint_gate_succeeded(
+    context: ToolContext,
+    adapter: _ApiAdapter,
+    exchanges: Sequence[Mapping[str, object]],
+    *,
+    session_reused: bool,
+) -> bool:
+    if session_reused or any(
+        exchange.get("evaluation_uncertain") is True
+        or exchange.get("attempt_disposition")
+        in {"contaminated", "protocol_invalid", "infrastructure_failed"}
+        for exchange in exchanges
+    ):
+        return False
+    gate = context.objective_phase_gate_contract
+    if not isinstance(gate, Mapping):
+        return False
+    observations = [
+        observation
+        for exchange in exchanges
+        for observation in _mapping_list(exchange.get("state_observations"))
+    ]
+    corroboration_rules = (
+        [item.model_dump(mode="json") for item in adapter.state_capabilities.corroboration_rules]
+        if adapter.state_capabilities is not None
+        else []
+    )
+    transition = _target_state_transition(observations, corroboration_rules)
+    return evaluate_objective_gate_predicate(gate, transition) is True
+
+
+def _redacted_json_pointer_copy(value: object, pointer: str) -> object:
+    redacted = deepcopy(value)
+    if not pointer.startswith("/"):
+        raise ValueError("checkpoint restore request pointer must be non-root")
+    tokens = pointer[1:].split("/")
+    current = redacted
+    for index, raw_token in enumerate(tokens):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        final = index == len(tokens) - 1
+        if isinstance(current, dict) and token in current:
+            if final:
+                current[token] = "[checkpoint-secret-redacted]"
+                return redacted
+            current = current[token]
+            continue
+        if isinstance(current, list) and token.isdigit() and int(token) < len(current):
+            position = int(token)
+            if final:
+                current[position] = "[checkpoint-secret-redacted]"
+                return redacted
+            current = current[position]
+            continue
+        raise ValueError("checkpoint restore request pointer is unavailable")
+    raise ValueError("checkpoint restore request pointer is unavailable")
+
+
+def _redact_checkpoint_capture(value: object, secret: str) -> None:
+    if isinstance(value, dict):
+        for key, item in tuple(value.items()):
+            if item == secret:
+                value[key] = "[checkpoint-secret-redacted]"
+            else:
+                _redact_checkpoint_capture(item, secret)
+    elif isinstance(value, list):
+        for index, item in enumerate(tuple(value)):
+            if item == secret:
+                value[index] = "[checkpoint-secret-redacted]"
+            else:
+                _redact_checkpoint_capture(item, secret)
 
 
 def _select(value: object, pointer: str, step_id: str) -> object:
@@ -3693,6 +5138,56 @@ def _request_constraint_violation_result(error: _RequestConstraintViolation) -> 
     )
 
 
+def _target_resource_blocked_result(
+    state: CampaignApiSession | None,
+    status: Mapping[str, object],
+    exchanges: Sequence[Mapping[str, object]],
+) -> ToolResult:
+    current_exchanges = [dict(item) for item in exchanges]
+    target_call_budget_charge = sum(
+        int(item.get("target_call_budget_charge", 1))
+        for item in current_exchanges
+        if item.get("cleanup") is not True
+    )
+    wake_at = status.get("wake_at")
+    if isinstance(wake_at, datetime):
+        wake_at = wake_at.isoformat()
+    return ToolResult(
+        content="reviewed target resource is blocked until its durable wake time",
+        is_error=True,
+        metadata={
+            **(
+                {
+                    "campaign_id": state.campaign_id,
+                    "target_profile_id": state.target_id,
+                    "target_session_id": state.target_session_id,
+                    "target_session_generation": state.generation,
+                    "session_scope_id": state.session_scope_id,
+                }
+                if state is not None
+                else {}
+            ),
+            "failure_code": "target_resource_blocked",
+            "attempt_disposition": "infrastructure_failed",
+            "infrastructure_failure_category": (
+                InfrastructureFailureCategory.DELIVERY_FAILURE.value
+            ),
+            "target_resource_blocked": True,
+            "retryable": True,
+            "wake_at": wake_at,
+            "resource_state": status.get("state"),
+            "resource_available": status.get("available"),
+            "acknowledged_capability_evidence": False,
+            "no_target_effect": target_call_budget_charge == 0,
+            "target_effect_attempted": target_call_budget_charge > 0,
+            "target_call_budget_charge": target_call_budget_charge,
+            "limit_interaction_count": 0,
+            "target_exchanges": current_exchanges,
+            "current_target_exchanges": current_exchanges,
+        },
+    )
+
+
 def _target_execution_busy_result(state: CampaignApiSession) -> ToolResult:
     return ToolResult(
         content=(
@@ -3805,6 +5300,25 @@ def _target_delivery_rejected_result(
     current_target_exchanges: list[dict[str, object]],
 ) -> ToolResult:
     current = current_target_exchanges[-1]
+    resource_blocks = current.get("resource_blocks")
+    if isinstance(resource_blocks, Mapping) and resource_blocks:
+        block = next(
+            (dict(value) for value in resource_blocks.values() if isinstance(value, Mapping)),
+            {},
+        )
+        blocked = _target_resource_blocked_result(
+            state,
+            {
+                "state": "suspended",
+                "available": False,
+                "wake_at": block.get("wake_at"),
+            },
+            current_target_exchanges,
+        )
+        metadata = dict(blocked.metadata)
+        metadata["target_exchanges"] = target_exchanges
+        metadata["resource_block_evidence"] = block
+        return blocked.model_copy(update={"metadata": metadata})
     status_code = int(current["status_code"])
     evaluation_uncertainties = list(adapter.evaluation_uncertainties)
     for exchange in current_target_exchanges:

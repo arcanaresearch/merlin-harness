@@ -1,0 +1,1539 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from hashlib import sha256
+from threading import RLock
+from typing import Any
+from uuid import NAMESPACE_URL, uuid4, uuid5
+
+from merlin_contracts.state_scope import (
+    LEGACY_ATTEMPT_SCHEMA_VERSION,
+    STATE_SCOPE_SCHEMA_VERSION,
+    KeyedIdentityDigest,
+    OpaqueIdentityReference,
+    StateScopeEnvelope,
+)
+from psycopg.types.json import Jsonb
+
+
+class _StateScopeLeaseUnavailable(RuntimeError):
+    pass
+
+
+def _envelope(value: StateScopeEnvelope | Mapping[str, object]) -> StateScopeEnvelope:
+    if isinstance(value, StateScopeEnvelope):
+        return value
+    return StateScopeEnvelope.model_validate(value)
+
+
+def _identity_key(
+    value: KeyedIdentityDigest | OpaqueIdentityReference | None,
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, KeyedIdentityDigest):
+        return f"keyed_digest:{value.algorithm}:{value.key_id}:{value.digest}"
+    return f"opaque_reference:{value.namespace}:{value.reference_id}"
+
+
+def _digest(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return "sha256:" + sha256(encoded).hexdigest()
+
+
+def _required(value: str, label: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{label} cannot be empty")
+    return normalized
+
+
+def _scheduler_recovery_action(
+    campaign_status: str,
+    latest_wave: Mapping[str, object] | None,
+    active_batch: Mapping[str, object] | None,
+    frontier_counts: Mapping[str, int],
+) -> str:
+    """Classify one exact scheduler/wave/frontier persistence boundary."""
+
+    queued = int(frontier_counts.get("queued", 0))
+    if campaign_status == "prepared":
+        if latest_wave is None and active_batch is None:
+            return "await_approval"
+        return "pause_inconsistent"
+    if active_batch is not None:
+        batch_state = str(active_batch["state"])
+        if batch_state == "claimed":
+            return (
+                "bind_successor_schedule"
+                if active_batch.get("schedule_status") is not None
+                else "persist_successor_schedule"
+            )
+        if latest_wave is None or int(latest_wave["wave"]) < int(active_batch["wave"]):
+            return "persist_wave_binding"
+        if str(active_batch.get("schedule_id") or "") != str(
+            latest_wave.get("schedule_id") or ""
+        ) or int(active_batch["wave"]) != int(latest_wave["wave"]):
+            return "pause_inconsistent"
+        schedule_status = str(latest_wave["schedule_status"])
+        wave_status = str(latest_wave["wave_status"])
+        if schedule_status in {"completed", "failed", "cancelled"}:
+            return (
+                "finalize_and_settle_terminal_batch"
+                if wave_status in {"running", "paused"}
+                else "settle_terminal_batch"
+            )
+        if schedule_status == "running" and wave_status in {"running", "paused"}:
+            return "paused" if campaign_status == "paused" else "resume_active"
+        return "pause_inconsistent"
+    if latest_wave is not None:
+        schedule_status = str(latest_wave["schedule_status"])
+        wave_status = str(latest_wave["wave_status"])
+        if schedule_status in {"completed", "failed", "cancelled"}:
+            if wave_status in {"running", "paused"}:
+                return "finalize_terminal_wave"
+            return "claim_successor" if queued else "idle"
+        if schedule_status == "running" and wave_status in {"running", "paused"}:
+            return "paused" if campaign_status == "paused" else "resume_active"
+        return "pause_inconsistent"
+    if queued and campaign_status == "executing":
+        return "claim_successor"
+    return "paused" if campaign_status == "paused" else "idle"
+
+
+class StateScopeRepository:
+    """Versioned state envelopes plus global isolation and resource coordination."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+        self._lock = RLock()
+
+    def create_state_scope(
+        self,
+        campaign_id: str,
+        target_authority: str,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        isolation_disposition: str = "unknown",
+    ) -> dict[str, Any]:
+        """Create one new-format action boundary and its immutable first revision."""
+
+        value = _envelope(envelope)
+        if value.revision != 1:
+            raise ValueError("a new state scope must start at revision 1")
+        campaign = _required(campaign_id, "campaign id")
+        authority = _required(target_authority, "target authority")
+        if value.campaign_id != campaign:
+            raise ValueError("state scope campaign identity does not match its envelope")
+        if value.target_authority != authority:
+            raise ValueError("state scope target authority does not match its envelope")
+        if value.isolation_lease_id is not None:
+            raise ValueError("a new state scope cannot bind a lease before it is claimed")
+        document = value.model_dump(mode="json")
+        document_digest = _digest(document)
+        principal_key = _identity_key(value.principal_identity)
+        physical_key = _identity_key(value.physical_state_identity)
+        with self._lock, self.connection.transaction():
+            format_row = self.connection.execute(
+                """SELECT claims_enabled FROM merlin_storage.scope_formats
+                   WHERE version = %s FOR SHARE""",
+                (value.schema_version,),
+            ).fetchone()
+            if format_row is None or not bool(format_row["claims_enabled"]):
+                raise ValueError("state scope format is unavailable for new claims")
+            campaign_row = self.connection.execute(
+                """SELECT execution_format FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (campaign,),
+            ).fetchone()
+            if campaign_row is None:
+                raise KeyError(campaign)
+            current_format = str(campaign_row["execution_format"])
+            if current_format not in {LEGACY_ATTEMPT_SCHEMA_VERSION, value.schema_version}:
+                raise ValueError("campaign execution format is incompatible with state scopes")
+            self.connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET execution_format = %s, updated_at = now() WHERE id = %s""",
+                (value.schema_version, campaign),
+            )
+            self.connection.execute(
+                """INSERT INTO merlin_storage.state_scopes
+                       (id, format_version, campaign_id, experiment_id, attempt_id, candidate_id,
+                        action_id, action_kind, target_authority, principal_key,
+                        physical_state_key, isolation_disposition, current_revision)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                   ON CONFLICT (id) DO NOTHING""",
+                (
+                    value.scope_id,
+                    value.schema_version,
+                    campaign,
+                    value.experiment_id,
+                    value.attempt_id,
+                    value.candidate_id,
+                    value.action_id,
+                    value.action_kind.value,
+                    authority,
+                    principal_key,
+                    physical_key,
+                    isolation_disposition,
+                ),
+            )
+            stored = self.connection.execute(
+                "SELECT * FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE",
+                (value.scope_id,),
+            ).fetchone()
+            if stored is None:
+                raise RuntimeError("state scope disappeared during creation")
+            identity = (
+                str(stored["format_version"]),
+                str(stored["campaign_id"]),
+                str(stored["experiment_id"]),
+                str(stored["attempt_id"]),
+                stored["candidate_id"],
+                str(stored["action_id"]),
+                str(stored["action_kind"]),
+                str(stored["target_authority"]),
+                stored["principal_key"],
+                stored["physical_state_key"],
+            )
+            expected = (
+                value.schema_version,
+                campaign,
+                value.experiment_id,
+                value.attempt_id,
+                value.candidate_id,
+                value.action_id,
+                value.action_kind.value,
+                authority,
+                principal_key,
+                physical_key,
+            )
+            if identity != expected:
+                raise ValueError("state scope identity conflicts with durable state")
+            self.connection.execute(
+                """INSERT INTO merlin_storage.scope_envelopes
+                       (scope_id, revision, envelope, envelope_digest)
+                   VALUES (%s, 1, %s, %s)
+                   ON CONFLICT (scope_id, revision) DO NOTHING""",
+                (value.scope_id, Jsonb(document), document_digest),
+            )
+            revision = self.connection.execute(
+                """SELECT envelope_digest FROM merlin_storage.scope_envelopes
+                   WHERE scope_id = %s AND revision = 1""",
+                (value.scope_id,),
+            ).fetchone()
+            if revision is None or str(revision["envelope_digest"]) != document_digest:
+                raise ValueError("state scope first revision conflicts with durable state")
+            return self._load_state_scope_locked(value.scope_id)
+
+    def revise_state_scope(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Append one immutable CAS revision without rewriting prior evidence."""
+
+        value = _envelope(envelope)
+        if value.scope_id != scope_id:
+            raise ValueError("state scope revision identity changed")
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            return self._revise_state_scope_locked(
+                scope_id, expected_revision, value, claim_id=claim_id
+            )
+
+    def acknowledge_state_scope(
+        self, scope_id: str, *, claim_id: str, claimant_id: str
+    ) -> dict[str, Any]:
+        """Record that the target action was delivered before result settlement."""
+
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            row = self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET status = 'effect_acknowledged', effect_acknowledged_at = now(),
+                       updated_at = now()
+                   WHERE id = %s AND status = 'open' RETURNING id""",
+                (scope_id,),
+            ).fetchone()
+            if row is None:
+                current = self.connection.execute(
+                    "SELECT status FROM merlin_storage.state_scopes WHERE id = %s",
+                    (scope_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(scope_id)
+                if str(current["status"]) not in {"effect_acknowledged", "settled"}:
+                    raise ValueError("only an open state scope can acknowledge target delivery")
+            return self._load_state_scope_locked(scope_id)
+
+    def settle_state_scope(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        transition_disposition: str,
+        isolation_disposition: str,
+        cleanup_disposition: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Append the terminal envelope and settle the action exactly once."""
+
+        value = _envelope(envelope)
+        if value.scope_id != scope_id:
+            raise ValueError("state scope settlement identity changed")
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            current = self.connection.execute(
+                "SELECT * FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE",
+                (scope_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(scope_id)
+            if str(current["status"]) == "settled":
+                existing = self._load_state_scope_locked(scope_id)
+                if (
+                    existing["transition_disposition"] != transition_disposition
+                    or existing["isolation_disposition"] != isolation_disposition
+                    or existing["cleanup_disposition"] != cleanup_disposition
+                ):
+                    raise ValueError("state scope was already settled differently")
+                return existing
+            if str(current["status"]) != "effect_acknowledged":
+                raise ValueError("only an acknowledged target effect can be settled")
+            revised = self._revise_state_scope_locked(
+                scope_id, expected_revision, value, claim_id=claim_id
+            )
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET status = 'settled', transition_disposition = %s,
+                       isolation_disposition = %s, cleanup_disposition = %s,
+                       settled_at = now(), updated_at = now()
+                   WHERE id = %s""",
+                (
+                    transition_disposition,
+                    isolation_disposition,
+                    cleanup_disposition,
+                    scope_id,
+                ),
+            )
+            return {**revised, **self._load_state_scope_locked(scope_id)}
+
+    def pause_state_scope(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        transition_disposition: str,
+        isolation_disposition: str,
+        cleanup_disposition: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Terminally pause an action that did not produce an acknowledged target effect."""
+
+        value = _envelope(envelope)
+        if value.scope_id != scope_id:
+            raise ValueError("state scope pause identity changed")
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            current = self.connection.execute(
+                "SELECT status FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE",
+                (scope_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(scope_id)
+            if str(current["status"]) == "paused":
+                return self._load_state_scope_locked(scope_id)
+            if str(current["status"]) != "open":
+                raise ValueError("only a pre-delivery state scope can be paused")
+            self._revise_state_scope_locked(scope_id, expected_revision, value, claim_id=claim_id)
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET status = 'paused', transition_disposition = %s,
+                       isolation_disposition = %s, cleanup_disposition = %s,
+                       updated_at = now() WHERE id = %s""",
+                (
+                    transition_disposition,
+                    isolation_disposition,
+                    cleanup_disposition,
+                    scope_id,
+                ),
+            )
+            return self._load_state_scope_locked(scope_id)
+
+    def pause_unclaimed_state_scope(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        transition_disposition: str,
+        isolation_disposition: str,
+        cleanup_disposition: str,
+    ) -> dict[str, Any]:
+        """Pause a losing pre-delivery scope only while it has no global lease."""
+
+        value = _envelope(envelope)
+        if value.scope_id != scope_id or value.isolation_lease_id is not None:
+            raise ValueError("unclaimed state scope evidence cannot bind a lease")
+        with self._lock, self.connection.transaction():
+            current = self.connection.execute(
+                "SELECT status FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE",
+                (scope_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(scope_id)
+            lease = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.state_scope_leases
+                   WHERE scope_id = %s AND expires_at > now()""",
+                (scope_id,),
+            ).fetchone()
+            if lease is not None:
+                raise ValueError("claimed state scope requires its fencing token")
+            if str(current["status"]) == "paused":
+                return self._load_state_scope_locked(scope_id)
+            if str(current["status"]) != "open":
+                raise ValueError("only an unacknowledged state scope can pause without a claim")
+            self._revise_state_scope_locked(scope_id, expected_revision, value, claim_id=None)
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET status = 'paused', transition_disposition = %s,
+                       isolation_disposition = %s, cleanup_disposition = %s,
+                       updated_at = now() WHERE id = %s""",
+                (
+                    transition_disposition,
+                    isolation_disposition,
+                    cleanup_disposition,
+                    scope_id,
+                ),
+            )
+            return self._load_state_scope_locked(scope_id)
+
+    def load_state_scope(self, scope_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM merlin_storage.state_scopes WHERE id = %s", (scope_id,)
+            ).fetchone()
+            return None if row is None else self._load_state_scope_locked(scope_id)
+
+    def set_scope_claims_enabled(self, format_version: str, enabled: bool) -> bool:
+        """Gate only new scopes; acknowledged effects remain settleable."""
+
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """UPDATE merlin_storage.scope_formats
+                   SET claims_enabled = %s, updated_at = now()
+                   WHERE version = %s RETURNING version""",
+                (enabled, format_version),
+            ).fetchone()
+            return row is not None
+
+    def claim_state_scope_lease(
+        self,
+        scope_id: str,
+        *,
+        target_authority: str,
+        principal_key: str,
+        equivalence_key: str,
+        claimant_id: str,
+        lease_seconds: int,
+    ) -> str | None:
+        """Globally fence one reviewed physical-state equivalence class."""
+
+        authority = _required(target_authority, "target authority")
+        principal = _required(principal_key, "principal key")
+        equivalence = _required(equivalence_key, "equivalence key")
+        claimant = _required(claimant_id, "claimant id")
+        if lease_seconds < 1:
+            raise ValueError("state scope lease duration must be positive")
+        claim_id = str(uuid4())
+        lock_key = json.dumps((authority, principal, equivalence), separators=(",", ":"))
+        with self._lock, self.connection.transaction():
+            scope = self.connection.execute(
+                """SELECT target_authority, principal_key, status
+                   FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE""",
+                (scope_id,),
+            ).fetchone()
+            if scope is None:
+                raise KeyError(scope_id)
+            if str(scope["status"]) not in {"open", "effect_acknowledged"}:
+                raise ValueError("state scope is not claimable")
+            expected_principal = str(scope["principal_key"] or "anonymous")
+            if str(scope["target_authority"]) != authority or expected_principal != principal:
+                raise ValueError("state scope lease authority or principal changed")
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,)
+            )
+            self.connection.execute(
+                """DELETE FROM merlin_storage.state_scope_leases
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND equivalence_key = %s AND expires_at <= now()""",
+                (authority, principal, equivalence),
+            )
+            existing = self.connection.execute(
+                """UPDATE merlin_storage.state_scope_leases
+                   SET expires_at = now() + make_interval(secs => %s), updated_at = now()
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND equivalence_key = %s AND scope_id = %s AND claimant_id = %s
+                   RETURNING claim_id""",
+                (lease_seconds, authority, principal, equivalence, scope_id, claimant),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["claim_id"])
+            row = self.connection.execute(
+                """INSERT INTO merlin_storage.state_scope_leases
+                       (target_authority, principal_key, equivalence_key, claim_id,
+                        scope_id, claimant_id, expires_at)
+                   VALUES (%s, %s, %s, %s, %s, %s,
+                           now() + make_interval(secs => %s))
+                   ON CONFLICT (target_authority, principal_key, equivalence_key)
+                   DO NOTHING RETURNING claim_id""",
+                (authority, principal, equivalence, claim_id, scope_id, claimant, lease_seconds),
+            ).fetchone()
+            return None if row is None else str(row["claim_id"])
+
+    def create_and_claim_state_scope(
+        self,
+        campaign_id: str,
+        target_authority: str,
+        envelope: StateScopeEnvelope | Mapping[str, object],
+        *,
+        principal_key: str,
+        equivalence_key: str,
+        claimant_id: str,
+        lease_seconds: int,
+        isolation_disposition: str = "unknown",
+    ) -> dict[str, Any] | None:
+        """Create a scope and its global lease atomically, leaving no loser orphan."""
+
+        try:
+            with self._lock, self.connection.transaction():
+                scope = self.create_state_scope(
+                    campaign_id,
+                    target_authority,
+                    envelope,
+                    isolation_disposition=isolation_disposition,
+                )
+                claim_id = self.claim_state_scope_lease(
+                    str(scope["id"]),
+                    target_authority=target_authority,
+                    principal_key=principal_key,
+                    equivalence_key=equivalence_key,
+                    claimant_id=claimant_id,
+                    lease_seconds=lease_seconds,
+                )
+                if claim_id is None:
+                    raise _StateScopeLeaseUnavailable
+                return {"scope": scope, "claim_id": claim_id}
+        except _StateScopeLeaseUnavailable:
+            return None
+
+    def rekey_state_scope_lease(
+        self,
+        claim_id: str,
+        claimant_id: str,
+        *,
+        principal_key: str,
+        equivalence_key: str,
+        maximum_parallel_states: int | None = None,
+    ) -> bool:
+        """Atomically refine a conservative lease without opening an ownership gap."""
+
+        claim = _required(claim_id, "claim id")
+        claimant = _required(claimant_id, "claimant id")
+        principal = _required(principal_key, "principal key")
+        equivalence = _required(equivalence_key, "equivalence key")
+        if maximum_parallel_states is not None and (
+            isinstance(maximum_parallel_states, bool) or maximum_parallel_states < 1
+        ):
+            raise ValueError("maximum parallel states must be a positive integer")
+        with self._lock, self.connection.transaction():
+            lease = self.connection.execute(
+                """SELECT lease.*, scope.principal_key AS scope_principal,
+                          scope.status AS scope_status,
+                          scope.effect_acknowledged_at AS scope_effect_acknowledged_at
+                   FROM merlin_storage.state_scope_leases AS lease
+                   JOIN merlin_storage.state_scopes AS scope ON scope.id = lease.scope_id
+                   WHERE lease.claim_id = %s AND lease.claimant_id = %s
+                     AND lease.expires_at > now()
+                   FOR UPDATE OF lease, scope""",
+                (claim, claimant),
+            ).fetchone()
+            if lease is None:
+                return False
+            scope_principal = lease["scope_principal"]
+            if scope_principal is not None and str(scope_principal) != principal:
+                provisional = str(scope_principal) == "anonymous"
+                pre_delivery = (
+                    str(lease["scope_status"]) == "open"
+                    and lease["scope_effect_acknowledged_at"] is None
+                )
+                if not (provisional and pre_delivery and principal != "anonymous"):
+                    raise ValueError("state scope principal identity cannot be changed")
+            authority = str(lease["target_authority"])
+            if maximum_parallel_states is not None:
+                capacity_key = json.dumps(
+                    (authority, principal, "independent-state-capacity"),
+                    separators=(",", ":"),
+                )
+                self.connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (capacity_key,),
+                )
+                active = self.connection.execute(
+                    """SELECT count(*) AS count
+                       FROM merlin_storage.state_scope_leases
+                       WHERE target_authority = %s AND principal_key = %s
+                         AND equivalence_key <> 'conservative-shared-state'
+                         AND expires_at > now() AND claim_id <> %s""",
+                    (authority, principal, claim),
+                ).fetchone()
+                if active is not None and int(active["count"]) >= maximum_parallel_states:
+                    return False
+            lock_key = json.dumps((authority, principal, equivalence), separators=(",", ":"))
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,)
+            )
+            self.connection.execute(
+                """DELETE FROM merlin_storage.state_scope_leases
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND equivalence_key = %s AND expires_at <= now()""",
+                (authority, principal, equivalence),
+            )
+            conflict = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.state_scope_leases
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND equivalence_key = %s AND claim_id <> %s""",
+                (authority, principal, equivalence, claim),
+            ).fetchone()
+            if conflict is not None:
+                return False
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scope_leases
+                   SET principal_key = %s, equivalence_key = %s, updated_at = now()
+                   WHERE claim_id = %s AND claimant_id = %s""",
+                (principal, equivalence, claim, claimant),
+            )
+            if principal != "anonymous":
+                self.connection.execute(
+                    """UPDATE merlin_storage.state_scopes
+                       SET principal_key = CASE
+                               WHEN principal_key IS NULL OR principal_key = 'anonymous'
+                               THEN %s ELSE principal_key END,
+                           updated_at = now()
+                       WHERE id = %s""",
+                    (principal, lease["scope_id"]),
+                )
+            return True
+
+    def renew_state_scope_lease(self, claim_id: str, claimant_id: str, lease_seconds: int) -> bool:
+        claimant = _required(claimant_id, "claimant id")
+        if not claim_id.strip() or lease_seconds < 1:
+            raise ValueError("state scope lease renewal requires a claim and duration")
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """UPDATE merlin_storage.state_scope_leases
+                   SET expires_at = now() + make_interval(secs => %s), updated_at = now()
+                   WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()
+                   RETURNING claim_id""",
+                (lease_seconds, claim_id, claimant),
+            ).fetchone()
+            return row is not None
+
+    def validate_state_scope_lease(self, claim_id: str, claimant_id: str) -> bool:
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.state_scope_leases
+                   WHERE claim_id = %s AND claimant_id = %s AND expires_at > now()""",
+                (claim_id, claimant_id.strip()),
+            ).fetchone()
+            return row is not None
+
+    def release_state_scope_lease(self, claim_id: str, claimant_id: str) -> bool:
+        if not claim_id.strip() or not claimant_id.strip():
+            return False
+        with self._lock, self.connection.transaction():
+            row = self.connection.execute(
+                """DELETE FROM merlin_storage.state_scope_leases
+                   WHERE claim_id = %s AND claimant_id = %s RETURNING claim_id""",
+                (claim_id, claimant_id.strip()),
+            ).fetchone()
+            return row is not None
+
+    def reserve_resource(
+        self,
+        scope_id: str,
+        reservation_id: str,
+        *,
+        target_authority: str,
+        principal_key: str,
+        resource_kind: str,
+        amount: int,
+        limit: int,
+        window_key: str,
+        wake_at: datetime | None = None,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Atomically reserve one principal-owned target resource unit."""
+
+        authority = _required(target_authority, "target authority")
+        principal = _required(principal_key, "principal key")
+        resource = _required(resource_kind, "resource kind")
+        window = _required(window_key, "window key")
+        reservation = _required(reservation_id, "reservation id")
+        if amount < 1 or limit < 1:
+            raise ValueError("resource amount and limit must be positive")
+        lock_key = json.dumps((authority, principal, resource, window), separators=(",", ":"))
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            scope_status = self._validate_scope_resource_identity(scope_id, authority, principal)
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,)
+            )
+            self.connection.execute(
+                """INSERT INTO merlin_storage.principal_resources
+                       (target_authority, principal_key, resource_kind, window_key,
+                        capacity, wake_at, state)
+                   VALUES (%s, %s, %s, %s, %s, %s,
+                           CASE WHEN %s::timestamptz IS NULL THEN 'active' ELSE 'suspended' END)
+                   ON CONFLICT (target_authority, principal_key, resource_kind, window_key)
+                   DO UPDATE SET capacity = LEAST(
+                       merlin_storage.principal_resources.capacity, EXCLUDED.capacity
+                   ), updated_at = now()""",
+                (authority, principal, resource, window, limit, wake_at, wake_at),
+            )
+            self._reopen_due_resource_locked(authority, principal, resource, window)
+            existing = self.connection.execute(
+                "SELECT * FROM merlin_storage.resource_reservations WHERE id = %s",
+                (reservation,),
+            ).fetchone()
+            if existing is not None:
+                expected = (scope_id, authority, principal, resource, window, amount)
+                actual = (
+                    str(existing["scope_id"]),
+                    str(existing["target_authority"]),
+                    str(existing["principal_key"]),
+                    str(existing["resource_kind"]),
+                    str(existing["window_key"]),
+                    int(existing["amount"]),
+                )
+                if actual != expected:
+                    raise ValueError("resource reservation identity conflicts with durable state")
+                return self._resource_decision(
+                    existing, admitted=str(existing["state"]) == "reserved"
+                )
+            if scope_status != "open":
+                raise ValueError("new resource reservations require a pre-delivery state scope")
+            ledger = self.connection.execute(
+                """SELECT * FROM merlin_storage.principal_resources
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s FOR UPDATE""",
+                (authority, principal, resource, window),
+            ).fetchone()
+            assert ledger is not None
+            available = max(
+                0,
+                int(ledger["capacity"]) - int(ledger["reserved"]) - int(ledger["consumed"]),
+            )
+            if str(ledger["state"]) != "active" or amount > available:
+                return {
+                    "admitted": False,
+                    "state": str(ledger["state"]),
+                    "reservation_id": None,
+                    "available": available,
+                    "wake_at": ledger["wake_at"],
+                }
+            inserted = self.connection.execute(
+                """INSERT INTO merlin_storage.resource_reservations
+                       (id, scope_id, target_authority, principal_key, resource_kind,
+                        window_key, amount)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+                (reservation, scope_id, authority, principal, resource, window, amount),
+            ).fetchone()
+            self.connection.execute(
+                """UPDATE merlin_storage.principal_resources
+                   SET reserved = reserved + %s, updated_at = now()
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s""",
+                (amount, authority, principal, resource, window),
+            )
+            assert inserted is not None
+            return self._resource_decision(inserted, admitted=True, available=available - amount)
+
+    def acknowledge_resource(
+        self, reservation_id: str, *, claim_id: str, claimant_id: str
+    ) -> dict[str, Any]:
+        with self._lock, self.connection.transaction():
+            owner = self.connection.execute(
+                "SELECT scope_id FROM merlin_storage.resource_reservations WHERE id = %s",
+                (reservation_id,),
+            ).fetchone()
+            if owner is None:
+                raise KeyError(reservation_id)
+            self._require_state_scope_lease_locked(str(owner["scope_id"]), claim_id, claimant_id)
+            row = self.connection.execute(
+                """UPDATE merlin_storage.resource_reservations
+                   SET state = 'acknowledged', acknowledged_at = now(), updated_at = now()
+                   WHERE id = %s AND state = 'reserved' RETURNING *""",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    "SELECT * FROM merlin_storage.resource_reservations WHERE id = %s",
+                    (reservation_id,),
+                ).fetchone()
+            if row is None:
+                raise KeyError(reservation_id)
+            if str(row["state"]) not in {"acknowledged", "settled"}:
+                raise ValueError("resource reservation cannot acknowledge target delivery")
+            return dict(row)
+
+    def settle_resource(
+        self,
+        reservation_id: str,
+        *,
+        actual_amount: int,
+        terminal_block: bool = False,
+        wake_at: datetime | None = None,
+        evidence: Mapping[str, object] | None = None,
+        claim_id: str | None,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Settle acknowledged use and optionally suspend the shared resource."""
+
+        if actual_amount < 0:
+            raise ValueError("actual resource use cannot be negative")
+        if terminal_block and wake_at is None:
+            raise ValueError("a terminal resource block requires a wake time")
+        with self._lock, self.connection.transaction():
+            reservation = self.connection.execute(
+                """SELECT * FROM merlin_storage.resource_reservations
+                   WHERE id = %s FOR UPDATE""",
+                (reservation_id,),
+            ).fetchone()
+            if reservation is None:
+                raise KeyError(reservation_id)
+            self._require_state_scope_lease_locked(
+                str(reservation["scope_id"]), claim_id, claimant_id
+            )
+            if str(reservation["state"]) == "settled":
+                if int(reservation["actual_amount"]) != actual_amount:
+                    raise ValueError("resource reservation was already settled differently")
+                return dict(reservation)
+            if str(reservation["state"]) != "acknowledged":
+                raise ValueError("only acknowledged target use can be settled")
+            key = (
+                reservation["target_authority"],
+                reservation["principal_key"],
+                reservation["resource_kind"],
+                reservation["window_key"],
+            )
+            ledger = self.connection.execute(
+                """SELECT * FROM merlin_storage.principal_resources
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s FOR UPDATE""",
+                key,
+            ).fetchone()
+            assert ledger is not None
+            new_consumed = int(ledger["consumed"]) + actual_amount
+            blocked = terminal_block or new_consumed >= int(ledger["capacity"])
+            next_state = (
+                "suspended"
+                if blocked and wake_at is not None
+                else ("exhausted" if blocked else str(ledger["state"]))
+            )
+            self.connection.execute(
+                """UPDATE merlin_storage.principal_resources
+                   SET reserved = greatest(0, reserved - %s), consumed = %s,
+                       state = %s, wake_at = %s,
+                       evidence = CASE WHEN %s::jsonb IS NULL THEN evidence ELSE %s::jsonb END,
+                       updated_at = now()
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s""",
+                (
+                    int(reservation["amount"]),
+                    new_consumed,
+                    next_state,
+                    wake_at if blocked else ledger["wake_at"],
+                    None if evidence is None else Jsonb(dict(evidence)),
+                    None if evidence is None else Jsonb(dict(evidence)),
+                    *key,
+                ),
+            )
+            settled = self.connection.execute(
+                """UPDATE merlin_storage.resource_reservations
+                   SET state = 'settled', actual_amount = %s, settled_at = now(),
+                       updated_at = now() WHERE id = %s RETURNING *""",
+                (actual_amount, reservation_id),
+            ).fetchone()
+            assert settled is not None
+            return dict(settled)
+
+    def release_resource(
+        self, reservation_id: str, *, claim_id: str, claimant_id: str
+    ) -> dict[str, Any]:
+        """Release only work that never reached the target."""
+
+        with self._lock, self.connection.transaction():
+            reservation = self.connection.execute(
+                """SELECT * FROM merlin_storage.resource_reservations
+                   WHERE id = %s FOR UPDATE""",
+                (reservation_id,),
+            ).fetchone()
+            if reservation is None:
+                raise KeyError(reservation_id)
+            self._require_state_scope_lease_locked(
+                str(reservation["scope_id"]), claim_id, claimant_id
+            )
+            if str(reservation["state"]) == "released":
+                return dict(reservation)
+            if str(reservation["state"]) != "reserved":
+                raise ValueError("acknowledged target use must settle and cannot be released")
+            key = (
+                reservation["target_authority"],
+                reservation["principal_key"],
+                reservation["resource_kind"],
+                reservation["window_key"],
+            )
+            self.connection.execute(
+                """UPDATE merlin_storage.principal_resources
+                   SET reserved = greatest(0, reserved - %s), updated_at = now()
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s""",
+                (int(reservation["amount"]), *key),
+            )
+            released = self.connection.execute(
+                """UPDATE merlin_storage.resource_reservations
+                   SET state = 'released', settled_at = now(), updated_at = now()
+                   WHERE id = %s RETURNING *""",
+                (reservation_id,),
+            ).fetchone()
+            assert released is not None
+            return dict(released)
+
+    def remaining_campaign_resource_budget(
+        self,
+        campaign_id: str,
+        target_authority: str,
+        resources: Sequence[Mapping[str, object]],
+    ) -> int | None:
+        """Return candidate capacity from one proven principal's shared ledgers.
+
+        ``None`` means the campaign has not established one unambiguous reviewed
+        principal yet. Callers must serialize that discovery rather than treating
+        a declared limit as independent capacity.
+        """
+
+        campaign = _required(campaign_id, "campaign id")
+        authority = _required(target_authority, "target authority")
+        grouped: dict[tuple[str, str], dict[str, int]] = {}
+        for resource in resources:
+            kind = _required(str(resource.get("resource_kind") or ""), "resource kind")
+            window = _required(str(resource.get("window_key") or ""), "window key")
+            amount = resource.get("reservation_amount")
+            limit = resource.get("limit")
+            if (
+                isinstance(amount, bool)
+                or not isinstance(amount, int)
+                or amount < 1
+                or isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+            ):
+                raise ValueError("resource batch budgets require positive amounts and limits")
+            aggregate = grouped.setdefault((kind, window), {"amount": 0, "limit": limit})
+            aggregate["amount"] += amount
+            aggregate["limit"] = min(aggregate["limit"], limit)
+        if not grouped:
+            return None
+
+        with self._lock, self.connection.transaction():
+            principals = self.connection.execute(
+                """SELECT DISTINCT principal_key
+                   FROM merlin_storage.state_scopes
+                   WHERE campaign_id = %s AND target_authority = %s
+                     AND principal_key IS NOT NULL
+                   ORDER BY principal_key""",
+                (campaign, authority),
+            ).fetchall()
+            if len(principals) != 1:
+                return None
+            principal = str(principals[0]["principal_key"] or "")
+            if not principal:
+                return None
+
+            candidate_budgets: list[int] = []
+            for (kind, window), contract in grouped.items():
+                self._reopen_due_resource_locked(authority, principal, kind, window)
+                row = self.connection.execute(
+                    """SELECT capacity, reserved, consumed, state
+                       FROM merlin_storage.principal_resources
+                       WHERE target_authority = %s AND principal_key = %s
+                         AND resource_kind = %s AND window_key = %s
+                       FOR SHARE""",
+                    (authority, principal, kind, window),
+                ).fetchone()
+                if row is None:
+                    available = contract["limit"]
+                elif str(row["state"]) != "active":
+                    available = 0
+                else:
+                    available = max(
+                        0,
+                        min(contract["limit"], int(row["capacity"]))
+                        - int(row["reserved"])
+                        - int(row["consumed"]),
+                    )
+                candidate_budgets.append(available // contract["amount"])
+            return min(candidate_budgets)
+
+    def resource_status(
+        self,
+        target_authority: str,
+        principal_key: str,
+        resource_kind: str,
+        window_key: str,
+    ) -> dict[str, Any] | None:
+        with self._lock, self.connection.transaction():
+            self._reopen_due_resource_locked(
+                target_authority, principal_key, resource_kind, window_key
+            )
+            row = self.connection.execute(
+                """SELECT * FROM merlin_storage.principal_resources
+                   WHERE target_authority = %s AND principal_key = %s
+                     AND resource_kind = %s AND window_key = %s""",
+                (target_authority, principal_key, resource_kind, window_key),
+            ).fetchone()
+            return None if row is None else dict(row)
+
+    def reconcile_durable_lifecycle(
+        self,
+        *,
+        claimant_id: str,
+        readable_formats: Sequence[str],
+        writable_format: str,
+        lease_seconds: int,
+    ) -> dict[str, Any]:
+        """Atomically reconcile global registries and classify campaign recovery."""
+
+        _required(claimant_id, "claimant id")
+        readable = tuple(
+            dict.fromkeys(_required(item, "readable format") for item in readable_formats)
+        )
+        writable = _required(writable_format, "writable format")
+        if lease_seconds < 1 or not readable:
+            raise ValueError("lifecycle reconciliation requires formats and a positive lease")
+        with self._lock, self.connection.transaction():
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("merlin:lifecycle-recovery:v1",),
+            )
+            expired_state = self.connection.execute(
+                """WITH expired AS (
+                       DELETE FROM merlin_storage.state_scope_leases
+                       WHERE expires_at <= now() RETURNING 1
+                   ) SELECT count(*) AS count FROM expired"""
+            ).fetchone()
+            expired_target = self.connection.execute(
+                """WITH expired AS (
+                       DELETE FROM merlin_storage.target_execution_leases
+                       WHERE expires_at <= now() RETURNING 1
+                   ) SELECT count(*) AS count FROM expired"""
+            ).fetchone()
+            due = self.connection.execute(
+                """SELECT target_authority, principal_key, resource_kind, window_key
+                   FROM merlin_storage.principal_resources
+                   WHERE state = 'suspended' AND wake_at <= now() FOR UPDATE"""
+            ).fetchall()
+            due_wakes = 0
+            for item in due:
+                due_wakes += int(
+                    self._reopen_due_resource_locked(
+                        str(item["target_authority"]),
+                        str(item["principal_key"]),
+                        str(item["resource_kind"]),
+                        str(item["window_key"]),
+                    )
+                )
+            campaigns = self.connection.execute(
+                """SELECT id, status, execution_format, lifecycle_pause_reason
+                   FROM merlin_storage.assessment_campaigns
+                   WHERE status IN ('prepared', 'executing', 'paused') ORDER BY id FOR UPDATE"""
+            ).fetchall()
+            results: list[dict[str, Any]] = []
+            for campaign in campaigns:
+                campaign_id = str(campaign["id"])
+                counts = self.connection.execute(
+                    """SELECT count(*) FILTER (WHERE status = 'open') AS open_count,
+                              count(*) FILTER (WHERE status = 'effect_acknowledged')
+                                  AS acknowledged_count,
+                              count(*) FILTER (WHERE effect_acknowledged_at IS NOT NULL)
+                                  AS target_call_count
+                       FROM merlin_storage.state_scopes WHERE campaign_id = %s""",
+                    (campaign_id,),
+                ).fetchone()
+                cleanup = self.connection.execute(
+                    """SELECT count(*) AS count FROM (
+                           SELECT 1 FROM merlin_storage.campaign_api_sessions
+                           WHERE campaign_id = %s AND state <> 'cleaned'
+                             AND cleanup_disposition IS NULL
+                           UNION ALL
+                           SELECT 1 FROM merlin_storage.state_scopes
+                           WHERE campaign_id = %s
+                             AND cleanup_disposition IN ('pending', 'failed')
+                       ) AS obligations""",
+                    (campaign_id, campaign_id),
+                ).fetchone()
+                leases = self.connection.execute(
+                    """SELECT count(*) AS count
+                       FROM merlin_storage.state_scope_leases AS lease
+                       JOIN merlin_storage.state_scopes AS scope ON scope.id = lease.scope_id
+                       WHERE scope.campaign_id = %s AND lease.expires_at > now()""",
+                    (campaign_id,),
+                ).fetchone()
+                quota = self.connection.execute(
+                    """SELECT count(*) AS blocked_count,
+                              count(*) FILTER (WHERE resource.wake_at IS NULL)
+                                  AS indefinite_count,
+                              min(resource.wake_at) AS wake_at
+                       FROM merlin_storage.principal_resources AS resource
+                       WHERE resource.state IN ('suspended', 'exhausted')
+                         AND EXISTS (
+                             SELECT 1 FROM merlin_storage.state_scopes AS scope
+                             WHERE scope.campaign_id = %s
+                               AND scope.target_authority = resource.target_authority
+                               AND coalesce(scope.principal_key, 'anonymous') =
+                                   resource.principal_key
+                         )""",
+                    (campaign_id,),
+                ).fetchone()
+                execution_format = str(campaign["execution_format"])
+                acknowledged_count = int(counts["acknowledged_count"] or 0)
+                cleanup_count = int(cleanup["count"] or 0)
+                blocked_count = int(quota["blocked_count"] or 0)
+                indefinite_count = int(quota["indefinite_count"] or 0)
+                wake = None if quota is None else quota["wake_at"]
+                if execution_format not in readable or (
+                    execution_format == STATE_SCOPE_SCHEMA_VERSION and writable != execution_format
+                ):
+                    decision = "pause_fixed_forward"
+                    pause_reason = "fixed_forward"
+                elif acknowledged_count:
+                    decision = "settle_acknowledged"
+                    pause_reason = "acknowledged_settlement"
+                elif cleanup_count:
+                    decision = "cleanup_required"
+                    pause_reason = "cleanup"
+                elif blocked_count:
+                    decision = "wait_quota"
+                    pause_reason = "quota"
+                else:
+                    decision = "resume"
+                    pause_reason = None
+                if pause_reason is not None:
+                    self.connection.execute(
+                        """UPDATE merlin_storage.assessment_campaigns
+                           SET status = 'paused', lifecycle_pause_reason = %s,
+                               lifecycle_resume_status = coalesce(
+                                   lifecycle_resume_status, status
+                               ),
+                               lifecycle_wake_at = CASE WHEN %s = 'quota'
+                                   THEN %s::timestamptz ELSE NULL END,
+                               updated_at = now() WHERE id = %s""",
+                        (pause_reason, pause_reason, wake, campaign_id),
+                    )
+                    resulting_status = "paused"
+                elif (
+                    str(campaign["status"]) == "paused"
+                    and campaign["lifecycle_pause_reason"] is not None
+                ):
+                    resumed = self.connection.execute(
+                        """UPDATE merlin_storage.assessment_campaigns
+                           SET status = lifecycle_resume_status,
+                               lifecycle_pause_reason = NULL,
+                               lifecycle_resume_status = NULL, lifecycle_wake_at = NULL,
+                               updated_at = now() WHERE id = %s RETURNING status""",
+                        (campaign_id,),
+                    ).fetchone()
+                    assert resumed is not None
+                    resulting_status = str(resumed["status"])
+                else:
+                    resulting_status = str(campaign["status"])
+                # Lock the frontier transition fence before taking a topology
+                # snapshot. Claim/bind/settle paths validate this row under a
+                # shared lock, while a new claim first locks the campaign row
+                # already held by this transaction.
+                transition = self.connection.execute(
+                    """SELECT claim_id, claimant_id, expires_at
+                       FROM merlin_storage.campaign_frontier_transition_leases
+                       WHERE campaign_id = %s FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchone()
+                latest_wave = self.connection.execute(
+                    """SELECT wave.wave, wave.kind, wave.schedule_id,
+                              wave.status AS wave_status,
+                              schedule.status AS schedule_status,
+                              schedule.graph_digest, schedule.checkpoint_digest
+                       FROM merlin_storage.campaign_waves AS wave
+                       JOIN merlin_storage.scheduler_schedules AS schedule
+                         ON schedule.id = wave.schedule_id
+                       WHERE wave.campaign_id = %s
+                       ORDER BY wave.wave DESC LIMIT 1
+                       FOR UPDATE OF wave, schedule""",
+                    (campaign_id,),
+                ).fetchone()
+                active_batch = self.connection.execute(
+                    """SELECT id, wave, state, schedule_id, candidate_digest
+                       FROM merlin_storage.campaign_frontier_batches
+                       WHERE campaign_id = %s AND state IN ('claimed', 'scheduled')
+                       FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchone()
+                active_schedule = None
+                if active_batch is not None:
+                    expected_schedule_id = str(
+                        active_batch["schedule_id"]
+                        or uuid5(
+                            NAMESPACE_URL,
+                            f"merlin.campaign-wave.v1\n{campaign_id}\n{int(active_batch['wave'])}",
+                        )
+                    )
+                    active_schedule = self.connection.execute(
+                        """SELECT id, status, graph_digest, checkpoint_digest
+                           FROM merlin_storage.scheduler_schedules
+                           WHERE id = %s FOR UPDATE""",
+                        (expected_schedule_id,),
+                    ).fetchone()
+                frontier_rows = self.connection.execute(
+                    """SELECT state, count(*) AS count
+                       FROM merlin_storage.campaign_frontier_candidates
+                       WHERE campaign_id = %s GROUP BY state""",
+                    (campaign_id,),
+                ).fetchall()
+                frontier_counts = {
+                    state: 0 for state in ("dormant", "queued", "claimed", "scheduled", "terminal")
+                }
+                frontier_counts.update(
+                    {str(item["state"]): int(item["count"]) for item in frontier_rows}
+                )
+                reservation_counts = self.connection.execute(
+                    """SELECT reservation.state, count(*) AS count
+                       FROM merlin_storage.resource_reservations AS reservation
+                       JOIN merlin_storage.state_scopes AS scope
+                         ON scope.id = reservation.scope_id
+                       WHERE scope.campaign_id = %s GROUP BY reservation.state""",
+                    (campaign_id,),
+                ).fetchall()
+                reservations = {
+                    state: 0 for state in ("reserved", "acknowledged", "settled", "released")
+                }
+                reservations.update(
+                    {str(item["state"]): int(item["count"]) for item in reservation_counts}
+                )
+                wave_projection = (
+                    None
+                    if latest_wave is None
+                    else {
+                        "wave": int(latest_wave["wave"]),
+                        "kind": str(latest_wave["kind"]),
+                        "schedule_id": str(latest_wave["schedule_id"]),
+                        "wave_status": str(latest_wave["wave_status"]),
+                        "schedule_status": str(latest_wave["schedule_status"]),
+                        "graph_digest": str(latest_wave["graph_digest"]),
+                        "checkpoint_digest": str(latest_wave["checkpoint_digest"]),
+                    }
+                )
+                batch_projection = (
+                    None
+                    if active_batch is None
+                    else {
+                        "id": str(active_batch["id"]),
+                        "wave": int(active_batch["wave"]),
+                        "state": str(active_batch["state"]),
+                        "schedule_id": (
+                            None
+                            if active_batch["schedule_id"] is None
+                            else str(active_batch["schedule_id"])
+                        ),
+                        "candidate_digest": str(active_batch["candidate_digest"]),
+                        "schedule_status": (
+                            None if active_schedule is None else str(active_schedule["status"])
+                        ),
+                        "graph_digest": (
+                            None
+                            if active_schedule is None
+                            else str(active_schedule["graph_digest"])
+                        ),
+                        "checkpoint_digest": (
+                            None
+                            if active_schedule is None
+                            else str(active_schedule["checkpoint_digest"])
+                        ),
+                    }
+                )
+                scheduler_action = _scheduler_recovery_action(
+                    resulting_status,
+                    wave_projection,
+                    batch_projection,
+                    frontier_counts,
+                )
+                recovery_action = "pause_lifecycle" if decision != "resume" else scheduler_action
+                topology = {
+                    "campaign_status": resulting_status,
+                    "lifecycle_decision": decision,
+                    "lifecycle_wake_at": (None if wake is None else wake.isoformat()),
+                    "latest_wave": wave_projection,
+                    "active_batch": batch_projection,
+                    "frontier_counts": frontier_counts,
+                    "state_scopes": {
+                        "open": int(counts["open_count"] or 0),
+                        "acknowledged": acknowledged_count,
+                        "target_calls": int(counts["target_call_count"] or 0),
+                    },
+                    "resource_reservations": reservations,
+                    "frontier_transition": (
+                        None
+                        if transition is None
+                        else {
+                            "claim_id": str(transition["claim_id"]),
+                            "claimant_id": str(transition["claimant_id"]),
+                            "live": transition["expires_at"]
+                            > self.connection.execute("SELECT now() AS value").fetchone()["value"],
+                        }
+                    ),
+                }
+                recovery_state_digest = _digest(topology)
+                recovery_decision = {
+                    "schema": "merlin.campaign-recovery.v1",
+                    "action": recovery_action,
+                    "scheduler_action": scheduler_action,
+                    "lifecycle_decision": decision,
+                    "topology": topology,
+                }
+                recovery_decision_digest = _digest(recovery_decision)
+                persisted_recovery = self.connection.execute(
+                    """INSERT INTO merlin_storage.campaign_recovery
+                           (campaign_id, state_digest, decision, decision_digest)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (campaign_id, state_digest) DO UPDATE
+                       SET last_observed_at = now()
+                       RETURNING decision_digest""",
+                    (
+                        campaign_id,
+                        recovery_state_digest,
+                        Jsonb(recovery_decision),
+                        recovery_decision_digest,
+                    ),
+                ).fetchone()
+                if (
+                    persisted_recovery is None
+                    or str(persisted_recovery["decision_digest"]) != recovery_decision_digest
+                ):
+                    raise ValueError("campaign recovery decision conflicts with durable state")
+                results.append(
+                    {
+                        "campaign_id": campaign_id,
+                        "execution_format": execution_format,
+                        "status": resulting_status,
+                        "decision": decision,
+                        "wake_at": wake,
+                        "quota_indefinite": bool(indefinite_count),
+                        "open_state_scopes": int(counts["open_count"] or 0),
+                        "acknowledged_state_scopes": acknowledged_count,
+                        "cleanup_obligations": cleanup_count,
+                        "active_global_leases": int(leases["count"] or 0),
+                        "recovery_action": recovery_action,
+                        "scheduler_action": scheduler_action,
+                        "recovery_state_digest": recovery_state_digest,
+                        "recovery_decision_digest": recovery_decision_digest,
+                        "target_call_count": int(counts["target_call_count"] or 0),
+                        "resource_reservations": reservations,
+                        "latest_wave": wave_projection,
+                        "active_frontier_batch": batch_projection,
+                        "frontier_counts": frontier_counts,
+                    }
+                )
+            return {
+                "schema": "merlin.durable-lifecycle-recovery.v1",
+                "reconciled_at": self.connection.execute("SELECT now() AS value").fetchone()[
+                    "value"
+                ],
+                "expired_global_leases": int(expired_state["count"] or 0)
+                + int(expired_target["count"] or 0),
+                "due_quota_wakes": due_wakes,
+                "campaigns": results,
+            }
+
+    def _revise_state_scope_locked(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        value: StateScopeEnvelope,
+        *,
+        claim_id: str | None,
+    ) -> dict[str, Any]:
+        current = self.connection.execute(
+            "SELECT * FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE", (scope_id,)
+        ).fetchone()
+        if current is None:
+            raise KeyError(scope_id)
+        if str(current["status"]) == "settled":
+            raise ValueError("settled state scope evidence is immutable")
+        if value.isolation_lease_id != claim_id:
+            raise ValueError("state scope envelope must bind the active isolation lease")
+        document = value.model_dump(mode="json")
+        document_digest = _digest(document)
+        latest = self.connection.execute(
+            """SELECT revision, envelope_digest FROM merlin_storage.scope_envelopes
+               WHERE scope_id = %s ORDER BY revision DESC LIMIT 1""",
+            (scope_id,),
+        ).fetchone()
+        if (
+            latest is not None
+            and str(latest["envelope_digest"]) == document_digest
+            and int(latest["revision"]) == value.revision
+        ):
+            return self._load_state_scope_locked(scope_id)
+        if int(current["current_revision"]) != expected_revision:
+            raise ValueError("state scope revision changed")
+        if value.revision != expected_revision + 1:
+            raise ValueError("state scope envelope revision must advance exactly once")
+        expected_identity = (
+            str(current["campaign_id"]),
+            str(current["experiment_id"]),
+            str(current["attempt_id"]),
+            current["candidate_id"],
+            str(current["action_id"]),
+            str(current["action_kind"]),
+            str(current["target_authority"]),
+        )
+        actual_identity = (
+            value.campaign_id or str(current["campaign_id"]),
+            value.experiment_id,
+            value.attempt_id,
+            value.candidate_id,
+            value.action_id,
+            value.action_kind.value,
+            value.target_authority,
+        )
+        if actual_identity != expected_identity:
+            raise ValueError("state scope revision changed logical identity")
+        principal_key = _identity_key(value.principal_identity)
+        physical_key = _identity_key(value.physical_state_identity)
+        for stored, incoming in (
+            (current["principal_key"], principal_key),
+            (current["physical_state_key"], physical_key),
+        ):
+            if stored is not None and str(stored) != incoming:
+                raise ValueError("state scope revision changed a safe identity")
+        revision = expected_revision + 1
+        self.connection.execute(
+            """INSERT INTO merlin_storage.scope_envelopes
+                   (scope_id, revision, envelope, envelope_digest)
+               VALUES (%s, %s, %s, %s)""",
+            (scope_id, revision, Jsonb(document), document_digest),
+        )
+        self.connection.execute(
+            """UPDATE merlin_storage.state_scopes
+               SET current_revision = %s,
+                   principal_key = coalesce(principal_key, %s),
+                   physical_state_key = coalesce(physical_state_key, %s),
+                   updated_at = now() WHERE id = %s""",
+            (revision, principal_key, physical_key, scope_id),
+        )
+        return self._load_state_scope_locked(scope_id)
+
+    def _load_state_scope_locked(self, scope_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            """SELECT scope.*, envelope.envelope, envelope.envelope_digest
+               FROM merlin_storage.state_scopes AS scope
+               JOIN merlin_storage.scope_envelopes AS envelope
+                 ON envelope.scope_id = scope.id
+                AND envelope.revision = scope.current_revision
+               WHERE scope.id = %s""",
+            (scope_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(scope_id)
+        result = dict(row)
+        result["envelope"] = StateScopeEnvelope.model_validate(result["envelope"])
+        return result
+
+    def _validate_scope_resource_identity(
+        self, scope_id: str, target_authority: str, principal_key: str
+    ) -> str:
+        scope = self.connection.execute(
+            """SELECT target_authority, principal_key, status
+               FROM merlin_storage.state_scopes
+               WHERE id = %s""",
+            (scope_id,),
+        ).fetchone()
+        if scope is None:
+            raise KeyError(scope_id)
+        if (
+            str(scope["target_authority"]) != target_authority
+            or str(scope["principal_key"] or "anonymous") != principal_key
+        ):
+            raise ValueError("resource identity does not match its state scope")
+        return str(scope["status"])
+
+    def _require_state_scope_lease_locked(
+        self, scope_id: str, claim_id: str, claimant_id: str
+    ) -> None:
+        claim = _required(claim_id, "claim id")
+        claimant = _required(claimant_id, "claimant id")
+        row = self.connection.execute(
+            """SELECT 1 FROM merlin_storage.state_scope_leases
+               WHERE scope_id = %s AND claim_id = %s AND claimant_id = %s
+                 AND expires_at > now() FOR SHARE""",
+            (scope_id, claim, claimant),
+        ).fetchone()
+        if row is None:
+            raise ValueError("state scope lease is missing, expired, or owned elsewhere")
+
+    def _reopen_due_resource_locked(
+        self, target_authority: str, principal_key: str, resource_kind: str, window_key: str
+    ) -> bool:
+        row = self.connection.execute(
+            """UPDATE merlin_storage.principal_resources AS resource
+               SET state = 'active', reserved = 0, consumed = 0, wake_at = NULL,
+                   generation = generation + 1, updated_at = now()
+               WHERE target_authority = %s AND principal_key = %s
+                 AND resource_kind = %s AND window_key = %s
+                 AND state = 'suspended' AND wake_at <= now()
+                 AND NOT EXISTS (
+                     SELECT 1 FROM merlin_storage.resource_reservations AS reservation
+                     WHERE reservation.target_authority = resource.target_authority
+                       AND reservation.principal_key = resource.principal_key
+                       AND reservation.resource_kind = resource.resource_kind
+                       AND reservation.window_key = resource.window_key
+                       AND reservation.state IN ('reserved', 'acknowledged')
+                 ) RETURNING generation""",
+            (target_authority, principal_key, resource_kind, window_key),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _resource_decision(
+        row: Mapping[str, object], *, admitted: bool, available: int | None = None
+    ) -> dict[str, Any]:
+        return {
+            "admitted": admitted,
+            "state": str(row["state"]),
+            "reservation_id": str(row["id"]),
+            "available": available,
+            "wake_at": row.get("wake_at"),
+        }

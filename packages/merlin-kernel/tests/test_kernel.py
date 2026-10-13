@@ -16,6 +16,7 @@ from merlin_contracts import (
     ModelCompleted,
     ModelError,
     ModelUsage,
+    ProviderFailureKind,
     ReasoningDelta,
     ReportResult,
     TextDelta,
@@ -205,6 +206,63 @@ async def test_provider_request_has_bounded_output_budget() -> None:
     await kernel.wait_for_turn()
 
     assert requests[0].max_output_tokens == 8_192
+
+
+@pytest.mark.asyncio
+async def test_provider_request_uses_catalogued_model_output_limit() -> None:
+    from merlin_providers import ModelCapabilityRegistry
+
+    requests = []
+
+    class RecordingProvider:
+        async def stream(self, request):
+            requests.append(request)
+            yield TextDelta(text="done")
+            yield ModelCompleted()
+
+    settings = Settings()
+    settings.model = "deepseek-v4-flash"
+    kernel = Kernel(
+        RecordingProvider(),
+        Store(),
+        Tools(),
+        settings,
+        capability_registry=ModelCapabilityRegistry(),
+    )
+    await kernel.start()
+    await kernel.submit("hello")
+    await kernel.wait_for_turn()
+
+    assert requests[0].max_output_tokens == 393_216
+
+
+@pytest.mark.asyncio
+async def test_explicit_kernel_output_limit_caps_catalogued_limit() -> None:
+    from merlin_providers import ModelCapabilityRegistry
+
+    requests = []
+
+    class RecordingProvider:
+        async def stream(self, request):
+            requests.append(request)
+            yield TextDelta(text="done")
+            yield ModelCompleted()
+
+    settings = Settings()
+    settings.model = "deepseek-v4-flash"
+    kernel = Kernel(
+        RecordingProvider(),
+        Store(),
+        Tools(),
+        settings,
+        capability_registry=ModelCapabilityRegistry(),
+        max_output_tokens_per_request=16_384,
+    )
+    await kernel.start()
+    await kernel.submit("hello")
+    await kernel.wait_for_turn()
+
+    assert requests[0].max_output_tokens == 16_384
 
 
 class Tools:
@@ -1140,7 +1198,67 @@ async def test_retryable_malformed_tool_call_is_repaired_inside_interactive_turn
 
     assert len(provider.requests) == 2
     assert "Emit exactly one complete JSON object" in provider.requests[1].messages[-2].content
+    assert provider.requests[1].reasoning == "disabled"
     assert store.messages[kernel.session_id][-1].content == "Recovered"
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_retries_exact_tool_without_reasoning() -> None:
+    class AvailableTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(name="shell_command", description="Run", input_schema={}),
+                ToolSpec(name="read_file", description="Read", input_schema={}),
+            )
+
+    class RepairingProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ReasoningDelta(text="long reconnaissance reasoning")
+                yield ModelError(
+                    message="provider truncated tool arguments at its output limit",
+                    code="truncated_tool_call",
+                    retryable=True,
+                    partial=True,
+                    tool_name="shell_command",
+                    failure_kind=ProviderFailureKind.TRUNCATED,
+                )
+                return
+            if len(self.requests) == 2:
+                yield ToolCall(
+                    call_id="repaired-shell",
+                    name="shell_command",
+                    arguments={"argv": ["python3", "-c", "print('ok')"]},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Session bootstrap completed.")
+            yield ModelCompleted()
+
+    class RecordingTools(AvailableTools):
+        def __init__(self):
+            self.calls = []
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append((name, arguments))
+            return ToolResult(content="ok")
+
+    provider = RepairingProvider()
+    tools = RecordingTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings(), max_provider_retries=1)
+    await kernel.start()
+    await kernel.submit("inspect")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 3
+    assert provider.requests[1].reasoning == "disabled"
+    assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["shell_command"]
+    assert tools.calls == [("shell_command", {"argv": ["python3", "-c", "print('ok')"]})]
 
 
 @pytest.mark.asyncio

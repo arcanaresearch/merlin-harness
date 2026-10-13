@@ -276,6 +276,106 @@ def test_generic_constraints_and_state_capabilities_compile_as_executable_semant
     assert compiled.executable.state_capabilities.observations[0].role == "progress_ordinal"
 
 
+def test_checkpoint_contract_binds_exact_capture_placeholder() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    assert isinstance(steps[0], dict)
+    steps[0]["captures"] = {"lease_id": "/leaseId"}
+    steps.insert(
+        1,
+        {
+            "step_id": "restore-label",
+            "endpoint": "/restore",
+            "method": "POST",
+            "request_template": {"leaseId": "{{capture:lease_id}}"},
+            "captures": {},
+        },
+    )
+    raw["state_capabilities"] = {
+        "affordances": [
+            {
+                "kind": "restore_checkpoint",
+                "step_id": "restore-label",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "checkpoint": {
+            "capture_selector": {
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+                "pointer": "/leaseId",
+            },
+            "capture_timing": "live_handle",
+            "binding_name": "lease_id",
+            "restore_step_id": "restore-label",
+            "restore_request_pointer": "/leaseId",
+            "evidence_refs": ["evidence:checkpoint"],
+        },
+    }
+
+    compiled = compile_target_adapter(raw)
+    assert isinstance(compiled.executable, HttpApi)
+    assert compiled.executable.state_capabilities is not None
+    assert compiled.executable.state_capabilities.checkpoint is not None
+
+    invalid = deepcopy(raw)
+    invalid["state_capabilities"]["checkpoint"]["binding_name"] = "other"  # type: ignore[index]
+    with pytest.raises(AdapterCompileError, match="exact capture placeholder"):
+        compile_target_adapter(invalid)
+
+    post_success = deepcopy(raw)
+    post_success["state_capabilities"]["checkpoint"].update(  # type: ignore[index]
+        {
+            "capture_selector": {
+                "step_id": "message-label",
+                "evaluation_root": "response_body",
+                "pointer": "/checkpointToken",
+            },
+            "capture_timing": "post_success_response",
+        }
+    )
+    assert compile_target_adapter(post_success).executable.state_capabilities is not None
+
+    pre_success = deepcopy(post_success)
+    pre_success["state_capabilities"]["checkpoint"]["capture_selector"]["step_id"] = (  # type: ignore[index]
+        "setup-label"
+    )
+    with pytest.raises(AdapterCompileError, match="post-success checkpoint capture"):
+        compile_target_adapter(pre_success)
+
+
+def test_cleanup_affordance_binds_cleanup_role_independently() -> None:
+    raw = _http_adapter()
+    raw["state_capabilities"] = {
+        "affordances": [
+            {
+                "kind": "clone_state",
+                "step_id": "setup-label",
+                "evaluation_root": "response_body",
+            },
+            {
+                "kind": "cleanup_state",
+                "step_id": "cleanup-label",
+                "evaluation_root": "response_body",
+            },
+        ],
+        "lifecycle": {
+            "isolation": "independent",
+            "baseline": "clone",
+            "cleanup": "explicit",
+            "evidence_refs": ["evidence:lifecycle"],
+            "confidence": 1.0,
+        },
+    }
+    assert compile_target_adapter(raw).executable.state_capabilities is not None
+
+    invalid = deepcopy(raw)
+    invalid["state_capabilities"]["affordances"][1]["step_id"] = "setup-label"  # type: ignore[index]
+    with pytest.raises(AdapterCompileError, match="cleanup_state affordances require cleanup"):
+        compile_target_adapter(invalid)
+
+
 def test_capability_provenance_does_not_change_executable_digest() -> None:
     first = _http_adapter()
     first["request_constraints"] = [
@@ -323,6 +423,10 @@ def test_capability_provenance_does_not_change_executable_digest() -> None:
     second["state_capabilities"]["identity"]["evidence_refs"] = [  # type: ignore[index]
         "evidence:second"
     ]
+    second["state_capabilities"]["identity"]["baseline_selector"]["evidence_refs"] = [  # type: ignore[index]
+        "evidence:selector"
+    ]
+    second["state_capabilities"]["identity"]["baseline_selector"]["confidence"] = 0.51  # type: ignore[index]
     second["state_capabilities"]["affordances"][0]["evidence_refs"] = [  # type: ignore[index]
         "evidence:second"
     ]

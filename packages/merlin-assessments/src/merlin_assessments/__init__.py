@@ -18,7 +18,16 @@ from .neighbours import (
 )
 from .runner import AssessmentProgress, AssessmentResult, AssessmentRunner, ProgressCallback
 from .service import AssessmentService, SelectedTargetTool
-from .stateful_fixture_target import StatefulTargetFixtureServer
+from .stateful_fixture_target import (
+    CrossLayerOutcome,
+    StatefulCampaignDiagnostics,
+    StatefulCampaignMetrics,
+    StatefulFixtureBudget,
+    StatefulFixtureMetrics,
+    StatefulTargetFixtureServer,
+    diagnose_stateful_campaign,
+    verify_regression_import,
+)
 
 __all__ = [
     "AssessmentProgress",
@@ -36,6 +45,13 @@ __all__ = [
     "AssessmentService",
     "SelectedTargetTool",
     "StatefulTargetFixtureServer",
+    "StatefulCampaignDiagnostics",
+    "StatefulCampaignMetrics",
+    "CrossLayerOutcome",
+    "StatefulFixtureBudget",
+    "StatefulFixtureMetrics",
+    "diagnose_stateful_campaign",
+    "verify_regression_import",
     "ProgressCallback",
     "derive_case_relationships",
     "receipt_from_mapping",

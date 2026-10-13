@@ -1,12 +1,16 @@
+import asyncio
 import hashlib
 
 import pytest
 from merlin_agents.arm_mutation import (
     MUTATION_OUTPUT_SCHEMA,
+    GeneratorExecutionLimitExceeded,
     build_mutation_prompt,
     generate_bounded_child_candidate,
+    generate_bounded_child_candidate_with_contract,
     generate_mutations,
 )
+from merlin_contracts.generation import GeneratorExecutionContract
 
 _EXISTING_OBJECTIVE = (
     "Test the authentication authorization and tenant isolation boundary by "
@@ -247,3 +251,82 @@ def test_bounded_child_rejects_unchanged_or_oversized_generator_output() -> None
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_child_contract_is_enforced_and_sealed_into_lineage() -> None:
+    class ContractGenerator:
+        def __call__(self, _prompt: str):
+            raise AssertionError("contract-aware generation must be used")
+
+        async def generate_with_contract(self, _prompt: str, _contract):
+            return ({"input_text": "compact", "rationale": "same complete intent"},)
+
+    contract = GeneratorExecutionContract(
+        generator_id="bounded-regeneration",
+        max_outputs=1,
+        max_output_bytes=1024,
+        max_seconds=1.0,
+    )
+    child = await generate_bounded_child_candidate_with_contract(
+        parent_candidate_id="candidate/source",
+        parent_identity={"technique_id": "technique/source"},
+        rejected_input="complete oversized source",
+        constraint={
+            "kind": "string_length",
+            "maximum": 8,
+            "unit": "unicode_characters",
+        },
+        generator=ContractGenerator(),
+        execution_contract=contract,
+    )
+
+    assert child is not None
+    preservation = child["variant"]["semantic_preservation"]
+    assert preservation["generator_execution"] == contract.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_kind", ["count", "bytes", "seconds"])
+async def test_bounded_child_contract_rejects_resource_limit_breaches(
+    limit_kind: str,
+) -> None:
+    outputs = (
+        {"input_text": "short", "rationale": "same intent"},
+        {"input_text": "brief", "rationale": "same intent"},
+    )
+
+    cancellations: list[str] = []
+
+    class ContractGenerator:
+        def __call__(self, _prompt: str):
+            raise AssertionError("contract-aware generation must be used")
+
+        async def generate_with_contract(self, _prompt: str, _contract):
+            try:
+                if limit_kind == "seconds":
+                    await asyncio.sleep(0.05)
+                return outputs
+            finally:
+                cancellations.append("closed")
+
+    contract = GeneratorExecutionContract(
+        generator_id="bounded-regeneration",
+        max_outputs=1 if limit_kind == "count" else 2,
+        max_output_bytes=8 if limit_kind == "bytes" else 1024,
+        max_seconds=0.01 if limit_kind == "seconds" else 1.0,
+    )
+    with pytest.raises(GeneratorExecutionLimitExceeded):
+        await generate_bounded_child_candidate_with_contract(
+            parent_candidate_id="candidate/source",
+            parent_identity={"technique_id": "technique/source"},
+            rejected_input="complete oversized source",
+            constraint={
+                "kind": "string_length",
+                "maximum": 8,
+                "unit": "unicode_characters",
+            },
+            generator=ContractGenerator(),
+            execution_contract=contract,
+        )
+    assert cancellations == ["closed"]

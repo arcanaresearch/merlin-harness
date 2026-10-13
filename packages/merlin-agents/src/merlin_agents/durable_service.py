@@ -37,6 +37,10 @@ from merlin_contracts import (
     SwarmRequest,
     TextDelta,
     ToolInteractionRole,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    project_candidate_outcome,
+    validate_candidate_outcome_projection,
 )
 
 from .campaign import ContextDocument, ReviewedTargetAdapter, WorkerContext
@@ -4990,6 +4994,51 @@ class DurableAgentService:
                     for item in attempt_receipts
                     if item.get("attempt_disposition") == disposition
                 )
+                receipt_projection = next(
+                    (
+                        item.get("candidate_outcome_projection")
+                        for item in reversed(matching)
+                        if isinstance(item.get("candidate_outcome_projection"), Mapping)
+                    ),
+                    None,
+                )
+                sealed_arm = _sealed_arm_contract(assignment.objective)
+                candidate_identity = _sealed_candidate_identity(
+                    assignment.objective,
+                    campaign_id=_campaign_id_for_assignment(assignment.id),
+                    target_id=assignment.target_profile_id,
+                    technique_id=(
+                        assignment.semantic_technique_id
+                        or (
+                            assignment.technique_ids[0]
+                            if len(assignment.technique_ids) == 1
+                            else None
+                        )
+                    ),
+                    controller_id=str(
+                        sealed_arm.get("controller_id") or assignment.strategy_id
+                        if sealed_arm is not None
+                        else assignment.strategy_id
+                    ),
+                    requested_language=assignment.requested_language,
+                    payload_family=assignment.requested_transform_id,
+                    mutation_id=(
+                        str(sealed_arm.get("mutation_id")) if sealed_arm is not None else None
+                    ),
+                )
+                if isinstance(receipt_projection, Mapping) and candidate_identity is not None:
+                    receipt_projection = validate_candidate_outcome_projection(
+                        receipt_projection,
+                        expected_candidate_id=candidate_id_for_identity(candidate_identity),
+                    )
+                elif candidate_identity is not None:
+                    receipt_projection = project_candidate_outcome(
+                        candidate_id=candidate_id_for_identity(candidate_identity),
+                        attempt_disposition=disposition,
+                        outcome_authority="none",
+                        outcome="unclear",
+                        evidence_digest=candidate_evidence_digest((digest,)),
+                    )
                 reason = next(
                     (
                         str(item["disposition_reason"])
@@ -5042,6 +5091,16 @@ class DurableAgentService:
                     "execution_stage": assignment.execution_stage or "",
                     "attempt_disposition": {"kind": disposition, "reason": reason},
                     **(
+                        {"candidate_identity": candidate_identity}
+                        if candidate_identity is not None
+                        else {}
+                    ),
+                    **(
+                        {"candidate_outcome_projection": dict(receipt_projection)}
+                        if isinstance(receipt_projection, Mapping)
+                        else {}
+                    ),
+                    **(
                         {"bounded_child_candidate": next(iter(child_candidates.values()))}
                         if len(child_candidates) == 1
                         else {}
@@ -5085,11 +5144,20 @@ class DurableAgentService:
                     target_calls=len({str(item["call_id"]) for item in attempt_receipts}),
                     attempt_disposition=disposition,
                     outcome_authority="none",
+                    candidate_outcome_projection=receipt_projection,
                 )
             # Deterministic evaluator gates cannot retire an experiment. It remains
             # observed until target-owned evidence or a validator witness resolves it.
             return
         terminal_state = next(iter(outcomes))
+        receipt_projection = next(
+            (
+                item.get("candidate_outcome_projection")
+                for item in reversed(authoritative)
+                if isinstance(item.get("candidate_outcome_projection"), Mapping)
+            ),
+            None,
+        )
         target_call_ids = tuple(sorted({str(item["call_id"]) for item in authoritative}))
         physical_state_identities = {
             str(identity["selected_digest"])
@@ -5133,6 +5201,28 @@ class DurableAgentService:
             # language/controller/transform axes do not match the sealed candidate.
             # Preserve the observation without retiring a different variant.
             return
+        if isinstance(receipt_projection, Mapping):
+            receipt_projection = validate_candidate_outcome_projection(
+                receipt_projection,
+                expected_candidate_id=candidate_id_for_identity(candidate_identity),
+            )
+            expected_projection = project_candidate_outcome(
+                candidate_id=receipt_projection["candidate_id"],
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome=terminal_state,
+                evidence_digest=receipt_projection["evidence_digest"],
+            )
+            if receipt_projection != expected_projection:
+                raise ValueError("attempt settlement conflicts with canonical target receipt")
+        else:
+            receipt_projection = project_candidate_outcome(
+                candidate_id=candidate_id_for_identity(candidate_identity),
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome=terminal_state,
+                evidence_digest=candidate_evidence_digest((digest,)),
+            )
         strategy_state = {
             "agenda_id": assignment.agenda_id or "",
             "execution_stage": assignment.execution_stage or "",
@@ -5149,6 +5239,11 @@ class DurableAgentService:
                 "kind": "valid",
                 "reason": "target-authored outcome matched the reviewed oracle",
             },
+            **(
+                {"candidate_outcome_projection": dict(receipt_projection)}
+                if isinstance(receipt_projection, Mapping)
+                else {}
+            ),
             **(
                 {"physical_state_identity": physical_state_identity}
                 if physical_state_identity is not None
@@ -5185,6 +5280,7 @@ class DurableAgentService:
             target_calls=len(target_call_ids),
             attempt_disposition="valid",
             outcome_authority="target",
+            candidate_outcome_projection=receipt_projection,
         )
 
     async def _record_terminal_arm_outcome(
@@ -5199,6 +5295,7 @@ class DurableAgentService:
         target_calls: int,
         attempt_disposition: str,
         outcome_authority: str,
+        candidate_outcome_projection: Mapping[str, object] | None = None,
     ) -> None:
         """Upsert the durable ARM outcome with usage and pinned-price model cost.
 
@@ -5232,6 +5329,47 @@ class DurableAgentService:
                 "state_id",
             )
         }
+        canonical_identity = _sealed_candidate_identity(
+            assignment.objective,
+            campaign_id=_campaign_id_for_assignment(assignment.id),
+            target_id=assignment.target_profile_id,
+            technique_id=assignment.semantic_technique_id
+            or (assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None),
+            controller_id=str(arm.get("controller_id") or assignment.strategy_id),
+            requested_language=assignment.requested_language,
+            payload_family=assignment.requested_transform_id,
+            mutation_id=str(arm.get("mutation_id") or "") or None,
+        )
+        if canonical_identity is None:
+            raise ValueError("ARM outcome has no sealed canonical candidate identity")
+        normalized_outcome = {
+            "authoritative_success": "confirmed",
+            "validated_finding": "confirmed",
+            "clean_negative": "refuted",
+            "partial_signal": "progress",
+        }.get(outcome, "unclear")
+        if candidate_outcome_projection is None:
+            candidate_outcome_projection = project_candidate_outcome(
+                candidate_id=candidate_id_for_identity(canonical_identity),
+                attempt_disposition=attempt_disposition,
+                outcome_authority=outcome_authority,
+                outcome=normalized_outcome,
+                evidence_digest=candidate_evidence_digest(evidence_refs),
+            )
+        else:
+            candidate_outcome_projection = validate_candidate_outcome_projection(
+                candidate_outcome_projection,
+                expected_candidate_id=candidate_id_for_identity(canonical_identity),
+            )
+            expected = project_candidate_outcome(
+                candidate_id=candidate_outcome_projection["candidate_id"],
+                attempt_disposition=attempt_disposition,
+                outcome_authority=outcome_authority,
+                outcome=normalized_outcome,
+                evidence_digest=candidate_outcome_projection["evidence_digest"],
+            )
+            if candidate_outcome_projection != expected:
+                raise ValueError("ARM settlement conflicts with canonical target receipt")
         observation = {
             "campaign_id": _campaign_id_for_assignment(assignment.id),
             "arm_id": str(arm["id"]),
@@ -5251,6 +5389,8 @@ class DurableAgentService:
             "model_cost_usd": model_cost,
             "usage": costed,
             "evidence_refs": evidence_refs,
+            "candidate_outcome_projection": candidate_outcome_projection,
+            "canonical_candidate_identity": canonical_identity,
             "reason": reason,
         }
         try:

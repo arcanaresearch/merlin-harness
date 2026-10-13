@@ -35,6 +35,7 @@ from merlin_contracts import (
     ToolResult,
     ToolSpec,
     parse_model_json,
+    project_candidate_outcome,
     strip_code_fences,
 )
 from merlin_contracts.target_adapter_compiler import (
@@ -455,6 +456,82 @@ WORKER_IDENTITY = (
     "detection marker, use a neutral, target-plausible value (for example an ordinary-looking "
     "reference code or account-like string) that remains uniquely recognizable in the transcript."
 )
+
+
+def _objective_phase_checkpoint_context(
+    strategy_contract: Mapping[str, str],
+) -> dict[str, object]:
+    """Project only sealed, secret-safe checkpoint intent into target tools."""
+
+    manifest_digest = strategy_contract.get("objective_phase_manifest_digest")
+    gate_document = strategy_contract.get("objective_phase_gate")
+    restore_document = strategy_contract.get("objective_phase_checkpoint_restore")
+    if gate_document is not None and restore_document is not None:
+        raise ValueError("objective checkpoint capture and restore intents cannot be combined")
+    if gate_document is not None:
+        gate = json.loads(gate_document)
+        if not isinstance(gate, Mapping):
+            raise ValueError("objective phase gate contract must be a JSON object")
+        if gate.get("retain_success") != "checkpoint":
+            return {}
+        gate_id = gate.get("id")
+        if not isinstance(gate_id, str) or not gate_id.strip():
+            raise ValueError("checkpoint-retained objective gate requires an id")
+        recipe = json.dumps(
+            gate,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        recipe_digest = "sha256:" + hashlib.sha256(recipe.encode()).hexdigest()
+        if not isinstance(manifest_digest, str) or not manifest_digest.startswith("sha256:"):
+            raise ValueError("checkpoint-retained objective gate requires its manifest digest")
+        return {
+            "objective_phase_gate_id": gate_id,
+            "objective_phase_gate_recipe_digest": recipe_digest,
+            "objective_phase_manifest_digest": manifest_digest,
+            "objective_phase_checkpoint_intent": "capture",
+            "objective_phase_gate_contract": dict(gate),
+        }
+    if restore_document is None:
+        return {}
+    restore = json.loads(restore_document)
+    if not isinstance(restore, Mapping) or restore.get("schema") != (
+        "merlin.objective-phase-checkpoint-restore.v1"
+    ):
+        raise ValueError("objective checkpoint restore contract is malformed")
+    checkpoints = restore.get("checkpoints")
+    if (
+        not isinstance(checkpoints, list)
+        or not checkpoints
+        or any(not isinstance(item, Mapping) for item in checkpoints)
+    ):
+        raise ValueError("objective checkpoint restore contract requires reviewed checkpoints")
+    checkpoint = checkpoints[-1]
+    gate_id = checkpoint.get("gate_id")
+    recipe_digest = checkpoint.get("recipe_digest")
+    reference = checkpoint.get("checkpoint_reference")
+    if not isinstance(gate_id, str) or not gate_id.strip():
+        raise ValueError("objective checkpoint restore requires a gate id")
+    if not isinstance(recipe_digest, str) or not recipe_digest.startswith("sha256:"):
+        raise ValueError("objective checkpoint restore requires a recipe digest")
+    if not (
+        isinstance(reference, Mapping)
+        and reference.get("kind") == "opaque_reference"
+        and reference.get("namespace") == "state"
+        and isinstance(reference.get("reference_id"), str)
+        and str(reference["reference_id"]).strip()
+    ):
+        raise ValueError("objective checkpoint restore requires an opaque state reference")
+    if not isinstance(manifest_digest, str) or not manifest_digest.startswith("sha256:"):
+        raise ValueError("objective checkpoint restore requires its manifest digest")
+    return {
+        "objective_phase_gate_id": gate_id,
+        "objective_phase_gate_recipe_digest": recipe_digest,
+        "objective_phase_manifest_digest": manifest_digest,
+        "objective_phase_checkpoint_intent": "restore",
+        "objective_phase_checkpoint_reference": dict(reference),
+    }
 
 
 def _crescendo_contract(assignment: WorkerAssignment) -> CrescendoContract | None:
@@ -1601,6 +1678,14 @@ class WorkerRuntime:
                 retry_class="terminal",
             )
         strategy_values = dict(handoff.assignment.strategy_contract)
+        try:
+            objective_checkpoint_context = _objective_phase_checkpoint_context(strategy_values)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            return self._failed(
+                handoff,
+                f"sealed objective checkpoint contract is invalid: {error}",
+                retry_class="terminal",
+            )
         raw_compiled_adapter = strategy_values.get("compiled_adapter")
         raw_compiled_adapter_digest = strategy_values.get("compiled_adapter_digest")
         if bool(raw_compiled_adapter) != bool(raw_compiled_adapter_digest):
@@ -2027,6 +2112,17 @@ class WorkerRuntime:
         # helpers. Any target-bearing assignment with no reviewed actor returned
         # the typed infrastructure failure above.
         target_tool = selected_target_tool or "target_request"
+        if handoff.assignment.strategy_id == "objective-phase-gate/v1":
+            return await self._run_objective_phase_gate_controller(
+                handoff,
+                control,
+                checkpoint=checkpoint,
+                target_tool=target_tool,
+                strategy_values=strategy_values,
+                sealed_compiled_adapter=sealed_compiled_adapter,
+                sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+                objective_checkpoint_context=objective_checkpoint_context,
+            )
         if goat_contract is not None or hydra_contract is not None:
             route_contract = goat_contract or hydra_contract
             route_digest = (
@@ -3378,6 +3474,7 @@ class WorkerRuntime:
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
                                 requested_transform_id=handoff.assignment.requested_transform_id,
+                                **objective_checkpoint_context,
                             ),
                             call.arguments,
                         ),
@@ -3532,6 +3629,7 @@ class WorkerRuntime:
                     planned_language=handoff.assignment.planned_language,
                     requested_language=handoff.assignment.requested_language,
                     requested_transform_id=handoff.assignment.requested_transform_id,
+                    **objective_checkpoint_context,
                 ),
                 pending_call.arguments,
             )
@@ -4223,6 +4321,7 @@ class WorkerRuntime:
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
                                 requested_transform_id=handoff.assignment.requested_transform_id,
+                                **objective_checkpoint_context,
                             ),
                             call.arguments,
                         ),
@@ -5263,6 +5362,7 @@ class WorkerRuntime:
                                     requested_transform_id=(
                                         handoff.assignment.requested_transform_id
                                     ),
+                                    **objective_checkpoint_context,
                                 ),
                                 call.arguments,
                             ),
@@ -6023,6 +6123,264 @@ class WorkerRuntime:
 
         return terminal_runtime_result(
             self._failed(handoff, "worker exceeded the model turn limit", retry_class="terminal")
+        )
+
+    async def _run_objective_phase_gate_controller(
+        self,
+        handoff: WorkerHandoff,
+        control: WorkerControl,
+        *,
+        checkpoint: Mapping[str, object] | None,
+        target_tool: str,
+        strategy_values: Mapping[str, object],
+        sealed_compiled_adapter: str | None,
+        sealed_compiled_adapter_digest: str | None,
+        objective_checkpoint_context: Mapping[str, object],
+    ) -> WorkerResult:
+        """Execute an objective gate's sealed actions without provider inference."""
+
+        raw_gate = strategy_values.get("objective_phase_gate")
+        try:
+            gate = json.loads(str(raw_gate))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            return self._failed(
+                handoff,
+                f"sealed objective phase gate is malformed: {error}",
+                retry_class="terminal",
+            )
+        if not isinstance(gate, Mapping):
+            return self._failed(
+                handoff,
+                "sealed objective phase gate must be a JSON object",
+                retry_class="terminal",
+            )
+        gate_id = gate.get("id")
+        raw_actions = gate.get("actions")
+        if (
+            not isinstance(gate_id, str)
+            or not gate_id.strip()
+            or not isinstance(raw_actions, list)
+            or not raw_actions
+        ):
+            return self._failed(
+                handoff,
+                "sealed objective phase gate requires an id and ordered actions",
+                retry_class="terminal",
+            )
+        actions: list[tuple[str, str, str]] = []
+        for raw_action in raw_actions:
+            if not isinstance(raw_action, Mapping):
+                return self._failed(
+                    handoff,
+                    "sealed objective phase gate action is malformed",
+                    retry_class="terminal",
+                )
+            action_id = raw_action.get("id")
+            step_id = raw_action.get("step_id")
+            input_text = raw_action.get("input_text")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (action_id, step_id, input_text)
+            ):
+                return self._failed(
+                    handoff,
+                    "sealed objective phase gate action requires id, step_id, and input_text",
+                    retry_class="terminal",
+                )
+            actions.append((str(action_id), str(step_id), str(input_text)))
+        if len({action_id for action_id, _, _ in actions}) != len(actions):
+            return self._failed(
+                handoff,
+                "sealed objective phase gate action ids must be unique",
+                retry_class="terminal",
+            )
+        max_exchanges = handoff.assignment.max_target_exchanges
+        if max_exchanges is not None and len(actions) > max_exchanges:
+            return self._failed(
+                handoff,
+                "sealed objective phase gate actions exceed the reviewed target-call budget",
+                retry_class="terminal",
+            )
+
+        started = time.monotonic()
+        elapsed_before = float((checkpoint or {}).get("elapsed_seconds", 0.0))
+        messages = self._restore_messages(handoff, checkpoint, grant=self._capability_grant)
+        target_evidence = self._restore_target_evidence(checkpoint)
+        target_session_id = (
+            str((checkpoint or {})["target_session_id"])
+            if (checkpoint or {}).get("target_session_id") is not None
+            else None
+        )
+        raw_generation = (checkpoint or {}).get("target_session_generation")
+        target_session_generation = (
+            raw_generation
+            if isinstance(raw_generation, int) and not isinstance(raw_generation, bool)
+            else None
+        )
+
+        def checkpoint_payload() -> dict[str, object]:
+            return self._checkpoint_payload(
+                messages,
+                {},
+                bool(target_evidence),
+                action_count=len(target_evidence),
+                elapsed_seconds=elapsed_before + time.monotonic() - started,
+                active_phase="target",
+                target_session_id=target_session_id,
+                target_session_generation=target_session_generation,
+                technique_attempt_id=handoff.technique_attempt_id,
+                target_evidence=tuple(target_evidence.values()),
+            )
+
+        for ordinal, (action_id, step_id, input_text) in enumerate(actions):
+            digest = hashlib.sha256(
+                (f"{handoff.assignment.id}\0{gate_id}\0{ordinal}\0{action_id}\0{step_id}").encode()
+            ).hexdigest()[:24]
+            call_id = f"objective-gate-{digest}"
+            prior = target_evidence.get(call_id)
+            if prior is not None:
+                if prior.get("is_error") is True or prior.get("acknowledged") is not True:
+                    return WorkerResult(
+                        task_id=handoff.assignment.id,
+                        status="failed",
+                        error=(
+                            f"sealed objective phase gate action {action_id!r} was not acknowledged"
+                        ),
+                        error_code="objective_phase_gate_action_failed",
+                        retry_class="fresh_worker",
+                        checkpoint=checkpoint_payload(),
+                        target_session_id=target_session_id,
+                    )
+                continue
+            if await self._boundary(handoff, control, messages, "tool", drain_mailbox=False):
+                return self._cancelled(handoff)
+            maximum_seconds = handoff.assignment.budget.max_seconds
+            remaining_seconds = (
+                None
+                if maximum_seconds is None
+                else maximum_seconds - elapsed_before - (time.monotonic() - started)
+            )
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                return WorkerResult(
+                    task_id=handoff.assignment.id,
+                    status="failed",
+                    error="objective phase gate exceeded its reviewed wall-clock budget",
+                    error_code="objective_phase_gate_timeout",
+                    retry_class="terminal",
+                    checkpoint=checkpoint_payload(),
+                    target_session_id=target_session_id,
+                )
+            arguments = _controller_tool_arguments(target_tool, {"input": input_text})
+            call = ToolCall(call_id=call_id, name=target_tool, arguments=arguments)
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    result = await self._interruptible(
+                        self._tools.invoke(
+                            target_tool,
+                            ToolContext(
+                                session_id=handoff.session_id,
+                                workspace_root=handoff.workspace_root,
+                                call_id=call.call_id,
+                                agent_id=handoff.assignment.id,
+                                attempt_id=handoff.attempt_id,
+                                technique_attempt_id=handoff.technique_attempt_id,
+                                campaign_id=(
+                                    "/".join(handoff.assignment.id.split("/")[:2])
+                                    if handoff.assignment.id.startswith("campaign/")
+                                    else None
+                                ),
+                                permission_grant_digest=(
+                                    handoff.worker_context.digest
+                                    if handoff.worker_context is not None
+                                    else None
+                                ),
+                                target_id=handoff.assignment.target_profile_id,
+                                compiled_adapter=sealed_compiled_adapter,
+                                compiled_adapter_digest=sealed_compiled_adapter_digest,
+                                expected_target_tool=handoff.expected_target_tool,
+                                expected_target_arguments_digest=(
+                                    handoff.expected_target_arguments_digest
+                                ),
+                                expected_target_sequence=handoff.expected_target_sequence,
+                                target_effects_blocked=handoff.target_effects_blocked,
+                                effect_attempt_lineage=handoff.effect_attempt_lineage,
+                                transform_bindings=handoff.assignment.transform_bindings,
+                                planned_language=handoff.assignment.planned_language,
+                                requested_language=handoff.assignment.requested_language,
+                                requested_transform_id=handoff.assignment.requested_transform_id,
+                                **objective_checkpoint_context,
+                            ),
+                            arguments,
+                        ),
+                        control,
+                    )
+            except (TimeoutError, _WorkerCancelled):
+                return WorkerResult(
+                    task_id=handoff.assignment.id,
+                    status="failed",
+                    error="objective phase gate exceeded its reviewed wall-clock budget",
+                    error_code="objective_phase_gate_timeout",
+                    retry_class="terminal",
+                    checkpoint=checkpoint_payload(),
+                    target_session_id=target_session_id,
+                )
+            self._record_target_evidence(target_evidence, handoff, call, result)
+            try:
+                target_session_id, target_session_generation = self._merge_target_session(
+                    target_session_id,
+                    target_session_generation,
+                    result,
+                )
+            except ValueError as error:
+                return WorkerResult(
+                    task_id=handoff.assignment.id,
+                    status="failed",
+                    error=f"objective phase gate state identity is ambiguous: {error}",
+                    error_code="objective_phase_gate_identity_ambiguous",
+                    retry_class="effect_replay_forbidden",
+                    checkpoint=checkpoint_payload(),
+                    target_session_id=target_session_id,
+                )
+            await self._checkpoint(
+                messages,
+                {},
+                True,
+                (),
+                action_count=len(target_evidence),
+                elapsed_seconds=elapsed_before + time.monotonic() - started,
+                active_phase="target",
+                target_session_id=target_session_id,
+                target_session_generation=target_session_generation,
+                technique_attempt_id=handoff.technique_attempt_id,
+                target_evidence=tuple(target_evidence.values()),
+                provider_model=handoff.assignment.provider_model or handoff.model,
+            )
+            if result.is_error:
+                return WorkerResult(
+                    task_id=handoff.assignment.id,
+                    status="failed",
+                    error=f"sealed objective phase gate action {action_id!r} failed",
+                    error_code="objective_phase_gate_action_failed",
+                    retry_class="fresh_worker",
+                    checkpoint=checkpoint_payload(),
+                    target_session_id=target_session_id,
+                )
+
+        structured = {
+            "gate_id": gate_id,
+            "status": "succeeded",
+            "attempts": 1,
+            "target_calls": len(target_evidence),
+            "last_transition": None,
+            "blocker": None,
+        }
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="completed",
+            content=json.dumps(structured, sort_keys=True, separators=(",", ":")),
+            structured=structured,
+            checkpoint=checkpoint_payload(),
+            target_session_id=target_session_id,
         )
 
     def _provider_supports_vision(self) -> bool:
@@ -7538,6 +7896,28 @@ class WorkerRuntime:
                 receipt_body["target_authoritative_conflict"] = True
             if state_outcome is not None:
                 receipt_body["target_authoritative_state_outcome"] = state_outcome
+        candidate_identity = (
+            handoff.candidate_identity.projection()
+            if handoff.candidate_identity is not None
+            else None
+        )
+        candidate_id = (
+            "sha256:" + cls._json_fingerprint(candidate_identity)
+            if candidate_identity is not None
+            else handoff.assignment.technique_ids[0]
+            if len(handoff.assignment.technique_ids) == 1
+            else handoff.assignment.id
+        )
+        receipt_body["candidate_outcome_projection"] = project_candidate_outcome(
+            candidate_id=candidate_id,
+            attempt_disposition=attempt_disposition,
+            outcome_authority=receipt_body.get("outcome_authority", "none"),
+            outcome=receipt_body.get(
+                "target_authoritative_outcome",
+                receipt_body.get("target_authoritative_state_outcome", "unclear"),
+            ),
+            evidence_digest=str(receipt_body["content_sha256"]),
+        )
         latest_status = next(
             (
                 item.get("status_code")
@@ -7615,6 +7995,7 @@ class WorkerRuntime:
         projected_transition, _ = cls._target_state_transition(metadata)
         if projected_transition is not None and (
             projected_transition.get("conflict") is True
+            or projected_transition.get("outcome") == "unclear"
             or (
                 cls._target_state_identity_required(metadata)
                 and projected_transition.get("identity_match") is not True
@@ -7652,6 +8033,7 @@ class WorkerRuntime:
         if not isinstance(raw, Mapping) or raw.get("authority") != "target":
             return None, None
         identity_match = raw.get("identity_match")
+        schema = str(raw.get("schema") or "")
         raw_outcome = str(raw.get("outcome") or "").strip().casefold()
         outcome = (
             raw_outcome
@@ -7673,15 +8055,35 @@ class WorkerRuntime:
             "progress",
             "regression",
         } <= statuses
+        raw_validation_errors = raw.get("validation_errors")
+        validation_errors = (
+            sorted({str(item) for item in raw_validation_errors if isinstance(item, str) and item})
+            if isinstance(raw_validation_errors, Sequence)
+            and not isinstance(raw_validation_errors, (str, bytes))
+            else []
+        )
+        raw_quarantined = raw.get("quarantined_observations")
+        quarantined = (
+            sorted({str(item) for item in raw_quarantined if isinstance(item, str) and item})
+            if isinstance(raw_quarantined, Sequence)
+            and not isinstance(raw_quarantined, (str, bytes))
+            else []
+        )
+        if schema != "merlin.target-state-transition.v2":
+            validation_errors.append("transition:legacy_or_unreviewed_schema")
         identity_required = cls._target_state_identity_required(metadata)
         if conflict or (identity_required and identity_match is not True):
             outcome = "unclear"
         projected: dict[str, object] = {
-            "schema": str(raw.get("schema") or "merlin.target-state-transition.v1"),
+            "schema": schema or "merlin.target-state-transition.v1",
             "authority": "target",
             "identity_match": identity_match if isinstance(identity_match, bool) else None,
             "outcome": outcome,
             "observations": projected_observations,
+            "disposition_rule": str(raw.get("disposition_rule") or "unreviewed_transition"),
+            "validation_errors": sorted(set(validation_errors)),
+            "quarantined_observations": quarantined,
+            "corroboration": cls._semantic_value(raw.get("corroboration", [])),
             **({"conflict": True} if conflict else {}),
         }
         return projected, outcome  # type: ignore[return-value]

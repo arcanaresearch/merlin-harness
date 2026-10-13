@@ -22,9 +22,9 @@
 
 ## Executive summary
 
-- Revision: sample-policy-refund-campaign:r1:c7c662e2b2a1
-- Digest: sha256:c7c662e2b2a1a35928378723cd7bb0e48edd25ccd6b034209d843067f8d6ed71
-- Stop reason: completed_with_limitations
+- Revision: sample-policy-refund-campaign:r1:8b59ff7f6198
+- Digest: sha256:8b59ff7f6198ff7bd79dd717ae7d5713a2347813f12d50b96da8d5741b6921c4
+- Stop reason: frontier_exhausted
 - State: **provisional**
 - Audience: internal
 - Cleanup: complete
@@ -33,8 +33,8 @@
 
 ## Integrity and provenance
 
-- Revision ID: `sample-policy-refund-campaign:r1:c7c662e2b2a1`
-- Projection digest: `sha256:c7c662e2b2a1a35928378723cd7bb0e48edd25ccd6b034209d843067f8d6ed71`
+- Revision ID: `sample-policy-refund-campaign:r1:8b59ff7f6198`
+- Projection digest: `sha256:8b59ff7f6198ff7bd79dd717ae7d5713a2347813f12d50b96da8d5741b6921c4`
 - Completion digest: `sha256:59e297f0ed3cd42c9b90dbf253fc3b46d8a9311497f54f930ecee786d55198a7`
 - Source seal: sealed
 

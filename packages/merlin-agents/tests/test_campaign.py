@@ -13,6 +13,13 @@ from merlin_agents import (
     CampaignManifest,
     CampaignProfile,
     ContextDocument,
+    ObjectiveGateAction,
+    ObjectiveGateBudget,
+    ObjectiveGateOperator,
+    ObjectiveGatePredicate,
+    ObjectiveGateRetention,
+    ObjectiveGateRetryReason,
+    ObjectivePhaseGate,
     ReviewedTargetAdapter,
     WorkerAssignment,
     WorkerHandoff,
@@ -23,11 +30,15 @@ from merlin_agents import (
     comparable_attempt_dimensions,
     compile_attack_campaign,
     compile_initial_campaign,
+    compile_prerequisite_campaign,
     compile_recon_campaign,
     compile_target_brief,
     compile_worker_context,
     expand_language_techniques,
+    manifest_with_bounded_regeneration,
+    manifest_with_objective_phase_gates,
     manifest_with_target_brief,
+    objective_phase_gate_from_mapping,
     partition_attempt_history,
     related_advantage_decision,
     related_history_technique_ids,
@@ -57,6 +68,7 @@ from merlin_contracts import (
     executable_adapter_digest,
     trusted_hydra_select_mechanisms,
 )
+from merlin_contracts.generation import GeneratorExecutionContract
 from merlin_contracts.target_adapter_compiler import (
     compile_target_adapter,
     compiled_target_adapter_digest,
@@ -1552,6 +1564,128 @@ def manifest() -> CampaignManifest:
         ),
         budget=AssignmentBudget(8, 8_000, 120),
     )
+
+
+def objective_gate(*, gate_id: str = "baseline", ordinal: int = 0) -> ObjectivePhaseGate:
+    return ObjectivePhaseGate(
+        id=gate_id,
+        ordinal=ordinal,
+        objective="Reach the reviewed prerequisite state",
+        actions=(ObjectiveGateAction("normal-turn", "interaction", "Hello"),),
+        success_predicate=ObjectiveGatePredicate(
+            "progress_stage", ObjectiveGateOperator.AT_LEAST, (2,)
+        ),
+        budget=ObjectiveGateBudget(max_attempts=2, max_target_calls=3, max_seconds=30),
+        retry_on=(
+            ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE,
+            ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION,
+        ),
+        retain_success=ObjectiveGateRetention.CHECKPOINT,
+        operator_waivable=True,
+    )
+
+
+def test_objective_phase_gates_are_digest_bound_and_round_trip() -> None:
+    base = manifest()
+    prepared = manifest_with_objective_phase_gates(base, (objective_gate(),))
+
+    assert prepared.digest != base.digest
+    restored = CampaignManifest.from_mapping(json.loads(json.dumps(asdict(prepared))))
+    restored.validate()
+    assert restored.objective_phase_gates == prepared.objective_phase_gates
+    assert objective_phase_gate_from_mapping(asdict(objective_gate())) == objective_gate()
+
+
+def test_bounded_regeneration_is_digest_bound_round_trips_and_is_optional() -> None:
+    base = manifest()
+    contract = GeneratorExecutionContract(
+        generator_id="reviewed-semantic-rewrite",
+        max_outputs=2,
+        max_output_bytes=8192,
+        max_seconds=3.0,
+    )
+    prepared = manifest_with_bounded_regeneration(base, contract)
+
+    assert base.bounded_regeneration is None
+    assert prepared.digest != base.digest
+    restored = CampaignManifest.from_mapping(json.loads(json.dumps(asdict(prepared))))
+    restored.validate()
+    assert restored.bounded_regeneration == contract.model_dump(mode="json")
+    legacy = CampaignManifest.from_mapping(json.loads(json.dumps(asdict(base))))
+    legacy.validate()
+    assert legacy.digest == base.digest
+    assert legacy.bounded_regeneration is None
+
+
+def test_objective_phase_gates_require_unique_manifest_order() -> None:
+    base = manifest()
+    with pytest.raises(ValueError, match="ordered by ordinal"):
+        manifest_with_objective_phase_gates(
+            base,
+            (objective_gate(gate_id="second", ordinal=2), objective_gate(ordinal=1)),
+        )
+    with pytest.raises(ValueError, match="action ids must be unique"):
+        ObjectivePhaseGate(
+            id="duplicate-actions",
+            ordinal=0,
+            objective="Reach reviewed state",
+            actions=(
+                ObjectiveGateAction("same", "first", "one"),
+                ObjectiveGateAction("same", "second", "two"),
+            ),
+            success_predicate=ObjectiveGatePredicate(
+                "ready", ObjectiveGateOperator.EQUALS, (True,)
+            ),
+            budget=ObjectiveGateBudget(1, 2),
+        )
+
+
+def test_compile_prerequisite_campaign_emits_bounded_non_attack_contracts() -> None:
+    base = manifest()
+    prepared = manifest_with_objective_phase_gates(
+        base,
+        (objective_gate(), objective_gate(gate_id="progress", ordinal=1)),
+    )
+    context = AssignmentContext(
+        target_profile_id=prepared.target.id,
+        techniques=(
+            AssignmentTechnique("attack-cell", "Attack objective", frozenset({"prompt"}), ()),
+        ),
+        tool_ids=prepared.tool_ids,
+        skill_ids=(),
+        provider_id=prepared.provider_id,
+        authority_ids=prepared.authority_ids,
+        budget=prepared.budget,
+        input_schema="merlin.worker-input/v1",
+        output_schema="merlin.worker-result/v1",
+    )
+
+    compiled = compile_prerequisite_campaign(prepared, context, gate_ids=("baseline",))
+
+    assert len(compiled.assignments) == len(compiled.worker_contexts) == 1
+    assert compile_prerequisite_campaign(prepared, context).assignments == compiled.assignments
+    assignment = compiled.assignments[0]
+    assert assignment.strategy_id == "objective-phase-gate/v1"
+    assert assignment.technique_ids == ()
+    assert assignment.max_target_exchanges == 3
+    assert assignment.budget.max_turns == 2
+    gate_contract = json.loads(dict(assignment.strategy_contract)["objective_phase_gate"])
+    assert dict(assignment.strategy_contract)["objective_phase_manifest_digest"] == prepared.digest
+    assert gate_contract["id"] == "baseline"
+    assert gate_contract["success_predicate"] == {
+        "expected_values": [2],
+        "observation_name": "progress_stage",
+        "operator": "at_least",
+    }
+    output_schema = json.loads(assignment.output_schema)
+    assert output_schema["properties"]["status"]["enum"] == [
+        "succeeded",
+        "retryable",
+        "blocked",
+        "waived",
+    ]
+    with pytest.raises(ValueError, match="manifest order"):
+        compile_prerequisite_campaign(prepared, context, gate_ids=("progress", "baseline"))
 
 
 def assignment(**changes: object) -> WorkerAssignment:

@@ -51,6 +51,9 @@ from merlin_contracts import (
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    project_candidate_outcome,
 )
 
 
@@ -530,11 +533,14 @@ def test_retry_progress_ignores_fresh_receipt_and_session_identifiers() -> None:
             evidence,
             SimpleNamespace(
                 assignment=SimpleNamespace(
-                    id="campaign/retry-progress/worker", target_profile_id="target"
+                    id="campaign/retry-progress/worker",
+                    target_profile_id="target",
+                    technique_ids=(),
                 ),
                 worker_context=None,
                 attempt_id=None,
                 technique_attempt_id=None,
+                candidate_identity=None,
             ),
             ToolCall(
                 call_id=call_id,
@@ -7718,6 +7724,13 @@ async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome
                         "kind": "valid",
                         "reason": "target-authored outcome matched the reviewed oracle",
                     },
+                    "candidate_outcome_projection": project_candidate_outcome(
+                        candidate_id=candidate_id_for_identity(identity),
+                        attempt_disposition="valid",
+                        outcome_authority="target",
+                        outcome=outcome,
+                        evidence_digest=candidate_evidence_digest(("sha256:direct-evidence",)),
+                    ),
                     "physical_state_identity": "sha256:state-1",
                     "state_identity_match": True,
                 },
@@ -7820,7 +7833,14 @@ async def test_protocol_invalid_attempt_persists_bounded_child_without_quality_c
             self.terminalizations.append((attempt_id, state, metadata))
 
     store = TerminalStore()
-    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    observations: list[dict[str, object]] = []
+    service = DurableAgentService(
+        Provider(),
+        Tools(),
+        store,
+        model="test",
+        arm_outcome_recorder=observations.append,
+    )
     assignment = SimpleNamespace(
         id="campaign/one/direct",
         agenda_id="agenda/one",
@@ -7885,6 +7905,7 @@ async def test_protocol_invalid_attempt_persists_bounded_child_without_quality_c
             },
         )
     ]
+    assert observations == []
 
 
 async def test_terminalized_attempt_upserts_arm_outcome_with_pinned_cost() -> None:

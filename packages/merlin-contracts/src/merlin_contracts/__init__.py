@@ -27,6 +27,15 @@ from .attempts import (
     TechniqueAttemptControlKind,
     TechniqueAttemptState,
 )
+from .campaign_lifecycle import (
+    CAMPAIGN_TERMINAL_REASONS,
+    CampaignTerminalContract,
+    CampaignTerminalReason,
+    LegacyTerminalMapping,
+    map_legacy_terminal_reason,
+    read_campaign_terminal_reason,
+    require_campaign_terminal_reason,
+)
 from .chat import (
     ChatMessage,
     ChatRequest,
@@ -64,6 +73,7 @@ from .findings import (
     ReportRequest,
     ReportResult,
 )
+from .generation import GeneratorExecutionContract
 from .goat_catalog import (
     GOAT_DEFAULT_TARGET_TURNS,
     GOAT_STRATEGIES,
@@ -82,6 +92,7 @@ from .hydra_catalog import (
     trusted_hydra_select_mechanisms,
 )
 from .model_json import ModelJsonError, parse_model_json, strip_code_fences
+from .objective_gate import evaluate_objective_gate_predicate
 from .observability import (
     ArmIdentity,
     ArmOutcome,
@@ -94,6 +105,15 @@ from .observability import (
     LanguageEvidenceStatus,
     OutcomeAuthority,
     TechniqueLanguageEvidence,
+)
+from .outcome_projection import (
+    assert_candidate_outcome_match,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    model_authority_disagreement,
+    project_candidate_outcome,
+    summarize_candidate_projections,
+    validate_candidate_outcome_projection,
 )
 from .packs import (
     AttackCase,
@@ -118,6 +138,11 @@ from .promotion import (
     promotion_digest,
 )
 from .records import EventRecord, MessageRecord, SessionRecord
+from .state_isolation import (
+    StateIsolationPlan,
+    StateIsolationStrategy,
+    resolve_state_isolation,
+)
 from .target_adapter import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
     executable_adapter_digest,
@@ -125,6 +150,7 @@ from .target_adapter import (
     reviewed_adapter_cleanup_lifecycle,
     reviewed_adapter_target_delivery,
 )
+from .target_capabilities import StateCapabilities, SupportedModality, TargetModality
 from .tools import (
     LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     TargetDeliveryClass,
@@ -134,8 +160,10 @@ from .tools import (
     ToolResult,
     ToolSpec,
 )
+from .transition_oracle import build_state_observation, evaluate_state_transition
 
 __all__ = [
+    "CAMPAIGN_TERMINAL_REASONS",
     "EXECUTABLE_ADAPTER_IDENTITY_VERSION",
     "GOAT_DEFAULT_TARGET_TURNS",
     "GOAT_STRATEGIES",
@@ -153,6 +181,16 @@ __all__ = [
     "trusted_hydra_select_mechanisms",
     "executable_adapter_digest",
     "executable_adapter_projection",
+    "evaluate_objective_gate_predicate",
+    "model_authority_disagreement",
+    "assert_candidate_outcome_match",
+    "candidate_evidence_digest",
+    "candidate_id_for_identity",
+    "project_candidate_outcome",
+    "summarize_candidate_projections",
+    "validate_candidate_outcome_projection",
+    "evaluate_state_transition",
+    "build_state_observation",
     "reviewed_adapter_cleanup_lifecycle",
     "reviewed_adapter_target_delivery",
     "AbsenceAuthority",
@@ -175,6 +213,8 @@ __all__ = [
     "CampaignObservation",
     "CampaignCounterEvent",
     "CampaignCounters",
+    "CampaignTerminalContract",
+    "CampaignTerminalReason",
     "ChatMessage",
     "ChatRequest",
     "DynamicToolHandler",
@@ -198,10 +238,12 @@ __all__ = [
     "FindingSeverity",
     "FindingStatus",
     "FindingValidation",
+    "GeneratorExecutionContract",
     "HypothesisRecord",
     "HypothesisState",
     "InfrastructureFailureCategory",
     "LanguageEvidenceStatus",
+    "LegacyTerminalMapping",
     "LEGACY_TARGET_EXCHANGE_TOOL_IDS",
     "MessageRecord",
     "MessageLineage",
@@ -237,6 +279,11 @@ __all__ = [
     "RedirectDirective",
     "ScheduleProjection",
     "SessionRecord",
+    "StateCapabilities",
+    "SupportedModality",
+    "TargetModality",
+    "StateIsolationPlan",
+    "StateIsolationStrategy",
     "TextDelta",
     "TargetProfile",
     "TERMINAL_TECHNIQUE_ATTEMPT_STATES",
@@ -258,5 +305,9 @@ __all__ = [
     "ToolSpec",
     "deterministic_gates",
     "promotion_digest",
+    "resolve_state_isolation",
+    "map_legacy_terminal_reason",
+    "read_campaign_terminal_reason",
+    "require_campaign_terminal_reason",
     "trusted_goat_toolbox",
 ]

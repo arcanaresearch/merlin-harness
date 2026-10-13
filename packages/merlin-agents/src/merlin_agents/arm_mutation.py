@@ -12,11 +12,15 @@ meaningfully different along a caller-supplied direction.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 
 from jsonschema import ValidationError, validate
+from merlin_contracts.generation import GeneratorExecutionContract
 
 MUTATION_OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -36,6 +40,11 @@ _MAX_OBJECTIVE_CHARS = 500
 _MAX_DIRECTION_CHARS = 200
 
 Generator = Callable[[str], Sequence[Mapping[str, object]]]
+
+
+class GeneratorExecutionLimitExceeded(RuntimeError):
+    """Raised when a generator exceeds its reviewed execution contract."""
+
 
 _BOUNDED_MUTATION_OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -163,6 +172,7 @@ def generate_bounded_child_candidate(
     rejected_input: str,
     constraint: Mapping[str, object],
     generator: Generator,
+    execution_contract: GeneratorExecutionContract | None = None,
 ) -> dict[str, object] | None:
     """Regenerate one immutable child that satisfies an exact string limit.
 
@@ -225,6 +235,11 @@ def generate_bounded_child_candidate(
             "constraint": constraint_projection,
             "input_text": input_text,
         }
+        execution_projection = (
+            execution_contract.model_dump(mode="json") if execution_contract is not None else None
+        )
+        if execution_projection is not None:
+            identity_material["generator_execution"] = execution_projection
         suffix = hashlib.sha256(
             json.dumps(
                 identity_material,
@@ -249,11 +264,97 @@ def generate_bounded_child_candidate(
                 "semantic_preservation": {
                     "source": "model_mutation",
                     "rationale": rationale,
+                    **(
+                        {"generator_execution": execution_projection}
+                        if execution_projection is not None
+                        else {}
+                    ),
                 },
             },
             "reason": (f"semantic-preserving regeneration for reviewed {unit} limit {maximum}"),
         }
     return None
+
+
+async def generate_bounded_child_candidate_with_contract(
+    *,
+    parent_candidate_id: str,
+    parent_identity: Mapping[str, object],
+    rejected_input: str,
+    constraint: Mapping[str, object],
+    generator: Generator,
+    execution_contract: GeneratorExecutionContract,
+) -> dict[str, object] | None:
+    """Run semantic regeneration within reviewed count, byte, and time bounds."""
+
+    deadline = time.monotonic() + execution_contract.max_seconds
+    contract_generator = getattr(generator, "generate_with_contract", None)
+    if not callable(contract_generator):
+        raise GeneratorExecutionLimitExceeded(
+            "bounded child generator does not implement generate_with_contract"
+        )
+    prompt = _bounded_mutation_prompt(rejected_input, constraint)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GeneratorExecutionLimitExceeded(
+            "bounded child generator exceeded reviewed max_seconds"
+        )
+    invocation_contract = execution_contract.model_copy(update={"max_seconds": remaining})
+    try:
+        if inspect.iscoroutinefunction(contract_generator):
+            async with asyncio.timeout(remaining):
+                outputs = await contract_generator(prompt, invocation_contract)
+        else:
+            async with asyncio.timeout(remaining):
+                outputs = await asyncio.to_thread(contract_generator, prompt, invocation_contract)
+    except TimeoutError as error:
+        raise GeneratorExecutionLimitExceeded(
+            "bounded child generator exceeded reviewed max_seconds"
+        ) from error
+
+    def bounded_outputs() -> tuple[Mapping[str, object], ...]:
+        if time.monotonic() >= deadline:
+            raise GeneratorExecutionLimitExceeded(
+                "bounded child generator exceeded reviewed max_seconds"
+            )
+        admitted: list[Mapping[str, object]] = []
+        serialized_bytes = 2  # JSON array delimiters.
+        for index, output in enumerate(outputs):
+            if time.monotonic() >= deadline:
+                raise GeneratorExecutionLimitExceeded(
+                    "bounded child generator exceeded reviewed max_seconds"
+                )
+            if index >= execution_contract.max_outputs:
+                raise GeneratorExecutionLimitExceeded(
+                    "bounded child generator exceeded reviewed max_outputs"
+                )
+            try:
+                encoded = json.dumps(
+                    output,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise GeneratorExecutionLimitExceeded(
+                    "bounded child generator returned non-serializable output"
+                ) from error
+            serialized_bytes += len(encoded) + int(index > 0)
+            if serialized_bytes > execution_contract.max_output_bytes:
+                raise GeneratorExecutionLimitExceeded(
+                    "bounded child generator exceeded reviewed max_output_bytes"
+                )
+            admitted.append(output)
+        return tuple(admitted)
+
+    return generate_bounded_child_candidate(
+        parent_candidate_id=parent_candidate_id,
+        parent_identity=parent_identity,
+        rejected_input=rejected_input,
+        constraint=constraint,
+        generator=lambda _prompt: bounded_outputs(),
+        execution_contract=execution_contract,
+    )
 
 
 def _bounded_mutation_prompt(source: str, constraint: Mapping[str, object]) -> str:

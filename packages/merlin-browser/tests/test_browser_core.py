@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import merlin_browser.service as browser_service_module
 import pytest
-from merlin_assessments import ReviewedApiTargetTool
+from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
 from merlin_browser import (
     ApiReconHandoff,
     BrowserAction,
@@ -71,10 +72,208 @@ class _NativeRequestFixtureRecorder:
         }
 
 
-def browser_tools(resolver, recorder=None, adapter_resolver=None):
+class _StateScopeFixtureStore:
+    def __init__(
+        self,
+        events: list[str] | None = None,
+        *,
+        enforce_conflicts: bool = False,
+    ) -> None:
+        self.events = events if events is not None else []
+        self.resource_state: str | None = None
+        self.resource_limit = 0
+        self.checkpoint: dict[str, object] | None = None
+        self.envelopes: list[dict[str, object]] = []
+        self.fail_claim = False
+        self.enforce_conflicts = enforce_conflicts
+        self.claims: dict[str, tuple[str, str, str]] = {}
+        self.claim_calls: list[dict[str, object]] = []
+        self.rekey_calls: list[dict[str, object]] = []
+
+    def create_state_scope(self, *args, **kwargs):
+        self.events.append("created")
+        self.envelopes.append(dict(args[2]))
+        return {}
+
+    def claim_state_scope_lease(self, *args, **kwargs):
+        self.events.append("claimed")
+        self.claim_calls.append(dict(kwargs))
+        if self.fail_claim:
+            return None
+        key = (
+            str(kwargs["target_authority"]),
+            str(kwargs["principal_key"]),
+            str(kwargs["equivalence_key"]),
+        )
+        if self.enforce_conflicts and key in self.claims.values():
+            return None
+        claim_id = (
+            f"claim-browser-fixture-{len(self.claims) + 1}"
+            if self.enforce_conflicts
+            else "claim-browser-fixture"
+        )
+        self.claims[claim_id] = key
+        return claim_id
+
+    def pause_unclaimed_state_scope(self, *args, **kwargs):
+        self.events.append("paused_unclaimed")
+        return {}
+
+    def revise_state_scope(self, *args, **kwargs):
+        self.events.append("revised")
+        return {}
+
+    def acknowledge_state_scope(self, *args, **kwargs):
+        self.events.append("acknowledged")
+        return {}
+
+    def settle_state_scope(self, *args, **kwargs):
+        self.events.append("settled")
+        return {}
+
+    def pause_state_scope(self, *args, **kwargs):
+        self.events.append("paused")
+        return {}
+
+    def release_state_scope_lease(self, *args, **kwargs):
+        self.events.append("released")
+        if args:
+            self.claims.pop(str(args[0]), None)
+        return True
+
+    def rekey_state_scope_lease(
+        self,
+        claim_id,
+        claimant_id,
+        *,
+        principal_key,
+        equivalence_key,
+        maximum_parallel_states=None,
+    ):
+        current = self.claims.get(str(claim_id))
+        if current is None:
+            return False
+        authority = current[0]
+        replacement = (authority, str(principal_key), str(equivalence_key))
+        others = {key: value for key, value in self.claims.items() if key != str(claim_id)}
+        if self.enforce_conflicts and replacement in others.values():
+            return False
+        if maximum_parallel_states is not None:
+            active = sum(
+                value[0] == authority
+                and value[1] == str(principal_key)
+                and value[2] != "conservative-shared-state"
+                for value in others.values()
+            )
+            if active >= int(maximum_parallel_states):
+                return False
+        self.events.append("rekeyed")
+        self.rekey_calls.append(
+            {
+                "claimant_id": str(claimant_id),
+                "principal_key": str(principal_key),
+                "equivalence_key": str(equivalence_key),
+                "maximum_parallel_states": maximum_parallel_states,
+            }
+        )
+        self.claims[str(claim_id)] = replacement
+        return True
+
+    def resource_status(self, *args, **kwargs):
+        if self.resource_state is None:
+            return None
+        return {
+            "state": self.resource_state,
+            "available": 0 if self.resource_state == "exhausted" else self.resource_limit,
+        }
+
+    def reserve_resource(self, *args, **kwargs):
+        self.events.append("resource_reserved")
+        self.resource_limit = int(kwargs["limit"])
+        if self.resource_state == "exhausted":
+            return {"admitted": False, "state": "exhausted", "available": 0}
+        self.resource_state = "active"
+        return {"admitted": True, "state": "reserved", "available": 0}
+
+    def acknowledge_resource(self, *args, **kwargs):
+        self.events.append("resource_acknowledged")
+        return {}
+
+    def settle_resource(self, *args, **kwargs):
+        self.events.append("resource_settled")
+        self.resource_state = "exhausted"
+        return {}
+
+    def release_resource(self, *args, **kwargs):
+        self.events.append("resource_released")
+        return {}
+
+    def record_objective_gate_checkpoint(self, campaign_id, gate_id, **kwargs):
+        self.events.append("checkpoint_recorded")
+        self.checkpoint = {"campaign_id": campaign_id, "gate_id": gate_id, **kwargs}
+        return dict(self.checkpoint)
+
+    def claim_objective_gate_checkpoint_restore(self, campaign_id, gate_id, **kwargs):
+        self.events.append("checkpoint_claimed")
+        if self.checkpoint is None:
+            raise KeyError((campaign_id, gate_id))
+        return dict(self.checkpoint)
+
+    def release_objective_gate_checkpoint_restore(self, *args, **kwargs):
+        self.events.append("checkpoint_released")
+        return True
+
+    def mark_objective_gate_checkpoint_restored(self, *args, **kwargs):
+        self.events.append("checkpoint_restored")
+        return {}
+
+
+class _CheckpointVaultFixture:
+    def __init__(self) -> None:
+        self.secrets: dict[str, str] = {}
+
+    def store_checkpoint(self, secret, *, campaign_id, gate_id):
+        reference_id = f"checkpoint:{campaign_id}:{gate_id}"
+        self.secrets[reference_id] = secret
+        return SimpleNamespace(
+            reference_id=reference_id,
+            opaque_reference=lambda: {
+                "kind": "opaque_reference",
+                "namespace": "state",
+                "reference_id": reference_id,
+            },
+            keyed_digest=lambda: {"digest": "sha256:" + "a" * 64},
+        )
+
+    def resolve_checkpoint(self, reference_id):
+        return self.secrets[reference_id]
+
+    def delete_checkpoint(self, reference_id, *, expected_digest):
+        del expected_digest
+        return self.secrets.pop(reference_id, None) is not None
+
+
+def browser_tools(
+    resolver,
+    recorder=None,
+    adapter_resolver=None,
+    state_scope_store=None,
+    checkpoint_store=None,
+    checkpoint_vault=None,
+):
     if recorder is not None and not hasattr(recorder, "reviewed_native_input_receipt"):
         recorder = _NativeRequestFixtureRecorder(recorder)
-    return _production_browser_tools(resolver, recorder, adapter_resolver)
+    effective_state_scope_store = state_scope_store
+    if effective_state_scope_store is None and adapter_resolver is not None:
+        effective_state_scope_store = _StateScopeFixtureStore()
+    return _production_browser_tools(
+        resolver,
+        recorder,
+        adapter_resolver,
+        effective_state_scope_store,
+        checkpoint_store,
+        checkpoint_vault,
+    )
 
 
 @pytest.mark.asyncio
@@ -1284,6 +1483,238 @@ async def test_browser_tools_use_read_and_mutating_permission_boundaries() -> No
 
 
 @pytest.mark.asyncio
+async def test_raw_browser_action_persists_and_claims_scope_before_target_delivery() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+    browser_owner = owner()
+
+    class Session:
+        context_id = "raw-browser-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = browser_owner
+        mode = "isolated"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(tabs=())
+
+        async def act(self, action, *, actor_id):
+            del actor_id
+            events.append("target")
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref="tab-1",
+                kind="navigation",
+                step=action.step,
+                evidence_refs=("browser-response:fixture",),
+            )
+
+        def api_exchange_events(self):
+            return ()
+
+    tools = {
+        tool.name: tool
+        for tool in _production_browser_tools(
+            lambda _: Session(),
+            state_scope_store=scope_store,
+        )
+    }
+    missing_campaign = await tools["browser_open_tab"].invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {"url": "https://target.example", "step": 0},
+    )
+    assert missing_campaign.is_error is True
+    assert missing_campaign.metadata["failure_code"] == "state_scope_campaign_required"
+    assert missing_campaign.metadata["target_effect_attempted"] is False
+    assert events == []
+
+    result = await tools["browser_open_tab"].invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:raw-browser",
+            call_id="call:raw-browser",
+        ),
+        {"url": "https://target.example", "step": 0},
+    )
+
+    assert result.is_error is False
+    assert events == [
+        "created",
+        "claimed",
+        "revised",
+        "acknowledged",
+        "target",
+        "settled",
+        "released",
+    ]
+    assert scope_store.envelopes[0]["action_kind"] == "reconnaissance"
+    assert scope_store.envelopes[0]["before"]["availability"] == "missing"
+    assert result.metadata["state_scope_id"].startswith("state-scope:")
+
+    baseline = await tools["browser_open_tab"].invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:raw-browser",
+            call_id="call:raw-browser-baseline",
+            objective_phase_checkpoint_intent="capture",
+        ),
+        {"url": "https://target.example", "step": 0},
+    )
+    assert baseline.is_error is False
+    assert scope_store.envelopes[-1]["action_kind"] == "baseline"
+
+
+@pytest.mark.asyncio
+async def test_raw_browser_action_does_not_deliver_when_global_scope_lease_fails() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+    scope_store.fail_claim = True
+
+    class Session:
+        context_id = "contended-browser-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "isolated"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(tabs=())
+
+        async def act(self, action, *, actor_id):
+            del action, actor_id
+            events.append("target")
+            raise AssertionError("target delivery must not occur without the global lease")
+
+    tools = {
+        tool.name: tool
+        for tool in _production_browser_tools(
+            lambda _: Session(),
+            state_scope_store=scope_store,
+        )
+    }
+    result = await tools["browser_open_tab"].invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:raw-browser",
+            call_id="call:contended-browser",
+        ),
+        {"url": "https://target.example", "step": 0},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "physical_state_unavailable"
+    assert result.metadata["target_effect_attempted"] is False
+    assert events == ["created", "claimed", "paused_unclaimed"]
+
+
+@pytest.mark.asyncio
+async def test_raw_browser_actions_serialize_aliases_across_contexts_and_campaigns() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events, enforce_conflicts=True)
+    first_started = asyncio.Event()
+    finish_first = asyncio.Event()
+
+    class Session:
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "isolated"
+
+        def __init__(self, context_id: str) -> None:
+            self.context_id = context_id
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(tabs=())
+
+        async def act(self, action, *, actor_id):
+            del actor_id
+            events.append(f"target:{self.context_id}")
+            if self.context_id == "context-a":
+                first_started.set()
+                await finish_first.wait()
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref=f"tab:{self.context_id}",
+                kind="navigation",
+                step=action.step,
+                evidence_refs=(f"browser-response:{self.context_id}",),
+            )
+
+        def api_exchange_events(self):
+            return ()
+
+    sessions = {"s1": Session("context-a"), "s2": Session("context-b")}
+    tools = {
+        tool.name: tool
+        for tool in _production_browser_tools(
+            lambda session_id: sessions[session_id],
+            state_scope_store=scope_store,
+        )
+    }
+    first = asyncio.create_task(
+        tools["browser_open_tab"].invoke(
+            ToolContext(
+                session_id="s1",
+                workspace_root="/tmp",
+                campaign_id="campaign:first",
+                call_id="call:first",
+            ),
+            {"url": "https://target.example", "step": 0},
+        )
+    )
+    await first_started.wait()
+    second = await tools["browser_open_tab"].invoke(
+        ToolContext(
+            session_id="s2",
+            workspace_root="/tmp",
+            campaign_id="campaign:second",
+            call_id="call:second",
+        ),
+        {"url": "https://target.example", "step": 0},
+    )
+    finish_first.set()
+    first_result = await first
+
+    assert first_result.is_error is False
+    assert second.is_error is True
+    assert second.metadata["failure_code"] == "physical_state_unavailable"
+    assert "target:context-b" not in events
+    assert len(scope_store.claim_calls) == 2
+    assert {
+        (
+            call["target_authority"],
+            call["principal_key"],
+            call["equivalence_key"],
+        )
+        for call in scope_store.claim_calls
+    } == {
+        (
+            "https://target.example",
+            "anonymous",
+            "conservative-shared-state",
+        )
+    }
+
+
+@pytest.mark.asyncio
 async def test_api_handoff_compiles_from_captured_exchange_without_nested_model_json() -> None:
     class Session:
         context_id = "browser-context"
@@ -1537,8 +1968,12 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                 "resumed": False,
                 "state": {
                     "physicalId": "physical-1",
+                    "principalId": "principal-1",
                     "stage": 1,
                     "quality": 75,
+                    "qualityMirror": 75,
+                    "remaining": 25,
+                    "resetAt": "2030-01-01T00:00:00Z",
                     "status": "active",
                 },
             },
@@ -1552,9 +1987,13 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                 "reply": "observed response",
                 "state": {
                     "stage": 1,
-                    "physicalId": "physical-1",
+                    "physicalId": "physical-2",
+                    "previousPhysicalId": "physical-1",
+                    "principalId": "principal-1",
                     "quality": 77,
+                    "qualityMirror": 77,
                     "remaining": 24,
+                    "resetAt": "2030-01-01T00:00:00Z",
                     "status": "active",
                 },
             },
@@ -1620,6 +2059,7 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                     "step_id": "observed-message-exchange",
                     "evaluation_root": "response_body",
                 },
+                "value_type": "string",
             },
             {
                 "name": "progress_stage",
@@ -1635,6 +2075,9 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                     "evaluation_root": "response_body",
                 },
                 "preferred_direction": "increase",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "monotonicity": "nondecreasing",
             },
             {
                 "name": "objective_score",
@@ -1650,6 +2093,47 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                     "evaluation_root": "response_body",
                 },
                 "preferred_direction": "increase",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "maximum_value": 100,
+                "monotonicity": "nondecreasing",
+            },
+            {
+                "name": "objective_score_mirror",
+                "role": "score",
+                "baseline_selector": {
+                    "pointer": "/state/qualityMirror",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/qualityMirror",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "preferred_direction": "increase",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "maximum_value": 100,
+                "monotonicity": "nondecreasing",
+            },
+            {
+                "name": "remaining_allowance",
+                "role": "budget_remaining",
+                "baseline_selector": {
+                    "pointer": "/state/remaining",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/state/remaining",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "preferred_direction": "decrease",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "monotonicity": "nonincreasing",
             },
             {
                 "name": "terminal_state",
@@ -1666,6 +2150,76 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                 },
                 "success_values": ["complete"],
                 "failure_values": ["failed"],
+                "value_type": "string",
+            },
+        ],
+        "corroboration_rules": [
+            {
+                "name": "score_fields_agree",
+                "observation_names": ["objective_score", "objective_score_mirror"],
+                "minimum_agreement": 2,
+            }
+        ],
+        "identity_equivalence_rules": [
+            {
+                "name": "rotated_identifier_links_previous",
+                "relation": "equal",
+                "left_selector": {
+                    "pointer": "/state/physicalId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "right_selector": {
+                    "pointer": "/state/previousPhysicalId",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+            },
+            {
+                "name": "unproven_rotated_identifier_match",
+                "relation": "equal",
+                "left_selector": {
+                    "pointer": "/state/physicalId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "right_selector": {
+                    "pointer": "/state/physicalId",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+            },
+        ],
+        "resource_ownership": [
+            {
+                "name": "principal_allowance",
+                "resource_kind": "quota",
+                "resource_observation_name": "remaining_allowance",
+                "principal_selector": {
+                    "pointer": "/state/principalId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "reset_selector": {
+                    "pointer": "/state/resetAt",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+            },
+            {
+                "name": "invalid_interaction_reset",
+                "resource_kind": "quota",
+                "resource_observation_name": "remaining_allowance",
+                "principal_selector": {
+                    "pointer": "/state/principalId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "reset_selector": {
+                    "pointer": "/state/resetAt",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
             },
         ],
     }
@@ -1697,21 +2251,326 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
     assert len(constraint["evidence_refs"]) == 2
     assert {item["observed_maximum"] for item in constraint["evidence_bindings"]} == {500}
     capabilities = adapter["state_capabilities"]
+    assert capabilities["schema_version"] == "merlin.state-capabilities.v1"
     identity_selector = capabilities["identity"]["baseline_selector"]
     assert capabilities["identity"]["identity_scope"] == "physical_state"
     assert identity_selector["pointer"] == "/state/physicalId"
     assert identity_selector["step_id"] == "observed-session-setup"
     assert identity_selector["evaluation_root"] == "response_body"
+    assert identity_selector["schema_version"] == "merlin.state-selector.v1"
+    assert len(identity_selector["evidence_refs"]) == 1
+    assert identity_selector["evidence_refs"][0].startswith("browser-api-response:sha256:")
     assert {item["name"] for item in capabilities["observations"]} == {
         "progress_stage",
         "objective_score",
         "terminal_state",
         "remote_state_id",
+        "objective_score_mirror",
+        "remaining_allowance",
     }
     assert capabilities.get("affordances", []) == []
     assert capabilities.get("freshness_rules", []) == []
+    assert capabilities["identity_equivalence_rules"][0]["relation"] == "equal"
+    assert len(capabilities["identity_equivalence_rules"]) == 1
+    assert capabilities["identity_equivalence_rules"][0]["left_selector"]["pointer"] == (
+        "/state/physicalId"
+    )
+    assert capabilities["identity_equivalence_rules"][0]["right_selector"]["pointer"] == (
+        "/state/previousPhysicalId"
+    )
+    ownership = capabilities["resource_ownership"][0]
+    assert len(capabilities["resource_ownership"]) == 1
+    assert ownership["authority"] == "adapter_origin"
+    assert ownership["resource_kind"] == "quota"
+    assert ownership["resource_observation_name"] == "remaining_allowance"
+    assert ownership["principal_selector"]["pointer"] == "/state/principalId"
+    assert "principal-1" not in json.dumps(capabilities)
+    assert capabilities.get("corroboration_rules", []) == []
+    uncertainty_sources = {item["source"] for item in adapter.get("evaluation_uncertainties", [])}
+    assert "browser_compile_api_handoff.identity_equivalence_rules" in uncertainty_sources
+    assert "browser_compile_api_handoff.resource_ownership" in uncertainty_sources
+    assert "browser_compile_api_handoff.corroboration_rules" in uncertainty_sources
+    observations = {item["name"]: item for item in capabilities["observations"]}
+    assert (observations["progress_stage"] | {"evidence_refs": []}).items() >= {
+        "value_type": "integer",
+        "minimum_value": 0,
+        "monotonicity": "nondecreasing",
+        "trust_class": "target_reported",
+        "evidence_refs": [],
+    }.items()
+    assert (observations["objective_score"] | {"evidence_refs": []}).items() >= {
+        "value_type": "integer",
+        "minimum_value": 0,
+        "maximum_value": 100,
+        "monotonicity": "nondecreasing",
+        "trust_class": "target_reported",
+        "evidence_refs": [],
+    }.items()
+    for observation in observations.values():
+        assert observation["trust_class"] == "target_reported"
+        assert len(observation["baseline_selector"]["evidence_refs"]) == 1
+        assert len(observation["result_selector"]["evidence_refs"]) == 1
+        assert observation["baseline_selector"]["evidence_refs"][0].startswith(
+            "browser-api-response:sha256:"
+        )
+        assert observation["result_selector"]["evidence_refs"][0].startswith(
+            "browser-api-response:sha256:"
+        )
     recorded_refs = {item[1] for item in recorder.evidence}
     assert set(constraint["evidence_refs"]).issubset(recorded_refs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("affordance_kind", "operation", "ack_pointer", "resource_kind", "window_key"),
+    [
+        ("reset_state", "reset", "/reset", "quota", "daily"),
+        ("clone_state", "clone", "/cloned", "rate_limit", "sixty_seconds"),
+        ("restore_checkpoint", "restore", "/restored", "quota", "daily"),
+    ],
+)
+async def test_generic_fixture_recon_compiles_state_and_resource_controls(
+    affordance_kind: str,
+    operation: str,
+    ack_pointer: str,
+    resource_kind: str,
+    window_key: str,
+    tmp_path: Path,
+) -> None:
+    async with StatefulTargetFixtureServer(interaction_quota=1) as target:
+        async with httpx.AsyncClient(base_url=target.origin) as client:
+            started = (await client.post("/api/start", json={})).json()
+            session_id = started["sessionId"]
+            await client.post(f"/api/{operation}", json={"sessionId": session_id})
+            await client.post(
+                "/api/message", json={"sessionId": session_id, "message": "reviewed probe"}
+            )
+            await client.post(
+                "/api/message", json={"sessionId": session_id, "message": "quota probe"}
+            )
+            await client.post("/api/cleanup", json={"sessionId": session_id})
+
+        cleanup_action, _, cleanup_ref = _cleanup_action_records()
+        setup_action, _ = _setup_action_records()
+        base_time = _SETUP_ACTION_AT + timedelta(seconds=1)
+        events = []
+        for index, row in enumerate(target.http_log):
+            event = {
+                "method": row["method"],
+                "url": target.origin + str(row["path"]),
+                "status": row["status"],
+                "request_json": row["request"],
+                "response_json": row["response"],
+                "observed_at": (base_time + timedelta(seconds=index)).isoformat(),
+            }
+            if row["operation"] == "start":
+                event.update(
+                    {
+                        "_observation_step": setup_action.step,
+                        "_observation_tab_ref": setup_action.tab_ref,
+                        "trigger_action_ref": _SETUP_ACTION_REF,
+                    }
+                )
+            if row["operation"] == "cleanup":
+                event["observed_at"] = _CLEANUP_RESPONSE_AT.isoformat()
+                event["trigger_action_ref"] = cleanup_ref
+            events.append(event)
+
+        class Session:
+            context_id = "browser-context"
+            bounds = SimpleNamespace(target_id="target", allowed_origins=frozenset({target.origin}))
+            owner = owner()
+
+            def api_exchange_events(self):
+                return tuple(events)
+
+        class Recorder(_CleanupActionRecorder):
+            handoff = None
+            evidence: list[tuple[object, ...]] = []
+
+            async def record_evidence(self, *value):
+                self.evidence.append(value)
+
+            async def record_handoff(self, value):
+                self.handoff = value
+
+        baseline_pointer = "/state/id"
+        arguments = {
+            **_compile_arguments(),
+            "url": target.origin + "/api/message",
+            "cleanup_url": target.origin + "/api/cleanup",
+            "cleanup_method": "POST",
+            "cleanup_acknowledgement": {
+                "pointer": "/closed",
+                "match_values": [True],
+                "status_codes": [200],
+            },
+            "supported_modalities": [
+                {"modality": "text", "request_pointer": "/message", "confidence": 1.0},
+                {"modality": "image", "request_pointer": "/message", "confidence": 0.4},
+            ],
+            "state_observations": [
+                {
+                    "name": "physical_state",
+                    "role": "state_identity",
+                    "baseline_selector": {
+                        "step_id": "observed-session-setup",
+                        "evaluation_root": "response_body",
+                        "pointer": baseline_pointer,
+                    },
+                    "result_selector": {
+                        "step_id": "observed-message-exchange",
+                        "evaluation_root": "response_body",
+                        "pointer": baseline_pointer,
+                    },
+                    "value_type": "string",
+                },
+                {
+                    "name": "remaining_resource",
+                    "role": "budget_remaining",
+                    "baseline_selector": {
+                        "step_id": "observed-session-setup",
+                        "evaluation_root": "response_body",
+                        "pointer": "/hostState/quotaRemaining",
+                    },
+                    "result_selector": {
+                        "step_id": "observed-message-exchange",
+                        "evaluation_root": "response_body",
+                        "pointer": "/hostState/quotaRemaining",
+                    },
+                    "value_type": "integer",
+                    "minimum_value": 0,
+                    "maximum_value": 1,
+                    "monotonicity": "nonincreasing",
+                },
+            ],
+            "resource_ownership": [
+                {
+                    "name": "principal_daily_resource",
+                    "resource_kind": resource_kind,
+                    "resource_observation_name": "remaining_resource",
+                    "principal_selector": {
+                        "step_id": "observed-session-setup",
+                        "evaluation_root": "response_body",
+                        "pointer": "/principalId",
+                    },
+                    "reset_selector": {
+                        "step_id": "observed-session-setup",
+                        "evaluation_root": "response_body",
+                        "pointer": "/hostState/quotaResetAt",
+                    },
+                }
+            ],
+            "resource_controls": [
+                {
+                    "ownership_name": "principal_daily_resource",
+                    "limit": 1,
+                    "window_key": window_key,
+                    "status_codes": [429],
+                    "retry_after_seconds_pointer": "/error/retryAfterSeconds",
+                }
+            ],
+            "state_affordances": [
+                {
+                    "kind": affordance_kind,
+                    "method": "POST",
+                    "url": target.origin + f"/api/{operation}",
+                    "status_codes": [200],
+                    "pointer": ack_pointer,
+                    "match_values": [True],
+                    "confidence": 1.0,
+                }
+            ],
+        }
+        if affordance_kind == "restore_checkpoint":
+            arguments["checkpoint"] = {
+                "capture_selector": {
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "capture_timing": "live_handle",
+                "binding_name": "session_id",
+                "restore_request_pointer": "/sessionId",
+            }
+        if affordance_kind == "clone_state":
+            arguments["state_affordances"][0]["identity_pointer"] = "/state/id"
+        recorder = Recorder()
+        tool = next(
+            item
+            for item in browser_tools(lambda _: Session(), recorder)
+            if item.describe().name == "browser_compile_api_handoff"
+        )
+        result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+        adapter = json.loads(recorder.handoff.adapter)
+
+        if affordance_kind == "reset_state":
+            runtime_adapter = json.loads(json.dumps(adapter))
+            runtime_adapter["state_capabilities"].pop("resource_controls")
+            runtime_adapter["state_capabilities"].pop("resource_ownership")
+
+            async def requester(
+                _campaign_id: str,
+                request_method: str,
+                request_url: str,
+                request: object,
+                _headers: object,
+            ) -> tuple[int, object]:
+                async with httpx.AsyncClient() as runtime_client:
+                    response = await runtime_client.request(
+                        request_method, request_url, json=request
+                    )
+                return response.status_code, response.json()
+
+            campaign_id = "campaign/generic-recon-state-contract"
+            with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+                with database.connect() as connection:
+                    MigrationRunner(connection).apply()
+                    session = SessionRepository(connection).create("generic recon state contract")
+                    CampaignStore(connection).prepare(
+                        campaign_id,
+                        str(session.id),
+                        {"manifest": {"id": campaign_id}, "assignment_context": {}},
+                        "sha256:reviewed",
+                    )
+                    runtime = ReviewedApiTargetTool(
+                        CampaignApiSessionRepository(connection),
+                        lambda _campaign_id: runtime_adapter,
+                        {},
+                        browser_api_requester=requester,
+                    )
+                    execution = await runtime.invoke(
+                        ToolContext(
+                            session_id=str(session.id),
+                            workspace_root="/tmp",
+                            call_id="call-1",
+                            agent_id=f"{campaign_id}/worker",
+                            campaign_id=campaign_id,
+                            target_id="target",
+                        ),
+                        {"input": "runtime candidate"},
+                    )
+            assert execution.is_error is False, execution.content
+
+    assert result.is_error is False, result.content
+    capabilities = adapter["state_capabilities"]
+    assert {item["kind"] for item in capabilities["affordances"]} >= {
+        affordance_kind,
+        "cleanup_state",
+    }
+    assert capabilities["supported_modalities"][0]["modality"] == "text"
+    assert len(capabilities["supported_modalities"]) == 1
+    assert capabilities["resource_ownership"][0]["resource_kind"] == resource_kind
+    assert capabilities["resource_controls"][0]["window_key"] == window_key
+    assert (
+        capabilities["resource_controls"][0]["structured_blocks"][0]["retry_after_seconds_pointer"]
+        == "/error/retryAfterSeconds"
+    )
+    if affordance_kind == "restore_checkpoint":
+        assert capabilities["checkpoint"]["restore_request_pointer"] == "/sessionId"
+    assert "browser_compile_api_handoff.supported_modalities" in {
+        item["source"] for item in adapter["evaluation_uncertainties"]
+    }
 
 
 @pytest.mark.asyncio
@@ -2162,11 +3021,15 @@ async def test_api_handoff_terminal_contract_executes_unchanged(
     assert terminal.metadata["target_session_generation"] == 1
     assert "target_session_terminal" not in terminal.metadata
     assert terminal.metadata["evaluation_uncertain"] is True
-    assert terminal.metadata["target_exchanges"][-1]["response_body"] == {
-        "text": "terminal target reply",
-        "gameStatus": "lost",
-        "messagesRemaining": 0,
-    }
+    terminal_exchange = terminal.metadata["target_exchanges"][-1]
+    assert "response_body" not in terminal_exchange
+    assert terminal_exchange["response_body_summary"]["kind"] == "object"
+    assert terminal_exchange["response_body_summary"]["fields"] == [
+        "gameStatus",
+        "messagesRemaining",
+        "text",
+    ]
+    assert terminal_exchange["response_body_summary"]["item_count"] == 3
     assert terminal.metadata["target_exchanges"][-1]["outcome"] == "evaluation_uncertain"
     assert terminal.metadata["target_exchanges"][-1]["terminal_response_observation"] == {
         "matched": True,
@@ -3741,7 +4604,10 @@ async def test_api_handoff_seals_complete_visible_bank_lifecycle() -> None:
             "url": message_url,
             "status": 200,
             "request_json": {"sessionId": session_id, "message": "harmless probe"},
-            "response_json": {"reply": "observed response"},
+            "response_json": {
+                "reply": "observed response",
+                "sessionId": session_id,
+            },
         },
         {
             "method": "POST",
@@ -3798,6 +4664,23 @@ async def test_api_handoff_seals_complete_visible_bank_lifecycle() -> None:
             "match_values": [True],
             "status_codes": [200],
         },
+        "state_observations": [
+            {
+                "name": "physical_state_id",
+                "role": "state_identity",
+                "baseline_selector": {
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "result_selector": {
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "value_type": "string",
+            }
+        ],
     }
     result = await next(
         tool
@@ -3842,6 +4725,25 @@ async def test_api_handoff_seals_complete_visible_bank_lifecycle() -> None:
     ownership_evidence_refs = adapter["session_creation_transition"]["evidence_refs"]
     assert set(ownership_evidence_refs).issubset(freshness_evidence_refs)
     assert len(freshness_evidence_refs) == len(ownership_evidence_refs) + 2
+    capabilities = adapter["state_capabilities"]
+    assert [item["kind"] for item in capabilities["affordances"]] == [
+        "provision_fresh_state",
+        "cleanup_state",
+    ]
+    assert all(item["confidence"] == 1.0 for item in capabilities["affordances"])
+    assert capabilities["freshness_rules"][0]["selector"]["evidence_refs"]
+    assert capabilities["freshness_rules"][0]["selector"]["confidence"] == 1.0
+    assert capabilities["lifecycle"] == {
+        "isolation": "independent",
+        "baseline": "fresh",
+        "cleanup": "explicit",
+        "evidence_refs": list(
+            dict.fromkeys(
+                [*freshness_evidence_refs, *adapter["cleanup_lifecycle"]["evidence_refs"]]
+            )
+        ),
+        "confidence": 1.0,
+    }
     assert result.metadata["preferred_next_tool"] == "assessment_prepare"
 
 
@@ -5431,6 +6333,7 @@ async def test_browser_fill_records_non_sensitive_input_verbatim() -> None:
     class Recorder:
         def __init__(self) -> None:
             self.actions = []
+            self.observations = []
             self.observations = []
 
         async def append_action(self, value):
@@ -7269,21 +8172,89 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
                 {
                     "step_id": "fill",
                     "tool": "browser_fill",
+                    "interaction": False,
                     "arguments": {"element_ref": message.ref},
                 },
                 {
                     "step_id": "submit",
                     "tool": "browser_click",
+                    "interaction": True,
                     "arguments": {"element_ref": send.ref},
                 },
             ]
+            adapter["state_capabilities"] = {
+                "identity": {
+                    "identity_scope": "physical_state",
+                    "baseline_selector": {
+                        "step_id": "fill",
+                        "evaluation_root": "response_body",
+                        "pointer": "/principal",
+                    },
+                    "result_selector": {
+                        "step_id": "submit",
+                        "evaluation_root": "response_body",
+                        "pointer": "/principal",
+                    },
+                    "evidence_refs": ["fixture:principal-contract"],
+                },
+                "observations": [
+                    {
+                        "name": "messages_remaining",
+                        "role": "budget_remaining",
+                        "baseline_selector": {
+                            "step_id": "fill",
+                            "evaluation_root": "response_body",
+                            "pointer": "/remaining",
+                        },
+                        "result_selector": {
+                            "step_id": "submit",
+                            "evaluation_root": "response_body",
+                            "pointer": "/remaining",
+                        },
+                        "value_type": "integer",
+                    }
+                ],
+                "resource_ownership": [
+                    {
+                        "name": "shared_message_quota",
+                        "resource_kind": "quota",
+                        "resource_observation_name": "messages_remaining",
+                        "principal_selector": {
+                            "step_id": "fill",
+                            "evaluation_root": "response_body",
+                            "pointer": "/principal",
+                        },
+                    }
+                ],
+                "resource_controls": [
+                    {
+                        "ownership_name": "shared_message_quota",
+                        "step_id": "submit",
+                        "limit": 1,
+                        "window_key": "fixture-window",
+                        "structured_blocks": [
+                            {
+                                "status_codes": [429],
+                                "retry_after_seconds_pointer": "/retry_after_seconds",
+                                "evidence_refs": ["fixture:quota-contract"],
+                            }
+                        ],
+                    }
+                ],
+            }
             recorder = Recorder()
+            state_scope_store = _StateScopeFixtureStore()
 
             async def allow(*_):
                 return True
 
             broker = ToolBroker(
-                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: adapter,
+                    state_scope_store,
+                ),
                 confirmer=allow,
             )
             result = await broker.invoke(
@@ -7301,6 +8272,437 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
             exchange = result.metadata["target_exchanges"][0]
             assert isinstance(exchange["latency_ms"], int)
             assert exchange["latency_ms"] >= 0
+            assert state_scope_store.events == [
+                "created",
+                "claimed",
+                "resource_reserved",
+                "resource_acknowledged",
+                "revised",
+                "acknowledged",
+                "resource_settled",
+                "settled",
+                "released",
+            ]
+            assert state_scope_store.claim_calls[0]["equivalence_key"] == (
+                "conservative-shared-state"
+            )
+            assert state_scope_store.claim_calls[0]["principal_key"] == "anonymous"
+
+            recorder.actions.clear()
+            blocked = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "second"},
+            )
+            assert blocked.is_error is True
+            assert blocked.metadata["failure_code"] == "target_resource_blocked"
+            assert blocked.metadata["target_effect_attempted"] is False
+            assert blocked.metadata["target_call_budget_charge"] == 0
+            assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_reviewed_clone_isolation_rekeys_cross_campaign_browser_scopes() -> None:
+    chat = b"""
+    <input aria-label="Clone state">
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent =
+        'assistant:' + document.querySelector('textarea').value;
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        adapter = reviewed_browser_adapter(origin)
+        adapter["browser_steps"] = [
+            {
+                "step_id": "clone",
+                "tool": "browser_fill",
+                "interaction": False,
+                "arguments": {"locator": "textbox Clone state", "value": "clone"},
+            },
+            {
+                "step_id": "fill",
+                "tool": "browser_fill",
+                "interaction": True,
+                "arguments": {"locator": "textbox Message"},
+            },
+            {
+                "step_id": "submit",
+                "tool": "browser_click",
+                "interaction": True,
+                "arguments": {"locator": "button Send"},
+            },
+        ]
+        adapter["state_capabilities"] = {
+            "identity": {
+                "identity_scope": "physical_state",
+                "baseline_selector": {
+                    "step_id": "clone",
+                    "evaluation_root": "response_body",
+                    "pointer": "/context_id",
+                },
+                "result_selector": {
+                    "step_id": "submit",
+                    "evaluation_root": "response_body",
+                    "pointer": "/context_id",
+                },
+            },
+            "freshness_rules": [
+                {
+                    "selector": {
+                        "step_id": "clone",
+                        "evaluation_root": "response_body",
+                        "pointer": "/target_id",
+                    },
+                    "match_values": ["target"],
+                }
+            ],
+            "affordances": [
+                {
+                    "kind": "clone_state",
+                    "step_id": "clone",
+                    "evaluation_root": "response_body",
+                }
+            ],
+            "maximum_parallel_states": 2,
+        }
+        store = _StateScopeFixtureStore(enforce_conflicts=True)
+        first = await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        )
+        second = await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        )
+        try:
+            await asyncio.gather(first.new_tab(origin), second.new_tab(origin))
+            sessions = {"s1": first, "s2": second}
+            broker = ToolBroker(
+                browser_tools(
+                    lambda session_id: sessions[session_id],
+                    Recorder(),
+                    lambda _campaign_id: adapter,
+                    store,
+                ),
+                confirmer=allow,
+            )
+            results = await asyncio.gather(
+                broker.invoke(
+                    "browser_chat_exchange",
+                    ToolContext(
+                        session_id="s1",
+                        workspace_root="/tmp",
+                        campaign_id="campaign:clone-a",
+                    ),
+                    {"prompt": "first", "timeout_ms": 1000},
+                ),
+                broker.invoke(
+                    "browser_chat_exchange",
+                    ToolContext(
+                        session_id="s2",
+                        workspace_root="/tmp",
+                        campaign_id="campaign:clone-b",
+                    ),
+                    {"prompt": "second", "timeout_ms": 1000},
+                ),
+            )
+            capabilities = adapter["state_capabilities"]
+            assert isinstance(capabilities, dict)
+            freshness_rules = capabilities["freshness_rules"]
+            assert isinstance(freshness_rules, list)
+            freshness_rules[0]["match_values"] = ["not-this-target"]
+            rejected = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:clone-proof-failed",
+                ),
+                {"prompt": "must not be delivered", "timeout_ms": 1000},
+            )
+        finally:
+            await asyncio.gather(first.close(), second.close())
+
+    assert all(result.is_error is False for result in results)
+    assert len(store.rekey_calls) == 2
+    assert {item["maximum_parallel_states"] for item in store.rekey_calls} == {2}
+    assert len({item["equivalence_key"] for item in store.rekey_calls}) == 2
+    assert all(
+        result.metadata["target_exchanges"][0]["target_state_transition"]["identity_match"] is True
+        for result in results
+    )
+    assert rejected.is_error is True
+    assert rejected.metadata["failure_code"] == "physical_state_unavailable"
+    assert rejected.metadata["target_effect_attempted"] is False
+    assert rejected.metadata["target_call_budget_charge"] == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_checkpoint_requires_sealed_gate_then_restores_under_fresh_scope() -> None:
+    chat = b"""
+    <input autocomplete="current-password" aria-label="Checkpoint">
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      const restored = !location.search || document.querySelector('input').value.length > 0;
+      this.textContent = restored ? 'Gate complete' : 'Restore failed';
+      this.setAttribute('aria-label', this.textContent);
+      if (restored) document.querySelector('input').setAttribute(
+        'aria-label', 'opaque-state-handle'
+      );
+      document.getElementById('reply').textContent = this.textContent;
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    def checkpoint_adapter(endpoint: str) -> dict[str, object]:
+        adapter = reviewed_browser_adapter(endpoint)
+        adapter["browser_steps"] = [
+            {
+                "step_id": "restore",
+                "tool": "browser_fill",
+                "interaction": False,
+                "arguments": {
+                    "locator": "textbox Checkpoint",
+                    "value": "{{capture:state_handle}}",
+                },
+            },
+            {
+                "step_id": "baseline",
+                "tool": "browser_fill",
+                "interaction": False,
+                "arguments": {"locator": "textbox Message", "value": "baseline"},
+            },
+            {
+                "step_id": "fill",
+                "tool": "browser_fill",
+                "interaction": True,
+                "arguments": {"locator": "textbox Message"},
+            },
+            {
+                "step_id": "submit",
+                "tool": "browser_click",
+                "interaction": True,
+                "arguments": {"locator": "button Send"},
+            },
+        ]
+        adapter["interaction_contract"]["oracle_predicates"] = [
+            {
+                "purpose": "objective",
+                "oracle_digest": "sha256:" + "1" * 64,
+                "pointer": "/target_id",
+                "match_values": ["target"],
+                "modality": "dom",
+                "turn": "single",
+                "language": "en",
+            }
+        ]
+        adapter["state_capabilities"] = {
+            "identity": {
+                "identity_scope": "physical_state",
+                "baseline_selector": {
+                    "step_id": "baseline",
+                    "evaluation_root": "response_body",
+                    "pointer": "/context_id",
+                },
+                "result_selector": {
+                    "step_id": "submit",
+                    "evaluation_root": "response_body",
+                    "pointer": "/context_id",
+                },
+            },
+            "observations": [
+                {
+                    "name": "gate_status",
+                    "role": "custom",
+                    "baseline_selector": {
+                        "step_id": "baseline",
+                        "evaluation_root": "response_body",
+                        "pointer": "/elements/1/name",
+                    },
+                    "result_selector": {
+                        "step_id": "submit",
+                        "evaluation_root": "response_body",
+                        "pointer": "/elements/1/name",
+                    },
+                    "success_values": ["Gate complete"],
+                    "value_type": "string",
+                    "trust_class": "host_observed",
+                }
+            ],
+            "affordances": [
+                {
+                    "kind": "restore_checkpoint",
+                    "step_id": "restore",
+                    "evaluation_root": "response_body",
+                }
+            ],
+            "checkpoint": {
+                "capture_selector": {
+                    "step_id": "submit",
+                    "evaluation_root": "response_body",
+                    "pointer": "/elements/3/name",
+                },
+                "capture_timing": "post_success_response",
+                "binding_name": "state_handle",
+                "restore_step_id": "restore",
+                "restore_request_pointer": "/value",
+            },
+        }
+        return adapter
+
+    async def allow(*_):
+        return True
+
+    def context(intent, *, expected="Gate complete", reference=None):
+        return ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:test",
+            objective_phase_gate_id="gate:test",
+            objective_phase_gate_recipe_digest="sha256:" + "2" * 64,
+            objective_phase_manifest_digest="sha256:" + "3" * 64,
+            objective_phase_checkpoint_intent=intent,
+            objective_phase_checkpoint_reference=reference,
+            objective_phase_gate_contract={
+                "success_predicate": {
+                    "observation_name": "gate_status",
+                    "operator": "equals",
+                    "expected_values": [expected],
+                }
+            },
+        )
+
+    store = _StateScopeFixtureStore()
+    vault = _CheckpointVaultFixture()
+    async with web_fixture(chat) as origin:
+        adapter = checkpoint_adapter(origin)
+        capture_recorder = Recorder()
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as rejected_session:
+            await rejected_session.new_tab(origin)
+            rejected = await ToolBroker(
+                browser_tools(
+                    lambda _: rejected_session,
+                    Recorder(),
+                    lambda _: adapter,
+                    store,
+                    store,
+                    vault,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                context("capture", expected="Impossible"),
+                {"prompt": "prerequisite", "timeout_ms": 1000},
+            )
+            assert rejected.is_error is True
+            assert rejected.metadata.get("failure_code") == "checkpoint_success_unproven", (
+                rejected.content,
+                rejected.metadata,
+            )
+            rejected_exchange = rejected.metadata["target_exchanges"][0]
+            assert rejected_exchange["oracle_observation"]["matched"] is True
+            assert vault.secrets == {}
+
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as capture_session:
+            await capture_session.new_tab(origin)
+            capture = await ToolBroker(
+                browser_tools(
+                    lambda _: capture_session,
+                    capture_recorder,
+                    lambda _: adapter,
+                    store,
+                    store,
+                    vault,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                context("capture"),
+                {"prompt": "prerequisite", "timeout_ms": 1000},
+            )
+            assert capture.is_error is False, json.dumps(
+                {
+                    "transition": capture.metadata.get("target_state_transition"),
+                    "elements": [
+                        [element.name for element in observation.elements]
+                        for observation in capture_recorder.observations
+                    ],
+                },
+                sort_keys=True,
+            )
+            checkpoint = capture.metadata["objective_phase_checkpoint"]
+            reference = checkpoint["checkpoint_reference"]
+            assert checkpoint["captured"] is True
+            assert "opaque-state-handle" not in json.dumps(checkpoint)
+
+        restore_recorder = Recorder()
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as restore_session:
+            await restore_session.new_tab(origin + "?restore=1")
+            restored = await ToolBroker(
+                browser_tools(
+                    lambda _: restore_session,
+                    restore_recorder,
+                    lambda _: adapter,
+                    store,
+                    store,
+                    vault,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                context("restore", reference=reference),
+                {"prompt": "attack", "timeout_ms": 1000},
+            )
+            assert restored.is_error is False
+            assert restored.metadata["objective_phase_checkpoint"]["restored"] is True
+            assert "Gate complete" in restored.content
+            assert all(
+                action.value != capture_session.context_id for action in restore_recorder.actions
+            )
+            restore_action = next(
+                action for action in restore_recorder.actions if action.element_ref is not None
+            )
+            assert restore_action.value == "[redacted]"
 
 
 @pytest.mark.asyncio
@@ -7342,7 +8744,7 @@ async def test_compiled_chat_exchange_executes_normalized_steps_and_emits_both_d
             adapter = reviewed_browser_adapter(origin)
             adapter["browser_steps"] = [
                 {
-                    "step_id": "fill",
+                    "step_id": "baseline",
                     "tool": "browser_fill",
                     "arguments": {
                         "locator": "textbox Message",
@@ -7379,16 +8781,17 @@ async def test_compiled_chat_exchange_executes_normalized_steps_and_emits_both_d
                 {"prompt": "hello"},
             )
 
-            assert result.is_error is False
-            assert [item.kind for item in recorder.actions] == ["fill", "press"]
+            assert result.is_error is True
+            assert recorder.actions == []
             assert result.metadata["adapter_digest"] == executable_adapter_digest(adapter)
             assert result.metadata["compiled_adapter_digest"] == expected_compiled_digest
             assert result.metadata["target_profile_id"] == "target"
-            assert any(
-                item["source"] == "browser.input_limit"
-                for item in result.metadata["evaluation_uncertainties"]
-            )
-            assert "assistant:hello" in result.content
+            assert result.metadata["attempt_disposition"] == "protocol_invalid"
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            observation = result.metadata["request_constraint_observations"][0]
+            assert observation["maximum"] == 3
+            assert observation["observed"] == 5
 
 
 @pytest.mark.asyncio
@@ -8718,6 +10121,82 @@ async def test_compiled_chat_exchange_records_adaptive_exchange_with_typed_oracl
             }
             assert observation["observation_digest"] == digest_of(unsigned)
             assert exchange["oracle_observation"] is observation
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_waits_for_complete_multi_message_boundary() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      const reply=document.getElementById('reply');
+      reply.textContent='assistant:hello';
+      setTimeout(() => reply.textContent += ' assistant:follow-up', 250);
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            message = next(item for item in snapshot.elements if item.name == "Message")
+            send = next(item for item in snapshot.elements if item.name == "Send")
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"element_ref": message.ref},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"element_ref": send.ref},
+                },
+            ]
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {
+                    "prompt": "hello",
+                    "strategy_plan": {
+                        "observation": "o",
+                        "thought": "t",
+                        "strategy": ["hypothetical"],
+                        "response": "hello",
+                    },
+                    "strategy_turn_index": 0,
+                },
+            )
+
+            assert result.is_error is False
+            (exchange,) = result.metadata["target_exchanges"]
+            assert exchange["response_boundary_observed"] is True
+            assert exchange["response_boundary_complete"] is True
+            assert "assistant:hello assistant:follow-up" in exchange["response"]
+            assert exchange.get("evaluation_uncertain") is not True
 
 
 @pytest.mark.asyncio

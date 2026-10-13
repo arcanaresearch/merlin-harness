@@ -8,11 +8,13 @@ from contextlib import suppress
 from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from merlin_contracts import (
     AttackCase,
     ChatMessage,
     ChatRequest,
+    ModelCompleted,
     ModelError,
     TargetDeliveryClass,
     TargetProfile,
@@ -22,6 +24,7 @@ from merlin_contracts import (
     ToolResult,
     ToolSpec,
 )
+from merlin_contracts.state_scope_runtime import StateScopeLifecycle, StateScopeStore
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompileError,
     ProviderChat,
@@ -50,6 +53,46 @@ def _adapter_state_integrity_result(message: str) -> ToolResult:
             "retryable": False,
         },
     )
+
+
+def _target_authority(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("compiled provider endpoint does not identify a target authority")
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = (parsed.scheme == "http" and parsed.port == 80) or (
+        parsed.scheme == "https" and parsed.port == 443
+    )
+    port = "" if parsed.port is None or default_port else f":{parsed.port}"
+    return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
+
+
+def _target_chat_evidence_ref(kind: str, value: object) -> str:
+    encoded = repr(value).encode()
+    return f"target-chat-{kind}:sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+async def _renew_state_scope_lease(
+    store: StateScopeStore,
+    claim_id: str,
+    claimant_id: str,
+    lease_seconds: int,
+    owner: asyncio.Task[object] | None,
+) -> None:
+    while True:
+        await asyncio.sleep(max(1, lease_seconds // 3))
+        renewed = await asyncio.to_thread(
+            store.renew_state_scope_lease,
+            claim_id,
+            claimant_id,
+            lease_seconds,
+        )
+        if not renewed:
+            if owner is not None:
+                owner.cancel()
+            return
 
 
 def _comparison_metadata(case: AttackCase, control: AttackCase | None) -> Mapping[str, object]:
@@ -129,6 +172,7 @@ class AssessmentService:
         attacker_config: ProviderConfig,
         target_factory: TargetProviderFactory,
         permissions: Any | None = None,
+        state_scope_store: StateScopeStore | None = None,
         workspace_root: str = ".",
         knowledge_entry_limit: int = 12,
     ) -> None:
@@ -138,6 +182,7 @@ class AssessmentService:
         self._attacker_config = attacker_config
         self._target_factory = target_factory
         self._permissions = permissions
+        self._state_scope_store = state_scope_store
         self._workspace_root = workspace_root
         self._knowledge_entry_limit = knowledge_entry_limit
         self._selected_target_id: str | None = None
@@ -478,6 +523,9 @@ class AssessmentService:
         self,
         prompt: str,
         *,
+        campaign_id: str | None,
+        action_id: str,
+        candidate_id: str,
         target_id: str | None = None,
         compiled_adapter: str | None = None,
         expected_compiled_adapter_digest: str | None = None,
@@ -544,6 +592,73 @@ class AssessmentService:
             return _adapter_state_integrity_result(
                 "selected target compiled adapter endpoint does not match its profile"
             )
+        if campaign_id is None or self._state_scope_store is None:
+            return ToolResult(
+                content=(
+                    "target_chat requires an active campaign and durable state-scope storage; "
+                    "the target was not called"
+                ),
+                is_error=True,
+                metadata={
+                    "effect": "target_network",
+                    "failure_code": "state_scope_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        target_authority = _target_authority(executable.endpoint)
+        claimant_id = (
+            "target-chat:" + hashlib.sha256(f"{campaign_id}\0{action_id}".encode()).hexdigest()
+        )
+        lease_seconds = 120
+        try:
+            lifecycle = await StateScopeLifecycle.create(
+                self._state_scope_store,
+                campaign_id=campaign_id,
+                target_authority=target_authority,
+                attempt_id=action_id,
+                action_id=action_id,
+                candidate_id=candidate_id,
+            )
+            claim_id = await asyncio.to_thread(
+                self._state_scope_store.claim_state_scope_lease,
+                lifecycle.scope_id,
+                target_authority=target_authority,
+                principal_key=lifecycle.principal_key,
+                equivalence_key="unknown-provider-state",
+                claimant_id=claimant_id,
+                lease_seconds=lease_seconds,
+            )
+        except Exception:
+            return ToolResult(
+                content=(
+                    "target_chat could not persist and claim its durable state scope; "
+                    "the target was not called"
+                ),
+                is_error=True,
+                metadata={
+                    "effect": "target_network",
+                    "failure_code": "state_scope_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        if not isinstance(claim_id, str) or not claim_id:
+            await lifecycle.pause_unclaimed(isolation_disposition="unknown")
+            return ToolResult(
+                content="reviewed provider target state is owned by another execution",
+                is_error=True,
+                metadata={
+                    "effect": "target_network",
+                    "failure_code": "physical_state_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        lifecycle.bind_lease(claim_id, claimant_id)
         bound_profile = profile.model_copy(update={"base_url": executable.endpoint})
         provider = self._target_factory.create(bound_profile, executable.credential_handle)
         compatibility_metadata = {
@@ -552,24 +667,159 @@ class AssessmentService:
             "compiled_adapter_digest": compiled_adapter_digest,
         }
         parts: list[str] = []
-        async for event in provider.stream(
-            ChatRequest(
-                model=profile.model,
-                messages=[ChatMessage(role="user", content=prompt)],
-            )
-        ):
-            if isinstance(event, TextDelta):
-                parts.append(event.text)
-            elif isinstance(event, ModelError):
-                return ToolResult(
-                    content=event.message,
-                    is_error=True,
-                    metadata=compatibility_metadata,
-                )
-        return ToolResult(
-            content="".join(parts),
-            metadata=compatibility_metadata,
+        response_event_refs: list[str] = []
+        completion_count = 0
+        text_after_completion = False
+        action_ref = _target_chat_evidence_ref(
+            "action",
+            {
+                "compiled_adapter_digest": compiled_adapter_digest,
+                "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+            },
         )
+        owner = asyncio.current_task()
+        heartbeat = asyncio.create_task(
+            _renew_state_scope_lease(
+                self._state_scope_store,
+                claim_id,
+                claimant_id,
+                lease_seconds,
+                owner,
+            )
+        )
+        try:
+            try:
+                async for event in provider.stream(
+                    ChatRequest(
+                        model=profile.model,
+                        messages=[ChatMessage(role="user", content=prompt)],
+                    )
+                ):
+                    response_event_refs.append(
+                        _target_chat_evidence_ref(
+                            "response-event",
+                            {
+                                "ordinal": len(response_event_refs),
+                                "event": event.model_dump(mode="json"),
+                            },
+                        )
+                    )
+                    if not lifecycle.acknowledged:
+                        await lifecycle.acknowledge(
+                            before_refs=(),
+                            action_refs=(action_ref,),
+                        )
+                    if isinstance(event, TextDelta):
+                        if completion_count:
+                            text_after_completion = True
+                        parts.append(event.text)
+                    elif isinstance(event, ModelCompleted):
+                        completion_count += 1
+                    elif isinstance(event, ModelError):
+                        await lifecycle.settle(
+                            before_refs=(),
+                            action_refs=(action_ref,),
+                            response_refs=response_event_refs,
+                            after_refs=(),
+                            after_missing_reason=None,
+                            transition_disposition="infrastructure_failure",
+                            isolation_disposition="shared_serialized",
+                            cleanup_disposition="not_required",
+                        )
+                        return ToolResult(
+                            content=event.message,
+                            is_error=True,
+                            metadata={
+                                **compatibility_metadata,
+                                "attempt_disposition": "infrastructure_failed",
+                                "response_boundary_complete": False,
+                                "response_completion_count": completion_count,
+                            },
+                        )
+                if not lifecycle.acknowledged:
+                    await lifecycle.acknowledge(before_refs=(), action_refs=(action_ref,))
+                content = "".join(parts)
+                response_boundary_complete = completion_count == 1 and not text_after_completion
+                if not response_boundary_complete:
+                    response_event_refs.append(
+                        _target_chat_evidence_ref(
+                            "response-incomplete",
+                            {
+                                "content_digest": hashlib.sha256(content.encode()).hexdigest(),
+                                "completion_count": completion_count,
+                                "text_after_completion": text_after_completion,
+                            },
+                        )
+                    )
+                    await lifecycle.settle(
+                        before_refs=(),
+                        action_refs=(action_ref,),
+                        response_refs=response_event_refs,
+                        after_refs=(),
+                        after_missing_reason=None,
+                        transition_disposition="infrastructure_failure",
+                        isolation_disposition="shared_serialized",
+                        cleanup_disposition="not_required",
+                    )
+                    return ToolResult(
+                        content=content or "provider stream ended before a complete response",
+                        is_error=True,
+                        metadata={
+                            **compatibility_metadata,
+                            "failure_code": "incomplete_response_boundary",
+                            "retryable": True,
+                            "attempt_disposition": "infrastructure_failed",
+                            "response_boundary_complete": False,
+                            "response_completion_count": completion_count,
+                        },
+                    )
+                await lifecycle.settle(
+                    before_refs=(),
+                    action_refs=(action_ref,),
+                    response_refs=response_event_refs,
+                    after_refs=(),
+                    after_missing_reason=None,
+                    transition_disposition="ambiguous",
+                    isolation_disposition="shared_serialized",
+                    cleanup_disposition="not_required",
+                )
+                return ToolResult(
+                    content=content,
+                    metadata={
+                        **compatibility_metadata,
+                        "response_boundary_complete": True,
+                        "response_completion_count": completion_count,
+                    },
+                )
+            except BaseException:
+                if lifecycle.acknowledged:
+                    await lifecycle.settle(
+                        before_refs=(),
+                        action_refs=(action_ref,),
+                        response_refs=response_event_refs,
+                        after_refs=(),
+                        transition_disposition="infrastructure_failure",
+                        isolation_disposition="shared_serialized",
+                        cleanup_disposition="not_required",
+                    )
+                else:
+                    await lifecycle.pause(
+                        action_refs=(action_ref,),
+                        reason="transport_failed",
+                        retryable=True,
+                        isolation_disposition="shared_serialized",
+                        cleanup_disposition="not_required",
+                    )
+                raise
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            await asyncio.to_thread(
+                self._state_scope_store.release_state_scope_lease,
+                claim_id,
+                claimant_id,
+            )
 
     async def run_pack(
         self, pack_id: str | None, session_id: str
@@ -582,6 +832,10 @@ class AssessmentService:
         profile = await self._store.get_target(self._selected_target_id)
         if profile is None:
             raise ValueError("selected target no longer exists")
+        raise RuntimeError(
+            "direct /run target execution is deprecated because it has no prepared campaign "
+            "state scope; prepare, approve, and execute a reviewed campaign instead"
+        )
         if self._permissions is not None:
             if not await self._permissions.authorize_provider(session_id, self._workspace_root):
                 raise PermissionError("provider network permission denied")
@@ -672,8 +926,12 @@ class SelectedTargetTool:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return ToolResult(content="prompt must be a non-empty string", is_error=True)
+        action_id = str(context.call_id or uuid4())
         return await self._service.invoke_selected_target(
             prompt,
+            campaign_id=context.campaign_id,
+            action_id=action_id,
+            candidate_id=str(context.agent_id or action_id),
             target_id=context.target_id,
             compiled_adapter=context.compiled_adapter,
             expected_compiled_adapter_digest=context.compiled_adapter_digest,

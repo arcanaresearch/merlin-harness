@@ -737,13 +737,12 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
         "supports_structured_output": True,
         "modalities": ("text", "image"),
     },
-    # DeepSeek V4 context windows per the OpenRouter frontend catalog
-    # (https://openrouter.ai/api/frontend/v1/catalog/models, fetched 2026-09-05):
-    # v4-flash / v4-pro / v4-flash-vision-exp = 1_048_576; dated flash variants
-    # (0731, latest) = 1_310_720. api.deepseek.com's /models exposes ids only.
+    # DeepSeek V4 limits reconciled with models.dev on 2026-10-13. The official
+    # endpoint's /models response exposes ids only, so models.dev remains the
+    # live corroborating source for output limits.
     "deepseek-v4-pro": {
         "context_window_tokens": 1_048_576,
-        "max_output_tokens": 65_536,
+        "max_output_tokens": 393_216,
         "supports_tools": True,
         "supports_reasoning": True,
         "supports_streaming": True,
@@ -753,7 +752,7 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
     },
     "deepseek-v4-flash-vision-exp": {
         "context_window_tokens": 1_048_576,
-        "max_output_tokens": 8_192,
+        "max_output_tokens": 393_216,
         "supports_tools": True,
         "supports_reasoning": True,
         "supports_streaming": True,
@@ -763,7 +762,7 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
     },
     "deepseek-v4-flash": {
         "context_window_tokens": 1_048_576,
-        "max_output_tokens": 8_192,
+        "max_output_tokens": 393_216,
         "supports_tools": True,
         "supports_reasoning": True,
         "supports_streaming": True,
@@ -773,7 +772,7 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
     },
     "deepseek-v4": {
         "context_window_tokens": 1_048_576,
-        "max_output_tokens": 8_192,
+        "max_output_tokens": 393_216,
         "supports_tools": True,
         "supports_reasoning": True,
         "supports_streaming": True,

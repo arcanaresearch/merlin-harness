@@ -141,6 +141,7 @@ class KernelBackend:
         browser: Any | None = None,
         memory: Any | None = None,
         campaigns: Any | None = None,
+        lifecycle_recovery: Any | None = None,
         report_repository: Any | None = None,
         route_preflight: RoutePreflight | None = None,
         operator_controls: bool = False,
@@ -169,6 +170,7 @@ class KernelBackend:
         self._browser = browser
         self._memory = memory
         self._campaigns = campaigns
+        self._lifecycle_recovery = lifecycle_recovery
         self._report_repository = report_repository
         self._route_preflight = route_preflight
         self._operator_controls = operator_controls
@@ -827,6 +829,14 @@ class KernelBackend:
             return ()
         return tuple(await loader(self.kernel.session_id or "", assignment_id))
 
+    async def get_campaign_lead_log(
+        self, campaign_id: str, limit: int = 100
+    ) -> tuple[Mapping[str, object], ...]:
+        if self._campaigns is None:
+            raise RuntimeError("campaign support is not configured")
+        await self._current_session_campaign(campaign_id)
+        return tuple(await self._campaigns.lead_journal(campaign_id, limit=limit))
+
     async def _snapshot_agent_views(
         self, snapshots: Sequence[SwarmSnapshot]
     ) -> tuple[AgentView, ...]:
@@ -1447,6 +1457,8 @@ class KernelBackend:
         # schedules. Explicit session/campaign resume restores execution. Later
         # watchdog passes still repair supervisors started in this daemon.
         if self._campaigns is not None:
+            if self._lifecycle_recovery is not None:
+                await self._lifecycle_recovery.reconcile()
             await self._campaigns.recover(resume_execution=self._campaigns_recovered)
         self._campaigns_recovered = True
         if not self._agents_recovered:

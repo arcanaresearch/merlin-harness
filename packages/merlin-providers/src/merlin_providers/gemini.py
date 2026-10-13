@@ -278,11 +278,17 @@ class GeminiProvider(OpenAICompatibleProvider):
         tools: dict[tuple[int, int], dict[str, Any]],
         *,
         partial: bool = False,
+        finish_reason: str | None = None,
     ) -> ModelError | None:
         if self._pending_usage is not None:
             events.append(self._pending_usage)
             self._pending_usage = None
-        return super()._finish_tools(events, tools, partial=partial)
+        return super()._finish_tools(
+            events,
+            tools,
+            partial=partial,
+            finish_reason=finish_reason,
+        )
 
 
 def _function_declaration(tool: Mapping[str, Any]) -> dict[str, Any]:

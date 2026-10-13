@@ -54,6 +54,7 @@ _SNAPSHOT_METHODS = frozenset(
     {
         "get_runtime_status",
         "get_agent_transcript",
+        "get_campaign_lead_log",
         "list_agents",
         "list_history",
         "list_resume_sessions",
@@ -84,6 +85,7 @@ _ALLOWED = {
     "configure_remote_mcp",
     "list_agents",
     "get_agent_transcript",
+    "get_campaign_lead_log",
     "list_active_schedules",
     "list_schedules",
     "list_findings",

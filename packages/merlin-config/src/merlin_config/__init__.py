@@ -1,5 +1,6 @@
 """Owner-only configuration and credential persistence."""
 
+from .checkpoint_vault import CheckpointVaultEntry, CredentialCheckpointVault
 from .config import (
     Config,
     ConfigPaths,
@@ -14,6 +15,8 @@ from .credentials import Credentials, CredentialStore
 __all__ = [
     "Config",
     "ConfigPaths",
+    "CheckpointVaultEntry",
+    "CredentialCheckpointVault",
     "CredentialStore",
     "Credentials",
     "JudgmentsConfig",

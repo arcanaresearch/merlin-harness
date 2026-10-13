@@ -10,6 +10,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
+from merlin_contracts import candidate_id_for_identity, project_candidate_outcome
 from merlin_findings import (
     CampaignLesson,
     DurableReportService,
@@ -88,6 +89,130 @@ def create(service, summary="confirmed"):
         ),
         created_at=datetime(2030, 1, 1, tzinfo=UTC),
     )
+
+
+def test_report_counts_unique_candidates_separately_from_repeat_attempts() -> None:
+    service = DurableReportService(Repository())
+    attempts = tuple(
+        project_candidate_outcome(
+            candidate_id=candidate_id,
+            attempt_disposition="valid",
+            outcome_authority="target",
+            outcome=outcome,
+            evidence_digest=str(index) * 64,
+        )
+        for index, (candidate_id, outcome) in enumerate(
+            (
+                ("candidate/one", "confirmed"),
+                ("candidate/one", "confirmed"),
+                ("candidate/two", "refuted"),
+            ),
+            start=1,
+        )
+    )
+
+    report = service.create(
+        "campaign-repeat-counts",
+        stop_reason="operator_stopped",
+        cleanup_status="complete",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"candidate_outcome_projections": attempts},
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    assert report.metadata["attempt_count"] == 3
+    assert report.metadata["unique_candidate_count"] == 2
+    assert report.metadata["repeat_attempt_count"] == 1
+    assert report.metadata["terminal_unique_candidate_count"] == 2
+
+
+def test_report_rejects_technique_projection_that_disagrees_with_attempt_ledger() -> None:
+    service = DurableReportService(Repository())
+    authoritative = project_candidate_outcome(
+        candidate_id="candidate/one",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        outcome="confirmed",
+        evidence_digest="a" * 64,
+    )
+    drifted = project_candidate_outcome(
+        candidate_id="candidate/one",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        outcome="refuted",
+        evidence_digest="a" * 64,
+    )
+
+    with pytest.raises(ValueError, match="canonical attempt ledger"):
+        service.create(
+            "campaign-projection-drift",
+            stop_reason="operator_stopped",
+            cleanup_status="complete",
+            findings=(),
+            tasks=(),
+            evidence=(),
+            usage={},
+            metadata={"candidate_outcome_projections": (authoritative,)},
+            techniques=(
+                {
+                    "id": "candidate/one",
+                    "candidate_outcome_projection": drifted,
+                },
+            ),
+            created_at=datetime(2030, 1, 1, tzinfo=UTC),
+        )
+
+
+def test_canonical_attempt_ledger_overrides_conflicting_validator_summary() -> None:
+    service = DurableReportService(Repository())
+    identity = {
+        "campaign_id": "campaign-canonical-precedence",
+        "target_id": "target/one",
+        "target_generation": "generation/one",
+        "scenario_fingerprint": "sha256:scenario",
+        "technique_id": "technique/one",
+        "controller_id": "direct",
+        "payload_family": "baseline",
+        "requested_language": "en",
+        "mutation_id": "baseline",
+    }
+    authoritative = {
+        **project_candidate_outcome(
+            candidate_id=candidate_id_for_identity(identity),
+            attempt_disposition="valid",
+            outcome_authority="target",
+            outcome="confirmed",
+            evidence_digest="a" * 64,
+        ),
+        "candidate_identity": identity,
+    }
+    report = service.create(
+        "campaign-canonical-precedence",
+        stop_reason="operator_stopped",
+        cleanup_status="complete",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"candidate_outcome_projections": (authoritative,)},
+        techniques=(
+            {
+                **identity,
+                "id": candidate_id_for_identity(identity),
+                "ledger_source": "validator",
+                "outcome": "negative",
+            },
+        ),
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    archive = ZipFile(BytesIO(service.export(report.revision_id, "csv", "customer")))
+    techniques = list(csv.DictReader(archive.read("techniques.csv").decode().splitlines()))
+    assert len(techniques) == 1
+    assert techniques[0]["outcome"] == "confirmed"
 
 
 def test_report_separates_current_history_and_unresolved_coverage() -> None:
@@ -964,11 +1089,7 @@ class FrontierSnapshotProvider:
     ):
         assert (campaign_id, snapshot_id) == (self.campaign_id, self.snapshot_id)
         self.page_limits.append(limit)
-        return tuple(
-            row
-            for row in self.rows
-            if row["position"] > after_position
-        )[:limit]
+        return tuple(row for row in self.rows if row["position"] > after_position)[:limit]
 
 
 def _completion_seal_v2(provider: FrontierSnapshotProvider, *, stop_reason="capped"):
@@ -990,9 +1111,12 @@ def _completion_seal_v2(provider: FrontierSnapshotProvider, *, stop_reason="capp
         "cleanup": {"expected": (), "states": (), "authority": {"target_id": "target-1"}},
         "saturation": {"ready": stop_reason == "saturated"},
     }
-    authority_digest = "sha256:" + hashlib.sha256(
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    authority_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     receipt = {
         "kind": "campaign_completion",
         "schema": "merlin.campaign-completion.v2",
@@ -1001,9 +1125,12 @@ def _completion_seal_v2(provider: FrontierSnapshotProvider, *, stop_reason="capp
         "stop_reason": stop_reason,
         "document": document,
     }
-    receipt_digest = "sha256:" + hashlib.sha256(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    receipt_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     return receipt, receipt_digest
 
 
@@ -1022,9 +1149,7 @@ def test_v2_completion_snapshot_is_paged_verified_and_projected() -> None:
     )
     provider = FrontierSnapshotProvider("campaign-v2", "completion/final", rows)
     receipt, receipt_digest = _completion_seal_v2(provider)
-    service = DurableReportService(
-        Repository(), frontier_snapshot_provider=provider
-    )
+    service = DurableReportService(Repository(), frontier_snapshot_provider=provider)
     report = service.create(
         "campaign-v2",
         stop_reason="capped",
@@ -1079,9 +1204,9 @@ def test_v2_completion_snapshot_fails_closed_without_provider_or_on_drift() -> N
 
     provider.rows = ({**provider.rows[0], "outcome": "refuted"},)
     with pytest.raises(ValueError, match="counts do not match|row digest"):
-        DurableReportService(
-            Repository(), frontier_snapshot_provider=provider
-        ).create("campaign-v2-drift", **kwargs)
+        DurableReportService(Repository(), frontier_snapshot_provider=provider).create(
+            "campaign-v2-drift", **kwargs
+        )
 
 
 def test_sealed_report_rejects_receipt_projection_and_stored_revision_drift() -> None:
@@ -1189,8 +1314,8 @@ def test_recovered_campaign_appends_report_after_failed_completion_seal() -> Non
     assert failed.revision == 1
     assert completed.revision == 2
     assert [item.stop_reason for item in repository.list("campaign-recovered-report")] == [
-        "failed",
-        "completed_with_limitations",
+        "infrastructure_blocked_after_retry_policy",
+        "frontier_exhausted",
     ]
 
     third_receipt, third_digest = _completion_seal(
@@ -2962,8 +3087,8 @@ def test_refinalized_failed_campaign_supersedes_prior_failed_seal() -> None:
     assert second.revision == 2
     assert second.completion_digest == second_digest
     assert [item.stop_reason for item in repository.list("campaign-refinalized")] == [
-        "failed",
-        "failed",
+        "infrastructure_blocked_after_retry_policy",
+        "infrastructure_blocked_after_retry_policy",
     ]
     assert service.export(second.revision_id, "html", "customer")
 

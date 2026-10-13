@@ -9,6 +9,8 @@ from uuid import uuid4
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from .state_scope_store import StateScopeRepository
+
 LEGACY_API_SESSION_SCOPE_ID = "legacy:campaign"
 CleanupDisposition = Literal[
     "cleanup_completed",
@@ -73,7 +75,7 @@ class PhysicalStateClaim:
         return bool(self.prior_session_scope_ids)
 
 
-class CampaignApiSessionRepository:
+class CampaignApiSessionRepository(StateScopeRepository):
     """Durable reviewed HTTP API sessions, isolated by assignment scope."""
 
     def __init__(self, connection: Any) -> None:

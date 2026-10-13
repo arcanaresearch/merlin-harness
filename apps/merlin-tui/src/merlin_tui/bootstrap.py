@@ -20,8 +20,10 @@ from uuid import UUID
 
 from merlin_browser import normalize_api_adapter_input_aliases
 from merlin_contracts import (
+    CampaignTerminalReason,
     ChatMessage,
     ChatRequest,
+    GeneratorExecutionContract,
     ModelCompleted,
     ModelError,
     ModelJsonError,
@@ -30,10 +32,15 @@ from merlin_contracts import (
     ReasoningDelta,
     TechniqueLanguageEvidence,
     TextDelta,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
     executable_adapter_digest,
     executable_adapter_projection,
     parse_model_json,
+    project_candidate_outcome,
+    require_campaign_terminal_reason,
     reviewed_adapter_cleanup_lifecycle,
+    validate_candidate_outcome_projection,
 )
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompilation,
@@ -116,6 +123,75 @@ _INTERNAL_NON_CAMPAIGN_TOOL_IDS = frozenset(
     }
 )
 
+
+def _canonical_report_candidate_projections(
+    arm_outcomes: Sequence[object],
+) -> tuple[dict[str, object], ...]:
+    """Project durable ARM attempts through the shared report/frontier relation."""
+
+    outcome_map = {
+        "authoritative_success": "confirmed",
+        "validated_finding": "confirmed",
+        "clean_negative": "refuted",
+        "partial_signal": "progress",
+        "infrastructure_failure": "unclear",
+        "ambiguous": "unclear",
+    }
+    projections: list[dict[str, object]] = []
+    for item in arm_outcomes:
+        candidate_id = str(getattr(item, "arm_id", "") or "").strip()
+        evidence_refs = tuple(
+            str(value)
+            for value in getattr(item, "evidence_refs", ())
+            if isinstance(value, str) and value
+        )
+        disposition = getattr(item, "attempt_disposition", None)
+        authority = getattr(item, "outcome_authority", None)
+        raw_outcome = getattr(item, "outcome", None)
+        normalized_outcome = outcome_map.get(getattr(raw_outcome, "value", raw_outcome), "unclear")
+        usage = getattr(item, "usage", {})
+        persisted = (
+            usage.get("candidate_outcome_projection") if isinstance(usage, Mapping) else None
+        )
+        if isinstance(persisted, Mapping):
+            identity = usage.get("canonical_candidate_identity")
+            projection = validate_candidate_outcome_projection(
+                persisted,
+                expected_candidate_id=(
+                    candidate_id_for_identity(identity) if isinstance(identity, Mapping) else None
+                ),
+            )
+            expected = project_candidate_outcome(
+                candidate_id=projection["candidate_id"],
+                attempt_disposition=getattr(disposition, "value", disposition),
+                outcome_authority=getattr(authority, "value", authority),
+                outcome=normalized_outcome,
+                evidence_digest=projection["evidence_digest"],
+            )
+            if projection != expected:
+                raise ValueError("durable ARM outcome conflicts with canonical attempt ledger")
+            identity_projection = (
+                {"candidate_identity": dict(identity)} if isinstance(identity, Mapping) else {}
+            )
+            projections.append(
+                {
+                    **projection,
+                    **identity_projection,
+                }
+            )
+        else:
+            projections.append(
+                project_candidate_outcome(
+                    candidate_id=candidate_id,
+                    attempt_disposition=getattr(disposition, "value", disposition),
+                    outcome_authority=getattr(authority, "value", authority),
+                    outcome=normalized_outcome,
+                    evidence_digest=candidate_evidence_digest(evidence_refs),
+                )
+            )
+    return tuple(projections)
+
+
 _logger = logging.getLogger(__name__)
 
 _STRUCTURED_OUTPUT_FALLBACK_TOKENS = 16_384
@@ -173,6 +249,7 @@ async def _request_structured_json(
     max_attempts: int,
     budget_id: str | None = None,
     usage_sink: Callable[[ModelUsage], None] | None = None,
+    execution_contract: GeneratorExecutionContract | None = None,
 ) -> object:
     """Request complete machine JSON with bounded, pre-effect repair attempts."""
     if expected_container not in {"array", "object"}:
@@ -180,6 +257,12 @@ async def _request_structured_json(
     attempts = max(1, max_attempts)
     output_limit = _structured_output_token_limit(capability_registry, provider, selected_model)
     last_failure = "provider returned no complete JSON"
+    deadline = (
+        asyncio.get_running_loop().time() + execution_contract.max_seconds
+        if execution_contract is not None
+        else None
+    )
+    streamed_bytes = 0
     for attempt in range(attempts):
         request_messages = list(messages)
         if attempt:
@@ -197,7 +280,7 @@ async def _request_structured_json(
         completion: ModelCompleted | None = None
         warnings: list[str] = []
         provider_error: ModelError | None = None
-        async for event in provider.stream(
+        stream = provider.stream(
             ChatRequest(
                 model=selected_model,
                 messages=request_messages,
@@ -205,21 +288,51 @@ async def _request_structured_json(
                 budget_id=budget_id,
                 reasoning="disabled",
             )
-        ):
-            if isinstance(event, TextDelta):
-                parts.append(event.text)
-            elif isinstance(event, ReasoningDelta):
-                continue
-            elif isinstance(event, ModelUsage):
-                if usage_sink is not None:
-                    usage_sink(event)
-            elif isinstance(event, ModelWarning):
-                warnings.append(f"{event.code}: {event.message}")
-            elif isinstance(event, ModelError):
-                provider_error = event
-                break
-            elif isinstance(event, ModelCompleted):
-                completion = event
+        )
+
+        async def consume_stream(
+            stream: Any = stream,
+            parts: list[str] = parts,
+            warnings: list[str] = warnings,
+        ) -> None:
+            nonlocal completion, provider_error, streamed_bytes
+            try:
+                async for event in stream:
+                    if isinstance(event, TextDelta):
+                        streamed_bytes += len(event.text.encode("utf-8"))
+                        if (
+                            execution_contract is not None
+                            and streamed_bytes > execution_contract.max_output_bytes
+                        ):
+                            raise ValueError(
+                                "structured generator exceeded reviewed max_output_bytes"
+                            )
+                        parts.append(event.text)
+                    elif isinstance(event, ReasoningDelta):
+                        continue
+                    elif isinstance(event, ModelUsage):
+                        if usage_sink is not None:
+                            usage_sink(event)
+                    elif isinstance(event, ModelWarning):
+                        warnings.append(f"{event.code}: {event.message}")
+                    elif isinstance(event, ModelError):
+                        provider_error = event
+                        break
+                    elif isinstance(event, ModelCompleted):
+                        completion = event
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    await close()
+
+        if deadline is None:
+            await consume_stream()
+        else:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("structured generator exceeded reviewed max_seconds")
+            async with asyncio.timeout(remaining):
+                await consume_stream()
         if provider_error is not None:
             last_failure = provider_error.message
             if not provider_error.retryable:
@@ -238,6 +351,12 @@ async def _request_structured_json(
             isinstance(value, list) if expected_container == "array" else isinstance(value, dict)
         )
         if valid:
+            if (
+                execution_contract is not None
+                and isinstance(value, list)
+                and len(value) > execution_contract.max_outputs
+            ):
+                raise ValueError("structured generator exceeded reviewed max_outputs")
             return value
         last_failure = f"provider returned a non-{expected_container} JSON value"
     raise ModelJsonError(
@@ -3329,11 +3448,19 @@ def _register_browser_tools(
     service: object,
     store: object,
     adapter_resolver: Callable[[str], Mapping[str, object] | None] | None = None,
+    state_scope_store: object | None = None,
+    checkpoint_store: object | None = None,
+    checkpoint_vault: object | None = None,
 ) -> tuple[str, ...]:
     from merlin_browser import browser_tools
 
     tools = browser_tools(  # type: ignore[attr-defined]
-        service.for_tool, store, adapter_resolver=adapter_resolver
+        service.for_tool,
+        store,
+        adapter_resolver=adapter_resolver,
+        state_scope_store=state_scope_store,
+        checkpoint_store=checkpoint_store,
+        checkpoint_vault=checkpoint_vault,
     )
     for tool in tools:
         broker.register(tool)  # type: ignore[attr-defined]
@@ -3595,6 +3722,7 @@ def build_backend(
         CapabilitySupport,
         plan_capability_probes,
     )
+    from merlin_agents.lifecycle_recovery import DurableLifecycleRecovery
     from merlin_agents.telemetry import (
         TelemetrySettings,
         configure_telemetry,
@@ -3602,7 +3730,12 @@ def build_backend(
     )
     from merlin_assessments import AssessmentService, ReviewedApiTargetTool
     from merlin_browser import BrowserBounds, BrowserService
-    from merlin_config import ConfigPaths, CredentialStore, load_config
+    from merlin_config import (
+        ConfigPaths,
+        CredentialCheckpointVault,
+        CredentialStore,
+        load_config,
+    )
     from merlin_contracts import (
         CampaignCounterEvent,
         CampaignCounters,
@@ -3700,6 +3833,7 @@ def build_backend(
         PostgresSessionStore,
         PostgresToolEffectStore,
         PromotionRepository,
+        StateScopeRepository,
         TechniqueLanguageEvidenceRepository,
         ToolEffectRepository,
     )
@@ -3776,6 +3910,10 @@ def build_backend(
         scheduler_store = DurableSchedulerStore(agent_connection)
         campaign_connection = database.connect()
         campaign_store = CampaignStore(campaign_connection)
+        lifecycle_recovery = DurableLifecycleRecovery(
+            StateScopeRepository(campaign_connection),
+            claimant_id=f"merlin-tui:{os.getpid()}",
+        )
         campaign_arm_store = CampaignArmStore(campaign_connection)
         hypothesis_repository = HypothesisRepository(campaign_connection)
         campaign_observability_repository = CampaignObservabilityRepository(campaign_connection)
@@ -4138,6 +4276,7 @@ def build_backend(
             attacker_config=provider_config,
             target_factory=TargetProviderFactory(credentials),
             permissions=permissions,
+            state_scope_store=api_sessions,
             workspace_root=str(Path(workspace_root).resolve()),
             knowledge_entry_limit=config.runtime.knowledge_entry_limit,
         )
@@ -4354,6 +4493,8 @@ def build_backend(
             resolve_reviewed_api_adapter,
             credentials,
             browser_api_requester=browser_api_request,
+            checkpoint_store=campaign_store,
+            checkpoint_vault=CredentialCheckpointVault(),
             timeout_seconds=config.runtime.tool_action_timeout_seconds,
         )
         tool_broker.register(api_target)
@@ -4363,6 +4504,9 @@ def build_backend(
             browser,
             browser_store,
             adapter_resolver=resolve_reviewed_api_adapter,
+            state_scope_store=api_sessions,
+            checkpoint_store=campaign_store,
+            checkpoint_vault=CredentialCheckpointVault(),
         )
         promotion_domain = PromotionService(
             promotion_repository,
@@ -7041,6 +7185,7 @@ def build_backend(
         async def create_campaign_report(
             campaign_id: str, manifest: CampaignManifest, stop_reason: str
         ) -> None:
+            stop_reason = require_campaign_terminal_reason(stop_reason).value
             report_directory = automatic_report_directory
             safe_campaign_id = "".join(
                 character if character.isalnum() or character in {"-", "_"} else "-"
@@ -7061,6 +7206,7 @@ def build_backend(
             arm_outcomes = await asyncio.to_thread(
                 campaign_observability_repository.list_arm_outcomes, campaign_id
             )
+            candidate_outcome_projections = _canonical_report_candidate_projections(arm_outcomes)
             language_evidence_rows = list(
                 await asyncio.to_thread(
                     technique_language_evidence_repository.list_for_campaign, campaign_id
@@ -7120,7 +7266,7 @@ def build_backend(
             ):
                 raise ValueError("campaign completion receipt conflicts with durable campaign")
             completion_saturation = completion_document.get("saturation")
-            if stop_reason == "saturated" and (
+            if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value and (
                 not isinstance(completion_saturation, Mapping)
                 or completion_saturation.get("ready") is not True
             ):
@@ -8439,10 +8585,14 @@ def build_backend(
                 for row in hydra_rows
             )
             transform_report_state = (
-                ("provisional" if stop_reason == "completed_with_limitations" else "incomplete")
+                (
+                    "provisional"
+                    if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value
+                    else "incomplete"
+                )
                 if goat_incomplete or hydra_incomplete
                 else "provisional"
-                if stop_reason == "saturated"
+                if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value
                 and not unsearched_frontier
                 and (
                     any(row.get("transform_spec_digest") for row in technique_rows)
@@ -8496,11 +8646,15 @@ def build_backend(
                 transform_report_state = "incomplete"
             final_report_state = transform_report_state or (
                 "complete"
-                if stop_reason == "saturated"
+                if stop_reason
+                in {
+                    CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
+                    CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+                }
                 and not unsearched_frontier
                 and cleanup_status == "completed"
                 else "provisional"
-                if stop_reason == "completed_with_limitations"
+                if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value
                 and not unsearched_frontier
                 and cleanup_status == "completed"
                 else "incomplete"
@@ -8534,7 +8688,7 @@ def build_backend(
                         "All required testing and cleanup completed, but some results were "
                         "inconclusive. Review the limitations before relying on the security "
                         "conclusion."
-                        if stop_reason == "completed_with_limitations"
+                        if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value
                         else "Scan ended with a provisional conclusion because independent "
                         "validation remains outstanding."
                     )
@@ -8676,6 +8830,7 @@ def build_backend(
                         and str(exchange["id"]).split(":", 1)[0] in technique_by_call_id
                     },
                     "campaign_counters": campaign_counters.model_dump(mode="json"),
+                    "candidate_outcome_projections": candidate_outcome_projections,
                     "hypothesis_lifecycle": [
                         item.model_dump(mode="json") for item in hypothesis_rows
                     ],
@@ -9233,6 +9388,34 @@ def build_backend(
         arm_generation_usage: list[Mapping[str, object]] = []
         arm_generation_model = _structured_model_for_role(config, "adversarial-researcher", model)
 
+        async def generate_arm_outputs(
+            prompt: str,
+            execution_contract: GeneratorExecutionContract | None = None,
+        ) -> tuple[Mapping[str, object], ...]:
+            value = await _request_structured_json(
+                provider=provider,
+                capability_registry=capability_registry,
+                selected_model=arm_generation_model,
+                messages=(
+                    ChatMessage(
+                        role="system",
+                        content=(
+                            "You propose novel assessment arms for a reviewed target. "
+                            "Return a JSON array of arm objects."
+                        ),
+                    ),
+                    ChatMessage(role="user", content=prompt),
+                ),
+                expected_container="array",
+                max_attempts=config.provider_runtime.worker_retry_attempts,
+                usage_sink=lambda event: arm_generation_usage.append(
+                    stream_usage_record(arm_generation_model, event)
+                ),
+                execution_contract=execution_contract,
+            )
+            assert isinstance(value, list)
+            return tuple(item for item in value if isinstance(item, Mapping))
+
         def arm_generator(prompt: str) -> tuple[Mapping[str, object], ...]:
             """Bridge the sync arm-discovery orchestrator to the async provider.
 
@@ -9242,31 +9425,13 @@ def build_backend(
             generator contract has no campaign identity of its own.
             """
 
-            async def _generate() -> tuple[Mapping[str, object], ...]:
-                value = await _request_structured_json(
-                    provider=provider,
-                    capability_registry=capability_registry,
-                    selected_model=arm_generation_model,
-                    messages=(
-                        ChatMessage(
-                            role="system",
-                            content=(
-                                "You propose novel assessment arms for a reviewed target. "
-                                "Return a JSON array of arm objects."
-                            ),
-                        ),
-                        ChatMessage(role="user", content=prompt),
-                    ),
-                    expected_container="array",
-                    max_attempts=config.provider_runtime.worker_retry_attempts,
-                    usage_sink=lambda event: arm_generation_usage.append(
-                        stream_usage_record(arm_generation_model, event)
-                    ),
-                )
-                assert isinstance(value, list)
-                return tuple(item for item in value if isinstance(item, Mapping))
+            return asyncio.run(generate_arm_outputs(prompt))
 
-            return asyncio.run(_generate())
+        async def generate_arm_outputs_with_contract(
+            prompt: str,
+            execution_contract: GeneratorExecutionContract,
+        ) -> tuple[Mapping[str, object], ...]:
+            return await generate_arm_outputs(prompt, execution_contract)
 
         def drain_arm_generation_usage() -> tuple[Mapping[str, object], ...]:
             drained = tuple(arm_generation_usage)
@@ -9274,6 +9439,9 @@ def build_backend(
             return drained
 
         arm_generator.drain_usage = drain_arm_generation_usage  # type: ignore[attr-defined]
+        arm_generator.generate_with_contract = (  # type: ignore[attr-defined]
+            generate_arm_outputs_with_contract
+        )
 
         campaigns = CampaignService(
             campaign_store,
@@ -9299,6 +9467,7 @@ def build_backend(
             max_coverage_extensions=config.max_coverage_extensions,
             arm_store=campaign_arm_store,
             arm_generator=arm_generator,
+            state_scope_store=api_sessions,
             hypothesis_budget=config.runtime.campaign_hypothesis_budget,
             language_escalation_budget=config.runtime.campaign_language_escalation_budget,
             lead_assessment_batch_size=config.runtime.campaign_lead_assessment_batch_size,
@@ -9482,6 +9651,7 @@ def build_backend(
             memory=memory,
             readiness=readiness,
             campaigns=campaigns,
+            lifecycle_recovery=lifecycle_recovery,
             report_repository=report_repository,
             route_preflight=preflight_campaign_routes,
             operator_controls=True,
@@ -9587,12 +9757,12 @@ def _require_terminal_report_status(
     if durable_reason != stop_reason:
         raise RuntimeError("campaign stop reason changed after completion was sealed")
     expected_statuses = {
-        "saturated": {"completed"},
-        "completed_with_limitations": {"completed"},
-        "capped": {"completed"},
-        "failed": {"failed"},
-        "operator_stopped": {"cancelled"},
-        "interrupted": {"cancelled", "failed"},
+        CampaignTerminalReason.OBJECTIVE_SATISFIED.value: {"completed"},
+        CampaignTerminalReason.FRONTIER_EXHAUSTED.value: {"completed"},
+        CampaignTerminalReason.BUDGET_EXHAUSTED.value: {"completed"},
+        CampaignTerminalReason.TARGET_TERMINAL.value: {"completed"},
+        CampaignTerminalReason.OPERATOR_STOPPED.value: {"cancelled"},
+        CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value: {"failed"},
     }
     if status not in expected_statuses.get(stop_reason, set()):
         raise RuntimeError("campaign terminal status conflicts with its stop reason")

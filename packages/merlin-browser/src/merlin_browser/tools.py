@@ -10,6 +10,7 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from inspect import isawaitable
@@ -23,9 +24,15 @@ from merlin_contracts import (
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    build_state_observation,
+    evaluate_objective_gate_predicate,
+    evaluate_state_transition,
     executable_adapter_digest,
 )
 from merlin_contracts.request_bindings import bind_request_values, validate_request_bindings
+from merlin_contracts.state_isolation import StateIsolationPlan, resolve_state_isolation
+from merlin_contracts.state_scope import MissingEvidenceReason, StateScopeActionKind
+from merlin_contracts.state_scope_runtime import StateScopeLifecycle
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompilation,
     AdapterCompileError,
@@ -386,6 +393,7 @@ class BrowserTool:
         recorder: BrowserRecorder | None = None,
         failure_tracker: dict[tuple[str, ...], int] | None = None,
         network_seen: dict[tuple[str, ...], deque[str]] | None = None,
+        state_scope_store: object | None = None,
     ) -> None:
         if name not in _SPECS:
             raise ValueError(f"unknown browser tool: {name}")
@@ -394,6 +402,7 @@ class BrowserTool:
         self.effect = definition[2] if len(definition) == 3 else "target_network"
         self._failures = failure_tracker if failure_tracker is not None else {}
         self._network_seen = network_seen if network_seen is not None else {}
+        self._state_scope_store = state_scope_store
 
     def describe(self) -> ToolSpec:
         kind, properties = _SPECS[self.name][:2]
@@ -439,12 +448,6 @@ class BrowserTool:
             base = (action_value or "Harmless API adapter discovery").strip()
             action_value = f"{base} [Merlin connection probe {nonce}]"
             evidence_refs.append(f"browser-input-probe:{nonce}")
-        redaction_status = "not_needed"
-        if kind == "fill" and await session.fill_requires_redaction(
-            str(arguments.get("tab_ref", "")),
-            _string(arguments.get("element_ref")),
-        ):
-            redaction_status = "redacted"
         action = BrowserAction(
             context_id=session.context_id,
             target_id=session.bounds.target_id,
@@ -457,7 +460,7 @@ class BrowserTool:
             timeout_ms=int(arguments.get("timeout_ms", 10_000)),
             step=int(arguments.get("step", 0)),
             evidence_refs=tuple(evidence_refs),
-            redaction_status=redaction_status,
+            redaction_status="not_needed",
         )
         actor_id = context.agent_id or f"console:{context.session_id}"
         if kind == "release":
@@ -503,6 +506,87 @@ class BrowserTool:
                     "campaign_scoped": True,
                 },
             )
+        state_scope: _BrowserStateScope | None = None
+        before_refs: tuple[str, ...] = ()
+        if self._state_scope_store is not None:
+            if context.campaign_id is None:
+                return ToolResult(
+                    content=(
+                        "browser target action requires a durable campaign state scope; "
+                        "the target was not called"
+                    ),
+                    is_error=True,
+                    metadata={
+                        "effect": self.effect,
+                        "failure_code": "state_scope_campaign_required",
+                        "retryable": True,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                    },
+                )
+            action_id = str(context.call_id or uuid4())
+            state_scope = await _BrowserStateScope.open(
+                self._state_scope_store,
+                campaign_id=context.campaign_id,
+                target_authority=_browser_action_authority(session, action),
+                action_id=action_id,
+                candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
+                action_kind=_browser_action_kind(context, kind),
+                equivalence_key="conservative-shared-state",
+            )
+            if state_scope is None:
+                return ToolResult(
+                    content="reviewed browser state is already owned by another execution",
+                    is_error=True,
+                    metadata={
+                        "effect": self.effect,
+                        "failure_code": "physical_state_unavailable",
+                        "retryable": True,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                    },
+                )
+            if action.tab_ref and kind != "open_tab":
+                try:
+                    before = await session.snapshot(
+                        action.tab_ref, action.frame_ref, step=action.step
+                    )
+                except Exception:
+                    await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
+                    return ToolResult(
+                        content="browser state could not be observed before the target action",
+                        is_error=True,
+                        metadata={
+                            "effect": self.effect,
+                            "failure_code": "state_scope_before_unavailable",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                before_refs = (_browser_evidence_ref("before", before),)
+                if self._recorder is not None:
+                    try:
+                        await self._recorder.append_observation(before)
+                    except BaseException:
+                        await state_scope.pause(
+                            MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                            before_refs=before_refs,
+                        )
+                        raise
+        try:
+            if kind == "fill" and await session.fill_requires_redaction(
+                str(arguments.get("tab_ref", "")),
+                _string(arguments.get("element_ref")),
+            ):
+                action = action.model_copy(update={"redaction_status": "redacted"})
+        except BaseException:
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                    before_refs=before_refs,
+                )
+            raise
         recorded = action
         if action.redaction_status == "redacted":
             recorded = action.model_copy(update={"value": "[redacted]"})
@@ -517,8 +601,24 @@ class BrowserTool:
             recorded.value or "",
         )
         if self._recorder is not None:
-            await self._recorder.append_action(recorded)
+            try:
+                await self._recorder.append_action(recorded)
+            except BaseException:
+                if state_scope is not None:
+                    await state_scope.pause(
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                        before_refs=before_refs,
+                        action_refs=action.evidence_refs,
+                    )
+                raise
         if self._failures.get(fingerprint, 0) >= 2:
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    before_refs=before_refs,
+                    action_refs=action.evidence_refs,
+                    retryable=False,
+                )
             return ToolResult(
                 content=(
                     "unchanged browser action already failed twice; take a fresh snapshot, "
@@ -532,6 +632,11 @@ class BrowserTool:
                 },
             )
         try:
+            if state_scope is not None:
+                await state_scope.lifecycle.acknowledge(
+                    before_refs=before_refs,
+                    action_refs=action.evidence_refs,
+                )
             async with asyncio.timeout(action.timeout_ms / 1_000):
                 observation = await session.act(action, actor_id=actor_id)
         except Exception as error:
@@ -569,6 +674,12 @@ class BrowserTool:
                     }
             if self._recorder is not None:
                 await self._recorder.save_metadata(session.metadata(restart=True))
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    before_refs=before_refs,
+                    action_refs=action.evidence_refs,
+                )
             category = (
                 "browser_boundary"
                 if isinstance(error, BrowserBoundaryError)
@@ -714,6 +825,16 @@ class BrowserTool:
                 "unobserved cleanup endpoint, and never repeat reconnaissance solely to prove "
                 "session ownership."
             )
+        if state_scope is not None:
+            await state_scope.settle(
+                before_refs=before_refs,
+                action_refs=action.evidence_refs,
+                response_refs=observation.evidence_refs,
+                after_refs=observation.evidence_refs,
+                transition_disposition="unchanged",
+                cleanup_disposition=("released" if kind == "close_tab" else "retained"),
+            )
+            metadata["state_scope_id"] = state_scope.lifecycle.scope_id
         return ToolResult(content=content, metadata=metadata)
 
 
@@ -772,10 +893,12 @@ class BrowserOwnedSessionCleanupTool:
         resolver: BrowserSessionResolver,
         recorder: BrowserRecorder | None = None,
         failure_tracker: dict[tuple[str, ...], int] | None = None,
+        state_scope_store: object | None = None,
     ) -> None:
         self._resolver = resolver
         self._recorder = recorder
         self._failures = failure_tracker if failure_tracker is not None else {}
+        self._state_scope_store = state_scope_store
 
     def describe(self) -> ToolSpec:
         return ToolSpec(
@@ -803,7 +926,7 @@ class BrowserOwnedSessionCleanupTool:
             "target": session.bounds.target_id,
             "target_session_id": f"browser:{session.context_id}",
         }
-        if context.campaign_id is not None:
+        if context.campaign_id is not None and context.agent_id is not None:
             return ToolResult(
                 content=(
                     "owned session cleanup is reconnaissance-only: campaign workers cannot "
@@ -811,6 +934,21 @@ class BrowserOwnedSessionCleanupTool:
                 ),
                 is_error=True,
                 metadata={**metadata, "campaign_scoped": True},
+            )
+        if self._state_scope_store is not None and context.campaign_id is None:
+            return ToolResult(
+                content=(
+                    "owned session cleanup requires a durable campaign state scope; "
+                    "the target was not called"
+                ),
+                is_error=True,
+                metadata={
+                    **metadata,
+                    "failure_code": "state_scope_campaign_required",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
             )
         allowed = {"step", "timeout_ms"}
         if set(arguments) - allowed:
@@ -836,10 +974,51 @@ class BrowserOwnedSessionCleanupTool:
                 metadata=metadata,
             )
         tab_ref = open_tabs[0]
-        snapshot = await session.snapshot(
-            tab_ref,
-            step=int(arguments.get("step", 0)),
-        )
+        state_scope: _BrowserStateScope | None = None
+        if self._state_scope_store is not None:
+            assert context.campaign_id is not None
+            action_id = str(context.call_id or uuid4())
+            state_scope = await _BrowserStateScope.open(
+                self._state_scope_store,
+                campaign_id=context.campaign_id,
+                target_authority=_browser_action_authority(
+                    session,
+                    BrowserAction(
+                        context_id=session.context_id,
+                        target_id=session.bounds.target_id,
+                        owner=session.owner,
+                        kind="close_tab",
+                        tab_ref=tab_ref,
+                        step=int(arguments.get("step", 0)),
+                    ),
+                ),
+                action_id=action_id,
+                candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
+                action_kind=StateScopeActionKind.CLEANUP,
+                equivalence_key="conservative-shared-state",
+            )
+            if state_scope is None:
+                return ToolResult(
+                    content="reviewed browser state is already owned by another execution",
+                    is_error=True,
+                    metadata={
+                        **metadata,
+                        "failure_code": "physical_state_unavailable",
+                        "retryable": True,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                    },
+                )
+        try:
+            snapshot = await session.snapshot(
+                tab_ref,
+                step=int(arguments.get("step", 0)),
+            )
+        except Exception:
+            if state_scope is not None:
+                await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
+            raise
+        before_refs = (_browser_evidence_ref("before", snapshot),)
         if self._recorder is not None:
             await self._recorder.append_observation(snapshot)
         candidates = tuple(
@@ -850,6 +1029,12 @@ class BrowserOwnedSessionCleanupTool:
             and _OWNED_SESSION_END_LABEL.fullmatch(_normalized_accessible_name(element.name))
         )
         if len(candidates) != 1:
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    before_refs=before_refs,
+                    retryable=False,
+                )
             return ToolResult(
                 content=(
                     "owned session cleanup requires exactly one visible, enabled session-ending "
@@ -860,6 +1045,12 @@ class BrowserOwnedSessionCleanupTool:
             )
         candidate = candidates[0]
         if self._recorder is None:
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    before_refs=before_refs,
+                    retryable=False,
+                )
             return ToolResult(
                 content="owned session cleanup requires its durable reconnaissance handoff",
                 is_error=True,
@@ -901,6 +1092,12 @@ class BrowserOwnedSessionCleanupTool:
             or not isinstance(transition.get("evidence_refs"), list)
             or not transition["evidence_refs"]
         ):
+            if state_scope is not None:
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    before_refs=before_refs,
+                    retryable=False,
+                )
             return ToolResult(
                 content=(
                     "owned session cleanup rejected: the latest same-context handoff does not "
@@ -908,6 +1105,15 @@ class BrowserOwnedSessionCleanupTool:
                 ),
                 is_error=True,
                 metadata=metadata,
+            )
+        action_ref = _browser_evidence_ref(
+            "cleanup-action",
+            {"element_ref": candidate.ref, "frame_ref": candidate.frame_ref},
+        )
+        if state_scope is not None:
+            await state_scope.lifecycle.acknowledge(
+                before_refs=before_refs,
+                action_refs=(action_ref,),
             )
         result = await BrowserTool(
             "browser_click",
@@ -924,6 +1130,27 @@ class BrowserOwnedSessionCleanupTool:
                 "timeout_ms": int(arguments.get("timeout_ms", 10_000)),
             },
         )
+        if state_scope is not None:
+            response_refs = tuple(
+                str(item)
+                for item in result.metadata.get("evidence_refs", ())
+                if isinstance(item, str) and item
+            )
+            if result.is_error:
+                await state_scope.pause(
+                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    before_refs=before_refs,
+                    action_refs=(action_ref,),
+                )
+            else:
+                await state_scope.settle(
+                    before_refs=before_refs,
+                    action_refs=(action_ref,),
+                    response_refs=response_refs,
+                    after_refs=response_refs,
+                    transition_disposition="unchanged",
+                    cleanup_disposition="released",
+                )
         return result.model_copy(
             update={
                 "metadata": {
@@ -1546,6 +1773,595 @@ class ApiReconHandoffTool:
         )
 
 
+class BrowserCheckpointVaultEntry(Protocol):
+    reference_id: str
+
+    def opaque_reference(self) -> dict[str, str]: ...
+
+    def keyed_digest(self) -> dict[str, str]: ...
+
+
+class BrowserCheckpointVault(Protocol):
+    def store_checkpoint(
+        self, checkpoint_secret: str, *, campaign_id: str, gate_id: str
+    ) -> BrowserCheckpointVaultEntry: ...
+
+    def resolve_checkpoint(self, reference_id: str) -> str: ...
+
+    def delete_checkpoint(self, reference_id: str, *, expected_digest: str) -> bool: ...
+
+
+class BrowserCheckpointStore(Protocol):
+    def record_objective_gate_checkpoint(
+        self, *args: Any, **kwargs: Any
+    ) -> Mapping[str, object]: ...
+
+    def claim_objective_gate_checkpoint_restore(
+        self, *args: Any, **kwargs: Any
+    ) -> Mapping[str, object]: ...
+
+    def release_objective_gate_checkpoint_restore(self, *args: Any, **kwargs: Any) -> bool: ...
+
+    def mark_objective_gate_checkpoint_restored(
+        self, *args: Any, **kwargs: Any
+    ) -> Mapping[str, object]: ...
+
+
+@dataclass(slots=True)
+class _BrowserStateScope:
+    store: object
+    lifecycle: StateScopeLifecycle
+    claim_id: str
+    claimant_id: str
+    isolation_disposition: str = "shared_serialized"
+
+    @classmethod
+    async def open(
+        cls,
+        store: object,
+        *,
+        campaign_id: str,
+        target_authority: str,
+        action_id: str,
+        candidate_id: str,
+        action_kind: StateScopeActionKind = StateScopeActionKind.CANDIDATE,
+        equivalence_key: str,
+        isolation_disposition: str = "shared_serialized",
+        wait_for_lease_seconds: float = 0.0,
+    ) -> _BrowserStateScope | None:
+        lifecycle = await StateScopeLifecycle.create(
+            store,  # type: ignore[arg-type]
+            campaign_id=campaign_id,
+            target_authority=target_authority,
+            attempt_id=action_id,
+            action_id=action_id,
+            candidate_id=candidate_id,
+            action_kind=action_kind,
+        )
+        claimant_id = (
+            "browser-state:" + hashlib.sha256(f"{campaign_id}\0{action_id}".encode()).hexdigest()
+        )
+        claim = store.claim_state_scope_lease  # type: ignore[attr-defined]
+        deadline = asyncio.get_running_loop().time() + max(0.0, wait_for_lease_seconds)
+        try:
+            while True:
+                claim_id = await asyncio.to_thread(
+                    claim,
+                    lifecycle.scope_id,
+                    target_authority=target_authority,
+                    principal_key=lifecycle.principal_key,
+                    equivalence_key=equivalence_key,
+                    claimant_id=claimant_id,
+                    lease_seconds=120,
+                )
+                if isinstance(claim_id, str) and claim_id:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.02)
+        except BaseException:
+            await lifecycle.pause_unclaimed(
+                isolation_disposition=isolation_disposition,
+            )
+            raise
+        if not isinstance(claim_id, str) or not claim_id:
+            await lifecycle.pause_unclaimed(
+                isolation_disposition=isolation_disposition,
+            )
+            return None
+        lifecycle.bind_lease(claim_id, claimant_id)
+        return cls(store, lifecycle, claim_id, claimant_id, isolation_disposition)
+
+    async def pause(
+        self,
+        reason: MissingEvidenceReason,
+        *,
+        before_refs: tuple[str, ...] = (),
+        action_refs: tuple[str, ...] = (),
+        retryable: bool = True,
+    ) -> None:
+        try:
+            await self.lifecycle.pause(
+                before_refs=before_refs,
+                action_refs=action_refs,
+                reason=reason.value,
+                retryable=retryable,
+                isolation_disposition=self.isolation_disposition,
+            )
+        finally:
+            await self.close()
+
+    async def settle(
+        self,
+        *,
+        before_refs: tuple[str, ...],
+        action_refs: tuple[str, ...],
+        response_refs: tuple[str, ...],
+        after_refs: tuple[str, ...],
+        transition_disposition: str,
+        cleanup_disposition: str = "retained",
+    ) -> None:
+        try:
+            await self.lifecycle.settle(
+                before_refs=before_refs,
+                action_refs=action_refs,
+                response_refs=response_refs,
+                after_refs=after_refs,
+                transition_disposition=transition_disposition,
+                isolation_disposition=self.isolation_disposition,
+                cleanup_disposition=cleanup_disposition,
+            )
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        release = self.store.release_state_scope_lease  # type: ignore[attr-defined]
+        await asyncio.to_thread(release, self.claim_id, self.claimant_id)
+
+    async def bind_isolated_state(
+        self,
+        *,
+        equivalence_key: str,
+        isolation_disposition: str,
+        maximum_parallel_states: int,
+    ) -> bool:
+        """Atomically replace the conservative lease after host-side proof succeeds."""
+        rekey = getattr(self.store, "rekey_state_scope_lease", None)
+        if not callable(rekey):
+            return False
+        changed = await asyncio.to_thread(
+            rekey,
+            self.claim_id,
+            self.claimant_id,
+            principal_key=self.lifecycle.principal_key,
+            equivalence_key=equivalence_key,
+            maximum_parallel_states=maximum_parallel_states,
+        )
+        if changed:
+            self.isolation_disposition = isolation_disposition
+        return bool(changed)
+
+    async def preflight_resource_block(self, adapter: BrowserChat) -> Mapping[str, object] | None:
+        status_reader = getattr(self.store, "resource_status", None)
+        capabilities = adapter.state_capabilities
+        if not callable(status_reader) or capabilities is None:
+            return None
+        ownership = {item.name: item for item in capabilities.resource_ownership}
+        for control in capabilities.resource_controls:
+            owner = ownership[control.ownership_name]
+            status = await asyncio.to_thread(
+                status_reader,
+                self.lifecycle.target_authority,
+                self.lifecycle.principal_key,
+                owner.resource_kind.value,
+                control.window_key,
+            )
+            if isinstance(status, Mapping) and str(status.get("state")) in {
+                "suspended",
+                "exhausted",
+            }:
+                return status
+        return None
+
+    async def reserve_resources(self, adapter: BrowserChat) -> list[tuple[str, object]]:
+        reserve = getattr(self.store, "reserve_resource", None)
+        capabilities = adapter.state_capabilities
+        if not callable(reserve) or capabilities is None:
+            return []
+        ownership = {item.name: item for item in capabilities.resource_ownership}
+        reservations: list[tuple[str, object]] = []
+        for control in capabilities.resource_controls:
+            owner = ownership[control.ownership_name]
+            reservation_id = (
+                "browser-resource:"
+                + hashlib.sha256(
+                    (
+                        f"{self.lifecycle.scope_id}\0{control.ownership_name}\0{control.step_id}"
+                    ).encode()
+                ).hexdigest()
+            )
+            status = await asyncio.to_thread(
+                reserve,
+                self.lifecycle.scope_id,
+                reservation_id,
+                target_authority=self.lifecycle.target_authority,
+                principal_key=self.lifecycle.principal_key,
+                resource_kind=owner.resource_kind.value,
+                amount=control.reservation_amount,
+                limit=control.limit,
+                window_key=control.window_key,
+                claim_id=self.claim_id,
+                claimant_id=self.claimant_id,
+            )
+            if not isinstance(status, Mapping) or status.get("admitted") is not True:
+                await self.release_resources(reservations)
+                raise _BrowserResourceBlocked(
+                    status if isinstance(status, Mapping) else {"state": "unavailable"}
+                )
+            reservations.append((reservation_id, control))
+        return reservations
+
+    async def acknowledge_resources(self, reservations: list[tuple[str, object]]) -> None:
+        acknowledge = getattr(self.store, "acknowledge_resource", None)
+        if not callable(acknowledge):
+            return
+        for reservation_id, _ in reservations:
+            await asyncio.to_thread(
+                acknowledge,
+                reservation_id,
+                claim_id=self.claim_id,
+                claimant_id=self.claimant_id,
+            )
+
+    async def settle_resources(self, reservations: list[tuple[str, object]]) -> None:
+        settle = getattr(self.store, "settle_resource", None)
+        if not callable(settle):
+            return
+        for reservation_id, control in reservations:
+            await asyncio.to_thread(
+                settle,
+                reservation_id,
+                actual_amount=control.reservation_amount,
+                claim_id=self.claim_id,
+                claimant_id=self.claimant_id,
+            )
+
+    async def release_resources(self, reservations: list[tuple[str, object]]) -> None:
+        release = getattr(self.store, "release_resource", None)
+        if not callable(release):
+            return
+        for reservation_id, _ in reservations:
+            await asyncio.to_thread(
+                release,
+                reservation_id,
+                claim_id=self.claim_id,
+                claimant_id=self.claimant_id,
+            )
+
+
+class _BrowserResourceBlocked(ValueError):
+    def __init__(self, status: Mapping[str, object]) -> None:
+        self.status = dict(status)
+        super().__init__("reviewed browser target resource is unavailable before delivery")
+
+
+def _browser_evidence_ref(kind: str, value: object) -> str:
+    if hasattr(value, "model_dump_json"):
+        encoded = value.model_dump_json().encode()
+    else:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return f"browser-{kind}:sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _browser_target_authority(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("compiled browser endpoint does not identify a target authority")
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = (parsed.scheme == "http" and parsed.port == 80) or (
+        parsed.scheme == "https" and parsed.port == 443
+    )
+    port = "" if parsed.port is None or default_port else f":{parsed.port}"
+    return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
+
+
+def _browser_action_authority(session: BrowserSession, action: BrowserAction) -> str:
+    """Resolve one stable authority without exposing a raw target identifier."""
+    candidates: list[str] = []
+    if action.kind in {"open_tab", "navigate"} and action.value:
+        candidates.append(action.value)
+    if action.tab_ref:
+        candidates.extend(
+            tab.url for tab in session.metadata().tabs if tab.tab_ref == action.tab_ref
+        )
+    candidates.extend(sorted(session.bounds.allowed_origins))
+    for candidate in candidates:
+        try:
+            return _browser_target_authority(candidate)
+        except ValueError:
+            continue
+    return (
+        "browser-target:sha256:"
+        + hashlib.sha256(str(session.bounds.target_id).encode()).hexdigest()
+    )
+
+
+def _browser_action_kind(context: ToolContext, kind: str) -> StateScopeActionKind:
+    if kind == "close_tab":
+        return StateScopeActionKind.CLEANUP
+    if context.objective_phase_checkpoint_intent == "capture":
+        return StateScopeActionKind.BASELINE
+    if context.technique_attempt_id or context.attempt_id:
+        return StateScopeActionKind.CANDIDATE
+    return StateScopeActionKind.RECONNAISSANCE
+
+
+def _checkpoint_context(context: ToolContext) -> tuple[str, str, str, str] | None:
+    if context.objective_phase_checkpoint_intent is None:
+        return None
+    values = (
+        context.objective_phase_checkpoint_intent,
+        context.objective_phase_gate_id,
+        context.objective_phase_gate_recipe_digest,
+        context.objective_phase_manifest_digest,
+    )
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError("checkpoint intent requires sealed gate, recipe, and manifest identity")
+    return values  # type: ignore[return-value]
+
+
+def _checkpoint_reference_id(value: object) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError("checkpoint restore requires an opaque state reference")
+    if value.get("kind") != "opaque_reference" or value.get("namespace") != "state":
+        raise ValueError("checkpoint restore requires an opaque state reference")
+    reference_id = value.get("reference_id")
+    if not isinstance(reference_id, str) or not reference_id:
+        raise ValueError("checkpoint restore reference is invalid")
+    return reference_id
+
+
+def _json_pointer_value(value: object, pointer: str) -> object:
+    current = value
+    if not pointer.startswith("/"):
+        raise ValueError("checkpoint selector must be a non-root JSON Pointer")
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, list):
+            if not token.isdecimal() or int(token) >= len(current):
+                raise ValueError("checkpoint selector did not resolve")
+            current = current[int(token)]
+        elif isinstance(current, Mapping) and token in current:
+            current = current[token]
+        else:
+            raise ValueError("checkpoint selector did not resolve")
+    return current
+
+
+def _inject_checkpoint_secret(document: object, pointer: str, secret: str) -> object:
+    result = deepcopy(document)
+    if not pointer.startswith("/"):
+        raise ValueError("checkpoint restore destination must be a non-root JSON Pointer")
+    tokens = pointer[1:].split("/")
+    current = result
+    for index, raw in enumerate(tokens):
+        token: str | int = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, list):
+            if not str(token).isdecimal() or int(token) >= len(current):
+                raise ValueError("checkpoint restore destination did not resolve")
+            token = int(token)
+        elif not isinstance(current, dict) or token not in current:
+            raise ValueError("checkpoint restore destination did not resolve")
+        if index == len(tokens) - 1:
+            current[token] = secret
+            return result
+        current = current[token]
+    raise ValueError("checkpoint restore destination did not resolve")
+
+
+def _checkpoint_evidence_digest(value: object) -> str:
+    if hasattr(value, "model_dump_json"):
+        encoded = value.model_dump_json().encode()
+    else:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _redact_checkpoint_secret(value: object, secret: str) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "[checkpoint-secret-redacted]"
+            if item == secret
+            else _redact_checkpoint_secret(item, secret)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            "[checkpoint-secret-redacted]"
+            if item == secret
+            else _redact_checkpoint_secret(item, secret)
+            for item in value
+        ]
+    return value
+
+
+def _browser_capability_step_ids(adapter: BrowserChat) -> frozenset[str]:
+    """Return every exact browser step referenced by the reviewed state contract."""
+    capabilities = adapter.state_capabilities
+    if capabilities is None:
+        return frozenset()
+    step_ids: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            step_id = value.get("step_id")
+            if isinstance(step_id, str) and step_id:
+                step_ids.add(step_id)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(capabilities.model_dump(mode="json"))
+    return frozenset(step_ids)
+
+
+def _browser_checkpoint_gate_succeeded(
+    context: ToolContext,
+    adapter: BrowserChat,
+    step_documents: Mapping[str, object],
+) -> tuple[bool, dict[str, object]]:
+    """Evaluate the sealed gate through the shared authoritative transition oracle."""
+    gate = context.objective_phase_gate_contract
+    capabilities = adapter.state_capabilities
+    if not isinstance(gate, Mapping) or capabilities is None or capabilities.identity is None:
+        return False, {}
+    transition = _browser_state_transition(adapter, step_documents)
+    return evaluate_objective_gate_predicate(gate, transition) is True, transition
+
+
+def _browser_state_transition(
+    adapter: BrowserChat,
+    step_documents: Mapping[str, object],
+) -> dict[str, object]:
+    """Evaluate reviewed browser state from exact host-captured step snapshots."""
+    capabilities = adapter.state_capabilities
+    if capabilities is None or capabilities.identity is None:
+        return {}
+    binding_context = {
+        "compiled_adapter_digest": compiled_target_adapter_digest(adapter),
+    }
+
+    def bind(selector: object, *, name: str, role: str, phase: str, **definition: object):
+        step_id = str(getattr(selector, "step_id", ""))
+        evaluation_root = str(getattr(selector, "evaluation_root", ""))
+        pointer = str(getattr(selector, "pointer", ""))
+        root = step_documents.get(step_id)
+        try:
+            if evaluation_root != "response_body" or root is None:
+                raise ValueError("browser state selector is unavailable")
+            value = _select(root, pointer, step_id)
+        except ValueError:
+            value, available = None, False
+        else:
+            available = True
+        return build_state_observation(
+            name=name,
+            role=role,
+            phase=phase,
+            step_id=step_id,
+            evaluation_root=evaluation_root,
+            pointer=pointer,
+            binding_context=binding_context,
+            selected_value=value,
+            selected_available=available,
+            **definition,
+        )
+
+    observations: list[dict[str, object]] = []
+    identity = capabilities.identity
+    observations.append(
+        bind(
+            identity.baseline_selector,
+            name="physical_state_identity",
+            role="state_identity",
+            phase="baseline",
+            evidence_refs=identity.evidence_refs,
+        )
+    )
+    if identity.result_selector is not None:
+        observations.append(
+            bind(
+                identity.result_selector,
+                name="physical_state_identity",
+                role="state_identity",
+                phase="result",
+                evidence_refs=identity.evidence_refs,
+            )
+        )
+    for observation in capabilities.observations:
+        definition = {
+            "preferred_direction": (
+                observation.preferred_direction.value
+                if observation.preferred_direction is not None
+                else None
+            ),
+            "success_values": observation.success_values,
+            "failure_values": observation.failure_values,
+            "evidence_refs": observation.evidence_refs,
+            "value_type": (
+                observation.value_type.value if observation.value_type is not None else None
+            ),
+            "minimum_value": observation.minimum_value,
+            "maximum_value": observation.maximum_value,
+            "monotonicity": (
+                observation.monotonicity.value if observation.monotonicity is not None else None
+            ),
+            "trust_class": (
+                observation.trust_class.value if observation.trust_class is not None else None
+            ),
+        }
+        observations.extend(
+            (
+                bind(
+                    observation.baseline_selector,
+                    name=observation.name,
+                    role=observation.role.value,
+                    phase="baseline",
+                    **definition,
+                ),
+                bind(
+                    observation.result_selector,
+                    name=observation.name,
+                    role=observation.role.value,
+                    phase="result",
+                    **definition,
+                ),
+            )
+        )
+    return evaluate_state_transition(
+        observations,
+        [item.model_dump(mode="json") for item in capabilities.corroboration_rules],
+    )
+
+
+def _browser_isolation_baseline(
+    adapter: BrowserChat,
+    plan: StateIsolationPlan,
+    step_documents: Mapping[str, object],
+) -> tuple[str | None, str | None]:
+    """Return a content-addressed physical-state key only after every reviewed proof matches."""
+    capabilities = adapter.state_capabilities
+    if not plan.isolated or capabilities is None or capabilities.identity is None:
+        return None, "reviewed browser lifecycle does not establish isolated state"
+    selector = capabilities.identity.baseline_selector
+    root = step_documents.get(selector.step_id)
+    if selector.evaluation_root != "response_body" or root is None:
+        return None, "reviewed browser physical-state identity is unavailable before delivery"
+    try:
+        identity = _select(root, selector.pointer, selector.step_id)
+    except ValueError:
+        return None, "reviewed browser physical-state identity selector did not resolve"
+    for rule in capabilities.freshness_rules:
+        rule_root = step_documents.get(rule.selector.step_id)
+        if rule.selector.evaluation_root != "response_body" or rule_root is None:
+            return None, "reviewed browser freshness evidence is unavailable before delivery"
+        try:
+            observed = _select(rule_root, rule.selector.pointer, rule.selector.step_id)
+        except ValueError:
+            return None, "reviewed browser freshness selector did not resolve"
+        if not any(
+            type(observed) is type(expected) and observed == expected
+            for expected in rule.match_values
+        ):
+            return None, "reviewed browser independent-state freshness proof did not match"
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return "physical-state:sha256:" + hashlib.sha256(encoded).hexdigest(), None
+
+
 class BrowserChatExchangeTool:
     """Execute the reviewed fill/submit browser flow without another model turn."""
 
@@ -1557,10 +2373,16 @@ class BrowserChatExchangeTool:
         resolver: BrowserSessionResolver,
         recorder: BrowserRecorder,
         adapter_resolver: ReviewedBrowserAdapterResolver,
+        state_scope_store: object | None = None,
+        checkpoint_store: BrowserCheckpointStore | None = None,
+        checkpoint_vault: BrowserCheckpointVault | None = None,
     ) -> None:
         self._resolver = resolver
         self._recorder = recorder
         self._adapter_resolver = adapter_resolver
+        self._state_scope_store = state_scope_store
+        self._checkpoint_store = checkpoint_store
+        self._checkpoint_vault = checkpoint_vault
         self._failures: dict[tuple[str, ...], int] = {}
 
     def describe(self) -> ToolSpec:
@@ -1717,26 +2539,107 @@ class BrowserChatExchangeTool:
         }
         compilation_uncertainties = _compilation_uncertainties(canonical_compilation)
         prompt = str(arguments["prompt"])
+        if self._state_scope_store is None:
+            return ToolResult(
+                content=(
+                    "compiled browser delivery requires durable state-scope storage; "
+                    "the target was not called"
+                ),
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "state_scope_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        action_id = str(context.call_id or uuid4())
+        preliminary_isolation_plan = resolve_state_isolation(
+            executable_adapter.state_capabilities,
+            checkpoint_available=context.objective_phase_checkpoint_intent == "restore",
+        )
+        state_scope = await _BrowserStateScope.open(
+            self._state_scope_store,
+            campaign_id=context.campaign_id,
+            target_authority=_browser_target_authority(executable_adapter.endpoint),
+            action_id=action_id,
+            candidate_id=str(context.agent_id or action_id),
+            action_kind=StateScopeActionKind.CANDIDATE,
+            equivalence_key="conservative-shared-state",
+            wait_for_lease_seconds=(
+                2.0 if preliminary_isolation_plan.permits_parallel_delivery else 0.0
+            ),
+        )
+        if state_scope is None:
+            return ToolResult(
+                content="reviewed browser state is already owned by another execution",
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "physical_state_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        resource_block = await state_scope.preflight_resource_block(executable_adapter)
+        if resource_block is not None:
+            await state_scope.pause(MissingEvidenceReason.NOT_YET_OBSERVED)
+            return ToolResult(
+                content="reviewed browser target resource is unavailable before delivery",
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "target_resource_blocked",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "resource_state": resource_block.get("state"),
+                    "resource_available": resource_block.get("available"),
+                    "wake_at": resource_block.get("wake_at"),
+                },
+            )
         contract = adapter.get("interaction_contract")
         if isinstance(contract, Mapping):
             limit = contract.get("input_limit")
             maximum = limit.get("max_characters") if isinstance(limit, Mapping) else None
-            if isinstance(maximum, int) and len(prompt) > maximum:
-                compilation_uncertainties.append(
-                    {
-                        "kind": "evaluation_uncertain",
-                        "source": "browser.input_limit",
-                        "reason": (
-                            f"The prompt exceeds the observed {maximum} character input limit; "
-                            "delivery will continue and the actual browser state will be retained."
-                        ),
-                        "confidence": 0.0,
-                    }
+            if type(maximum) is int and maximum > 0 and len(prompt) > maximum:
+                observation = {
+                    "schema": "merlin.request-constraint-observation.v1",
+                    "step_id": "browser-chat",
+                    "evaluation_root": "request_body",
+                    "path": "/prompt",
+                    "kind": "string_length",
+                    "maximum": maximum,
+                    "unit": "unicode_characters",
+                    "observed": len(prompt),
+                    "satisfied": False,
+                    "source": "reviewed_browser_interaction_contract",
+                }
+                await state_scope.pause(MissingEvidenceReason.NOT_APPLICABLE)
+                return ToolResult(
+                    content=(
+                        "rendered browser prompt violates the reviewed input constraint; "
+                        "the target was not called"
+                    ),
+                    is_error=True,
+                    metadata={
+                        **adapter_identity_metadata,
+                        "attempt_disposition": "protocol_invalid",
+                        "retryable": True,
+                        "acknowledged_capability_evidence": False,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                        "limit_interaction_count": 0,
+                        "request_constraint_observations": [observation],
+                    },
                 )
         if compilation_uncertainties:
             adapter_identity_metadata["evaluation_uncertainties"] = compilation_uncertainties
         open_tabs = [tab.tab_ref for tab in session.metadata().tabs if tab.state == "open"]
         if len(open_tabs) != 1:
+            await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
             return ToolResult(
                 content="compiled browser flow requires exactly one reviewed open tab",
                 is_error=True,
@@ -1745,8 +2648,36 @@ class BrowserChatExchangeTool:
         tab_ref = open_tabs[0]
         current = await session.snapshot(tab_ref)
         await self._recorder.append_observation(current)
-        executable: list[tuple[str, dict[str, object]]] = []
+        before_ref = _browser_evidence_ref("before", current)
+        action_ref = _browser_evidence_ref(
+            "action", {"adapter_digest": compiled_adapter_digest, "prompt": prompt}
+        )
+        checkpoint_contract = (
+            executable_adapter.state_capabilities.checkpoint
+            if executable_adapter.state_capabilities is not None
+            else None
+        )
+        try:
+            checkpoint_context = _checkpoint_context(context)
+        except ValueError as error:
+            await state_scope.pause(
+                MissingEvidenceReason.NOT_APPLICABLE,
+                before_refs=(before_ref,),
+                retryable=False,
+            )
+            return ToolResult(
+                content=str(error),
+                is_error=True,
+                metadata={**adapter_identity_metadata, "failure_code": "checkpoint_contract"},
+            )
+        executable: list[tuple[str, dict[str, object], str | None, str]] = []
         for compiled_step in executable_adapter.steps:
+            if (
+                checkpoint_contract is not None
+                and compiled_step.step_id == checkpoint_contract.restore_step_id
+                and (checkpoint_context is None or checkpoint_context[0] != "restore")
+            ):
+                continue
             name = compiled_step.tool
             step_arguments = dict(compiled_step.arguments)
             default_role = "button" if name == "browser_click" else "textbox"
@@ -1757,6 +2688,10 @@ class BrowserChatExchangeTool:
                 default_role=default_role,
             )
             if resolved is None:
+                await state_scope.pause(
+                    MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                    before_refs=(before_ref,),
+                )
                 return ToolResult(
                     content=(
                         "reviewed browser flow locator does not identify exactly one current "
@@ -1768,15 +2703,28 @@ class BrowserChatExchangeTool:
             step_arguments["element_ref"], step_arguments["frame_ref"] = resolved
             step_arguments.pop("locator", None)
             step_arguments["tab_ref"] = tab_ref
-            if name == "browser_fill":
+            if name == "browser_fill" and (
+                compiled_step.role.value == "interaction" or "value" not in step_arguments
+            ):
                 step_arguments["value"] = prompt
             executable.extend(
-                (str(name), dict(step_arguments)) for _ in range(compiled_step.repeat)
+                (
+                    str(name),
+                    dict(step_arguments),
+                    compiled_step.step_id,
+                    compiled_step.role.value,
+                )
+                for _ in range(compiled_step.repeat)
             )
-        names = tuple(name for name, _ in executable)
+        names = tuple(name for name, _, _, _ in executable)
         if "browser_fill" not in names or not any(
             name in {"browser_click", "browser_press"} for name in names
         ):
+            await state_scope.pause(
+                MissingEvidenceReason.NOT_APPLICABLE,
+                before_refs=(before_ref,),
+                retryable=False,
+            )
             return ToolResult(
                 content="reviewed browser flow must contain exact fill and submit steps",
                 is_error=True,
@@ -1790,20 +2738,227 @@ class BrowserChatExchangeTool:
         response_frame = (
             _string(contract.get("frame_context")) if isinstance(contract, Mapping) else None
         )
-        results: list[ToolResult] = []
-        fill_step: tuple[str, str | None] | None = None
-        exchange_started = time.monotonic()
-        for step, (name, step_arguments) in enumerate(executable, start=1):
-            if name in {"browser_click", "browser_press"} and fill_step is not None:
-                element_ref, frame_ref = fill_step
+        checkpoint_receipt: dict[str, object] | None = None
+        restore_claimed = False
+        restore_secret: str | None = None
+
+        async def release_unacknowledged_restore() -> None:
+            nonlocal restore_claimed
+            if not restore_claimed or checkpoint_context is None:
+                return
+            await asyncio.to_thread(
+                self._checkpoint_store.release_objective_gate_checkpoint_restore,  # type: ignore[union-attr]
+                context.campaign_id,
+                checkpoint_context[1],
+                scope_id=state_scope.lifecycle.scope_id,
+                claim_id=state_scope.claim_id,
+                claimant_id=state_scope.claimant_id,
+            )
+            restore_claimed = False
+
+        if checkpoint_context is not None:
+            if (
+                checkpoint_contract is None
+                or self._checkpoint_store is None
+                or self._checkpoint_vault is None
+            ):
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    before_refs=(before_ref,),
+                    retryable=False,
+                )
+                return ToolResult(
+                    content="reviewed checkpoint execution dependencies are unavailable",
+                    is_error=True,
+                    metadata={
+                        **adapter_identity_metadata,
+                        "failure_code": "checkpoint_contract",
+                    },
+                )
+            intent, gate_id, recipe_digest, manifest_digest = checkpoint_context
+            if intent == "restore":
                 try:
-                    await session.verify_input_value(tab_ref, element_ref, prompt, frame_ref)
+                    reference_id = _checkpoint_reference_id(
+                        context.objective_phase_checkpoint_reference
+                    )
+                    claimed = await asyncio.to_thread(
+                        self._checkpoint_store.claim_objective_gate_checkpoint_restore,
+                        context.campaign_id,
+                        gate_id,
+                        scope_id=state_scope.lifecycle.scope_id,
+                        claim_id=state_scope.claim_id,
+                        claimant_id=state_scope.claimant_id,
+                    )
+                    if (
+                        str(claimed.get("manifest_digest")) != manifest_digest
+                        or str(claimed.get("recipe_digest")) != recipe_digest
+                    ):
+                        raise ValueError("durable checkpoint does not match the sealed assignment")
+                    durable_reference = claimed.get("checkpoint_handle")
+                    if _checkpoint_reference_id(durable_reference) != reference_id:
+                        raise ValueError(
+                            "checkpoint assignment reference does not match durable state"
+                        )
+                    restore_secret = await asyncio.to_thread(
+                        self._checkpoint_vault.resolve_checkpoint,
+                        reference_id,
+                    )
+                    restore_claimed = True
+                except (KeyError, ValueError) as error:
+                    await state_scope.pause(
+                        MissingEvidenceReason.NOT_YET_OBSERVED,
+                        before_refs=(before_ref,),
+                    )
+                    return ToolResult(
+                        content=str(error),
+                        is_error=True,
+                        metadata={
+                            **adapter_identity_metadata,
+                            "failure_code": "checkpoint_restore_unavailable",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                restored_steps = 0
+                updated: list[tuple[str, dict[str, object], str | None, str]] = []
+                try:
+                    for name, step_arguments, step_id, role in executable:
+                        if step_id == checkpoint_contract.restore_step_id:
+                            assert restore_secret is not None
+                            if name != "browser_fill" or not await session.fill_requires_redaction(
+                                tab_ref,
+                                str(step_arguments.get("element_ref") or ""),
+                            ):
+                                raise ValueError(
+                                    "checkpoint restore requires a reviewed redacted browser fill"
+                                )
+                            injected = _inject_checkpoint_secret(
+                                step_arguments,
+                                checkpoint_contract.restore_request_pointer,
+                                restore_secret,
+                            )
+                            if not isinstance(injected, dict):
+                                raise ValueError("checkpoint restore step arguments are invalid")
+                            step_arguments = injected
+                            restored_steps += 1
+                        updated.append((name, step_arguments, step_id, role))
+                    if restored_steps != 1:
+                        raise ValueError("checkpoint restore step must execute exactly once")
+                except ValueError as error:
+                    await release_unacknowledged_restore()
+                    await state_scope.pause(
+                        MissingEvidenceReason.NOT_APPLICABLE,
+                        before_refs=(before_ref,),
+                        retryable=False,
+                    )
+                    return ToolResult(
+                        content=str(error),
+                        is_error=True,
+                        metadata={
+                            **adapter_identity_metadata,
+                            "failure_code": "checkpoint_contract",
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                executable = updated
+        isolation_plan = resolve_state_isolation(
+            executable_adapter.state_capabilities,
+            checkpoint_available=(
+                checkpoint_context is not None and checkpoint_context[0] == "restore"
+            ),
+        )
+        try:
+            resource_reservations = await state_scope.reserve_resources(executable_adapter)
+        except _BrowserResourceBlocked as error:
+            await release_unacknowledged_restore()
+            await state_scope.pause(
+                MissingEvidenceReason.NOT_YET_OBSERVED,
+                before_refs=(before_ref,),
+            )
+            return ToolResult(
+                content="reviewed browser target resource is unavailable before delivery",
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "target_resource_blocked",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "resource_state": error.status.get("state"),
+                    "resource_available": error.status.get("available"),
+                    "wake_at": error.status.get("wake_at"),
+                },
+            )
+        results: list[ToolResult] = []
+        fill_step: tuple[str, str | None, str] | None = None
+        resources_acknowledged = False
+        captured_checkpoint_secret: str | None = None
+        captured_checkpoint_evidence_digest: str | None = None
+        checkpoint_step_documents: dict[str, object] = {}
+        capability_step_ids = _browser_capability_step_ids(executable_adapter)
+        isolation_bound = False
+        exchange_started = time.monotonic()
+        for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
+            if role == "interaction" and isolation_plan.isolated and not isolation_bound:
+                equivalence_key, isolation_error = _browser_isolation_baseline(
+                    executable_adapter,
+                    isolation_plan,
+                    checkpoint_step_documents,
+                )
+                rebound = bool(
+                    equivalence_key is not None
+                    and await state_scope.bind_isolated_state(
+                        equivalence_key=equivalence_key,
+                        isolation_disposition=isolation_plan.isolation_disposition,
+                        maximum_parallel_states=isolation_plan.maximum_parallel_states,
+                    )
+                )
+                if not rebound:
+                    await state_scope.release_resources(resource_reservations)
+                    await release_unacknowledged_restore()
+                    await state_scope.pause(
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                        before_refs=(before_ref,),
+                    )
+                    return ToolResult(
+                        content=(
+                            isolation_error or "reviewed browser physical state is already leased"
+                        ),
+                        is_error=True,
+                        metadata={
+                            **adapter_identity_metadata,
+                            "failure_code": "physical_state_unavailable",
+                            "attempt_disposition": "contaminated",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                        },
+                    )
+                isolation_bound = True
+            if name in {"browser_click", "browser_press"} and fill_step is not None:
+                element_ref, frame_ref, expected_value = fill_step
+                try:
+                    await session.verify_input_value(
+                        tab_ref, element_ref, expected_value, frame_ref
+                    )
                 except BrowserBoundaryError as error:
+                    await state_scope.release_resources(resource_reservations)
+                    await release_unacknowledged_restore()
+                    await state_scope.pause(
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                        before_refs=(before_ref,),
+                        action_refs=(action_ref,),
+                    )
                     return ToolResult(
                         content=str(error),
                         is_error=True,
                         metadata={**adapter_identity_metadata, "retryable": False},
                     )
+            if name in {"browser_click", "browser_press"}:
+                await state_scope.acknowledge_resources(resource_reservations)
+                resources_acknowledged = True
             step_arguments["step"] = step
             step_arguments["timeout_ms"] = timeout_ms
             result = await BrowserTool(name, self._resolver, self._recorder, self._failures).invoke(
@@ -1811,6 +2966,16 @@ class BrowserChatExchangeTool:
             )
             results.append(result)
             if result.is_error:
+                if resources_acknowledged:
+                    await state_scope.settle_resources(resource_reservations)
+                else:
+                    await state_scope.release_resources(resource_reservations)
+                    await release_unacknowledged_restore()
+                await state_scope.pause(
+                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    before_refs=(before_ref,),
+                    action_refs=(action_ref,),
+                )
                 return result.model_copy(
                     update={
                         "metadata": {
@@ -1819,47 +2984,139 @@ class BrowserChatExchangeTool:
                         }
                     }
                 )
+            if step_id is not None and step_id in capability_step_ids:
+                state_observation = await session.snapshot(tab_ref, response_frame, step=step)
+                step_document = state_observation.model_dump(mode="json")
+                durable_observation = state_observation
+                if (
+                    checkpoint_context is not None
+                    and checkpoint_context[0] == "capture"
+                    and checkpoint_contract is not None
+                    and step_id == checkpoint_contract.capture_selector.step_id
+                ):
+                    try:
+                        candidate_secret = _json_pointer_value(
+                            step_document,
+                            checkpoint_contract.capture_selector.pointer,
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        if isinstance(candidate_secret, str) and candidate_secret:
+                            redacted_document = _inject_checkpoint_secret(
+                                step_document,
+                                checkpoint_contract.capture_selector.pointer,
+                                "[checkpoint-secret-redacted]",
+                            )
+                            durable_observation = BrowserObservation.model_validate(
+                                redacted_document
+                            )
+                await self._recorder.append_observation(durable_observation)
+            else:
+                try:
+                    step_document = json.loads(result.content)
+                except json.JSONDecodeError:
+                    step_document = None
+            if step_id is not None and step_document is not None:
+                checkpoint_step_documents[step_id] = step_document
             if name == "browser_fill":
                 fill_step = (
                     str(step_arguments["element_ref"]),
                     _string(step_arguments.get("frame_ref")),
+                    str(step_arguments.get("value", "")),
                 )
+            if name in {"browser_click", "browser_press"}:
+                await state_scope.lifecycle.acknowledge(
+                    before_refs=(before_ref,),
+                    action_refs=(action_ref,),
+                )
+                await state_scope.settle_resources(resource_reservations)
+            if (
+                checkpoint_context is not None
+                and checkpoint_context[0] == "capture"
+                and checkpoint_contract is not None
+                and step_id == checkpoint_contract.capture_selector.step_id
+            ):
+                if (
+                    checkpoint_contract.capture_timing == "post_success_response"
+                    and role != "interaction"
+                ):
+                    raise ValueError(
+                        "post-success checkpoint capture requires an interaction response"
+                    )
+                if step_document is None:
+                    raise ValueError("checkpoint capture response is not structured")
+                response_document = step_document
+                capture_root = (
+                    response_document
+                    if checkpoint_contract.capture_selector.evaluation_root == "response_body"
+                    else result.metadata.get("captures", {})
+                )
+                checkpoint_secret = _json_pointer_value(
+                    capture_root,
+                    checkpoint_contract.capture_selector.pointer,
+                )
+                if not isinstance(checkpoint_secret, str) or not checkpoint_secret:
+                    raise ValueError("checkpoint capture selector did not resolve to a token")
+                captured_checkpoint_secret = checkpoint_secret
+                captured_checkpoint_evidence_digest = _checkpoint_evidence_digest(response_document)
         submitted = await session.snapshot(tab_ref, response_frame, step=len(executable) + 1)
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
         after = submitted
-        response_boundary_observed = bool(
+        response_boundary_observed = submitted.text != current.text or bool(
             response_witness
             and submitted.text.count(response_witness) > current.text.count(response_witness)
         )
+        response_boundary_complete = False
+        last_response_change = asyncio.get_running_loop().time()
+        response_settle_seconds = min(0.6, max(0.2, timeout_ms / 4_000))
         while asyncio.get_running_loop().time() < deadline:
-            if response_boundary_observed:
-                break
             await asyncio.sleep(0.2)
             candidate = await session.snapshot(tab_ref, response_frame, step=len(executable) + 2)
-            if candidate.text != submitted.text:
+            if candidate.text != after.text:
                 after = candidate
                 response_boundary_observed = True
+                last_response_change = asyncio.get_running_loop().time()
+                continue
+            if (
+                response_boundary_observed
+                and asyncio.get_running_loop().time() - last_response_change
+                >= response_settle_seconds
+            ):
+                response_boundary_complete = True
                 break
-        await self._recorder.append_observation(after)
+        public_after = after
+        checkpoint_secret = captured_checkpoint_secret or restore_secret
+        if checkpoint_secret is not None:
+            public_after = BrowserObservation.model_validate(
+                _redact_checkpoint_secret(
+                    after.model_dump(mode="json"),
+                    checkpoint_secret,
+                )
+            )
+        await self._recorder.append_observation(public_after)
         await self._recorder.save_metadata(session.metadata(restart=True))
+        after_ref = _browser_evidence_ref("after", public_after)
         exchange: dict[str, object] = {
             "id": "chat-exchange",
             "interaction": True,
             "cleanup": False,
             "request": {"prompt": prompt},
-            "response": after.text,
+            "response": public_after.text,
             "outcome": "acknowledged",
+            "response_boundary_observed": response_boundary_observed,
+            "response_boundary_complete": response_boundary_complete,
             "latency_ms": max(0, int((time.monotonic() - exchange_started) * 1_000)),
         }
         evaluation_uncertainties: list[dict[str, object]] = []
-        if not response_boundary_observed:
+        if not response_boundary_complete:
             evaluation_uncertainties.append(
                 {
                     "kind": "evaluation_uncertain",
                     "source": "browser.response_boundary",
                     "reason": (
-                        "The prompt was submitted and snapshots were retained, but no structural "
-                        "post-submit response change was observed before timeout."
+                        "The prompt was submitted and snapshots were retained, but the complete "
+                        "post-submit response did not reach a stable boundary before timeout."
                     ),
                     "confidence": 0.0,
                 }
@@ -1881,7 +3138,7 @@ class BrowserChatExchangeTool:
             exchange["evaluation_uncertainties"] = evaluation_uncertainties
             exchange["evaluation_confidence"] = 0.0
         if predicates:
-            oracle_response = json.loads(after.model_dump_json())
+            oracle_response = json.loads(public_after.model_dump_json())
             oracle_response["response_witness_text"] = _response_witness_text(
                 after.text, response_witness
             )
@@ -1901,8 +3158,159 @@ class BrowserChatExchangeTool:
                 (item for item in observations if item.get("purpose") == "objective"),
                 observations[0],
             )
+        gate_succeeded, gate_transition = _browser_checkpoint_gate_succeeded(
+            context,
+            executable_adapter,
+            checkpoint_step_documents,
+        )
+        state_transition = _browser_state_transition(
+            executable_adapter,
+            checkpoint_step_documents,
+        )
+        if state_transition:
+            exchange["target_state_transition"] = state_transition
+        if isolation_plan.isolated and state_transition.get("identity_match") is not True:
+            await release_unacknowledged_restore()
+            state_scope.isolation_disposition = "contaminated"
+            await state_scope.settle(
+                before_refs=(before_ref,),
+                action_refs=(action_ref,),
+                response_refs=(after_ref,),
+                after_refs=(after_ref,),
+                transition_disposition="ambiguous",
+                cleanup_disposition="retained",
+            )
+            return ToolResult(
+                content="reviewed browser physical-state identity changed during delivery",
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "physical_state_contaminated",
+                    "attempt_disposition": "contaminated",
+                    "retryable": True,
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "target_state_transition": state_transition,
+                    "target_exchanges": [exchange],
+                },
+            )
+        if checkpoint_context is not None:
+            assert checkpoint_contract is not None
+            assert self._checkpoint_store is not None
+            assert self._checkpoint_vault is not None
+            intent, gate_id, recipe_digest, manifest_digest = checkpoint_context
+            if (
+                not state_scope.lifecycle.acknowledged
+                or not response_boundary_complete
+                or not gate_succeeded
+            ):
+                await state_scope.pause(
+                    MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                    before_refs=(before_ref,),
+                    action_refs=(action_ref,),
+                )
+                return ToolResult(
+                    content=(
+                        "checkpoint retention requires an acknowledged, authoritative "
+                        "successful prerequisite response"
+                    ),
+                    is_error=True,
+                    metadata={
+                        **adapter_identity_metadata,
+                        "failure_code": "checkpoint_success_unproven",
+                        "retryable": True,
+                        "target_effect_attempted": True,
+                        "target_state_transition": gate_transition,
+                        "target_exchanges": [exchange],
+                    },
+                )
+            if intent == "capture":
+                if (
+                    captured_checkpoint_secret is None
+                    or captured_checkpoint_evidence_digest is None
+                ):
+                    await state_scope.pause(
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                        before_refs=(before_ref,),
+                        action_refs=(action_ref,),
+                    )
+                    return ToolResult(
+                        content="reviewed checkpoint capture selector produced no handle",
+                        is_error=True,
+                        metadata={
+                            **adapter_identity_metadata,
+                            "failure_code": "checkpoint_capture_missing",
+                            "retryable": True,
+                        },
+                    )
+                entry = await asyncio.to_thread(
+                    self._checkpoint_vault.store_checkpoint,
+                    captured_checkpoint_secret,
+                    campaign_id=context.campaign_id,
+                    gate_id=gate_id,
+                )
+                opaque_reference = entry.opaque_reference()
+                try:
+                    await asyncio.to_thread(
+                        self._checkpoint_store.record_objective_gate_checkpoint,
+                        context.campaign_id,
+                        gate_id,
+                        manifest_digest=manifest_digest,
+                        recipe_digest=recipe_digest,
+                        checkpoint_handle=opaque_reference,
+                        evidence_digest=captured_checkpoint_evidence_digest,
+                        scope_id=state_scope.lifecycle.scope_id,
+                        claim_id=state_scope.claim_id,
+                        claimant_id=state_scope.claimant_id,
+                    )
+                except BaseException:
+                    keyed_digest = entry.keyed_digest()
+                    await asyncio.to_thread(
+                        self._checkpoint_vault.delete_checkpoint,
+                        entry.reference_id,
+                        expected_digest=str(keyed_digest["digest"]),
+                    )
+                    raise
+                checkpoint_receipt = {
+                    "gate_id": gate_id,
+                    "recipe_digest": recipe_digest,
+                    "checkpoint_reference": opaque_reference,
+                    "evidence_digest": captured_checkpoint_evidence_digest,
+                    "captured": True,
+                }
+            else:
+                assert restore_claimed
+                restore_evidence_digest = _checkpoint_evidence_digest(public_after)
+                await asyncio.to_thread(
+                    self._checkpoint_store.mark_objective_gate_checkpoint_restored,
+                    context.campaign_id,
+                    gate_id,
+                    scope_id=state_scope.lifecycle.scope_id,
+                    claim_id=state_scope.claim_id,
+                    claimant_id=state_scope.claimant_id,
+                    evidence_digest=restore_evidence_digest,
+                )
+                checkpoint_receipt = {
+                    "gate_id": gate_id,
+                    "recipe_digest": recipe_digest,
+                    "checkpoint_reference": dict(
+                        context.objective_phase_checkpoint_reference or {}
+                    ),
+                    "evidence_digest": restore_evidence_digest,
+                    "restored": True,
+                }
+            captured_checkpoint_secret = None
+            restore_secret = None
+        await state_scope.settle(
+            before_refs=(before_ref,),
+            action_refs=(action_ref,),
+            response_refs=(after_ref,),
+            after_refs=(after_ref,),
+            transition_disposition=("unchanged" if response_boundary_complete else "ambiguous"),
+            cleanup_disposition="retained",
+        )
         return ToolResult(
-            content=after.model_dump_json(),
+            content=public_after.model_dump_json(),
             metadata={
                 **adapter_identity_metadata,
                 "compiled_flow": "merlin.browser-flow.v1",
@@ -1910,9 +3318,16 @@ class BrowserChatExchangeTool:
                 "input_value_verified": True,
                 "response_witness": response_witness,
                 "response_boundary_observed": response_boundary_observed,
+                "response_boundary_complete": response_boundary_complete,
+                "attempt_disposition": "valid" if response_boundary_complete else "uncertain",
                 "target": session.bounds.target_id,
                 "target_session_id": f"browser:{session.context_id}",
                 "target_exchanges": [exchange],
+                **(
+                    {"objective_phase_checkpoint": checkpoint_receipt}
+                    if checkpoint_receipt is not None
+                    else {}
+                ),
             },
         )
 
@@ -2815,6 +4230,24 @@ class CompiledApiReconHandoffTool:
                                 },
                                 "baseline_selector": {"$ref": "#/$defs/state_selector"},
                                 "result_selector": {"$ref": "#/$defs/state_selector"},
+                                "value_type": {
+                                    "type": "string",
+                                    "enum": ["integer", "number", "string", "boolean"],
+                                },
+                                "minimum_value": {"type": "number"},
+                                "maximum_value": {"type": "number"},
+                                "monotonicity": {
+                                    "type": "string",
+                                    "enum": ["nondecreasing", "nonincreasing"],
+                                },
+                                "trust_class": {
+                                    "const": "target_reported",
+                                    "description": (
+                                        "Browser API response fields are target-reported. "
+                                        "Host-observed and independent-authority trust require "
+                                        "separate reviewed evidence sources."
+                                    ),
+                                },
                                 "preferred_direction": {
                                     "type": "string",
                                     "enum": ["increase", "decrease"],
@@ -2855,6 +4288,226 @@ class CompiledApiReconHandoffTool:
                             "additionalProperties": False,
                         },
                     },
+                    "identity_equivalence_rules": {
+                        "type": "array",
+                        "description": (
+                            "Reviewed equality links that prove physical-state continuity when "
+                            "the target rotates its displayed identifier."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "relation": {"const": "equal"},
+                                "left_selector": {"$ref": "#/$defs/state_selector"},
+                                "right_selector": {"$ref": "#/$defs/state_selector"},
+                            },
+                            "required": [
+                                "name",
+                                "relation",
+                                "left_selector",
+                                "right_selector",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "corroboration_rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "observation_names": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 2,
+                                    "uniqueItems": True,
+                                },
+                                "minimum_agreement": {"type": "integer", "minimum": 2},
+                            },
+                            "required": [
+                                "name",
+                                "observation_names",
+                                "minimum_agreement",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "resource_ownership": {
+                        "type": "array",
+                        "description": (
+                            "Reviewed bindings from quota, rate-limit, or budget observations to "
+                            "a principal at the compiled adapter origin."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "resource_kind": {
+                                    "type": "string",
+                                    "enum": ["quota", "rate_limit", "budget"],
+                                },
+                                "resource_observation_name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "principal_selector": {"$ref": "#/$defs/state_selector"},
+                                "reset_selector": {"$ref": "#/$defs/state_selector"},
+                            },
+                            "required": [
+                                "name",
+                                "resource_kind",
+                                "resource_observation_name",
+                                "principal_selector",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "supported_modalities": {
+                        "type": "array",
+                        "description": (
+                            "Request modalities demonstrated by the captured interaction. "
+                            "Unsupported or unbound declarations remain advisory."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "modality": {
+                                    "type": "string",
+                                    "enum": ["text", "image", "audio", "file", "mixed"],
+                                },
+                                "request_pointer": {"type": "string", "pattern": "^/"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "required": ["modality", "request_pointer", "confidence"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "state_affordances": {
+                        "type": "array",
+                        "description": (
+                            "State-management operations independently demonstrated by exact "
+                            "captured request/response exchanges before the selected interaction."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["clone_state", "restore_checkpoint", "reset_state"],
+                                },
+                                "method": {
+                                    "type": "string",
+                                    "enum": ["POST", "PUT", "PATCH", "DELETE"],
+                                },
+                                "url": {"type": "string", "minLength": 1},
+                                "status_codes": {
+                                    "type": "array",
+                                    "items": {"type": "integer", "minimum": 200, "maximum": 299},
+                                    "minItems": 1,
+                                    "uniqueItems": True,
+                                },
+                                "pointer": {"type": "string", "pattern": "^(?:|/.*)$"},
+                                "identity_pointer": {
+                                    "type": "string",
+                                    "pattern": "^/",
+                                    "description": (
+                                        "For clone_state, the new physical-state identity in "
+                                        "the clone response. It must differ from baseline and "
+                                        "match the selected interaction identity."
+                                    ),
+                                },
+                                "match_values": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": ["string", "number", "integer", "boolean", "null"]
+                                    },
+                                    "minItems": 1,
+                                    "uniqueItems": True,
+                                },
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "required": [
+                                "kind",
+                                "method",
+                                "url",
+                                "status_codes",
+                                "pointer",
+                                "match_values",
+                                "confidence",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "checkpoint": {
+                        "type": "object",
+                        "properties": {
+                            "capture_selector": {"$ref": "#/$defs/state_selector"},
+                            "capture_timing": {
+                                "type": "string",
+                                "enum": ["post_success_response", "live_handle"],
+                            },
+                            "binding_name": {
+                                "type": "string",
+                                "pattern": "^[a-z][a-z0-9_]*$",
+                            },
+                            "restore_request_pointer": {"type": "string", "pattern": "^/"},
+                        },
+                        "required": [
+                            "capture_selector",
+                            "capture_timing",
+                            "binding_name",
+                            "restore_request_pointer",
+                        ],
+                        "additionalProperties": False,
+                    },
+                    "resource_controls": {
+                        "type": "array",
+                        "description": (
+                            "Executable quota or rate controls bound to ownership plus an exact "
+                            "captured structured block response."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "ownership_name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "limit": {"type": "integer", "minimum": 1},
+                                "window_key": {"type": "string", "minLength": 1},
+                                "status_codes": {
+                                    "type": "array",
+                                    "items": {"type": "integer", "minimum": 400, "maximum": 599},
+                                    "minItems": 1,
+                                    "uniqueItems": True,
+                                },
+                                "retry_after_seconds_pointer": {
+                                    "type": "string",
+                                    "pattern": "^(?:|/.*)$",
+                                },
+                                "wake_at_pointer": {
+                                    "type": "string",
+                                    "pattern": "^(?:|/.*)$",
+                                },
+                            },
+                            "required": ["ownership_name", "limit", "window_key", "status_codes"],
+                            "oneOf": [
+                                {"required": ["retry_after_seconds_pointer"]},
+                                {"required": ["wake_at_pointer"]},
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "$defs": {
                     "state_selector": {
@@ -2870,6 +4523,7 @@ class CompiledApiReconHandoffTool:
                             },
                             "evaluation_root": {"const": "response_body"},
                             "pointer": {"type": "string", "pattern": "^/"},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         },
                         "required": ["step_id", "evaluation_root", "pointer"],
                         "additionalProperties": False,
@@ -4414,6 +6068,7 @@ class CompiledApiReconHandoffTool:
             )
 
         state_observations: list[dict[str, object]] = []
+        observation_values_by_name: dict[str, dict[str, object]] = {}
         reviewed_state_identities: list[dict[str, object]] = []
         state_evidence_by_step_id: dict[
             str,
@@ -4435,13 +6090,21 @@ class CompiledApiReconHandoffTool:
         for raw_observation in arguments.get("state_observations", []):
             if not isinstance(raw_observation, Mapping):
                 continue
-            selectors: dict[str, dict[str, str]] = {}
+            selectors: dict[str, dict[str, object]] = {}
             observation_evidence_refs: list[str] = []
+            observed_values: dict[str, object] = {}
             for selector_name in ("baseline_selector", "result_selector"):
                 raw_selector = raw_observation.get(selector_name)
                 if not isinstance(raw_selector, Mapping):
                     break
                 step_id = raw_selector.get("step_id")
+                expected_step_id = (
+                    "observed-session-setup"
+                    if selector_name == "baseline_selector"
+                    else "observed-message-exchange"
+                )
+                if step_id != expected_step_id:
+                    break
                 pointer = raw_selector.get("pointer")
                 observed_event, observed_evidence = state_evidence_by_step_id.get(
                     str(step_id), (None, ())
@@ -4453,13 +6116,23 @@ class CompiledApiReconHandoffTool:
                 )
                 if observed_value is _MISSING:
                     break
+                response_evidence = tuple(
+                    (reference, payload)
+                    for reference, payload in observed_evidence
+                    if payload.get("part") == "response"
+                )
+                selector_evidence_refs = [reference for reference, _ in response_evidence]
                 selectors[selector_name] = {
+                    "schema_version": "merlin.state-selector.v1",
                     "step_id": str(step_id),
                     "evaluation_root": "response_body",
                     "pointer": str(pointer),
+                    "evidence_refs": selector_evidence_refs,
+                    "confidence": float(raw_selector.get("confidence", 1.0)),
                 }
-                observation_evidence_refs.extend(reference for reference, _ in observed_evidence)
-                capability_evidence_by_ref.update(dict(observed_evidence))
+                observed_values[selector_name] = observed_value
+                observation_evidence_refs.extend(selector_evidence_refs)
+                capability_evidence_by_ref.update(dict(response_evidence))
             if set(selectors) != {"baseline_selector", "result_selector"}:
                 evaluation_uncertainties.append(
                     _evaluation_uncertainty(
@@ -4469,17 +6142,105 @@ class CompiledApiReconHandoffTool:
                     )
                 )
                 continue
+            value_type = raw_observation.get("value_type")
+            value_type_matches = {
+                "integer": lambda value: type(value) is int,
+                "number": lambda value: type(value) in {int, float},
+                "string": lambda value: isinstance(value, str),
+                "boolean": lambda value: type(value) is bool,
+            }
+            if value_type is None:
+                if all(type(value) is int for value in observed_values.values()):
+                    value_type = "integer"
+                elif all(type(value) in {int, float} for value in observed_values.values()):
+                    value_type = "number"
+                elif all(isinstance(value, str) for value in observed_values.values()):
+                    value_type = "string"
+                elif all(type(value) is bool for value in observed_values.values()):
+                    value_type = "boolean"
+            if value_type is not None and (
+                value_type not in value_type_matches
+                or not all(
+                    value_type_matches[str(value_type)](value) for value in observed_values.values()
+                )
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_observations",
+                        "A state observation did not match its reviewed value type and was not "
+                        "made executable.",
+                    )
+                )
+                continue
+            numeric_values = tuple(
+                value for value in observed_values.values() if type(value) in {int, float}
+            )
+            minimum_value = raw_observation.get("minimum_value")
+            maximum_value = raw_observation.get("maximum_value")
+            if (minimum_value is not None or maximum_value is not None) and len(
+                numeric_values
+            ) != len(observed_values):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_observations",
+                        "Numeric bounds were declared for a non-numeric state observation and "
+                        "were not made executable.",
+                    )
+                )
+                continue
+            if (
+                minimum_value is not None and any(value < minimum_value for value in numeric_values)
+            ) or (
+                maximum_value is not None and any(value > maximum_value for value in numeric_values)
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_observations",
+                        "A state observation fell outside its reviewed bounds and was not made "
+                        "executable.",
+                    )
+                )
+                continue
+            monotonicity = raw_observation.get("monotonicity")
+            baseline_value = observed_values["baseline_selector"]
+            result_value = observed_values["result_selector"]
+            if monotonicity is not None and (
+                type(baseline_value) not in {int, float}
+                or type(result_value) not in {int, float}
+                or (monotonicity == "nondecreasing" and result_value < baseline_value)
+                or (monotonicity == "nonincreasing" and result_value > baseline_value)
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_observations",
+                        "A state observation contradicted its reviewed monotonic rule and was "
+                        "not made executable.",
+                    )
+                )
+                continue
             observation = {
                 "name": str(raw_observation["name"]),
                 "role": str(raw_observation["role"]),
                 **selectors,
                 "evidence_refs": list(dict.fromkeys(observation_evidence_refs)),
+                "trust_class": "target_reported",
             }
-            for optional_key in ("preferred_direction", "success_values", "failure_values"):
+            if value_type is not None:
+                observation["value_type"] = str(value_type)
+            for optional_key in (
+                "preferred_direction",
+                "success_values",
+                "failure_values",
+                "value_type",
+                "minimum_value",
+                "maximum_value",
+                "monotonicity",
+            ):
                 if optional_key in raw_observation:
                     value = raw_observation[optional_key]
                     observation[optional_key] = list(value) if isinstance(value, list) else value
             state_observations.append(observation)
+            observation_values_by_name[str(observation["name"])] = observed_values
             if observation["role"] == "state_identity":
                 reviewed_state_identities.append(
                     {
@@ -4500,6 +6261,515 @@ class CompiledApiReconHandoffTool:
                     "capability was sealed.",
                 )
             )
+        identity_equivalence_rules: list[dict[str, object]] = []
+        resource_ownership: list[dict[str, object]] = []
+        corroboration_rules: list[dict[str, object]] = []
+
+        def compile_state_selector(
+            raw_selector: object,
+        ) -> tuple[dict[str, object], object] | None:
+            if not isinstance(raw_selector, Mapping):
+                return None
+            step_id = str(raw_selector.get("step_id") or "")
+            pointer = raw_selector.get("pointer")
+            observed_event, observed_evidence = state_evidence_by_step_id.get(step_id, (None, ()))
+            observed_value = (
+                _json_pointer_value_or_missing(observed_event.get("response_json"), pointer)
+                if observed_event is not None and isinstance(pointer, str)
+                else _MISSING
+            )
+            if observed_value is _MISSING:
+                return None
+            response_evidence = tuple(
+                (reference, payload)
+                for reference, payload in observed_evidence
+                if payload.get("part") == "response"
+            )
+            capability_evidence_by_ref.update(dict(response_evidence))
+            return (
+                {
+                    "schema_version": "merlin.state-selector.v1",
+                    "step_id": step_id,
+                    "evaluation_root": "response_body",
+                    "pointer": str(pointer),
+                    "evidence_refs": [reference for reference, _ in response_evidence],
+                    "confidence": float(raw_selector.get("confidence", 1.0)),
+                },
+                observed_value,
+            )
+
+        for raw_rule in arguments.get("identity_equivalence_rules", []):
+            if not isinstance(raw_rule, Mapping):
+                continue
+            left = compile_state_selector(raw_rule.get("left_selector"))
+            right = compile_state_selector(raw_rule.get("right_selector"))
+            if (
+                reviewed_state_identity is None
+                or left is None
+                or right is None
+                or left[0]["step_id"] != "observed-session-setup"
+                or right[0]["step_id"] != "observed-message-exchange"
+                or type(left[1]) is not type(right[1])
+                or left[1] != right[1]
+                or {key: left[0][key] for key in ("step_id", "evaluation_root", "pointer")}
+                == {key: right[0][key] for key in ("step_id", "evaluation_root", "pointer")}
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.identity_equivalence_rules",
+                        "A rotating-identity equivalence rule lacked distinct, equal, exact "
+                        "captured linkage values and was not made executable.",
+                    )
+                )
+                continue
+            rule_evidence_refs = list(
+                dict.fromkeys(
+                    [
+                        *left[0]["evidence_refs"],
+                        *right[0]["evidence_refs"],
+                    ]
+                )
+            )
+            identity_equivalence_rules.append(
+                {
+                    "name": str(raw_rule["name"]),
+                    "relation": "equal",
+                    "left_selector": left[0],
+                    "right_selector": right[0],
+                    "evidence_refs": rule_evidence_refs,
+                }
+            )
+
+        for raw_rule in arguments.get("corroboration_rules", []):
+            if not isinstance(raw_rule, Mapping):
+                continue
+            names = raw_rule.get("observation_names")
+            minimum_agreement = raw_rule.get("minimum_agreement")
+            if not isinstance(names, list) or type(minimum_agreement) is not int:
+                continue
+            named_observations = [
+                next(
+                    (
+                        observation
+                        for observation in state_observations
+                        if observation.get("name") == str(name)
+                    ),
+                    None,
+                )
+                for name in names
+            ]
+            trust_classes = {
+                observation.get("trust_class")
+                for observation in named_observations
+                if observation is not None
+            }
+            if not trust_classes & {"host_observed", "independent_authority"}:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.corroboration_rules",
+                        "Agreement between target-reported fields is not independent "
+                        "corroboration; the requested rule remains advisory.",
+                    )
+                )
+                continue
+            named_values = [observation_values_by_name.get(str(name)) for name in names]
+            if any(values is None for values in named_values):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.corroboration_rules",
+                        "A corroboration rule referenced an unavailable observation and was not "
+                        "made executable.",
+                    )
+                )
+                continue
+            agrees = True
+            for selector_name in ("baseline_selector", "result_selector"):
+                values = [item[selector_name] for item in named_values if item is not None]
+                greatest_agreement = max(
+                    (
+                        sum(type(other) is type(value) and other == value for other in values)
+                        for value in values
+                    ),
+                    default=0,
+                )
+                if greatest_agreement < minimum_agreement:
+                    agrees = False
+                    break
+            if not agrees:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.corroboration_rules",
+                        "Captured observation values did not satisfy a reviewed corroboration "
+                        "rule, so the rule was not made executable.",
+                    )
+                )
+                continue
+            corroboration_rules.append(
+                {
+                    "name": str(raw_rule["name"]),
+                    "observation_names": [str(name) for name in names],
+                    "minimum_agreement": minimum_agreement,
+                }
+            )
+
+        observations_by_name = {
+            str(observation["name"]): observation for observation in state_observations
+        }
+        for raw_ownership in arguments.get("resource_ownership", []):
+            if not isinstance(raw_ownership, Mapping):
+                continue
+            observation_name = str(raw_ownership.get("resource_observation_name") or "")
+            resource_observation = observations_by_name.get(observation_name)
+            principal = compile_state_selector(raw_ownership.get("principal_selector"))
+            reset = (
+                compile_state_selector(raw_ownership.get("reset_selector"))
+                if "reset_selector" in raw_ownership
+                else None
+            )
+            principal_value = principal[1] if principal is not None else None
+            principal_is_safe_scalar = (
+                isinstance(principal_value, (str, int))
+                and not isinstance(principal_value, bool)
+                and str(principal_value) != ""
+            )
+            if (
+                resource_observation is None
+                or resource_observation.get("role") != "budget_remaining"
+                or principal is None
+                or principal[0]["step_id"] != "observed-session-setup"
+                or not principal_is_safe_scalar
+                or ("reset_selector" in raw_ownership and reset is None)
+                or (reset is not None and reset[0]["step_id"] != "observed-session-setup")
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.resource_ownership",
+                        "A resource ownership declaration lacked an exact principal, reset, or "
+                        "budget observation binding and was not made executable.",
+                    )
+                )
+                continue
+            ownership_evidence_refs = list(principal[0]["evidence_refs"])
+            if reset is not None:
+                ownership_evidence_refs.extend(reset[0]["evidence_refs"])
+            ownership_evidence_refs.extend(resource_observation["evidence_refs"])
+            resource_ownership.append(
+                {
+                    "name": str(raw_ownership["name"]),
+                    "resource_kind": str(raw_ownership["resource_kind"]),
+                    "resource_observation_name": observation_name,
+                    "principal_selector": principal[0],
+                    "authority": "adapter_origin",
+                    **({"reset_selector": reset[0]} if reset is not None else {}),
+                    "evidence_refs": list(dict.fromkeys(ownership_evidence_refs)),
+                }
+            )
+        supported_modalities: list[dict[str, object]] = []
+        for raw_modality in arguments.get("supported_modalities", []):
+            if not isinstance(raw_modality, Mapping):
+                continue
+            try:
+                modality_pointer = _normalize_json_pointer(raw_modality.get("request_pointer"))
+            except ValueError:
+                modality_pointer = ""
+            observed_modality_value = _json_pointer_value_or_missing(request_json, modality_pointer)
+            modality = str(raw_modality.get("modality") or "")
+            if (
+                modality_pointer != input_pointer
+                or observed_modality_value is _MISSING
+                or modality != "text"
+                or not isinstance(observed_modality_value, str)
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.supported_modalities",
+                        "A modality declaration was not bound to the exact captured input and "
+                        "remains advisory.",
+                    )
+                )
+                continue
+            capability_evidence_by_ref[request_evidence_ref] = request_evidence
+            supported_modalities.append(
+                {
+                    "modality": modality,
+                    "step_id": "observed-message-exchange",
+                    "request_pointer": modality_pointer,
+                    "evidence_refs": [request_evidence_ref],
+                    "confidence": float(raw_modality.get("confidence", 1.0)),
+                }
+            )
+
+        resource_controls: list[dict[str, object]] = []
+        known_ownership = {str(item["name"]) for item in resource_ownership}
+        for raw_control in arguments.get("resource_controls", []):
+            if not isinstance(raw_control, Mapping):
+                continue
+            ownership_name = str(raw_control.get("ownership_name") or "")
+            status_codes = raw_control.get("status_codes")
+            retry_pointer = raw_control.get("retry_after_seconds_pointer")
+            wake_pointer = raw_control.get("wake_at_pointer")
+            wake_key = (
+                "retry_after_seconds_pointer"
+                if isinstance(retry_pointer, str)
+                else "wake_at_pointer"
+            )
+            wake_value = retry_pointer if isinstance(retry_pointer, str) else wake_pointer
+            matching_blocks = [
+                candidate
+                for candidate in all_context_exchanges
+                if candidate.get("method") == method
+                and candidate.get("url") == url
+                and isinstance(status_codes, list)
+                and candidate.get("status") in status_codes
+                and isinstance(wake_value, str)
+                and _json_pointer_value_or_missing(candidate.get("response_json"), wake_value)
+                is not _MISSING
+            ]
+            if (
+                ownership_name not in known_ownership
+                or not matching_blocks
+                or (isinstance(retry_pointer, str) == isinstance(wake_pointer, str))
+            ):
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.resource_controls",
+                        "A resource control lacked reviewed ownership or an exact structured "
+                        "block response and remains advisory.",
+                    )
+                )
+                continue
+            block_evidence_refs: list[str] = []
+            for block in matching_blocks:
+                response_ref, response_payload = _captured_api_evidence(session, block, "response")
+                capability_evidence_by_ref[response_ref] = response_payload
+                block_evidence_refs.append(response_ref)
+            resource_controls.append(
+                {
+                    "ownership_name": ownership_name,
+                    "step_id": "observed-message-exchange",
+                    "reservation_amount": 1,
+                    "limit": int(raw_control["limit"]),
+                    "window_key": str(raw_control["window_key"]),
+                    "structured_blocks": [
+                        {
+                            "status_codes": list(status_codes),
+                            wake_key: str(wake_value),
+                            "evidence_refs": list(dict.fromkeys(block_evidence_refs)),
+                        }
+                    ],
+                }
+            )
+
+        state_affordances: list[dict[str, object]] = []
+        auxiliary_setup_steps: list[dict[str, object]] = []
+        affordance_step_ids: dict[str, str] = {}
+        for raw_affordance in arguments.get("state_affordances", []):
+            if not isinstance(raw_affordance, Mapping):
+                continue
+            affordance_kind = str(raw_affordance.get("kind") or "")
+            affordance_method = str(raw_affordance.get("method") or "").upper()
+            affordance_url = str(raw_affordance.get("url") or "")
+            affordance_statuses = raw_affordance.get("status_codes")
+            affordance_pointer = raw_affordance.get("pointer")
+            affordance_values = raw_affordance.get("match_values")
+            candidates = [
+                candidate
+                for candidate in exchanges[:event_index]
+                if candidate.get("method") == affordance_method
+                and candidate.get("url") == affordance_url
+                and isinstance(affordance_statuses, list)
+                and candidate.get("status") in affordance_statuses
+                and isinstance(affordance_pointer, str)
+                and isinstance(affordance_values, list)
+                and any(
+                    type(observed) is type(expected) and observed == expected
+                    for observed in [
+                        _json_pointer_value_or_missing(
+                            candidate.get("response_json"), affordance_pointer
+                        )
+                    ]
+                    for expected in affordance_values
+                )
+            ]
+            if len(candidates) != 1 or setup_step is None:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_affordances",
+                        "A state affordance did not have one exact captured pre-interaction "
+                        "exchange and remains advisory.",
+                    )
+                )
+                continue
+            affordance_event = candidates[0]
+            if affordance_kind == "clone_state":
+                clone_identity_pointer = raw_affordance.get("identity_pointer")
+                identity_values = next(
+                    (
+                        observation_values_by_name.get(str(observation["name"]))
+                        for observation in state_observations
+                        if observation.get("role") == "state_identity"
+                    ),
+                    None,
+                )
+                clone_identity = (
+                    _json_pointer_value_or_missing(
+                        affordance_event.get("response_json"), clone_identity_pointer
+                    )
+                    if isinstance(clone_identity_pointer, str)
+                    else _MISSING
+                )
+                if (
+                    identity_values is None
+                    or clone_identity is _MISSING
+                    or clone_identity == identity_values["baseline_selector"]
+                    or type(clone_identity) is not type(identity_values["result_selector"])
+                    or clone_identity != identity_values["result_selector"]
+                ):
+                    evaluation_uncertainties.append(
+                        _evaluation_uncertainty(
+                            "browser_compile_api_handoff.state_affordances",
+                            "A clone affordance did not prove a distinct physical identity that "
+                            "continued into the selected interaction and remains advisory.",
+                        )
+                    )
+                    continue
+            affordance_evidence = (
+                _captured_api_evidence(session, affordance_event, "request"),
+                _captured_api_evidence(session, affordance_event, "response"),
+            )
+            capability_evidence_by_ref.update(dict(affordance_evidence))
+            if affordance_event is setup_event:
+                affordance_step_id = "observed-session-setup"
+            else:
+                affordance_step_id = "observed-" + affordance_kind.replace("_", "-")
+                affordance_request = affordance_event.get("request_json")
+                if affordance_request is None:
+                    affordance_request = {}
+                for binding_value, capture_name in capture_names.items():
+                    affordance_request = _replace_json_value(
+                        affordance_request,
+                        binding_value,
+                        f"{{{{capture:{capture_name}}}}}",
+                    )
+                auxiliary_setup_steps.append(
+                    {
+                        "step_id": affordance_step_id,
+                        "endpoint": affordance_url,
+                        "method": affordance_method,
+                        "request_template": affordance_request,
+                        "response_selector": str(affordance_pointer),
+                        "success_witness": "captured state-management response is reproduced",
+                        "expected_status": int(affordance_event["status"]),
+                        "idempotency_key": None,
+                        "replay_after_ambiguous_result": False,
+                        "cleanup": False,
+                        "interaction": False,
+                        "captures": {},
+                        "repeat": 1,
+                    }
+                )
+            affordance_step_ids[affordance_kind] = affordance_step_id
+            state_affordances.append(
+                {
+                    "kind": affordance_kind,
+                    "step_id": affordance_step_id,
+                    "evaluation_root": "response_body",
+                    "evidence_refs": [reference for reference, _ in affordance_evidence],
+                    "confidence": float(raw_affordance.get("confidence", 1.0)),
+                }
+            )
+        if cleanup_event is not None:
+            state_affordances.append(
+                {
+                    "kind": "cleanup_state",
+                    "step_id": "observed-cleanup-exchange",
+                    "evaluation_root": "response_body",
+                    "evidence_refs": cleanup_evidence_refs,
+                    "confidence": 1.0,
+                }
+            )
+
+        checkpoint: dict[str, object] | None = None
+        if "restore_checkpoint" in affordance_step_ids:
+            raw_checkpoint = arguments.get("checkpoint")
+            capture = (
+                compile_state_selector(raw_checkpoint.get("capture_selector"))
+                if isinstance(raw_checkpoint, Mapping)
+                else None
+            )
+            binding_name = (
+                str(raw_checkpoint.get("binding_name") or "")
+                if isinstance(raw_checkpoint, Mapping)
+                else ""
+            )
+            restore_pointer = (
+                str(raw_checkpoint.get("restore_request_pointer") or "")
+                if isinstance(raw_checkpoint, Mapping)
+                else ""
+            )
+            restore_step_id = affordance_step_ids["restore_checkpoint"]
+            restore_step = next(
+                (step for step in auxiliary_setup_steps if step["step_id"] == restore_step_id),
+                setup_step if restore_step_id == "observed-session-setup" else None,
+            )
+            restore_request = (
+                restore_step.get("request_template") if isinstance(restore_step, Mapping) else None
+            )
+            restored_value = _json_pointer_value_or_missing(restore_request, restore_pointer)
+            expected_capture_placeholder = f"{{{{capture:{binding_name}}}}}"
+            restore_binding_matches = capture is not None and (
+                (type(restored_value) is type(capture[1]) and restored_value == capture[1])
+                or restored_value == expected_capture_placeholder
+            )
+            if (
+                capture is None
+                or not binding_name
+                or capture[0]["step_id"] != "observed-session-setup"
+                or restored_value is _MISSING
+                or not restore_binding_matches
+                or not isinstance(restore_step, dict)
+                or not isinstance(setup_step, dict)
+            ):
+                state_affordances = [
+                    item for item in state_affordances if item["kind"] != "restore_checkpoint"
+                ]
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.checkpoint",
+                        "The restore affordance lacked an exact setup-captured handle binding "
+                        "and remains advisory.",
+                    )
+                )
+            else:
+                setup_captures = setup_step.setdefault("captures", {})
+                assert isinstance(setup_captures, dict)
+                setup_captures[binding_name] = capture[0]["pointer"]
+                restore_step["request_template"] = _replace_json_pointer(
+                    restore_request,
+                    restore_pointer,
+                    f"{{{{capture:{binding_name}}}}}",
+                )
+                checkpoint_evidence_refs = list(
+                    dict.fromkeys(
+                        [
+                            *capture[0]["evidence_refs"],
+                            *next(
+                                item["evidence_refs"]
+                                for item in state_affordances
+                                if item["kind"] == "restore_checkpoint"
+                            ),
+                        ]
+                    )
+                )
+                checkpoint = {
+                    "schema_version": "merlin.state-checkpoint.v1",
+                    "capture_selector": capture[0],
+                    "capture_timing": "live_handle",
+                    "binding_name": binding_name,
+                    "restore_step_id": restore_step_id,
+                    "restore_request_pointer": restore_pointer,
+                    "evidence_refs": checkpoint_evidence_refs,
+                }
         capability_evidence = tuple(capability_evidence_by_ref.items())
         message_step: dict[str, object] = {
             "step_id": "observed-message-exchange",
@@ -4617,6 +6887,7 @@ class CompiledApiReconHandoffTool:
                 "expected_status": int(event["status"]),
             },
             "api_steps": ([setup_step] if setup_step is not None else [])
+            + auxiliary_setup_steps
             + [message_step]
             + (
                 [
@@ -4651,9 +6922,65 @@ class CompiledApiReconHandoffTool:
             adapter["observed_evidence"] = list(
                 dict.fromkeys([*adapter["observed_evidence"], *capability_evidence_by_ref])
             )
-        if state_observations:
+        has_state_capabilities = bool(
+            state_observations
+            or state_affordances
+            or supported_modalities
+            or resource_controls
+            or resource_ownership
+        )
+        if has_state_capabilities:
+            baseline_by_kind = {
+                "restore_checkpoint": ("restore", "independent"),
+                "clone_state": ("clone", "independent"),
+                "reset_state": ("reset", "serialized"),
+            }
+            selected_baseline = next(
+                (
+                    baseline_by_kind[str(item["kind"])]
+                    for item in state_affordances
+                    if str(item["kind"]) in baseline_by_kind
+                ),
+                None,
+            )
+            lifecycle_evidence_refs = list(
+                dict.fromkeys(
+                    reference for item in state_affordances for reference in item["evidence_refs"]
+                )
+            )
             adapter["state_capabilities"] = {
+                "schema_version": "merlin.state-capabilities.v1",
                 "observations": state_observations,
+                **({"corroboration_rules": corroboration_rules} if corroboration_rules else {}),
+                **(
+                    {"identity_equivalence_rules": identity_equivalence_rules}
+                    if identity_equivalence_rules
+                    else {}
+                ),
+                **({"resource_ownership": resource_ownership} if resource_ownership else {}),
+                **({"resource_controls": resource_controls} if resource_controls else {}),
+                **({"supported_modalities": supported_modalities} if supported_modalities else {}),
+                **({"affordances": state_affordances} if state_affordances else {}),
+                **({"checkpoint": checkpoint} if checkpoint is not None else {}),
+                **(
+                    {
+                        "lifecycle": {
+                            "baseline": (
+                                selected_baseline[0] if selected_baseline is not None else "unknown"
+                            ),
+                            "isolation": (
+                                selected_baseline[1] if selected_baseline is not None else "unknown"
+                            ),
+                            "cleanup": ("explicit" if cleanup_event is not None else "unknown"),
+                            "evidence_refs": lifecycle_evidence_refs,
+                            "confidence": min(
+                                float(item["confidence"]) for item in state_affordances
+                            ),
+                        }
+                    }
+                    if lifecycle_evidence_refs
+                    else {}
+                ),
                 **(
                     {"identity": reviewed_state_identity}
                     if reviewed_state_identity is not None
@@ -4729,25 +7056,65 @@ class CompiledApiReconHandoffTool:
             ):
                 freshness = adapter["session_freshness_predicate"]
                 assert isinstance(freshness, Mapping)
-                state_capabilities["affordances"] = [
+                freshness_evidence_refs = list(freshness["evidence_refs"])
+                affordances = list(state_capabilities.get("affordances", []))
+                affordances.insert(
+                    0,
                     {
                         "kind": "provision_fresh_state",
                         "step_id": "observed-session-setup",
                         "evaluation_root": "response_body",
-                        "evidence_refs": list(freshness["evidence_refs"]),
-                    }
-                ]
+                        "evidence_refs": freshness_evidence_refs,
+                        "confidence": 1.0,
+                    },
+                )
+                if cleanup_event is not None and not any(
+                    item.get("kind") == "cleanup_state" for item in affordances
+                ):
+                    affordances.append(
+                        {
+                            "kind": "cleanup_state",
+                            "step_id": "observed-cleanup-exchange",
+                            "evaluation_root": "response_body",
+                            "evidence_refs": cleanup_evidence_refs,
+                            "confidence": 1.0,
+                        }
+                    )
+                state_capabilities["affordances"] = affordances
                 state_capabilities["freshness_rules"] = [
                     {
                         "selector": {
+                            "schema_version": "merlin.state-selector.v1",
                             "step_id": "observed-session-setup",
                             "evaluation_root": "response_body",
                             "pointer": freshness["pointer"],
+                            "evidence_refs": freshness_evidence_refs,
+                            "confidence": 1.0,
                         },
                         "match_values": list(freshness["match_values"]),
-                        "evidence_refs": list(freshness["evidence_refs"]),
+                        "evidence_refs": freshness_evidence_refs,
                     }
                 ]
+                lifecycle_evidence_refs = list(
+                    dict.fromkeys(
+                        [
+                            *freshness_evidence_refs,
+                            *cleanup_evidence_refs,
+                            *(
+                                state_capabilities.get("lifecycle", {}).get("evidence_refs", [])
+                                if isinstance(state_capabilities.get("lifecycle"), Mapping)
+                                else []
+                            ),
+                        ]
+                    )
+                )
+                state_capabilities["lifecycle"] = {
+                    "isolation": "independent",
+                    "baseline": "fresh",
+                    "cleanup": ("explicit" if cleanup_event is not None else "unknown"),
+                    "evidence_refs": lifecycle_evidence_refs,
+                    "confidence": 1.0,
+                }
         # Captured request/response evidence is sufficient to seal the executable
         # transport. A second target call is not routine admission bureaucracy;
         # live execution records any state drift as retryable infrastructure evidence.
@@ -5711,6 +8078,9 @@ def browser_tools(
     resolver: BrowserSessionResolver,
     recorder: BrowserRecorder | None = None,
     adapter_resolver: ReviewedBrowserAdapterResolver | None = None,
+    state_scope_store: object | None = None,
+    checkpoint_store: BrowserCheckpointStore | None = None,
+    checkpoint_vault: BrowserCheckpointVault | None = None,
 ) -> tuple[
     BrowserTool
     | BrowserOwnedSessionCleanupTool
@@ -5730,8 +8100,19 @@ def browser_tools(
         | BrowserChatExchangeTool
         | CompiledApiReconHandoffTool,
         ...,
-    ] = tuple(BrowserTool(name, resolver, recorder, failures, network_seen) for name in _SPECS)
-    actions = (*actions, BrowserOwnedSessionCleanupTool(resolver, recorder, failures))
+    ] = tuple(
+        BrowserTool(name, resolver, recorder, failures, network_seen, state_scope_store)
+        for name in _SPECS
+    )
+    actions = (
+        *actions,
+        BrowserOwnedSessionCleanupTool(
+            resolver,
+            recorder,
+            failures,
+            state_scope_store,
+        ),
+    )
     if recorder is not None:
         actions = (
             *actions,
@@ -5740,7 +8121,17 @@ def browser_tools(
             CompiledApiReconHandoffTool(resolver, recorder),
         )
         if adapter_resolver is not None:
-            actions = (*actions, BrowserChatExchangeTool(resolver, recorder, adapter_resolver))
+            actions = (
+                *actions,
+                BrowserChatExchangeTool(
+                    resolver,
+                    recorder,
+                    adapter_resolver,
+                    state_scope_store,
+                    checkpoint_store,
+                    checkpoint_vault,
+                ),
+            )
     return actions
 
 

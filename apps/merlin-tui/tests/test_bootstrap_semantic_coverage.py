@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 from merlin_contracts import TechniqueLanguageEvidence
+from merlin_findings import DurableReportService
 from merlin_tui.bootstrap import (
     _apply_pair_verdict,
+    _canonical_report_candidate_projections,
     _fold_attempted_technique_outcome,
     _language_evidence_disagreement,
     _language_observation_for_technique,
@@ -16,6 +18,124 @@ from merlin_tui.bootstrap import (
     _semantic_unsearched_frontier,
     _transform_payload_receipt_chain,
 )
+
+
+class _ReportRepository:
+    def __init__(self) -> None:
+        self.values = {}
+
+    def next_revision(self, _campaign_id):
+        return len(self.values) + 1
+
+    def save(self, projection):
+        self.values[projection.revision_id] = projection
+
+    def get(self, revision_id):
+        return self.values.get(revision_id)
+
+    def list(self, campaign_id):
+        return tuple(item for item in self.values.values() if item.campaign_id == campaign_id)
+
+
+def test_campaign_report_projects_unique_candidates_and_repeated_attempts() -> None:
+    projections = _canonical_report_candidate_projections(
+        (
+            SimpleNamespace(
+                arm_id="arm/one",
+                evidence_refs=("target-call:1",),
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome="authoritative_success",
+            ),
+            SimpleNamespace(
+                arm_id="arm/one",
+                evidence_refs=("target-call:2",),
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome="authoritative_success",
+            ),
+            SimpleNamespace(
+                arm_id="arm/two",
+                evidence_refs=("target-call:3",),
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome="clean_negative",
+            ),
+        )
+    )
+    service = DurableReportService(_ReportRepository())
+
+    report = service.create(
+        "campaign/report-counts",
+        stop_reason="operator_stopped",
+        cleanup_status="completed",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"candidate_outcome_projections": projections},
+    )
+
+    assert report.metadata["attempt_count"] == 3
+    assert report.metadata["unique_candidate_count"] == 2
+    assert report.metadata["repeat_attempt_count"] == 1
+    assert report.metadata["terminal_unique_candidate_count"] == 2
+    with pytest.raises(ValueError, match="attempt_count conflicts"):
+        service.create(
+            "campaign/report-mismatch",
+            stop_reason="operator_stopped",
+            cleanup_status="completed",
+            findings=(),
+            tasks=(),
+            evidence=(),
+            usage={},
+            metadata={
+                "candidate_outcome_projections": projections,
+                "attempt_count": 99,
+            },
+        )
+
+
+def test_campaign_report_preserves_persisted_canonical_settlement() -> None:
+    from merlin_contracts import candidate_id_for_identity, project_candidate_outcome
+
+    identity = {
+        "campaign_id": "campaign/one",
+        "target_id": "target/one",
+        "target_generation": "generation/one",
+        "scenario_fingerprint": "sha256:scenario",
+        "technique_id": "technique/one",
+        "controller_id": "direct",
+        "payload_family": "baseline",
+        "requested_language": "en",
+        "mutation_id": "baseline",
+    }
+    projection = project_candidate_outcome(
+        candidate_id=candidate_id_for_identity(identity),
+        attempt_disposition="valid",
+        outcome_authority="target",
+        outcome="confirmed",
+        evidence_digest="a" * 64,
+    )
+    outcome = SimpleNamespace(
+        arm_id="arm/presentation-only",
+        evidence_refs=("target-call:1",),
+        attempt_disposition="valid",
+        outcome_authority="target",
+        outcome="authoritative_success",
+        usage={
+            "candidate_outcome_projection": projection,
+            "canonical_candidate_identity": identity,
+        },
+    )
+
+    assert _canonical_report_candidate_projections((outcome,)) == (
+        {**projection, "candidate_identity": identity},
+    )
+    with pytest.raises(ValueError, match="canonical attempt ledger"):
+        _canonical_report_candidate_projections(
+            (SimpleNamespace(**{**vars(outcome), "outcome": "clean_negative"}),)
+        )
 
 
 def test_report_language_evidence_treats_source_variation_as_provenance() -> None:
@@ -77,13 +197,13 @@ def test_report_publication_requires_current_terminal_campaign_authority() -> No
     authority = {
         "id": "campaign/example",
         "status": "completed",
-        "stop_reason": "saturated",
+        "stop_reason": "frontier_exhausted",
         "completion_digest": completion_digest,
         "completion_document": completion_document,
     }
     _require_terminal_report_authority(
         "campaign/example",
-        "saturated",
+        "frontier_exhausted",
         authority,
         completion_digest=completion_digest,
         cleanup_status="completed",
@@ -93,21 +213,24 @@ def test_report_publication_requires_current_terminal_campaign_authority() -> No
     with pytest.raises(RuntimeError, match="not terminal"):
         _require_terminal_report_authority(
             "campaign/example",
-            "saturated",
+            "frontier_exhausted",
             {**authority, "status": "executing", "stop_reason": ""},
             completion_digest=completion_digest,
         )
     with pytest.raises(RuntimeError, match="stop reason changed"):
         _require_terminal_report_authority(
             "campaign/example",
-            "saturated",
-            {**authority, "stop_reason": "failed"},
+            "frontier_exhausted",
+            {
+                **authority,
+                "stop_reason": "infrastructure_blocked_after_retry_policy",
+            },
             completion_digest=completion_digest,
         )
     with pytest.raises(RuntimeError, match="completed cleanup"):
         _require_terminal_report_authority(
             "campaign/example",
-            "saturated",
+            "frontier_exhausted",
             authority,
             completion_digest=completion_digest,
             cleanup_status="pending",
@@ -126,14 +249,14 @@ def test_report_publication_rejects_missing_live_completion_digest() -> None:
     authority = {
         "id": "campaign/example",
         "status": "completed",
-        "stop_reason": "saturated",
+        "stop_reason": "frontier_exhausted",
         "completion_document": completion_document,
     }
 
     with pytest.raises(RuntimeError, match="campaign evidence changed"):
         _require_terminal_report_authority(
             "campaign/example",
-            "saturated",
+            "frontier_exhausted",
             authority,
             completion_digest=completion_digest,
             cleanup_status="completed",
@@ -152,7 +275,7 @@ def test_report_publication_rejects_current_unresolved_cleanup() -> None:
     authority = {
         "id": "campaign/example",
         "status": "completed",
-        "stop_reason": "saturated",
+        "stop_reason": "frontier_exhausted",
         "completion_digest": completion_digest,
         "completion_document": completion_document,
     }
@@ -160,7 +283,7 @@ def test_report_publication_rejects_current_unresolved_cleanup() -> None:
     with pytest.raises(RuntimeError, match="cleanup is unresolved"):
         _require_terminal_report_authority(
             "campaign/example",
-            "saturated",
+            "frontier_exhausted",
             authority,
             completion_digest=completion_digest,
             cleanup_status="completed",

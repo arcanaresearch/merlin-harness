@@ -1683,6 +1683,38 @@ def test_truncation_capability_drift_and_budget_are_explicit() -> None:
     ]
 
 
+def test_truncated_streamed_tool_arguments_report_output_limit() -> None:
+    stream = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1",'
+        '"function":{"name":"shell_command","arguments":"{\\"argv\\":[\\"python3\\",\\"-c\\",\\"pri"}}]},'
+        '"finish_reason":null}]}\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n'
+        'data: {"choices":[],"usage":{"output_tokens":8192,"total_tokens":9000}}\n'
+        "data: [DONE]\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=stream)
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig("https://models.example/v1", "", "model"), client=client
+            )
+            return [
+                event async for event in provider.stream(ChatRequest(model="model", messages=[]))
+            ]
+
+    events = asyncio.run(run())
+    errors = [event for event in events if isinstance(event, ModelError)]
+    assert len(errors) == 1
+    assert errors[0].code == "truncated_tool_call"
+    assert errors[0].retryable is True
+    assert errors[0].failure_kind == ProviderFailureKind.TRUNCATED
+    assert "output limit" in errors[0].message
+    assert not any(isinstance(event, ToolCall) for event in events)
+
+
 def test_output_token_parameter_matches_the_configured_provider_contract() -> None:
     observed = {}
     stream = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'

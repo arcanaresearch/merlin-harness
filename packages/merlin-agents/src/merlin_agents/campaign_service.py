@@ -22,6 +22,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from merlin_contracts import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
     AgentTask,
+    CampaignTerminalReason,
     CapabilityGrant,
     InfrastructureFailureCategory,
     ModelJsonError,
@@ -31,9 +32,18 @@ from merlin_contracts import (
     ToolContext,
     ToolResult,
     ToolSpec,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    evaluate_objective_gate_predicate,
+    model_authority_disagreement,
     parse_model_json,
+    project_candidate_outcome,
+    read_campaign_terminal_reason,
     reviewed_adapter_target_delivery,
+    validate_candidate_outcome_projection,
 )
+from merlin_contracts.generation import GeneratorExecutionContract
+from merlin_contracts.target_capabilities import StateCapabilities
 
 from .arm_boundary_search import generate_boundary_arms
 from .arm_context_specialization import generate_specializations
@@ -44,7 +54,12 @@ from .arm_lifecycle import (
     evaluate_trial_from_stats,
     lifecycle_counts,
 )
-from .arm_mutation import generate_bounded_child_candidate, generate_mutations
+from .arm_mutation import (
+    GeneratorExecutionLimitExceeded,
+    generate_bounded_child_candidate_with_contract,
+    generate_mutations,
+)
+from .arm_pool import rank_frontier
 from .automation import ARTIFACT_KIND_RUNTIMES, AutomationOutcome
 from .bounded_children import materialize_bounded_child_family
 from .campaign import (
@@ -53,6 +68,8 @@ from .campaign import (
     CampaignManifest,
     CampaignProfile,
     ContextDocument,
+    ObjectiveGateRetryReason,
+    ObjectivePhaseGate,
     ReviewedTargetAdapter,
     _reviewed_adapter_digest,
     _reviewed_adapter_value,
@@ -61,13 +78,17 @@ from .campaign import (
     compile_attack_campaign,
     compile_execution_agenda,
     compile_initial_campaign,
+    compile_prerequisite_campaign,
     compile_recon_campaign,
     compile_target_brief,
     compile_worker_context,
     enumerate_language_candidate_references,
     expand_language_techniques,
+    manifest_with_bounded_regeneration,
+    manifest_with_objective_phase_gates,
     manifest_with_target_brief,
     materialize_language_technique,
+    objective_phase_gate_from_mapping,
     profile_grant,
     project_by_effects,
     reconcile_techniques_for_surfaces,
@@ -1027,6 +1048,7 @@ class CampaignService:
         preflight_max_cost_usd: float | None = None,
         arm_trial_min_attempts: int = DEFAULT_TRIAL_MIN_ATTEMPTS,
         refusal_judge: RefusalJudge | None = None,
+        state_scope_store: Any | None = None,
     ) -> None:
         if stalled_after_seconds <= 0:
             raise ValueError("campaign stall interval must be positive")
@@ -1079,6 +1101,7 @@ class CampaignService:
         self._preflight_max_cost_usd = preflight_max_cost_usd
         self._arm_trial_min_attempts = arm_trial_min_attempts
         self._refusal_judge = refusal_judge
+        self._state_scope_store = state_scope_store
         # Judgments are advisory and cached per evidence digest so repeated
         # status() projections never re-run a model call for the same evidence.
         self._judgment_cache: dict[str, RefusalJudgment | None] = {}
@@ -1293,8 +1316,93 @@ class CampaignService:
         All remaining candidates stay queued, including negative or unavailable
         judgments. Scores never become attack outcomes or retirement evidence.
         """
+        if len(candidates) < 2:
+            return candidates
+        arm_source = self._arm_store
+        arm_loader = getattr(arm_source, "list_arms", None)
+        observation_loader = getattr(arm_source, "list_arm_observations", None)
+        if callable(arm_loader) and callable(observation_loader):
+            scenario = scenario_fingerprint_for(manifest.target, manifest.catalogue)
+            try:
+                # CampaignArmStore deliberately owns one serialized psycopg
+                # connection. Read its two projections in order; concurrent
+                # operations on that connection intermittently fail and would
+                # make adaptive ranking fall back to catalogue order.
+                arms = await asyncio.to_thread(arm_loader, manifest.target.id, scenario)
+                observations = await asyncio.to_thread(
+                    observation_loader, manifest.target.id, scenario
+                )
+                candidate_ids = {
+                    str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                    for candidate in candidates
+                }
+                matching_arms = tuple(
+                    arm
+                    for arm in arms
+                    if isinstance(arm, Mapping)
+                    and str(arm.get("technique_id") or "") in candidate_ids
+                )
+                ranked = rank_frontier(matching_arms, tuple(observations))
+            except Exception:  # noqa: BLE001 - advisory ranking cannot block execution
+                ranked = ()
+            if ranked:
+                arm_scores: dict[str, float] = {}
+                for item in ranked:
+                    candidate_id = str(item.arm.get("technique_id") or "")
+                    arm_scores[candidate_id] = max(
+                        item.score,
+                        arm_scores.get(candidate_id, float("-inf")),
+                    )
+                indexed = tuple(enumerate(candidates[1:], start=1))
+                arm_ranked = tuple(
+                    candidate
+                    for _, candidate in sorted(
+                        indexed,
+                        key=lambda item: (
+                            0
+                            if str(getattr(item[1], "id", "") or _followup_digest(item[1]))
+                            in arm_scores
+                            else 1,
+                            -arm_scores.get(
+                                str(getattr(item[1], "id", "") or _followup_digest(item[1])),
+                                0.0,
+                            ),
+                            item[0],
+                        ),
+                    )
+                )
+                candidates = (candidates[0], *arm_ranked)
+                priority_writer = getattr(self._store, "update_frontier_priorities", None)
+                if callable(priority_writer):
+                    await asyncio.to_thread(priority_writer, campaign_id, arm_scores)
+                append_lead = getattr(self._store, "append_lead", None)
+                if callable(append_lead):
+                    await asyncio.to_thread(
+                        append_lead,
+                        campaign_id,
+                        wave,
+                        {
+                            "kind": "execution_arm_priority",
+                            "ranked_count": len(arm_scores),
+                            "candidate_count": len(candidates),
+                            "ranked_sample": tuple(
+                                {
+                                    "candidate_id": candidate_id,
+                                    "score": score,
+                                }
+                                for candidate_id, score in sorted(
+                                    arm_scores.items(), key=lambda item: (-item[1], item[0])
+                                )[:32]
+                            ),
+                            "policy": (
+                                "durable ARM outcomes rank the bounded shortlist; the leading "
+                                "exploration candidate and every low or unscored candidate "
+                                "remain eligible"
+                            ),
+                        },
+                    )
         client = self._jev_escalation_client()
-        if client is None or len(candidates) < 2:
+        if client is None:
             return candidates
         width = max(1, self._max_worker_concurrency)
         shortlist = candidates[1 : 1 + 2 * width]
@@ -1464,13 +1572,44 @@ class CampaignService:
             )
         return families, candidates
 
-    def _frontier_batch_limit(self, manifest: CampaignManifest) -> int:
-        limit = max(1, self._max_worker_concurrency * 2)
-        return (
-            min(limit, QUICKSCAN_INITIAL_CELL_LIMIT)
-            if (manifest.profile is CampaignProfile.QUICKSCAN)
-            else limit
-        )
+    async def _frontier_batch_limit(self, manifest: CampaignManifest) -> int:
+        """Bound a claim by proven state width and principal-owned resources."""
+
+        capabilities = _reviewed_state_capabilities(manifest)
+        # Unknown independence is shared state. Claim one candidate until exact
+        # execution evidence establishes a wider target capacity.
+        limit = min(self._max_worker_concurrency, _reviewed_target_state_capacity(manifest))
+
+        budget_reader = getattr(self._state_scope_store, "remaining_campaign_resource_budget", None)
+        if capabilities is not None and capabilities.resource_controls:
+            if not callable(budget_reader):
+                limit = min(limit, 1)
+            else:
+                ownership = {item.name: item for item in capabilities.resource_ownership}
+                resources = tuple(
+                    {
+                        "ownership_name": control.ownership_name,
+                        "resource_kind": ownership[control.ownership_name].resource_kind.value,
+                        "reservation_amount": control.reservation_amount,
+                        "limit": control.limit,
+                        "window_key": control.window_key,
+                    }
+                    for control in capabilities.resource_controls
+                )
+                resource_budget = await asyncio.to_thread(
+                    budget_reader,
+                    manifest.id,
+                    _adapter_target_authority(manifest.target.endpoint),
+                    resources,
+                )
+                # Before a reviewed principal is available, serialize discovery.
+                # A zero budget still claims one retryable candidate; the runtime's
+                # atomic reservation gate prevents any target delivery and preserves
+                # the remaining frontier for quota wake/reconciliation.
+                limit = min(limit, max(1, int(resource_budget or 1)))
+        if manifest.profile is CampaignProfile.QUICKSCAN:
+            limit = min(limit, QUICKSCAN_INITIAL_CELL_LIMIT)
+        return max(1, limit)
 
     async def _claim_execution_frontier_context(
         self,
@@ -1502,7 +1641,7 @@ class CampaignService:
                 campaign_id, manifest, context, wave
             ), None
         batch_id = str(uuid5(NAMESPACE_URL, f"merlin.frontier-batch.v1\n{campaign_id}\n{wave}"))
-        batch_limit = self._frontier_batch_limit(manifest)
+        batch_limit = await self._frontier_batch_limit(manifest)
         shortlist_loader = getattr(self._store, "list_frontier_shortlist", None)
         exact_claim = getattr(self._store, "claim_frontier_batch_exact", None)
         preselected = False
@@ -1734,6 +1873,7 @@ class CampaignService:
         live: Any,
         tasks: tuple[AgentTask, ...],
         *,
+        manifest: CampaignManifest | None = None,
         transition_lease: _FrontierTransitionLease | None = None,
     ) -> Mapping[str, int] | None:
         """Settle the active batch; infrastructure failures return candidates to queue."""
@@ -1772,8 +1912,45 @@ class CampaignService:
             authority_kind = (
                 str(authority.get("kind") or "").casefold()
                 if isinstance(authority, Mapping)
-                else ""
+                else "none"
             )
+            projection_value = strategy.get("candidate_outcome_projection")
+            canonical_projection = None
+            if isinstance(projection_value, Mapping):
+                identity_value = strategy.get("candidate_identity")
+                if not isinstance(identity_value, Mapping):
+                    raise ValueError(
+                        "frontier settlement projection has no canonical candidate identity"
+                    )
+                canonical_projection = validate_candidate_outcome_projection(
+                    projection_value,
+                    expected_candidate_id=candidate_id_for_identity(identity_value),
+                )
+                identity_technique_id = str(identity_value.get("technique_id") or "").strip()
+                if not isinstance(technique_id, str) or identity_technique_id != technique_id:
+                    raise ValueError(
+                        "frontier settlement projection conflicts with attempted candidate"
+                    )
+                if canonical_projection["attempt_disposition"] != disposition:
+                    raise ValueError(
+                        "frontier settlement disposition conflicts with canonical projection"
+                    )
+                if canonical_projection["outcome_authority"] != authority_kind:
+                    raise ValueError(
+                        "frontier settlement authority conflicts with canonical projection"
+                    )
+                if canonical_projection["terminality"] == "terminal" and (
+                    not isinstance(authority, Mapping)
+                    or str(authority.get("outcome") or "").casefold()
+                    != canonical_projection["outcome"]
+                ):
+                    raise ValueError(
+                        "frontier settlement authority outcome conflicts with canonical projection"
+                    )
+                if state in {"confirmed", "refuted"} and canonical_projection["outcome"] != state:
+                    raise ValueError(
+                        "frontier settlement outcome conflicts with canonical projection"
+                    )
             child = strategy.get("bounded_child_candidate")
             protocol_request = strategy.get("protocol_invalid_request")
             if (
@@ -1785,17 +1962,21 @@ class CampaignService:
                 and isinstance(protocol_request.get("constraint"), Mapping)
                 and isinstance(protocol_request.get("parent_identity"), Mapping)
                 and self._arm_generator is not None
+                and manifest is not None
+                and manifest.bounded_regeneration is not None
             ):
                 try:
-                    child = await asyncio.to_thread(
-                        generate_bounded_child_candidate,
+                    child = await generate_bounded_child_candidate_with_contract(
                         parent_candidate_id=technique_id,
                         parent_identity=dict(protocol_request["parent_identity"]),
                         rejected_input=str(protocol_request["rendered_input"]),
                         constraint=dict(protocol_request["constraint"]),
                         generator=self._arm_generator,
+                        execution_contract=GeneratorExecutionContract.model_validate(
+                            manifest.bounded_regeneration
+                        ),
                     )
-                except Exception as error:
+                except (GeneratorExecutionLimitExceeded, ValueError) as error:
                     append_lead = getattr(self._store, "append_lead", None)
                     if callable(append_lead):
                         await asyncio.to_thread(
@@ -1809,6 +1990,27 @@ class CampaignService:
                                 "retryable": True,
                             },
                         )
+            elif (
+                disposition == "protocol_invalid"
+                and child is None
+                and isinstance(technique_id, str)
+                and isinstance(protocol_request, Mapping)
+                and self._arm_generator is not None
+                and (manifest is None or manifest.bounded_regeneration is None)
+            ):
+                append_lead = getattr(self._store, "append_lead", None)
+                if callable(append_lead):
+                    await asyncio.to_thread(
+                        append_lead,
+                        campaign_id,
+                        int(batch.get("wave", 0)),
+                        {
+                            "kind": "bounded_child_generation_deferred",
+                            "candidate_id": technique_id,
+                            "reason": "no reviewed bounded regeneration execution contract",
+                            "retryable": True,
+                        },
+                    )
             if (
                 disposition == "protocol_invalid"
                 and isinstance(technique_id, str)
@@ -1865,14 +2067,14 @@ class CampaignService:
                                 family_document=_json_value(asdict(child_technique)),
                             )
             if (
-                state in {"confirmed", "refuted"}
-                and disposition == "valid"
-                and authority_kind in {"target", "validator"}
-                and isinstance(authority, Mapping)
-                and str(authority.get("outcome") or "").casefold() == state
-                and isinstance(technique_id, str)
+                canonical_projection is not None
+                and canonical_projection["valid"]
+                and canonical_projection["terminality"] == "terminal"
+                and canonical_projection["outcome"] in {"confirmed", "refuted"}
             ):
-                authoritative_outcomes.setdefault(technique_id, set()).add(state)
+                authoritative_outcomes.setdefault(technique_id, set()).add(
+                    canonical_projection["outcome"]
+                )
         if not callable(attempt_loader):
             for task in tasks:
                 for technique_id, outcome in _technique_attempt_outcomes(attempts, task.id).items():
@@ -2400,6 +2602,9 @@ class CampaignService:
         adapter: Mapping[str, Any] | None = None,
         budget: AssignmentBudget | None = None,
         specialist_composition: str | None = None,
+        service_objectives: Mapping[str, object] | None = None,
+        objective_phase_gates: tuple[ObjectivePhaseGate, ...] = (),
+        bounded_regeneration: GeneratorExecutionContract | Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         if specialist_composition is not None and specialist_composition not in (
             "opinionated",
@@ -2409,6 +2614,16 @@ class CampaignService:
         composition_kwargs: dict[str, str] = {}
         if specialist_composition is not None:
             composition_kwargs["specialist_composition"] = specialist_composition
+        reviewed_service_objectives = _reviewed_service_objectives(service_objectives)
+        reviewed_regeneration = (
+            bounded_regeneration
+            if isinstance(bounded_regeneration, GeneratorExecutionContract)
+            else (
+                GeneratorExecutionContract.model_validate(bounded_regeneration)
+                if bounded_regeneration is not None
+                else None
+            )
+        )
         _prepare_started = time.monotonic()
 
         def _prepare_stage(name: str, started: float = _prepare_started) -> float:
@@ -2430,6 +2645,37 @@ class CampaignService:
         else:
             prepared = await self._preparation_factory(
                 session_id, objective, profile, adapter, **composition_kwargs
+            )
+        if objective_phase_gates:
+            prepared = replace(
+                prepared,
+                manifest=manifest_with_objective_phase_gates(
+                    prepared.manifest, objective_phase_gates
+                ),
+            )
+            if any(gate.retain_success.value == "checkpoint" for gate in objective_phase_gates):
+                reviewed_adapter = _reviewed_adapter_value(prepared.manifest)
+                state_capabilities = (
+                    reviewed_adapter.get("state_capabilities")
+                    if isinstance(reviewed_adapter, Mapping)
+                    else None
+                )
+                checkpoint_contract = (
+                    state_capabilities.get("checkpoint")
+                    if isinstance(state_capabilities, Mapping)
+                    else None
+                )
+                if not isinstance(checkpoint_contract, Mapping):
+                    raise ValueError(
+                        "checkpoint-retained objective phase gates require a reviewed target "
+                        "checkpoint capture and restore contract"
+                    )
+        if reviewed_regeneration is not None:
+            prepared = replace(
+                prepared,
+                manifest=manifest_with_bounded_regeneration(
+                    prepared.manifest, reviewed_regeneration
+                ),
             )
         _prepare_mark = _prepare_stage("preparation_factory")
         prepared.manifest.validate()
@@ -2470,6 +2716,11 @@ class CampaignService:
             "adapter_generation": adapter_generation,
             "technique_skips": [dict(item) for item in technique_skips],
             "preflight_estimate": preflight_estimate,
+            **(
+                {"service_objectives": reviewed_service_objectives}
+                if reviewed_service_objectives is not None
+                else {}
+            ),
         }
         reviewed_digest = _reviewed_preparation_digest(
             prepared.manifest, prepared.assignment_context
@@ -3134,24 +3385,32 @@ class CampaignService:
                 "reference": str(latest["id"]),
                 "source": "reused_reconnaissance",
             }
-            execution_context, frontier_batch = await self._claim_execution_frontier_context(
-                campaign_id, manifest, context, 0
-            )
-            compiled = await self._compile_initial_attack_ownership(
-                campaign_id,
-                manifest,
-                execution_context,
-                0,
-                (reused_recon_source,),
-                reused_recon_source,
-                reused_recon_evidence,
-            )
-            compiled = compile_execution_agenda(manifest, execution_context, compiled)
-            compiled = _seal_compilation_candidate_identities(
-                manifest,
-                execution_context,
-                compiled,
-            )
+            if manifest.objective_phase_gates:
+                # Reused reconnaissance skips observation work only. It must
+                # never bypass reviewed objective prerequisites or claim the
+                # attack frontier before those gates settle successfully.
+                execution_context = context
+                frontier_batch = None
+                compiled = compile_prerequisite_campaign(manifest, context)
+            else:
+                execution_context, frontier_batch = await self._claim_execution_frontier_context(
+                    campaign_id, manifest, context, 0
+                )
+                compiled = await self._compile_initial_attack_ownership(
+                    campaign_id,
+                    manifest,
+                    execution_context,
+                    0,
+                    (reused_recon_source,),
+                    reused_recon_source,
+                    reused_recon_evidence,
+                )
+                compiled = compile_execution_agenda(manifest, execution_context, compiled)
+                compiled = _seal_compilation_candidate_identities(
+                    manifest,
+                    execution_context,
+                    compiled,
+                )
         else:
             reused_observations = await self._reusable_capability_observations(manifest, context)
             if reused_observations is not None:
@@ -3316,6 +3575,136 @@ class CampaignService:
         try:
             live_assignments = tuple(getattr(live, "assignments", ()))
             if live_assignments and all(
+                assignment.strategy_id == "objective-phase-gate/v1"
+                for assignment in live_assignments
+            ):
+                gate = next(
+                    (
+                        candidate
+                        for candidate in manifest.objective_phase_gates
+                        if any(
+                            assignment.id.endswith(f"-{candidate.id}")
+                            for assignment in live_assignments
+                        )
+                    ),
+                    None,
+                )
+                if gate is None:
+                    raise RuntimeError("objective prerequisite schedule has no reviewed gate")
+                lead = await asyncio.to_thread(self._store.list_lead, campaign_id)
+                elapsed_seconds = sum(
+                    max(0.0, float(payload.get("elapsed_seconds") or 0.0))
+                    for row in lead
+                    if isinstance(row, Mapping)
+                    and isinstance((payload := row.get("payload")), Mapping)
+                    and payload.get("kind") == "objective_phase_gate_settled"
+                    and payload.get("gate_id") == gate.id
+                )
+                remaining_seconds = (
+                    None
+                    if gate.budget.max_seconds is None
+                    else max(0.0, gate.budget.max_seconds - elapsed_seconds)
+                )
+                attempt_started = time.monotonic()
+                timed_out = False
+                try:
+                    async with asyncio.timeout(remaining_seconds):
+                        if live.execution is not None:
+                            await self._await_wave_budget(campaign_id, manifest, initial_wave, live)
+                        await self._await_live_wave_drivers(live)
+                except TimeoutError:
+                    timed_out = True
+                    await self._agents.cancel_schedule(
+                        live.id,
+                        reason="objective-phase-gate-time-budget-exhausted",
+                    )
+                elapsed_seconds += max(0.0, time.monotonic() - attempt_started)
+                tasks = tuple(await self._agents.list_schedule_tasks(live.id))
+                if timed_out:
+                    settled: Mapping[str, object] = {
+                        "status": "blocked",
+                        "attempt_disposition": "infrastructure_failed",
+                        "target_calls": 0,
+                        "last_transition": None,
+                        "blocker": "reviewed prerequisite wall-clock budget exhausted",
+                    }
+                else:
+                    evidence = await self._source_evidence(str(live.id), tasks)
+                    settled = await self._settle_objective_phase_gate(
+                        campaign_id, manifest, gate, tasks, evidence
+                    )
+                if wave_running:
+                    await self._finish_wave_once(
+                        campaign_id,
+                        initial_wave,
+                        "completed" if settled["status"] == "succeeded" else "failed",
+                        {
+                            "completed": sum(task.status == "completed" for task in tasks),
+                            "failed": sum(task.status != "completed" for task in tasks),
+                            "phase": "objective_prerequisite",
+                            "gate_id": gate.id,
+                            "gate_status": settled["status"],
+                        },
+                    )
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    initial_wave,
+                    {
+                        "kind": "objective_phase_gate_settled",
+                        "gate_id": gate.id,
+                        "ordinal": gate.ordinal,
+                        **settled,
+                        "elapsed_seconds": elapsed_seconds,
+                        "frontier_claimed": False,
+                    },
+                )
+                if settled["status"] == "blocked":
+                    pause_campaign = getattr(self._store, "pause", None)
+                    if callable(pause_campaign):
+                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    return
+                gates_ready, last_gate_wave = await self._run_objective_phase_gates(
+                    campaign_id,
+                    manifest,
+                    context,
+                    first_wave=initial_wave + 1,
+                )
+                if not gates_ready:
+                    return
+                attack_wave = last_gate_wave + 1
+                attack_context, frontier_batch = await self._claim_execution_frontier_context(
+                    campaign_id,
+                    manifest,
+                    context,
+                    attack_wave,
+                )
+                compiled = compile_attack_campaign(manifest, attack_context)
+                compiled = compile_execution_agenda(manifest, attack_context, compiled)
+                compiled = _seal_compilation_candidate_identities(
+                    manifest, attack_context, compiled
+                )
+                attack_live = await self._start_wave(
+                    campaign_id,
+                    manifest,
+                    attack_wave,
+                    "initial",
+                    compiled,
+                    frontier_batch_id=(
+                        None if frontier_batch is None else str(frontier_batch["id"])
+                    ),
+                )
+                self._supervisors[campaign_id] = asyncio.create_task(
+                    self._supervise(
+                        campaign_id,
+                        manifest,
+                        context,
+                        attack_live,
+                        initial_wave=attack_wave,
+                    )
+                )
+                return
+            if live_assignments and all(
                 assignment.profile_id == "recon" for assignment in live_assignments
             ):
                 if live.execution is not None:
@@ -3407,10 +3796,19 @@ class CampaignService:
                     applicability,
                 )
                 await self._record_recon_result(manifest, applicability)
+                gates_ready, last_gate_wave = await self._run_objective_phase_gates(
+                    campaign_id,
+                    manifest,
+                    context,
+                    first_wave=initial_wave + 1,
+                )
+                if not gates_ready:
+                    return
+                attack_wave = last_gate_wave + 1
                 # Advertised/observed capabilities are evidence, not attack
                 # admission. Unknown surfaces remain eligible for safe probing.
                 attack_context, frontier_batch = await self._claim_execution_frontier_context(
-                    campaign_id, manifest, context, initial_wave + 1
+                    campaign_id, manifest, context, attack_wave
                 )
                 # The initial attack wave's workers are the wave-0 admitted
                 # dynamic specialists plus the structural lanes compiled here.
@@ -3436,7 +3834,7 @@ class CampaignService:
                         attack_live = await self._start_wave(
                             campaign_id,
                             manifest,
-                            initial_wave + 1,
+                            attack_wave,
                             "initial",
                             attack,
                             frontier_batch_id=(
@@ -3457,7 +3855,7 @@ class CampaignService:
                                 campaign_id,
                                 manifest,
                                 context,
-                                initial_wave + 1,
+                                attack_wave,
                                 frontier_batch,
                                 error,
                             )
@@ -3481,7 +3879,7 @@ class CampaignService:
                     manifest,
                     context,
                     attack_live,
-                    initial_wave=initial_wave + 1,
+                    initial_wave=attack_wave,
                 )
                 return
             # Capture durable follow-up admission history before this wave's Lead
@@ -3600,6 +3998,9 @@ class CampaignService:
                 },
             )
             budget_capped = await self._campaign_budget_capped(campaign_id)
+            service_objective_state = await self._campaign_service_objective_state(
+                campaign_id, manifest
+            )
             summary = {
                 "completed": sum(task.status == "completed" for task in tasks),
                 "failed": sum(task.status in {"failed", "quarantined"} for task in tasks),
@@ -3625,6 +4026,20 @@ class CampaignService:
                     # Another local or remote supervisor settled this exact
                     # schedule while we waited for the transition lease.
                     return
+                if transition_batch is not None:
+                    # ARM learning is part of the frontier transition, not
+                    # post-settlement reporting.  Persist the canonical,
+                    # receipt-backed outcomes before the batch can be settled
+                    # or a successor can be claimed.  A failed write therefore
+                    # leaves this scheduled batch available for exact restart;
+                    # replay is idempotent on campaign + arm + attempt identity.
+                    frontier_evidence = await self._source_evidence(source_schedule_id, tasks)
+                    await self._record_arm_outcomes(
+                        campaign_id,
+                        tasks,
+                        frontier_evidence,
+                        wave=initial_wave,
+                    )
                 if wave_running:
                     if transition_batch is None:
                         await self._finish_wave_once(
@@ -3645,6 +4060,7 @@ class CampaignService:
                     campaign_id,
                     live,
                     tasks,
+                    manifest=manifest,
                     transition_lease=transition_lease,
                 )
                 frontier_retry_available = bool(
@@ -3660,11 +4076,34 @@ class CampaignService:
                     and frontier_counts.get("queued", 0) > 0
                     and (summary["completed"] > 0 or frontier_retry_available)
                     and not budget_capped
+                    and not service_objective_state.get("violations")
                     and not (
                         manifest.profile is CampaignProfile.QUICKSCAN
                         and initial_wave >= QUICKSCAN_FOLLOWUP_WAVE_LIMIT
                     )
                 )
+                if (
+                    frontier_counts is not None
+                    and frontier_counts.get("queued", 0) > 0
+                    and service_objective_state.get("violations")
+                ):
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        initial_wave,
+                        {
+                            "kind": "service_objective_violation",
+                            "state": "paused",
+                            "violations": service_objective_state["violations"],
+                            "metrics": service_objective_state["metrics"],
+                            "queued": frontier_counts.get("queued", 0),
+                            "retryable": True,
+                        },
+                    )
+                    pause_campaign = getattr(self._store, "pause", None)
+                    if callable(pause_campaign):
+                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    return
                 if (
                     frontier_counts is not None
                     and frontier_counts.get("queued", 0) > 0
@@ -4832,6 +5271,7 @@ class CampaignService:
                     # This is a real operator-selected cap, not a scheduler synonym
                     # for an exhausted graph with mandatory coverage still missing.
                     stop_reason = "capped"
+            stop_reason = read_campaign_terminal_reason(stop_reason).value
             await asyncio.to_thread(
                 self._store.append_lead,
                 campaign_id,
@@ -4839,7 +5279,11 @@ class CampaignService:
                 {"stop_reason": stop_reason, "profile": manifest.profile.value},
             )
             terminal = "failed" if campaign_failed else "completed"
-            terminal_reason = "failed" if campaign_failed else stop_reason
+            terminal_reason = (
+                CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value
+                if campaign_failed
+                else stop_reason
+            )
             if terminal == "failed" and await self._wave_provider_billing_failed(
                 source_schedule_id
             ):
@@ -7274,11 +7718,28 @@ class CampaignService:
         if projection_loader is not None:
             projection = await projection_loader(schedule_id)
             evidence = projection.get("evidence", {}) if isinstance(projection, Mapping) else {}
-            return {
+            values = {
                 str(task_id): dict(value)
                 for task_id, value in _mapping_items(evidence)
                 if isinstance(value, Mapping)
             }
+            verifier = getattr(self._agents, "committed_task_result_evidence", None)
+            if verifier is not None:
+                for task in tasks:
+                    projected = values.get(task.id)
+                    structured = (
+                        projected.get("structured_result")
+                        if isinstance(projected, Mapping)
+                        else None
+                    )
+                    if not isinstance(structured, Mapping) or not isinstance(
+                        structured.get("gate_id"), str
+                    ):
+                        continue
+                    committed = await verifier(schedule_id, task)
+                    if isinstance(committed, Mapping):
+                        values[task.id] = dict(committed)
+            return values
         verifier = getattr(self._agents, "committed_task_result_evidence", None)
         if verifier is None:
             return {}
@@ -7310,12 +7771,56 @@ class CampaignService:
             contract = _sealed_hypothesis_contract(task.objective)
             arm = contract.get("arm") if isinstance(contract, Mapping) else None
             committed = evidence.get(task.id)
-            if not isinstance(contract, Mapping) or not isinstance(committed, Mapping):
+            if not isinstance(committed, Mapping):
                 continue
+            catalogue_arm = False
+            if not isinstance(arm, Mapping):
+                identities = tuple(
+                    identity
+                    for identity in _sealed_candidate_identities(task.objective)
+                    if identity.technique_id in task.technique_ids
+                )
+                if len(identities) == 1:
+                    identity = identities[0]
+                    arm = {
+                        "id": "proposal:" + candidate_id_for_identity(identity.projection()),
+                        "target_id": identity.target_id,
+                        "scenario_fingerprint": identity.scenario_fingerprint,
+                        "semantic_id": identity.technique_id,
+                        "strategy_id": identity.controller_id,
+                        "technique_id": identity.technique_id,
+                        "controller_id": identity.controller_id,
+                        "mutation_id": identity.mutation_id,
+                        "objective": task.objective.partition("Sealed candidate identities:")[
+                            0
+                        ].rstrip(),
+                        "source": "seed",
+                        "status": "trial",
+                        "rank_components": {"catalogue_seed": 1.0},
+                        "eligibility_reasons": ("reviewed frontier",),
+                        "decision_reason": "reviewed catalogue candidate reached execution",
+                        "execution_reachability": {
+                            "requested_language": identity.requested_language,
+                            "requested_transform_id": identity.payload_family,
+                        },
+                    }
+                    contract = {
+                        "id": identity.technique_id,
+                        "surface": "reviewed target interaction",
+                        "assertion": "the reviewed catalogue candidate advances the objective",
+                        "oracle": "authoritative target receipt",
+                        "novelty_basis": "reviewed catalogue frontier",
+                        "candidate_identity": identity.projection(),
+                    }
+                    catalogue_arm = True
             hypothesis_observation = _hypothesis_task_observation(
                 campaign_id, task, contract, committed
             )
-            if hypothesis_observation is not None and callable(hypothesis_writer):
+            if (
+                not catalogue_arm
+                and hypothesis_observation is not None
+                and callable(hypothesis_writer)
+            ):
                 try:
                     await asyncio.to_thread(hypothesis_writer, hypothesis_observation)
                 except KeyError:
@@ -7358,9 +7863,17 @@ class CampaignService:
                 arm = materialized
                 if callable(arm_recorder):
                     await asyncio.to_thread(arm_recorder, arm)
-            observation = _arm_task_observation(campaign_id, task, arm, committed)
+            observation = _arm_task_observation(
+                campaign_id,
+                task,
+                arm,
+                committed,
+                contract_override=contract,
+            )
             if observation is None:
                 continue
+            if catalogue_arm:
+                observation = {**observation, "hypothesis_id": None}
             await asyncio.to_thread(recorder, observation)
             emit_arm_outcome(
                 {
@@ -7880,6 +8393,8 @@ class CampaignService:
         new and a post-completion evidence change (e.g. late validation) seals
         a fresh authoritative receipt.
         """
+        require_saturation_ready = reason.strip().casefold() == "saturated"
+        reason = read_campaign_terminal_reason(reason).value
         production_completion_store = all(
             callable(getattr(self._store, name, None))
             for name in ("get", "list_waves", "list_lead", "commit_lead_decision")
@@ -7909,7 +8424,7 @@ class CampaignService:
         if digest != expected_digest:
             raise RuntimeError("campaign completion authority digest is invalid")
         saturation = document.get("saturation")
-        if reason == "saturated" and (
+        if require_saturation_ready and (
             not isinstance(saturation, Mapping) or saturation.get("ready") is not True
         ):
             raise RuntimeError("saturated campaign requires ready completion authority")
@@ -7939,6 +8454,7 @@ class CampaignService:
         # protocol fakes retain terminal compatibility, but cannot claim a completion
         # receipt or generate a production report.
         digest = await self._seal_completion_receipt(campaign_id, status, reason)
+        reason = read_campaign_terminal_reason(reason).value
         if digest is not None:
             status_projection = self.status
             projection = (
@@ -8201,6 +8717,7 @@ class CampaignService:
         wave: int,
         stop_reason: str,
     ) -> None:
+        stop_reason = read_campaign_terminal_reason(stop_reason).value
         if self._report_runner is None:
             return
         try:
@@ -8395,6 +8912,58 @@ class CampaignService:
             "elapsed_seconds": elapsed,
             "exhausted": exhausted,
         }
+
+    async def _campaign_service_objective_state(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+    ) -> Mapping[str, object]:
+        """Evaluate reviewed objectives across all durable campaign attempts."""
+
+        get_campaign = getattr(self._store, "get", None)
+        if not callable(get_campaign):
+            return {"reviewed": False, "violations": (), "metrics": {}}
+        row = await asyncio.to_thread(get_campaign, campaign_id)
+        envelope = row.get("manifest") if isinstance(row, Mapping) else None
+        reviewed = envelope.get("service_objectives") if isinstance(envelope, Mapping) else None
+        if not isinstance(reviewed, Mapping):
+            return {"reviewed": False, "violations": (), "metrics": {}}
+        list_waves = getattr(self._store, "list_waves", None)
+        if not callable(list_waves):
+            return {"reviewed": True, "violations": (), "metrics": {}}
+        waves = await asyncio.to_thread(list_waves, campaign_id)
+        receipts: list[Mapping[str, object]] = []
+        assignment_count = 0
+        for wave in waves:
+            schedule_id = str(wave.get("schedule_id") or "")
+            if not schedule_id:
+                continue
+            tasks = tuple(await self._agents.list_schedule_tasks(schedule_id))
+            assignment_count += len(tasks)
+            evidence = await self._source_evidence(schedule_id, tasks)
+            for task in tasks:
+                committed = evidence.get(task.id)
+                if not isinstance(committed, Mapping):
+                    continue
+                receipts.append(
+                    {
+                        "schedule_id": schedule_id,
+                        "task_id": task.id,
+                        "target_call_ids": tuple(committed.get("target_call_ids", ())),
+                        **_canonical_committed_attempt_outcome(committed),
+                    }
+                )
+        budget = await self._campaign_budget_state(campaign_id, manifest, waves=waves)
+        return _service_objective_projection(
+            reviewed,
+            budget,
+            receipts,
+            worker_concurrency=_reviewed_worker_concurrency(
+                manifest,
+                self._max_worker_concurrency,
+                max(1, assignment_count),
+            ),
+        )
 
     async def _campaign_budget_capped(self, campaign_id: str) -> bool:
         list_lead = getattr(self._store, "list_lead", None)
@@ -9619,6 +10188,333 @@ class CampaignService:
         )
         return tasks
 
+    async def _run_objective_phase_gates(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        *,
+        first_wave: int,
+    ) -> tuple[bool, int]:
+        """Execute reviewed prerequisites in order before any frontier claim."""
+
+        if not manifest.objective_phase_gates:
+            return True, first_wave - 1
+        lead = await asyncio.to_thread(self._store.list_lead, campaign_id)
+        gate_events = tuple(
+            payload
+            for row in lead
+            if isinstance(row, Mapping)
+            and isinstance((payload := row.get("payload")), Mapping)
+            and payload.get("kind") == "objective_phase_gate_settled"
+        )
+        waived = {
+            str(payload.get("gate_id"))
+            for row in lead
+            if isinstance(row, Mapping)
+            and isinstance((payload := row.get("payload")), Mapping)
+            and payload.get("kind") == "objective_phase_gate_waived"
+        }
+        wave = first_wave - 1
+        for gate in manifest.objective_phase_gates:
+            prior = tuple(event for event in gate_events if event.get("gate_id") == gate.id)
+            if any(event.get("status") == "succeeded" for event in prior):
+                continue
+            if gate.id in waived:
+                if not gate.operator_waivable:
+                    raise RuntimeError(f"objective phase gate {gate.id!r} is not waivable")
+                continue
+            if prior and prior[-1].get("status") == "blocked":
+                return False, wave
+            attempts = len(prior)
+            target_calls = sum(int(event.get("target_calls") or 0) for event in prior)
+            elapsed_seconds = sum(
+                max(0.0, float(event.get("elapsed_seconds") or 0.0)) for event in prior
+            )
+            gate_succeeded = False
+            while (
+                attempts < gate.budget.max_attempts and target_calls < gate.budget.max_target_calls
+            ):
+                remaining_seconds = (
+                    None
+                    if gate.budget.max_seconds is None
+                    else gate.budget.max_seconds - elapsed_seconds
+                )
+                if remaining_seconds is not None and remaining_seconds <= 0:
+                    wave += 1
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        wave,
+                        {
+                            "kind": "objective_phase_gate_settled",
+                            "gate_id": gate.id,
+                            "ordinal": gate.ordinal,
+                            "attempt": attempts,
+                            "status": "blocked",
+                            "attempt_disposition": "infrastructure_failed",
+                            "target_calls": 0,
+                            "cumulative_target_calls": target_calls,
+                            "elapsed_seconds": elapsed_seconds,
+                            "last_transition": None,
+                            "blocker": "reviewed prerequisite wall-clock budget exhausted",
+                            "retain_success": gate.retain_success.value,
+                            "frontier_claimed": False,
+                        },
+                    )
+                    pause_campaign = getattr(self._store, "pause", None)
+                    if callable(pause_campaign):
+                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    return False, wave
+                wave += 1
+                attempts += 1
+                remaining_calls = gate.budget.max_target_calls - target_calls
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "objective_phase_gate_started",
+                        "gate_id": gate.id,
+                        "ordinal": gate.ordinal,
+                        "attempt": attempts,
+                        "status": "pending",
+                        "remaining_seconds": remaining_seconds,
+                        "frontier_claimed": False,
+                    },
+                )
+                compiled = compile_prerequisite_campaign(
+                    manifest,
+                    context,
+                    gate_ids=(gate.id,),
+                )
+                compiled = replace(
+                    compiled,
+                    assignments=tuple(
+                        replace(
+                            assignment,
+                            budget=replace(assignment.budget, max_turns=1),
+                            max_target_exchanges=remaining_calls,
+                        )
+                        for assignment in compiled.assignments
+                    ),
+                )
+                attempt_started = time.monotonic()
+                try:
+                    if remaining_seconds is None:
+                        tasks = await self._run_wave(
+                            campaign_id,
+                            manifest,
+                            wave,
+                            "objective_prerequisite",
+                            compiled,
+                        )
+                    else:
+                        async with asyncio.timeout(remaining_seconds):
+                            tasks = await self._run_wave(
+                                campaign_id,
+                                manifest,
+                                wave,
+                                "objective_prerequisite",
+                                compiled,
+                            )
+                except TimeoutError:
+                    schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    await self._agents.cancel_schedule(
+                        schedule_id,
+                        reason="objective-phase-gate-time-budget-exhausted",
+                    )
+                    elapsed_seconds += max(0.0, time.monotonic() - attempt_started)
+                    settled = {
+                        "status": "blocked",
+                        "attempt_disposition": "infrastructure_failed",
+                        "target_calls": 0,
+                        "last_transition": None,
+                        "blocker": "reviewed prerequisite wall-clock budget exhausted",
+                    }
+                else:
+                    elapsed_seconds += max(0.0, time.monotonic() - attempt_started)
+                    schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    evidence = await self._source_evidence(schedule_id, tasks)
+                    settled = dict(
+                        await self._settle_objective_phase_gate(
+                            campaign_id, manifest, gate, tasks, evidence
+                        )
+                    )
+                target_calls += int(settled.get("target_calls") or 0)
+                exhausted = (
+                    attempts >= gate.budget.max_attempts
+                    or target_calls >= gate.budget.max_target_calls
+                    or (
+                        gate.budget.max_seconds is not None
+                        and elapsed_seconds >= gate.budget.max_seconds
+                    )
+                )
+                if settled["status"] == "retryable" and exhausted:
+                    settled["status"] = "blocked"
+                    settled["blocker"] = (
+                        f"{settled.get('blocker')}; reviewed prerequisite retry budget exhausted"
+                    )
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "objective_phase_gate_settled",
+                        "gate_id": gate.id,
+                        "ordinal": gate.ordinal,
+                        "attempt": attempts,
+                        "cumulative_target_calls": target_calls,
+                        "elapsed_seconds": elapsed_seconds,
+                        "retain_success": gate.retain_success.value,
+                        **settled,
+                        "frontier_claimed": False,
+                    },
+                )
+                if settled["status"] == "succeeded":
+                    gate_succeeded = True
+                    break
+                if settled["status"] == "blocked":
+                    pause_campaign = getattr(self._store, "pause", None)
+                    if callable(pause_campaign):
+                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    return False, wave
+            if not gate_succeeded:
+                pause_campaign = getattr(self._store, "pause", None)
+                if callable(pause_campaign):
+                    await asyncio.to_thread(pause_campaign, campaign_id)
+                return False, wave
+        return True, wave
+
+    async def _settle_objective_phase_gate(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        gate: ObjectivePhaseGate,
+        tasks: Sequence[AgentTask],
+        evidence: Mapping[str, Mapping[str, object]],
+    ) -> Mapping[str, object]:
+        """Require a fenced durable checkpoint before advancing a checkpoint gate."""
+
+        settled = dict(_objective_phase_gate_result(gate, tasks, evidence))
+        if settled["status"] != "succeeded" or gate.retain_success.value != "checkpoint":
+            return settled
+        loader = getattr(self._store, "load_objective_gate_checkpoint", None)
+        checkpoint = (
+            await asyncio.to_thread(loader, campaign_id, gate.id) if callable(loader) else None
+        )
+        if not isinstance(checkpoint, Mapping):
+            return {
+                **settled,
+                "status": "blocked",
+                "attempt_disposition": "infrastructure_failed",
+                "blocker": (
+                    "reviewed prerequisite succeeded but its durable checkpoint was not "
+                    "captured under the target state lease; refusing to replay an "
+                    "acknowledged target effect"
+                ),
+            }
+        if str(checkpoint.get("manifest_digest")) != manifest.digest:
+            return {
+                **settled,
+                "status": "blocked",
+                "attempt_disposition": "uncertain",
+                "blocker": "durable prerequisite checkpoint belongs to another manifest",
+            }
+        expected_recipe_digest = _objective_phase_gate_recipe_digest(gate)
+        if str(checkpoint.get("recipe_digest")) != expected_recipe_digest:
+            return {
+                **settled,
+                "status": "blocked",
+                "attempt_disposition": "uncertain",
+                "blocker": "durable prerequisite checkpoint does not match the sealed recipe",
+            }
+        reference = checkpoint.get("checkpoint_handle")
+        if not _opaque_state_checkpoint_reference(reference):
+            return {
+                **settled,
+                "status": "blocked",
+                "attempt_disposition": "uncertain",
+                "blocker": "durable prerequisite checkpoint has no opaque state reference",
+            }
+        return {
+            **settled,
+            "checkpoint_reference": dict(reference),
+            "checkpoint_evidence_digest": checkpoint.get("evidence_digest"),
+            "checkpoint_recipe_digest": expected_recipe_digest,
+        }
+
+    async def _bind_objective_phase_checkpoint_restores(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        assignments: Sequence[WorkerAssignment],
+    ) -> tuple[WorkerAssignment, ...]:
+        """Bind secret-safe durable checkpoint references to attack assignments."""
+
+        checkpoint_gates = tuple(
+            gate
+            for gate in manifest.objective_phase_gates
+            if gate.retain_success.value == "checkpoint"
+        )
+        if not checkpoint_gates:
+            return tuple(assignments)
+        loader = getattr(self._store, "load_objective_gate_checkpoint", None)
+        if not callable(loader):
+            raise RuntimeError("campaign store cannot restore objective prerequisite checkpoints")
+        restores: list[dict[str, object]] = []
+        for gate in checkpoint_gates:
+            checkpoint = await asyncio.to_thread(loader, campaign_id, gate.id)
+            if not isinstance(checkpoint, Mapping):
+                raise RuntimeError(
+                    f"objective phase gate {gate.id!r} has no durable checkpoint to restore"
+                )
+            if str(checkpoint.get("manifest_digest")) != manifest.digest:
+                raise RuntimeError(
+                    f"objective phase gate {gate.id!r} checkpoint manifest does not match"
+                )
+            recipe_digest = _objective_phase_gate_recipe_digest(gate)
+            reference = checkpoint.get("checkpoint_handle")
+            if str(checkpoint.get("recipe_digest")) != recipe_digest:
+                raise RuntimeError(
+                    f"objective phase gate {gate.id!r} checkpoint recipe does not match"
+                )
+            if not _opaque_state_checkpoint_reference(reference):
+                raise RuntimeError(
+                    f"objective phase gate {gate.id!r} checkpoint reference is invalid"
+                )
+            restores.append(
+                {
+                    "gate_id": gate.id,
+                    "recipe_digest": recipe_digest,
+                    "checkpoint_reference": dict(reference),
+                    "evidence_digest": str(checkpoint.get("evidence_digest") or ""),
+                }
+            )
+        contract = json.dumps(
+            {
+                "schema": "merlin.objective-phase-checkpoint-restore.v1",
+                "checkpoints": restores,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return tuple(
+            replace(
+                assignment,
+                strategy_contract=tuple(
+                    sorted(
+                        {
+                            **dict(assignment.strategy_contract),
+                            "objective_phase_manifest_digest": manifest.digest,
+                            "objective_phase_checkpoint_restore": contract,
+                        }.items()
+                    )
+                ),
+            )
+            for assignment in assignments
+        )
+
     async def _start_wave(
         self,
         campaign_id: str,
@@ -9639,8 +10535,13 @@ class CampaignService:
             and inherited_transition[0] == campaign_id
         ):
             transition_lease = inherited_transition[1]
+        assignments = compiled.assignments
+        if kind in {"initial", "frontier", "followup", "validation"}:
+            assignments = await self._bind_objective_phase_checkpoint_restores(
+                campaign_id, manifest, assignments
+            )
         assignments = _bind_validation_equivalence(
-            compiled.assignments,
+            assignments,
             scenario_fingerprint_for(manifest.target, manifest.catalogue),
             self._target_exchange_tool_ids(compiled.assignments),
         )
@@ -12215,6 +13116,17 @@ class CampaignService:
         lightweight review mode for low/medium non-ambiguous drafts.
         """
         source_task_ids = {task.id for task in tasks}
+        defensive_task_ids = {
+            task.id
+            for task in tasks
+            if _outcomes_are_defensive_only(
+                _attempted_technique_outcomes(
+                    task.result or "",
+                    task.technique_ids,
+                    normalize_blocked=False,
+                )
+            )
+        }
         if self._finding_reader is not None:
             findings = await self._finding_reader(manifest.session_id)
             verified = tuple(
@@ -12225,6 +13137,8 @@ class CampaignService:
                     # creator; normalize so older drafts stay admissible.
                     if str(_record_value(item, "creator") or "").removeprefix("worker:")
                     in source_task_ids
+                    and str(_record_value(item, "creator") or "").removeprefix("worker:")
+                    not in defensive_task_ids
                     and str(_record_value(item, "validation")) == "unvalidated"
                     and _record_value(item, "id") is not None
                     and str(_record_value(item, "target_id") or manifest.target.id)
@@ -12500,6 +13414,7 @@ class CampaignService:
         self,
     ) -> tuple[
         AssessmentPrepareTool,
+        AssessmentPhaseGateWaiveTool,
         AssessmentExecuteTool,
         AssessmentCancelTool,
         AssessmentStatusTool,
@@ -12508,6 +13423,7 @@ class CampaignService:
     ]:
         return (
             AssessmentPrepareTool(self),
+            AssessmentPhaseGateWaiveTool(self),
             AssessmentExecuteTool(self),
             AssessmentCancelTool(self),
             AssessmentStatusTool(self),
@@ -13047,6 +13963,17 @@ class CampaignService:
     async def _pause_recovered_campaign(self, campaign_id: str) -> None:
         """Settle a terminal frontier schedule before pausing daemon recovery."""
 
+        get_campaign = getattr(self._store, "get", None)
+        campaign_row = (
+            await asyncio.to_thread(get_campaign, campaign_id) if callable(get_campaign) else None
+        )
+        manifest = (
+            _manifest(campaign_row["manifest"]["manifest"])
+            if isinstance(campaign_row, Mapping)
+            and isinstance(campaign_row.get("manifest"), Mapping)
+            and isinstance(campaign_row["manifest"].get("manifest"), Mapping)
+            else None
+        )
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         frontier_loader = getattr(self._store, "load_active_frontier_batch", None)
         active = (
@@ -13092,6 +14019,7 @@ class CampaignService:
                         campaign_id,
                         _TerminalFrontierSchedule(schedule_id),
                         tasks,
+                        manifest=manifest,
                         transition_lease=transition_lease,
                     )
             await asyncio.to_thread(self._store.pause, campaign_id)
@@ -13252,6 +14180,70 @@ class CampaignService:
                 unresolved.add(technique_id)
         return outcomes, tuple(sorted(unresolved)), tuple(receipts)
 
+    async def lead_journal(
+        self, campaign_id: str, *, limit: int = 100
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return a bounded, presentation-safe view of the Campaign Lead journal."""
+        row = await asyncio.to_thread(self._store.get, campaign_id)
+        if row is None:
+            raise KeyError(f"unknown campaign {campaign_id!r}")
+        bounded_limit = max(1, min(int(limit), 500))
+        records = tuple(await asyncio.to_thread(self._store.list_lead, campaign_id))
+        return tuple(
+            {
+                "sequence": int(record.get("sequence", 0)),
+                "wave": int(record.get("wave", 0)),
+                "created_at": (
+                    record["created_at"].isoformat()
+                    if hasattr(record.get("created_at"), "isoformat")
+                    else str(record.get("created_at") or "")
+                ),
+                "payload": dict(record.get("payload") or {}),
+            }
+            for record in records[-bounded_limit:]
+        )
+
+    async def waive_objective_phase_gate(
+        self,
+        session_id: str,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        reason: str,
+    ) -> Mapping[str, object]:
+        """Persist an explicit operator waiver before attack execution begins."""
+
+        row = await asyncio.to_thread(self._store.get, campaign_id)
+        if row is None or str(row.get("session_id")) != session_id:
+            raise KeyError(f"unknown campaign {campaign_id!r}")
+        manifest = _manifest(row["manifest"]["manifest"])
+        gate = next((item for item in manifest.objective_phase_gates if item.id == gate_id), None)
+        if gate is None:
+            raise ValueError("objective phase gate is not preparation-reviewed")
+        if not gate.operator_waivable:
+            raise ValueError("objective phase gate is not operator-waivable")
+        if not reason.strip():
+            raise ValueError("objective phase gate waiver requires an operator reason")
+        waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+        if any(str(wave.get("kind")) in {"initial", "frontier", "followup"} for wave in waves):
+            raise RuntimeError("objective phase gates cannot be waived after attack execution")
+        wave_number = max((int(wave.get("wave") or 0) for wave in waves), default=0)
+        payload = {
+            "kind": "objective_phase_gate_waived",
+            "gate_id": gate.id,
+            "ordinal": gate.ordinal,
+            "status": "waived",
+            "reason": reason.strip(),
+            "frontier_claimed": False,
+        }
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave_number,
+            payload,
+        )
+        return payload
+
     async def status(
         self, campaign_id: str, *, seal_frontier_snapshot: bool = False
     ) -> Mapping[str, object]:
@@ -13265,6 +14257,7 @@ class CampaignService:
         finding_waves: set[int] = set()
         awaiting_validation = 0
         task_wave_by_id: dict[str, int] = {}
+        task_outcomes_by_id: dict[str, Mapping[str, str]] = {}
         adaptive_unresolved: set[str] = set()
         completion_receipts: list[Mapping[str, object]] = []
         completion_outcomes: list[VerifiedCandidateOutcome | Mapping[str, object]] = []
@@ -13406,6 +14399,9 @@ class CampaignService:
                                 )
                             ),
                             "evaluation_uncertainties": transport_uncertainties,
+                            **_canonical_committed_attempt_outcome(committed),
+                            "model_steps": int(committed.get("model_steps") or 0),
+                            "model_cost_usd": float(committed.get("model_cost_usd") or 0.0),
                         }
                     )
                     completion_outcomes.extend(
@@ -13452,6 +14448,7 @@ class CampaignService:
                     if not ledger_rows and isinstance(committed, Mapping) and trusted_refs
                     else {}
                 )
+                task_outcomes_by_id[task.id] = outcomes
                 # Receipt-native clear negatives: an observed attempt whose sealed
                 # target responses are all deterministic refusals is a refuted cell,
                 # not a partial.  Explicit hypothesis/override outcomes below still win.
@@ -13551,6 +14548,7 @@ class CampaignService:
         envelope = row["manifest"]
         manifest = _manifest(envelope["manifest"])
         assignment_context = _assignment_context(envelope["assignment_context"])
+        objective_phase_gates = _objective_phase_gate_projection(manifest, lead)
         capability_results = _capability_probe_results_from_lead(lead)
         observed_capability_surfaces = tuple(
             sorted(capability_observed_surfaces(capability_results))
@@ -13588,10 +14586,13 @@ class CampaignService:
             durable_findings = await self._finding_reader(manifest.session_id)
             for finding in durable_findings:
                 creator = str(_record_value(finding, "creator") or "")
-                finding_wave = task_wave_by_id.get(creator)
+                normalized_creator = creator.removeprefix("worker:")
+                finding_wave = task_wave_by_id.get(normalized_creator)
                 if finding_wave is None or str(_record_value(finding, "target_id")) != (
                     manifest.target.id
                 ):
+                    continue
+                if _outcomes_are_defensive_only(task_outcomes_by_id.get(normalized_creator, {})):
                     continue
                 validation = str(_record_value(finding, "validation") or "unvalidated")
                 finding_waves.add(finding_wave)
@@ -13720,6 +14721,16 @@ class CampaignService:
         )
         saturation_decision = _latest_saturation_decision_state(lead)
         budget = await self._campaign_budget_state(campaign_id, manifest, waves=waves)
+        service_objectives = _service_objective_projection(
+            envelope.get("service_objectives"),
+            budget,
+            completion_receipts,
+            worker_concurrency=_reviewed_worker_concurrency(
+                manifest,
+                self._max_worker_concurrency,
+                len(assignment_context.techniques),
+            ),
+        )
         scenario_fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
         target_generation = str(envelope.get("adapter_generation") or scenario_fingerprint)
         completion_scope = CompletionScope(
@@ -14151,6 +15162,8 @@ class CampaignService:
                 envelope.get("technique_skips", ()), attempted_cell_ids
             ),
             "saturation": saturation_document,
+            "service_objectives": service_objectives,
+            "objective_phase_gates": objective_phase_gates,
         }
         if frontier_snapshot is not None:
             completion_document["frontier_snapshot"] = frontier_snapshot
@@ -14219,6 +15232,8 @@ class CampaignService:
             "observed_capability_surfaces": observed_capability_surfaces,
             "saturation_decision": saturation_decision,
             "budget": budget,
+            "service_objectives": service_objectives,
+            "objective_phase_gates": objective_phase_gates,
             "pace": _campaign_pace(tuple(pace_waves), datetime.now(UTC)),
             "dynamic_specialists": tuple(
                 {
@@ -15148,6 +16163,121 @@ class AssessmentPrepareTool:
                         },
                         "additionalProperties": False,
                     },
+                    "bounded_regeneration": {
+                        "type": "object",
+                        "description": (
+                            "Optional operator-reviewed hard limits for model-backed semantic "
+                            "regeneration after a protocol-invalid target request. The contract "
+                            "is sealed into the campaign manifest; omit it when regeneration "
+                            "has not been explicitly reviewed."
+                        ),
+                        "properties": {
+                            "schema_version": {"const": "merlin.generator-execution.v1"},
+                            "generator_id": {"type": "string", "minLength": 1},
+                            "max_outputs": {"type": "integer", "minimum": 1},
+                            "max_output_bytes": {"type": "integer", "minimum": 1},
+                            "max_seconds": {"type": "number", "exclusiveMinimum": 0},
+                        },
+                        "required": [
+                            "schema_version",
+                            "generator_id",
+                            "max_outputs",
+                            "max_output_bytes",
+                            "max_seconds",
+                        ],
+                        "additionalProperties": False,
+                    },
+                    "phase_gates": {
+                        "type": "array",
+                        "description": (
+                            "Optional operator-reviewed ordered prerequisites. Each gate must "
+                            "contain an exact target action recipe and a typed predicate over a "
+                            "reviewed target state observation. Never derive gates from objective "
+                            "prose."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "minLength": 1},
+                                "ordinal": {"type": "integer", "minimum": 0},
+                                "objective": {"type": "string", "minLength": 1},
+                                "actions": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string", "minLength": 1},
+                                            "step_id": {"type": "string", "minLength": 1},
+                                            "input_text": {"type": "string", "minLength": 1},
+                                        },
+                                        "required": ["id", "step_id", "input_text"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "success_predicate": {
+                                    "type": "object",
+                                    "properties": {
+                                        "observation_name": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                        "operator": {
+                                            "enum": [
+                                                "equals",
+                                                "one_of",
+                                                "at_least",
+                                                "at_most",
+                                                "increases",
+                                                "decreases",
+                                                "terminal_success",
+                                            ]
+                                        },
+                                        "expected_values": {"type": "array"},
+                                    },
+                                    "required": ["observation_name", "operator"],
+                                    "additionalProperties": False,
+                                },
+                                "budget": {
+                                    "type": "object",
+                                    "properties": {
+                                        "max_attempts": {"type": "integer", "minimum": 1},
+                                        "max_target_calls": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                        },
+                                        "max_seconds": {
+                                            "type": "number",
+                                            "exclusiveMinimum": 0,
+                                        },
+                                    },
+                                    "required": ["max_attempts", "max_target_calls"],
+                                    "additionalProperties": False,
+                                },
+                                "retry_on": {
+                                    "type": "array",
+                                    "items": {
+                                        "enum": [
+                                            "infrastructure_failure",
+                                            "ambiguous_transition",
+                                            "unchanged",
+                                        ]
+                                    },
+                                },
+                                "retain_success": {"enum": ["recipe", "checkpoint"]},
+                                "operator_waivable": {"type": "boolean"},
+                            },
+                            "required": [
+                                "id",
+                                "ordinal",
+                                "objective",
+                                "actions",
+                                "success_predicate",
+                                "budget",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
                     "adapter": {
                         "type": "object",
                         "properties": {
@@ -15405,14 +16535,39 @@ class AssessmentPrepareTool:
             )
         except (TypeError, ValueError):
             return ToolResult(content="budget limits must be positive numbers", is_error=True)
+        phase_gates_value = arguments.get("phase_gates")
+        if phase_gates_value is None:
+            phase_gates_value = []
+        if not isinstance(phase_gates_value, list):
+            return ToolResult(content="phase_gates must be an array", is_error=True)
+        try:
+            phase_gates = tuple(
+                objective_phase_gate_from_mapping(value) for value in phase_gates_value
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            return ToolResult(content=f"invalid phase_gates: {error}", is_error=True)
+        regeneration_value = arguments.get("bounded_regeneration")
+        try:
+            regeneration = (
+                GeneratorExecutionContract.model_validate(regeneration_value)
+                if regeneration_value is not None
+                else None
+            )
+        except (TypeError, ValueError) as error:
+            return ToolResult(content=f"invalid bounded_regeneration: {error}", is_error=True)
         composition_kwargs = {} if composition is None else {"specialist_composition": composition}
+        prepare_kwargs = {
+            **composition_kwargs,
+            **({"objective_phase_gates": phase_gates} if phase_gates else {}),
+            **({"bounded_regeneration": regeneration} if regeneration is not None else {}),
+        }
         if budget is None:
             result = await self._service.prepare(
-                context.session_id, objective, profile, adapter, **composition_kwargs
+                context.session_id, objective, profile, adapter, **prepare_kwargs
             )
         else:
             result = await self._service.prepare(
-                context.session_id, objective, profile, adapter, budget, **composition_kwargs
+                context.session_id, objective, profile, adapter, budget, **prepare_kwargs
             )
         self._adapter_candidates.pop(context.session_id, None)
         return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
@@ -15714,6 +16869,20 @@ def _normalize_adapter_evaluation_metadata(
             }.values()
         ]
     return adapter
+
+
+def _adapter_target_authority(endpoint: str) -> str:
+    """Normalize an adapter endpoint to the shared target-resource authority."""
+
+    parsed = urlsplit(endpoint)
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = (parsed.scheme == "http" and parsed.port == 80) or (
+        parsed.scheme == "https" and parsed.port == 443
+    )
+    port = "" if parsed.port is None or default_port else f":{parsed.port}"
+    return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
 
 
 def _validate_reviewed_adapter(
@@ -16077,6 +17246,57 @@ def _validate_browser_interaction_contract(contract: Mapping[str, object]) -> st
     return None
 
 
+class AssessmentPhaseGateWaiveTool:
+    effect = "workspace_write"
+
+    def __init__(self, service: CampaignService) -> None:
+        self._service = service
+
+    def describe(self) -> ToolSpec:
+        return ToolSpec(
+            name="assessment_phase_gate_waive",
+            description=(
+                "Record an explicit operator waiver for one preparation-reviewed, waivable "
+                "objective prerequisite before any attack wave starts."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "campaign_id": {"type": "string", "minLength": 1},
+                    "gate_id": {"type": "string", "minLength": 1},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 2048},
+                },
+                "required": ["campaign_id", "gate_id", "reason"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+        campaign_id = arguments.get("campaign_id")
+        gate_id = arguments.get("gate_id")
+        reason = arguments.get("reason")
+        if not all(
+            isinstance(value, str) and value.strip() for value in (campaign_id, gate_id, reason)
+        ):
+            return ToolResult(
+                content="campaign_id, gate_id, and operator reason are required",
+                is_error=True,
+            )
+        assert isinstance(campaign_id, str)
+        assert isinstance(gate_id, str)
+        assert isinstance(reason, str)
+        try:
+            result = await self._service.waive_objective_phase_gate(
+                context.session_id,
+                campaign_id,
+                gate_id,
+                reason=reason,
+            )
+        except (KeyError, RuntimeError, ValueError) as error:
+            return ToolResult(content=str(error), is_error=True)
+        return ToolResult(content=json.dumps(result, sort_keys=True), metadata=dict(result))
+
+
 class AssessmentExecuteTool:
     effect = "target_network"
 
@@ -16156,14 +17376,40 @@ def new_campaign_id() -> str:
     return f"campaign/{uuid4()}"
 
 
+def _reviewed_state_capabilities(manifest: CampaignManifest) -> StateCapabilities | None:
+    adapter = _reviewed_adapter_value(manifest)
+    raw = adapter.get("state_capabilities") if isinstance(adapter, Mapping) else None
+    try:
+        return StateCapabilities.model_validate(raw) if isinstance(raw, Mapping) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _reviewed_target_state_capacity(manifest: CampaignManifest) -> int:
+    capabilities = _reviewed_state_capabilities(manifest)
+    values = [
+        value
+        for value in (
+            manifest.target.browser_concurrency,
+            capabilities.maximum_parallel_states if capabilities is not None else None,
+        )
+        if value is not None
+    ]
+    return max(1, min(values)) if values else 1
+
+
 def _reviewed_worker_concurrency(
     manifest: CampaignManifest, configured_maximum: int, assignment_count: int
 ) -> int:
     """Honor the reviewed target/session ceiling on every campaign wave."""
-    reviewed_maximum = manifest.target.browser_concurrency
-    if reviewed_maximum is None:
-        reviewed_maximum = configured_maximum
-    return max(1, min(assignment_count, configured_maximum, reviewed_maximum))
+    return max(
+        1,
+        min(
+            assignment_count,
+            configured_maximum,
+            _reviewed_target_state_capacity(manifest),
+        ),
+    )
 
 
 def _capability_probe_wave_concurrency(configured_maximum: int, assignment_count: int) -> int:
@@ -16342,29 +17588,7 @@ def _lead_initial_composition_proposal(
 
 
 def _manifest(value: Mapping[str, Any]) -> CampaignManifest:
-    reviewed_policy = value.get("dynamic_specialist_policy")
-    return CampaignManifest(
-        id=value["id"],
-        session_id=value["session_id"],
-        objective=value["objective"],
-        profile=CampaignProfile(value["profile"]),
-        target=ReviewedTargetAdapter(**value["target"]),
-        provider_id=value["provider_id"],
-        provider_model=value.get("provider_model", value["target"].get("model") or "unknown"),
-        provider_effort=value.get("provider_effort", "default"),
-        authority_ids=tuple(value["authority_ids"]),
-        catalogue=tuple(ContextDocument(**item) for item in value["catalogue"]),
-        skill_documents=tuple(ContextDocument(**item) for item in value["skill_documents"]),
-        tool_ids=tuple(value["tool_ids"]),
-        budget=AssignmentBudget(**value["budget"]),
-        digest=value["digest"],
-        specialist_composition=value.get("specialist_composition", "opinionated"),
-        dynamic_specialist_policy=(
-            DynamicSpecialistPolicy(**reviewed_policy)
-            if isinstance(reviewed_policy, Mapping)
-            else None
-        ),
-    )
+    return CampaignManifest.from_mapping(value)
 
 
 def _assignment_technique(item: Mapping[str, Any]) -> AssignmentTechnique:
@@ -16482,6 +17706,9 @@ def _assignment_context(value: Mapping[str, Any]) -> AssignmentContext:
 
 
 def _json_value(value: Any) -> Any:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _json_value(model_dump(mode="json"))
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (set, frozenset)):
@@ -17946,6 +19173,11 @@ def _verified_completion_outcomes(
                     validator_evidence_refs=tuple(sorted(validator_refs)),
                     validator_witness_digests=tuple(sorted(witness_digests)),
                     verifier_record_id=str(matching.get("id") or task.id),
+                    candidate_outcome_projection=(
+                        dict(strategy_state["candidate_outcome_projection"])
+                        if isinstance(strategy_state.get("candidate_outcome_projection"), Mapping)
+                        else None
+                    ),
                 )
             )
         except ValueError:
@@ -18577,6 +19809,8 @@ def _arm_task_observation(
     task: AgentTask,
     arm: Mapping[str, object],
     committed: Mapping[str, object],
+    *,
+    contract_override: Mapping[str, object] | None = None,
 ) -> Mapping[str, object] | None:
     """Translate one attributed task receipt into the durable outcome contract."""
     attempt_id = committed.get("attempt_id")
@@ -18587,7 +19821,7 @@ def _arm_task_observation(
         "scenario_fingerprint": str(arm.get("scenario_fingerprint") or ""),
         **ArmIdentity.from_mapping(arm).projection(),
     }
-    contract = _sealed_hypothesis_contract(task.objective)
+    contract = contract_override or _sealed_hypothesis_contract(task.objective)
     measured = _hypothesis_task_observation(campaign_id, task, contract or {}, committed)
     if measured is None:
         return None
@@ -18658,6 +19892,17 @@ def _arm_task_observation(
         "usage": dict(committed.get("usage") or {}),
         "evidence_refs": refs,
         "evaluation_uncertainties": tuple(uncertainties),
+        "candidate_outcome_projection": measured.get("candidate_outcome_projection"),
+        "canonical_candidate_identity": (
+            dict(contract["candidate_identity"])
+            if isinstance(contract.get("candidate_identity"), Mapping)
+            else None
+        ),
+        "model_verdict": measured.get("model_verdict"),
+        "model_authority_disagreement": measured.get("model_authority_disagreement"),
+        "requires_independent_reproduction": bool(
+            measured.get("requires_independent_reproduction")
+        ),
         "reason": (
             measured["reason"]
             if transform_credit_eligible
@@ -18690,7 +19935,21 @@ def _hypothesis_task_observation(
         if infrastructure_category in {item.value for item in InfrastructureFailureCategory}
         else None
     )
-    attempt_disposition, outcome_authority = _committed_attempt_authority(committed)
+    candidate_identity = _candidate_identity_from_projection(contract.get("candidate_identity"))
+    expected_candidate_id = (
+        candidate_id_for_identity(candidate_identity.projection())
+        if candidate_identity is not None
+        else hypothesis_id
+    )
+    canonical = _canonical_committed_attempt_outcome(
+        committed, expected_candidate_id=expected_candidate_id
+    )
+    attempt_disposition = str(canonical["attempt_disposition"])
+    outcome_authority = str(canonical["outcome_authority"])
+    attempted_outcomes = _attempted_technique_outcomes(task.result or "", task.technique_ids)
+    model_verdict = attempted_outcomes.get(hypothesis_id)
+    if model_verdict is None and len(attempted_outcomes) == 1:
+        model_verdict = next(iter(attempted_outcomes.values()))
     if typed_infrastructure is not None:
         outcome, signal, distance, reason = (
             "infrastructure_failure",
@@ -18714,16 +19973,17 @@ def _hypothesis_task_observation(
             f"(disposition={attempt_disposition}, authority={outcome_authority})",
         )
     else:
-        verdicts = set(
-            _attempted_technique_outcomes(task.result or "", task.technique_ids).values()
-        )
+        authoritative_outcome = canonical["outcome"]
+        verdicts = set(attempted_outcomes.values())
         try:
             document = parse_model_json(task.result or "")
         except ValueError:
             document = {}
         declared = document.get("outcome") if isinstance(document, Mapping) else None
         declared_signal = document.get("signal") if isinstance(document, Mapping) else None
-        if "confirmed" in verdicts:
+        if authoritative_outcome == "confirmed" or (
+            outcome_authority == "validator" and "confirmed" in verdicts
+        ):
             outcome, signal, distance, reason = (
                 "authoritative_success",
                 None,
@@ -18749,7 +20009,9 @@ def _hypothesis_task_observation(
                     None,
                     "worker declared a partial outcome without a valid numeric signal",
                 )
-        elif "refuted" in verdicts:
+        elif authoritative_outcome == "refuted" or (
+            outcome_authority == "validator" and "refuted" in verdicts
+        ):
             outcome, signal, distance, reason = (
                 "clean_negative",
                 None,
@@ -18776,7 +20038,27 @@ def _hypothesis_task_observation(
     )
     if not refs:
         return None
-    return {
+    if canonical.get("schema") == "merlin.candidate-outcome.v1":
+        candidate_projection = validate_candidate_outcome_projection(
+            canonical, expected_candidate_id=expected_candidate_id
+        )
+    else:
+        evidence_digest = str(committed.get("digest") or "")
+        if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", evidence_digest):
+            evidence_digest = candidate_evidence_digest(refs)
+        candidate_projection = project_candidate_outcome(
+            candidate_id=expected_candidate_id,
+            attempt_disposition=attempt_disposition,
+            outcome_authority=outcome_authority,
+            outcome=canonical["outcome"],
+            evidence_digest=evidence_digest,
+        )
+    disagreement = (
+        model_authority_disagreement(model_verdict, candidate_projection)
+        if outcome_authority == "target"
+        else None
+    )
+    observation = {
         "campaign_id": campaign_id,
         "hypothesis_id": hypothesis_id,
         "technique_attempt_id": attempt_id,
@@ -18788,38 +20070,115 @@ def _hypothesis_task_observation(
         "evidence_refs": refs,
         "reason": reason,
         "infrastructure_failure_category": typed_infrastructure,
+        "candidate_outcome_projection": candidate_projection,
     }
+    if model_verdict is not None:
+        observation["model_verdict"] = model_verdict
+    if disagreement is not None:
+        observation["model_authority_disagreement"] = disagreement
+        observation["requires_independent_reproduction"] = True
+    return observation
 
 
 def _committed_attempt_authority(committed: Mapping[str, object]) -> tuple[str, str]:
     """Project conservative attempt validity from authenticated target receipts."""
 
+    canonical = _canonical_committed_attempt_outcome(committed)
+    return str(canonical["attempt_disposition"]), str(canonical["outcome_authority"])
+
+
+def _canonical_committed_attempt_outcome(
+    committed: Mapping[str, object],
+    *,
+    expected_candidate_id: str | None = None,
+) -> Mapping[str, object]:
+    """Normalize one committed attempt without allowing projections to disagree.
+
+    Receipt-native values take precedence over duplicated top-level fields. Any
+    receipt disagreement makes the attempt uncertain and removes terminal
+    authority, so worker prose cannot turn a refusal or contaminated run into a
+    learning signal.
+    """
+
     direct_disposition = committed.get("attempt_disposition")
     direct_authority = committed.get("outcome_authority")
-    if isinstance(direct_disposition, str):
-        disposition = direct_disposition.strip().casefold() or "uncertain"
-        authority = (
-            direct_authority.strip().casefold()
-            if isinstance(direct_authority, str) and direct_authority.strip()
-            else "none"
-        )
-        return disposition, authority if disposition == "valid" else "none"
-
     receipts = committed.get("target_evidence_receipts")
     values = (
         tuple(value for _, value in _mapping_items(receipts) if isinstance(value, Mapping))
         if isinstance(receipts, Mapping)
         else ()
     )
+    ordered_call_ids = tuple(
+        str(value)
+        for value in committed.get("target_call_ids", ())
+        if isinstance(value, str) and value
+    )
+    ordered_values = tuple(
+        receipts[call_id]
+        for call_id in ordered_call_ids
+        if isinstance(receipts, Mapping) and isinstance(receipts.get(call_id), Mapping)
+    )
+    if ordered_values:
+        values = ordered_values
+    raw_projections = tuple(value.get("candidate_outcome_projection") for value in values)
+    if raw_projections and all(isinstance(value, Mapping) for value in raw_projections):
+        projections = tuple(
+            validate_candidate_outcome_projection(
+                value,
+                expected_candidate_id=expected_candidate_id,
+            )
+            for value in raw_projections
+            if isinstance(value, Mapping)
+        )
+        candidate_ids = {value["candidate_id"] for value in projections}
+        if len(candidate_ids) != 1:
+            raise ValueError("target receipts disagree on canonical candidate id")
+        invalid = tuple(value for value in projections if not value["valid"])
+        selected = invalid[-1] if invalid else projections[-1]
+        for field, direct in (
+            ("attempt_disposition", direct_disposition),
+            ("outcome_authority", direct_authority),
+            ("outcome", committed.get("target_authoritative_outcome")),
+        ):
+            if direct is not None and str(direct).strip().casefold() != selected[field]:
+                raise ValueError(f"committed {field} conflicts with canonical target receipt")
+        return selected
+    if any(isinstance(value, Mapping) for value in raw_projections):
+        raise ValueError("target receipts mix canonical and legacy outcome projections")
+    if not values and isinstance(direct_disposition, str):
+        disposition = direct_disposition.strip().casefold() or "uncertain"
+        authority = (
+            direct_authority.strip().casefold()
+            if isinstance(direct_authority, str) and direct_authority.strip()
+            else "none"
+        )
+        outcome = str(committed.get("target_authoritative_outcome") or "unclear").casefold()
+        if disposition != "valid" or authority not in {"target", "validator"}:
+            authority, outcome = "none", "unclear"
+        elif outcome not in {"confirmed", "refuted", "progress", "regression", "unclear"}:
+            outcome = "unclear"
+        return {
+            "attempt_disposition": disposition,
+            "outcome_authority": authority,
+            "outcome": outcome,
+        }
     dispositions = {
         str(value.get("attempt_disposition") or "uncertain").strip().casefold() for value in values
     }
     dispositions.discard("")
     if len(dispositions) != 1:
-        return "uncertain", "none"
+        return {
+            "attempt_disposition": "uncertain",
+            "outcome_authority": "none",
+            "outcome": "unclear",
+        }
     disposition = next(iter(dispositions))
     if disposition != "valid":
-        return disposition, "none"
+        return {
+            "attempt_disposition": disposition,
+            "outcome_authority": "none",
+            "outcome": "unclear",
+        }
     authorities = {
         str(value.get("outcome_authority") or "none").strip().casefold() for value in values
     }
@@ -18827,7 +20186,350 @@ def _committed_attempt_authority(committed: Mapping[str, object]) -> tuple[str, 
     authority = next(iter(authorities)) if len(authorities) == 1 else "none"
     if authority not in {"target", "validator"}:
         authority = "none"
-    return disposition, authority
+    outcomes = {
+        str(value.get("target_authoritative_outcome") or "unclear").strip().casefold()
+        for value in values
+    }
+    outcomes.discard("")
+    outcome = next(iter(outcomes)) if len(outcomes) == 1 else "unclear"
+    if outcome not in {"confirmed", "refuted", "progress", "regression", "unclear"}:
+        outcome = "unclear"
+    if authority == "none":
+        outcome = "unclear"
+    return {
+        "attempt_disposition": disposition,
+        "outcome_authority": authority,
+        "outcome": outcome,
+    }
+
+
+def _outcomes_are_defensive_only(outcomes: Mapping[str, str]) -> bool:
+    """Return true only when explicit outcomes demonstrate defensive behavior."""
+
+    values = {str(value).casefold() for value in outcomes.values()}
+    return bool(values) and values <= {"refuted", "blocked"}
+
+
+def _objective_phase_gate_result(
+    gate: ObjectivePhaseGate,
+    tasks: Sequence[AgentTask],
+    evidence: Mapping[str, Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Settle a prerequisite only from its reviewed target observation."""
+
+    committed = next(
+        (evidence[task.id] for task in tasks if isinstance(evidence.get(task.id), Mapping)),
+        None,
+    )
+    target_calls = tuple(
+        dict.fromkeys(
+            str(call_id)
+            for call_id in (() if committed is None else committed.get("target_call_ids", ()))
+            if isinstance(call_id, str) and call_id
+        )
+    )
+    if committed is None:
+        return {
+            "status": "retryable",
+            "attempt_disposition": "infrastructure_failed",
+            "target_calls": len(target_calls),
+            "last_transition": None,
+            "blocker": "objective prerequisite produced no committed evidence",
+        }
+    receipts = committed.get("target_evidence_receipts")
+    gate_receipts = tuple(
+        receipts[call_id]
+        for call_id in target_calls
+        if isinstance(receipts, Mapping) and isinstance(receipts.get(call_id), Mapping)
+    )
+    if gate_receipts:
+        dispositions = {
+            str(receipt.get("attempt_disposition") or "uncertain").strip().casefold()
+            for receipt in gate_receipts
+        }
+        dispositions.discard("")
+        disposition = next(iter(dispositions)) if len(dispositions) == 1 else "uncertain"
+    else:
+        canonical = _canonical_committed_attempt_outcome(committed)
+        disposition = str(canonical["attempt_disposition"])
+    if disposition != "valid":
+        retry_reason = (
+            ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE
+            if disposition == "infrastructure_failed"
+            else ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION
+        )
+        return {
+            "status": "retryable" if retry_reason in gate.retry_on else "blocked",
+            "attempt_disposition": disposition,
+            "target_calls": len(target_calls),
+            "last_transition": None,
+            "blocker": f"objective prerequisite attempt was {disposition}",
+        }
+    transitions = _objective_gate_transitions(committed)
+    evaluated_transition = transitions[-1] if transitions else None
+    predicate_result = (
+        None
+        if evaluated_transition is None
+        else evaluate_objective_gate_predicate(asdict(gate), evaluated_transition)
+    )
+    observation = next(
+        (
+            item
+            for item in reversed(
+                tuple(evaluated_transition.get("observations", ()))
+                if evaluated_transition is not None
+                else ()
+            )
+            if isinstance(item, Mapping)
+            and item.get("name") == gate.success_predicate.observation_name
+        ),
+        None,
+    )
+    last_transition = dict(transitions[-1]) if transitions else None
+    if predicate_result is True:
+        status, blocker = "succeeded", None
+    elif predicate_result is None:
+        retryable = ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION in gate.retry_on
+        status = "retryable" if retryable else "blocked"
+        blocker = (
+            f"reviewed observation {gate.success_predicate.observation_name!r} "
+            "was absent or ambiguous"
+        )
+    else:
+        unchanged = observation is not None and observation.get("status") == "unchanged"
+        retryable = unchanged and ObjectiveGateRetryReason.UNCHANGED in gate.retry_on
+        status = "retryable" if retryable else "blocked"
+        blocker = (
+            f"reviewed predicate {gate.success_predicate.operator.value} was not satisfied "
+            f"by observation {gate.success_predicate.observation_name!r}"
+        )
+    return {
+        "status": status,
+        "attempt_disposition": disposition,
+        "target_calls": len(target_calls),
+        "last_transition": last_transition,
+        "blocker": blocker,
+        "evidence_refs": tuple(
+            str(value)
+            for value in (committed.get("reference"), committed.get("digest"), *target_calls)
+            if isinstance(value, str) and value
+        ),
+    }
+
+
+def _objective_phase_gate_recipe_digest(gate: ObjectivePhaseGate) -> str:
+    body = json.dumps(asdict(gate), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+
+
+def _opaque_state_checkpoint_reference(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("kind") == "opaque_reference"
+        and value.get("namespace") == "state"
+        and isinstance(value.get("reference_id"), str)
+        and str(value["reference_id"]).strip()
+    )
+
+
+def _objective_phase_gate_projection(
+    manifest: CampaignManifest,
+    lead: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    events = tuple(
+        payload
+        for row in lead
+        if isinstance(row, Mapping)
+        and isinstance((payload := row.get("payload")), Mapping)
+        and payload.get("kind")
+        in {
+            "objective_phase_gate_started",
+            "objective_phase_gate_settled",
+            "objective_phase_gate_waived",
+        }
+    )
+    return tuple(
+        {
+            "gate_id": gate.id,
+            "ordinal": gate.ordinal,
+            "objective": gate.objective,
+            "operator_waivable": gate.operator_waivable,
+            "retain_success": gate.retain_success.value,
+            "status": str(latest.get("status") or "pending") if latest else "pending",
+            "attempt": int(latest.get("attempt") or 0) if latest else 0,
+            "target_calls": int(
+                latest.get("cumulative_target_calls", latest.get("target_calls", 0)) or 0
+            )
+            if latest
+            else 0,
+            "blocker": latest.get("blocker") if latest else None,
+            "last_transition": latest.get("last_transition") if latest else None,
+        }
+        for gate in manifest.objective_phase_gates
+        for latest in (
+            next(
+                (event for event in reversed(events) if event.get("gate_id") == gate.id),
+                None,
+            ),
+        )
+    )
+
+
+def _objective_gate_transitions(
+    committed: Mapping[str, object],
+) -> tuple[Mapping[str, object], ...]:
+    transitions: list[Mapping[str, object]] = []
+    direct = committed.get("target_state_transition")
+    if isinstance(direct, Mapping):
+        transitions.append(direct)
+    receipts = committed.get("target_evidence_receipts")
+    for _, receipt in _mapping_items(receipts):
+        if isinstance(receipt, Mapping) and isinstance(
+            transition := receipt.get("target_state_transition"), Mapping
+        ):
+            transitions.append(transition)
+    return tuple(transitions)
+
+
+_SERVICE_OBJECTIVE_SCHEMA = "merlin.campaign-service-objectives.v1"
+_SERVICE_OBJECTIVE_LIMITS = (
+    "max_orchestration_steps_per_target_call",
+    "max_cost_per_unique_valid_attempt_usd",
+    "min_valid_attempt_throughput",
+    "evaluate_throughput_after_target_calls",
+)
+
+
+def _reviewed_service_objectives(
+    value: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    """Validate an explicit, versioned campaign service-objective contract."""
+
+    if value is None:
+        return None
+    unknown = set(value) - {"schema", *_SERVICE_OBJECTIVE_LIMITS}
+    if unknown:
+        raise ValueError(f"unsupported service objective fields: {sorted(unknown)!r}")
+    if value.get("schema") != _SERVICE_OBJECTIVE_SCHEMA:
+        raise ValueError(f"service_objectives.schema must be {_SERVICE_OBJECTIVE_SCHEMA!r}")
+    projected: dict[str, object] = {"schema": _SERVICE_OBJECTIVE_SCHEMA}
+    for key in _SERVICE_OBJECTIVE_LIMITS:
+        limit = value.get(key)
+        if limit is None:
+            continue
+        if (
+            not isinstance(limit, (int, float))
+            or isinstance(limit, bool)
+            or not math.isfinite(float(limit))
+            or float(limit) <= 0
+        ):
+            raise ValueError(f"service objective {key} must be a finite positive number")
+        if key == "min_valid_attempt_throughput" and float(limit) > 1:
+            raise ValueError("min_valid_attempt_throughput must be at most 1")
+        if key == "evaluate_throughput_after_target_calls":
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise ValueError("evaluate_throughput_after_target_calls must be an integer")
+            projected[key] = limit
+        else:
+            projected[key] = float(limit)
+    if len(projected) == 1:
+        raise ValueError("service_objectives must contain at least one reviewed limit")
+    if ("min_valid_attempt_throughput" in projected) != (
+        "evaluate_throughput_after_target_calls" in projected
+    ):
+        raise ValueError(
+            "min_valid_attempt_throughput and evaluate_throughput_after_target_calls "
+            "must be reviewed together"
+        )
+    return projected
+
+
+def _service_objective_projection(
+    reviewed: object,
+    budget: Mapping[str, object],
+    receipts: Sequence[Mapping[str, object]],
+    *,
+    worker_concurrency: int,
+) -> Mapping[str, object]:
+    """Report campaign efficiency and enforce only an explicit reviewed contract."""
+
+    contract = dict(reviewed) if isinstance(reviewed, Mapping) else None
+    target_calls = {
+        str(call_id)
+        for receipt in receipts
+        for call_id in receipt.get("target_call_ids", ())
+        if isinstance(call_id, str) and call_id
+    }
+    valid_attempts = {
+        (str(receipt.get("schedule_id") or ""), str(receipt.get("task_id") or ""))
+        for receipt in receipts
+        if receipt.get("attempt_disposition") == "valid"
+        and receipt.get("outcome_authority") in {"target", "validator"}
+    }
+    valid_attempts.discard(("", ""))
+    usage = budget.get("usage") if isinstance(budget.get("usage"), Mapping) else {}
+    turns = int(usage.get("turns") or 0) if isinstance(usage, Mapping) else 0
+    cost = float(usage.get("estimated_cost_usd") or 0.0) if isinstance(usage, Mapping) else 0.0
+    target_call_count = len(target_calls)
+    valid_attempt_count = len(valid_attempts)
+    metrics = {
+        "target_calls": target_call_count,
+        "unique_valid_attempts": valid_attempt_count,
+        "orchestration_steps": turns,
+        "orchestration_steps_per_target_call": (
+            turns / target_call_count if target_call_count else None
+        ),
+        "cost_per_unique_valid_attempt_usd": (
+            cost / valid_attempt_count if valid_attempt_count else None
+        ),
+        "valid_attempt_throughput": (
+            valid_attempt_count / target_call_count if target_call_count else None
+        ),
+    }
+    violations: list[Mapping[str, object]] = []
+    if contract is not None:
+        comparisons = (
+            (
+                "max_orchestration_steps_per_target_call",
+                metrics["orchestration_steps_per_target_call"],
+                "maximum",
+            ),
+            (
+                "max_cost_per_unique_valid_attempt_usd",
+                metrics["cost_per_unique_valid_attempt_usd"],
+                "maximum",
+            ),
+            (
+                "min_valid_attempt_throughput",
+                metrics["valid_attempt_throughput"],
+                "minimum",
+            ),
+        )
+        for key, observed, direction in comparisons:
+            limit = contract.get(key)
+            if not isinstance(limit, (int, float)) or observed is None:
+                continue
+            if key == "min_valid_attempt_throughput" and target_call_count < int(
+                contract["evaluate_throughput_after_target_calls"]
+            ):
+                continue
+            breached = (
+                observed > float(limit) if direction == "maximum" else observed < float(limit)
+            )
+            if breached:
+                violations.append({"objective": key, "observed": observed, "limit": float(limit)})
+    return {
+        "schema": _SERVICE_OBJECTIVE_SCHEMA,
+        "reviewed": contract is not None,
+        "contract": contract,
+        "metrics": metrics,
+        "violations": tuple(violations),
+        "compliant": None if contract is None else not violations,
+        "diagnostic_basis": {
+            "worker_concurrency": worker_concurrency,
+            "campaign_limits": dict(budget.get("limits") or {}),
+        },
+    }
 
 
 def _adapter_health_recovery(

@@ -13,6 +13,13 @@ from dataclasses import asdict, dataclass, is_dataclass
 from enum import StrEnum
 from typing import Any
 
+from merlin_contracts import (
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    project_candidate_outcome,
+    validate_candidate_outcome_projection,
+)
+
 
 class FrontierState(StrEnum):
     RUNNABLE = "runnable"
@@ -70,6 +77,7 @@ class VerifiedCandidateOutcome:
     verifier_record_id: str
     validator_evidence_refs: tuple[str, ...] = ()
     validator_witness_digests: tuple[str, ...] = ()
+    candidate_outcome_projection: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, CompletionCandidateIdentity):
@@ -111,6 +119,27 @@ class VerifiedCandidateOutcome:
             or set(self.validator_evidence_refs) != set(self.validator_witness_digests)
         ):
             raise ValueError("validator authority requires an exact disjoint witness/ref union")
+        evidence_refs = tuple(sorted((*self.source_evidence_refs, *self.validator_evidence_refs)))
+        persisted = (
+            None
+            if self.candidate_outcome_projection is None
+            else validate_candidate_outcome_projection(self.candidate_outcome_projection)
+        )
+        expected = project_candidate_outcome(
+            candidate_id=candidate_id_for_identity(self.identity.projection()),
+            attempt_disposition="valid",
+            outcome_authority=self.authority_kind,
+            outcome=self.outcome,
+            evidence_digest=(
+                candidate_evidence_digest(evidence_refs)
+                if persisted is None
+                else persisted["evidence_digest"]
+            ),
+        )
+        if persisted is None:
+            object.__setattr__(self, "candidate_outcome_projection", expected)
+        elif persisted != expected:
+            raise ValueError("frontier outcome conflicts with canonical attempt projection")
 
     def projection(self) -> dict[str, object]:
         return {
@@ -121,6 +150,7 @@ class VerifiedCandidateOutcome:
             "validator_evidence_refs": self.validator_evidence_refs,
             "validator_witness_digests": self.validator_witness_digests,
             "verifier_record_id": self.verifier_record_id,
+            "candidate_outcome_projection": dict(self.candidate_outcome_projection or {}),
         }
 
 

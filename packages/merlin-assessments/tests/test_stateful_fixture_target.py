@@ -89,7 +89,9 @@ async def test_authoritative_snapshots_expose_before_after_delta_and_aliasing() 
             "state_identity",
             "progress_ordinal",
             "score",
+            "score",
             "budget_remaining",
+            "terminal_status",
             "terminal_status",
         ]
         score = observations[2]
@@ -107,6 +109,9 @@ async def test_authoritative_snapshots_expose_before_after_delta_and_aliasing() 
         assert compiled is not None
         assert compiled.state_capabilities is not None
         assert compiled.state_capabilities.observations[2].name == "objective_score"
+        assert compiled.state_capabilities.observations[2].trust_class == "target_reported"
+        assert compiled.state_capabilities.observations[3].trust_class == "host_observed"
+        assert compiled.state_capabilities.corroboration_rules[0].minimum_agreement == 2
         async with httpx.AsyncClient(base_url=target.origin) as client:
             first = (await client.post("/api/start", json={})).json()
             second = (await client.post("/api/start", json={})).json()
@@ -226,8 +231,8 @@ async def test_checkpoint_restore_reestablishes_a_shared_baseline() -> None:
     assert first["state"]["id"] == second["state"]["id"]
     assert changed["state"]["score"] == 10
     assert second["state"]["score"] == 10
-    assert restored["state"]["score"] == 0
-    assert restored["state"]["turnsRemaining"] == 4
+    assert restored["state"]["score"] == 10
+    assert restored["state"]["turnsRemaining"] == 3
 
 
 @pytest.mark.asyncio
@@ -259,3 +264,35 @@ async def test_runtime_rejection_exposes_an_unadvertised_constraint_for_regenera
     }
     assert regenerated.status_code == 200
     assert regenerated.json()["state"]["score"] == 10
+
+
+@pytest.mark.asyncio
+async def test_fixture_metrics_count_quota_rejection_and_transport_latency() -> None:
+    async with StatefulTargetFixtureServer(
+        maximum_parallel_states=1, interaction_quota=1
+    ) as target:
+        ownership = target.adapter()["state_capabilities"]["resource_ownership"][0]
+        assert ownership["principal_selector"] == {
+            "step_id": "start",
+            "evaluation_root": "response_body",
+            "pointer": "/principalId",
+        }
+        async with httpx.AsyncClient(base_url=target.origin) as client:
+            started = (await client.post("/api/start", json={})).json()
+            assert started["principalId"] == "fixture-principal"
+            lease = started["leaseId"]
+            accepted = await client.post(
+                "/api/message", json={"leaseId": lease, "message": "first"}
+            )
+            rejected = await client.post(
+                "/api/message", json={"leaseId": lease, "message": "second"}
+            )
+        metrics = target.metrics()
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 429
+    assert metrics.interactions == 2
+    assert metrics.accepted_interactions == 1
+    assert metrics.rejected_interactions == 1
+    assert metrics.quota_rejections == 1
+    assert metrics.total_latency_ms >= 0

@@ -855,7 +855,7 @@ def test_models_dev_malformed_or_oversized_payload_falls_through(tmp_path: Path)
 
 
 def test_deepseek_v4_flash_and_pro_catalogue_windows() -> None:
-    """OpenRouter frontend catalog (fetched 2026-09-05): v4 flash/pro = 1M ctx."""
+    """DeepSeek V4 uses the reviewed 1M context and current 384K output limits."""
     registry = _registry()
     for model in ("deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"):
         route = RouteIdentity(
@@ -865,5 +865,6 @@ def test_deepseek_v4_flash_and_pro_catalogue_windows() -> None:
         )
         resolved = registry.resolve(route)
         assert resolved.context_window_tokens.value == 1_048_576, model
+        assert resolved.max_output_tokens.value == 393_216, model
         assert resolved.context_window_tokens.provenance.tier == SourceTier.BUILTIN_REGISTRY
         assert resolved.context_window_tokens.provenance.raw_model_id == model

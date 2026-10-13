@@ -22,6 +22,10 @@ from merlin_contracts import (
     HypothesisState,
     InfrastructureFailureCategory,
     LanguageEvidenceStatus,
+    candidate_evidence_digest,
+    candidate_id_for_identity,
+    project_candidate_outcome,
+    validate_candidate_outcome_projection,
 )
 from psycopg.types.json import Jsonb
 
@@ -223,6 +227,46 @@ class CampaignArmStore:
         if any(not isinstance(item, Mapping) for item in uncertainties_raw):
             raise ValueError("ARM evaluation uncertainties must contain only mappings")
         usage = dict(observation["usage"]) if isinstance(observation.get("usage"), Mapping) else {}
+        canonical_identity = observation.get("canonical_candidate_identity")
+        canonical_projection = observation.get("candidate_outcome_projection")
+        if not isinstance(canonical_projection, Mapping):
+            canonical_projection = project_candidate_outcome(
+                candidate_id=str(observation["arm_id"]),
+                attempt_disposition=observation.get("attempt_disposition") or "uncertain",
+                outcome_authority=observation.get("outcome_authority") or "none",
+                outcome={
+                    ArmOutcomeKind.AUTHORITATIVE_SUCCESS: "confirmed",
+                    ArmOutcomeKind.VALIDATED_FINDING: "confirmed",
+                    ArmOutcomeKind.CLEAN_NEGATIVE: "refuted",
+                    ArmOutcomeKind.PARTIAL_SIGNAL: "progress",
+                }.get(outcome, "unclear"),
+                evidence_digest=candidate_evidence_digest(evidence_refs),
+            )
+        canonical_projection = validate_candidate_outcome_projection(
+            canonical_projection,
+            expected_candidate_id=(
+                candidate_id_for_identity(canonical_identity)
+                if isinstance(canonical_identity, Mapping)
+                else None
+            ),
+        )
+        expected_projection = project_candidate_outcome(
+            candidate_id=canonical_projection["candidate_id"],
+            attempt_disposition=observation.get("attempt_disposition") or "uncertain",
+            outcome_authority=observation.get("outcome_authority") or "none",
+            outcome={
+                ArmOutcomeKind.AUTHORITATIVE_SUCCESS: "confirmed",
+                ArmOutcomeKind.VALIDATED_FINDING: "confirmed",
+                ArmOutcomeKind.CLEAN_NEGATIVE: "refuted",
+                ArmOutcomeKind.PARTIAL_SIGNAL: "progress",
+            }.get(outcome, "unclear"),
+            evidence_digest=canonical_projection["evidence_digest"],
+        )
+        if canonical_projection != expected_projection:
+            raise ValueError("ARM outcome conflicts with canonical candidate settlement")
+        usage["candidate_outcome_projection"] = canonical_projection
+        if isinstance(canonical_identity, Mapping):
+            usage["canonical_candidate_identity"] = dict(canonical_identity)
         if uncertainties_raw:
             usage["evaluation_uncertainties"] = _jsonb_canonicalize(uncertainties_raw)
         usage = _jsonb_canonicalize(usage)

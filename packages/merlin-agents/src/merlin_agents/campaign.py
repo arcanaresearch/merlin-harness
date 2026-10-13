@@ -12,6 +12,7 @@ from enum import StrEnum
 from typing import Any
 
 from merlin_contracts import CapabilityGrant, executable_adapter_digest
+from merlin_contracts.generation import GeneratorExecutionContract
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompileError,
     compile_target_adapter,
@@ -50,6 +51,133 @@ class CampaignProfile(StrEnum):
     EXHAUSTIVE = "exhaustive"
     EXPLORATION = "exploration"
     QUICKSCAN = "quickscan"
+
+
+class ObjectiveGateOperator(StrEnum):
+    EQUALS = "equals"
+    ONE_OF = "one_of"
+    AT_LEAST = "at_least"
+    AT_MOST = "at_most"
+    INCREASES = "increases"
+    DECREASES = "decreases"
+    TERMINAL_SUCCESS = "terminal_success"
+
+
+class ObjectiveGateRetention(StrEnum):
+    RECIPE = "recipe"
+    CHECKPOINT = "checkpoint"
+
+
+class ObjectiveGateRetryReason(StrEnum):
+    INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+    AMBIGUOUS_TRANSITION = "ambiguous_transition"
+    UNCHANGED = "unchanged"
+
+
+ObjectiveGateScalar = str | int | float | bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveGateAction:
+    id: str
+    step_id: str
+    input_text: str
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.step_id.strip() or not self.input_text.strip():
+            raise ValueError("objective gate actions require id, step_id, and input_text")
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveGatePredicate:
+    observation_name: str
+    operator: ObjectiveGateOperator
+    expected_values: tuple[ObjectiveGateScalar, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.observation_name.strip():
+            raise ValueError("objective gate predicates require an observation name")
+        if not isinstance(self.operator, ObjectiveGateOperator):
+            raise ValueError("objective gate predicate operator must be a reviewed enum value")
+        if any(
+            value is not None and not isinstance(value, (str, int, float, bool))
+            for value in self.expected_values
+        ):
+            raise ValueError("objective gate expected values must be JSON scalars")
+        value_operators = {
+            ObjectiveGateOperator.EQUALS,
+            ObjectiveGateOperator.ONE_OF,
+            ObjectiveGateOperator.AT_LEAST,
+            ObjectiveGateOperator.AT_MOST,
+        }
+        if self.operator in value_operators and not self.expected_values:
+            raise ValueError(f"{self.operator.value} predicates require expected values")
+        if self.operator is not ObjectiveGateOperator.ONE_OF and len(self.expected_values) > 1:
+            raise ValueError(f"{self.operator.value} predicates accept at most one expected value")
+        if self.operator not in value_operators and self.expected_values:
+            raise ValueError(f"{self.operator.value} predicates do not accept expected values")
+        if self.operator in {
+            ObjectiveGateOperator.AT_LEAST,
+            ObjectiveGateOperator.AT_MOST,
+        } and (
+            isinstance(self.expected_values[0], bool)
+            or not isinstance(self.expected_values[0], (int, float))
+        ):
+            raise ValueError(f"{self.operator.value} predicates require a numeric expected value")
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveGateBudget:
+    max_attempts: int
+    max_target_calls: int
+    max_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_attempts, bool)
+            or isinstance(self.max_target_calls, bool)
+            or self.max_attempts <= 0
+            or self.max_target_calls <= 0
+        ):
+            raise ValueError("objective gate attempt and target-call budgets must be positive")
+        if self.max_seconds is not None and (
+            isinstance(self.max_seconds, bool)
+            or not isinstance(self.max_seconds, (int, float))
+            or self.max_seconds <= 0
+        ):
+            raise ValueError("objective gate time budgets must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectivePhaseGate:
+    id: str
+    ordinal: int
+    objective: str
+    actions: tuple[ObjectiveGateAction, ...]
+    success_predicate: ObjectiveGatePredicate
+    budget: ObjectiveGateBudget
+    retry_on: tuple[ObjectiveGateRetryReason, ...] = (
+        ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE,
+        ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION,
+    )
+    retain_success: ObjectiveGateRetention = ObjectiveGateRetention.RECIPE
+    operator_waivable: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.objective.strip():
+            raise ValueError("objective phase gates require id and objective")
+        if isinstance(self.ordinal, bool) or self.ordinal < 0:
+            raise ValueError("objective phase gate ordinals cannot be negative")
+        if not self.actions:
+            raise ValueError("objective phase gates require a sealed action recipe")
+        if len({action.id for action in self.actions}) != len(self.actions):
+            raise ValueError("objective phase gate action ids must be unique")
+        if len(set(self.retry_on)) != len(self.retry_on):
+            raise ValueError("objective phase gate retry reasons must be unique")
+        if any(not isinstance(item, ObjectiveGateRetryReason) for item in self.retry_on):
+            raise ValueError("objective phase gate retry reasons must be reviewed enum values")
+        if not isinstance(self.retain_success, ObjectiveGateRetention):
+            raise ValueError("objective phase gate retention must be a reviewed enum value")
 
 
 _BASE_CHAT_SURFACES = frozenset({"direct-user-channel", "conversational", "prior-model-output"})
@@ -806,6 +934,64 @@ def related_history_technique_ids(
     )
 
 
+def _validate_objective_phase_gates(gates: tuple[ObjectivePhaseGate, ...]) -> None:
+    if len({gate.id for gate in gates}) != len(gates):
+        raise ValueError("objective phase gate ids must be unique")
+    if len({gate.ordinal for gate in gates}) != len(gates):
+        raise ValueError("objective phase gate ordinals must be unique")
+    if tuple(gate.ordinal for gate in gates) != tuple(sorted(gate.ordinal for gate in gates)):
+        raise ValueError("objective phase gates must be ordered by ordinal")
+
+
+def objective_phase_gate_from_mapping(value: object) -> ObjectivePhaseGate:
+    if not isinstance(value, Mapping):
+        raise ValueError("objective phase gate entries must be mappings")
+    actions = value.get("actions", ())
+    predicate = value.get("success_predicate")
+    budget = value.get("budget")
+    if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+        raise ValueError("objective phase gate actions must be a sequence")
+    if any(not isinstance(action, Mapping) for action in actions):
+        raise ValueError("objective phase gate action entries must be mappings")
+    if not isinstance(predicate, Mapping) or not isinstance(budget, Mapping):
+        raise ValueError("objective phase gates require predicate and budget mappings")
+    return ObjectivePhaseGate(
+        id=str(value["id"]),
+        ordinal=int(value["ordinal"]),
+        objective=str(value["objective"]),
+        actions=tuple(
+            ObjectiveGateAction(
+                id=str(action["id"]),
+                step_id=str(action["step_id"]),
+                input_text=str(action["input_text"]),
+            )
+            for action in actions
+        ),
+        success_predicate=ObjectiveGatePredicate(
+            observation_name=str(predicate["observation_name"]),
+            operator=ObjectiveGateOperator(predicate["operator"]),
+            expected_values=tuple(predicate.get("expected_values", ())),
+        ),
+        budget=ObjectiveGateBudget(
+            max_attempts=int(budget["max_attempts"]),
+            max_target_calls=int(budget["max_target_calls"]),
+            max_seconds=budget.get("max_seconds"),
+        ),
+        retry_on=tuple(
+            ObjectiveGateRetryReason(item)
+            for item in value.get(
+                "retry_on",
+                (
+                    ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE,
+                    ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION,
+                ),
+            )
+        ),
+        retain_success=ObjectiveGateRetention(value.get("retain_success", "recipe")),
+        operator_waivable=bool(value.get("operator_waivable", False)),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignManifest:
     id: str
@@ -824,6 +1010,8 @@ class CampaignManifest:
     digest: str
     specialist_composition: str = "opinionated"
     dynamic_specialist_policy: DynamicSpecialistPolicy | None = None
+    objective_phase_gates: tuple[ObjectivePhaseGate, ...] = ()
+    bounded_regeneration: Mapping[str, object] | None = None
 
     @classmethod
     def create(
@@ -844,9 +1032,12 @@ class CampaignManifest:
         budget: AssignmentBudget,
         specialist_composition: str = "opinionated",
         dynamic_specialist_policy: DynamicSpecialistPolicy | None = None,
+        objective_phase_gates: tuple[ObjectivePhaseGate, ...] = (),
+        bounded_regeneration: GeneratorExecutionContract | Mapping[str, object] | None = None,
     ) -> CampaignManifest:
         if specialist_composition not in ("opinionated", "autonomous"):
             raise ValueError("specialist_composition must be 'opinionated' or 'autonomous'")
+        _validate_objective_phase_gates(objective_phase_gates)
         values = {
             "id": id,
             "session_id": session_id,
@@ -866,6 +1057,15 @@ class CampaignManifest:
                 asdict(dynamic_specialist_policy) if dynamic_specialist_policy is not None else None
             ),
         }
+        if objective_phase_gates:
+            values["objective_phase_gates"] = [asdict(gate) for gate in objective_phase_gates]
+        reviewed_regeneration = (
+            GeneratorExecutionContract.model_validate(bounded_regeneration).model_dump(mode="json")
+            if bounded_regeneration is not None
+            else None
+        )
+        if reviewed_regeneration is not None:
+            values["bounded_regeneration"] = reviewed_regeneration
         digest = _digest(values)
         return cls(
             id=id,
@@ -884,6 +1084,48 @@ class CampaignManifest:
             digest=digest,
             specialist_composition=specialist_composition,
             dynamic_specialist_policy=dynamic_specialist_policy,
+            objective_phase_gates=objective_phase_gates,
+            bounded_regeneration=reviewed_regeneration,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> CampaignManifest:
+        reviewed_policy = value.get("dynamic_specialist_policy")
+        gates_value = value.get("objective_phase_gates", ())
+        regeneration_value = value.get("bounded_regeneration")
+        if not isinstance(gates_value, Sequence) or isinstance(gates_value, (str, bytes)):
+            raise ValueError("objective_phase_gates must be a sequence")
+        if regeneration_value is not None and not isinstance(regeneration_value, Mapping):
+            raise ValueError("bounded_regeneration must be a mapping")
+        return cls(
+            id=str(value["id"]),
+            session_id=str(value["session_id"]),
+            objective=str(value["objective"]),
+            profile=CampaignProfile(value["profile"]),
+            target=ReviewedTargetAdapter(**value["target"]),
+            provider_id=str(value["provider_id"]),
+            provider_model=str(
+                value.get("provider_model", value["target"].get("model") or "unknown")
+            ),
+            provider_effort=str(value.get("provider_effort", "default")),
+            authority_ids=tuple(str(item) for item in value["authority_ids"]),
+            catalogue=tuple(ContextDocument(**item) for item in value["catalogue"]),
+            skill_documents=tuple(ContextDocument(**item) for item in value["skill_documents"]),
+            tool_ids=tuple(str(item) for item in value["tool_ids"]),
+            budget=AssignmentBudget(**value["budget"]),
+            digest=str(value["digest"]),
+            specialist_composition=str(value.get("specialist_composition", "opinionated")),
+            dynamic_specialist_policy=(
+                DynamicSpecialistPolicy(**reviewed_policy)
+                if isinstance(reviewed_policy, Mapping)
+                else None
+            ),
+            objective_phase_gates=tuple(
+                objective_phase_gate_from_mapping(item) for item in gates_value
+            ),
+            bounded_regeneration=(
+                dict(regeneration_value) if regeneration_value is not None else None
+            ),
         )
 
     def validate(self) -> None:
@@ -907,12 +1149,19 @@ class CampaignManifest:
             budget=self.budget,
             specialist_composition=self.specialist_composition,
             dynamic_specialist_policy=self.dynamic_specialist_policy,
+            objective_phase_gates=self.objective_phase_gates,
+            bounded_regeneration=self.bounded_regeneration,
         )
         if rebuilt.digest == self.digest:
             return
         # Manifests sealed before specialist-composition binding remain valid
         # while they carry the additive defaults.
-        if self.specialist_composition == "opinionated" and self.dynamic_specialist_policy is None:
+        if (
+            not self.objective_phase_gates
+            and self.bounded_regeneration is None
+            and self.specialist_composition == "opinionated"
+            and self.dynamic_specialist_policy is None
+        ):
             legacy_values = {
                 "id": self.id,
                 "session_id": self.session_id,
@@ -1257,7 +1506,182 @@ def manifest_with_target_brief(
         budget=manifest.budget,
         specialist_composition=manifest.specialist_composition,
         dynamic_specialist_policy=manifest.dynamic_specialist_policy,
+        objective_phase_gates=manifest.objective_phase_gates,
+        bounded_regeneration=manifest.bounded_regeneration,
     )
+
+
+def manifest_with_objective_phase_gates(
+    manifest: CampaignManifest,
+    gates: tuple[ObjectivePhaseGate, ...],
+) -> CampaignManifest:
+    """Re-seal a manifest with explicitly reviewed objective prerequisite gates."""
+    return CampaignManifest.create(
+        id=manifest.id,
+        session_id=manifest.session_id,
+        objective=manifest.objective,
+        profile=manifest.profile,
+        target=manifest.target,
+        provider_id=manifest.provider_id,
+        provider_model=manifest.provider_model,
+        provider_effort=manifest.provider_effort,
+        authority_ids=manifest.authority_ids,
+        catalogue=manifest.catalogue,
+        skill_documents=manifest.skill_documents,
+        tool_ids=manifest.tool_ids,
+        budget=manifest.budget,
+        specialist_composition=manifest.specialist_composition,
+        dynamic_specialist_policy=manifest.dynamic_specialist_policy,
+        objective_phase_gates=gates,
+        bounded_regeneration=manifest.bounded_regeneration,
+    )
+
+
+def manifest_with_bounded_regeneration(
+    manifest: CampaignManifest,
+    contract: GeneratorExecutionContract | Mapping[str, object] | None,
+) -> CampaignManifest:
+    """Re-seal a manifest with explicitly reviewed generator execution limits."""
+    return CampaignManifest.create(
+        id=manifest.id,
+        session_id=manifest.session_id,
+        objective=manifest.objective,
+        profile=manifest.profile,
+        target=manifest.target,
+        provider_id=manifest.provider_id,
+        provider_model=manifest.provider_model,
+        provider_effort=manifest.provider_effort,
+        authority_ids=manifest.authority_ids,
+        catalogue=manifest.catalogue,
+        skill_documents=manifest.skill_documents,
+        tool_ids=manifest.tool_ids,
+        budget=manifest.budget,
+        specialist_composition=manifest.specialist_composition,
+        dynamic_specialist_policy=manifest.dynamic_specialist_policy,
+        objective_phase_gates=manifest.objective_phase_gates,
+        bounded_regeneration=contract,
+    )
+
+
+def compile_prerequisite_campaign(
+    manifest: CampaignManifest,
+    context: AssignmentContext,
+    *,
+    gate_ids: tuple[str, ...] | None = None,
+) -> CampaignCompilation:
+    """Compile sealed objective prerequisites as bounded controller assignments.
+
+    The caller advances one durable gate at a time. This compiler never derives
+    gates from objective prose and never assigns attack techniques to a gate.
+    """
+    manifest.validate()
+    if manifest.target.id != context.target_profile_id:
+        raise ValueError("campaign target does not match assignment context")
+    gates_by_id = {gate.id: gate for gate in manifest.objective_phase_gates}
+    if gate_ids is None:
+        selected = manifest.objective_phase_gates[:1]
+    else:
+        if len(set(gate_ids)) != len(gate_ids):
+            raise ValueError("objective phase gate ids must be unique")
+        unknown = set(gate_ids) - set(gates_by_id)
+        if unknown:
+            raise ValueError("objective phase gates must be preparation-reviewed")
+        selected = tuple(gate for gate in manifest.objective_phase_gates if gate.id in gate_ids)
+        if tuple(gate.id for gate in selected) != gate_ids:
+            raise ValueError("objective phase gates must be requested in manifest order")
+
+    profile = next(item for item in CORE_WORKER_PROFILES if item.id == "recon")
+    grant = profile_grant(profile.id, target_scope=context.target_profile_id)
+    projected_tools = _profile_projection(
+        manifest.tool_ids,
+        profile.id,
+        target_interface=manifest.target.interface,
+        api_credential=manifest.target.credential_handle is not None,
+    )
+    if not {"target_request", "target_chat", "browser_chat_exchange"}.intersection(projected_tools):
+        raise ValueError("objective phase gates require a projected target interaction tool")
+    compiled_adapter = _reviewed_compiled_adapter(manifest)
+    assignments: list[WorkerAssignment] = []
+    worker_contexts: list[WorkerContext] = []
+    for gate in selected:
+        gate_contract = json.dumps(asdict(gate), sort_keys=True, separators=(",", ":"))
+        time_limit = gate.budget.max_seconds
+        if context.budget.max_seconds is not None:
+            time_limit = (
+                context.budget.max_seconds
+                if time_limit is None
+                else min(time_limit, context.budget.max_seconds)
+            )
+        assignment = WorkerAssignment(
+            id=f"{manifest.id}/objective-gate/{gate.ordinal}-{gate.id}",
+            objective=(
+                f"Execute sealed objective prerequisite {gate.id}: {gate.objective}. "
+                "Deliver only its reviewed action recipe and evaluate only its reviewed "
+                "authoritative observation predicate."
+            ),
+            profile_id=profile.id,
+            target_profile_id=context.target_profile_id,
+            technique_ids=(),
+            guidance_ids=(),
+            tool_ids=projected_tools,
+            skill_ids=(),
+            provider_id=context.provider_id,
+            authority_ids=context.authority_ids,
+            budget=AssignmentBudget(
+                max_turns=gate.budget.max_attempts,
+                max_tokens=context.budget.max_tokens,
+                max_seconds=time_limit,
+                max_cost_usd=context.budget.max_cost_usd,
+            ),
+            input_schema=context.input_schema,
+            output_schema=json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "gate_id": {"const": gate.id},
+                        "status": {"enum": ["succeeded", "retryable", "blocked", "waived"]},
+                        "attempts": {"type": "integer", "minimum": 0},
+                        "target_calls": {"type": "integer", "minimum": 0},
+                        "last_transition": {"type": ["object", "null"]},
+                        "blocker": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "gate_id",
+                        "status",
+                        "attempts",
+                        "target_calls",
+                        "last_transition",
+                        "blocker",
+                    ],
+                    "additionalProperties": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            provider_model=context.model_for(profile.id) or manifest.provider_model,
+            provider_capabilities=context.capabilities_for(profile.id),
+            target_session_capacity=manifest.target.browser_concurrency,
+            grant_id=grant.id,
+            strategy_id="objective-phase-gate/v1",
+            strategy_contract=(
+                ("objective_phase_gate", gate_contract),
+                ("objective_phase_manifest_digest", manifest.digest),
+                *(
+                    (
+                        ("compiled_adapter", compiled_adapter[0]),
+                        ("compiled_adapter_digest", compiled_adapter[1]),
+                    )
+                    if compiled_adapter is not None
+                    else (("compiled_adapter_compatibility", "legacy_absent"),)
+                ),
+            ),
+            max_target_exchanges=gate.budget.max_target_calls,
+        )
+        assignments.append(assignment)
+        worker_contexts.append(
+            compile_worker_context(manifest, assignment, profile, capability_grant=grant)
+        )
+    return CampaignCompilation(tuple(assignments), tuple(worker_contexts))
 
 
 def compile_initial_campaign(

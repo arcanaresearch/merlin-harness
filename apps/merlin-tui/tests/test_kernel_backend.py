@@ -957,6 +957,10 @@ async def test_backend_agents_use_one_snapshot_read_without_recovery_or_schedule
 async def test_background_recovery_renews_campaign_ownership_but_recovers_agents_once() -> None:
     calls = []
 
+    class LifecycleRecovery:
+        async def reconcile(self):
+            calls.append(("lifecycle", None))
+
     class RecoverableAgents:
         async def recover(self, *, resume_execution=True):
             calls.append(("agents", resume_execution))
@@ -969,12 +973,19 @@ async def test_background_recovery_renews_campaign_ownership_but_recovers_agents
         FakeKernel([]),
         agents=RecoverableAgents(),
         campaigns=RecoverableCampaigns(),
+        lifecycle_recovery=LifecycleRecovery(),
     )
 
     await backend.recover_background()
     await backend.recover_background()
 
-    assert calls == [("campaigns", False), ("agents", False), ("campaigns", True)]
+    assert calls == [
+        ("lifecycle", None),
+        ("campaigns", False),
+        ("agents", False),
+        ("lifecycle", None),
+        ("campaigns", True),
+    ]
 
 
 class Findings:

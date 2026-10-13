@@ -1,0 +1,268 @@
+{
+  "schema": "merlin.stateful-target-regression-corpus.v1",
+  "source_snapshot": "stateful_failed_campaign_snapshot.json",
+  "source_kind": "sanitized_durable_export",
+  "cases": [
+    {
+      "id": "preserved-shared-state-fanout",
+      "kind": "shared_state",
+      "observed_shape": {
+        "logical_attempts": 16,
+        "physical_states": 2,
+        "accepted_requests": 14,
+        "rejected_requests": 4,
+        "outcomes": {
+          "refuted": 10,
+          "blocked": 2,
+          "unclear": 4
+        },
+        "verified_progress": 0
+      },
+      "expected": {
+        "identity_collisions": 14,
+        "negative_learning_allowed": false,
+        "retry_required": true
+      },
+      "diagnostic_labels": {
+        "unique_candidates": 16,
+        "physical_state_scopes": 2,
+        "target_calls": 18,
+        "quota_consumption": 14,
+        "cross_layer_disagreements": 1,
+        "terminal_producing_layer": "scheduler",
+        "terminal_reason": "scheduler_completed",
+        "unfinished_frontier_cause": "queued_batch_after_scheduler_completion"
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "empty-state-api",
+      "kind": "empty_state",
+      "expected": {
+        "outcome": "unclear",
+        "execution_allowed": true
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "stateful-chat-delta",
+      "kind": "stateful_chat",
+      "expected": {
+        "outcome": "progress",
+        "authority": "target"
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "ordered-checkpoint-workflow",
+      "kind": "ordered_workflow",
+      "expected": {
+        "steps": [
+          "start",
+          "restore",
+          "message"
+        ]
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "rotating-physical-identity",
+      "kind": "rotating_ids",
+      "expected": {
+        "disposition": "contaminated",
+        "outcome": "unclear"
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "hostile-untrusted-oracle",
+      "kind": "hostile_oracle",
+      "expected": {
+        "untrusted_claim_authoritative": false
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "finite-interaction-quota",
+      "kind": "quota",
+      "expected": {
+        "status": 429,
+        "quality_penalty": false
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "multi-message-response",
+      "kind": "multi_message",
+      "expected": {
+        "messages_captured": 3
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "durable-session-restart",
+      "kind": "restart",
+      "expected": {
+        "physical_identity_preserved": true
+      },
+      "fixture_budget": {
+        "max_model_turns": 10,
+        "max_target_calls": 10,
+        "max_total_tokens": 1000000,
+        "max_latency_ms": 60000,
+        "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000,
+        "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "fresh-independent-state",
+      "kind": "fresh_state",
+      "expected": {"accepted": 2, "physical_states": 2, "identity_collisions": 0},
+      "fixture_budget": {
+        "max_model_turns": 10, "max_target_calls": 10, "max_total_tokens": 1000000,
+        "max_latency_ms": 60000, "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000, "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "preflight-request-constraint",
+      "kind": "constraint",
+      "expected": {"disposition": "protocol_invalid", "target_calls": 0},
+      "fixture_budget": {
+        "max_model_turns": 10, "max_target_calls": 10, "max_total_tokens": 1000000,
+        "max_latency_ms": 60000, "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000, "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "concurrent-campaign-shared-state",
+      "kind": "concurrent_campaign",
+      "expected": {"accepted": 1, "blocked": 1, "target_interactions": 1},
+      "fixture_budget": {
+        "max_model_turns": 10, "max_target_calls": 10, "max_total_tokens": 1000000,
+        "max_latency_ms": 60000, "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000, "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "sensitive-identity-redaction",
+      "kind": "sensitive_identity",
+      "expected": {"raw_identity_exposed": false, "keyed_digest_present": true},
+      "fixture_budget": {
+        "max_model_turns": 10, "max_target_calls": 10, "max_total_tokens": 1000000,
+        "max_latency_ms": 60000, "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000, "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    },
+    {
+      "id": "missing-authoritative-oracle",
+      "kind": "missing_oracle",
+      "expected": {"outcome": "unclear", "authoritative": false},
+      "fixture_budget": {
+        "max_model_turns": 10, "max_target_calls": 10, "max_total_tokens": 1000000,
+        "max_latency_ms": 60000, "max_elapsed_ms": 120000,
+        "max_cost_usd_micros": 1000000, "minimum_unique_valid_attempts": 1,
+        "minimum_accepted_attempts_per_minute": 0.0
+      }
+    }
+  ],
+  "source_import": {
+    "selection": "latest_failed_campaign",
+    "database": "postgresql",
+    "extractor_schema": "merlin.stateful-campaign-export.v1",
+    "campaign_id_digest": "sha256:216a3f8c4b42b41d9d59252fdafd805f80c16a0b0568a8359650cbf3e3f28223",
+    "export_digest": "sha256:437654592cf34525007f3ce964a331cdaa340376c62bbabb763b8459cecdfa67",
+    "table_row_counts": {
+      "campaigns": 1,
+      "campaign_waves": 1,
+      "scheduler_runs": 1,
+      "frontier_batches": 2,
+      "technique_attempts": 16,
+      "state_transitions": 14,
+      "target_exchanges": 18,
+      "resource_events": 5,
+      "model_calls": 5,
+      "state_scopes": 2,
+      "frontier_outcomes": 16,
+      "findings": 16
+    }
+  }
+}

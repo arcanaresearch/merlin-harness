@@ -15,6 +15,15 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
+from merlin_contracts import (
+    CampaignTerminalReason,
+    assert_candidate_outcome_match,
+    candidate_id_for_identity,
+    read_campaign_terminal_reason,
+    summarize_candidate_projections,
+    validate_candidate_outcome_projection,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceCitation:
@@ -34,18 +43,64 @@ class CampaignLesson:
     evidence_references: tuple[str, ...]
 
 
+def _canonical_candidate_metadata(
+    metadata: Mapping[str, Any] | None,
+    techniques: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate the attempt ledger and derive its immutable report counters."""
+
+    normalized = dict(metadata or {})
+    raw_projections = normalized.get("candidate_outcome_projections")
+    if raw_projections is None:
+        return normalized
+    if not isinstance(raw_projections, Sequence) or isinstance(raw_projections, (str, bytes)):
+        raise ValueError("report candidate outcome projections must be a sequence")
+    if any(not isinstance(item, Mapping) for item in raw_projections):
+        raise ValueError("report candidate outcome projections must all be mappings")
+    canonical_items: list[dict[str, Any]] = []
+    for item in raw_projections:
+        identity = item.get("candidate_identity")
+        projection = validate_candidate_outcome_projection(
+            item,
+            expected_candidate_id=(
+                candidate_id_for_identity(identity) if isinstance(identity, Mapping) else None
+            ),
+        )
+        canonical_items.append({**dict(item), **projection})
+    canonical = tuple(canonical_items)
+    by_candidate = {str(item["candidate_id"]): item for item in canonical}
+    for row in techniques:
+        if not isinstance(row, Mapping):
+            continue
+        projected = row.get("candidate_outcome_projection")
+        if not isinstance(projected, Mapping):
+            continue
+        authoritative = by_candidate.get(str(projected.get("candidate_id") or ""))
+        if authoritative is None:
+            raise ValueError("report technique outcome has no canonical attempt-ledger projection")
+        assert_candidate_outcome_match(authoritative, projected)
+    summary = summarize_candidate_projections(canonical)
+    for key, value in summary.items():
+        existing = normalized.get(key)
+        if existing is not None and existing != value:
+            raise ValueError(f"report {key} conflicts with canonical candidate outcomes")
+        normalized[key] = value
+    normalized["candidate_outcome_projections"] = canonical
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignReportProjection:
     revision_id: str
     campaign_id: str
     revision: int
     stop_reason: Literal[
-        "saturated",
-        "completed_with_limitations",
-        "capped",
-        "failed",
-        "interrupted",
+        "objective_satisfied",
+        "frontier_exhausted",
+        "budget_exhausted",
+        "target_terminal",
         "operator_stopped",
+        "infrastructure_blocked_after_retry_policy",
     ]
     cleanup_status: str
     findings: tuple[Mapping[str, Any], ...]
@@ -73,8 +128,15 @@ class CampaignReportProjection:
     # its digest so the stored completion document remains bounded.
     frontier_snapshot_rows: tuple[Mapping[str, Any], ...] = ()
 
+    @property
+    def terminal_reason(self) -> CampaignTerminalReason:
+        """Canonical reason, including explicit translation for historical reports."""
+
+        return read_campaign_terminal_reason(self.stop_reason)
+
     def __post_init__(self) -> None:
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        metadata = _canonical_candidate_metadata(self.metadata, self.techniques)
+        object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "coverage", dict(self.coverage or {}))
         if self.completion_document is not None:
             object.__setattr__(self, "completion_document", dict(self.completion_document))
@@ -147,9 +209,7 @@ def _normalize_frontier_snapshot_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "attempt_id": None
         if row.get("attempt_id") is None
         else str(row.get("attempt_id")).strip() or None,
-        "task_id": None
-        if row.get("task_id") is None
-        else str(row.get("task_id")).strip() or None,
+        "task_id": None if row.get("task_id") is None else str(row.get("task_id")).strip() or None,
         "evidence_refs": [str(value).strip() for value in refs],
         "disposition_reason": None
         if row.get("disposition_reason") is None
@@ -218,17 +278,19 @@ class DurableReportService:
         lineage = _json_value(lineage)
         hypotheses = _json_value(hypotheses)
         unsearched_frontier = _json_value(unsearched_frontier)
+        metadata = _canonical_candidate_metadata(metadata, techniques)
         if completion_document is not None:
             completion_document = _json_value(completion_document)
-        if stop_reason not in {
+        source_stop_reason = stop_reason.strip().casefold()
+        legacy_limited_completion = source_stop_reason == "completed_with_limitations"
+        require_frontier_ready = source_stop_reason in {
             "saturated",
-            "completed_with_limitations",
-            "capped",
-            "failed",
-            "interrupted",
-            "operator_stopped",
-        }:
-            raise ValueError("report requires an exact terminal campaign stop reason")
+            CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+        }
+        try:
+            stop_reason = read_campaign_terminal_reason(stop_reason).value
+        except ValueError as exc:
+            raise ValueError("report requires an exact terminal campaign stop reason") from exc
         finding_ids = {str(item.get("id", "")) for item in findings}
         if len(finding_ids) != len(findings) or "" in finding_ids:
             raise ValueError("report findings require unique non-empty IDs")
@@ -241,19 +303,30 @@ class DurableReportService:
             raise ValueError("report timestamp must be timezone-aware")
         cleanup_complete = cleanup_status in {"complete", "completed"}
         state = report_state or (
-            "complete"
-            if stop_reason == "saturated" and not unsearched_frontier and cleanup_complete
-            else "provisional"
-            if stop_reason == "completed_with_limitations"
+            "provisional"
+            if legacy_limited_completion and not unsearched_frontier and cleanup_complete
+            else "complete"
+            if stop_reason
+            in {
+                CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
+                CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+            }
             and not unsearched_frontier
             and cleanup_complete
             else "incomplete"
         )
         if state == "complete" and (
-            stop_reason != "saturated" or unsearched_frontier or not cleanup_complete
+            stop_reason
+            not in {
+                CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
+                CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+            }
+            or unsearched_frontier
+            or not cleanup_complete
         ):
             raise ValueError(
-                "complete report requires saturated reason, empty frontier, and completed cleanup"
+                "complete report requires an objective/frontier completion reason, empty "
+                "frontier, and completed cleanup"
             )
         if (completion_digest is None) != (completion_document is None):
             raise ValueError("report completion seal requires both document and digest")
@@ -269,14 +342,20 @@ class DurableReportService:
                 "merlin.campaign-completion.v2",
             }:
                 raise ValueError("report requires a supported campaign completion seal")
-            if sealed_completion.get("stop_reason") != stop_reason:
+            sealed_stop_reason = sealed_completion.get("stop_reason")
+            if (
+                not isinstance(sealed_stop_reason, str)
+                or read_campaign_terminal_reason(sealed_stop_reason).value != stop_reason
+            ):
                 raise ValueError("report stop reason conflicts with the completion seal")
             inner_digest = sealed_completion.get("completion_digest")
             sealed_document = sealed_completion.get("document")
             if not isinstance(sealed_document, Mapping) or inner_digest != _digest(sealed_document):
                 raise ValueError("report completion seal contains an invalid authority document")
             if sealed_document.get("schema") != completion_schema:
-                raise ValueError("report completion seal schema conflicts with its authority document")
+                raise ValueError(
+                    "report completion seal schema conflicts with its authority document"
+                )
             required_fields = {
                 "schema",
                 "campaign_id",
@@ -305,7 +384,7 @@ class DurableReportService:
             if completion_schema == "merlin.campaign-completion.v2":
                 self._load_frontier_snapshot(campaign_id, sealed_document)
             saturation = sealed_document.get("saturation")
-            if stop_reason == "saturated" and (
+            if require_frontier_ready and (
                 not isinstance(saturation, Mapping) or saturation.get("ready") is not True
             ):
                 raise ValueError("saturated report requires a ready completion seal")
@@ -335,7 +414,8 @@ class DurableReportService:
         # new completion document; the new revision supersedes them. A sealed
         # report from a successful terminalization is never shadowed.
         supersedes_failed_seal = bool(conflicting_seals) and all(
-            item.stop_reason in {"failed", "interrupted"} for item in conflicting_seals
+            item.terminal_reason is CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY
+            for item in conflicting_seals
         )
         if completion_digest is not None and conflicting_seals and not supersedes_failed_seal:
             raise ValueError("campaign already has a different sealed completion report")
@@ -632,7 +712,10 @@ class DurableReportService:
             _normalize_frontier_snapshot_row(row) if isinstance(row, Mapping) else None
             for row in sample
         )
-        if any(row is None for row in normalized_sample) or tuple(rows[: len(sample)]) != normalized_sample:
+        if (
+            any(row is None for row in normalized_sample)
+            or tuple(rows[: len(sample)]) != normalized_sample
+        ):
             raise ValueError("v2 completion frontier snapshot sample conflicts with its rows")
         return tuple(rows)
 
@@ -896,7 +979,11 @@ def _customer_projection(value: CampaignReportProjection) -> CampaignReportProje
             "specialist_instance_count",
             "execution_task_records",
             "execution_task_count",
+            "attempt_count",
             "unique_candidate_count",
+            "repeat_attempt_count",
+            "terminal_unique_candidate_count",
+            "conflicting_unique_candidate_count",
             "unique_technique_count",
         )
         if key in value.metadata
@@ -1526,8 +1613,34 @@ def _candidate_ledger(value: CampaignReportProjection) -> tuple[_CandidateLedger
         "history": 4,
         "execution": 5,
         "validator": 6,
+        "canonical": 7,
     }
     source_rows: list[tuple[str, Mapping[str, Any]]] = []
+    canonical_projections = value.metadata.get("candidate_outcome_projections", ())
+    if isinstance(canonical_projections, (tuple, list)):
+        for raw in canonical_projections:
+            if not isinstance(raw, Mapping):
+                continue
+            projection = validate_candidate_outcome_projection(raw)
+            identity = raw.get("candidate_identity")
+            identity = dict(identity) if isinstance(identity, Mapping) else {}
+            source_rows.append(
+                (
+                    "canonical",
+                    {
+                        **identity,
+                        "id": projection["candidate_id"],
+                        "candidate_id": projection["candidate_id"],
+                        "outcome": projection["outcome"],
+                        "attempt_disposition": projection["attempt_disposition"],
+                        "outcome_authority": projection["outcome_authority"],
+                        "evidence_digest": projection["evidence_digest"],
+                        "terminality": projection["terminality"],
+                        "status": "executed",
+                        "candidate_outcome_projection": projection,
+                    },
+                )
+            )
     admitted = value.metadata.get("admitted_candidates", ())
     if isinstance(admitted, (tuple, list)):
         source_rows.extend(
@@ -1720,7 +1833,7 @@ def _candidate_ledger(value: CampaignReportProjection) -> tuple[_CandidateLedger
         evaluation_uncertain = bool(
             row.get("evaluation_uncertain")
             or row.get("evaluation_uncertainties")
-            or raw in {"unclear", "inconclusive", "evaluation_uncertain", "ambiguous"}
+            or raw in {"unclear", "inconclusive", "evaluation_uncertain", "ambiguous", "regression"}
         )
         execution_status = str(row.get("lifecycle_state") or row.get("status") or "").strip()
         execution_evidenced = bool(
@@ -1952,9 +2065,15 @@ def _canonical_outcome(row: Mapping[str, Any]) -> str:
         return "confirmed"
     if raw in {"negative", "refuted", "clean_negative", "clear_negative"}:
         return "negative"
-    if raw in {"partial", "partial_signal", "partial_progress"}:
+    if raw in {"partial", "partial_signal", "partial_progress", "progress"}:
         return "partial"
-    if raw in {"unclear", "inconclusive", "evaluation_uncertain", "ambiguous"}:
+    if raw in {
+        "unclear",
+        "inconclusive",
+        "evaluation_uncertain",
+        "ambiguous",
+        "regression",
+    }:
         return "inconclusive"
     if raw in {"attempted", "executed"} and (
         row.get("task_id")
@@ -2893,7 +3012,10 @@ def _html_report(
         verdict_label = "No issue observed in tested scope"
         verdict = "No validated vulnerability was found in the tests that produced a clear result. This is not a guarantee that the target is safe."
         verdict_class = "success"
-    elif value.stop_reason == "completed_with_limitations" and value.report_state == "provisional":
+    elif (
+        value.terminal_reason is CampaignTerminalReason.FRONTIER_EXHAUSTED
+        and value.report_state == "provisional"
+    ):
         verdict_label = "Scan completed with limitations"
         verdict = (
             f"The campaign reached a terminal state and cleanup finished. Merlin addressed "
@@ -3390,7 +3512,7 @@ def _html_report(
 
 def _verdict(value: CampaignReportProjection) -> str:
     if value.report_state == "provisional":
-        if value.stop_reason == "completed_with_limitations":
+        if value.terminal_reason is CampaignTerminalReason.FRONTIER_EXHAUSTED:
             return (
                 "All required testing and cleanup completed, but some results were inconclusive. "
                 "Review the limitations before relying on the security conclusion."
@@ -3442,7 +3564,7 @@ def _report_state_label(value: CampaignReportProjection) -> str:
     if value.report_state == "provisional":
         return (
             "Merlin scan completed · limitations present"
-            if value.stop_reason == "completed_with_limitations"
+            if value.terminal_reason is CampaignTerminalReason.FRONTIER_EXHAUSTED
             else "Merlin scan ended · conclusion provisional"
         )
     coverage = _coverage(value)

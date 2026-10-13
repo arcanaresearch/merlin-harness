@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
+from merlin_contracts import require_campaign_terminal_reason
 from merlin_findings import CampaignReportProjection, EvidenceCitation
 
 
@@ -22,6 +23,7 @@ class PostgresReportRevisionStore:
         return int(row["revision"])
 
     def save(self, projection: CampaignReportProjection) -> CampaignReportProjection | None:
+        require_campaign_terminal_reason(projection.stop_reason)
         document = {
             "revision_id": projection.revision_id,
             "campaign_id": projection.campaign_id,

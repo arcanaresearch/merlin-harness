@@ -671,7 +671,12 @@ class OpenAICompatibleProvider:
                     emitted = True
                     yield TextDelta(text=buffered_text)
             terminal_events: list[ModelEvent] = []
-            if self._finish_tools(terminal_events, tools, partial=emitted):
+            if self._finish_tools(
+                terminal_events,
+                tools,
+                partial=emitted,
+                finish_reason=finish,
+            ):
                 for event in terminal_events:
                     yield event
                 return
@@ -870,6 +875,7 @@ class OpenAICompatibleProvider:
         tools: dict[tuple[int, int], dict[str, Any]],
         *,
         partial: bool = False,
+        finish_reason: str | None = None,
     ) -> ModelError | None:
         completed: list[tuple[str, str, dict[str, object]]] = []
         for slot, item in tools.items():
@@ -913,10 +919,15 @@ class OpenAICompatibleProvider:
             if len(valid) != 1:
                 argument_text = argument_candidates["fragments"]
                 assembly = str(item.get("argument_assembly", "single"))
+                truncated = finish_reason == "length"
                 event = ModelError(
                     message=(
-                        "provider returned malformed tool arguments "
-                        f"(assembly={assembly}, chunks={chunk_count}, "
+                        (
+                            "provider truncated tool arguments at its output limit "
+                            if truncated
+                            else "provider returned malformed tool arguments "
+                        )
+                        + f"(assembly={assembly}, chunks={chunk_count}, "
                         f"bytes={len(argument_text.encode())}, "
                         f"digest={hashlib.sha256(argument_text.encode()).hexdigest()[:12]})"
                         + (
@@ -928,11 +939,15 @@ class OpenAICompatibleProvider:
                             else ""
                         )
                     ),
-                    code="malformed_tool_call",
+                    code="truncated_tool_call" if truncated else "malformed_tool_call",
                     retryable=True,
                     partial=partial,
                     tool_name=str(item["name"]).strip() or None,
-                    failure_kind=ProviderFailureKind.FORMATTING,
+                    failure_kind=(
+                        ProviderFailureKind.TRUNCATED
+                        if truncated
+                        else ProviderFailureKind.FORMATTING
+                    ),
                 )
                 events.append(event)
                 return event

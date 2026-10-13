@@ -5,6 +5,7 @@ import difflib
 import json
 import re
 import shlex
+import textwrap
 import time
 import webbrowser
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
@@ -1988,6 +1989,200 @@ class AgentsOverviewScreen(ModalScreen[None]):
         self.query_one(AgentOutputText).update(text, preserve_scroll=preserve_scroll)
 
 
+_CAMPAIGN_LEAD_PREFIX = "campaign-lead::"
+
+
+def _plain_log_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_log_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_log_value(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return {
+            str(key): _plain_log_value(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return value
+
+
+def _log_json(row: str) -> tuple[str, Mapping[str, object] | None]:
+    if row.strip().startswith("{"):
+        prefix = ""
+        candidate = row.strip()
+    else:
+        prefix, separator, body = row.partition(":")
+        candidate = body.strip() if separator else row.strip()
+    if not candidate.startswith("{"):
+        return prefix.strip(), None
+    try:
+        decoded = json.loads(candidate)
+    except (TypeError, ValueError):
+        return prefix.strip(), None
+    return prefix.strip(), decoded if isinstance(decoded, Mapping) else None
+
+
+def _bubble(title: str, body: str, width: int) -> str:
+    usable = max(28, width - 5)
+    safe_title = _short_activity(_scrub_secrets(title.replace("\n", " ")), usable)
+    safe_body = _scrub_secrets(body.strip()) or "No detail recorded."
+    lines: list[str] = []
+    for paragraph in safe_body.splitlines() or [safe_body]:
+        lines.extend(
+            textwrap.wrap(
+                paragraph,
+                width=usable,
+                replace_whitespace=False,
+                drop_whitespace=True,
+            )
+            or [""]
+        )
+    return "\n".join((f"╭─ {safe_title}", *(f"│ {line}" for line in lines), "╰─"))
+
+
+def _first_log_values(value: object, keys: tuple[str, ...]) -> dict[str, object]:
+    found: dict[str, object] = {}
+
+    def visit(item: object) -> None:
+        if len(found) == len(keys):
+            return
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                normalized = str(key).casefold()
+                if (
+                    normalized in keys
+                    and normalized not in found
+                    and nested not in (None, "", [], {})
+                ):
+                    found[normalized] = nested
+                visit(nested)
+        elif isinstance(item, (tuple, list)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return found
+
+
+def _tool_call_summary(payload: Mapping[str, object]) -> tuple[str, str]:
+    function = payload.get("function")
+    function_map = function if isinstance(function, Mapping) else {}
+    name = str(function_map.get("name") or "tool")
+    arguments: object = function_map.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            arguments = {}
+    safe = _first_log_values(
+        arguments,
+        ("method", "url", "path", "message", "prompt", "text", "element_ref", "step"),
+    )
+    detail = "\n".join(f"{key.replace('_', ' ').title()}: {value}" for key, value in safe.items())
+    return f"Action · {name}", detail or "Request sent."
+
+
+def _tool_result_summary(payload: Mapping[str, object]) -> tuple[str, str]:
+    kind = str(payload.get("kind") or "response")
+    safe = _first_log_values(
+        payload,
+        (
+            "origin",
+            "url",
+            "status",
+            "flags",
+            "score_delta",
+            "mood",
+            "turns_remaining",
+            "run_status",
+            "outcome",
+            "message",
+        ),
+    )
+    if isinstance(payload.get("elements"), (tuple, list)):
+        safe["visible_controls"] = len(payload["elements"])
+    detail = "\n".join(f"{key.replace('_', ' ').title()}: {value}" for key, value in safe.items())
+    return f"Target · {kind}", detail or "Response recorded; open Raw JSON for the full payload."
+
+
+def _lead_event_summary(payload: Mapping[str, object]) -> str:
+    kind = str(payload.get("kind") or "lead update").replace("_", " ")
+    parts: list[str] = []
+    summary = payload.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        parts.append(summary.strip())
+    plan = payload.get("plan_update")
+    if isinstance(plan, Mapping) and isinstance(plan.get("rationale"), str):
+        parts.append("Rationale: " + str(plan["rationale"]))
+    actions = payload.get("actions")
+    if isinstance(actions, (tuple, list)):
+        labels = [
+            str(item.get("kind") or item.get("action") or item.get("profile_id") or "decision")
+            for item in actions
+            if isinstance(item, Mapping)
+        ]
+        parts.append(
+            f"Decisions: {len(actions)}" + (" · " + ", ".join(labels[:4]) if labels else "")
+        )
+    followups = payload.get("followups")
+    if isinstance(followups, (tuple, list)):
+        labels = [
+            str(item.get("profile_id") or item.get("objective") or "follow-up")
+            for item in followups
+            if isinstance(item, Mapping)
+        ]
+        parts.append(
+            f"Follow-ups dispatched: {len(followups)}"
+            + (
+                " · " + ", ".join(_short_activity(label, 48) for label in labels[:4])
+                if labels
+                else ""
+            )
+        )
+    for key in ("blocker", "error", "reason"):
+        if payload.get(key):
+            parts.append(f"{key.title()}: {payload[key]}")
+            break
+    if not parts:
+        parts.append(kind.capitalize() + ".")
+    return "\n".join(parts)
+
+
+def _readable_log(rows: Iterable[str], *, width: int, lead: bool = False) -> str:
+    rendered: list[str] = []
+    for raw_row in rows:
+        row = str(raw_row)
+        prefix, payload = _log_json(row)
+        if lead and payload is not None:
+            lead_payload = payload.get("payload")
+            lead_payload = lead_payload if isinstance(lead_payload, Mapping) else payload
+            timestamp = str(payload.get("created_at") or "time unavailable")
+            timestamp = timestamp.replace("T", " ").replace("+00:00", "Z")
+            wave = payload.get("wave")
+            kind = str(lead_payload.get("kind") or "update").replace("_", " ")
+            title = f"Lead · {timestamp}" + (f" · Wave {wave}" if wave is not None else "")
+            rendered.append(
+                _bubble(title, kind.title() + "\n" + _lead_event_summary(lead_payload), width)
+            )
+        elif prefix.casefold() == "tool call" and payload is not None:
+            title, body = _tool_call_summary(payload)
+            rendered.append(_bubble(title, body, width))
+        elif prefix.casefold() == "tool" and payload is not None:
+            title, body = _tool_result_summary(payload)
+            rendered.append(_bubble(title, body, width))
+        elif prefix.casefold() == "assistant":
+            rendered.append(_bubble("Worker reasoning", row.partition(":")[2], width))
+        elif prefix.casefold() in {"result", "assessment"}:
+            rendered.append(_bubble("Assessment", row.partition(":")[2], width))
+        elif prefix.casefold() in {"failure", "error"}:
+            rendered.append(_bubble("Blocker", row.partition(":")[2], width))
+        elif row.casefold().startswith("attempt "):
+            rendered.append("── " + _scrub_secrets(row) + " ──")
+        else:
+            rendered.append(_bubble(prefix or "Event", row.partition(":")[2] or row, width))
+    return "\n\n".join(rendered)
+
+
 class AgentScreen(ModalScreen[None]):
     """Full-screen worker workspace with independent live panes and retained transcripts."""
 
@@ -2028,6 +2223,7 @@ class AgentScreen(ModalScreen[None]):
         Binding("enter", "inspect_agent", "Expand transcript", show=False, priority=True),
         Binding("space", "pin_agent", "Pin pane", show=False, priority=True),
         Binding("a", "agents_overview", "Agent overview", show=False, priority=True),
+        Binding("r", "toggle_raw", "Toggle raw log", show=False, priority=True),
     ]
 
     def __init__(self, backend: ChatBackend, session_id: str) -> None:
@@ -2051,6 +2247,7 @@ class AgentScreen(ModalScreen[None]):
         self._transcript: tuple[str, ...] | None = None
         self._transcript_error = ""
         self._rendered_keys: dict[int, str] = {}
+        self._raw_logs = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="agent-workspace"):
@@ -2095,6 +2292,55 @@ class AgentScreen(ModalScreen[None]):
                 self._campaigns = _campaigns_for_session(campaigns, self.session_id)
                 visible = _current_campaigns(self._campaigns) or self._campaigns[:1]
                 incoming = _ordered_agents(_agents_for_campaigns(agents, visible))
+                if visible:
+                    campaign = visible[0]
+                    lead_rows: tuple[object, ...] = ()
+                    lead_loader = getattr(self.backend, "get_campaign_lead_log", None)
+                    if callable(lead_loader):
+                        try:
+                            lead_rows = tuple(await lead_loader(campaign.id, 100))
+                        except Exception:
+                            # An older daemon may not expose the read-only Lead log yet.
+                            lead_rows = ()
+                    serialized = tuple(
+                        json.dumps(
+                            _redact_sensitive(_plain_log_value(row)), sort_keys=True, default=str
+                        )
+                        for row in lead_rows
+                    )
+                    latest_payload = _plain_log_value(lead_rows[-1]) if lead_rows else {}
+                    latest_payload = latest_payload if isinstance(latest_payload, Mapping) else {}
+                    nested_payload = latest_payload.get("payload")
+                    nested_payload = nested_payload if isinstance(nested_payload, Mapping) else {}
+                    incoming = (
+                        *incoming,
+                        AgentView(
+                            name="campaign-lead",
+                            owner="campaign",
+                            task="Coordinate workers, review evidence, and decide the next wave",
+                            provider="Campaign Lead",
+                            elapsed="live journal",
+                            latest_event=(
+                                "working · "
+                                + str(nested_payload.get("kind") or "reviewing campaign")
+                                if campaign.status == "executing"
+                                else campaign.status
+                            ),
+                            result=None,
+                            profile="Campaign Lead",
+                            technique="coordination",
+                            campaign_id=campaign.id,
+                            assignment_id=_CAMPAIGN_LEAD_PREFIX + campaign.id,
+                            identity_provenance="durable",
+                            execution_stage="coordinate",
+                            activity=(
+                                str(nested_payload.get("kind") or "reviewing campaign").replace(
+                                    "_", " "
+                                ),
+                            ),
+                            output=serialized,
+                        ),
+                    )
                 # Keep rows in place as states change; new assignments append.
                 by_key = {self._key(agent): agent for agent in incoming}
                 old_keys = tuple(self._key(agent) for agent in self._agents)
@@ -2114,16 +2360,19 @@ class AgentScreen(ModalScreen[None]):
                 if self._expanded:
                     await self._refresh_transcript()
                 working = sum(
-                    _agent_display_state(a.latest_event) == "working" for a in self._agents
+                    _agent_display_state(a.latest_event) == "working"
+                    for a in self._agents
+                    if a.profile != "Campaign Lead"
                 )
                 specialist_ids = {
                     a.specialist_instance_id or a.name
                     for a in self._agents
-                    if a.profile != "Unassigned/structural tasks"
+                    if a.profile not in {"Unassigned/structural tasks", "Campaign Lead"}
                 }
+                workers = tuple(a for a in self._agents if a.profile != "Campaign Lead")
                 self.query_one("#agent-status", Static).update(
-                    f"{len(keys)} tasks · "
-                    f"{len({a.owner for a in self._agents if a.owner != 'unassigned'})} workers"
+                    f"{len(workers)} tasks · "
+                    f"{len({a.owner for a in workers if a.owner != 'unassigned'})} workers"
                     f" · {len(specialist_ids)} specialists"
                     f" · {working} working"
                     + (
@@ -2146,6 +2395,10 @@ class AgentScreen(ModalScreen[None]):
 
     def action_agents_overview(self) -> None:
         self.app.push_screen(AgentsOverviewScreen(self.backend, self.session_id))
+
+    def action_toggle_raw(self) -> None:
+        self._raw_logs = not self._raw_logs
+        self._render_progress(reveal_cursor=False)
 
     def on_resize(self) -> None:
         if self.is_mounted and self.query("#agent-picker"):
@@ -2259,14 +2512,40 @@ class AgentScreen(ModalScreen[None]):
         agent = next((a for a in self._agents if self._key(a) == key), None)
         if agent is None:
             return
-        loader = getattr(self.backend, "get_agent_transcript", None)
+        is_lead = key.startswith(_CAMPAIGN_LEAD_PREFIX) if key else False
+        loader = getattr(
+            self.backend,
+            "get_campaign_lead_log" if is_lead else "get_agent_transcript",
+            None,
+        )
         try:
-            transcript = (
-                tuple(await loader(agent.assignment_id))
-                if callable(loader) and agent.assignment_id
-                else ()
+            if callable(loader) and agent.assignment_id:
+                loaded = (
+                    await loader(agent.campaign_id, 100)
+                    if is_lead
+                    else await loader(agent.assignment_id)
+                )
+                transcript = (
+                    tuple(
+                        json.dumps(
+                            _redact_sensitive(_plain_log_value(row)), sort_keys=True, default=str
+                        )
+                        for row in loaded
+                    )
+                    if is_lead
+                    else tuple(loaded)
+                )
+            else:
+                transcript = ()
+            error = (
+                ""
+                if transcript
+                else (
+                    "No Campaign Lead journal entries recorded yet."
+                    if is_lead
+                    else "Only recent output is available for this worker."
+                )
             )
-            error = "" if transcript else "Only recent output is available for this worker."
         except Exception as exc:
             transcript = ()
             error = f"Could not load retained transcript: {exc}"
@@ -2318,10 +2597,11 @@ class AgentScreen(ModalScreen[None]):
             "AGENT WORKSPACE · " + (wave_label + " · " if wave_label else "") + objective
         )
         self.query_one("#agent-help", Static).update(
-            "↑/↓ workers · PgUp/PgDn scroll · Esc workspace · Esc again conversation"
+            "↑/↓ entries · PgUp/PgDn scroll · R readable/raw · "
+            "Esc workspace · Esc again conversation"
             if self._expanded
             else "↑/↓ select · Tab pane · Space pin · Enter expand · PgUp/Dn scroll · "
-            "A agents · drag to select · Ctrl+Shift+C copy · Esc back"
+            "R readable/raw · A agents · drag to select · Ctrl+Shift+C copy · Esc back"
         )
         by_key = {self._key(agent): agent for agent in self._agents}
         for index in range(3):
@@ -2337,17 +2617,33 @@ class AgentScreen(ModalScreen[None]):
                 title = "No worker selected"
             else:
                 agent = by_key[key]
+                is_lead = agent.profile == "Campaign Lead"
                 state = _agent_display_state(agent.latest_event)
                 glyph, style = _agent_state_chip(state)
                 stage = agent.execution_stage or _agent_stage(agent)
+                worker_number = sum(
+                    item.profile != "Campaign Lead" for item in self._agents[: keys.index(key) + 1]
+                )
                 title = _short_activity(
-                    f"{glyph} {keys.index(key) + 1:02d} · {state} · "
-                    f"{_workspace_specialist_label(agent)} · {stage}",
+                    (
+                        f"{glyph} Campaign Lead · {state} · {stage}"
+                        if is_lead
+                        else f"{glyph} {worker_number:02d} · "
+                        f"{state} · {_workspace_specialist_label(agent)} · {stage}"
+                    ),
                     max(20, self.size.width - self.query_one("#agent-sidebar").size.width - 8),
                 )
                 content = Text()
-                content.append(f"Agent: {_workspace_specialist_label(agent)}\n", style="cyan")
-                content.append(f"Worker owner: {agent.owner}\n", style="dim")
+                content.append(
+                    (
+                        "Campaign Lead\n"
+                        if is_lead
+                        else f"Agent: {_workspace_specialist_label(agent)}\n"
+                    ),
+                    style="cyan",
+                )
+                if not is_lead:
+                    content.append(f"Worker owner: {agent.owner}\n", style="dim")
                 content.append("Task: " + _workspace_task_label(agent) + "\n", style="bold")
                 content.append(
                     _worker_activity(agent) + "\n", style="cyan" if state == "working" else style
@@ -2359,14 +2655,20 @@ class AgentScreen(ModalScreen[None]):
                         style="#ff8290",
                     )
                 if self._expanded:
-                    content.append(f"Worker: {agent.name}\n", style="dim")
+                    content.append(
+                        ("Role: Campaign Lead\n" if is_lead else f"Worker: {agent.name}\n"),
+                        style="dim",
+                    )
                     if agent.technique:
                         content.append(f"Technique: {agent.technique}\n", style="dim")
                     content.append("Full assignment\n", style="bold")
                     content.append(agent.task + "\n\n")
                     content.append("Recorded activity\n", style="bold")
                     content.append("\n".join(agent.activity) + "\n\n")
-                    content.append("Retained worker transcript\n", style="bold cyan")
+                    content.append(
+                        ("Campaign Lead journal\n" if is_lead else "Retained worker transcript\n"),
+                        style="bold cyan",
+                    )
                     if self._transcript is None:
                         content.append("Loading transcript…\n", style="dim")
                     elif self._transcript_error:
@@ -2376,8 +2678,18 @@ class AgentScreen(ModalScreen[None]):
                     if self._expanded and self._transcript_key == key and self._transcript
                     else agent.output
                 )
-                for row in output:
-                    content.append(row + "\n\n")
+                if output:
+                    rows = tuple(str(row) for row in output)
+                    if self._raw_logs:
+                        content.append("\n\n".join(_scrub_secrets(row) for row in rows) + "\n\n")
+                    else:
+                        pane_width = max(
+                            32,
+                            self.size.width
+                            - (0 if self._expanded else self.query_one("#agent-sidebar").size.width)
+                            - 10,
+                        )
+                        content.append(_readable_log(rows, width=pane_width, lead=is_lead) + "\n\n")
                 if not output:
                     content.append(agent.result or "No worker output recorded yet.", style="dim")
             self.query_one(f"#worker-title-{index}", Static).update(
@@ -2404,7 +2716,12 @@ class AgentScreen(ModalScreen[None]):
         unread = self._unread.get(key, 0)
         if unread:
             suffix += f" +{unread}"
-        label.append(f"{cursor}{glyph} {index + 1:02d} ", style=style)
+        is_lead = agent.profile == "Campaign Lead"
+        worker_index = sum(item.profile != "Campaign Lead" for item in self._agents[: index + 1])
+        label.append(
+            f"{cursor}{glyph} " + ("LEAD " if is_lead else f"{worker_index:02d} "),
+            style=style,
+        )
         label.append(
             _short_activity(_workspace_specialist_label(agent), max(4, width - 7 - len(suffix))),
             style="bold",
@@ -3932,6 +4249,23 @@ class MerlinApp(App[None]):
             composer.clear()
             await self._run_command(text)
             return
+        startup = getattr(self, "_campaign_start_task", None)
+        if startup is not None and not startup.done() and not text.startswith("/"):
+            self.notify("Campaign startup is already in progress", severity="information")
+            return
+        if (
+            self._pending_choice_kind == "campaign_review"
+            and self._pending_campaign_review is not None
+            and text.lower() in {"", "1", "approve"}
+        ):
+            # This is an operator decision, not model steering. Execution does
+            # not replace the foreground reader, so it need not wait for the
+            # model's post-preparation response to finish streaming.
+            review = self._pending_campaign_review
+            self._clear_pending_decision()
+            composer.clear()
+            self._campaign_start_task = self._spawn(self._execute_approved_campaign(*review))
+            return
         if text and self._pending_choice:
             answers = {value.lower() for _, value in self._pending_choice}
             answers.update(str(i) for i in range(1, len(self._pending_choice) + 1))
@@ -4076,12 +4410,41 @@ class MerlinApp(App[None]):
         transcript.write(user_row)
         self._remember("user", "approve")
         self._activate_conversation()
+        started_at = time.monotonic()
+        startup = Static("", id="campaign-start", markup=False)
+        startup.styles.height = "auto"
+        startup.styles.padding = (0, 1)
+        startup.styles.border = ("round", "cyan")
+        frame = 0
+
+        def render_startup() -> None:
+            nonlocal frame
+            elapsed = int(time.monotonic() - started_at)
+            spinner = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")[frame % 10]
+            frame += 1
+            message = Text(f"{spinner} Starting campaign · {elapsed}s", style="bold cyan")
+            message.append("\nApproval received · waiting for the daemon to confirm startup.")
+            if elapsed >= 30:
+                message.append(
+                    "\nStartup is taking longer than expected. Inspect /campaign status "
+                    + campaign_id,
+                    style="yellow",
+                )
+            startup.update(message)
+
+        render_startup()
+        await self.mount(startup, before=self.query_one("#activity"))
+        timer = self.set_interval(0.12, render_startup)
+        transcript.write(Text("Approval received · starting campaign…", style="cyan"))
         try:
             await self.backend.execute_campaign(campaign_id, manifest_digest)
         except Exception as exc:
             transcript.write(_transcript_text("✕ Campaign execution failed: ", exc, "bold red"))
             self._remember("error", _scrub_secrets(f"Campaign execution failed: {exc}"))
             return
+        finally:
+            timer.stop()
+            await startup.remove()
         console = getattr(self, "_web_console", None)
         if console:
             console.workspace.latest_review = None
@@ -7198,10 +7561,23 @@ def _render_campaign_status(status: object) -> str:
         required = int(saturation.get("hypothesis_cells_required", 0))
         terminal = int(saturation.get("terminal_tasks", 0))
         total = int(saturation.get("total_tasks", 0))
+        catalogue_total = sum(
+            int(saturation.get(field, 0))
+            for field in (
+                "catalogue_cells_confirmed",
+                "catalogue_cells_refuted",
+                "catalogue_cells_blocked",
+                "catalogue_cells_terminal_blocked",
+                "catalogue_cells_unclear",
+                "catalogue_cells_unsearched",
+            )
+        )
         lines.extend(
             (
                 "",
-                "Exhaustive saturation evidence",
+                "Adaptive coverage frontier",
+                f"  Eligible catalogue cells: {catalogue_total:,} logical candidates"
+                " · scheduled in bounded adaptive batches",
                 f"  Quiet waves: {saturation.get('no_new_findings_waves', 0)}/3",
                 "  Catalogue techniques attempted: "
                 f"{saturation.get('attempted_techniques', 0)}/"
@@ -7263,6 +7639,23 @@ def _render_campaign_status(status: object) -> str:
                 f" · proposal {_display_digest(record.get('proposal_digest', 'unknown'))}"
                 f"{_dynamic_creation_reason(record)}"
             )
+    acceptance = status.get("stateful_acceptance")
+    if isinstance(acceptance, Mapping):
+        case_id = str(acceptance.get("case_id", "unknown"))
+        kind = str(acceptance.get("kind", "unknown"))
+        result = str(acceptance.get("result", "unknown"))
+        lines.extend(
+            (
+                "",
+                "Stateful target acceptance",
+                f"  Case: {case_id} · {kind}",
+                f"  Result: {result}",
+            )
+        )
+        expected = acceptance.get("expected")
+        if isinstance(expected, Mapping):
+            summary = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+            lines.append(f"  Expected: {summary}")
     waves = status.get("waves", ())
     if isinstance(waves, (tuple, list)):
         lines.extend(("", "Waves"))

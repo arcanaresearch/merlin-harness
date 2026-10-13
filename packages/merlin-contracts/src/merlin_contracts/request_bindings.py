@@ -10,6 +10,13 @@ from uuid import uuid4
 RequestValueGenerator = Literal["uuid4", "hex32"]
 
 
+def validate_capture_binding(template: object, pointer: object, binding_name: str) -> None:
+    """Require one exact request destination for an ephemeral reviewed capture."""
+    parent, key = _destination(template, pointer)
+    if parent[key] != f"{{{{capture:{binding_name}}}}}":
+        raise ValueError("checkpoint restore binding must address its exact capture placeholder")
+
+
 def validate_request_bindings(
     template: object, bindings: object
 ) -> dict[str, RequestValueGenerator]:

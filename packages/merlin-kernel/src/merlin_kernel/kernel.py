@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from merlin_contracts import (
     AppCommand,
@@ -510,7 +511,7 @@ class Kernel:
         campaign_context: Callable[[str], Awaitable[str | None]] | None = None,
         max_workers: int = 3,
         max_provider_retries: int = 3,
-        max_output_tokens_per_request: int = 8_192,
+        max_output_tokens_per_request: int | None = None,
         tool_timeout_seconds: float = 30,
         capability_registry: object | None = None,
     ) -> None:
@@ -518,7 +519,7 @@ class Kernel:
             raise ValueError("max_workers must be between 1 and 3")
         if max_provider_retries < 0:
             raise ValueError("max_provider_retries must be non-negative")
-        if max_output_tokens_per_request < 1:
+        if max_output_tokens_per_request is not None and max_output_tokens_per_request < 1:
             raise ValueError("max output tokens per request must be positive")
         if tool_timeout_seconds <= 0:
             raise ValueError("tool timeout seconds must be positive")
@@ -736,6 +737,7 @@ class Kernel:
         reasoning = ""
         provider_failures = 0
         recovery_tool_name: str | None = None
+        recovery_reasoning: Literal["enabled", "disabled"] | None = None
         preferred_next_tool_name: str | None = None
         blocked_recovery_tools: set[str] = set()
         repair_messages: list[ChatMessage] = []
@@ -821,6 +823,8 @@ class Kernel:
                 # turn behind that tool's schema or repair instruction.
                 request_recovery_tool_name = recovery_tool_name
                 recovery_tool_name = None
+                request_recovery_reasoning = recovery_reasoning
+                recovery_reasoning = None
                 request_preferred_tool_name = preferred_next_tool_name
                 request_repair_messages = repair_messages
                 repair_messages = []
@@ -864,6 +868,7 @@ class Kernel:
                     else getattr(self._provider, "capabilities", None)
                 )
                 context_window = await self._context_window_tokens(capabilities, model=model)
+                output_token_limit = self._output_token_limit(capabilities, model=model)
                 described_tools = tuple(
                     spec
                     for spec in self._tools.describe()
@@ -950,11 +955,12 @@ class Kernel:
                     messages=_compact_messages(
                         messages,
                         context_window_tokens=context_window,
-                        reserved_output_tokens=self._max_output_tokens_per_request,
+                        reserved_output_tokens=output_token_limit,
                         reserved_overhead_tokens=estimate_tool_schema_tokens(tool_schemas),
                     ),
                     tools=tool_schemas,
-                    max_output_tokens=self._max_output_tokens_per_request,
+                    reasoning=request_recovery_reasoning,
+                    max_output_tokens=output_token_limit,
                 )
                 used_tool = False
                 tool_calls: list[ToolCall] = []
@@ -1196,7 +1202,13 @@ class Kernel:
                             malformed_tool_call = event.code in {
                                 "malformed_tool_arguments",
                                 "malformed_tool_call",
+                                "truncated_tool_call",
                             }
+                            if malformed_tool_call:
+                                # The model already decided to call a tool. Spend the repair
+                                # attempt's output budget on the call arguments instead of a
+                                # second reasoning trace that can truncate them again.
+                                recovery_reasoning = "disabled"
                             failed_tool_name = event.tool_name or request_recovery_tool_name
                             if (
                                 malformed_tool_call
@@ -1227,7 +1239,7 @@ class Kernel:
                             if malformed_tool_call and provider_failures == 1:
                                 recovery_strategy = (
                                     "Emit exactly one complete JSON object matching the tool "
-                                    "schema."
+                                    "schema, and emit the tool call immediately."
                                 )
                             elif not malformed_tool_call:
                                 recovery_strategy = (
@@ -1909,6 +1921,38 @@ class Kernel:
             )
         )
         return CONTEXT_WINDOW_ASSUMPTION_TOKENS
+
+    def _output_token_limit(self, capabilities: object, *, model: str) -> int:
+        """Resolve the routed model's per-request output limit.
+
+        An explicit kernel limit is an operator cap. Otherwise use an exact
+        provider/registry value and retain 8,192 only as the unknown-model
+        fallback used before capability-aware request sizing.
+        """
+
+        configured = self._max_output_tokens_per_request
+        candidate = getattr(capabilities, "max_output_tokens", None)
+        if not isinstance(candidate, int) or isinstance(candidate, bool) or candidate < 1:
+            candidate = None
+        resolve = getattr(self._capability_registry, "resolve_model", None)
+        if candidate is None and callable(resolve) and model:
+            route = self._route_identity_for_model(model)
+            resolved = resolve(
+                model,
+                transport=getattr(route, "transport", "openai_compatible"),
+                endpoint=getattr(route, "endpoint", ""),
+            ).max_output_tokens
+            value = getattr(resolved, "value", None)
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                and not getattr(getattr(resolved, "provenance", None), "assumed", True)
+            ):
+                candidate = value
+        if configured is not None:
+            return configured if candidate is None else min(configured, candidate)
+        return candidate or 8_192
 
     def _route_identity_for_model(self, model: str) -> object | None:
         """The provider's exact RouteIdentity for this model, when it exposes one."""

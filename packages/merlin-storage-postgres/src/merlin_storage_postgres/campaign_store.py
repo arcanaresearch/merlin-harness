@@ -10,7 +10,9 @@ from typing import Any
 from uuid import uuid4
 
 from merlin_agents import ExplorationCriticDecision
-from merlin_contracts import CampaignObservation
+from merlin_contracts import CampaignObservation, CampaignTerminalReason
+from merlin_contracts.campaign_lifecycle import require_campaign_terminal_reason
+from merlin_contracts.state_scope import OpaqueIdentityReference
 from merlin_memory import VerifiedInteractionLesson
 from psycopg.types.json import Jsonb
 
@@ -1886,6 +1888,14 @@ class CampaignStore:
 
     def resume(self, campaign_id: str) -> dict[str, Any]:
         with self.connection.transaction():
+            current = self.connection.execute(
+                """SELECT lifecycle_pause_reason
+                   FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s AND status = 'paused' FOR UPDATE""",
+                (campaign_id,),
+            ).fetchone()
+            if current is not None and current["lifecycle_pause_reason"] is not None:
+                raise ValueError("campaign is lifecycle-paused and requires durable reconciliation")
             row = self.connection.execute(
                 """UPDATE merlin_storage.assessment_campaigns
                    SET status = 'executing', updated_at = now()
@@ -1902,13 +1912,284 @@ class CampaignStore:
             )
         return self._row(row)
 
+    def record_objective_gate_checkpoint(
+        self,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        manifest_digest: str,
+        recipe_digest: str,
+        checkpoint_handle: Mapping[str, object],
+        evidence_digest: str,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Persist one immutable, secret-safe checkpoint under an active scope fence."""
+
+        gate = _nonempty(gate_id, "objective gate id")
+        manifest = _nonempty(manifest_digest, "reviewed manifest digest")
+        recipe = _reviewed_sha256(recipe_digest, "objective gate recipe digest")
+        evidence = _reviewed_sha256(evidence_digest, "checkpoint evidence digest")
+        handle = OpaqueIdentityReference.model_validate(checkpoint_handle)
+        if handle.namespace != "state":
+            raise ValueError("checkpoint handles must use the opaque state namespace")
+        document = handle.model_dump(mode="json")
+        with self.connection.transaction():
+            status = self._validate_gate_scope_lease_locked(
+                campaign_id, scope_id, claim_id, claimant_id
+            )
+            if status not in {"effect_acknowledged", "settled"}:
+                raise ValueError("checkpoint capture requires an acknowledged target effect")
+            campaign = self.connection.execute(
+                """SELECT manifest, manifest_digest FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR SHARE""",
+                (campaign_id,),
+            ).fetchone()
+            envelope = campaign["manifest"] if campaign is not None else None
+            reviewed_manifest = envelope.get("manifest") if isinstance(envelope, Mapping) else None
+            sealed_manifest_digest = (
+                reviewed_manifest.get("digest") if isinstance(reviewed_manifest, Mapping) else None
+            )
+            accepted_digests = (
+                set()
+                if campaign is None
+                else {str(campaign["manifest_digest"]), str(sealed_manifest_digest or "")}
+            )
+            if manifest not in accepted_digests:
+                raise ValueError("checkpoint manifest digest is not the reviewed campaign")
+            self.connection.execute(
+                """INSERT INTO merlin_storage.gate_checkpoints
+                       (campaign_id, gate_id, manifest_digest, recipe_digest, checkpoint_handle,
+                        evidence_digest, captured_scope_id, capture_claim_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (campaign_id, gate_id) DO NOTHING""",
+                (
+                    campaign_id,
+                    gate,
+                    manifest,
+                    recipe,
+                    Jsonb(document),
+                    evidence,
+                    scope_id,
+                    claim_id,
+                ),
+            )
+            row = self.connection.execute(
+                """SELECT * FROM merlin_storage.gate_checkpoints
+                   WHERE campaign_id = %s AND gate_id = %s FOR SHARE""",
+                (campaign_id, gate),
+            ).fetchone()
+            assert row is not None
+            expected = (manifest, recipe, document, evidence, scope_id, claim_id)
+            actual = (
+                str(row["manifest_digest"]),
+                str(row["recipe_digest"]),
+                dict(row["checkpoint_handle"]),
+                str(row["evidence_digest"]),
+                str(row["captured_scope_id"]),
+                str(row["capture_claim_id"]),
+            )
+            if actual != expected:
+                raise ValueError("objective gate checkpoint conflicts with durable state")
+            return dict(row)
+
+    def load_objective_gate_checkpoint(
+        self, campaign_id: str, gate_id: str
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT * FROM merlin_storage.gate_checkpoints
+               WHERE campaign_id = %s AND gate_id = %s""",
+            (campaign_id, gate_id),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def claim_objective_gate_checkpoint_restore(
+        self,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> dict[str, Any]:
+        """Fence one restore attempt while keeping the checkpoint reusable."""
+
+        gate = _nonempty(gate_id, "objective gate id")
+        with self.connection.transaction():
+            status = self._validate_gate_scope_lease_locked(
+                campaign_id, scope_id, claim_id, claimant_id
+            )
+            checkpoint = self.connection.execute(
+                """SELECT * FROM merlin_storage.gate_checkpoints
+                   WHERE campaign_id = %s AND gate_id = %s FOR SHARE""",
+                (campaign_id, gate),
+            ).fetchone()
+            if checkpoint is None:
+                raise KeyError((campaign_id, gate))
+            restore = self.connection.execute(
+                """SELECT * FROM merlin_storage.checkpoint_restores
+                   WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s FOR UPDATE""",
+                (campaign_id, gate, scope_id),
+            ).fetchone()
+            if restore is None:
+                if status != "open":
+                    raise ValueError("new checkpoint restore requires a pre-delivery state scope")
+                restore = self.connection.execute(
+                    """INSERT INTO merlin_storage.checkpoint_restores
+                           (campaign_id, gate_id, scope_id, claim_id, claimant_id)
+                       VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+                    (campaign_id, gate, scope_id, claim_id, claimant_id),
+                ).fetchone()
+            elif str(restore["state"]) == "restored":
+                return {
+                    **dict(checkpoint),
+                    "restore": dict(restore),
+                    "already_restored": True,
+                    "effect_acknowledged": True,
+                }
+            elif str(restore["state"]) != "claimed":
+                raise ValueError("checkpoint restore attempt is terminal")
+            elif str(restore["claim_id"]) != claim_id:
+                active = self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.state_scope_leases
+                       WHERE claim_id = %s AND expires_at > now()""",
+                    (restore["claim_id"],),
+                ).fetchone()
+                if active is not None:
+                    raise ValueError("checkpoint restore is owned by another active lease")
+                restore = self.connection.execute(
+                    """UPDATE merlin_storage.checkpoint_restores
+                       SET claim_id = %s, claimant_id = %s, updated_at = now()
+                       WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s
+                       RETURNING *""",
+                    (claim_id, claimant_id, campaign_id, gate, scope_id),
+                ).fetchone()
+            assert restore is not None
+            return {
+                **dict(checkpoint),
+                "restore": dict(restore),
+                "already_restored": False,
+                "effect_acknowledged": status == "effect_acknowledged",
+            }
+
+    def validate_objective_gate_checkpoint_restore(
+        self,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> bool:
+        """Return whether the exact restore attempt still owns its active fence."""
+
+        with self.connection.transaction():
+            try:
+                self._validate_gate_scope_lease_locked(campaign_id, scope_id, claim_id, claimant_id)
+            except ValueError:
+                return False
+            row = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.checkpoint_restores
+                   WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s
+                     AND claim_id = %s AND claimant_id = %s AND state = 'claimed'""",
+                (campaign_id, gate_id, scope_id, claim_id, claimant_id),
+            ).fetchone()
+            return row is not None
+
+    def release_objective_gate_checkpoint_restore(
+        self,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> bool:
+        """Release only a restore that never reached the target."""
+
+        with self.connection.transaction():
+            status = self._validate_gate_scope_lease_locked(
+                campaign_id, scope_id, claim_id, claimant_id
+            )
+            if status != "open":
+                raise ValueError("acknowledged checkpoint restores cannot be released")
+            row = self.connection.execute(
+                """DELETE FROM merlin_storage.checkpoint_restores
+                   WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s
+                     AND claim_id = %s AND claimant_id = %s AND state = 'claimed'
+                   RETURNING scope_id""",
+                (campaign_id, gate_id, scope_id, claim_id, claimant_id),
+            ).fetchone()
+            return row is not None
+
+    def mark_objective_gate_checkpoint_restored(
+        self,
+        campaign_id: str,
+        gate_id: str,
+        *,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+        evidence_digest: str,
+    ) -> dict[str, Any]:
+        """Commit restore completion once under the same unexpired scope lease."""
+
+        evidence = _reviewed_sha256(evidence_digest, "checkpoint restore evidence digest")
+        with self.connection.transaction():
+            status = self._validate_gate_scope_lease_locked(
+                campaign_id, scope_id, claim_id, claimant_id
+            )
+            if status not in {"effect_acknowledged", "settled"}:
+                raise ValueError("checkpoint restore completion requires target acknowledgement")
+            row = self.connection.execute(
+                """UPDATE merlin_storage.checkpoint_restores
+                   SET state = 'restored', evidence_digest = %s, restored_at = now(),
+                       updated_at = now()
+                   WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s
+                     AND claim_id = %s AND claimant_id = %s AND state = 'claimed'
+                   RETURNING *""",
+                (evidence, campaign_id, gate_id, scope_id, claim_id, claimant_id),
+            ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    """SELECT * FROM merlin_storage.checkpoint_restores
+                       WHERE campaign_id = %s AND gate_id = %s AND scope_id = %s""",
+                    (campaign_id, gate_id, scope_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError((campaign_id, gate_id, scope_id))
+                if str(row["state"]) != "restored" or str(row["evidence_digest"]) != evidence:
+                    raise ValueError("checkpoint restore completion conflicts with durable state")
+            return dict(row)
+
+    def _validate_gate_scope_lease_locked(
+        self,
+        campaign_id: str,
+        scope_id: str,
+        claim_id: str,
+        claimant_id: str,
+    ) -> str:
+        row = self.connection.execute(
+            """SELECT scope.status FROM merlin_storage.state_scopes AS scope
+               JOIN merlin_storage.state_scope_leases AS lease ON lease.scope_id = scope.id
+               WHERE scope.id = %s AND scope.campaign_id = %s
+                 AND lease.claim_id = %s AND lease.claimant_id = %s
+                 AND lease.expires_at > now() FOR SHARE OF scope, lease""",
+            (scope_id, campaign_id, claim_id, claimant_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("objective gate checkpoint requires its active state-scope lease")
+        return str(row["status"])
+
     def retry_incomplete(self, campaign_id: str) -> dict[str, Any]:
         """Reopen a failed campaign without rewriting its completed waves."""
         with self.connection.transaction():
             row = self.connection.execute(
                 """UPDATE merlin_storage.assessment_campaigns
                    SET status = 'executing', stop_reason = NULL, updated_at = now()
-                   WHERE id = %s AND status = 'failed' AND stop_reason = 'failed'
+                   WHERE id = %s AND status = 'failed'
+                     AND stop_reason = 'infrastructure_blocked_after_retry_policy'
                    RETURNING *""",
                 (campaign_id,),
             ).fetchone()
@@ -1956,20 +2237,12 @@ class CampaignStore:
         stop_reason = (
             stop_reason
             or {
-                "completed": "saturated",
-                "cancelled": "operator_stopped",
-                "failed": "failed",
+                "completed": CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+                "cancelled": CampaignTerminalReason.OPERATOR_STOPPED.value,
+                "failed": CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value,
             }[status]
         )
-        if stop_reason not in {
-            "saturated",
-            "completed_with_limitations",
-            "capped",
-            "failed",
-            "interrupted",
-            "operator_stopped",
-        }:
-            raise ValueError("invalid campaign stop reason")
+        stop_reason = require_campaign_terminal_reason(stop_reason).value
         with self.connection.transaction():
             row = self.connection.execute(
                 """UPDATE merlin_storage.assessment_campaigns
@@ -2715,3 +2988,18 @@ def _campaign_budget(value: object) -> dict[str, int | float | None]:
             raise ValueError("campaign manifest contains an invalid reviewed budget")
         result[key] = item
     return result
+
+
+def _nonempty(value: str, label: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{label} cannot be empty")
+    return normalized
+
+
+def _reviewed_sha256(value: str, label: str) -> str:
+    normalized = _nonempty(value, label)
+    payload = normalized.removeprefix("sha256:")
+    if len(payload) != 64 or any(character not in "0123456789abcdef" for character in payload):
+        raise ValueError(f"{label} must be a lowercase sha256 digest")
+    return "sha256:" + payload

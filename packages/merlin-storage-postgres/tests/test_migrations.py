@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from merlin_storage_postgres import (
     CampaignStore,
     Database,
@@ -9,11 +10,12 @@ from merlin_storage_postgres import (
     SessionRepository,
     load_migrations,
 )
+from psycopg.errors import CheckViolation
 
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 84))
+    assert [migration.version for migration in migrations] == list(range(1, 87))
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -89,9 +91,81 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "CREATE TABLE merlin_storage.campaign_capability_observations" in migrations[73].sql
     assert "CREATE TABLE merlin_storage.campaign_frontier_transition_leases" in migrations[81].sql
     assert "CREATE TABLE merlin_storage.target_constraints" in migrations[82].sql
+    assert "CREATE TABLE merlin_storage.state_scopes" in migrations[83].sql
+    assert "CREATE TABLE merlin_storage.principal_resources" in migrations[83].sql
+    assert "CREATE TABLE merlin_storage.gate_checkpoints" in migrations[83].sql
+    assert "CREATE TABLE merlin_storage.checkpoint_restores" in migrations[83].sql
+    assert "CREATE TABLE merlin_storage.campaign_recovery" in migrations[84].sql
+    assert "objective_satisfied" in migrations[85].sql
+    assert "infrastructure_blocked_after_retry_policy" in migrations[85].sql
     evidence = next(migration for migration in migrations if migration.version == 17)
     assert "CREATE TABLE merlin_storage.campaign_observations" in evidence.sql
     assert "CREATE TABLE IF NOT EXISTS merlin_storage.report_revisions" in migrations[17].sql
+
+
+def test_campaign_terminal_taxonomy_migrates_legacy_rows_and_rejects_legacy_writes(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-terminal-taxonomy")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:85])
+            session = SessionRepository(connection).create("legacy campaign terminal reason")
+            campaigns = CampaignStore(connection)
+            campaigns.prepare("campaign/legacy-terminal", str(session.id), {}, "sha256:legacy")
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'failed', stop_reason = 'failed'
+                   WHERE id = 'campaign/legacy-terminal'"""
+            )
+            connection.commit()
+
+            runner.apply(migrations[85:])
+
+            row = connection.execute(
+                """SELECT stop_reason FROM merlin_storage.assessment_campaigns
+                   WHERE id = 'campaign/legacy-terminal'"""
+            ).fetchone()
+            assert row["stop_reason"] == "infrastructure_blocked_after_retry_policy"
+            with connection.transaction(), pytest.raises(CheckViolation):
+                connection.execute(
+                    """UPDATE merlin_storage.assessment_campaigns
+                       SET stop_reason = 'failed'
+                       WHERE id = 'campaign/legacy-terminal'"""
+                )
+
+
+def test_campaign_store_writes_only_current_terminal_reasons(tmp_path: Path) -> None:
+    reasons = (
+        "objective_satisfied",
+        "frontier_exhausted",
+        "budget_exhausted",
+        "target_terminal",
+        "operator_stopped",
+        "infrastructure_blocked_after_retry_policy",
+    )
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-current-terminal")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply(load_migrations())
+            session = SessionRepository(connection).create("current campaign terminal reasons")
+            campaigns = CampaignStore(connection)
+            for index, reason in enumerate(reasons):
+                campaign_id = f"campaign/current-terminal-{index}"
+                campaigns.prepare(campaign_id, str(session.id), {}, f"sha256:{index}")
+                status = (
+                    "cancelled"
+                    if reason == "operator_stopped"
+                    else "failed"
+                    if reason == "infrastructure_blocked_after_retry_policy"
+                    else "completed"
+                )
+                row = campaigns.finish(campaign_id, status, stop_reason=reason)
+                assert row["stop_reason"] == reason
+
+            campaigns.prepare("campaign/reject-legacy", str(session.id), {}, "sha256:reject")
+            with pytest.raises(ValueError, match="invalid current"):
+                campaigns.finish("campaign/reject-legacy", "failed", stop_reason="failed")
 
 
 def test_api_session_scope_migration_reserves_legacy_rows(tmp_path: Path) -> None:

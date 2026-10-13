@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
+import httpx
 import pytest
 from merlin_agents import (
     AssignmentBudget,
@@ -19,24 +20,49 @@ from merlin_agents import (
     FrontierHypothesis,
     LeadAssessment,
     LeadFollowUp,
+    ObjectiveGateAction,
+    ObjectiveGateBudget,
+    ObjectiveGateOperator,
+    ObjectiveGatePredicate,
+    ObjectiveGateRetention,
+    ObjectivePhaseGate,
     ReviewedTargetAdapter,
     WorkerAssignment,
     compile_initial_campaign,
 )
-from merlin_agents.campaign import compile_attack_campaign, compile_execution_agenda
+from merlin_agents.campaign import (
+    compile_attack_campaign,
+    compile_execution_agenda,
+    scenario_fingerprint_for,
+)
 from merlin_agents.campaign_service import (
     _bind_recon_applicability_evidence,
     _recon_applicability_partition,
 )
-from merlin_contracts import AgentTask, ModelCompleted, TextDelta
+from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
+from merlin_config import ConfigPaths, CredentialCheckpointVault
+from merlin_contracts import (
+    AgentTask,
+    ModelCompleted,
+    TextDelta,
+    ToolCall,
+)
+from merlin_contracts.target_adapter_compiler import (
+    compile_target_adapter,
+    compiled_target_adapter_digest,
+)
 from merlin_storage_postgres import (
+    CampaignApiSessionRepository,
     CampaignStore,
     Database,
     DatabaseConfig,
     DurableSchedulerStore,
     MigrationRunner,
+    PostgresToolEffectStore,
     SessionRepository,
+    ToolEffectRepository,
 )
+from merlin_tools import ToolBroker
 
 
 async def _unused_preparation(*_args, **_kwargs):
@@ -125,6 +151,236 @@ class _NoTools:
 
     async def invoke(self, *_args, **_kwargs):
         raise AssertionError("no tools admitted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "rotate_identity", "expected_score", "expected_gate_status", "expect_attack"),
+    (
+        ("success", False, 10, "succeeded", True),
+        ("predicate-failed", False, 20, "blocked", False),
+        ("identity-ambiguous", True, 10, "retryable", False),
+    ),
+)
+async def test_public_execute_orders_reused_recon_gate_recipe_before_attack_with_postgres(
+    tmp_path: Path,
+    case: str,
+    rotate_identity: bool,
+    expected_score: int,
+    expected_gate_status: str,
+    expect_attack: bool,
+) -> None:
+    data_dir = tmp_path / f"postgres-objective-gate-public-path-{case}"
+    campaign_id = f"campaign/objective-gate-public-path-{case}"
+    async with StatefulTargetFixtureServer(
+        maximum_parallel_states=1,
+        state_mode="checkpoint",
+        rotate_identity_on_message=rotate_identity,
+    ) as target:
+        adapter = target.adapter()
+        state_capabilities = adapter["state_capabilities"]
+        assert isinstance(state_capabilities, dict)
+        identity = state_capabilities["identity"]
+        assert isinstance(identity, dict)
+        identity["baseline_selector"]["step_id"] = "start"
+        for rule in state_capabilities["identity_equivalence_rules"]:
+            rule["left_selector"]["step_id"] = "start"
+        for observation in state_capabilities["observations"]:
+            observation["baseline_selector"]["step_id"] = "start"
+        compiled_adapter = compile_target_adapter(adapter)
+        reviewed_adapter = {
+            **adapter,
+            "compiled_adapter": json.dumps(
+                compiled_adapter.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "compiled_adapter_digest": compiled_target_adapter_digest(compiled_adapter),
+        }
+        adapter_document = ContextDocument.create(
+            "target:reviewed-interaction-contract",
+            "Reviewed stateful fixture adapter.\n"
+            + json.dumps(reviewed_adapter, sort_keys=True, separators=(",", ":")),
+        )
+        provider_calls: list[object] = []
+
+        class AttackProvider:
+            async def stream(self, request):
+                provider_calls.append(request)
+                if any(message.role == "tool" for message in request.messages):
+                    yield TextDelta(
+                        text=(
+                            '{"attempted_techniques":[{"technique_id":"prompt",'
+                            '"outcome":"refuted","evidence_refs":["exchange:attack"]}],'
+                            '"hypothesis_proposals":[]}'
+                        )
+                    )
+                    yield ModelCompleted()
+                    return
+                yield ToolCall(
+                    call_id=f"attack-{len(provider_calls)}",
+                    name="target_request",
+                    arguments={"input": "attack"},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        async def allow(*_args) -> bool:
+            return True
+
+        async def lead(*_args, **_kwargs):
+            return LeadAssessment("bounded public-path proof complete", True)
+
+        with Database(DatabaseConfig(data_dir=data_dir)) as database:
+            with (
+                database.connect() as scheduler_connection,
+                database.connect() as campaign_connection,
+                database.connect() as target_connection,
+            ):
+                MigrationRunner(scheduler_connection).apply()
+                session = SessionRepository(campaign_connection).create(
+                    "objective gate public path"
+                )
+                session_id = str(session.id)
+                gate = ObjectivePhaseGate(
+                    id="baseline",
+                    ordinal=0,
+                    objective="Establish the reviewed baseline",
+                    actions=(ObjectiveGateAction("baseline/message", "interaction", "advance"),),
+                    success_predicate=ObjectiveGatePredicate(
+                        "objective_score", ObjectiveGateOperator.EQUALS, (expected_score,)
+                    ),
+                    budget=ObjectiveGateBudget(1, 1, 5),
+                    retain_success=ObjectiveGateRetention.CHECKPOINT,
+                )
+                manifest = CampaignManifest.create(
+                    id=campaign_id,
+                    session_id=session_id,
+                    objective="Assess the reviewed target",
+                    profile=CampaignProfile.RECOMMENDED,
+                    target=ReviewedTargetAdapter(
+                        "target-1", "http_api", target.origin, "message", browser_concurrency=1
+                    ),
+                    provider_id="provider",
+                    provider_model="model",
+                    provider_effort="default",
+                    authority_ids=(f"session:{session_id}", "target:target-1"),
+                    catalogue=(
+                        ContextDocument.create("case:prompt", "Probe prompt boundary"),
+                        adapter_document,
+                    ),
+                    skill_documents=(),
+                    tool_ids=("target_request",),
+                    budget=AssignmentBudget(max_seconds=10),
+                    specialist_composition="autonomous",
+                    objective_phase_gates=(gate,),
+                )
+                context = AssignmentContext(
+                    target_profile_id="target-1",
+                    techniques=(
+                        AssignmentTechnique(
+                            "prompt",
+                            "probe",
+                            frozenset({"prompt", "injection"}),
+                            ("case:prompt",),
+                            execution_role="direct",
+                        ),
+                    ),
+                    tool_ids=("target_request",),
+                    skill_ids=(),
+                    provider_id="provider",
+                    authority_ids=manifest.authority_ids,
+                    budget=manifest.budget,
+                    input_schema='{"type":"object"}',
+                    output_schema='{"type":"object"}',
+                )
+
+                async def prepare(*_args, **_kwargs):
+                    return CampaignPreparation(manifest, context)
+
+                sessions = CampaignApiSessionRepository(target_connection)
+                store = CampaignStore(campaign_connection)
+                async with httpx.AsyncClient() as client:
+                    target_tool = ReviewedApiTargetTool(
+                        sessions,
+                        lambda _target_id: adapter,
+                        {},
+                        checkpoint_store=store,
+                        checkpoint_vault=CredentialCheckpointVault(
+                            ConfigPaths(tmp_path / "credentials")
+                        ),
+                        client=client,
+                    )
+                    scheduler = DurableSchedulerStore(scheduler_connection)
+                    agents = DurableAgentService(
+                        AttackProvider(),
+                        ToolBroker(
+                            (target_tool,),
+                            confirmer=allow,
+                            effect_store=PostgresToolEffectStore(
+                                ToolEffectRepository(target_connection)
+                            ),
+                        ),
+                        scheduler,
+                        model="model",
+                    )
+                    service = CampaignService(store, agents, prepare, lead_runner=lead)
+                    review = await service.prepare(
+                        session_id,
+                        manifest.objective,
+                        CampaignProfile.RECOMMENDED,
+                        objective_phase_gates=(gate,),
+                    )
+                    fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
+                    recon_digest = "sha256:" + "a" * 64
+                    store.record_recon_result(
+                        {
+                            "id": "recon-result:objective-gate",
+                            "target_id": manifest.target.id,
+                            "scenario_fingerprint": fingerprint,
+                            "result_digest": recon_digest,
+                            "result": {
+                                "applicable_ids": ["prompt"],
+                                "inapplicable_ids": [],
+                                "result_digest": recon_digest,
+                            },
+                        }
+                    )
+
+                    executed = await service.execute(
+                        session_id,
+                        campaign_id,
+                        str(review["manifest_digest"]),
+                    )
+                    assert executed["status"] == "executing"
+                    assert store.frontier_counts(campaign_id)["claimed"] == 0
+
+                    for _ in range(8):
+                        supervisor = service._supervisors.get(campaign_id)  # noqa: SLF001
+                        if supervisor is None:
+                            break
+                        await asyncio.wait_for(asyncio.shield(supervisor), timeout=10)
+                        await asyncio.sleep(0)
+
+                gate_events = [
+                    row["payload"]
+                    for row in store.list_lead(campaign_id)
+                    if row["payload"].get("kind") == "objective_phase_gate_settled"
+                ]
+                assert gate_events[-1]["status"] == expected_gate_status
+                assert gate_events[-1]["frontier_claimed"] is False
+                operations = [item["operation"] for item in target.http_log]
+                if expect_attack:
+                    assert operations.count("message") >= 2
+                    assert provider_calls
+                    gate_message = operations.index("message")
+                    attack_message = operations.index("message", gate_message + 1)
+                    assert "restore" in operations[gate_message + 1 : attack_message]
+                    checkpoint = store.load_objective_gate_checkpoint(campaign_id, "baseline")
+                    assert checkpoint is not None
+                    assert checkpoint["checkpoint_handle"]["kind"] == "opaque_reference"
+                else:
+                    assert store.frontier_counts(campaign_id)["claimed"] == 0
+                    assert provider_calls == []
 
 
 @pytest.mark.asyncio

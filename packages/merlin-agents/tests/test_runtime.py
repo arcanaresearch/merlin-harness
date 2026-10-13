@@ -409,6 +409,113 @@ async def test_missing_auxiliary_broker_spec_remains_generic_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_objective_phase_gate_executes_sealed_actions_without_provider_inference() -> None:
+    base = reviewed_handoff(interface="http_api", tools=("target_request",))
+    gate = {
+        "id": "baseline",
+        "ordinal": 0,
+        "objective": "Establish reviewed baseline",
+        "actions": [
+            {"id": "first", "step_id": "message", "input_text": "hello exactly"},
+            {"id": "second", "step_id": "message", "input_text": "continue exactly"},
+        ],
+        "success_predicate": {
+            "observation_name": "stage",
+            "operator": "equals",
+            "expected_values": ["ready"],
+        },
+        "budget": {"max_attempts": 1, "max_target_calls": 2, "max_seconds": 10},
+        "retry_on": ["infrastructure_failure", "ambiguous_transition"],
+        "retain_success": "recipe",
+        "operator_waivable": False,
+    }
+    assignment = replace(
+        base.assignment,
+        id="campaign/00000000-0000-0000-0000-000000000001/objective-gate/0-baseline",
+        strategy_id="objective-phase-gate/v1",
+        strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
+        max_target_exchanges=2,
+    )
+    assert base.worker_context is not None
+    reviewed = replace(
+        base,
+        assignment=assignment,
+        worker_context=replace(base.worker_context, assignment_id=assignment.id),
+    )
+
+    class GateTools(Tools):
+        def __init__(self) -> None:
+            super().__init__(effect="target_network")
+            self.arguments: list[Mapping[str, object]] = []
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="target_request",
+                    description="Target",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert name == "target_request"
+            self.calls.append(name)
+            self.arguments.append(dict(arguments))
+            transition = {
+                "schema": "merlin.target-state-transition.v2",
+                "authority": "target",
+                "identity_match": True,
+                "outcome": "progress",
+                "observations": [
+                    {
+                        "name": "stage",
+                        "before_value": "start",
+                        "after_value": "ready",
+                        "status": "progress",
+                        "validation_errors": [],
+                    }
+                ],
+                "validation_errors": [],
+            }
+            return ToolResult(
+                content="target reply",
+                metadata={
+                    "target_session_id": "api:gate-session",
+                    "attempt_disposition": "valid",
+                    "target_state_transition": transition,
+                    "target_exchanges": [
+                        {
+                            "interaction": True,
+                            "cleanup": False,
+                            "request": dict(arguments),
+                            "response": {"stage": "ready"},
+                        }
+                    ],
+                },
+            )
+
+    provider = Provider([])
+    tools = GateTools()
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert result.status == "completed"
+    assert provider.requests == []
+    assert tools.arguments == [
+        {"input": "hello exactly"},
+        {"input": "continue exactly"},
+    ]
+    assert result.structured == {
+        "gate_id": "baseline",
+        "status": "succeeded",
+        "attempts": 1,
+        "target_calls": 2,
+        "last_transition": None,
+        "blocker": None,
+    }
+    assert len(result.checkpoint["target_evidence"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_unavailable_adaptive_strategy_is_retryable_without_provider_or_target_effect() -> (
     None
 ):
@@ -5154,22 +5261,60 @@ def test_target_receipt_projects_only_target_owned_objective_outcome(
     assert receipt["target_authoritative_outcome"] == outcome
 
 
+def test_target_receipt_seals_canonical_candidate_outcome_projection() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-1", name="target_request", arguments={"prompt": "x"}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [
+                    {
+                        "interaction": True,
+                        "cleanup": False,
+                        "oracle_observations": [
+                            {"purpose": "objective", "authority": "target", "matched": True}
+                        ],
+                    }
+                ],
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-1"]
+    assert receipt["candidate_outcome_projection"] == {
+        "schema": "merlin.candidate-outcome.v1",
+        "candidate_id": "t1",
+        "valid": True,
+        "attempt_disposition": "valid",
+        "outcome_authority": "target",
+        "outcome": "confirmed",
+        "evidence_digest": "sha256:" + receipt["content_sha256"],
+        "terminality": "terminal",
+    }
+
+
 @pytest.mark.parametrize(
-    ("state_outcome", "terminal_outcome"),
+    ("state_outcome", "terminal_outcome", "attempt_disposition"),
     [
-        ("confirmed", "confirmed"),
-        ("refuted", "refuted"),
-        ("progress", None),
-        ("regression", None),
-        ("unclear", None),
+        ("confirmed", "confirmed", "valid"),
+        ("refuted", "refuted", "valid"),
+        ("progress", None, "valid"),
+        ("regression", None, "valid"),
+        ("unclear", None, "uncertain"),
     ],
 )
 def test_target_receipt_projects_reviewed_state_transition_without_model_judgment(
-    state_outcome: str, terminal_outcome: str | None
+    state_outcome: str,
+    terminal_outcome: str | None,
+    attempt_disposition: str,
 ) -> None:
     evidence: dict[str, dict[str, object]] = {}
     transition = {
-        "schema": "merlin.target-state-transition.v1",
+        "schema": "merlin.target-state-transition.v2",
         "authority": "target",
         "identity_match": True,
         "outcome": state_outcome,
@@ -5182,6 +5327,10 @@ def test_target_receipt_projects_reviewed_state_transition_without_model_judgmen
                 "preferred_direction": "increase",
             }
         ],
+        "disposition_rule": "validated_corroborated_observations",
+        "validation_errors": [],
+        "quarantined_observations": [],
+        "corroboration": [],
     }
     WorkerRuntime._record_target_evidence(  # noqa: SLF001
         evidence,
@@ -5199,15 +5348,53 @@ def test_target_receipt_projects_reviewed_state_transition_without_model_judgmen
     )
 
     receipt = evidence["target-call-state"]
-    assert receipt["attempt_disposition"] == "valid"
+    assert receipt["attempt_disposition"] == attempt_disposition
     assert receipt["target_state_transition"] == transition
-    assert receipt["target_authoritative_state_outcome"] == state_outcome
+    if attempt_disposition == "valid":
+        assert receipt["target_authoritative_state_outcome"] == state_outcome
+    else:
+        assert "target_authoritative_state_outcome" not in receipt
     if terminal_outcome is None:
         assert "target_authoritative_outcome" not in receipt
         assert "outcome_authority" not in receipt
     else:
         assert receipt["target_authoritative_outcome"] == terminal_outcome
         assert receipt["outcome_authority"] == "target"
+
+
+def test_quarantined_target_claim_does_not_poison_independent_outcome() -> None:
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-call-mixed-trust", name="target_request", arguments={}),
+        ToolResult(
+            content='{"response":"observed"}',
+            metadata={
+                "target_session_id": "session-1",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "target_state_transition": {
+                    "schema": "merlin.target-state-transition.v2",
+                    "authority": "target",
+                    "identity_match": True,
+                    "outcome": "progress",
+                    "observations": [
+                        {"name": "host_score", "role": "score", "status": "progress"},
+                        {"name": "target_score", "role": "score", "status": "unclear"},
+                    ],
+                    "disposition_rule": "validated_corroborated_observations",
+                    "validation_errors": ["target_score:result:digest_mismatch"],
+                    "quarantined_observations": ["target_score"],
+                    "corroboration": [],
+                },
+            },
+        ),
+    )
+
+    receipt = evidence["target-call-mixed-trust"]
+    assert receipt["attempt_disposition"] == "valid"
+    assert receipt["target_authoritative_state_outcome"] == "progress"
+    assert receipt["target_state_transition"]["quarantined_observations"] == ["target_score"]
 
 
 @pytest.mark.parametrize(

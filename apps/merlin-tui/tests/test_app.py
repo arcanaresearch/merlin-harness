@@ -4582,7 +4582,8 @@ async def test_agent_workspace_panes_unread_transcript_and_failure_are_session_s
         await app.push_screen(app_module.AgentScreen(backend, "session-demo"))
         await pilot.pause()
         screen = app.screen
-        assert len(screen._agents) == 7  # noqa: SLF001
+        assert len(screen._agents) == 8  # noqa: SLF001
+        assert screen._agents[-1].profile == "Campaign Lead"  # noqa: SLF001
         assert len(screen._pane_keys) == 3  # noqa: SLF001
         assert all("PRIVATE" not in view.plain for view in screen.query(app_module.AgentOutputText))
         assert not backend.transcript_calls
@@ -4613,6 +4614,94 @@ async def test_agent_workspace_panes_unread_transcript_and_failure_are_session_s
         await pilot.press("escape")
         assert app.screen is app.screen_stack[0]
         assert not app._exit  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_agent_workspace_renders_lead_journal_and_worker_chat_with_raw_toggle() -> None:
+    class ReadableLogsBackend(DemoBackend):
+        lead_calls = 0
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/readable",
+                    "session-demo",
+                    "Readable assessment",
+                    "exploration",
+                    "executing",
+                    "digest",
+                ),
+            )
+
+        async def list_agents(self):
+            return (
+                AgentView(
+                    name="worker-0",
+                    owner="lead",
+                    task="Test Gertie",
+                    provider="demo",
+                    elapsed="4s",
+                    latest_event="running",
+                    profile="Tier 1 specialist",
+                    assignment_id="assignment-readable",
+                    campaign_id="campaign/readable",
+                    output=(
+                        "assistant: I will send the reviewed handoff prompt.",
+                        'Tool call: {"function":{"name":"browser_click",'
+                        '"arguments":"{\\"element_ref\\":\\"play\\"}"}}',
+                        'tool: {"kind":"snapshot","origin":"http://localhost:3100",'
+                        '"elements":[{},{}]}',
+                    ),
+                ),
+            )
+
+        async def get_campaign_lead_log(self, campaign_id, limit=100):
+            self.lead_calls += 1
+            return (
+                {
+                    "sequence": 7,
+                    "wave": 1,
+                    "created_at": "2026-10-13T09:41:02+00:00",
+                    "payload": {
+                        "kind": "lead_assessment",
+                        "summary": "Reviewed three worker reports; no forced win is proven.",
+                        "actions": [{"kind": "continue"}],
+                        "followups": [{"profile_id": "tier-2"}],
+                        "plan_update": {"rationale": "Escalate from the strongest near miss."},
+                    },
+                },
+            )
+
+    backend = ReadableLogsBackend()
+    app = build_app(backend)
+    async with app.run_test(size=(140, 44)) as pilot:
+        await app.push_screen(app_module.AgentScreen(backend, "session-demo"))
+        await pilot.pause()
+        screen = app.screen
+
+        worker = screen.query_one("#overview-content", app_module.AgentOutputText)
+        assert "╭─ Worker reasoning" in worker.plain
+        assert "Action · browser_click" in worker.plain
+        assert "Target · snapshot" in worker.plain
+        assert '"context_id"' not in worker.plain
+
+        await pilot.press("down")
+        assert screen._selected_agent_key == "campaign-lead::campaign/readable"  # noqa: SLF001
+        lead = screen.query_one("#worker-output-1", app_module.AgentOutputText)
+        assert "Campaign Lead" in lead.plain
+        assert "Lead · 2026-10-13 09:41:02Z · Wave 1" in lead.plain
+        assert "no forced win is proven" in lead.plain
+        assert "Follow-ups dispatched: 1 · tier-2" in lead.plain
+        assert '"payload"' not in lead.plain
+
+        await pilot.press("r")
+        assert '"payload"' in lead.plain
+        await pilot.press("r", "enter")
+        await pilot.pause()
+        lead = screen.query_one("#overview-content", app_module.AgentOutputText)
+        assert backend.lead_calls >= 2
+        assert "Campaign Lead journal" in lead.plain
+        assert "Lead · 2026-10-13 09:41:02Z · Wave 1" in lead.plain
 
 
 @pytest.mark.asyncio
@@ -5814,6 +5903,99 @@ async def test_recovered_review_waits_for_operator_then_executes_exact_binding()
         await app.action_send()
         await pilot.pause()
         assert backend.executions == [("campaign/recovered", "sha256:saved")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["1", "approve", ""])
+async def test_campaign_approval_bypasses_live_model_and_shows_responsive_startup(
+    answer, monkeypatch
+):
+    from textual.widgets import Static
+
+    finish_response = asyncio.Event()
+    finish_startup = asyncio.Event()
+    executing = asyncio.Event()
+    clock = [1000.0]
+    monkeypatch.setattr(app_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    class SlowBackend(DemoBackend):
+        def __init__(self):
+            super().__init__()
+            self.executions = []
+            self.steering = []
+
+        async def stream(self, prompt):
+            yield StreamEvent("campaign_review", json.dumps(_campaign_review_payload()))
+            await finish_response.wait()
+
+        async def steer(self, prompt):
+            self.steering.append(prompt)
+            return True
+
+        async def execute_campaign(self, campaign_id, manifest_digest):
+            self.executions.append((campaign_id, manifest_digest))
+            executing.set()
+            await finish_startup.wait()
+
+    backend = SlowBackend()
+    app = MerlinApp(backend)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#composer").text = "prepare"
+        await app.action_send()
+        await pilot.pause()
+        assert app._stream_task is not None and not app._stream_task.done()
+        app.query_one("#composer").text = answer
+        await pilot.press("enter")
+        await asyncio.wait_for(executing.wait(), timeout=2)
+        await pilot.pause()
+        startup = app.query_one("#campaign-start", Static)
+        first = str(startup.render())
+        assert "Starting campaign" in first
+        assert "Approval received" in first
+        assert startup.region.height > 0
+        await pilot.pause(0.25)
+        assert str(startup.render()) != first
+        clock[0] += 31
+        await pilot.pause(0.15)
+        assert "31s" in str(startup.render())
+        assert "taking longer than expected" in str(startup.render())
+        assert backend.steering == []
+
+        # A repeated Enter must neither steer the model nor execute twice.
+        app.query_one("#composer").text = "1"
+        await pilot.press("enter")
+        await pilot.pause()
+        payload = _campaign_review_payload()
+        assert backend.executions == [(payload["campaign_id"], payload["manifest_digest"])]
+        assert backend.steering == []
+        assert not app.query_one("#composer").disabled
+
+        finish_startup.set()
+        await pilot.pause()
+        assert not app.query("#campaign-start")
+        rendered = " ".join(line.text for line in app.query_one("#transcript").lines)
+        assert "Campaign started:" in rendered
+        finish_response.set()
+
+
+@pytest.mark.asyncio
+async def test_campaign_startup_error_removes_pending_indicator():
+    class FailedBackend(DemoBackend):
+        async def execute_campaign(self, campaign_id, manifest_digest):
+            raise RuntimeError("daemon unavailable")
+
+    app = MerlinApp(FailedBackend())
+    async with app.run_test() as pilot:
+        app._pending_choice_kind = "campaign_review"
+        app._pending_campaign_review = ("campaign/test", "sha256:test")
+        app.query_one("#composer").text = "1"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not app.query("#campaign-start")
+        rendered = " ".join(line.text for line in app.query_one("#transcript").lines)
+        assert "Campaign execution failed: daemon unavailable" in rendered
+        assert "Campaign started:" not in rendered
+        assert app._campaign_start_task.done()
 
 
 @pytest.mark.asyncio

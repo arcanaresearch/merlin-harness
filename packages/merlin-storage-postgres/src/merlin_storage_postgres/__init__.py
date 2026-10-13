@@ -56,6 +56,7 @@ from .scheduler_store import (
     StaleLeaseError,
 )
 from .session_store import PostgresSessionStore
+from .state_scope_store import StateScopeRepository
 from .technique_attempt_store import TechniqueAttemptRepository
 
 __all__ = [
@@ -109,6 +110,7 @@ __all__ = [
     "SessionRepository",
     "ScheduleArtifactTooLarge",
     "StaleLeaseError",
+    "StateScopeRepository",
     "TargetProfileRepository",
     "TechniqueAttemptRepository",
     "TechniqueLanguageEvidenceRepository",

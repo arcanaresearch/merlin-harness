@@ -1,5 +1,7 @@
+import hashlib
 from pathlib import Path
 
+import pytest
 from merlin_assessments import AssessmentService
 from merlin_contracts import (
     ModelCompleted,
@@ -15,6 +17,8 @@ from merlin_contracts.target_adapter_compiler import (
 from merlin_packs import PackCatalog
 from merlin_providers import ProviderConfig, TargetProviderFactory, TargetSessionIdentity
 from merlin_storage_postgres import (
+    CampaignApiSessionRepository,
+    CampaignStore,
     Database,
     DatabaseConfig,
     MigrationRunner,
@@ -36,25 +40,108 @@ class Store:
         return (self.target,)
 
 
+class StateScopeStore:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.envelopes: list[dict[str, object]] = []
+
+    def create_state_scope(self, *_args, **_kwargs):
+        self.events.append("created")
+        self.envelopes.append(dict(_args[2]))
+        return {}
+
+    def claim_state_scope_lease(self, *_args, **_kwargs):
+        self.events.append("claimed")
+        return "claim:test"
+
+    def renew_state_scope_lease(self, *_args, **_kwargs):
+        return True
+
+    def release_state_scope_lease(self, *_args, **_kwargs):
+        self.events.append("released")
+        return True
+
+    def revise_state_scope(self, *_args, **_kwargs):
+        self.events.append("revised")
+        self.envelopes.append(dict(_args[2]))
+        return {}
+
+    def acknowledge_state_scope(self, *_args, **_kwargs):
+        self.events.append("acknowledged")
+        return {}
+
+    def settle_state_scope(self, *_args, **_kwargs):
+        self.events.append("settled")
+        self.envelopes.append(dict(_args[2]))
+        return {}
+
+    def pause_state_scope(self, *_args, **_kwargs):
+        self.events.append("paused")
+        self.envelopes.append(dict(_args[2]))
+        return {}
+
+    def pause_unclaimed_state_scope(self, *_args, **_kwargs):
+        self.events.append("paused_unclaimed")
+        return {}
+
+
+class FailingStateScopeStore(StateScopeStore):
+    def create_state_scope(self, *_args, **_kwargs):
+        self.events.append("create_failed")
+        raise RuntimeError("persistence unavailable")
+
+
 class TargetProvider:
+    def __init__(self, state_scopes: StateScopeStore | None = None) -> None:
+        self._state_scopes = state_scopes
+
     async def stream(self, request):
+        if self._state_scopes is not None:
+            assert self._state_scopes.events[:2] == ["created", "claimed"]
         yield TextDelta(text=f"target replied to: {request.messages[0].content}")
         yield ModelCompleted()
 
 
+class IncompleteTargetProvider:
+    async def stream(self, _request):
+        yield TextDelta(text="partial target reply")
+
+
+class FailingTargetProvider:
+    async def stream(self, _request):
+        if False:
+            yield None
+        raise RuntimeError("transport failed before response")
+
+
 class TargetFactory:
-    def __init__(self) -> None:
+    def __init__(self, state_scopes: StateScopeStore | None = None) -> None:
         self.profiles = []
         self.credential_handles = []
+        self.state_scopes = state_scopes
 
     def create(self, profile, secret_lookup_key=None):
         self.profiles.append(profile)
         self.credential_handles.append(secret_lookup_key)
-        return TargetProvider()
+        return TargetProvider(self.state_scopes)
 
     async def preflight(self, profile):
         self.profiles.append(profile)
         return TargetSessionIdentity(profile.id, "target_handle", True, "user-7", 200)
+
+
+class IncompleteTargetFactory(TargetFactory):
+    def create(self, profile, secret_lookup_key=None):
+        self.profiles.append(profile)
+        self.credential_handles.append(secret_lookup_key)
+        return IncompleteTargetProvider()
+
+
+class FailingTargetFactory(TargetFactory):
+    def create(self, profile, secret_lookup_key=None):
+        self.profiles.append(profile)
+        self.credential_handles.append(secret_lookup_key)
+        return FailingTargetProvider()
 
 
 async def test_resource_risk_campaign_receives_executable_experiment_contracts() -> None:
@@ -305,19 +392,26 @@ async def test_target_tool_routes_to_exact_selected_profile() -> None:
         base_url="https://exact.example/v1",
         model="exact-model",
     )
-    factory = TargetFactory()
+    state_scopes = StateScopeStore()
+    factory = TargetFactory(state_scopes)
     service = AssessmentService(
         catalog=PackCatalog(),
         store=Store(target),  # type: ignore[arg-type]
         attacker=object(),
         attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
         target_factory=factory,  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
     )
     await service.select_target("target-exact")
 
     tool = service.target_tool()
     result = await tool.invoke(
-        ToolContext(session_id="session-1", workspace_root="."),
+        ToolContext(
+            session_id="session-1",
+            workspace_root=".",
+            campaign_id="campaign:target-exact",
+            call_id="call:target-exact",
+        ),
         {"prompt": "hello"},
     )
 
@@ -335,6 +429,142 @@ async def test_target_tool_routes_to_exact_selected_profile() -> None:
         )
     )
     assert factory.profiles[-1] == target
+    assert state_scopes.events == [
+        "created",
+        "claimed",
+        "revised",
+        "acknowledged",
+        "settled",
+        "released",
+    ]
+    settled = state_scopes.envelopes[-1]
+    assert settled["before"] == {
+        "availability": "empty",
+        "evidence_refs": [],
+        "item_count": 0,
+    }
+    assert settled["after"] == {
+        "availability": "empty",
+        "evidence_refs": [],
+        "item_count": 0,
+    }
+    assert settled["responses"]["availability"] == "present"
+    assert settled["responses"]["item_count"] == 2
+
+
+async def test_target_tool_never_delivers_before_state_scope_persists() -> None:
+    target = TargetProfile(
+        id="target-no-scope",
+        title="No Scope",
+        base_url="https://no-scope.example/v1",
+        model="no-scope-model",
+    )
+    state_scopes = FailingStateScopeStore()
+    factory = TargetFactory(state_scopes)
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=factory,  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
+    )
+    await service.select_target(target.id)
+    provider_constructions = len(factory.profiles)
+
+    result = await service.target_tool().invoke(
+        ToolContext(
+            session_id="session-1",
+            workspace_root=".",
+            campaign_id="campaign:no-scope",
+            call_id="call:no-scope",
+        ),
+        {"prompt": "must not be sent"},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "state_scope_unavailable"
+    assert result.metadata["target_effect_attempted"] is False
+    assert result.metadata["target_call_budget_charge"] == 0
+    assert len(factory.profiles) == provider_constructions
+    assert state_scopes.events == ["create_failed"]
+
+
+async def test_target_tool_persists_scope_before_real_postgres_delivery(tmp_path: Path) -> None:
+    target = TargetProfile(
+        id="target-postgres-scope",
+        title="Postgres Scope",
+        base_url="https://postgres-scope.example/v1",
+        model="postgres-scope-model",
+    )
+    factory = TargetFactory()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target chat state scope")
+            campaign_id = "campaign/target-chat-state-scope"
+            CampaignStore(connection).prepare(
+                campaign_id,
+                str(session.id),
+                {"manifest": {}},
+                "sha256:" + "4" * 64,
+            )
+            state_scope_store = CampaignApiSessionRepository(connection)
+            service = AssessmentService(
+                catalog=PackCatalog(),
+                store=Store(target),  # type: ignore[arg-type]
+                attacker=object(),
+                attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+                target_factory=factory,  # type: ignore[arg-type]
+                state_scope_store=state_scope_store,
+            )
+            await service.select_target(target.id)
+
+            result = await service.target_tool().invoke(
+                ToolContext(
+                    session_id=str(session.id),
+                    workspace_root=".",
+                    campaign_id=campaign_id,
+                    call_id="call:postgres-target-chat",
+                ),
+                {"prompt": "hello through a durable scope"},
+            )
+            scope_id = (
+                "state-scope:"
+                + hashlib.sha256(f"{campaign_id}\0call:postgres-target-chat".encode()).hexdigest()
+            )
+            scope = state_scope_store.load_state_scope(scope_id)
+
+    assert result.is_error is False
+    assert scope is not None
+    assert scope["status"] == "settled"
+    assert scope["isolation_disposition"] == "shared_serialized"
+
+
+async def test_legacy_run_pack_never_calls_target_without_prepared_campaign() -> None:
+    target = TargetProfile(
+        id="target-legacy-run",
+        title="Legacy Run",
+        base_url="https://legacy-run.example/v1",
+        model="legacy-run-model",
+    )
+    catalog = PackCatalog()
+    catalog.enable("merlin-injection-taxonomy")
+    factory = TargetFactory()
+    service = AssessmentService(
+        catalog=catalog,
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=TargetProvider(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=factory,  # type: ignore[arg-type]
+    )
+    await service.select_target(target.id)
+    provider_constructions = len(factory.profiles)
+
+    with pytest.raises(RuntimeError, match="prepare, approve, and execute a reviewed campaign"):
+        _ = [item async for item in service.run_pack(None, "session-legacy-run")]
+
+    assert len(factory.profiles) == provider_constructions
 
 
 async def test_worker_target_context_survives_process_selection_loss() -> None:
@@ -344,17 +574,25 @@ async def test_worker_target_context_survives_process_selection_loss() -> None:
         base_url="https://durable.example/v1",
         model="durable-model",
     )
-    factory = TargetFactory()
+    state_scopes = StateScopeStore()
+    factory = TargetFactory(state_scopes)
     service = AssessmentService(
         catalog=PackCatalog(),
         store=Store(target),  # type: ignore[arg-type]
         attacker=object(),
         attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
         target_factory=factory,  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
     )
 
     result = await service.target_tool().invoke(
-        ToolContext(session_id="session-1", workspace_root=".", target_id="target-durable"),
+        ToolContext(
+            session_id="session-1",
+            workspace_root=".",
+            campaign_id="campaign:target-durable",
+            call_id="call:target-durable",
+            target_id="target-durable",
+        ),
         {"prompt": "hello after restart"},
     )
 
@@ -379,13 +617,15 @@ async def test_target_tool_executes_the_canonical_selected_provider_adapter() ->
         base_url="HTTPS://Canonical.Example/v1",
         model="canonical-model",
     )
-    factory = TargetFactory()
+    state_scopes = StateScopeStore()
+    factory = TargetFactory(state_scopes)
     service = AssessmentService(
         catalog=PackCatalog(),
         store=Store(target),  # type: ignore[arg-type]
         attacker=object(),
         attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
         target_factory=factory,  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
     )
     await service.select_target(target.id)
 
@@ -402,6 +642,8 @@ async def test_target_tool_executes_the_canonical_selected_provider_adapter() ->
         ToolContext(
             session_id="session-1",
             workspace_root=".",
+            campaign_id="campaign:target-canonical",
+            call_id="call:target-canonical",
             target_id=target.id,
             compiled_adapter=compilation.model_dump_json(),
             compiled_adapter_digest=compiled_digest,
@@ -416,7 +658,90 @@ async def test_target_tool_executes_the_canonical_selected_provider_adapter() ->
         "target_profile_id": target.id,
         "target_model": target.model,
         "compiled_adapter_digest": compiled_digest,
+        "response_boundary_complete": True,
+        "response_completion_count": 1,
     }
+
+
+async def test_target_tool_rejects_provider_stream_without_completion_boundary() -> None:
+    target = TargetProfile(
+        id="target-incomplete",
+        title="Incomplete",
+        base_url="https://incomplete.example/v1",
+        model="incomplete-model",
+    )
+    state_scopes = StateScopeStore()
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=IncompleteTargetFactory(state_scopes),  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
+    )
+    await service.select_target(target.id)
+
+    result = await service.target_tool().invoke(
+        ToolContext(
+            session_id="session-1",
+            workspace_root=".",
+            campaign_id="campaign:target-incomplete",
+            call_id="call:target-incomplete",
+        ),
+        {"prompt": "hello"},
+    )
+
+    assert result.is_error is True
+    assert result.content == "partial target reply"
+    assert result.metadata["failure_code"] == "incomplete_response_boundary"
+    assert result.metadata["attempt_disposition"] == "infrastructure_failed"
+    assert result.metadata["response_boundary_complete"] is False
+    assert state_scopes.events[-2:] == ["settled", "released"]
+
+
+async def test_target_tool_records_typed_missing_evidence_when_transport_fails() -> None:
+    target = TargetProfile(
+        id="target-transport-failure",
+        title="Transport failure",
+        base_url="https://transport-failure.example/v1",
+        model="transport-failure-model",
+    )
+    state_scopes = StateScopeStore()
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=FailingTargetFactory(state_scopes),  # type: ignore[arg-type]
+        state_scope_store=state_scopes,  # type: ignore[arg-type]
+    )
+    await service.select_target(target.id)
+
+    with pytest.raises(RuntimeError, match="transport failed before response"):
+        await service.target_tool().invoke(
+            ToolContext(
+                session_id="session-1",
+                workspace_root=".",
+                campaign_id="campaign:target-transport-failure",
+                call_id="call:target-transport-failure",
+            ),
+            {"prompt": "hello"},
+        )
+
+    paused = state_scopes.envelopes[-1]
+    assert paused["responses"] == {
+        "availability": "missing",
+        "evidence_refs": [],
+        "item_count": 0,
+        "missing": {"reason": "transport_failed", "retryable": True},
+    }
+    assert paused["after"] == {
+        "availability": "missing",
+        "evidence_refs": [],
+        "item_count": 0,
+        "missing": {"reason": "transport_failed", "retryable": True},
+    }
+    assert state_scopes.events[-2:] == ["paused", "released"]
 
 
 async def test_target_tool_rejects_compiled_adapter_drift_before_target_execution() -> None:

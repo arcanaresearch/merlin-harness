@@ -1,0 +1,706 @@
+{
+  "schema": "merlin.stateful-target-durable-snapshot.v1",
+  "provenance": {
+    "kind": "sanitized_durable_export",
+    "source_format": "postgres_logical_rows_v1",
+    "preserved_fields": [
+      "row_cardinality",
+      "status_relationships",
+      "physical_state_aliasing",
+      "outcome_distribution",
+      "model_context_total",
+      "unique_candidate_count",
+      "physical_state_scope_count",
+      "target_call_count",
+      "quota_consumption",
+      "cross_layer_outcomes",
+      "terminal_producing_layer",
+      "unfinished_frontier_cause"
+    ],
+    "sanitized_fields": [
+      "identifiers",
+      "digests",
+      "timestamps"
+    ],
+    "removed_fields": [
+      "target",
+      "prompt",
+      "request_body",
+      "response_body",
+      "credentials"
+    ],
+    "normalized_fields": [
+      "latency_ms",
+      "cost_usd_micros"
+    ],
+    "export_digest": "sha256:437654592cf34525007f3ce964a331cdaa340376c62bbabb763b8459cecdfa67"
+  },
+  "fixture_budget": {
+    "max_model_turns": 6,
+    "max_total_tokens": 1048576,
+    "max_latency_ms": 650000,
+    "max_cost_usd_micros": 1200000,
+    "minimum_accepted_attempts_per_minute": 8.0,
+    "max_target_calls": 20,
+    "max_elapsed_ms": 130000,
+    "minimum_unique_valid_attempts": 3
+  },
+  "durable_export": {
+    "campaigns": [
+      {
+        "id": "campaign/sanitized-regression",
+        "status": "running",
+        "elapsed_ms": 120000
+      }
+    ],
+    "campaign_waves": [
+      {
+        "id": "wave/sanitized-01",
+        "campaign_id": "campaign/sanitized-regression",
+        "status": "running"
+      }
+    ],
+    "scheduler_runs": [
+      {
+        "id": "scheduler/sanitized-01",
+        "campaign_id": "campaign/sanitized-regression",
+        "status": "completed"
+      }
+    ],
+    "frontier_batches": [
+      {
+        "id": "batch/sanitized-01",
+        "status": "completed",
+        "candidate_count": 16
+      },
+      {
+        "id": "batch/sanitized-02",
+        "status": "queued",
+        "candidate_count": 16
+      }
+    ],
+    "technique_attempts": [
+      {
+        "id": "attempt/sanitized-01",
+        "candidate_id": "candidate/sanitized-01",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "valid",
+        "outcome": "refuted",
+        "worker_claim": "confirmed"
+      },
+      {
+        "id": "attempt/sanitized-02",
+        "candidate_id": "candidate/sanitized-02",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "valid",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-03",
+        "candidate_id": "candidate/sanitized-03",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-04",
+        "candidate_id": "candidate/sanitized-04",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-05",
+        "candidate_id": "candidate/sanitized-05",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-06",
+        "candidate_id": "candidate/sanitized-06",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-07",
+        "candidate_id": "candidate/sanitized-07",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-08",
+        "candidate_id": "candidate/sanitized-08",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-09",
+        "candidate_id": "candidate/sanitized-09",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-10",
+        "candidate_id": "candidate/sanitized-10",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "refuted",
+        "worker_claim": "refuted"
+      },
+      {
+        "id": "attempt/sanitized-11",
+        "candidate_id": "candidate/sanitized-11",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "blocked",
+        "worker_claim": "blocked"
+      },
+      {
+        "id": "attempt/sanitized-12",
+        "candidate_id": "candidate/sanitized-12",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "blocked",
+        "worker_claim": "blocked"
+      },
+      {
+        "id": "attempt/sanitized-13",
+        "candidate_id": "candidate/sanitized-13",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "unclear",
+        "worker_claim": "unclear"
+      },
+      {
+        "id": "attempt/sanitized-14",
+        "candidate_id": "candidate/sanitized-14",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "accepted",
+        "attempt_disposition": "contaminated",
+        "outcome": "unclear",
+        "worker_claim": "unclear"
+      },
+      {
+        "id": "attempt/sanitized-15",
+        "candidate_id": "candidate/sanitized-15",
+        "physical_state_digest": "sha256:physical-1",
+        "delivery_status": "rejected",
+        "attempt_disposition": "contaminated",
+        "outcome": "unclear",
+        "worker_claim": "unclear"
+      },
+      {
+        "id": "attempt/sanitized-16",
+        "candidate_id": "candidate/sanitized-16",
+        "physical_state_digest": "sha256:physical-2",
+        "delivery_status": "rejected",
+        "attempt_disposition": "contaminated",
+        "outcome": "unclear",
+        "worker_claim": "unclear"
+      }
+    ],
+    "state_transitions": [
+      {
+        "attempt_id": "attempt/sanitized-01",
+        "identity_match": true,
+        "target_outcome": "progress",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "confirmed"
+      },
+      {
+        "attempt_id": "attempt/sanitized-02",
+        "identity_match": true,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-03",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-04",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-05",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-06",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-07",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-08",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-09",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-10",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "refuted"
+      },
+      {
+        "attempt_id": "attempt/sanitized-11",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "blocked"
+      },
+      {
+        "attempt_id": "attempt/sanitized-12",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "blocked"
+      },
+      {
+        "attempt_id": "attempt/sanitized-13",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "unclear"
+      },
+      {
+        "attempt_id": "attempt/sanitized-14",
+        "identity_match": false,
+        "target_outcome": "regression",
+        "host_outcome": "regression",
+        "terminal": false,
+        "authoritative_outcome": "unclear"
+      }
+    ],
+    "target_exchanges": [
+      {
+        "id": "exchange/sanitized-01",
+        "attempt_id": "attempt/sanitized-01",
+        "status_code": 200,
+        "response_message_count": 3,
+        "request_digest": "sha256:request-01",
+        "response_digest": "sha256:response-01"
+      },
+      {
+        "id": "exchange/sanitized-02",
+        "attempt_id": "attempt/sanitized-02",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-02",
+        "response_digest": "sha256:response-02"
+      },
+      {
+        "id": "exchange/sanitized-03",
+        "attempt_id": "attempt/sanitized-03",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-03",
+        "response_digest": "sha256:response-03"
+      },
+      {
+        "id": "exchange/sanitized-04",
+        "attempt_id": "attempt/sanitized-04",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-04",
+        "response_digest": "sha256:response-04"
+      },
+      {
+        "id": "exchange/sanitized-05",
+        "attempt_id": "attempt/sanitized-05",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-05",
+        "response_digest": "sha256:response-05"
+      },
+      {
+        "id": "exchange/sanitized-06",
+        "attempt_id": "attempt/sanitized-06",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-06",
+        "response_digest": "sha256:response-06"
+      },
+      {
+        "id": "exchange/sanitized-07",
+        "attempt_id": "attempt/sanitized-07",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-07",
+        "response_digest": "sha256:response-07"
+      },
+      {
+        "id": "exchange/sanitized-08",
+        "attempt_id": "attempt/sanitized-08",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-08",
+        "response_digest": "sha256:response-08"
+      },
+      {
+        "id": "exchange/sanitized-09",
+        "attempt_id": "attempt/sanitized-09",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-09",
+        "response_digest": "sha256:response-09"
+      },
+      {
+        "id": "exchange/sanitized-10",
+        "attempt_id": "attempt/sanitized-10",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-10",
+        "response_digest": "sha256:response-10"
+      },
+      {
+        "id": "exchange/sanitized-11",
+        "attempt_id": "attempt/sanitized-11",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-11",
+        "response_digest": "sha256:response-11"
+      },
+      {
+        "id": "exchange/sanitized-12",
+        "attempt_id": "attempt/sanitized-12",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-12",
+        "response_digest": "sha256:response-12"
+      },
+      {
+        "id": "exchange/sanitized-13",
+        "attempt_id": "attempt/sanitized-13",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-13",
+        "response_digest": "sha256:response-13"
+      },
+      {
+        "id": "exchange/sanitized-14",
+        "attempt_id": "attempt/sanitized-14",
+        "status_code": 200,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-14",
+        "response_digest": "sha256:response-14"
+      },
+      {
+        "id": "exchange/sanitized-15",
+        "attempt_id": "attempt/sanitized-15",
+        "status_code": 429,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-15",
+        "response_digest": "sha256:response-15"
+      },
+      {
+        "id": "exchange/sanitized-16",
+        "attempt_id": "attempt/sanitized-16",
+        "status_code": 429,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-16",
+        "response_digest": "sha256:response-16"
+      },
+      {
+        "id": "exchange/sanitized-17",
+        "attempt_id": "attempt/sanitized-16",
+        "status_code": 429,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-17",
+        "response_digest": "sha256:response-17"
+      },
+      {
+        "id": "exchange/sanitized-18",
+        "attempt_id": "attempt/sanitized-16",
+        "status_code": 429,
+        "response_message_count": 1,
+        "request_digest": "sha256:request-18",
+        "response_digest": "sha256:response-18"
+      }
+    ],
+    "resource_events": [
+      {
+        "id": "resource-event/sanitized-01",
+        "resource_kind": "quota",
+        "result": "rejected"
+      },
+      {
+        "id": "resource-event/sanitized-02",
+        "resource_kind": "quota",
+        "result": "rejected"
+      },
+      {
+        "id": "resource-event/sanitized-03",
+        "resource_kind": "quota",
+        "result": "rejected"
+      },
+      {
+        "id": "resource-event/sanitized-04",
+        "resource_kind": "quota",
+        "result": "rejected"
+      },
+      {
+        "id": "resource-event/sanitized-05",
+        "resource_kind": "quota",
+        "result": "consumed",
+        "units": 14
+      }
+    ],
+    "model_calls": [
+      {
+        "id": "model-call/sanitized-01",
+        "role": "lead_composition",
+        "input_tokens": 220000,
+        "output_tokens": 20,
+        "latency_ms": 120000,
+        "cost_usd_micros": 200000,
+        "result": "context_limit"
+      },
+      {
+        "id": "model-call/sanitized-02",
+        "role": "lead_composition",
+        "input_tokens": 220000,
+        "output_tokens": 20,
+        "latency_ms": 120000,
+        "cost_usd_micros": 200000,
+        "result": "context_limit"
+      },
+      {
+        "id": "model-call/sanitized-03",
+        "role": "lead_composition",
+        "input_tokens": 220000,
+        "output_tokens": 20,
+        "latency_ms": 120000,
+        "cost_usd_micros": 200000,
+        "result": "context_limit"
+      },
+      {
+        "id": "model-call/sanitized-04",
+        "role": "lead_composition",
+        "input_tokens": 220000,
+        "output_tokens": 20,
+        "latency_ms": 120000,
+        "cost_usd_micros": 200000,
+        "result": "context_limit"
+      },
+      {
+        "id": "model-call/sanitized-05",
+        "role": "lead_composition",
+        "input_tokens": 207603,
+        "output_tokens": 20,
+        "latency_ms": 120000,
+        "cost_usd_micros": 200000,
+        "result": "context_limit"
+      }
+    ],
+    "state_scopes": [
+      {
+        "id": "scope/sanitized-01",
+        "physical_state_digest": "sha256:physical-1"
+      },
+      {
+        "id": "scope/sanitized-02",
+        "physical_state_digest": "sha256:physical-2"
+      }
+    ],
+    "frontier_outcomes": [
+      {
+        "candidate_id": "candidate/sanitized-01",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-02",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-03",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-04",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-05",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-06",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-07",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-08",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-09",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-10",
+        "outcome": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-11",
+        "outcome": "blocked"
+      },
+      {
+        "candidate_id": "candidate/sanitized-12",
+        "outcome": "blocked"
+      },
+      {
+        "candidate_id": "candidate/sanitized-13",
+        "outcome": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-14",
+        "outcome": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-15",
+        "outcome": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-16",
+        "outcome": "unclear"
+      }
+    ],
+    "findings": [
+      {
+        "candidate_id": "candidate/sanitized-01",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-02",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-03",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-04",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-05",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-06",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-07",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-08",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-09",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-10",
+        "status": "refuted"
+      },
+      {
+        "candidate_id": "candidate/sanitized-11",
+        "status": "blocked"
+      },
+      {
+        "candidate_id": "candidate/sanitized-12",
+        "status": "blocked"
+      },
+      {
+        "candidate_id": "candidate/sanitized-13",
+        "status": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-14",
+        "status": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-15",
+        "status": "unclear"
+      },
+      {
+        "candidate_id": "candidate/sanitized-16",
+        "status": "unclear"
+      }
+    ]
+  }
+}

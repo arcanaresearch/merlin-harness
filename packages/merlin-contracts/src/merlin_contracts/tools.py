@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -56,6 +56,12 @@ class ToolContext(BaseModel):
     planned_language: str = "und"
     requested_language: str = "und"
     requested_transform_id: str = "baseline"
+    objective_phase_gate_id: str | None = None
+    objective_phase_gate_recipe_digest: str | None = None
+    objective_phase_manifest_digest: str | None = None
+    objective_phase_checkpoint_intent: Literal["capture", "restore"] | None = None
+    objective_phase_checkpoint_reference: dict[str, object] | None = None
+    objective_phase_gate_contract: dict[str, object] | None = None
 
 
 class ToolResult(BaseModel):

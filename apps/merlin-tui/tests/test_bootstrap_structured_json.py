@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from merlin_contracts import (
     ChatMessage,
+    GeneratorExecutionContract,
     ModelCompleted,
     ModelJsonError,
     ModelUsage,
@@ -155,3 +157,82 @@ async def test_structured_json_retries_wrong_shape_then_reports_typed_exhaustion
 
     assert len(provider.requests) == 2
     assert all(request.max_output_tokens == 16_384 for request in provider.requests)
+
+
+@pytest.mark.asyncio
+async def test_structured_json_contract_cancels_and_closes_provider_at_deadline() -> None:
+    class DeadlineProvider(_Provider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.closed = asyncio.Event()
+            self.continued = False
+
+        async def stream(self, request):
+            self.requests.append(request)
+            try:
+                yield TextDelta(text="[")
+                await asyncio.sleep(1)
+                self.continued = True
+                yield TextDelta(text="]")
+            finally:
+                self.closed.set()
+
+    provider = DeadlineProvider()
+    contract = GeneratorExecutionContract(
+        generator_id="bounded-regeneration",
+        max_outputs=1,
+        max_output_bytes=1024,
+        max_seconds=0.01,
+    )
+    with pytest.raises(TimeoutError):
+        await _request_structured_json(
+            provider=provider,
+            capability_registry=_Capabilities(8_192),
+            selected_model="deepseek-v4-flash",
+            messages=(ChatMessage(role="user", content="Return an array."),),
+            expected_container="array",
+            max_attempts=1,
+            execution_contract=contract,
+        )
+
+    assert provider.closed.is_set()
+    assert provider.continued is False
+
+
+@pytest.mark.asyncio
+async def test_structured_json_contract_stops_consuming_after_byte_cap() -> None:
+    class ByteProvider(_Provider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.emitted = 0
+            self.closed = False
+
+        async def stream(self, request):
+            self.requests.append(request)
+            try:
+                for chunk in ("12345", "6", "unread"):
+                    self.emitted += 1
+                    yield TextDelta(text=chunk)
+            finally:
+                self.closed = True
+
+    provider = ByteProvider()
+    contract = GeneratorExecutionContract(
+        generator_id="bounded-regeneration",
+        max_outputs=1,
+        max_output_bytes=5,
+        max_seconds=1.0,
+    )
+    with pytest.raises(ValueError, match="max_output_bytes"):
+        await _request_structured_json(
+            provider=provider,
+            capability_registry=_Capabilities(8_192),
+            selected_model="deepseek-v4-flash",
+            messages=(ChatMessage(role="user", content="Return an array."),),
+            expected_container="array",
+            max_attempts=1,
+            execution_contract=contract,
+        )
+
+    assert provider.emitted == 2
+    assert provider.closed is True

@@ -189,7 +189,11 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
             assert outcome["hypothesis_id"] == hypothesis.id
             assert outcome["latency_ms"] == 217
             assert float(outcome["model_cost_usd"]) == 0.0042
-            assert outcome["usage"] == {
+            assert {
+                key: value
+                for key, value in outcome["usage"].items()
+                if key != "candidate_outcome_projection"
+            } == {
                 "input_tokens": 120,
                 "output_tokens": 35,
                 "evaluation_uncertainties": [
@@ -200,6 +204,7 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
                     }
                 ],
             }
+            assert outcome["usage"]["candidate_outcome_projection"]["candidate_id"] == arm["id"]
             store.record_arm_observation(
                 {
                     "campaign_id": "campaign-1",
@@ -410,7 +415,12 @@ def test_pg0_arm_observation_materializes_missing_arm_from_sealed_contract(
                    FROM merlin_storage.campaign_arm_outcomes"""
             ).fetchone()
             assert float(outcome["model_cost_usd"]) == 0.001
-            assert outcome["usage"] == {"input_tokens": 100, "output_tokens": 25}
+            assert {
+                key: value
+                for key, value in outcome["usage"].items()
+                if key != "candidate_outcome_projection"
+            } == {"input_tokens": 100, "output_tokens": 25}
+            assert outcome["usage"]["candidate_outcome_projection"]["candidate_id"] == arm["id"]
 
 
 def test_pg0_arm_observation_without_sealed_contract_keeps_key_error(
@@ -440,3 +450,74 @@ def test_pg0_arm_observation_without_sealed_contract_keeps_key_error(
             store = CampaignArmStore(connection)
             with pytest.raises(KeyError):
                 store.record_arm_observation(_observation(_arm(), attempt_id))
+
+
+def test_pg0_arm_observation_preserves_and_guards_canonical_settlement(
+    tmp_path: Path,
+) -> None:
+    import pytest
+    from merlin_contracts import candidate_id_for_identity, project_candidate_outcome
+
+    canonical_identity = {
+        "campaign_id": "campaign-1",
+        "target_id": "target-1",
+        "target_generation": "generation-1",
+        "scenario_fingerprint": "sha256:scenario-one",
+        "technique_id": "technique/one",
+        "controller_id": "direct",
+        "payload_family": "baseline",
+        "requested_language": "en",
+        "mutation_id": "mutation/none",
+    }
+    projection = project_candidate_outcome(
+        candidate_id=candidate_id_for_identity(canonical_identity),
+        attempt_disposition="valid",
+        outcome_authority="target",
+        outcome="refuted",
+        evidence_digest="a" * 64,
+    )
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create()
+            CampaignStore(connection).prepare("campaign-1", session.id, {}, "digest")
+            attempt_id = str(uuid4())
+            TechniqueAttemptRepository(connection).begin(
+                TechniqueAttempt(
+                    id=attempt_id,
+                    campaign_id="campaign-1",
+                    wave=1,
+                    task_id="generated-arm",
+                    technique_id="technique/one",
+                    strategy_id="direct",
+                    language="en",
+                    control_kind="attack",
+                    oracle_digest="sha256:" + "b" * 64,
+                )
+            )
+            store = CampaignArmStore(connection)
+            arm = _arm()
+            store.record_arm(arm)
+            observation = {
+                **_observation(arm, attempt_id),
+                "attempt_disposition": "valid",
+                "outcome_authority": "target",
+                "canonical_candidate_identity": canonical_identity,
+                "candidate_outcome_projection": projection,
+            }
+            store.record_arm_observation(observation)
+            persisted = connection.execute(
+                "SELECT usage FROM merlin_storage.campaign_arm_outcomes"
+            ).fetchone()
+            assert persisted["usage"]["candidate_outcome_projection"] == projection
+
+            with pytest.raises(ValueError, match="candidate id conflicts"):
+                store.record_arm_observation(
+                    {
+                        **observation,
+                        "candidate_outcome_projection": {
+                            **projection,
+                            "candidate_id": "candidate/drifted",
+                        },
+                    }
+                )

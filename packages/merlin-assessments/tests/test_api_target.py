@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,11 +24,13 @@ from merlin_assessments.api_target import (
     _infrastructure_failure_category,
     _ResponsePointerMissing,
     _reviewed_session_scope_id,
+    _StateScopeLease,
     _structured_constraint_rejection_observations,
     _target_parallel_capacity,
     _target_state_transition,
     _TargetCleanupUnverified,
 )
+from merlin_config import ConfigPaths, CredentialCheckpointVault
 from merlin_contracts import (
     InfrastructureFailureCategory,
     ToolContext,
@@ -299,6 +302,168 @@ def _sealed_context(campaign_id: str, adapter: dict[str, object]) -> ToolContext
 
 
 @pytest.mark.asyncio
+async def test_shared_principal_quota_blocks_campaigns_until_one_post_restart_resume(
+    tmp_path: Path,
+) -> None:
+    """Exercise constraint, block, reset, and restart through the public target tool."""
+
+    first_campaign = "campaign/shared-quota-a"
+    second_campaign = "campaign/shared-quota-b"
+    postgres_dir = tmp_path / "postgres-shared-quota"
+    async with StatefulTargetFixtureServer(
+        maximum_parallel_states=2,
+        interaction_quota=3,
+        input_limit=5,
+    ) as target:
+        adapter = target.adapter()
+        with Database(DatabaseConfig(data_dir=postgres_dir)) as database:
+            with database.connect() as connection:
+                MigrationRunner(connection).apply()
+                sessions = _prepare(connection, first_campaign)
+                _prepare(connection, second_campaign)
+
+                def context(campaign_id: str, call_id: str) -> ToolContext:
+                    return _sealed_context(campaign_id, adapter).model_copy(
+                        update={"call_id": call_id}
+                    )
+
+                async with httpx.AsyncClient() as client:
+                    tool = ReviewedApiTargetTool(
+                        sessions,
+                        lambda _: adapter,
+                        {},
+                        checkpoint_vault=CredentialCheckpointVault(
+                            ConfigPaths(tmp_path / "shared-quota-credentials")
+                        ),
+                        client=client,
+                    )
+                    first = await tool.invoke(context(first_campaign, "seed-a"), {"input": "one"})
+                    second = await tool.invoke(context(second_campaign, "seed-b"), {"input": "two"})
+                    assert first.is_error is False, first.model_dump(mode="json")
+                    assert second.is_error is False, second.model_dump(mode="json")
+
+                    calls_before_oversize = target.metrics().requests
+                    oversized = await tool.invoke(
+                        context(second_campaign, "oversized"),
+                        {"input": "sixxxx"},
+                    )
+                    assert oversized.is_error is True
+                    assert oversized.metadata["failure_code"] == "request_constraint_violation"
+                    assert oversized.metadata["target_effect_attempted"] is False
+                    assert target.metrics().requests == calls_before_oversize
+
+                    first_state = sessions.load(
+                        first_campaign,
+                        target_id="target-refund",
+                        session_scope_id=f"{first_campaign}/injection",
+                    )
+                    assert first_state is not None
+                    lease_id = first_state.variables["lease_id"]
+                    assert isinstance(lease_id, str)
+                    # Exhaust the target-side window independently so the next
+                    # public tool call observes the authoritative structured 429.
+                    for message in ("x", "y"):
+                        response = await client.post(
+                            target.origin + "/api/message",
+                            json={"leaseId": lease_id, "message": message},
+                        )
+                        assert response.status_code == 200
+
+                    authoritative_block = await tool.invoke(
+                        context(first_campaign, "quota-signal"),
+                        {"input": "three"},
+                    )
+                    assert authoritative_block.is_error is True, authoritative_block.model_dump(
+                        mode="json"
+                    )
+                    assert "failure_code" in authoritative_block.metadata, (
+                        authoritative_block.model_dump(mode="json")
+                    )
+                    assert authoritative_block.metadata["failure_code"] == "target_resource_blocked"
+                    assert authoritative_block.metadata["target_effect_attempted"] is True
+                    assert (
+                        authoritative_block.metadata["resource_block_evidence"]["status_code"]
+                        == 429
+                    )
+
+                    calls_after_block = target.metrics().requests
+                    blocked_a = await tool.invoke(
+                        context(first_campaign, "blocked-a"), {"input": "four"}
+                    )
+                    blocked_b = await tool.invoke(
+                        context(second_campaign, "blocked-b"), {"input": "five"}
+                    )
+                    for blocked in (blocked_a, blocked_b):
+                        assert blocked.is_error is True
+                        assert blocked.metadata["failure_code"] == "target_resource_blocked"
+                        assert blocked.metadata["target_effect_attempted"] is False
+                    assert target.metrics().requests == calls_after_block
+
+                    resource = connection.execute(
+                        """SELECT target_authority, principal_key, resource_kind, window_key
+                           FROM merlin_storage.principal_resources"""
+                    ).fetchone()
+                    assert resource is not None
+                    connection.execute(
+                        """UPDATE merlin_storage.principal_resources
+                           SET capacity = 1, wake_at = %s
+                           WHERE target_authority = %s AND principal_key = %s
+                             AND resource_kind = %s AND window_key = %s""",
+                        (
+                            datetime.now(UTC) - timedelta(seconds=1),
+                            resource["target_authority"],
+                            resource["principal_key"],
+                            resource["resource_kind"],
+                            resource["window_key"],
+                        ),
+                    )
+                    connection.commit()
+
+                    restarted = ReviewedApiTargetTool(
+                        CampaignApiSessionRepository(connection),
+                        lambda _: adapter,
+                        {},
+                        checkpoint_vault=CredentialCheckpointVault(
+                            ConfigPaths(tmp_path / "shared-quota-credentials")
+                        ),
+                        client=client,
+                    )
+                    resumed = await restarted.invoke(
+                        context(second_campaign, "resumed"), {"input": "again"}
+                    )
+                    blocked_after_resume = await restarted.invoke(
+                        context(first_campaign, "post-resume"), {"input": "later"}
+                    )
+                    resource_after_resume = connection.execute(
+                        """SELECT capacity, consumed, state, generation
+                           FROM merlin_storage.principal_resources
+                           WHERE target_authority = %s AND principal_key = %s
+                             AND resource_kind = %s AND window_key = %s""",
+                        (
+                            resource["target_authority"],
+                            resource["principal_key"],
+                            resource["resource_kind"],
+                            resource["window_key"],
+                        ),
+                    ).fetchone()
+
+        final_metrics = target.metrics()
+
+    assert resumed.is_error is False
+    assert blocked_after_resume.is_error is True
+    assert blocked_after_resume.metadata["failure_code"] == "target_resource_blocked"
+    assert blocked_after_resume.metadata["target_effect_attempted"] is False
+    assert resource_after_resume is not None
+    assert dict(resource_after_resume) == {
+        "capacity": 1,
+        "consumed": 1,
+        "state": "exhausted",
+        "generation": 2,
+    }
+    assert final_metrics.requests == calls_after_block + 1
+
+
+@pytest.mark.asyncio
 async def test_structured_runtime_limit_regenerates_child_for_next_batch(
     tmp_path: Path,
 ) -> None:
@@ -553,11 +718,11 @@ async def test_reviewed_api_tool_reuses_one_session_and_runs_idempotent_cleanup(
                 "message",
             ]
             assert first.metadata["current_target_exchanges"] == first.metadata["target_exchanges"]
-            assert first.metadata["target_exchanges"][1]["request"] == {
-                "sessionId": "session-42",
-                "userMessage": "first",
-            }
-            assert first.metadata["target_exchanges"][1]["response"] == "seen:first"
+            assert first.metadata["target_exchanges"][1]["request_summary"]["fields"] == [
+                "sessionId",
+                "userMessage",
+            ]
+            assert first.metadata["target_exchanges"][1]["response_summary"]["kind"] == "str"
             assert [
                 (row["interaction"], row["cleanup"]) for row in first.metadata["target_exchanges"]
             ] == [(False, False), (True, False)]
@@ -994,7 +1159,7 @@ async def test_reviewed_api_tool_does_not_treat_generic_resumed_field_as_lifecyc
 
     assert result.is_error is False
     assert json.loads(result.content) == "ordinary domain response"
-    assert result.metadata["remote_target_session_id"] == "ordinary-session"
+    assert result.metadata["remote_target_session"]["kind"] == "opaque_reference"
     assert result.metadata["target_session_id"] != "ordinary-session"
     assert calls == ["start", "message", "abandon"]
 
@@ -1066,9 +1231,9 @@ async def test_reviewed_recon_owned_resumed_session_is_attacked_then_cleaned(
         item.get("source") == "api_target.fresh_setup_isolation"
         for item in resumed.metadata["evaluation_uncertainties"]
     )
-    assert resumed.metadata["remote_target_session_id"] == reviewed_session_id
+    assert resumed.metadata["remote_target_session"]["kind"] == "opaque_reference"
     assert again.is_error is False
-    assert again.metadata["remote_target_session_id"] == reviewed_session_id
+    assert again.metadata["remote_target_session"] == resumed.metadata["remote_target_session"]
     assert calls == [
         ("start", reviewed_session_id),
         ("message", reviewed_session_id),
@@ -1170,8 +1335,8 @@ async def test_reviewed_api_tool_exposes_all_selected_text_siblings(
     assert result.is_error is False
     assert json.loads(result.content) == expected
     exchange = result.metadata["current_target_exchanges"][-1]
-    assert exchange["response"] == expected
-    assert exchange["response_body"] == response_body
+    assert exchange["response_summary"]["kind"] in {"array", "str"}
+    assert exchange["response_body_summary"]["kind"] in {"array", "object"}
 
 
 @pytest.mark.asyncio
@@ -1220,11 +1385,11 @@ async def test_reviewed_api_tool_preserves_actual_http_500_in_target_exchange(
     )
     assert interaction["status_code"] == 500
     assert interaction["outcome"] == "target_delivery_rejected"
-    assert interaction["response_body"] == {
-        "error": "Internal Server Error",
-        "message": "deepseek_empty_content",
-        "statusCode": 500,
-    }
+    assert interaction["response_body_summary"]["fields"] == [
+        "error",
+        "message",
+        "statusCode",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1607,8 +1772,8 @@ async def test_reviewed_api_tool_preserves_interaction_response_after_selector_m
     assert "pointer_miss_session_rotations" not in result.metadata
     assert result.metadata["target_session_generation"] == 1
     exchange = result.metadata["target_exchanges"][-1]
-    assert exchange["response"] == response
-    assert exchange["response_body"] == response
+    assert exchange["response_summary"]["kind"] == "object"
+    assert exchange["response_body_summary"]["fields"] == ["gameStatus", "riskScore"]
     assert exchange["outcome"] == "evaluation_uncertain"
     assert calls == ["start", "message", "abandon"]
 
@@ -1811,10 +1976,7 @@ async def test_reviewed_api_tool_preserves_applied_terminal_response_on_http_4xx
     interaction = result.metadata["current_target_exchanges"][-1]
     assert interaction["status_code"] == 409
     assert interaction["outcome"] == "target_delivery_rejected"
-    assert interaction["response_body"] == {
-        "reply": "final target reply",
-        "gameStatus": "won",
-    }
+    assert interaction["response_body_summary"]["fields"] == ["gameStatus", "reply"]
 
 
 @pytest.mark.asyncio
@@ -1871,9 +2033,7 @@ async def test_reviewed_api_tool_rotates_for_exact_declared_terminal_error(
     assert result.metadata["failure_code"] == "target_delivery_rejected"
     assert result.metadata["target_exchanges"][-1]["status_code"] == 400
     assert result.metadata["target_exchanges"][-1]["outcome"] == "target_delivery_rejected"
-    assert result.metadata["target_exchanges"][-1]["response_body"] == {
-        "error": "Game already ended"
-    }
+    assert result.metadata["target_exchanges"][-1]["response_body_summary"]["fields"] == ["error"]
     assert starts == 1
     assert messages == 1
 
@@ -2367,10 +2527,7 @@ async def test_reviewed_api_tool_preserves_interaction_on_expected_status_mismat
     exchange = result.metadata["target_exchanges"][-1]
     assert exchange["status_code"] == 409
     assert exchange["expected_status"] == 200
-    assert exchange["response_body"] == {
-        "reply": "target rejected the premise",
-        "reason": "policy",
-    }
+    assert exchange["response_body_summary"]["fields"] == ["reason", "reply"]
     assert exchange["outcome"] == "target_delivery_rejected"
 
 
@@ -2424,7 +2581,7 @@ async def test_reviewed_api_tool_records_uncertain_oracle_metadata_without_block
     )
     exchange = result.metadata["target_exchanges"][-1]
     assert exchange["outcome"] == "evaluation_uncertain"
-    assert exchange["response_body"] == {"reply": "target response preserved"}
+    assert exchange["response_body_summary"]["fields"] == ["reply"]
 
 
 @pytest.mark.asyncio
@@ -2458,7 +2615,7 @@ async def test_reviewed_api_tool_preserves_setup_response_when_status_metadata_d
     assert setup["status_code"] == 201
     assert setup["expected_status"] == 200
     assert setup["outcome"] == "evaluation_uncertain"
-    assert setup["response_body"] == {"sessionId": "session-created"}
+    assert setup["response_body_summary"]["fields"] == ["sessionId"]
 
 
 @pytest.mark.asyncio
@@ -2680,8 +2837,8 @@ async def test_browser_context_invalid_json_marks_interaction_ambiguous(
     exchange = result.metadata["current_target_exchanges"][-1]
     assert exchange["id"] == "message"
     assert exchange["status_code"] == status_code
-    assert exchange["response"] == body
-    assert exchange["response_body"] == body
+    assert exchange["response_summary"]["kind"] == "str"
+    assert exchange["response_body_summary"]["kind"] == "str"
     assert exchange["outcome"] == "target_delivery_rejected"
     assert restored is not None
     assert restored.state == "active"
@@ -2823,8 +2980,8 @@ async def test_reviewed_api_tool_preserves_plain_text_http_failure_before_select
     exchange = result.metadata["current_target_exchanges"][0]
     assert exchange["id"] == "start"
     assert exchange["status_code"] == 503
-    assert exchange["response"] == "<html>temporarily unavailable</html>"
-    assert exchange["response_body"] == "<html>temporarily unavailable</html>"
+    assert exchange["response_summary"]["kind"] == "str"
+    assert exchange["response_body_summary"]["kind"] == "str"
 
 
 @pytest.mark.asyncio
@@ -2854,8 +3011,8 @@ async def test_reviewed_api_tool_preserves_invalid_utf8_http_failure_before_sele
     exchange = result.metadata["current_target_exchanges"][0]
     assert exchange["id"] == "start"
     assert exchange["status_code"] == 502
-    assert exchange["response"] == "��\x00"
-    assert exchange["response_body"] == "��\x00"
+    assert exchange["response_summary"]["kind"] == "str"
+    assert exchange["response_body_summary"]["kind"] == "str"
 
 
 @pytest.mark.asyncio
@@ -2887,7 +3044,7 @@ async def test_reviewed_api_tool_classifies_non_2xx_before_required_capture(
     assert result.metadata["failure_code"] == "target_delivery_rejected"
     exchange = result.metadata["current_target_exchanges"][-1]
     assert exchange["status_code"] == 422
-    assert exchange["response_body"] == {"error": "request rejected"}
+    assert exchange["response_body_summary"]["fields"] == ["error"]
     assert exchange["outcome"] == "target_delivery_rejected"
 
 
@@ -3502,6 +3659,10 @@ async def test_reviewed_state_contract_emits_attributable_authoritative_transiti
                     "pointer": "/run/score",
                 },
                 "preferred_direction": "increase",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "monotonicity": "nondecreasing",
+                "trust_class": "host_observed",
             }
         ],
         "freshness_rules": [
@@ -3555,6 +3716,9 @@ async def test_reviewed_state_contract_emits_attributable_authoritative_transiti
                     sessions,
                     lambda _campaign_id: adapter,
                     {"target-token": "opaque-secret"},
+                    checkpoint_vault=CredentialCheckpointVault(
+                        ConfigPaths(tmp_path / "state-transition-credentials")
+                    ),
                     client=client,
                 )
                 result = await tool.invoke(
@@ -3573,7 +3737,7 @@ async def test_reviewed_state_contract_emits_attributable_authoritative_transiti
     assert result.is_error is False
     assert result.metadata["attempt_disposition"] == "valid"
     assert result.metadata["state_identity_match"] is True
-    assert result.metadata["physical_state_identity"]["selected_value"] == "physical-run"
+    assert result.metadata["physical_state_identity"]["kind"] == "keyed_digest"
     transition = result.metadata["target_state_transition"]
     assert transition["authority"] == "target"
     assert transition["outcome"] == "progress"
@@ -3587,8 +3751,12 @@ async def test_reviewed_state_contract_emits_attributable_authoritative_transiti
             "before_value": 10,
             "after_value": 25,
             "preferred_direction": "increase",
+            "monotonicity": "nondecreasing",
+            "minimum_value": 0,
+            "trust_class": "host_observed",
             "baseline_binding_digest": transition["observations"][0]["baseline_binding_digest"],
             "result_binding_digest": transition["observations"][0]["result_binding_digest"],
+            "validation_errors": [],
         }
     ]
     assert aliased_result.is_error is True
@@ -3609,8 +3777,46 @@ def test_target_parallel_capacity_enforces_caps_and_reset_is_not_concurrent_isol
                 SimpleNamespace(), lambda _campaign_id: capped, {}
             )._adapter("campaign", "target-refund")
         )
-        == 3
+        == 1
     )  # noqa: SLF001
+
+    independently_capped = _adapter()
+    independently_capped["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/fresh",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "maximum_parallel_states": 3,
+    }
+    independent_adapter = ReviewedApiTargetTool(
+        SimpleNamespace(), lambda _campaign_id: independently_capped, {}
+    )._adapter("campaign", "target-refund")  # noqa: SLF001
+    assert _target_parallel_capacity(independent_adapter) == 3
 
     reset_only = _adapter()
     reset_only["state_capabilities"] = {
@@ -3626,6 +3832,278 @@ def test_target_parallel_capacity_enforces_caps_and_reset_is_not_concurrent_isol
         SimpleNamespace(), lambda _campaign_id: reset_only, {}
     )._adapter("campaign", "target-refund")  # noqa: SLF001
     assert _target_parallel_capacity(reset_adapter) == 1
+
+    rotating_identity = _adapter()
+    rotating_identity["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/fresh",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+    }
+    rotating_adapter = ReviewedApiTargetTool(
+        SimpleNamespace(), lambda _campaign_id: rotating_identity, {}
+    )._adapter("campaign", "target-refund")  # noqa: SLF001
+    assert _target_parallel_capacity(rotating_adapter) == 1
+
+    legacy_adapter = ReviewedApiTargetTool(
+        SimpleNamespace(), lambda _campaign_id: _adapter(), {}
+    )._adapter("campaign", "target-refund")  # noqa: SLF001
+    assert _target_parallel_capacity(legacy_adapter) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_isolation_proof_never_falls_back_to_shared_delivery(tmp_path: Path) -> None:
+    adapter = _adapter()
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/fresh",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "maximum_parallel_states": 1,
+    }
+    interaction_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interaction_calls
+        if request.url.path.endswith("/start"):
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": "shared-session",
+                    "run": {"id": "shared-state", "fresh": False},
+                },
+            )
+        interaction_calls += 1
+        return httpx.Response(
+            200,
+            json={"reply": "must not be delivered", "run": {"id": "shared-state"}},
+        )
+
+    campaign_id = "campaign/no-isolated-fallback"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(_sealed_context(campaign_id, adapter), {"input": "candidate"})
+
+    assert result.is_error is True
+    assert result.metadata["attempt_disposition"] == "contaminated"
+    assert result.metadata["retryable"] is True
+    assert result.metadata["limit_interaction_count"] == 0
+    assert interaction_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_state_is_globally_serialized_across_campaign_target_aliases(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    setup_calls = 0
+    interaction_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal setup_calls, interaction_calls
+        if request.url.path.endswith("/start"):
+            setup_calls += 1
+            return httpx.Response(200, json={"sessionId": f"session-{setup_calls}"})
+        interaction_calls += 1
+        first_entered.set()
+        await release_first.wait()
+        return httpx.Response(200, json={"reply": "observed"})
+
+    first_campaign = "campaign/global-state-scope-a"
+    second_campaign = "campaign/global-state-scope-b"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-global-scope")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, first_campaign)
+            _prepare(connection, second_campaign)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                first_context = _sealed_context(first_campaign, adapter).model_copy(
+                    update={"target_id": "target-alias-a"}
+                )
+                second_context = _sealed_context(second_campaign, adapter).model_copy(
+                    update={"target_id": "target-alias-b"}
+                )
+                first_task = asyncio.create_task(tool.invoke(first_context, {"input": "first"}))
+                await asyncio.wait_for(first_entered.wait(), timeout=5)
+                second = await tool.invoke(second_context, {"input": "second"})
+                release_first.set()
+                first = await asyncio.wait_for(first_task, timeout=5)
+            scope_rows = connection.execute(
+                "SELECT status FROM merlin_storage.state_scopes ORDER BY campaign_id"
+            ).fetchall()
+
+    assert first.is_error is False
+    assert second.is_error is True
+    assert second.metadata["attempt_disposition"] == "infrastructure_failed"
+    assert second.metadata["acknowledged_capability_evidence"] is False
+    assert second.metadata["limit_interaction_count"] == 0
+    assert setup_calls == 1
+    assert interaction_calls == 1
+    assert [str(row["status"]) for row in scope_rows] == ["settled", "paused"]
+
+
+@pytest.mark.asyncio
+async def test_reviewed_physical_identity_is_globally_leased_across_target_aliases(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "freshness_rules": [
+            {
+                "selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/fresh",
+                },
+                "match_values": [True],
+            }
+        ],
+        "affordances": [
+            {
+                "kind": "provision_fresh_state",
+                "step_id": "start",
+                "evaluation_root": "response_body",
+            }
+        ],
+        "maximum_parallel_states": 2,
+    }
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    setup_calls = 0
+    interaction_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal setup_calls, interaction_calls
+        if request.url.path.endswith("/start"):
+            setup_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "sessionId": f"logical-{setup_calls}",
+                    "run": {"id": "aliased-physical-state", "fresh": True},
+                },
+            )
+        interaction_calls += 1
+        first_entered.set()
+        await release_first.wait()
+        return httpx.Response(
+            200,
+            json={"reply": "observed", "run": {"id": "aliased-physical-state"}},
+        )
+
+    first_campaign = "campaign/global-physical-state-a"
+    second_campaign = "campaign/global-physical-state-b"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-global-physical")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, first_campaign)
+            _prepare(connection, second_campaign)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    checkpoint_vault=CredentialCheckpointVault(
+                        ConfigPaths(tmp_path / "global-physical-credentials")
+                    ),
+                    client=client,
+                )
+                first_context = _sealed_context(first_campaign, adapter).model_copy(
+                    update={"target_id": "target-alias-a"}
+                )
+                second_context = _sealed_context(second_campaign, adapter).model_copy(
+                    update={"target_id": "target-alias-b"}
+                )
+                first_task = asyncio.create_task(tool.invoke(first_context, {"input": "first"}))
+                await asyncio.wait_for(first_entered.wait(), timeout=5)
+                second = await tool.invoke(second_context, {"input": "second"})
+                release_first.set()
+                first = await asyncio.wait_for(first_task, timeout=5)
+
+    assert first.is_error is False
+    assert second.is_error is True
+    assert second.metadata["acknowledged_capability_evidence"] is False
+    assert second.metadata["limit_interaction_count"] == 0
+    assert setup_calls == 2
+    assert interaction_calls == 1
 
 
 def test_target_state_transition_keeps_conflicting_or_missing_identity_unclear() -> None:
@@ -3790,6 +4268,10 @@ async def test_serial_reviewed_reset_allows_learning_eligible_physical_state_reu
                     "pointer": "/run/score",
                 },
                 "preferred_direction": "increase",
+                "value_type": "integer",
+                "minimum_value": 0,
+                "monotonicity": "nondecreasing",
+                "trust_class": "host_observed",
             }
         ],
         "freshness_rules": [
@@ -3853,6 +4335,9 @@ async def test_serial_reviewed_reset_allows_learning_eligible_physical_state_reu
                     sessions,
                     lambda _campaign_id: adapter,
                     {"target-token": "opaque-secret"},
+                    checkpoint_vault=CredentialCheckpointVault(
+                        ConfigPaths(tmp_path / "serial-reuse-credentials")
+                    ),
                     client=client,
                 )
                 first = await tool.invoke(_sealed_context(campaign_id, adapter), {"input": "first"})
@@ -3892,3 +4377,176 @@ async def test_target_execution_renewal_failure_cancels_the_owner() -> None:
     task = asyncio.create_task(owner())
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_state_scope_renewal_failure_cancels_the_owner() -> None:
+    sessions = SimpleNamespace(
+        renew_target_execution=lambda *_args: True,
+        renew_state_scope_lease=lambda *_args: False,
+    )
+    tool = ReviewedApiTargetTool(sessions, lambda _campaign_id: None, {})
+    state_scope_lease = _StateScopeLease(
+        claimant_id="claimant-id",
+        lease_seconds=1,
+        lifecycle=SimpleNamespace(),  # type: ignore[arg-type]
+        claim_id="state-scope-claim",
+        equivalence_key="conservative-shared-state",
+    )
+
+    async def owner() -> None:
+        await tool._renew_target_execution_lease(  # noqa: SLF001
+            "target-claim",
+            "claimant-id",
+            1,
+            asyncio.current_task(),
+            state_scope_lease,
+        )
+        await asyncio.sleep(0)
+
+    task = asyncio.create_task(owner())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_objective_checkpoint_capture_and_restore_stay_inside_fenced_tool_path(
+    tmp_path: Path,
+) -> None:
+    identity_vault = CredentialCheckpointVault(ConfigPaths(tmp_path / "identity-credentials"))
+
+    class VaultEntry:
+        digest = "a" * 64
+
+        def opaque_reference(self) -> dict[str, str]:
+            return {
+                "kind": "opaque_reference",
+                "namespace": "state",
+                "reference_id": "checkpoint-test-entry",
+            }
+
+    class Vault:
+        secret: str | None = None
+
+        def store_checkpoint(
+            self,
+            checkpoint_secret: str,
+            *,
+            campaign_id: str,
+            gate_id: str,
+        ) -> VaultEntry:
+            assert campaign_id == "campaign/objective-checkpoint"
+            assert gate_id == "reach-stage-two"
+            self.secret = checkpoint_secret
+            return VaultEntry()
+
+        def resolve_checkpoint(self, reference_id: str) -> str:
+            assert reference_id == "checkpoint-test-entry"
+            assert self.secret is not None
+            return self.secret
+
+        def digest_identity(self, value: object, *, purpose: str) -> dict[str, str]:
+            return identity_vault.digest_identity(value, purpose=purpose)
+
+    campaign_id = "campaign/objective-checkpoint"
+    recipe_digest = "sha256:" + "1" * 64
+    manifest_digest = "sha256:reviewed"
+    vault = Vault()
+    async with StatefulTargetFixtureServer(
+        state_mode="checkpoint",
+        maximum_parallel_states=1,
+    ) as target:
+        adapter = target.adapter()
+        capabilities = adapter["state_capabilities"]
+        assert isinstance(capabilities, dict)
+        checkpoint_contract = capabilities["checkpoint"]
+        assert isinstance(checkpoint_contract, dict)
+        checkpoint_contract.update(
+            {
+                "capture_selector": {
+                    "step_id": "interaction",
+                    "evaluation_root": "response_body",
+                    "pointer": "/leaseId",
+                },
+                "capture_timing": "post_success_response",
+            }
+        )
+        identity = capabilities["identity"]
+        assert isinstance(identity, dict)
+        baseline = identity["baseline_selector"]
+        assert isinstance(baseline, dict)
+        baseline["step_id"] = "start"
+        for observation in capabilities["observations"]:
+            assert isinstance(observation, dict)
+            selector = observation["baseline_selector"]
+            assert isinstance(selector, dict)
+            selector["step_id"] = "start"
+        with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+            with database.connect() as connection:
+                MigrationRunner(connection).apply()
+                sessions = _prepare(connection, campaign_id)
+                checkpoints = CampaignStore(connection)
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {},
+                    checkpoint_store=checkpoints,
+                    checkpoint_vault=vault,
+                )
+                capture_context = _sealed_context(campaign_id, adapter).model_copy(
+                    update={
+                        "objective_phase_gate_id": "reach-stage-two",
+                        "objective_phase_gate_recipe_digest": recipe_digest,
+                        "objective_phase_manifest_digest": manifest_digest,
+                        "objective_phase_checkpoint_intent": "capture",
+                        "objective_phase_gate_contract": {
+                            "id": "reach-stage-two",
+                            "retain_success": "checkpoint",
+                            "success_predicate": {
+                                "observation_name": "host_score",
+                                "operator": "increases",
+                                "expected_values": [],
+                            },
+                        },
+                    }
+                )
+                captured = await tool.invoke(capture_context, {"input": "advance"})
+                receipt = captured.metadata["objective_phase_checkpoint"]
+                assert isinstance(receipt, dict)
+                reference = receipt["checkpoint_reference"]
+                assert isinstance(reference, dict)
+                assert (
+                    checkpoints.load_objective_gate_checkpoint(campaign_id, "reach-stage-two")
+                    is not None
+                )
+
+                restored = await tool.invoke(
+                    _sealed_context(campaign_id, adapter).model_copy(
+                        update={
+                            "agent_id": f"{campaign_id}/candidate-after-gate",
+                            "call_id": "call-after-gate",
+                            "objective_phase_gate_id": "reach-stage-two",
+                            "objective_phase_gate_recipe_digest": recipe_digest,
+                            "objective_phase_manifest_digest": manifest_digest,
+                            "objective_phase_checkpoint_intent": "restore",
+                            "objective_phase_checkpoint_reference": reference,
+                        }
+                    ),
+                    {"input": "continue"},
+                )
+
+    assert captured.is_error is False
+    assert restored.is_error is False
+    assert restored.metadata["objective_phase_checkpoint"]["restored"] is True
+    assert vault.secret is not None
+    assert vault.secret not in json.dumps(captured.model_dump(mode="json"), sort_keys=True)
+    assert vault.secret not in json.dumps(restored.model_dump(mode="json"), sort_keys=True)
+    restore_exchange = next(
+        item for item in restored.metadata["current_target_exchanges"] if item["id"] == "restore"
+    )
+    assert restore_exchange["request_summary"]["fields"] == ["leaseId"]
+    assert restore_exchange["response_body_summary"]["fields"] == [
+        "hostState",
+        "restored",
+        "state",
+    ]
