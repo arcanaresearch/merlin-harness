@@ -570,6 +570,41 @@ def test_event_mapping_preserves_stream_and_failures() -> None:
     assert event_to_stream(app_event("message", role="assistant", text="token")) is None
 
 
+@pytest.mark.parametrize(
+    ("state", "text", "result_label"),
+    [
+        ("started", "", None),
+        ("completed", "done", "Result: done"),
+        ("failed", "denied", "Error: denied"),
+        ("interrupted", "stopped", "Error: stopped"),
+    ],
+)
+def test_shell_events_show_the_reviewed_command_and_working_directory(
+    state: str, text: str, result_label: str | None
+) -> None:
+    event = event_to_stream(
+        app_event(
+            "tool",
+            name="shell_command",
+            state=state,
+            text=text,
+            invocation={
+                "command": "rg -n TODO packages",
+                "working_directory": "/workspace/project",
+            },
+        )
+    )
+
+    assert event is not None
+    assert event.kind == "tool"
+    assert event.text.startswith("shell_command " + state + ": rg -n TODO packages")
+    assert "Working directory: /workspace/project" in event.text
+    if result_label is None:
+        assert "Result:" not in event.text and "Error:" not in event.text
+    else:
+        assert result_label in event.text
+
+
 def test_event_mapping_renders_durable_agent_identifiers() -> None:
     progress = event_to_stream(
         app_event(

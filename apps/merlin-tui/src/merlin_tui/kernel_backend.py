@@ -1675,6 +1675,21 @@ def event_to_stream(event: AppEvent) -> StreamEvent | None:
                 prepared = None
             if isinstance(prepared, Mapping) and isinstance(prepared.get("review"), Mapping):
                 return StreamEvent("campaign_review", text)
+        invocation = payload.get("invocation")
+        if isinstance(invocation, Mapping):
+            command = invocation.get("command")
+            working_directory = invocation.get("working_directory")
+            heading = f"{name} {state}"
+            if isinstance(command, str) and command:
+                heading += f": {command}"
+            lines = [heading]
+            if isinstance(working_directory, str) and working_directory:
+                lines.append(f"  Working directory: {working_directory}")
+            if text:
+                label = "Error" if state in {"failed", "interrupted"} else "Result"
+                lines.append(f"  {label}: {text}")
+            kind = "skill" if name == "skill_load" else "tool"
+            return StreamEvent(kind, "\n".join(lines))
         detail = f": {text}" if text else ""
         kind = "skill" if name == "skill_load" else "tool"
         return StreamEvent(kind, f"{name} {state}{detail}")

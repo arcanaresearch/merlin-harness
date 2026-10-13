@@ -29,6 +29,7 @@ from merlin_kernel.kernel import (
     _automatic_recon_continuation,
     _KernelJevClient,
     _restored_automatic_recon,
+    _safe_shell_invocation,
 )
 
 
@@ -1062,6 +1063,32 @@ async def test_interruption_closes_dynamic_tool_call() -> None:
     assert "interrupted" in tool_results[0].content
 
 
+def test_shell_invocation_preview_is_exact_terminal_safe_and_redacted(tmp_path) -> None:
+    preview = _safe_shell_invocation(
+        "shell_command",
+        {
+            "argv": [
+                "curl",
+                "--header",
+                "Authorization: Bearer secret-token",
+                "--token",
+                "top-secret",
+                "https://user:password@example.test/a\nsecond-line",
+            ],
+            "cwd": "scripts",
+        },
+        tmp_path,
+    )
+
+    invocation = preview["invocation"]
+    assert isinstance(invocation, dict)
+    assert invocation["command"] == (
+        "curl --header 'Authorization: [redacted]' --token '[redacted]' "
+        "'https://user:[redacted]@example.test/a\\nsecond-line'"
+    )
+    assert invocation["working_directory"] == str(tmp_path / "scripts")
+
+
 @pytest.mark.asyncio
 async def test_restart_closes_orphaned_tool_call_once_before_provider_replay() -> None:
     class CapturingProvider:
@@ -1260,6 +1287,20 @@ async def test_truncated_tool_call_retries_exact_tool_without_reasoning() -> Non
     assert provider.requests[2].reasoning is None
     assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["shell_command"]
     assert tools.calls == [("shell_command", {"argv": ["python3", "-c", "print('ok')"]})]
+    shell_events = [
+        event
+        for event in store.events
+        if event.type == "tool" and event.payload.get("name") == "shell_command"
+    ]
+    assert [event.payload["state"] for event in shell_events] == ["started", "completed"]
+    assert all(
+        event.payload["invocation"]
+        == {
+            "command": "python3 -c 'print('\"'\"'ok'\"'\"')'",
+            "working_directory": kernel._workspace_root,
+        }
+        for event in shell_events
+    )
 
 
 @pytest.mark.asyncio

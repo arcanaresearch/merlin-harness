@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import time
 import urllib.error
 import urllib.request
@@ -105,6 +106,82 @@ _AUTOMATIC_RECON_CONTINUATION_FIELDS = frozenset(
         "allowed_tools",
     }
 )
+
+_SENSITIVE_SHELL_OPTION = re.compile(
+    r"(?i)--?(?:api[-_]?key|access[-_]?key|password|passwd|secret|token|"
+    r"authorization|cookie|credential|private[-_]?key)"
+)
+
+
+def _safe_shell_invocation(
+    tool_name: str,
+    arguments: Mapping[str, object],
+    workspace_root: str | Path,
+) -> dict[str, object]:
+    """Build a redacted, terminal-safe shell preview for persisted UI events."""
+    if tool_name != "shell_command":
+        return {}
+    argv = arguments.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        command = "[invalid argv]"
+    else:
+        safe_argv: list[str] = []
+        hide_next = False
+        for item in argv:
+            if hide_next:
+                safe_item = "[redacted]"
+                hide_next = False
+            else:
+                safe_item = re.sub(
+                    r"(?i)^(authorization|cookie|x-api-key)\s*:.*$",
+                    r"\1: [redacted]",
+                    item,
+                )
+                safe_item = re.sub(
+                    r"(?i)^((?:--?)?(?:api[-_]?key|access[-_]?key|password|passwd|"
+                    r"secret|token|authorization|cookie|credential|private[-_]?key)=).*$",
+                    r"\1[redacted]",
+                    safe_item,
+                )
+                safe_item = re.sub(
+                    r"(?i)\b(api[-_ ]?key|access[-_ ]?key|password|passwd|secret|token|"
+                    r"authorization|cookie|credential)\b(\s*[:=]\s*)"
+                    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+                    r"\1\2[redacted]",
+                    safe_item,
+                )
+                safe_item = re.sub(
+                    r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", safe_item
+                )
+                safe_item = re.sub(
+                    r"(://[^:/\s]+:)[^@/\s]+(@)", r"\1[redacted]\2", safe_item
+                )
+                hide_next = bool(_SENSITIVE_SHELL_OPTION.fullmatch(item))
+            safe_argv.append(safe_item)
+        command = shlex.join(safe_argv)
+    command = re.sub(
+        r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]",
+        lambda match: json.dumps(match[0], ensure_ascii=True)[1:-1],
+        command,
+    )
+
+    cwd = arguments.get("cwd", ".")
+    try:
+        if not isinstance(cwd, str) or Path(cwd).is_absolute():
+            raise ValueError("cwd must be relative to the workspace")
+        root = Path(workspace_root).resolve(strict=True)
+        directory = (root / cwd).resolve(strict=False)
+        if not directory.is_relative_to(root):
+            raise ValueError("cwd must be inside the workspace")
+        working_directory = str(directory)
+    except (OSError, RuntimeError, ValueError) as error:
+        working_directory = f"invalid ({error})"
+    return {
+        "invocation": {
+            "command": command,
+            "working_directory": working_directory,
+        }
+    }
 
 
 def _validated_automatic_recon_continuation(
@@ -1002,7 +1079,12 @@ class Kernel:
                             ],
                         ),
                     )
-                    await self._emit(self._event("tool", name=call.name, state="started"))
+                    invocation = _safe_shell_invocation(
+                        call.name, call.arguments, self._workspace_root
+                    )
+                    await self._emit(
+                        self._event("tool", name=call.name, state="started", **invocation)
+                    )
                     owned_cleanup_key = (
                         str(automatic_recon_continuation.get("progress_key"))
                         if automatic_recon_continuation is not None
@@ -1057,6 +1139,7 @@ class Kernel:
                                 name=call.name,
                                 text="tool call interrupted before completion",
                                 state="interrupted",
+                                **invocation,
                             )
                         )
                         raise
@@ -1104,6 +1187,7 @@ class Kernel:
                             name=call.name,
                             text=result.content,
                             state="failed" if result.is_error else "completed",
+                            **invocation,
                             **_campaign_review_event_payload(call.name, result),
                             **failure_event_payload(failure_category),
                         )
@@ -1703,7 +1787,12 @@ class Kernel:
             ),
         )
         for position, event in enumerate(events):
-            await self._emit(self._event("tool", name=event.name, state="started"))
+            invocation = _safe_shell_invocation(
+                event.name, event.arguments, self._workspace_root
+            )
+            await self._emit(
+                self._event("tool", name=event.name, state="started", **invocation)
+            )
             context = ToolContext(
                 session_id=session_id,
                 workspace_root=self._workspace_root,
@@ -1731,6 +1820,9 @@ class Kernel:
                     result = await self._tools.invoke(event.name, context, event.arguments)
             except asyncio.CancelledError:
                 for interrupted in events[position:]:
+                    interrupted_invocation = _safe_shell_invocation(
+                        interrupted.name, interrupted.arguments, self._workspace_root
+                    )
                     await self._append_tool_terminal(
                         session_id,
                         name=interrupted.name,
@@ -1743,6 +1835,7 @@ class Kernel:
                             name=interrupted.name,
                             text="tool call interrupted before completion",
                             state="interrupted",
+                            **interrupted_invocation,
                         )
                     )
                 raise
@@ -1784,6 +1877,7 @@ class Kernel:
                     name=event.name,
                     text=result.content,
                     state="failed" if result.is_error else "completed",
+                    **invocation,
                     **_campaign_review_event_payload(event.name, result),
                     **failure_event_payload(failure_category),
                 )
