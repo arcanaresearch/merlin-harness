@@ -224,7 +224,6 @@ class AssessmentService:
         profile = await self._store.get_target(target_id)
         if profile is None:
             raise ValueError(f"unknown target {target_id!r}")
-        self._target_factory.create(profile)
         self._selected_target_id = target_id
         return profile.model_dump(mode="json") | {"selected": True}
 
@@ -496,10 +495,8 @@ class AssessmentService:
                 target for target in targets if target.base_url in objective
             )
             if len(matches) == 1:
-                self._target_factory.create(matches[0])
                 self._selected_target_id = matches[0].id
             elif len(targets) == 1 and _target_from_objective(objective) is None:
-                self._target_factory.create(targets[0])
                 self._selected_target_id = targets[0].id
             else:
                 raise ValueError(

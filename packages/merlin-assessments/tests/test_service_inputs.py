@@ -236,6 +236,50 @@ async def test_agent_inputs_bind_selected_target_and_enabled_pack_cases() -> Non
     )
 
 
+async def test_select_target_does_not_require_an_execution_credential() -> None:
+    target = TargetProfile(
+        id="web-local",
+        title="Local browser target",
+        base_url="http://localhost:3100/",
+        model="web-chat",
+    )
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=TargetProviderFactory({}),
+    )
+
+    selected = await service.select_target(target.id)
+
+    assert selected == target.model_dump(mode="json") | {"selected": True}
+    assert service.selected_target_id == target.id
+    with pytest.raises(ValueError, match="credential 'target_web-local' is not configured"):
+        await service.preflight_target()
+
+
+async def test_resolve_configured_target_does_not_require_an_execution_credential() -> None:
+    target = TargetProfile(
+        id="web-local",
+        title="Local browser target",
+        base_url="http://localhost:3100/",
+        model="web-chat",
+    )
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=TargetProviderFactory({}),
+    )
+
+    resolved = await service.resolve_target("continue the assessment for web-local")
+
+    assert resolved == target.model_dump(mode="json") | {"selected": True}
+    assert service.selected_target_id == target.id
+
+
 async def test_campaign_inputs_keep_all_comparison_differences_advisory() -> None:
     target = TargetProfile(
         id="target-advisory-comparison",
