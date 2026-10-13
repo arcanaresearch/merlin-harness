@@ -1257,6 +1257,7 @@ async def test_truncated_tool_call_retries_exact_tool_without_reasoning() -> Non
 
     assert len(provider.requests) == 3
     assert provider.requests[1].reasoning == "disabled"
+    assert provider.requests[2].reasoning == "disabled"
     assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["shell_command"]
     assert tools.calls == [("shell_command", {"argv": ["python3", "-c", "print('ok')"]})]
 
@@ -1985,6 +1986,7 @@ async def test_successful_malformed_tool_repair_restores_all_tools_next_request(
         "shell_command",
         "browser_snapshot",
     ]
+    assert provider.requests[2].reasoning == "disabled"
     assert all(
         "Call only `shell_command`" not in message.content
         for message in provider.requests[2].messages
