@@ -411,7 +411,7 @@ class KernelBackend:
                             "not be restored. Type: show the saved campaign review "
                             f"for {campaign.id}. Do not approve until it is displayed.",
                         )
-            resumed = await self._resume_paused_session_campaigns(values[1])
+            resumed, resume_failures = await self._resume_paused_session_campaigns(values[1])
             if resumed:
                 yield StreamEvent(
                     kind="status",
@@ -419,6 +419,11 @@ class KernelBackend:
                         f"Resumed {resumed} paused campaign"
                         f"{'s' if resumed != 1 else ''} from durable checkpoints."
                     ),
+                )
+            for campaign_id, error in resume_failures:
+                yield StreamEvent(
+                    kind="status",
+                    text=f"Could not resume {campaign_id}: {error}",
                 )
 
         if prompt.strip().startswith("/resume ") and hasattr(self.kernel, "_store"):
@@ -573,19 +578,24 @@ class KernelBackend:
         """Orderly owner shutdown: interrupt work and close every owned resource."""
         await self.close()
 
-    async def _resume_paused_session_campaigns(self, session_id: str) -> int:
+    async def _resume_paused_session_campaigns(
+        self, session_id: str
+    ) -> tuple[int, tuple[tuple[str, str], ...]]:
         if self._campaigns is None:
-            return 0
+            return 0, ()
         resumed = 0
+        failures: list[tuple[str, str]] = []
         for row in await self._campaigns.list_all():
             if str(row["session_id"]) != session_id or str(row["status"]) != "paused":
                 continue
+            campaign_id = str(row["campaign_id"])
             try:
-                await self._campaigns.resume(str(row["campaign_id"]))
-            except ValueError:
+                await self._campaigns.resume(campaign_id)
+            except (RuntimeError, ValueError) as error:
+                failures.append((campaign_id, str(error)))
                 continue
             resumed += 1
-        return resumed
+        return resumed, tuple(failures)
 
     async def detach(self) -> None:
         """Stop this daemon process without changing durable campaign state."""

@@ -14816,6 +14816,73 @@ async def test_campaign_resume_after_failed_terminal_wave_restarts_at_lead_bound
     await service.detach()
 
 
+async def test_campaign_resume_reconciles_running_wave_with_terminal_scheduler() -> None:
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.row = None
+            self.journal = []
+
+        def prepare(self, campaign_id, session_id, manifest, digest):
+            self.row = {
+                "id": campaign_id,
+                "session_id": session_id,
+                "manifest": manifest,
+                "manifest_digest": digest,
+                "status": "prepared",
+            }
+            return self.row
+
+        def get(self, _campaign_id):
+            return self.row
+
+        def list_waves(self, _campaign_id):
+            return [{"wave": 5, "status": "running", "schedule_id": "schedule-5"}]
+
+        def resume(self, _campaign_id):
+            self.row["status"] = "executing"
+            return self.row
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            self.journal.append(payload)
+
+    class RecoveryAgents:
+        async def schedule_status(self, schedule_id):
+            assert schedule_id == "schedule-5"
+            return "completed"
+
+        async def resume_schedule(self, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("a terminal scheduler must enter reconciliation")
+
+    class RecoveryService(CampaignService):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.recovery_calls = 0
+
+        async def recover(self, *, resume_execution=True):
+            assert resume_execution is True
+            self.recovery_calls += 1
+            return 1
+
+    store = RecoveryStore()
+    service = RecoveryService(store, RecoveryAgents(), preparation)  # type: ignore[arg-type]
+    review = await service.prepare("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    campaign_id = str(review["campaign_id"])
+    store.row["status"] = "paused"
+
+    assert await service.resume(campaign_id) == {
+        "campaign_id": campaign_id,
+        "status": "executing",
+    }
+    assert store.row["status"] == "executing"
+    assert service.recovery_calls == 1
+    assert store.journal[-1] == {
+        "state": "executing",
+        "reason": "operator-terminal-scheduler-continuation",
+        "schedule_id": "schedule-5",
+        "schedule_status": "completed",
+    }
+
+
 async def test_campaign_resume_retries_failed_incomplete_coverage_from_latest_wave() -> None:
     class RetryStore:
         def __init__(self) -> None:

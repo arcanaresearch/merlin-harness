@@ -15857,6 +15857,43 @@ class CampaignService:
             completed = [wave for wave in waves if str(wave["status"]) == "completed"]
             boundary_reason = "operator-campaign-resume-lead-boundary"
             terminal = [wave for wave in waves if str(wave["status"]) in {"completed", "failed"}]
+            if waves and str(waves[-1]["status"]) == "running":
+                # A daemon can stop after the scheduler commits its terminal
+                # state but before campaign supervision settles the matching
+                # wave.  Session recovery deliberately pauses the campaign,
+                # leaving this durable mixed state.  Re-enter normal recovery
+                # so it can settle the receipts and claim the next frontier
+                # batch instead of rejecting the resume as having no paused
+                # wave.
+                latest = waves[-1]
+                status_loader = getattr(self._agents, "schedule_status", None)
+                schedule_status = (
+                    await status_loader(str(latest["schedule_id"]))
+                    if callable(status_loader)
+                    else None
+                )
+                if schedule_status not in {"completed", "failed", "cancelled"}:
+                    raise ValueError(
+                        "paused campaign has a running wave without a terminal scheduler"
+                    )
+                await asyncio.to_thread(self._store.resume, campaign_id)
+                await self._stop_supervisor(campaign_id)
+                if await self.recover() < 1:
+                    raise RuntimeError(
+                        "terminal scheduler continuation could not reclaim campaign ownership"
+                    )
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    int(latest["wave"]),
+                    {
+                        "state": "executing",
+                        "reason": "operator-terminal-scheduler-continuation",
+                        "schedule_id": str(latest["schedule_id"]),
+                        "schedule_status": schedule_status,
+                    },
+                )
+                return {"campaign_id": campaign_id, "status": "executing"}
             if waves and str(waves[-1]["status"]) == "failed":
                 # Paused after the last wave terminalized failed (for example
                 # repeated Lead decision rejections at the wave boundary): the

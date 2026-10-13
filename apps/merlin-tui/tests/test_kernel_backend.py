@@ -261,6 +261,45 @@ async def test_resume_restores_only_paused_campaigns_owned_by_selected_session()
 
 
 @pytest.mark.asyncio
+async def test_resume_reports_campaign_reconciliation_failure() -> None:
+    class Campaigns:
+        async def recover(self, *, resume_execution=True) -> None:
+            return None
+
+        async def list_all(self):
+            return (
+                {
+                    "objective": "Saved assessment",
+                    "profile": "recommended",
+                    "manifest_digest": "digest",
+                    "campaign_id": "campaign/stale-wave",
+                    "session_id": "session-1",
+                    "status": "paused",
+                },
+            )
+
+        async def list(self, session_id, *, limit):
+            assert limit is None
+            return tuple(row for row in await self.list_all() if row["session_id"] == session_id)
+
+        async def resume(self, _campaign_id: str) -> None:
+            raise ValueError("terminal scheduler continuation could not be reconciled")
+
+    backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())  # type: ignore[arg-type]
+
+    events = [event async for event in backend.stream("/resume session-1")]
+
+    assert any(
+        event.text
+        == (
+            "Could not resume campaign/stale-wave: "
+            "terminal scheduler continuation could not be reconciled"
+        )
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_explicit_campaign_resume_rejects_a_different_session() -> None:
     resumed: list[str] = []
 
