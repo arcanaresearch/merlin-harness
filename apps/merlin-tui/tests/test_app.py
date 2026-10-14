@@ -3751,6 +3751,36 @@ def test_live_swarm_labels_paused_campaign_without_claiming_working() -> None:
     assert "Campaign Lead · paused" in rendered
 
 
+def test_live_swarm_labels_paused_campaign_with_running_worker_as_pausing() -> None:
+    agents = (
+        AgentView(
+            "worker",
+            "lead",
+            "active target interaction",
+            "demo",
+            "1m",
+            "running",
+        ),
+    )
+    campaigns = (
+        CampaignView(
+            "campaign/pausing",
+            "session-demo",
+            "Stateful policy assessment",
+            "recommended",
+            "paused",
+            "x",
+        ),
+    )
+
+    rendered = app_module._render_live_swarm(agents, campaigns, 0).plain  # noqa: SLF001
+
+    assert "Pausing · finishing active work" in rendered
+    assert "◎ Paused" not in rendered
+    assert "1 working" in rendered
+    assert "Campaign Lead · pause requested · waiting for active work" in rendered
+
+
 @pytest.mark.asyncio
 async def test_agents_drawer_navigates_beyond_nine_workers_with_arrows() -> None:
     from merlin_tui.backend import AgentView

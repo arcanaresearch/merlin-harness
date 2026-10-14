@@ -7098,7 +7098,11 @@ def _render_live_swarm(
     filled = 0 if total == 0 else round(width * finished / total)
     bar = "█" * filled + "░" * (width - filled)
     spinner = ("◐", "◓", "◑", "◒")[spinner_index % 4]
-    paused = bool(campaigns) and all(campaign.status == "paused" for campaign in campaigns)
+    pause_requested = bool(campaigns) and all(
+        campaign.status == "paused" for campaign in campaigns
+    )
+    paused = pause_requested and counts["working"] == 0
+    pausing = pause_requested and counts["working"] > 0
     title = campaigns[0].objective if campaigns else "Active campaign"
     if len(title) > 84:
         title = title[:83].rstrip() + "…"
@@ -7116,7 +7120,9 @@ def _render_live_swarm(
             f"{wave_label} · campaign totals below\n",
             style="cyan",
         )
-    if paused:
+    if pausing:
+        rendered.append(f"{spinner} Pausing · finishing active work…  ", style="bold yellow")
+    elif paused:
         rendered.append("◎ Paused  ", style="bold yellow")
     elif reviewing:
         rendered.append(f"{spinner} Reviewing wave results…  ", style="bold yellow")
@@ -7137,6 +7143,8 @@ def _render_live_swarm(
             "executing": "coordinating task groups",
             "paused": "paused",
         }.get(lead.status, lead.status)
+        if pausing:
+            lead_state = "pause requested · waiting for active work to reach a checkpoint"
         if reviewing:
             lead_state = "reviewing results · deciding next wave or completion"
         if lead.lead_activity:
