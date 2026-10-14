@@ -4036,6 +4036,37 @@ async def test_main_body_shows_replaceable_live_swarm_region() -> None:
 
 
 @pytest.mark.asyncio
+async def test_swarm_poll_reconciles_late_new_session_before_filtering_campaigns() -> None:
+    class LateSessionBackend(DemoBackend):
+        async def conversation_context(self):
+            return {"session_id": "session-created-after-timeout"}
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/late-session",
+                    "session-created-after-timeout",
+                    "Assess the active target",
+                    "quickscan",
+                    "executing",
+                    "sha256:late-session",
+                ),
+            )
+
+    app = build_app(LateSessionBackend())
+    async with app.run_test() as pilot:
+        app._active_session_id = "stale-session"  # noqa: SLF001
+
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        assert app._active_session_id == "session-created-after-timeout"  # noqa: SLF001
+        live = app.query_one("#swarm-live", RichLog)
+        assert live.has_class("visible")
+        assert "Assess the active target" in "".join(line.text for line in live.lines)
+
+
+@pytest.mark.asyncio
 async def test_main_body_hides_swarm_until_campaign_execution_starts() -> None:
     class PreparedCampaignBackend(DemoBackend):
         async def list_campaigns(self):

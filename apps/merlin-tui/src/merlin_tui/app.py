@@ -5243,6 +5243,10 @@ class MerlinApp(App[None]):
         if self._unmounting or self._swarm_refresh_lock.locked():
             return
         async with self._swarm_refresh_lock:
+            # The daemon may finish a /new request after the foreground client
+            # reconnects or times out. Always scope campaign projections to the
+            # daemon's authoritative session rather than a stale local value.
+            await self._sync_active_session()
             views = list(self.query("#swarm-live"))
             if not views:
                 return
