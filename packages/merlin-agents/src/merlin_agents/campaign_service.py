@@ -3970,8 +3970,11 @@ class CampaignService:
                     if terminal_frontier_batch
                     else await self._monitor_live(campaign_id, manifest, initial_wave, live)
                 )
-            if hypothesis_cap_capped:
-                tasks = tuple(await self._agents.list_schedule_tasks(live.id))
+            # Monitoring can span the entire worker run.  The projection loaded
+            # before it therefore describes admission-time states (usually
+            # pending/working), not the durable terminal states that must drive
+            # lessons, ARM settlement, and the wave summary.
+            tasks = tuple(await self._agents.list_schedule_tasks(live.id))
             # Keep the task batch bound to the schedule that actually produced it.
             # ``wave`` may advance for validation or recovery bookkeeping before
             # follow-up evidence is read, so reconstructing a schedule id from the

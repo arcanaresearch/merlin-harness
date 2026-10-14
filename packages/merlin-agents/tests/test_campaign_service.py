@@ -20197,6 +20197,55 @@ async def test_wave_terminal_race_during_finalization_does_not_fail_campaign() -
     assert races[0][1]["retryable"] is False
 
 
+async def test_supervision_refreshes_terminal_tasks_after_live_monitoring() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+    class Agents:
+        monitored = False
+        reads = 0
+
+        async def list_schedule_tasks(self, schedule_id):
+            assert schedule_id == "schedule-1"
+            self.reads += 1
+            return (
+                AgentTask(
+                    id="worker-1",
+                    objective="exercise reviewed target",
+                    status="completed" if self.monitored else "ready",
+                    result='{"attempted_techniques": []}' if self.monitored else None,
+                ),
+            )
+
+    class Service(CampaignService):
+        terminal_tasks = ()
+
+        async def _durable_followup_keys(self, _campaign_id):
+            return set()
+
+        async def _monitor_live(self, *_args, **_kwargs):
+            agents.monitored = True
+            return LeadAssessment("workers reached a durable terminal state", True)
+
+        async def _record_lessons(self, _campaign_id, _manifest, _wave, tasks, **_kwargs):
+            self.terminal_tasks = tuple(tasks)
+            raise asyncio.CancelledError
+
+    agents = Agents()
+    service = Service(object(), agents, None)  # type: ignore[arg-type]
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._supervise(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            prepared.assignment_context,
+            SimpleNamespace(id="schedule-1", assignments=(), execution=None),
+            wave_running=False,
+        )
+
+    assert agents.reads == 2
+    assert [task.status for task in service.terminal_tasks] == ["completed"]
+
+
 async def test_wave_terminal_race_mid_execution_still_fails_campaign() -> None:
     """The benign-terminal guard is evidence-gated: with no completion seal
     and no execution-complete projection, a genuine mid-execution ``campaign
