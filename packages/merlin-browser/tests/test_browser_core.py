@@ -37,6 +37,7 @@ from merlin_browser.tools import (
     BrowserTool,
     _reviewed_cleanup_action,
     _reviewed_latest_setup_action,
+    _reviewed_recon_observations,
 )
 from merlin_contracts import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
@@ -52,6 +53,67 @@ from merlin_storage_postgres import (
     SessionRepository,
 )
 from merlin_tools import ToolBroker
+
+
+def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
+    session = SimpleNamespace(
+        context_id="browser-context",
+        bounds=SimpleNamespace(target_id="target"),
+    )
+    exchanges = (
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "observed_at": "2026-10-13T18:31:34+00:00",
+            "request_json": {"message": "hello"},
+            "response_json": {"result": {"turn": {"score": 85}}},
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "observed_at": "2026-10-13T18:32:24+00:00",
+            "request_json": {"message": "winning turn"},
+            "response_json": {
+                "result": {"turn": {"score": 100, "outcome": {"kind": "win"}}}
+            },
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "observed_at": "2026-10-13T18:33:09+00:00",
+            "request_json": {"message": "next tier"},
+            "response_json": {"result": {"turn": {"score": 49}}},
+        },
+    )
+    observations, evidence = _reviewed_recon_observations(
+        session,
+        [
+            {
+                "name": "score",
+                "role": "score",
+                "preferred_direction": "increase",
+                "success_values": [100],
+                # The reviewed contract named the wrong envelope. The compiler
+                # may repair only the unique scalar leaf with the same field name.
+                "baseline_selector": {"pointer": "/result/session/score"},
+                "result_selector": {"pointer": "/result/session/score"},
+            }
+        ],
+        exchanges,
+        method="POST",
+        url="https://target.test/api/turn",
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["baseline"] == 85
+    assert observations[0]["result"] == 100
+    assert observations[0]["outcome"] == "observed"
+    assert observations[0]["success_value_matched"] is True
+    assert observations[0]["result_pointer"] == "/result/turn/score"
+    assert len(evidence) == 4
 
 
 class _NativeRequestFixtureRecorder:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,6 +107,24 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
                 created_at=now,
                 updated_at=now,
             )
+            recon_observation = {
+                "schema": "merlin.browser.recon-observation.v1",
+                "name": "score",
+                "role": "score",
+                "baseline": 85,
+                "result": 100,
+                "baseline_pointer": "/turn/score",
+                "result_pointer": "/turn/score",
+                "outcome": "observed",
+                "success_value_matched": True,
+                "result_observed_at": now.isoformat(),
+                "evidence_refs": [
+                    "browser-api-response:sha256:" + "b" * 64
+                ],
+            }
+            recon_observation["digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(recon_observation, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
             handoff = ApiReconHandoff(
                 id="handoff:verified",
                 context_id=metadata.context_id,
@@ -128,6 +148,7 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
                     "session_constraint": "one conversation",
                     "oracle_contract": "reply rendered",
                 },
+                recon_observations=(recon_observation,),
             )
             store = PostgresBrowserStore(connection)
             asyncio.run(store.save_metadata(metadata))
@@ -137,6 +158,14 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
                     handoff.request_evidence_ref,
                     "network_request",
                     {"method": "POST"},
+                )
+            )
+            asyncio.run(
+                store.record_evidence(
+                    metadata.context_id,
+                    recon_observation["evidence_refs"][0],
+                    "network_response",
+                    {"status": 200, "score": 100},
                 )
             )
             asyncio.run(
@@ -197,6 +226,7 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
             recalled = asyncio.run(store.list_handoffs(handoff.target_id))
             assert [item.id for item in recalled] == [handoff.id]
             assert recalled[0].recon_scope["agent_or_bot"] == "support-bot"
+            assert recalled[0].recon_observations == handoff.recon_observations
             assert recalled[0].reusable_adapter == handoff.reusable_adapter
             assert recalled[0].reusable_site_facts == handoff.reusable_site_facts
 

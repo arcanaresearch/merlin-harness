@@ -22192,3 +22192,73 @@ async def test_frontier_batch_limit_clamps_to_remaining_principal_resource_budge
     assert not bounded_context.techniques
     assert batch is not None and batch["state"] == "settled"
     assert resource_store.claimed_limit == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_recon_progress_is_attributed_once_without_arm_credit() -> None:
+    receipt = {
+        "digest": "sha256:" + "a" * 64,
+        "name": "score",
+        "baseline": 85,
+        "result": 100,
+        "outcome": "observed",
+        "result_observed_at": "2026-10-13T18:32:24+00:00",
+        "evidence_refs": ["browser-api-response:sha256:" + "b" * 64],
+    }
+    inherited_receipt = {
+        **receipt,
+        "digest": "sha256:" + "c" * 64,
+        "result_observed_at": "2026-10-13T18:28:59+00:00",
+    }
+
+    class ReconStore:
+        def __init__(self) -> None:
+            self.observations = {}
+
+        def get(self, _campaign_id):
+            return {"created_at": datetime(2026, 10, 13, 18, 29, tzinfo=UTC)}
+
+        def record_observation(self, observation):
+            key = (
+                observation.campaign_id,
+                observation.task_id,
+                observation.target_id,
+                observation.technique_id,
+            )
+            self.observations.setdefault(key, observation)
+            return self.observations[key]
+
+    async def read_recon(session_id, handoff_id, target_id):
+        assert session_id == "session-1"
+        assert handoff_id == "handoff:browser"
+        assert target_id == "target-1"
+        return (receipt, inherited_receipt)
+
+    contract = ContextDocument.create(
+        "target:reviewed-interaction-contract",
+        "Reviewed interaction contract\n"
+        + json.dumps({"recon_handoff_id": "handoff:browser"}),
+    )
+    manifest = SimpleNamespace(
+        id="campaign-1",
+        session_id="session-1",
+        target=SimpleNamespace(id="target-1"),
+        catalogue=(contract,),
+    )
+    store = ReconStore()
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        SimpleNamespace(),
+        None,
+        recon_observation_reader=read_recon,
+    )
+
+    await service._record_browser_recon_observations(manifest)  # type: ignore[arg-type]  # noqa: SLF001
+    await service._record_browser_recon_observations(manifest)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert len(store.observations) == 1
+    observation = next(iter(store.observations.values()))
+    assert observation.outcome == "observed"
+    assert observation.technique_id == "reconnaissance"
+    assert observation.summary == "Browser reconnaissance observed score: 85 -> 100."
+    assert not hasattr(store, "arm_observations")

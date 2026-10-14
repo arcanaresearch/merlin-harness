@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -928,6 +928,7 @@ class _DerivedApiHandoff:
     terminal_evidence: tuple[tuple[str, dict[str, object]], ...]
     cleanup_evidence: tuple[tuple[str, dict[str, object]], ...]
     capability_evidence: tuple[tuple[str, dict[str, object]], ...]
+    recon_observations: tuple[dict[str, object], ...]
     stateful_reuse_is_unsafe: bool
 
 
@@ -4796,6 +4797,7 @@ class CompiledApiReconHandoffTool:
             compiled_adapter_digest=derived.compiled_adapter_digest,
             reusable_site_facts=reusable_site_facts,
             recon_scope=recon_scope,
+            recon_observations=derived.recon_observations,
         )
         record_evidence = getattr(self._recorder, "record_evidence", None)
         if callable(record_evidence):
@@ -6452,6 +6454,14 @@ class CompiledApiReconHandoffTool:
                     "capability was sealed.",
                 )
             )
+        recon_observations, recon_observation_evidence = _reviewed_recon_observations(
+            session,
+            arguments.get("state_observations", ()),
+            exchanges,
+            method=method,
+            url=url,
+        )
+        capability_evidence_by_ref.update(dict(recon_observation_evidence))
         identity_equivalence_rules: list[dict[str, object]] = []
         resource_ownership: list[dict[str, object]] = []
         corroboration_rules: list[dict[str, object]] = []
@@ -7342,6 +7352,7 @@ class CompiledApiReconHandoffTool:
             terminal_evidence=terminal_evidence,
             cleanup_evidence=cleanup_evidence,
             capability_evidence=capability_evidence,
+            recon_observations=recon_observations,
             stateful_reuse_is_unsafe=setup_step is not None
             and (
                 cleanup_event is None
@@ -7593,6 +7604,163 @@ def _string_scalar_paths(value: object, pointer: str = "") -> tuple[tuple[str, s
     elif isinstance(value, str) and value:
         found.append((pointer, value))
     return tuple(found)
+
+
+def _json_scalar_paths(value: object, pointer: str = "") -> tuple[tuple[str, object], ...]:
+    """Return JSON Pointer paths for non-container scalar values."""
+    found: list[tuple[str, object]] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            token = str(key).replace("~", "~0").replace("/", "~1")
+            found.extend(_json_scalar_paths(item, f"{pointer}/{token}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_json_scalar_paths(item, f"{pointer}/{index}"))
+    elif value is None or type(value) in {str, int, float, bool}:
+        found.append((pointer, value))
+    return tuple(found)
+
+
+def _reviewed_recon_observations(
+    session: BrowserSession,
+    declarations: object,
+    exchanges: Sequence[Mapping[str, object]],
+    *,
+    method: str,
+    url: str,
+) -> tuple[
+    tuple[dict[str, object], ...],
+    tuple[tuple[str, dict[str, object]], ...],
+]:
+    """Project reviewed state progress already witnessed during browser recon.
+
+    These receipts describe reconnaissance provenance only. They never become
+    executable adapter state or ARM credit. Exact pointers are preferred; when
+    a reviewed pointer names the wrong response envelope, a unique scalar leaf
+    matching the reviewed observation name may repair the envelope without
+    inventing target semantics.
+    """
+    if not isinstance(declarations, list):
+        return (), ()
+    candidates = tuple(
+        event
+        for event in exchanges
+        if event.get("method") == method
+        and event.get("url") == url
+        and type(event.get("status")) is int
+        and 200 <= int(event["status"]) <= 299
+        and isinstance(event.get("response_json"), (Mapping, list))
+    )
+    if len(candidates) < 2:
+        return (), ()
+
+    def observed_value(
+        event: Mapping[str, object], pointer: object, name: str
+    ) -> tuple[str, object] | None:
+        if isinstance(pointer, str):
+            exact = _json_pointer_value_or_missing(event.get("response_json"), pointer)
+            if exact is not _MISSING:
+                return pointer, exact
+        normalized_name = "".join(character for character in name.casefold() if character.isalnum())
+        matches = tuple(
+            (path, value)
+            for path, value in _json_scalar_paths(event.get("response_json"))
+            if "".join(
+                character
+                for character in path.rsplit("/", 1)[-1].casefold()
+                if character.isalnum()
+            )
+            == normalized_name
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    receipts: list[dict[str, object]] = []
+    evidence: dict[str, dict[str, object]] = {}
+    for declaration in declarations:
+        if not isinstance(declaration, Mapping):
+            continue
+        name = declaration.get("name")
+        baseline_selector = declaration.get("baseline_selector")
+        result_selector = declaration.get("result_selector")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(baseline_selector, Mapping)
+            or not isinstance(result_selector, Mapping)
+        ):
+            continue
+        baseline_matches = tuple(
+            (event, resolved)
+            for event in candidates
+            if (
+                resolved := observed_value(event, baseline_selector.get("pointer"), name)
+            )
+            is not None
+        )
+        result_matches = tuple(
+            (event, resolved)
+            for event in candidates
+            if (resolved := observed_value(event, result_selector.get("pointer"), name))
+            is not None
+        )
+        if not baseline_matches or not result_matches:
+            continue
+        baseline_event, (baseline_pointer, baseline_value) = baseline_matches[0]
+        success_values = declaration.get("success_values")
+        successful_results = tuple(
+            match
+            for match in result_matches
+            if isinstance(success_values, list)
+            and any(
+                type(match[1][1]) is type(expected) and match[1][1] == expected
+                for expected in success_values
+            )
+        )
+        result_event, (result_pointer, result_value) = (
+            successful_results[-1] if successful_results else result_matches[-1]
+        )
+        if baseline_event is result_event or type(baseline_value) is not type(result_value):
+            continue
+        succeeded = isinstance(success_values, list) and any(
+            type(result_value) is type(expected) and result_value == expected
+            for expected in success_values
+        )
+        direction = declaration.get("preferred_direction")
+        progressed = (
+            type(baseline_value) in {int, float}
+            and type(result_value) in {int, float}
+            and (
+                (direction == "increase" and result_value > baseline_value)
+                or (direction == "decrease" and result_value < baseline_value)
+            )
+        )
+        if not succeeded and not progressed:
+            continue
+        evidence_refs: list[str] = []
+        for event in (baseline_event, result_event):
+            for part in ("request", "response"):
+                reference, payload = _captured_api_evidence(session, event, part)
+                evidence[reference] = payload
+                evidence_refs.append(reference)
+        core = {
+            "schema": "merlin.browser.recon-observation.v1",
+            "name": name,
+            "role": str(declaration.get("role") or "custom"),
+            "baseline": baseline_value,
+            "result": result_value,
+            "baseline_pointer": baseline_pointer,
+            "result_pointer": result_pointer,
+            "outcome": "observed" if succeeded else "partial",
+            "success_value_matched": succeeded,
+            "result_observed_at": str(
+                result_event.get("observed_at")
+                or result_event.get("_observation_observed_at")
+                or ""
+            ),
+            "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        }
+        receipts.append({**core, "digest": _digest_json(core)})
+    return tuple(receipts), tuple(evidence.items())
 
 
 def _string_scalar_values(value: object) -> set[str]:

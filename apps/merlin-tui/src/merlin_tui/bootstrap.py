@@ -9169,6 +9169,18 @@ def build_backend(
                 candidate["evaluation_uncertainties"] = uncertainties
             return candidate
 
+        async def read_recon_observations(
+            session_id: str, handoff_id: str, target_id: str
+        ) -> tuple[Mapping[str, object], ...]:
+            handoff = await browser_store.load_handoff(handoff_id)
+            if (
+                handoff is None
+                or str(handoff.owner.session_id) != session_id
+                or handoff.target_id != target_id
+            ):
+                return ()
+            return tuple(dict(item) for item in handoff.recon_observations)
+
         async def run_automation_request(
             manifest: CampaignManifest, request: LeadAutomationRequest
         ):
@@ -9525,6 +9537,7 @@ def build_backend(
             cleanup_authority_reader=completion_cleanup_authority,
             exploration_review_runner=run_exploration_review,
             reviewed_adapter_resolver=resolve_reviewed_adapter,
+            recon_observation_reader=read_recon_observations,
             automation_runner=run_automation_request,
             max_coverage_extensions=config.max_coverage_extensions,
             arm_store=campaign_arm_store,

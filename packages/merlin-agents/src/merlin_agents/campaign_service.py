@@ -22,8 +22,10 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from merlin_contracts import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
     AgentTask,
+    CampaignObservation,
     CampaignTerminalReason,
     CapabilityGrant,
+    EvidenceWitness,
     InfrastructureFailureCategory,
     ModelJsonError,
     ProviderFailureKind,
@@ -1011,6 +1013,9 @@ CampaignReportRunner = Callable[[str, CampaignManifest, str], Awaitable[None]]
 InteractionLessonRunner = Callable[[str, CampaignManifest, AgentTask], Awaitable[str | None]]
 PreparationCleanup = Callable[[str], Awaitable[None]]
 ReviewedAdapterResolver = Callable[[str, Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
+ReconObservationReader = Callable[
+    [str, str, str], Awaitable[Sequence[Mapping[str, object]]]
+]
 AutomationRunner = Callable[[CampaignManifest, LeadAutomationRequest], Awaitable[AutomationOutcome]]
 
 
@@ -1035,6 +1040,7 @@ class CampaignService:
         cleanup_authority_reader: CleanupAuthorityReader | None = None,
         exploration_review_runner: ExplorationReviewRunner | None = None,
         reviewed_adapter_resolver: ReviewedAdapterResolver | None = None,
+        recon_observation_reader: ReconObservationReader | None = None,
         automation_runner: AutomationRunner | None = None,
         max_coverage_extensions: int | None = None,
         arm_store: Any | None = None,
@@ -1088,6 +1094,7 @@ class CampaignService:
         self._cleanup_authority_reader = cleanup_authority_reader
         self._exploration_review_runner = exploration_review_runner
         self._reviewed_adapter_resolver = reviewed_adapter_resolver
+        self._recon_observation_reader = recon_observation_reader
         self._automation_runner = automation_runner
         self._max_coverage_extensions = max_coverage_extensions
         self._arm_store = arm_store
@@ -9621,26 +9628,97 @@ class CampaignService:
         self, manifest: CampaignManifest, applicability: Mapping[str, object]
     ) -> None:
         recorder = getattr(self._store, "record_recon_result", None)
-        if recorder is None:
+        if recorder is not None:
+            fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
+            result_digest = str(
+                applicability.get("result_digest") or applicability.get("digest") or ""
+            )
+            result_id = (
+                "recon-result:"
+                + hashlib.sha256(
+                    f"{manifest.target.id}\n{fingerprint}\n{result_digest}".encode()
+                ).hexdigest()
+            )
+            await asyncio.to_thread(
+                recorder,
+                {
+                    "id": result_id,
+                    "target_id": manifest.target.id,
+                    "scenario_fingerprint": fingerprint,
+                    "result": dict(applicability),
+                    "result_digest": result_digest,
+                },
+            )
+        await self._record_browser_recon_observations(manifest)
+
+    async def _record_browser_recon_observations(self, manifest: CampaignManifest) -> None:
+        """Attribute reviewed browser progress without fabricating candidate credit."""
+        reader = self._recon_observation_reader
+        writer = getattr(self._store, "record_observation", None)
+        adapter = _reviewed_adapter_value(manifest)
+        handoff_id = adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None
+        if reader is None or not callable(writer) or not isinstance(handoff_id, str):
             return
-        fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
-        result_digest = str(applicability.get("result_digest") or applicability.get("digest") or "")
-        result_id = (
-            "recon-result:"
-            + hashlib.sha256(
-                f"{manifest.target.id}\n{fingerprint}\n{result_digest}".encode()
-            ).hexdigest()
-        )
-        await asyncio.to_thread(
-            recorder,
-            {
-                "id": result_id,
-                "target_id": manifest.target.id,
-                "scenario_fingerprint": fingerprint,
-                "result": dict(applicability),
-                "result_digest": result_digest,
-            },
-        )
+        campaign = await asyncio.to_thread(self._store.get, manifest.id)
+        created_at = campaign.get("created_at") if isinstance(campaign, Mapping) else None
+        if isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except ValueError:
+                created_at = None
+        if not isinstance(created_at, datetime):
+            return
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        receipts = await reader(manifest.session_id, handoff_id, manifest.target.id)
+        for receipt in receipts:
+            if not isinstance(receipt, Mapping):
+                continue
+            observed_at = receipt.get("result_observed_at")
+            try:
+                observed = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=UTC)
+            if observed < created_at:
+                continue
+            receipt_digest = str(receipt.get("digest") or "")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_digest):
+                continue
+            evidence_refs = tuple(
+                str(reference)
+                for reference in receipt.get("evidence_refs", ())
+                if isinstance(reference, str) and ":sha256:" in reference
+            )
+            witnesses = [
+                EvidenceWitness(
+                    reference=reference,
+                    digest="sha256:" + reference.rsplit(":sha256:", 1)[-1],
+                    source="browser-network-reconnaissance",
+                )
+                for reference in dict.fromkeys(evidence_refs)
+                if re.fullmatch(r"[0-9a-f]{64}", reference.rsplit(":sha256:", 1)[-1])
+            ]
+            if not witnesses:
+                continue
+            name = str(receipt.get("name") or "target_state")
+            baseline = receipt.get("baseline")
+            result = receipt.get("result")
+            await asyncio.to_thread(
+                writer,
+                CampaignObservation(
+                    id="recon-observation:" + receipt_digest.removeprefix("sha256:"),
+                    campaign_id=manifest.id,
+                    task_id="browser-recon:" + receipt_digest.removeprefix("sha256:"),
+                    target_id=manifest.target.id,
+                    technique_id="reconnaissance",
+                    outcome=("observed" if receipt.get("outcome") == "observed" else "partial"),
+                    summary=f"Browser reconnaissance observed {name}: {baseline!r} -> {result!r}.",
+                    coverage=f"reviewed target state field {name}",
+                    witnesses=witnesses,
+                ),
+            )
 
     async def _reusable_capability_observations(
         self, manifest: CampaignManifest, context: AssignmentContext

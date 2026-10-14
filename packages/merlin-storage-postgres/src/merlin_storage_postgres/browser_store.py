@@ -164,18 +164,25 @@ class BrowserRepository:
             or origin not in context["allowed_origins"]
         ):
             raise ValueError("API handoff is outside its persisted target bounds")
+        recon_evidence_refs = {
+            str(reference)
+            for observation in handoff.recon_observations
+            for reference in observation.get("evidence_refs", ())
+        }
+        required_evidence_refs = {
+            handoff.request_evidence_ref,
+            handoff.response_evidence_ref,
+            *recon_evidence_refs,
+        }
         rows = self.connection.execute(
             """SELECT evidence_ref FROM merlin_storage.browser_evidence
                WHERE context_id = %s AND evidence_ref = ANY(%s)""",
             (
                 handoff.context_id,
-                [handoff.request_evidence_ref, handoff.response_evidence_ref],
+                list(required_evidence_refs),
             ),
         ).fetchall()
-        if {row["evidence_ref"] for row in rows} != {
-            handoff.request_evidence_ref,
-            handoff.response_evidence_ref,
-        }:
+        if {row["evidence_ref"] for row in rows} != required_evidence_refs:
             raise ValueError("API handoff evidence is missing or belongs to another context")
         self.connection.execute(
             """INSERT INTO merlin_storage.browser_recon_handoffs

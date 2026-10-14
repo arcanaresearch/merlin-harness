@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from merlin_contracts.target_adapter_compiler import (
     compiled_target_adapter_digest,
@@ -156,6 +158,7 @@ class ApiReconHandoff(BrowserModel):
     compiled_adapter_digest: str | None = None
     reusable_site_facts: str | None = None
     recon_scope: dict[str, str] = Field(default_factory=dict)
+    recon_observations: tuple[dict[str, Any], ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @model_validator(mode="after")
@@ -240,4 +243,50 @@ class ApiReconHandoff(BrowserModel):
             not isinstance(value, str) or not value.strip() for value in self.recon_scope.values()
         ):
             raise ValueError("recon scope contains unsupported or empty dimensions")
+        if _contains_secret_key(self.recon_observations):
+            raise ValueError("recon observations must not contain credential-like fields")
+        allowed_recon_observation_fields = {
+            "schema",
+            "name",
+            "role",
+            "baseline",
+            "result",
+            "baseline_pointer",
+            "result_pointer",
+            "outcome",
+            "success_value_matched",
+            "result_observed_at",
+            "evidence_refs",
+            "digest",
+        }
+        for observation in self.recon_observations:
+            if set(observation) != allowed_recon_observation_fields:
+                raise ValueError("recon observation fields are incomplete or unsupported")
+            if observation.get("schema") != "merlin.browser.recon-observation.v1":
+                raise ValueError("recon observation schema is unsupported")
+            if observation.get("outcome") not in {"observed", "partial"}:
+                raise ValueError("recon observation outcome is unsupported")
+            try:
+                observed_at = datetime.fromisoformat(
+                    str(observation["result_observed_at"]).replace("Z", "+00:00")
+                )
+            except (KeyError, ValueError) as error:
+                raise ValueError("recon observation timestamp is invalid") from error
+            if observed_at.tzinfo is None:
+                raise ValueError("recon observation timestamp must include a timezone")
+            evidence_refs = observation.get("evidence_refs")
+            if not isinstance(evidence_refs, list) or not evidence_refs or any(
+                not isinstance(reference, str)
+                or not re.fullmatch(
+                    r"browser-api-(?:request|response):sha256:[0-9a-f]{64}", reference
+                )
+                for reference in evidence_refs
+            ):
+                raise ValueError("recon observation evidence references are invalid")
+            core = {key: value for key, value in observation.items() if key != "digest"}
+            expected_digest = "sha256:" + hashlib.sha256(
+                json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if observation.get("digest") != expected_digest:
+                raise ValueError("recon observation digest does not match its content")
         return self
