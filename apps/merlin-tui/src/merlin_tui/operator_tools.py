@@ -104,7 +104,10 @@ class CampaignConfigureTool:
                 "new_campaign=true for a new scan with its exact target/scenario and objective. "
                 "For profile, composition, execution-mode, or budget changes, update only the "
                 "requested fields; omitted fields retain the selection. Null clears an optional "
-                "setting. Settings survive resume and are applied to assessment_prepare. Changes "
+                "setting. For a new campaign, omit execution_mode unless the operator explicitly "
+                "forces one; omission lets reconnaissance select browser, API, or hybrid from "
+                "observed target capabilities. Do not ask for an execution mode by default. "
+                "Settings survive resume and are applied to assessment_prepare. Changes "
                 "require a new review; this never changes an executing manifest or approves it."
             ),
             input_schema={
