@@ -131,10 +131,20 @@ def test_restart_settles_acknowledged_effect_once_after_lease_takeover(
             report = _reconcile(repository, "daemon/new")
             row = next(item for item in report["campaigns"] if item["campaign_id"] == campaign_id)
             assert report["expired_global_leases"] == 1
-            assert row["decision"] == "settle_acknowledged"
-            assert row["status"] == "paused"
+            assert row["decision"] == "resume"
+            assert row["status"] == "prepared"
+            assert row["acknowledged_state_scopes"] == 0
+            assert row["settled_acknowledged_state_scopes"] == 1
             assert row["target_call_count"] == 1
-            assert row["recovery_action"] == "pause_lifecycle"
+            assert row["recovery_action"] == row["scheduler_action"]
+            settled = repository.load_state_scope(envelope.scope_id)
+            assert settled is not None
+            assert settled["status"] == "settled"
+            assert settled["transition_disposition"] == "infrastructure_failure"
+            assert settled["cleanup_disposition"] == "retained"
+            assert settled["current_revision"] == 2
+            assert settled["envelope"].responses.missing is not None
+            assert settled["envelope"].responses.missing.code == "orphaned_after_delivery"
             with database.connect() as restarted_connection:
                 replayed_row = _campaign_recovery(
                     _reconcile(StateScopeRepository(restarted_connection), "daemon/replayed"),
@@ -142,41 +152,7 @@ def test_restart_settles_acknowledged_effect_once_after_lease_takeover(
                 )
             assert replayed_row["recovery_state_digest"] == row["recovery_state_digest"]
             assert replayed_row["target_call_count"] == 1
-
-            replacement_claim = repository.claim_state_scope_lease(
-                envelope.scope_id,
-                target_authority="target.example",
-                principal_key="anonymous",
-                equivalence_key="game-run/a",
-                claimant_id="daemon/new",
-                lease_seconds=30,
-            )
-            assert replacement_claim is not None
-            terminal = envelope.model_copy(
-                update={"revision": 2, "isolation_lease_id": replacement_claim}
-            )
-            settled = repository.settle_state_scope(
-                envelope.scope_id,
-                1,
-                terminal,
-                transition_disposition="unchanged",
-                isolation_disposition="restored",
-                cleanup_disposition="not_required",
-                claim_id=replacement_claim,
-                claimant_id="daemon/new",
-            )
-            replay = repository.settle_state_scope(
-                envelope.scope_id,
-                1,
-                terminal,
-                transition_disposition="unchanged",
-                isolation_disposition="restored",
-                cleanup_disposition="not_required",
-                claim_id=replacement_claim,
-                claimant_id="daemon/new",
-            )
-            assert settled["status"] == replay["status"] == "settled"
-            assert replay["current_revision"] == 2
+            assert replayed_row["settled_acknowledged_state_scopes"] == 0
 
 
 def test_resource_replay_after_acknowledgement_never_readmits_target_action(

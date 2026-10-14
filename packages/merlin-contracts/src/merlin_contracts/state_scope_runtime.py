@@ -376,31 +376,48 @@ class StateScopeLifecycle:
             return
         claim_id, claimant_id = self._lease_binding()
         next_revision = self.revision + 1
-        await asyncio.to_thread(
-            self.store.pause_state_scope,
-            self.scope_id,
-            self.revision,
-            self._envelope(
-                revision=next_revision,
-                before=(
-                    state_scope_evidence(before_refs)
-                    if before_refs
-                    else state_scope_evidence(missing_reason=reason, retryable=retryable)
-                ),
-                action=(
-                    state_scope_evidence(action_refs)
-                    if action_refs
-                    else state_scope_evidence(missing_reason=reason, retryable=retryable)
-                ),
-                responses=state_scope_evidence(missing_reason=reason, retryable=retryable),
-                after=state_scope_evidence(missing_reason=reason, retryable=retryable),
+        envelope = self._envelope(
+            revision=next_revision,
+            before=(
+                state_scope_evidence(before_refs)
+                if before_refs
+                else state_scope_evidence(missing_reason=reason, retryable=retryable)
             ),
-            isolation_disposition=isolation_disposition,
-            cleanup_disposition=cleanup_disposition,
-            transition_disposition="infrastructure_failure",
-            claim_id=claim_id,
-            claimant_id=claimant_id,
+            action=(
+                state_scope_evidence(action_refs)
+                if action_refs
+                else state_scope_evidence(missing_reason=reason, retryable=retryable)
+            ),
+            responses=state_scope_evidence(missing_reason=reason, retryable=retryable),
+            after=state_scope_evidence(missing_reason=reason, retryable=retryable),
         )
+        if self.acknowledged:
+            # Delivery already crossed the target boundary. It must be settled,
+            # never sent through the pre-delivery pause transition (which the
+            # store correctly rejects and would otherwise strand the scope).
+            await asyncio.to_thread(
+                self.store.settle_state_scope,
+                self.scope_id,
+                self.revision,
+                envelope,
+                isolation_disposition=isolation_disposition,
+                cleanup_disposition=cleanup_disposition,
+                transition_disposition="infrastructure_failure",
+                claim_id=claim_id,
+                claimant_id=claimant_id,
+            )
+        else:
+            await asyncio.to_thread(
+                self.store.pause_state_scope,
+                self.scope_id,
+                self.revision,
+                envelope,
+                isolation_disposition=isolation_disposition,
+                cleanup_disposition=cleanup_disposition,
+                transition_disposition="infrastructure_failure",
+                claim_id=claim_id,
+                claimant_id=claimant_id,
+            )
         self.revision = next_revision
         self.finished = True
 

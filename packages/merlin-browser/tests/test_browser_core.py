@@ -1845,6 +1845,68 @@ async def test_raw_browser_action_does_not_deliver_when_global_scope_lease_fails
 
 
 @pytest.mark.asyncio
+async def test_cancelled_browser_action_settles_acknowledged_scope_before_reraising() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    class Session:
+        context_id = "cancelled-browser-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "isolated"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(tabs=())
+
+        async def act(self, action, *, actor_id):
+            del action, actor_id
+            events.append("target")
+            raise asyncio.CancelledError
+
+    tool = BrowserTool(
+        "browser_open_tab",
+        lambda _: Session(),
+        Recorder(),  # type: ignore[arg-type]
+        state_scope_store=scope_store,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await tool.invoke(
+            ToolContext(
+                session_id="s1",
+                workspace_root="/tmp",
+                campaign_id="campaign:cancelled-browser",
+                call_id="call:cancelled-browser",
+            ),
+            {"url": "https://target.example", "step": 0},
+        )
+
+    assert events == [
+        "created",
+        "claimed",
+        "revised",
+        "acknowledged",
+        "target",
+        "settled",
+        "released",
+    ]
+    assert scope_store.settle_calls[-1]["transition_disposition"] == (
+        "infrastructure_failure"
+    )
+
+
+@pytest.mark.asyncio
 async def test_raw_browser_actions_serialize_aliases_across_contexts_and_campaigns() -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events, enforce_conflicts=True)

@@ -680,8 +680,20 @@ class BrowserTool:
                 )
             async with asyncio.timeout(action.timeout_ms / 1_000):
                 observation = await session.act(action, actor_id=actor_id)
-        except Exception as error:
+        except BaseException as error:
             self._failures[fingerprint] = self._failures.get(fingerprint, 0) + 1
+            if state_scope is not None:
+                # The action was acknowledged before dispatch. Settle that fact
+                # first so cancellation or best-effort diagnostic failures cannot
+                # leave a permanently acknowledged campaign scope behind.
+                await state_scope.pause(
+                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    before_refs=before_refs,
+                    action_refs=action.evidence_refs,
+                )
+                state_scope = None
+            if not isinstance(error, Exception):
+                raise
             diagnostics: dict[str, object] | None = None
             diagnostic_tab = action.tab_ref
             if not diagnostic_tab:
@@ -715,12 +727,6 @@ class BrowserTool:
                     }
             if self._recorder is not None:
                 await self._recorder.save_metadata(session.metadata(restart=True))
-            if state_scope is not None:
-                await state_scope.pause(
-                    MissingEvidenceReason.TRANSPORT_FAILED,
-                    before_refs=before_refs,
-                    action_refs=action.evidence_refs,
-                )
             category = (
                 "browser_boundary"
                 if isinstance(error, BrowserBoundaryError)

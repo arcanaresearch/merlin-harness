@@ -11,6 +11,7 @@ from merlin_contracts.state_scope import (
     STATE_SCOPE_SCHEMA_VERSION,
     StateScopeEnvelope,
 )
+from merlin_contracts.state_scope_runtime import StateScopeLifecycle
 from merlin_storage_postgres import (
     CampaignApiSessionRepository,
     CampaignStore,
@@ -116,6 +117,74 @@ def _envelope(
             "after": _present(f"evidence:{scope_id}:after") if complete else _missing(),
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_delivery_failure_settles_instead_of_stranding_campaign(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _prepare_campaign(connection, "campaign/delivery-failure")
+            store = CampaignApiSessionRepository(connection)
+            lifecycle = StateScopeLifecycle(
+                store=store,
+                campaign_id="campaign/delivery-failure",
+                target_authority="https://target.example",
+                scope_id="scope-delivery-failure",
+                attempt_id="attempt-delivery-failure",
+                action_id="action-delivery-failure",
+                candidate_id="candidate-delivery-failure",
+                experiment_id="attempt-delivery-failure",
+            )
+            store.create_state_scope(
+                lifecycle.campaign_id,
+                lifecycle.target_authority,
+                lifecycle._envelope(  # noqa: SLF001 - exercise the persisted lifecycle boundary
+                    revision=1,
+                    before=_missing(),
+                    action=_missing(),
+                    responses=_missing(),
+                    after=_missing(),
+                ),
+            )
+            claim_id = store.claim_state_scope_lease(
+                lifecycle.scope_id,
+                target_authority=lifecycle.target_authority,
+                principal_key="anonymous",
+                equivalence_key="shared-session",
+                claimant_id="worker/test",
+                lease_seconds=30,
+            )
+            assert claim_id is not None
+            lifecycle.bind_lease(claim_id, "worker/test")
+
+            await lifecycle.acknowledge(
+                before_refs=("evidence:before",),
+                action_refs=("evidence:action",),
+            )
+            await lifecycle.pause(reason="capture_incomplete", retryable=True)
+
+            scope = store.load_state_scope(lifecycle.scope_id)
+            assert scope is not None
+            assert scope["status"] == "settled"
+            assert scope["current_revision"] == 3
+            assert scope["transition_disposition"] == "infrastructure_failure"
+            assert scope["cleanup_disposition"] == "retained"
+            report = store.reconcile_durable_lifecycle(
+                claimant_id="daemon/restarted",
+                readable_formats=(LEGACY_ATTEMPT_SCHEMA_VERSION, STATE_SCOPE_SCHEMA_VERSION),
+                writable_format=STATE_SCOPE_SCHEMA_VERSION,
+                lease_seconds=30,
+            )
+            campaign = next(
+                row
+                for row in report["campaigns"]
+                if row["campaign_id"] == lifecycle.campaign_id
+            )
+            assert campaign["acknowledged_state_scopes"] == 0
+            assert campaign["decision"] == "resume"
 
 
 def test_conservative_lease_rekeys_atomically_to_reviewed_principal_and_alias(

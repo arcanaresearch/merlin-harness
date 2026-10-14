@@ -1076,6 +1076,9 @@ class StateScopeRepository:
             results: list[dict[str, Any]] = []
             for campaign in campaigns:
                 campaign_id = str(campaign["id"])
+                recovered_acknowledged = self._settle_orphaned_acknowledged_scopes_locked(
+                    campaign_id
+                )
                 counts = self.connection.execute(
                     """SELECT count(*) FILTER (WHERE status = 'open') AS open_count,
                               count(*) FILTER (WHERE status = 'effect_acknowledged')
@@ -1360,6 +1363,7 @@ class StateScopeRepository:
                         "recovery_state_digest": recovery_state_digest,
                         "recovery_decision_digest": recovery_decision_digest,
                         "target_call_count": int(counts["target_call_count"] or 0),
+                        "settled_acknowledged_state_scopes": recovered_acknowledged,
                         "resource_reservations": reservations,
                         "latest_wave": wave_projection,
                         "active_frontier_batch": batch_projection,
@@ -1376,6 +1380,114 @@ class StateScopeRepository:
                 "due_quota_wakes": due_wakes,
                 "campaigns": results,
             }
+
+    def _settle_orphaned_acknowledged_scopes_locked(self, campaign_id: str) -> int:
+        """Settle delivered actions whose execution lease no longer has an owner.
+
+        Recovery must never replay an acknowledged action. When a process dies
+        between delivery and response capture, the exact outcome is unknowable;
+        persist that uncertainty once and let the campaign continue with a new
+        action identity.
+        """
+
+        rows = self.connection.execute(
+            """SELECT scope.*, envelope.envelope
+               FROM merlin_storage.state_scopes AS scope
+               JOIN merlin_storage.scope_envelopes AS envelope
+                 ON envelope.scope_id = scope.id
+                AND envelope.revision = scope.current_revision
+               LEFT JOIN merlin_storage.state_scope_leases AS lease
+                 ON lease.scope_id = scope.id AND lease.expires_at > now()
+               WHERE scope.campaign_id = %s
+                 AND scope.status = 'effect_acknowledged'
+                 AND lease.scope_id IS NULL
+               ORDER BY scope.id FOR UPDATE OF scope, envelope""",
+            (campaign_id,),
+        ).fetchall()
+        for row in rows:
+            scope_id = str(row["id"])
+            current_revision = int(row["current_revision"])
+            document = StateScopeEnvelope.model_validate(row["envelope"]).model_dump(mode="json")
+            document["revision"] = current_revision + 1
+            missing = {
+                "availability": "missing",
+                "evidence_refs": [],
+                "item_count": 0,
+                "missing": {
+                    "reason": "capture_incomplete",
+                    "retryable": False,
+                    "code": "orphaned_after_delivery",
+                },
+            }
+            if document["responses"]["availability"] != "present":
+                document["responses"] = missing
+            if document["after"]["availability"] != "present":
+                document["after"] = missing
+            terminal = StateScopeEnvelope.model_validate(document)
+            terminal_document = terminal.model_dump(mode="json")
+            self.connection.execute(
+                """INSERT INTO merlin_storage.scope_envelopes
+                       (scope_id, revision, envelope, envelope_digest)
+                   VALUES (%s, %s, %s, %s)""",
+                (
+                    scope_id,
+                    terminal.revision,
+                    Jsonb(terminal_document),
+                    _digest(terminal_document),
+                ),
+            )
+            reservations = self.connection.execute(
+                """SELECT * FROM merlin_storage.resource_reservations
+                   WHERE scope_id = %s AND state IN ('reserved', 'acknowledged')
+                   FOR UPDATE""",
+                (scope_id,),
+            ).fetchall()
+            for reservation in reservations:
+                key = (
+                    reservation["target_authority"],
+                    reservation["principal_key"],
+                    reservation["resource_kind"],
+                    reservation["window_key"],
+                )
+                ledger = self.connection.execute(
+                    """SELECT * FROM merlin_storage.principal_resources
+                       WHERE target_authority = %s AND principal_key = %s
+                         AND resource_kind = %s AND window_key = %s FOR UPDATE""",
+                    key,
+                ).fetchone()
+                if ledger is not None:
+                    amount = int(reservation["amount"])
+                    consumed = int(ledger["consumed"]) + amount
+                    state = (
+                        "exhausted"
+                        if consumed >= int(ledger["capacity"])
+                        else str(ledger["state"])
+                    )
+                    self.connection.execute(
+                        """UPDATE merlin_storage.principal_resources
+                           SET reserved = greatest(0, reserved - %s), consumed = %s,
+                               state = %s, updated_at = now()
+                           WHERE target_authority = %s AND principal_key = %s
+                             AND resource_kind = %s AND window_key = %s""",
+                        (amount, consumed, state, *key),
+                    )
+                    self.connection.execute(
+                        """UPDATE merlin_storage.resource_reservations
+                           SET state = 'settled', actual_amount = %s,
+                               acknowledged_at = coalesce(acknowledged_at, now()),
+                               settled_at = now(), updated_at = now()
+                           WHERE id = %s""",
+                        (amount, reservation["id"]),
+                    )
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET status = 'settled', current_revision = %s,
+                       transition_disposition = 'infrastructure_failure',
+                       cleanup_disposition = 'retained', settled_at = now(),
+                       updated_at = now() WHERE id = %s""",
+                (terminal.revision, scope_id),
+            )
+        return len(rows)
 
     def _revise_state_scope_locked(
         self,
