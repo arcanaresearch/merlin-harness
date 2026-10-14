@@ -160,6 +160,69 @@ def _campaign_status_allows_provider(
     )
 
 
+def _active_schedule_provider_assignment(
+    campaign: Mapping[str, object],
+    wave: Mapping[str, object],
+    schedule: Mapping[str, object],
+    attempts: Sequence[Mapping[str, object]],
+    *,
+    session_id: str,
+    agent_id: str,
+    attempt_id: str,
+    provider_id: str,
+) -> Mapping[str, object] | None:
+    """Resolve provider authority from the worker's active reviewed lease.
+
+    Campaign status is a lifecycle projection updated independently from the
+    scheduler. It can briefly lag an already-issued worker lease. Provider
+    admission therefore follows the active schedule and exact sealed graph;
+    target and tool effects continue to use the stricter campaign grant path.
+    """
+
+    if str(campaign.get("session_id") or "") != session_id:
+        return None
+    if str(campaign.get("status") or "") not in {"executing", "paused"}:
+        return None
+    if str(wave.get("status") or "") != "running":
+        return None
+    if str(schedule.get("status") or "") != "running":
+        return None
+    if str(schedule.get("session_id") or "") != session_id:
+        return None
+    active_attempt = next(
+        (
+            item
+            for item in attempts
+            if str(item.get("id") or "") == attempt_id
+            and str(item.get("node_id") or "") == f"worker:{agent_id}"
+            and str(item.get("state") or "") == "running"
+        ),
+        None,
+    )
+    if active_attempt is None:
+        return None
+    graph = schedule.get("graph")
+    if not isinstance(graph, Mapping):
+        return None
+    assignments = graph.get("assignments")
+    contexts = graph.get("worker_contexts")
+    if not isinstance(assignments, (list, tuple)) or not isinstance(contexts, Mapping):
+        return None
+    assignment = next(
+        (
+            item
+            for item in assignments
+            if isinstance(item, Mapping) and str(item.get("id") or "") == agent_id
+        ),
+        None,
+    )
+    if assignment is None or agent_id not in contexts:
+        return None
+    if str(assignment.get("provider_id") or "") != provider_id:
+        return None
+    return assignment
+
+
 def _canonical_report_candidate_projections(
     arm_outcomes: Sequence[object],
 ) -> tuple[dict[str, object], ...]:
@@ -4348,16 +4411,20 @@ def build_backend(
             *,
             require_context_digest: bool = True,
             allow_settlement_pause: bool = False,
+            active_attempt_id: str | None = None,
+            provider_id: str | None = None,
         ) -> tuple[Mapping[str, object], Mapping[str, object]] | None:
             if not (campaign_id and agent_id) or (require_context_digest and not grant_digest):
                 return None
             campaign = await asyncio.to_thread(campaign_store.get, campaign_id)
             if (
                 campaign is None
-                or not _campaign_status_allows_provider(
-                    campaign, allow_settlement_pause=allow_settlement_pause
-                )
                 or str(campaign["session_id"]) != str(session_id)
+            ):
+                return None
+            leased_provider_admission = active_attempt_id is not None and provider_id is not None
+            if not leased_provider_admission and not _campaign_status_allows_provider(
+                campaign, allow_settlement_pause=allow_settlement_pause
             ):
                 return None
             waves = await asyncio.to_thread(campaign_store.list_waves, campaign_id)
@@ -4375,6 +4442,24 @@ def build_backend(
                     scheduler_store.load_schedule, str(wave["schedule_id"])
                 )
                 if schedule is None:
+                    continue
+                if leased_provider_admission:
+                    attempts = await asyncio.to_thread(
+                        scheduler_store.list_attempts, str(wave["schedule_id"])
+                    )
+                    assignment = _active_schedule_provider_assignment(
+                        campaign,
+                        wave,
+                        schedule,
+                        attempts,
+                        session_id=str(session_id),
+                        agent_id=agent_id,
+                        attempt_id=active_attempt_id,
+                        provider_id=provider_id,
+                    )
+                    if assignment is not None:
+                        graph = schedule["graph"]
+                        return assignment, graph.get("grants", {})
                     continue
                 graph = schedule["graph"]
                 assignment = next(
@@ -4718,6 +4803,8 @@ def build_backend(
                 handoff.schedule_id,
                 require_context_digest=False,
                 allow_settlement_pause=True,
+                active_attempt_id=handoff.attempt_id,
+                provider_id=assignment.provider_id,
             )
             if admitted is None or admitted[0].get("provider_id") != assignment.provider_id:
                 return False

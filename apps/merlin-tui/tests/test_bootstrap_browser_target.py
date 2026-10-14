@@ -3,10 +3,33 @@ from uuid import UUID
 
 from merlin_contracts import ChatMessage
 from merlin_tui.bootstrap import (
+    _active_schedule_provider_assignment,
     _browser_target_objective,
     _campaign_status_allows_provider,
     _same_schedule_id,
 )
+
+
+def _provider_admission_fixture() -> tuple[dict[str, object], ...]:
+    agent_id = "campaign/example/adversarial-explorer/target-derived-discovery"
+    campaign = {"session_id": "session-1", "status": "paused"}
+    wave = {"status": "running"}
+    schedule = {
+        "session_id": "session-1",
+        "status": "running",
+        "graph": {
+            "assignments": [{"id": agent_id, "provider_id": "provider-1"}],
+            "worker_contexts": {agent_id: {"digest": "sha256:context"}},
+        },
+    }
+    attempts = (
+        {
+            "id": "attempt-1",
+            "node_id": f"worker:{agent_id}",
+            "state": "running",
+        },
+    )
+    return campaign, wave, schedule, attempts
 
 
 def test_browser_target_prefers_latest_configured_campaign_objective() -> None:
@@ -71,4 +94,65 @@ def test_campaign_provider_continues_only_during_acknowledged_settlement() -> No
             "lifecycle_resume_status": "prepared",
         },
         allow_settlement_pause=True,
+    )
+
+
+def test_active_reviewed_worker_lease_authorizes_provider_during_projection_pause() -> None:
+    campaign, wave, schedule, attempts = _provider_admission_fixture()
+    agent_id = "campaign/example/adversarial-explorer/target-derived-discovery"
+
+    assignment = _active_schedule_provider_assignment(
+        campaign,
+        wave,
+        schedule,
+        attempts,
+        session_id="session-1",
+        agent_id=agent_id,
+        attempt_id="attempt-1",
+        provider_id="provider-1",
+    )
+
+    assert assignment == {"id": agent_id, "provider_id": "provider-1"}
+
+
+def test_provider_admission_rejects_inactive_or_mismatched_worker_lease() -> None:
+    campaign, wave, schedule, attempts = _provider_admission_fixture()
+    agent_id = "campaign/example/adversarial-explorer/target-derived-discovery"
+
+    for replacement in (
+        {**schedule, "status": "paused"},
+        {**schedule, "session_id": "session-other"},
+        {
+            **schedule,
+            "graph": {
+                **schedule["graph"],
+                "assignments": [{"id": agent_id, "provider_id": "provider-other"}],
+            },
+        },
+    ):
+        assert (
+            _active_schedule_provider_assignment(
+                campaign,
+                wave,
+                replacement,
+                attempts,
+                session_id="session-1",
+                agent_id=agent_id,
+                attempt_id="attempt-1",
+                provider_id="provider-1",
+            )
+            is None
+        )
+    assert (
+        _active_schedule_provider_assignment(
+            campaign,
+            wave,
+            schedule,
+            ({**attempts[0], "state": "failed"},),
+            session_id="session-1",
+            agent_id=agent_id,
+            attempt_id="attempt-1",
+            provider_id="provider-1",
+        )
+        is None
     )
