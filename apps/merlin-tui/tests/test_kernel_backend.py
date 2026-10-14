@@ -549,6 +549,23 @@ async def test_new_session_clears_pending_campaign_profile_gate() -> None:
     assert kernel.submissions == ["/new"]
 
 
+@pytest.mark.asyncio
+async def test_new_session_does_not_wait_for_mcp_startup() -> None:
+    class BlockingMcp:
+        async def start_configured(self) -> None:
+            await asyncio.Event().wait()
+
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, mcp=BlockingMcp())  # type: ignore[arg-type]
+
+    async with asyncio.timeout(0.5):
+        events = [event async for event in backend.stream("/new")]
+
+    assert events == []
+    assert kernel.submissions == ["/new"]
+    assert not backend._mcp_started
+
+
 def test_event_mapping_preserves_stream_and_failures() -> None:
     assert event_to_stream(app_event("stream", text="token")).kind == "content"
     usage = event_to_stream(

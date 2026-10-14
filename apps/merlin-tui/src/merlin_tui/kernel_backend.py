@@ -222,6 +222,7 @@ class KernelBackend:
         return self._config_reload_status
 
     async def stream(self, prompt: str) -> AsyncIterator[StreamEvent]:
+        new_session = prompt.strip().lower() == "/new"
         if prompt.strip().lower() == "/interrupt":
             await self.interrupt()
             yield StreamEvent(kind="status", text="Foreground interruption acknowledged.")
@@ -321,10 +322,11 @@ class KernelBackend:
             # A free-form correction belongs to the model, not a numeric gate.
             prompt = f"Pending assessment objective: {self._pending_campaign_objective}\n{prompt}"
             self._pending_campaign_objective = None
-        await self._recover_agents()
-        if self._mcp is not None and not self._mcp_started:
-            await self._mcp.start_configured()
-            self._mcp_started = True
+        if not new_session:
+            await self._recover_agents()
+            if self._mcp is not None and not self._mcp_started:
+                await self._mcp.start_configured()
+                self._mcp_started = True
         if campaign_selection and self.kernel.turn_active:
             yield StreamEvent(
                 kind="status",
