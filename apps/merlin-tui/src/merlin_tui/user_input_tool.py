@@ -5,7 +5,27 @@ from collections.abc import Mapping
 from typing import Any
 
 from merlin_contracts import ToolContext, ToolResult, ToolSpec
-from merlin_contracts.user_input import InputRequest
+from merlin_contracts.user_input import InputQuestion, InputRequest
+
+
+def _choice_names(question: InputQuestion) -> set[str]:
+    return {
+        value.casefold().strip()
+        for option in question.options
+        for value in (option.id, option.label)
+    }
+
+
+def _is_campaign_profile_question(question: InputQuestion) -> bool:
+    names = _choice_names(question)
+    return {"quickscan", "recommended", "exhaustive"} <= names and any(
+        name in names for name in {"exploration", "exploration / learning", "learning"}
+    )
+
+
+def _is_composition_question(question: InputQuestion) -> bool:
+    names = _choice_names(question)
+    return {"autonomous", "opinionated"} <= names
 
 
 class RequestUserInputTool:
@@ -44,6 +64,54 @@ class RequestUserInputTool:
             request = InputRequest(
                 request_id=f"{context.session_id}:{context.call_id}", **dict(arguments)
             )
+            has_profile = any(
+                _is_campaign_profile_question(question) for question in request.questions
+            )
+            has_composition = any(
+                _is_composition_question(question) for question in request.questions
+            )
+            if has_profile and not has_composition:
+                if len(request.questions) >= 3:
+                    raise ValueError(
+                        "campaign profile selection must include agent composition in the same "
+                        "request"
+                    )
+                question_id = "specialist_composition"
+                existing_ids = {question.id for question in request.questions}
+                suffix = 2
+                while question_id in existing_ids:
+                    question_id = f"specialist_composition_{suffix}"
+                    suffix += 1
+                request = InputRequest.model_validate(
+                    {
+                        **request.model_dump(),
+                        "questions": [
+                            *(question.model_dump() for question in request.questions),
+                            {
+                                "id": question_id,
+                                "question": "How should Merlin compose the specialist team?",
+                                "options": [
+                                    {
+                                        "id": "autonomous",
+                                        "label": "Autonomous",
+                                        "description": (
+                                            "Let the Campaign Lead compose a target-specific team."
+                                        ),
+                                    },
+                                    {
+                                        "id": "opinionated",
+                                        "label": "Opinionated",
+                                        "description": (
+                                            "Use Merlin's reviewed specialist template."
+                                        ),
+                                    },
+                                ],
+                                "default": ["autonomous"],
+                                "allow_free_text": True,
+                            },
+                        ],
+                    }
+                )
             payload = {"status": "awaiting_input", "request": request.model_dump()}
             return ToolResult(content=json.dumps(payload), metadata=payload)
         except (TypeError, ValueError) as error:

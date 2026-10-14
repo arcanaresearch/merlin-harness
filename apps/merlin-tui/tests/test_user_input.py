@@ -361,3 +361,36 @@ async def test_campaign_defaults_reach_tool_receipt_and_tui_without_submitting()
         assert not app.screen.query_one("#answer-1-0", RadioButton).value
         # Merely opening the screen leaves it pending; Continue is required.
         assert isinstance(app.screen, UserInputScreen)
+
+
+@pytest.mark.asyncio
+async def test_campaign_profile_question_adds_missing_composition_choice():
+    result = await RequestUserInputTool().invoke(
+        ToolContext(session_id="s1", call_id="profile-only", workspace_root="."),
+        {
+            "questions": [
+                {
+                    "id": "profile",
+                    "question": "Which Merlin scan profile should I use?",
+                    "options": [
+                        {"id": "quickscan", "label": "Quickscan"},
+                        {"id": "recommended", "label": "Recommended"},
+                        {"id": "exhaustive", "label": "Exhaustive"},
+                        {"id": "exploration", "label": "Exploration / learning"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert not result.is_error
+    request = InputRequest.model_validate(json.loads(result.content)["request"])
+    assert [question.id for question in request.questions] == [
+        "profile",
+        "specialist_composition",
+    ]
+    assert request.questions[1].default == ["autonomous"]
+    assert [option.id for option in request.questions[1].options] == [
+        "autonomous",
+        "opinionated",
+    ]
