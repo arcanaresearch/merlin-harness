@@ -16,7 +16,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from merlin_contracts import (
+    CampaignLifecycle,
+    CampaignObjective,
+    CampaignOutcomeProjection,
     CampaignTerminalReason,
+    CampaignVerdict,
     assert_candidate_outcome_match,
     candidate_id_for_identity,
     read_campaign_terminal_reason,
@@ -196,6 +200,107 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _completion_authority_document(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    document = value.get("document")
+    return document if isinstance(document, Mapping) else value
+
+
+def _reviewed_objective_contract(
+    value: object,
+) -> tuple[CampaignObjective, ...] | None:
+    """Read an optional sealed objective contract without inventing legacy objectives."""
+
+    if value is None:
+        return None
+    raw = value.get("objectives") if isinstance(value, Mapping) else value
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("campaign objective contract must contain an objectives sequence")
+    objectives = tuple(CampaignObjective.model_validate(item) for item in raw)
+    ids = tuple(item.id for item in objectives)
+    if not objectives or len(ids) != len(set(ids)):
+        raise ValueError("campaign objective contract requires unique non-empty objectives")
+    return objectives
+
+
+def _reviewed_campaign_outcome(value: object) -> CampaignOutcomeProjection | None:
+    if value is None:
+        return None
+    outcome = CampaignOutcomeProjection.model_validate(value)
+    required_ids = outcome.required_objective_ids
+    unresolved_ids = outcome.unresolved_objective_ids
+    if len(required_ids) != len(set(required_ids)) or len(unresolved_ids) != len(
+        set(unresolved_ids)
+    ):
+        raise ValueError("campaign outcome objective ids must be unique")
+    if not set(unresolved_ids).issubset(required_ids):
+        raise ValueError("campaign outcome unresolved objectives must be required objectives")
+    discharged = (
+        set(outcome.satisfied_by_campaign_ids)
+        | set(outcome.preexisting_objective_ids)
+        | set(outcome.waived_objective_ids)
+    )
+    if discharged & set(unresolved_ids):
+        raise ValueError("campaign outcome cannot both discharge and leave an objective unresolved")
+    successful = outcome.lifecycle is CampaignLifecycle.COMPLETED or outcome.verdict in {
+        CampaignVerdict.SATISFIED,
+        CampaignVerdict.SATISFIED_WITH_WAIVERS,
+    }
+    if successful and unresolved_ids:
+        raise ValueError("campaign outcome cannot claim success with unresolved objectives")
+    if outcome.lifecycle is CampaignLifecycle.COMPLETED and outcome.verdict not in {
+        CampaignVerdict.SATISFIED,
+        CampaignVerdict.SATISFIED_WITH_WAIVERS,
+    }:
+        raise ValueError("completed campaign outcome requires a satisfied verdict")
+    if outcome.lifecycle in {
+        CampaignLifecycle.COMPLETED,
+        CampaignLifecycle.INCOMPLETE,
+        CampaignLifecycle.STOPPED,
+        CampaignLifecycle.FAILED,
+    } and outcome.end_reason is None:
+        raise ValueError("terminal campaign outcome requires an end reason")
+    return outcome
+
+
+def _objective_report_authority(
+    metadata: Mapping[str, Any] | None,
+    completion: Mapping[str, Any] | None,
+) -> tuple[CampaignOutcomeProjection | None, bool]:
+    """Reconcile optional objective authority embedded in report and completion inputs."""
+
+    authority = _completion_authority_document(completion)
+    contracts = tuple(
+        item
+        for item in (
+            _reviewed_objective_contract((metadata or {}).get("objective_contract")),
+            _reviewed_objective_contract(authority.get("objective_contract")),
+        )
+        if item is not None
+    )
+    if len(contracts) == 2 and contracts[0] != contracts[1]:
+        raise ValueError("report objective contract conflicts with the completion authority")
+    outcomes = tuple(
+        item
+        for item in (
+            _reviewed_campaign_outcome((metadata or {}).get("campaign_outcome")),
+            _reviewed_campaign_outcome(authority.get("campaign_outcome")),
+        )
+        if item is not None
+    )
+    if len(outcomes) == 2 and outcomes[0] != outcomes[1]:
+        raise ValueError("report campaign outcome conflicts with the completion authority")
+    outcome = outcomes[0] if outcomes else None
+    if contracts and outcome is None:
+        raise ValueError("sealed objective contract requires a typed campaign outcome projection")
+    if contracts and outcome is not None:
+        required_ids = tuple(item.id for item in contracts[0] if item.required)
+        if required_ids != outcome.required_objective_ids:
+            raise ValueError("campaign outcome does not cover the sealed required objectives")
+    return outcome, bool(contracts)
+
+
 def _normalize_frontier_snapshot_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Rebuild the canonical row shape used by campaign snapshot sealing."""
     refs = row.get("evidence_refs", ())
@@ -281,6 +386,21 @@ class DurableReportService:
         metadata = _canonical_candidate_metadata(metadata, techniques)
         if completion_document is not None:
             completion_document = _json_value(completion_document)
+        campaign_outcome, _ = _objective_report_authority(metadata, completion_document)
+        objective_incomplete = campaign_outcome is not None and (
+            campaign_outcome.lifecycle is not CampaignLifecycle.COMPLETED
+            or bool(campaign_outcome.unresolved_objective_ids)
+        )
+        if objective_incomplete and report_state == "complete":
+            raise ValueError(
+                "complete report cannot claim success while required objectives remain unresolved"
+            )
+        if objective_incomplete and isinstance(completion_document, Mapping):
+            terminal_status = str(completion_document.get("terminal_status") or "").casefold()
+            if terminal_status in {"complete", "completed", "success", "succeeded"}:
+                raise ValueError(
+                    "successful completion seal conflicts with unresolved required objectives"
+                )
         source_stop_reason = stop_reason.strip().casefold()
         legacy_limited_completion = source_stop_reason == "completed_with_limitations"
         require_frontier_ready = source_stop_reason in {
@@ -302,7 +422,7 @@ class DurableReportService:
         if timestamp.tzinfo is None:
             raise ValueError("report timestamp must be timezone-aware")
         cleanup_complete = cleanup_status in {"complete", "completed"}
-        state = report_state or (
+        state = "incomplete" if objective_incomplete else report_state or (
             "provisional"
             if legacy_limited_completion and not unsearched_frontier and cleanup_complete
             else "complete"
@@ -3118,10 +3238,28 @@ def _html_report(
     unfinished = retryable + unreachable + unresolved
     provenance = _coverage_provenance(value)
     validated_findings = tuple(row for row in value.findings if _finding_is_validated(row))
+    objective_outcome = value.metadata.get("campaign_outcome")
+    objective_incomplete = (
+        value.report_state == "incomplete"
+        and isinstance(objective_outcome, Mapping)
+        and bool(objective_outcome.get("unresolved_objective_ids"))
+    )
     if validated_findings:
         verdict_label = "Action required"
         verdict = f"{len(validated_findings)} validated security finding{'s' if len(validated_findings) != 1 else ''} require attention."
         verdict_class = "danger"
+    elif objective_incomplete:
+        verdict_label = "Scan ended with unresolved results"
+        verdict = (
+            f"Merlin executed {executed} of {planned} selected techniques against the target: "
+            f"{clear} produced a clear result, {partial} made partial progress, and "
+            f"{inconclusive} were inconclusive. "
+            f"{retryable} hit retryable infrastructure failures, {unreachable} were proven "
+            f"physically unreachable, and {unresolved} remain unresolved. "
+            "No validated finding was established, "
+            "but this does not prove the target is safe."
+        )
+        verdict_class = "warning"
     elif not unfinished and clear == planned:
         verdict_label = "No issue observed in tested scope"
         verdict = "No validated vulnerability was found in the tests that produced a clear result. This is not a guarantee that the target is safe."

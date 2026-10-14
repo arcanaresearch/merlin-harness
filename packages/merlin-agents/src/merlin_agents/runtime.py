@@ -29,6 +29,7 @@ from merlin_contracts import (
     Provider,
     ProviderFailureKind,
     ReasoningDelta,
+    StateEnumerationReceipt,
     TextDelta,
     ToolCall,
     ToolContext,
@@ -3505,6 +3506,9 @@ class WorkerRuntime:
                                 expected_target_sequence=handoff.expected_target_sequence,
                                 target_effects_blocked=handoff.target_effects_blocked,
                                 effect_attempt_lineage=handoff.effect_attempt_lineage,
+                                state_action_kind=(
+                                    "reconnaissance" if probe_worker else None
+                                ),
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -3660,6 +3664,7 @@ class WorkerRuntime:
                     expected_target_sequence=handoff.expected_target_sequence,
                     target_effects_blocked=handoff.target_effects_blocked,
                     effect_attempt_lineage=handoff.effect_attempt_lineage,
+                    state_action_kind="reconnaissance" if probe_worker else None,
                     transform_bindings=handoff.assignment.transform_bindings,
                     planned_language=handoff.assignment.planned_language,
                     requested_language=handoff.assignment.requested_language,
@@ -4352,6 +4357,9 @@ class WorkerRuntime:
                                 expected_target_sequence=handoff.expected_target_sequence,
                                 target_effects_blocked=handoff.target_effects_blocked,
                                 effect_attempt_lineage=handoff.effect_attempt_lineage,
+                                state_action_kind=(
+                                    "reconnaissance" if probe_worker else None
+                                ),
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -5391,6 +5399,9 @@ class WorkerRuntime:
                                     expected_target_sequence=handoff.expected_target_sequence,
                                     target_effects_blocked=handoff.target_effects_blocked,
                                     effect_attempt_lineage=handoff.effect_attempt_lineage,
+                                    state_action_kind=(
+                                        "reconnaissance" if probe_worker else None
+                                    ),
                                     transform_bindings=handoff.assignment.transform_bindings,
                                     planned_language=handoff.assignment.planned_language,
                                     requested_language=handoff.assignment.requested_language,
@@ -6339,6 +6350,7 @@ class WorkerRuntime:
                                 expected_target_sequence=handoff.expected_target_sequence,
                                 target_effects_blocked=handoff.target_effects_blocked,
                                 effect_attempt_lineage=handoff.effect_attempt_lineage,
+                                state_action_kind="baseline",
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -7901,6 +7913,21 @@ class WorkerRuntime:
             receipt_body["request_constraint_observations"] = [
                 dict(item) for item in raw_constraint_observations
             ]
+        raw_state_enumerations = result.metadata.get("state_enumerations")
+        if isinstance(raw_state_enumerations, Sequence) and not isinstance(
+            raw_state_enumerations, (str, bytes)
+        ):
+            state_enumerations: list[dict[str, object]] = []
+            for raw_enumeration in raw_state_enumerations:
+                try:
+                    enumeration = StateEnumerationReceipt.model_validate(raw_enumeration)
+                except ValueError:
+                    continue
+                state_enumerations.append(enumeration.model_dump(mode="json"))
+            if state_enumerations:
+                # Canonical target-authored denominators are part of the signed
+                # receipt body. Later reducers never trust the worker transcript.
+                receipt_body["state_enumerations"] = state_enumerations
         if attempt_disposition == "protocol_invalid":
             receipt_body.setdefault(
                 "disposition_reason",

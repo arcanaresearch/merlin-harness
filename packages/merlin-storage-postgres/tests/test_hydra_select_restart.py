@@ -621,7 +621,11 @@ async def test_hydra_acknowledged_prefix_restores_cursor_and_exact_exchange_rece
                 row for row in internal.lineage if row.get("entry") == "merlin.hydra-select.v1"
             ]
             assert technique["outcome"] == "unclear"
-            assert internal.stop_reason == report_stop_reason
+            assert internal.stop_reason == (
+                "infrastructure_blocked_after_retry_policy"
+                if report_stop_reason == "interrupted"
+                else "budget_exhausted"
+            )
             assert internal.report_state == "incomplete"
             assert len(lineage) == 3
             assert all(row["stage_receipt"].startswith("sha256:") for row in lineage)

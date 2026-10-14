@@ -1564,6 +1564,11 @@ class KernelBackend:
                         if isinstance(progress.get("target_progress"), Mapping)
                         else None
                     ),
+                    review_progress=(
+                        dict(progress["review_progress"])
+                        if isinstance(progress.get("review_progress"), Mapping)
+                        else None
+                    ),
                 )
             )
         return tuple(campaigns)

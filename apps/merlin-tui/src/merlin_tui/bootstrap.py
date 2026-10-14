@@ -38,7 +38,7 @@ from merlin_contracts import (
     executable_adapter_projection,
     parse_model_json,
     project_candidate_outcome,
-    require_campaign_terminal_reason,
+    read_campaign_terminal_reason,
     reviewed_adapter_cleanup_lifecycle,
     validate_candidate_outcome_projection,
 )
@@ -53,6 +53,13 @@ from merlin_contracts.target_adapter_compiler import (
 from .app import MerlinApp
 from .backend import ChatBackend, FailureBackend
 from .language_evidence import observe_request_language
+from .lead_review import (
+    LeadReviewCoalescer,
+    LeadReviewSnapshot,
+    authoritative_task_revision,
+    guidance_revision,
+    prompt_input_revision,
+)
 
 # Advertised languages describe expected behavior; they are not a security-test
 # allowlist. The frontier leads with the forty most-spoken languages (ordered
@@ -3815,7 +3822,11 @@ def build_backend(
         AutomationStep,
     )
     from merlin_agents.campaign import language_frontier_spec
-    from merlin_agents.campaign_service import _dynamic_specialist_proposal, _json_value
+    from merlin_agents.campaign_service import (
+        CampaignLeadDecisionError,
+        _dynamic_specialist_proposal,
+        _json_value,
+    )
     from merlin_agents.capability_probes import (
         CapabilityProbeKind,
         CapabilitySupport,
@@ -4417,10 +4428,7 @@ def build_backend(
             if not (campaign_id and agent_id) or (require_context_digest and not grant_digest):
                 return None
             campaign = await asyncio.to_thread(campaign_store.get, campaign_id)
-            if (
-                campaign is None
-                or str(campaign["session_id"]) != str(session_id)
-            ):
+            if campaign is None or str(campaign["session_id"]) != str(session_id):
                 return None
             leased_provider_admission = active_attempt_id is not None and provider_id is not None
             if not leased_provider_admission and not _campaign_status_allows_provider(
@@ -4470,10 +4478,7 @@ def build_backend(
                 if (
                     assignment is not None
                     and worker_context is not None
-                    and (
-                        not require_context_digest
-                        or worker_context.get("digest") == grant_digest
-                    )
+                    and (not require_context_digest or worker_context.get("digest") == grant_digest)
                 ):
                     return assignment, graph.get("grants", {})
             return None
@@ -5173,25 +5178,17 @@ def build_backend(
             arm_outcome_recorder=campaign_arm_store.record_arm_observation,
         )
 
-        async def run_campaign_lead(
+        async def _run_campaign_lead_once(
             campaign_id: str,
             campaign_profile: CampaignProfile,
             attempt: int,
             tasks: tuple[object, ...],
+            review_snapshot: LeadReviewSnapshot,
+            task_snapshot: Mapping[str, object],
+            lead_rows: tuple[Mapping[str, object], ...],
         ) -> LeadAssessment:
             lead_model = config.provider_role_models.get("lead", model)
-            result_budget = _lead_result_char_budget(
-                capability_registry, provider, lead_model, len(tasks)
-            )
-            task_snapshot = _lead_task_rows(
-                tasks,
-                campaign_id=campaign_id,
-                profile=campaign_profile.value,
-                attempt=attempt,
-                per_result_chars=result_budget,
-            )
             task_rows = task_snapshot["tasks"]
-            lead_rows = await asyncio.to_thread(campaign_store.list_lead, campaign_id)
             consumed_guidance_ids = {
                 str(row["payload"].get("guidance_id"))
                 for row in lead_rows
@@ -5494,15 +5491,18 @@ def build_backend(
                         "cost-capped campaign requires configured provider pricing rates"
                     )
                 if cost_rate > 0:
-                    cost_token_share = math.floor(
-                        float(max_cost_usd)
-                        / (config.provider_runtime.max_concurrent_requests + 1)
-                        / cost_rate
+                    # Convert the campaign's remaining cost ceiling into its
+                    # total token ceiling here. Concurrency is applied once
+                    # below when computing the request's fair share. Dividing
+                    # in both places can make a valid Lead prompt larger than
+                    # its reservation even though the campaign has capacity.
+                    cost_token_capacity = math.floor(
+                        float(max_cost_usd) / cost_rate
                     )
                     max_tokens = (
-                        cost_token_share
+                        cost_token_capacity
                         if max_tokens is None
-                        else min(int(max_tokens), cost_token_share)
+                        else min(int(max_tokens), cost_token_capacity)
                     )
             reservation_id = ""
             reservation_grant: int | None = None
@@ -5565,6 +5565,10 @@ def build_backend(
 
             async def consume_lead() -> None:
                 nonlocal lead_usage, provider_error, provider_error_event
+                progress_started = time.monotonic()
+                last_progress_journal = progress_started
+                completed_chunks = 0
+                output_characters = 0
                 async for event in provider.stream(
                     ChatRequest(
                         model=lead_model,
@@ -5578,8 +5582,31 @@ def build_backend(
                         reasoning="disabled" if attempt > 0 else None,
                     )
                 ):
-                    if isinstance(event, TextDelta):
-                        parts.append(event.text)
+                    if isinstance(event, (TextDelta, ReasoningDelta)):
+                        if isinstance(event, TextDelta):
+                            parts.append(event.text)
+                        completed_chunks += 1
+                        output_characters += len(event.text)
+                        now = time.monotonic()
+                        if now - last_progress_journal >= 15.0:
+                            await asyncio.to_thread(
+                                campaign_store.append_lead,
+                                campaign_id,
+                                attempt,
+                                {
+                                    "kind": "lead_review_progress",
+                                    **review_snapshot.projection(),
+                                    "state": "reviewing",
+                                    "blocking": review_snapshot.blocking,
+                                    "advisory": not review_snapshot.blocking,
+                                    "elapsed_seconds": round(now - progress_started, 3),
+                                    "completed_chunks": completed_chunks,
+                                    "output_characters": output_characters,
+                                    "last_activity": "provider output received",
+                                    "waiting_for": review_snapshot.waiting_for,
+                                },
+                            )
+                            last_progress_journal = now
                     elif isinstance(event, ModelCompleted):
                         lead_finish.update(
                             finish_reason=event.finish_reason or "unknown",
@@ -5947,6 +5974,218 @@ def build_backend(
                 plan_update=plan_update,
                 automation_requests=automation_requests,
                 finish_current_work=value.get("finish_current_work") is True,
+            )
+
+        lead_review_coalescer = LeadReviewCoalescer()
+
+        async def _current_lead_task_revision(
+            campaign_id: str,
+        ) -> tuple[int | None, str | None, str | None]:
+            waves_loader = getattr(campaign_store, "list_waves", None)
+            if not callable(waves_loader):
+                return None, None, None
+            waves = await asyncio.to_thread(waves_loader, campaign_id)
+            if not waves:
+                return None, None, None
+            latest = waves[-1]
+            wave = int(latest["wave"])
+            schedule_id = str(latest.get("schedule_id") or "")
+            if not schedule_id:
+                return wave, None, None
+            current_tasks = tuple(await agents.list_schedule_tasks(schedule_id))
+            return wave, schedule_id, authoritative_task_revision(current_tasks)
+
+        async def run_campaign_lead(
+            campaign_id: str,
+            campaign_profile: CampaignProfile,
+            attempt: int,
+            tasks: tuple[object, ...],
+            refresh_prompt_tasks: Callable[[], Awaitable[tuple[object, ...]]] | None = None,
+        ) -> LeadAssessment:
+            wave, schedule_id, current_task_revision = await _current_lead_task_revision(
+                campaign_id
+            )
+            task_revision = current_task_revision or authoritative_task_revision(tasks)
+            lead_rows = tuple(await asyncio.to_thread(campaign_store.list_lead, campaign_id))
+            lead_model = config.provider_role_models.get("lead", model)
+            result_budget = _lead_result_char_budget(
+                capability_registry, provider, lead_model, len(tasks)
+            )
+            task_snapshot = _lead_task_rows(
+                tasks,
+                campaign_id=campaign_id,
+                profile=campaign_profile.value,
+                attempt=attempt,
+                per_result_chars=result_budget,
+            )
+            terminal_statuses = {
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted",
+                "quarantined",
+            }
+            active_worker_work = any(
+                str(getattr(task, "status", "")) not in terminal_statuses for task in tasks
+            )
+            blocking = not active_worker_work
+            waiting_for = (
+                "Lead supervision guidance; active workers continue"
+                if active_worker_work
+                else "Lead decision before the next dependent wave can be scheduled"
+            )
+            snapshot = LeadReviewSnapshot(
+                campaign_id=campaign_id,
+                profile=campaign_profile.value,
+                attempt=attempt,
+                wave=wave,
+                schedule_id=schedule_id,
+                task_revision=task_revision,
+                guidance_revision=guidance_revision(lead_rows),
+                prompt_revision=prompt_input_revision(task_snapshot, lead_rows),
+                blocking=blocking,
+                waiting_for=waiting_for,
+            )
+
+            async def execute() -> LeadAssessment:
+                started_at = datetime.now(UTC).isoformat()
+                await asyncio.to_thread(
+                    campaign_store.append_lead,
+                    campaign_id,
+                    wave if wave is not None else attempt,
+                    {
+                        "kind": "lead_review_started",
+                        **snapshot.projection(),
+                        "review_kind": "wave results",
+                        "state": "reviewing",
+                        "blocking": snapshot.blocking,
+                        "advisory": not snapshot.blocking,
+                        "started_at": started_at,
+                        "last_activity": "immutable review snapshot sealed",
+                        "waiting_for": snapshot.waiting_for,
+                    },
+                )
+                started = time.monotonic()
+                try:
+                    assessment = await _run_campaign_lead_once(
+                        campaign_id,
+                        campaign_profile,
+                        attempt,
+                        tasks,
+                        snapshot,
+                        task_snapshot,
+                        lead_rows,
+                    )
+                except BaseException as error:
+                    await asyncio.to_thread(
+                        campaign_store.append_lead,
+                        campaign_id,
+                        wave if wave is not None else attempt,
+                        {
+                            "kind": "lead_review_failed",
+                            **snapshot.projection(),
+                            "state": "cancelled"
+                            if isinstance(error, asyncio.CancelledError)
+                            else "failed",
+                            "blocking": False,
+                            "advisory": False,
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                            "last_activity": "review ended without a usable decision",
+                            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+                        },
+                    )
+                    raise
+                (
+                    latest_wave,
+                    latest_schedule_id,
+                    latest_task_revision,
+                ) = await _current_lead_task_revision(campaign_id)
+                latest_rows = await asyncio.to_thread(campaign_store.list_lead, campaign_id)
+                latest_guidance_revision = guidance_revision(latest_rows)
+                stale_reasons = []
+                current_prompt_revision = snapshot.prompt_revision
+                if refresh_prompt_tasks is not None:
+                    refreshed_tasks = await refresh_prompt_tasks()
+                    refreshed_budget = _lead_result_char_budget(
+                        capability_registry,
+                        provider,
+                        lead_model,
+                        len(refreshed_tasks),
+                    )
+                    refreshed_task_snapshot = _lead_task_rows(
+                        refreshed_tasks,
+                        campaign_id=campaign_id,
+                        profile=campaign_profile.value,
+                        attempt=attempt,
+                        per_result_chars=refreshed_budget,
+                    )
+                    # Keep the journal boundary sealed at review start so the
+                    # review's own progress/drop events cannot invalidate it.
+                    current_prompt_revision = prompt_input_revision(
+                        refreshed_task_snapshot,
+                        lead_rows,
+                    )
+                    if current_prompt_revision != snapshot.prompt_revision:
+                        stale_reasons.append("durable Lead prompt inputs changed")
+                if not await lead_review_coalescer.is_current(campaign_id, snapshot.revision):
+                    stale_reasons.append("normalized Lead prompt inputs changed")
+                if snapshot.wave is not None and latest_wave != snapshot.wave:
+                    stale_reasons.append("active wave changed")
+                if snapshot.schedule_id is not None and latest_schedule_id != snapshot.schedule_id:
+                    stale_reasons.append("active schedule changed")
+                if (
+                    snapshot.schedule_id is not None
+                    and latest_task_revision is not None
+                    and latest_task_revision != snapshot.task_revision
+                ):
+                    stale_reasons.append("authoritative task state changed")
+                if latest_guidance_revision != snapshot.guidance_revision:
+                    stale_reasons.append("operator guidance changed")
+                elapsed_seconds = round(time.monotonic() - started, 3)
+                if stale_reasons:
+                    await asyncio.to_thread(
+                        campaign_store.append_lead,
+                        campaign_id,
+                        wave if wave is not None else attempt,
+                        {
+                            "kind": "lead_review_stale",
+                            **snapshot.projection(),
+                            "state": "discarded",
+                            "blocking": False,
+                            "advisory": False,
+                            "elapsed_seconds": elapsed_seconds,
+                            "last_activity": "stale result rejected",
+                            "reason": "; ".join(stale_reasons),
+                            "current_schedule_id": latest_schedule_id,
+                            "current_wave": latest_wave,
+                            "current_task_revision": latest_task_revision,
+                            "current_guidance_revision": latest_guidance_revision,
+                            "current_prompt_revision": current_prompt_revision,
+                        },
+                    )
+                    raise CampaignLeadDecisionError(
+                        "Campaign Lead review snapshot became stale: " + "; ".join(stale_reasons)
+                    )
+                await asyncio.to_thread(
+                    campaign_store.append_lead,
+                    campaign_id,
+                    wave if wave is not None else attempt,
+                    {
+                        "kind": "lead_review_completed",
+                        **snapshot.projection(),
+                        "state": "completed",
+                        "blocking": False,
+                        "advisory": False,
+                        "elapsed_seconds": elapsed_seconds,
+                        "last_activity": "typed Lead decision returned for validation",
+                    },
+                )
+                return assessment
+
+            return await lead_review_coalescer.run(
+                snapshot.revision,
+                execute,
+                scope=campaign_id,
             )
 
         async def run_exploration_review(
@@ -7334,7 +7573,11 @@ def build_backend(
         async def create_campaign_report(
             campaign_id: str, manifest: CampaignManifest, stop_reason: str
         ) -> None:
-            stop_reason = require_campaign_terminal_reason(stop_reason).value
+            # Reports may be rebuilt from campaigns sealed before the closed
+            # terminal taxonomy. Normalize those persisted aliases here; new
+            # lifecycle writes remain guarded by require_campaign_terminal_reason
+            # in the campaign store.
+            stop_reason = read_campaign_terminal_reason(stop_reason).value
             report_directory = automatic_report_directory
             safe_campaign_id = "".join(
                 character if character.isalnum() or character in {"-", "_"} else "-"
@@ -8793,6 +9036,12 @@ def build_backend(
                 transform_report_state = "incomplete"
             if completion_incomplete:
                 transform_report_state = "incomplete"
+            sealed_campaign_outcome = completion_document.get("campaign_outcome")
+            if isinstance(sealed_campaign_outcome, Mapping) and (
+                sealed_campaign_outcome.get("lifecycle") != "completed"
+                or bool(sealed_campaign_outcome.get("unresolved_objective_ids"))
+            ):
+                transform_report_state = "incomplete"
             final_report_state = transform_report_state or (
                 "complete"
                 if stop_reason
@@ -8956,6 +9205,21 @@ def build_backend(
                 metadata={
                     "title": f"Security assessment of {canonical_target}",
                     "objective": manifest.objective,
+                    **(
+                        {
+                            "objective_contract": dict(
+                                completion_document["objective_contract"]
+                            ),
+                            "campaign_outcome": dict(
+                                completion_document["campaign_outcome"]
+                            ),
+                        }
+                        if isinstance(
+                            completion_document.get("objective_contract"), Mapping
+                        )
+                        and isinstance(completion_document.get("campaign_outcome"), Mapping)
+                        else {}
+                    ),
                     "target": canonical_target,
                     "target_endpoint": manifest.target.endpoint,
                     **(

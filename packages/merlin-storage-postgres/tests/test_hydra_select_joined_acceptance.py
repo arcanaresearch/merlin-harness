@@ -619,7 +619,7 @@ async def test_joined_hydra_ack_prefix_replacement_never_regenerates_or_resends(
                     row for row in internal.techniques if row["strategy_id"] == "hydra-select"
                 )
                 assert technique["outcome"] == "unclear"
-                assert internal.stop_reason == "capped"
+                assert internal.stop_reason == "budget_exhausted"
                 assert internal.report_state == "incomplete"
                 assert (
                     sum(row.get("strategy_id") == "hydra-select" for row in internal.techniques)

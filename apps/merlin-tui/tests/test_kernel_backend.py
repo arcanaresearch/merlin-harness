@@ -2083,7 +2083,15 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
             ]
 
         async def wave_progress(self, campaign_id):
-            return await service.wave_progress(campaign_id)
+            progress = dict(await service.wave_progress(campaign_id))
+            progress["review_progress"] = {
+                "review_kind": "wave_results",
+                "blocking": True,
+                "elapsed_seconds": 42,
+                "last_activity": "Checking state transitions",
+                "waiting_for": "Next-wave selection",
+            }
+            return progress
 
         async def list(self, session_id, *, limit):
             assert session_id == "session-1"
@@ -2096,6 +2104,13 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
     assert campaigns[0].target_progress["status"] == "unknown"
     assert campaigns[0].wave_kind == "attack"
     assert campaigns[0].wave_status == "running"
+    assert campaigns[0].review_progress == {
+        "review_kind": "wave_results",
+        "blocking": True,
+        "elapsed_seconds": 42,
+        "last_activity": "Checking state transitions",
+        "waiting_for": "Next-wave selection",
+    }
 
 
 @pytest.mark.asyncio

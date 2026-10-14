@@ -24,6 +24,7 @@ from merlin_assessments.api_target import (
     _infrastructure_failure_category,
     _ResponsePointerMissing,
     _reviewed_session_scope_id,
+    _state_enumerations,
     _StateScopeLease,
     _structured_constraint_rejection_observations,
     _target_parallel_capacity,
@@ -33,6 +34,9 @@ from merlin_assessments.api_target import (
 from merlin_config import ConfigPaths, CredentialCheckpointVault
 from merlin_contracts import (
     InfrastructureFailureCategory,
+    StateEnumerationCompleteness,
+    StateEnumerationDeclaration,
+    StateEnumerationShape,
     ToolContext,
     executable_adapter_digest,
 )
@@ -40,6 +44,7 @@ from merlin_contracts.target_adapter_compiler import (
     compile_target_adapter,
     compiled_target_adapter_digest,
 )
+from merlin_contracts.target_capabilities import StateCapabilities, StateSelector
 from merlin_storage_postgres import (
     CampaignApiSessionRepository,
     CampaignStore,
@@ -4231,6 +4236,77 @@ def test_state_metadata_without_physical_identity_is_never_authoritative() -> No
     transition = metadata["target_state_transition"]
     assert isinstance(transition, dict)
     assert transition["outcome"] == "unclear"
+
+
+def test_reviewed_api_state_enumeration_reaches_target_metadata() -> None:
+    declaration = StateEnumerationDeclaration(
+        schema_version="merlin.state-enumeration-declaration.v1",
+        name="language",
+        selector=StateSelector(
+            schema_version="merlin.state-selector.v1",
+            step_id="message",
+            evaluation_root="response_body",
+            pointer="/available_languages",
+            evidence_refs=("evidence:language-response",),
+        ),
+        shape=StateEnumerationShape.FLAT,
+        completeness=StateEnumerationCompleteness.COMPLETE,
+        evidence_refs=("evidence:reviewed-adapter",),
+    )
+    adapter = SimpleNamespace(
+        state_capabilities=StateCapabilities(enumerations=(declaration,)),
+        digest="sha256:" + "1" * 64,
+        compiled_digest="sha256:" + "2" * 64,
+        target_id="target-1",
+    )
+
+    enumerations = _state_enumerations(
+        adapter,
+        SimpleNamespace(id="message"),
+        {"available_languages": ["en", "ms"]},
+        {},
+    )
+    metadata: dict[str, object] = {
+        "current_target_exchanges": [{"state_enumerations": enumerations}]
+    }
+    _augment_target_state_metadata(metadata)
+
+    assert metadata["state_enumerations"] == enumerations
+    assert enumerations[0]["members_by_scope"] == {"*": ["en", "ms"]}
+    assert enumerations[0]["complete"] is True
+    assert _state_enumerations(
+        adapter,
+        SimpleNamespace(id="unreviewed-later-step"),
+        {"available_languages": ["forged"]},
+        {},
+    ) == []
+
+
+def test_reviewed_api_state_enumeration_rejects_shape_drift() -> None:
+    declaration = StateEnumerationDeclaration(
+        name="language",
+        selector=StateSelector(
+            step_id="message",
+            evaluation_root="response_body",
+            pointer="/available_languages",
+            evidence_refs=("evidence:language-response",),
+        ),
+        shape=StateEnumerationShape.FLAT,
+        completeness=StateEnumerationCompleteness.COMPLETE,
+    )
+    adapter = SimpleNamespace(
+        state_capabilities=StateCapabilities(enumerations=(declaration,)),
+        digest="sha256:" + "1" * 64,
+        compiled_digest="sha256:" + "2" * 64,
+        target_id="target-1",
+    )
+
+    assert _state_enumerations(
+        adapter,
+        SimpleNamespace(id="message"),
+        {"available_languages": "en"},
+        {},
+    ) == []
 
 
 @pytest.mark.asyncio

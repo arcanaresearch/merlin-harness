@@ -251,7 +251,9 @@ def test_final_request_projection_prunes_tool_output_before_summary() -> None:
         *[ChatMessage(role="assistant", content=f"state-{index}") for index in range(48)],
     ]
 
-    projected = _compact_messages(messages, context_window_tokens=3_072)
+    # Keep the fixture in the narrow band where the original transcript exceeds
+    # the request budget but replacing the old tool output with its receipt fits.
+    projected = _compact_messages(messages, context_window_tokens=4_096)
 
     assert not any("Earlier durable conversation context compacted" in m.content for m in projected)
     assert '"type":"tool_result_receipt"' in projected[2].content

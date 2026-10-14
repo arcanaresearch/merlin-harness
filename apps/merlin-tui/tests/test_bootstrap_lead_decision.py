@@ -1,10 +1,19 @@
 """Lead decision parsing tolerance and retry feedback in the bootstrap closure."""
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
-from merlin_agents import CampaignProfile, FrontierHypothesis, LeadFollowUp
+from merlin_agents import (
+    AssignmentBudget,
+    CampaignManifest,
+    CampaignProfile,
+    FrontierHypothesis,
+    LeadFollowUp,
+    ReviewedTargetAdapter,
+)
+from merlin_agents.campaign_service import CampaignLeadDecisionError
 from merlin_config import Config, CredentialStore
 from merlin_contracts import AgentTask, ModelCompleted, ModelUsage, TextDelta
 from merlin_storage_postgres import Database, DatabaseConfig
@@ -98,6 +107,353 @@ def _prepare_campaign(backend, campaign_id: str, session_id: str) -> None:
         },
         "sha256:lead-decision",
     )
+
+
+def _campaign_manifest(campaign_id: str, session_id: str) -> CampaignManifest:
+    return CampaignManifest.create(
+        id=campaign_id,
+        session_id=session_id,
+        objective="Assess the reviewed target",
+        profile=CampaignProfile.QUICKSCAN,
+        target=ReviewedTargetAdapter(
+            "target-1", "api", "https://target.invalid/chat", "target-model"
+        ),
+        provider_id="provider-1",
+        provider_model="lead-model",
+        provider_effort="default",
+        authority_ids=(f"session:{session_id}", "target:target-1"),
+        catalogue=(),
+        skill_documents=(),
+        tool_ids=(),
+        budget=AssignmentBudget(4, 100_000, 600),
+        specialist_composition="opinionated",
+    )
+
+
+class _StateChangingLeadProvider:
+    changed = False
+
+    def __init__(self, config) -> None:
+        self.config = config
+
+    async def stream(self, _request):
+        yield ModelUsage(input_tokens=10, output_tokens=10, total_tokens=20)
+        yield TextDelta(
+            text=json.dumps(
+                {
+                    "summary": "decision from the original task snapshot",
+                    "coverage_complete": False,
+                }
+            )
+        )
+        type(self).changed = True
+        yield ModelCompleted()
+
+
+@pytest.mark.asyncio
+async def test_lead_decision_rejects_result_when_authoritative_tasks_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _StateChangingLeadProvider.changed = False
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(
+            tmp_path,
+            monkeypatch,
+            database.url,
+            _StateChangingLeadProvider,
+        )
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-stale-snapshot"
+            _prepare_campaign(backend, campaign_id, session_id)
+            store = backend._campaigns._store  # noqa: SLF001
+            agents = backend._campaigns._agents  # noqa: SLF001
+            monkeypatch.setattr(
+                store,
+                "list_waves",
+                lambda _campaign_id: [
+                    {"wave": 4, "schedule_id": "schedule-4", "kind": "followup"}
+                ],
+            )
+
+            async def list_schedule_tasks(_schedule_id):
+                return (
+                    AgentTask(
+                        id="task-1",
+                        objective="Assess",
+                        status="running" if _StateChangingLeadProvider.changed else "completed",
+                    ),
+                )
+
+            monkeypatch.setattr(agents, "list_schedule_tasks", list_schedule_tasks)
+
+            with pytest.raises(CampaignLeadDecisionError, match="snapshot became stale"):
+                await backend._campaigns._lead_runner(  # noqa: SLF001
+                    campaign_id,
+                    CampaignProfile.RECOMMENDED,
+                    0,
+                    (AgentTask(id="task-1", objective="Assess", status="completed"),),
+                )
+
+            events = [
+                row["payload"]
+                for row in store.list_lead(campaign_id)
+                if row["payload"].get("kind") == "lead_review_stale"
+            ]
+            assert len(events) == 1
+            assert events[0]["wave"] == 4
+            assert "authoritative task state changed" in events[0]["reason"]
+        finally:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_control_projection_supersedes_in_flight_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class Provider:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def stream(self, request):
+            prompt = "\n".join(message.content for message in request.messages)
+            if "receipt-old" in prompt:
+                first_started.set()
+                await release_first.wait()
+            yield ModelUsage(input_tokens=10, output_tokens=10, total_tokens=20)
+            yield TextDelta(
+                text=json.dumps(
+                    {
+                        "summary": "decision for sealed prompt inputs",
+                        "coverage_complete": False,
+                    }
+                )
+            )
+            yield ModelCompleted()
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(tmp_path, monkeypatch, database.url, Provider)
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-control-superseded"
+            _prepare_campaign(backend, campaign_id, session_id)
+
+            def tasks(receipt: str) -> tuple[AgentTask, ...]:
+                return (
+                    AgentTask(id="task-1", objective="Assess", status="completed"),
+                    AgentTask(
+                        id=f"{campaign_id}/lead-control/evidence_get",
+                        objective="Project evidence",
+                        status="completed",
+                        result=json.dumps({"receipt": receipt}),
+                    ),
+                )
+
+            first = asyncio.create_task(
+                backend._campaigns._lead_runner(  # noqa: SLF001
+                    campaign_id,
+                    CampaignProfile.RECOMMENDED,
+                    0,
+                    tasks("receipt-old"),
+                )
+            )
+            await first_started.wait()
+            newer = await backend._campaigns._lead_runner(  # noqa: SLF001
+                campaign_id,
+                CampaignProfile.RECOMMENDED,
+                0,
+                tasks("receipt-new"),
+            )
+            assert newer.summary == "decision for sealed prompt inputs"
+            release_first.set()
+            with pytest.raises(CampaignLeadDecisionError, match="snapshot became stale"):
+                await first
+
+            stale = [
+                row["payload"]
+                for row in backend._campaigns._store.list_lead(campaign_id)  # noqa: SLF001
+                if row["payload"].get("kind") == "lead_review_stale"
+            ]
+            assert len(stale) == 1
+            assert "normalized Lead prompt inputs changed" in stale[0]["reason"]
+        finally:
+            release_first.set()
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_single_review_rejects_durable_control_change_without_second_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = False
+
+    class Provider:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def stream(self, _request):
+            nonlocal changed
+            yield ModelUsage(input_tokens=10, output_tokens=10, total_tokens=20)
+            yield TextDelta(
+                text=json.dumps(
+                    {
+                        "summary": "decision from old durable evidence",
+                        "coverage_complete": False,
+                    }
+                )
+            )
+            changed = True
+            yield ModelCompleted()
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(tmp_path, monkeypatch, database.url, Provider)
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-control-mutated"
+            _prepare_campaign(backend, campaign_id, session_id)
+
+            def projected_tasks(receipt: str) -> tuple[AgentTask, ...]:
+                return (
+                    AgentTask(id="task-1", objective="Assess", status="completed"),
+                    AgentTask(
+                        id=f"{campaign_id}/lead-control/evidence_get",
+                        objective="Project evidence",
+                        status="completed",
+                        result=json.dumps({"receipt": receipt}),
+                    ),
+                )
+
+            async def refresh_prompt_tasks() -> tuple[AgentTask, ...]:
+                return projected_tasks("receipt-new" if changed else "receipt-old")
+
+            with pytest.raises(CampaignLeadDecisionError, match="snapshot became stale"):
+                await backend._campaigns._lead_runner(  # noqa: SLF001
+                    campaign_id,
+                    CampaignProfile.RECOMMENDED,
+                    0,
+                    projected_tasks("receipt-old"),
+                    refresh_prompt_tasks,
+                )
+
+            stale = [
+                row["payload"]
+                for row in backend._campaigns._store.list_lead(campaign_id)  # noqa: SLF001
+                if row["payload"].get("kind") == "lead_review_stale"
+            ]
+            assert len(stale) == 1
+            assert "durable Lead prompt inputs changed" in stale[0]["reason"]
+        finally:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_production_lead_review_does_not_invalidate_its_own_journal_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Provider:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def stream(self, _request):
+            yield ModelUsage(input_tokens=10, output_tokens=10, total_tokens=20)
+            yield TextDelta(
+                text=json.dumps(
+                    {
+                        "summary": "accepted production review",
+                        "coverage_complete": False,
+                    }
+                )
+            )
+            yield ModelCompleted()
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(tmp_path, monkeypatch, database.url, Provider)
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-production-self-journal"
+            _prepare_campaign(backend, campaign_id, session_id)
+            manifest = _campaign_manifest(campaign_id, session_id)
+
+            result = await backend._campaigns._run_lead_with_policy(  # noqa: SLF001
+                manifest,
+                (AgentTask(id="task-1", objective="Assess", status="completed"),),
+            )
+
+            assert result.summary == "accepted production review"
+            lead_rows = backend._campaigns._store.list_lead(campaign_id)  # noqa: SLF001
+            assert not any(row["payload"].get("kind") == "lead_review_stale" for row in lead_rows)
+            assert any(row.get("decision_id") is not None for row in lead_rows)
+        finally:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_production_lead_review_rejects_external_worker_evidence_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def record_external_evidence() -> None:
+        pass
+
+    class Provider:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def stream(self, _request):
+            yield ModelUsage(input_tokens=10, output_tokens=10, total_tokens=20)
+            yield TextDelta(
+                text=json.dumps(
+                    {
+                        "summary": "decision from the old evidence projection",
+                        "coverage_complete": False,
+                    }
+                )
+            )
+            record_external_evidence()
+            yield ModelCompleted()
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        backend = _build_backend(tmp_path, monkeypatch, database.url, Provider)
+        try:
+            session_id = await backend.kernel.start()
+            campaign_id = "campaign/lead-production-external-evidence"
+            _prepare_campaign(backend, campaign_id, session_id)
+            manifest = _campaign_manifest(campaign_id, session_id)
+            store = backend._campaigns._store  # noqa: SLF001
+
+            def record() -> None:
+                store.record_worker_message(
+                    {
+                        "id": "external-evidence-1",
+                        "campaign_id": campaign_id,
+                        "wave": 0,
+                        "source_task_id": "worker/recon",
+                        "destination": "lead",
+                        "content": "A new attributable target receipt arrived during review.",
+                        "content_digest": "sha256:" + "a" * 64,
+                        "kind": "discovery",
+                    }
+                )
+
+            record_external_evidence = record
+
+            with pytest.raises(CampaignLeadDecisionError, match="snapshot became stale"):
+                await backend._campaigns._run_lead_with_policy(  # noqa: SLF001
+                    manifest,
+                    (AgentTask(id="task-1", objective="Assess", status="completed"),),
+                )
+
+            stale = [
+                row["payload"]
+                for row in store.list_lead(campaign_id)
+                if row["payload"].get("kind") == "lead_review_stale"
+            ]
+            assert len(stale) == 1
+            assert "durable Lead prompt inputs changed" in stale[0]["reason"]
+        finally:
+            await backend.close()
 
 
 @pytest.mark.asyncio

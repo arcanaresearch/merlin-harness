@@ -2,7 +2,7 @@ type Report = Record<string, unknown>;
 
 /** Execution termination and assessment completeness are different facts. */
 export function reportStatus(report: Report) {
-    if (report.stop_reason === "capped") {
+    if (["budget_exhausted", "capped"].includes(String(report.stop_reason))) {
         return {
             title: "Scan finished · limit reached",
             detail: "The configured scan limit was reached. Results cover the work completed within that limit.",

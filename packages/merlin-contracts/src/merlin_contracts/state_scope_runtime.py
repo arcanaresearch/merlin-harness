@@ -41,6 +41,18 @@ class StateScopeStore(Protocol):
 
     def release_state_scope_lease(self, claim_id: str, claimant_id: str) -> bool: ...
 
+    def reobserve_state_lane(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        evidence_refs: Sequence[str],
+        *,
+        claim_id: str,
+        claimant_id: str,
+        principal_identity: Mapping[str, object] | None = None,
+        physical_state_identity: Mapping[str, object] | None = None,
+    ) -> Mapping[str, object]: ...
+
     def create_state_scope(
         self,
         campaign_id: str,
@@ -216,6 +228,7 @@ class StateScopeLifecycle:
     finished: bool = False
     principal_identity: Mapping[str, object] | None = None
     physical_state_identity: Mapping[str, object] | None = None
+    lane_revision: int | None = None
 
     @classmethod
     async def create(
@@ -227,6 +240,7 @@ class StateScopeLifecycle:
         attempt_id: str,
         action_id: str,
         candidate_id: str,
+        experiment_id: str | None = None,
         action_kind: StateScopeActionKind = StateScopeActionKind.CANDIDATE,
     ) -> StateScopeLifecycle:
         scope_id = (
@@ -240,10 +254,10 @@ class StateScopeLifecycle:
             attempt_id=attempt_id,
             action_id=action_id,
             candidate_id=candidate_id,
-            experiment_id=attempt_id,
+            experiment_id=experiment_id or attempt_id,
             action_kind=action_kind,
         )
-        await asyncio.to_thread(
+        stored = await asyncio.to_thread(
             store.create_state_scope,
             campaign_id,
             target_authority,
@@ -256,6 +270,9 @@ class StateScopeLifecycle:
             ),
             isolation_disposition="unknown",
         )
+        expected_lane_revision = stored.get("expected_lane_revision")
+        if isinstance(expected_lane_revision, int):
+            lifecycle.lane_revision = expected_lane_revision
         return lifecycle
 
     @property
@@ -283,6 +300,27 @@ class StateScopeLifecycle:
     def unbind_lease(self) -> None:
         self.claim_id = None
         self.claimant_id = None
+
+    async def ensure_authoritative_before(self, evidence_refs: Sequence[str]) -> None:
+        """Reconcile a restart-fenced lane before any new target effect."""
+
+        reobserve = getattr(self.store, "reobserve_state_lane", None)
+        if not callable(reobserve) or self.lane_revision is None:
+            return
+        claim_id, claimant_id = self._lease_binding()
+        observed = await asyncio.to_thread(
+            reobserve,
+            self.scope_id,
+            self.lane_revision,
+            tuple(evidence_refs),
+            claim_id=claim_id,
+            claimant_id=claimant_id,
+            principal_identity=self.principal_identity,
+            physical_state_identity=self.physical_state_identity,
+        )
+        revision = observed.get("revision")
+        if isinstance(revision, int):
+            self.lane_revision = revision
 
     async def acknowledge(
         self,

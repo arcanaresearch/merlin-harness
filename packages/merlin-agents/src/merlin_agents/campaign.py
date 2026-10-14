@@ -11,7 +11,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from merlin_contracts import CapabilityGrant, executable_adapter_digest
+from merlin_contracts import (
+    CampaignObjectiveContract,
+    CapabilityGrant,
+    executable_adapter_digest,
+)
 from merlin_contracts.generation import GeneratorExecutionContract
 from merlin_contracts.target_adapter_compiler import (
     AdapterCompileError,
@@ -1072,6 +1076,7 @@ class CampaignManifest:
     tool_ids: tuple[str, ...]
     budget: AssignmentBudget
     digest: str
+    objective_contract: Mapping[str, object] | None = None
     specialist_composition: str = "opinionated"
     dynamic_specialist_policy: DynamicSpecialistPolicy | None = None
     objective_phase_gates: tuple[ObjectivePhaseGate, ...] = ()
@@ -1094,6 +1099,7 @@ class CampaignManifest:
         skill_documents: tuple[ContextDocument, ...],
         tool_ids: tuple[str, ...],
         budget: AssignmentBudget,
+        objective_contract: CampaignObjectiveContract | Mapping[str, object] | None = None,
         specialist_composition: str = "opinionated",
         dynamic_specialist_policy: DynamicSpecialistPolicy | None = None,
         objective_phase_gates: tuple[ObjectivePhaseGate, ...] = (),
@@ -1101,6 +1107,11 @@ class CampaignManifest:
     ) -> CampaignManifest:
         if specialist_composition not in ("opinionated", "autonomous"):
             raise ValueError("specialist_composition must be 'opinionated' or 'autonomous'")
+        reviewed_objective_contract = (
+            CampaignObjectiveContract.model_validate(objective_contract).model_dump(mode="json")
+            if objective_contract is not None
+            else None
+        )
         _validate_objective_phase_gates(objective_phase_gates)
         values = {
             "id": id,
@@ -1121,6 +1132,8 @@ class CampaignManifest:
                 asdict(dynamic_specialist_policy) if dynamic_specialist_policy is not None else None
             ),
         }
+        if reviewed_objective_contract is not None:
+            values["objective_contract"] = reviewed_objective_contract
         if objective_phase_gates:
             values["objective_phase_gates"] = [asdict(gate) for gate in objective_phase_gates]
         reviewed_regeneration = (
@@ -1146,6 +1159,7 @@ class CampaignManifest:
             tool_ids=tool_ids,
             budget=budget,
             digest=digest,
+            objective_contract=reviewed_objective_contract,
             specialist_composition=specialist_composition,
             dynamic_specialist_policy=dynamic_specialist_policy,
             objective_phase_gates=objective_phase_gates,
@@ -1178,6 +1192,13 @@ class CampaignManifest:
             tool_ids=tuple(str(item) for item in value["tool_ids"]),
             budget=AssignmentBudget(**value["budget"]),
             digest=str(value["digest"]),
+            objective_contract=(
+                CampaignObjectiveContract.model_validate(value["objective_contract"]).model_dump(
+                    mode="json"
+                )
+                if value.get("objective_contract") is not None
+                else None
+            ),
             specialist_composition=str(value.get("specialist_composition", "opinionated")),
             dynamic_specialist_policy=(
                 DynamicSpecialistPolicy(**reviewed_policy)
@@ -1211,6 +1232,7 @@ class CampaignManifest:
             skill_documents=self.skill_documents,
             tool_ids=self.tool_ids,
             budget=self.budget,
+            objective_contract=self.objective_contract,
             specialist_composition=self.specialist_composition,
             dynamic_specialist_policy=self.dynamic_specialist_policy,
             objective_phase_gates=self.objective_phase_gates,
@@ -1221,7 +1243,8 @@ class CampaignManifest:
         # Manifests sealed before specialist-composition binding remain valid
         # while they carry the additive defaults.
         if (
-            not self.objective_phase_gates
+            self.objective_contract is None
+            and not self.objective_phase_gates
             and self.bounded_regeneration is None
             and self.specialist_composition == "opinionated"
             and self.dynamic_specialist_policy is None
@@ -1558,6 +1581,7 @@ def manifest_with_target_brief(
         id=manifest.id,
         session_id=manifest.session_id,
         objective=manifest.objective,
+        objective_contract=manifest.objective_contract,
         profile=manifest.profile,
         target=manifest.target,
         provider_id=manifest.provider_id,
@@ -1584,6 +1608,7 @@ def manifest_with_objective_phase_gates(
         id=manifest.id,
         session_id=manifest.session_id,
         objective=manifest.objective,
+        objective_contract=manifest.objective_contract,
         profile=manifest.profile,
         target=manifest.target,
         provider_id=manifest.provider_id,
@@ -1610,6 +1635,7 @@ def manifest_with_bounded_regeneration(
         id=manifest.id,
         session_id=manifest.session_id,
         objective=manifest.objective,
+        objective_contract=manifest.objective_contract,
         profile=manifest.profile,
         target=manifest.target,
         provider_id=manifest.provider_id,
@@ -1624,6 +1650,33 @@ def manifest_with_bounded_regeneration(
         dynamic_specialist_policy=manifest.dynamic_specialist_policy,
         objective_phase_gates=manifest.objective_phase_gates,
         bounded_regeneration=contract,
+    )
+
+
+def manifest_with_objective_contract(
+    manifest: CampaignManifest,
+    contract: CampaignObjectiveContract | Mapping[str, object],
+) -> CampaignManifest:
+    """Re-seal a manifest with operator requirements compiled before approval."""
+    return CampaignManifest.create(
+        id=manifest.id,
+        session_id=manifest.session_id,
+        objective=manifest.objective,
+        objective_contract=contract,
+        profile=manifest.profile,
+        target=manifest.target,
+        provider_id=manifest.provider_id,
+        provider_model=manifest.provider_model,
+        provider_effort=manifest.provider_effort,
+        authority_ids=manifest.authority_ids,
+        catalogue=manifest.catalogue,
+        skill_documents=manifest.skill_documents,
+        tool_ids=manifest.tool_ids,
+        budget=manifest.budget,
+        specialist_composition=manifest.specialist_composition,
+        dynamic_specialist_policy=manifest.dynamic_specialist_policy,
+        objective_phase_gates=manifest.objective_phase_gates,
+        bounded_regeneration=manifest.bounded_regeneration,
     )
 
 
@@ -2898,6 +2951,29 @@ def compile_execution_agenda(
     profiles = {
         profile.id: profile for profile in (*CORE_WORKER_PROFILES, *context.additional_profiles)
     }
+    unresolved_objective_selectors: tuple[str, ...] = ()
+    if manifest.objective_contract is not None:
+        contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
+        unresolved: list[str] = []
+        for objective in contract.objectives:
+            for selector in objective.selectors:
+                bindings = {item.selector_value: item for item in selector.bindings}
+                for value in selector.expected_binding_values():
+                    binding = bindings.get(value)
+                    if binding is None or binding.status.value == "unresolved":
+                        unresolved.append(
+                            f"objective_id={objective.id}; "
+                            f"selector_dimension={selector.dimension}; "
+                            f"selector_value={value}"
+                        )
+        unresolved_objective_selectors = tuple(dict.fromkeys(unresolved))
+    selector_resolution_instruction = (
+        "\n\nResolve these sealed objective selectors using attributable target evidence "
+        "and return explicit selector-to-candidate bindings: "
+        + ", ".join(unresolved_objective_selectors)
+        if unresolved_objective_selectors
+        else ""
+    )
     discovery = tuple(
         assignment
         if not assignment.technique_ids
@@ -2908,6 +2984,7 @@ def compile_execution_agenda(
                 f"{manifest.objective}\n\nPropose target-derived hypotheses that are materially "
                 "different from the admitted catalogue. Do not execute a catalogue technique "
                 "in this discovery lane."
+                f"{selector_resolution_instruction}"
             ),
             technique_ids=(),
             guidance_ids=tuple(
@@ -3467,6 +3544,50 @@ def _technique_evidence_output_schema(
                 "assertion",
                 "oracle",
                 "novelty_basis",
+                "evidence_refs",
+            ],
+            "additionalProperties": False,
+        },
+    }
+    properties["objective_selector_resolutions"] = {
+        "type": "array",
+        "description": (
+            "Optional evidence-backed resolutions for objective selectors explicitly listed "
+            "in this assignment. This is a proposal only: the campaign service accepts it "
+            "only from committed target-derived discovery, requires exact sealed objective "
+            "and selector identities, and verifies every evidence reference."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "objective_id": {"type": "string", "minLength": 1},
+                "selector_dimension": {"type": "string", "minLength": 1},
+                "bindings": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "selector_value": {"type": "string", "minLength": 1},
+                            "candidate_ids": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                        },
+                        "required": ["selector_value", "candidate_ids"],
+                        "additionalProperties": False,
+                    },
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string", "minLength": 1},
+                },
+            },
+            "required": [
+                "objective_id",
+                "selector_dimension",
+                "bindings",
                 "evidence_refs",
             ],
             "additionalProperties": False,

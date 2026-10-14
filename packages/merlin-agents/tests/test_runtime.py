@@ -65,17 +65,22 @@ from merlin_contracts import (
     ModelUsage,
     ProviderFailureKind,
     ReasoningDelta,
+    StateEnumerationCompleteness,
+    StateEnumerationDeclaration,
+    StateEnumerationShape,
     TextDelta,
     ToolCall,
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    build_state_enumeration,
     trusted_hydra_select_mechanisms,
 )
 from merlin_contracts.target_adapter_compiler import (
     compile_target_adapter,
     compiled_target_adapter_digest,
 )
+from merlin_contracts.target_capabilities import StateSelector
 from merlin_providers import ModelCapabilityRegistry, OperatorOverride, RouteIdentity
 
 
@@ -5342,6 +5347,82 @@ def test_target_evidence_receipts_survive_long_run_checkpoint_compaction() -> No
     assert "content" not in receipt
 
 
+def test_target_evidence_receipt_signs_canonical_state_enumeration() -> None:
+    declaration = StateEnumerationDeclaration(
+        name="language",
+        selector=StateSelector(
+            step_id="message",
+            evaluation_root="response_body",
+            pointer="/languages",
+            evidence_refs=("evidence:languages",),
+        ),
+        shape=StateEnumerationShape.FLAT,
+        completeness=StateEnumerationCompleteness.COMPLETE,
+    )
+    enumeration = build_state_enumeration(
+        declaration,
+        selected_value=["en", "ms"],
+        binding_context={"adapter_digest": "sha256:" + "1" * 64},
+    )
+    evidence: dict[str, dict[str, object]] = {}
+
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-enumeration", name="target_request", arguments={}),
+        ToolResult(
+            content='{"languages":["en","ms"]}',
+            metadata={
+                "attempt_disposition": "valid",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "state_enumerations": [enumeration.model_dump(mode="json")],
+            },
+        ),
+    )
+
+    receipt = evidence["target-enumeration"]
+    assert receipt["state_enumerations"] == [enumeration.model_dump(mode="json")]
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    assert receipt["receipt_sha256"] == WorkerRuntime._json_fingerprint(unsigned)  # noqa: SLF001
+
+
+def test_target_evidence_receipt_rejects_tampered_state_enumeration() -> None:
+    declaration = StateEnumerationDeclaration(
+        name="language",
+        selector=StateSelector(
+            step_id="message",
+            evaluation_root="response_body",
+            pointer="/languages",
+            evidence_refs=("evidence:languages",),
+        ),
+        shape=StateEnumerationShape.FLAT,
+        completeness=StateEnumerationCompleteness.COMPLETE,
+    )
+    enumeration = build_state_enumeration(
+        declaration,
+        selected_value=["en"],
+        binding_context={"adapter_digest": "sha256:" + "1" * 64},
+    ).model_dump(mode="json")
+    enumeration["members_by_scope"] = {"*": ["forged"]}
+    evidence: dict[str, dict[str, object]] = {}
+
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff(),
+        ToolCall(call_id="target-enumeration", name="target_request", arguments={}),
+        ToolResult(
+            content='{"languages":["en"]}',
+            metadata={
+                "attempt_disposition": "valid",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "state_enumerations": [enumeration],
+            },
+        ),
+    )
+
+    assert "state_enumerations" not in evidence["target-enumeration"]
+
+
 @pytest.mark.parametrize("matched, outcome", [(True, "confirmed"), (False, "refuted")])
 def test_target_receipt_projects_only_target_owned_objective_outcome(
     matched: bool, outcome: str
@@ -7906,6 +7987,7 @@ class ProbeTargetTools(Tools):
         super().__init__(effect="target_network")
         self.error = error
         self.arguments: list[object] = []
+        self.contexts: list[object] = []
 
     def describe(self):
         return (
@@ -7924,6 +8006,7 @@ class ProbeTargetTools(Tools):
     async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
         self.calls.append(name)
         self.arguments.append(arguments)
+        self.contexts.append(context)
         if self.error:
             return ToolResult(content="target delivery failed", is_error=True)
         return ToolResult(
@@ -8028,9 +8111,15 @@ async def test_normal_surface_probe_finalization_keeps_grounding_target_reply() 
         ]
     )
 
-    result = await WorkerRuntime(provider, ProbeTargetTools()).run(probe_handoff())
+    tools = ProbeTargetTools()
+    result = await WorkerRuntime(provider, tools).run(probe_handoff())
 
     assert result.status == "completed", result.error
+    assert tools.contexts
+    assert all(
+        getattr(context, "state_action_kind", None) == "reconnaissance"
+        for context in tools.contexts
+    )
     grounded = provider.requests[1]
     assert grounded.tools == []
     assert any(

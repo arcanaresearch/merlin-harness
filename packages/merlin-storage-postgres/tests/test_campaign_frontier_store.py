@@ -287,6 +287,56 @@ def test_frontier_shortlist_priority_update_changes_next_claim(tmp_path: Path) -
             assert tuple(item["id"] for item in batch["candidates"]) == (selected_id,)
 
 
+def test_frontier_shortlist_prefers_fresh_work_and_distinct_families(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-frontier-fairness")) as database:
+        with database.connect() as connection:
+            store, _session_id = _prepare(connection)
+            families = [
+                {"id": f"family/{name}", "document": {"id": f"family/{name}"}}
+                for name in ("a", "b", "c")
+            ]
+            candidates = [
+                {
+                    "id": candidate_id,
+                    "family_id": family_id,
+                    "ordinal": ordinal,
+                    "requested_language": language,
+                    "variant_id": "baseline",
+                    "variant": {},
+                    "state": "queued",
+                }
+                for ordinal, (candidate_id, family_id, language) in enumerate(
+                    (
+                        ("candidate/a-1", "family/a", "en"),
+                        ("candidate/a-2", "family/a", "ms"),
+                        ("candidate/b-1", "family/b", "en"),
+                        ("candidate/c-1", "family/c", "en"),
+                    )
+                )
+            ]
+            store.register_frontier("campaign/frontier", families, candidates)
+
+            diverse = store.list_frontier_shortlist("campaign/frontier", 3)
+            assert tuple(item["family_id"] for item in diverse) == (
+                "family/a",
+                "family/b",
+                "family/c",
+            )
+
+            connection.execute(
+                """UPDATE merlin_storage.campaign_frontier_candidates
+                   SET claim_generation = 3
+                   WHERE campaign_id = 'campaign/frontier' AND family_id = 'family/a'"""
+            )
+            connection.commit()
+            fair = store.list_frontier_shortlist("campaign/frontier", 3)
+            assert tuple(item["family_id"] for item in fair[:2]) == (
+                "family/b",
+                "family/c",
+            )
+            assert fair[2]["family_id"] == "family/a"
+
+
 def test_exact_frontier_claim_is_ordered_idempotent_and_concurrent(tmp_path: Path) -> None:
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres-frontier-exact")) as database:
         with database.connect() as connection:

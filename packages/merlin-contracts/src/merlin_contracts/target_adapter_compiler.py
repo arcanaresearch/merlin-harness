@@ -288,6 +288,7 @@ def _capability_step_ids(
     for observation in capabilities.observations:
         result.add(observation.baseline_selector.step_id)
         result.add(observation.result_selector.step_id)
+    result.update(item.selector.step_id for item in capabilities.enumerations)
     for rule in capabilities.identity_equivalence_rules:
         result.add(rule.left_selector.step_id)
         result.add(rule.right_selector.step_id)
@@ -381,6 +382,18 @@ def _validate_capability_step_ids(
             AdapterCompileFailureKind.CONTRACT_VALIDATION,
             "state_capabilities.observations",
             "authoritative state observations require reviewed physical-state identity",
+        )
+    invalid_enumeration_steps = sorted(
+        declaration.selector.step_id
+        for declaration in capabilities.enumerations
+        if available_steps[declaration.selector.step_id][0] is AdapterStepRole.CLEANUP
+    )
+    if invalid_enumeration_steps:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "state_capabilities.enumerations",
+            "finite denominator selectors require setup or interaction responses: "
+            + ", ".join(invalid_enumeration_steps),
         )
     setup_only_ids = {item.selector.step_id for item in capabilities.freshness_rules} | {
         item.step_id for item in capabilities.affordances if item.kind.value != "cleanup_state"

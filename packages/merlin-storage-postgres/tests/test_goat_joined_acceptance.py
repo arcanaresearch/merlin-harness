@@ -571,7 +571,7 @@ async def test_joined_goat_pending_turn_survives_restart_without_regeneration_an
             internal = backend._report_repository.get(  # type: ignore[attr-defined]
                 revision.revision_id
             )
-            assert internal.stop_reason == "capped"
+            assert internal.stop_reason == "budget_exhausted"
             assert internal.report_state == "incomplete"
             assert internal.coverage["confirmed"] == 0
             technique = next(row for row in internal.techniques if row["strategy_id"] == "goat")
@@ -607,13 +607,22 @@ async def test_joined_goat_pending_turn_survives_restart_without_regeneration_an
                 *[str(row["receipt_digest"]) for row in receipt["steps"]],
             ):
                 assert secret not in serialized
-            for visible in (
-                "reviewed response 0",
-                "reviewed response 1",
-                "target reply 1",
-                "target reply 2",
-            ):
+            for visible in ("reviewed response 0", "reviewed response 1"):
                 assert visible in serialized
+            for redacted_wire_body in ("target reply 1", "target reply 2"):
+                assert redacted_wire_body not in serialized
+            interaction_exchanges = [
+                row for row in internal.exchanges if row.get("interaction") is True
+            ]
+            assert [row["oracle_observation"]["matched"] for row in interaction_exchanges] == [
+                False,
+                True,
+            ]
+            assert all("response" not in row for row in interaction_exchanges)
+            assert all(
+                row["response_summary"] == {"kind": "str", "utf8_bytes": 16}
+                for row in interaction_exchanges
+            )
             customer_lineage = [
                 row
                 for row in customer["lineage"]
@@ -988,7 +997,7 @@ async def test_joined_goat_old_intent_restart_is_ambiguous_without_provider_or_h
             internal = backend._report_repository.get(  # type: ignore[attr-defined]
                 revision.revision_id
             )
-            assert internal.stop_reason == "interrupted"
+            assert internal.stop_reason == "infrastructure_blocked_after_retry_policy"
             assert internal.report_state == "incomplete"
             technique = next(row for row in internal.techniques if row["strategy_id"] == "goat")
             assert technique["outcome"] in {"unclear", "blocked"}

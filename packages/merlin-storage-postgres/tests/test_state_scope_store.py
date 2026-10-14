@@ -72,16 +72,19 @@ def _envelope(
     complete: bool = False,
     principal_reference: str | None = "principal-one",
     principal_digest: str | None = None,
+    physical_digest: str | None = "a" * 64,
+    experiment_id: str | None = None,
+    action_kind: str = "candidate",
 ) -> StateScopeEnvelope:
     return StateScopeEnvelope.model_validate(
         {
             "revision": revision,
             "scope_id": scope_id,
             "campaign_id": campaign_id,
-            "experiment_id": f"experiment:{scope_id}",
+            "experiment_id": experiment_id or f"experiment:{scope_id}",
             "attempt_id": f"attempt:{scope_id}",
             "action_id": action_id,
-            "action_kind": "candidate",
+            "action_kind": action_kind,
             "target_authority": "https://target.example",
             "candidate_id": f"candidate:{scope_id}",
             "isolation_lease_id": isolation_lease_id,
@@ -105,12 +108,18 @@ def _envelope(
                 if principal_reference is not None
                 else {}
             ),
-            "physical_state_identity": {
-                "kind": "keyed_digest",
-                "algorithm": "hmac-sha256",
-                "key_id": "state-v1",
-                "digest": "a" * 64,
-            },
+            **(
+                {
+                    "physical_state_identity": {
+                        "kind": "keyed_digest",
+                        "algorithm": "hmac-sha256",
+                        "key_id": "state-v1",
+                        "digest": physical_digest,
+                    }
+                }
+                if physical_digest is not None
+                else {}
+            ),
             "before": _present(f"evidence:{scope_id}:before"),
             "action": _present(f"evidence:{scope_id}:action") if delivered else _missing(),
             "responses": (_present(f"evidence:{scope_id}:responses") if complete else _missing()),
@@ -179,9 +188,7 @@ async def test_acknowledged_delivery_failure_settles_instead_of_stranding_campai
                 lease_seconds=30,
             )
             campaign = next(
-                row
-                for row in report["campaigns"]
-                if row["campaign_id"] == lifecycle.campaign_id
+                row for row in report["campaigns"] if row["campaign_id"] == lifecycle.campaign_id
             )
             assert campaign["acknowledged_state_scopes"] == 0
             assert campaign["decision"] == "resume"
@@ -478,8 +485,26 @@ def test_state_scopes_fence_cross_campaign_effects_and_share_principal_quota(
             assert settled["status"] == "settled"
             assert store.release_state_scope_lease(claim_a, "daemon-a") is True
 
+            with pytest.raises(ValueError, match="expected physical state is stale"):
+                store.claim_state_scope_lease(
+                    "scope-b",
+                    target_authority="https://target.example",
+                    principal_key="opaque_reference:identity:principal-one",
+                    equivalence_key="keyed_digest:hmac-sha256:state-v1:" + "a" * 64,
+                    claimant_id="daemon-b",
+                    lease_seconds=60,
+                )
+            store.create_state_scope(
+                "campaign/b",
+                "https://target.example",
+                _envelope(
+                    campaign_id="campaign/b",
+                    scope_id="scope-b-after-a",
+                    action_id="action-b-after-a",
+                ),
+            )
             claim_b = store.claim_state_scope_lease(
-                "scope-b",
+                "scope-b-after-a",
                 target_authority="https://target.example",
                 principal_key="opaque_reference:identity:principal-one",
                 equivalence_key="keyed_digest:hmac-sha256:state-v1:" + "a" * 64,
@@ -488,7 +513,7 @@ def test_state_scopes_fence_cross_campaign_effects_and_share_principal_quota(
             )
             assert claim_b is not None
             denied = store.reserve_resource(
-                "scope-b",
+                "scope-b-after-a",
                 "reservation-b",
                 target_authority="https://target.example",
                 principal_key="opaque_reference:identity:principal-one",
@@ -501,12 +526,12 @@ def test_state_scopes_fence_cross_campaign_effects_and_share_principal_quota(
             )
             assert denied["admitted"] is False
             paused = store.pause_state_scope(
-                "scope-b",
+                "scope-b-after-a",
                 1,
                 _envelope(
                     campaign_id="campaign/b",
-                    scope_id="scope-b",
-                    action_id="action-b",
+                    scope_id="scope-b-after-a",
+                    action_id="action-b-after-a",
                     revision=2,
                     isolation_lease_id=claim_b,
                 ),
@@ -880,3 +905,475 @@ def test_campaign_resource_budget_uses_proven_principal_and_global_reservations(
                 )
                 is None
             )
+
+
+def test_experiment_lane_rejects_a_scope_admitted_from_a_stale_revision(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _prepare_campaign(connection, "campaign/lane-cas")
+            store = CampaignApiSessionRepository(connection)
+            experiment_id = "experiment/shared-browser-api"
+            for suffix in ("one", "stale"):
+                store.create_state_scope(
+                    "campaign/lane-cas",
+                    "https://target.example",
+                    _envelope(
+                        campaign_id="campaign/lane-cas",
+                        scope_id=f"scope-{suffix}",
+                        action_id=f"action-{suffix}",
+                        experiment_id=experiment_id,
+                    ),
+                )
+
+            claim = store.claim_state_scope_lease(
+                "scope-one",
+                target_authority="https://target.example",
+                principal_key="opaque_reference:identity:principal-one",
+                equivalence_key="shared-state",
+                claimant_id="worker-one",
+                lease_seconds=60,
+            )
+            assert claim is not None
+            store.revise_state_scope(
+                "scope-one",
+                1,
+                _envelope(
+                    campaign_id="campaign/lane-cas",
+                    scope_id="scope-one",
+                    action_id="action-one",
+                    experiment_id=experiment_id,
+                    revision=2,
+                    isolation_lease_id=claim,
+                    delivered=True,
+                ),
+                claim_id=claim,
+                claimant_id="worker-one",
+            )
+            store.acknowledge_state_scope("scope-one", claim_id=claim, claimant_id="worker-one")
+            store.settle_state_scope(
+                "scope-one",
+                2,
+                _envelope(
+                    campaign_id="campaign/lane-cas",
+                    scope_id="scope-one",
+                    action_id="action-one",
+                    experiment_id=experiment_id,
+                    revision=3,
+                    isolation_lease_id=claim,
+                    delivered=True,
+                    complete=True,
+                ),
+                transition_disposition="progress",
+                isolation_disposition="shared_serialized",
+                cleanup_disposition="retained",
+                claim_id=claim,
+                claimant_id="worker-one",
+            )
+            assert store.release_state_scope_lease(claim, "worker-one")
+
+            with pytest.raises(ValueError, match="expected state is stale"):
+                store.claim_state_scope_lease(
+                    "scope-stale",
+                    target_authority="https://target.example",
+                    principal_key="opaque_reference:identity:principal-one",
+                    equivalence_key="shared-state",
+                    claimant_id="worker-stale",
+                    lease_seconds=60,
+                )
+
+            lane = connection.execute(
+                """SELECT revision, status, last_transition
+                   FROM merlin_storage.state_lanes
+                   WHERE campaign_id = %s AND experiment_id = %s""",
+                ("campaign/lane-cas", experiment_id),
+            ).fetchone()
+            assert lane is not None
+            assert (lane["revision"], lane["status"], lane["last_transition"]) == (
+                2,
+                "current",
+                "attributed",
+            )
+
+
+def test_physical_lane_rejects_a1_b1_a2_cross_experiment_interleaving(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaign_id = "campaign/physical-lane-cas"
+            _prepare_campaign(connection, campaign_id)
+            store = CampaignApiSessionRepository(connection)
+
+            def settle(scope_id: str, experiment_id: str, claimant_id: str) -> None:
+                store.create_state_scope(
+                    campaign_id,
+                    "https://target.example",
+                    _envelope(
+                        campaign_id=campaign_id,
+                        scope_id=scope_id,
+                        action_id=f"action:{scope_id}",
+                        experiment_id=experiment_id,
+                    ),
+                )
+                claim = store.claim_state_scope_lease(
+                    scope_id,
+                    target_authority="https://target.example",
+                    principal_key="opaque_reference:identity:principal-one",
+                    equivalence_key="shared-state",
+                    claimant_id=claimant_id,
+                    lease_seconds=60,
+                )
+                assert claim is not None
+                store.revise_state_scope(
+                    scope_id,
+                    1,
+                    _envelope(
+                        campaign_id=campaign_id,
+                        scope_id=scope_id,
+                        action_id=f"action:{scope_id}",
+                        experiment_id=experiment_id,
+                        revision=2,
+                        isolation_lease_id=claim,
+                        delivered=True,
+                    ),
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                store.acknowledge_state_scope(
+                    scope_id,
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                store.settle_state_scope(
+                    scope_id,
+                    2,
+                    _envelope(
+                        campaign_id=campaign_id,
+                        scope_id=scope_id,
+                        action_id=f"action:{scope_id}",
+                        experiment_id=experiment_id,
+                        revision=3,
+                        isolation_lease_id=claim,
+                        delivered=True,
+                        complete=True,
+                    ),
+                    transition_disposition="progress",
+                    isolation_disposition="shared_serialized",
+                    cleanup_disposition="retained",
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                assert store.release_state_scope_lease(claim, claimant_id)
+
+            settle("scope-a1", "experiment-a", "worker-a1")
+            settle("scope-b1", "experiment-b", "worker-b1")
+
+            store.create_state_scope(
+                campaign_id,
+                "https://target.example",
+                _envelope(
+                    campaign_id=campaign_id,
+                    scope_id="scope-a2",
+                    action_id="action:scope-a2",
+                    experiment_id="experiment-a",
+                ),
+            )
+            with pytest.raises(ValueError, match="expected physical state is stale"):
+                store.claim_state_scope_lease(
+                    "scope-a2",
+                    target_authority="https://target.example",
+                    principal_key="opaque_reference:identity:principal-one",
+                    equivalence_key="shared-state",
+                    claimant_id="worker-a2",
+                    lease_seconds=60,
+                )
+
+            physical = connection.execute(
+                """SELECT revision, latest_experiment_id, latest_scope_id
+                   FROM merlin_storage.state_physical_lanes"""
+            ).fetchone()
+            assert physical == {
+                "revision": 2,
+                "latest_experiment_id": "experiment-b",
+                "latest_scope_id": "scope-b1",
+            }
+            assert (
+                connection.execute(
+                    """SELECT count(*) AS count
+                       FROM merlin_storage.state_scope_leases
+                       WHERE scope_id = 'scope-a2'"""
+                ).fetchone()["count"]
+                == 0
+            )
+
+
+def test_conservative_browser_lane_detects_api_identity_alias_between_actions(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaign_id = "campaign/hybrid-physical-lane-cas"
+            _prepare_campaign(connection, campaign_id)
+            store = CampaignApiSessionRepository(connection)
+
+            def settle(
+                scope_id: str,
+                experiment_id: str,
+                claimant_id: str,
+                *,
+                learned_physical_digest: str | None,
+            ) -> None:
+                common = {
+                    "campaign_id": campaign_id,
+                    "scope_id": scope_id,
+                    "action_id": f"action:{scope_id}",
+                    "experiment_id": experiment_id,
+                    "principal_reference": None,
+                }
+                store.create_state_scope(
+                    campaign_id,
+                    "https://target.example",
+                    _envelope(**common, physical_digest=None),
+                )
+                claim = store.claim_state_scope_lease(
+                    scope_id,
+                    target_authority="https://target.example",
+                    principal_key="anonymous",
+                    equivalence_key="conservative-shared-state",
+                    claimant_id=claimant_id,
+                    lease_seconds=60,
+                )
+                assert claim is not None
+                store.revise_state_scope(
+                    scope_id,
+                    1,
+                    _envelope(
+                        **common,
+                        revision=2,
+                        isolation_lease_id=claim,
+                        delivered=True,
+                        physical_digest=learned_physical_digest,
+                    ),
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                store.acknowledge_state_scope(
+                    scope_id,
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                store.settle_state_scope(
+                    scope_id,
+                    2,
+                    _envelope(
+                        **common,
+                        revision=3,
+                        isolation_lease_id=claim,
+                        delivered=True,
+                        complete=True,
+                        physical_digest=learned_physical_digest,
+                    ),
+                    transition_disposition="progress",
+                    isolation_disposition="shared_serialized",
+                    cleanup_disposition="retained",
+                    claim_id=claim,
+                    claimant_id=claimant_id,
+                )
+                assert store.release_state_scope_lease(claim, claimant_id)
+
+            settle(
+                "scope-browser-a1",
+                "experiment-browser-a",
+                "worker-browser-a1",
+                learned_physical_digest=None,
+            )
+            settle(
+                "scope-api-b1",
+                "experiment-api-b",
+                "worker-api-b1",
+                learned_physical_digest="b" * 64,
+            )
+
+            store.create_state_scope(
+                campaign_id,
+                "https://target.example",
+                _envelope(
+                    campaign_id=campaign_id,
+                    scope_id="scope-browser-a2",
+                    action_id="action:scope-browser-a2",
+                    experiment_id="experiment-browser-a",
+                    principal_reference=None,
+                    physical_digest=None,
+                ),
+            )
+            with pytest.raises(ValueError, match="expected physical state is stale"):
+                store.claim_state_scope_lease(
+                    "scope-browser-a2",
+                    target_authority="https://target.example",
+                    principal_key="anonymous",
+                    equivalence_key="conservative-shared-state",
+                    claimant_id="worker-browser-a2",
+                    lease_seconds=60,
+                )
+
+            conservative = connection.execute(
+                """SELECT revision, ambiguity_revision, latest_scope_id
+                   FROM merlin_storage.state_physical_lanes
+                   WHERE principal_key = 'anonymous'
+                     AND physical_state_key = 'conservative-shared-state'"""
+            ).fetchone()
+            assert conservative == {
+                "revision": 2,
+                "ambiguity_revision": 1,
+                "latest_scope_id": "scope-api-b1",
+            }
+            specific = connection.execute(
+                """SELECT revision, latest_scope_id
+                   FROM merlin_storage.state_physical_lanes
+                   WHERE physical_state_key <> 'conservative-shared-state'"""
+            ).fetchone()
+            assert specific == {"revision": 1, "latest_scope_id": "scope-api-b1"}
+
+
+def test_restart_requires_reobservation_and_records_unattributed_transition(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _prepare_campaign(connection, "campaign/lane-restart")
+            store = CampaignApiSessionRepository(connection)
+            experiment_id = "experiment/restart"
+            store.create_state_scope(
+                "campaign/lane-restart",
+                "https://target.example",
+                _envelope(
+                    campaign_id="campaign/lane-restart",
+                    scope_id="scope-orphan",
+                    action_id="action-orphan",
+                    experiment_id=experiment_id,
+                ),
+            )
+            claim = store.claim_state_scope_lease(
+                "scope-orphan",
+                target_authority="https://target.example",
+                principal_key="opaque_reference:identity:principal-one",
+                equivalence_key="shared-state",
+                claimant_id="crashed-worker",
+                lease_seconds=60,
+            )
+            assert claim is not None
+            store.revise_state_scope(
+                "scope-orphan",
+                1,
+                _envelope(
+                    campaign_id="campaign/lane-restart",
+                    scope_id="scope-orphan",
+                    action_id="action-orphan",
+                    experiment_id=experiment_id,
+                    revision=2,
+                    isolation_lease_id=claim,
+                    delivered=True,
+                ),
+                claim_id=claim,
+                claimant_id="crashed-worker",
+            )
+            store.acknowledge_state_scope(
+                "scope-orphan", claim_id=claim, claimant_id="crashed-worker"
+            )
+            connection.execute(
+                """UPDATE merlin_storage.state_scope_leases
+                   SET expires_at = now() - interval '1 second'
+                   WHERE claim_id = %s""",
+                (claim,),
+            )
+
+            recovery = store.reconcile_durable_lifecycle(
+                claimant_id="restart-daemon",
+                readable_formats=STATE_SCOPE_MIGRATION.readable_versions,
+                writable_format=STATE_SCOPE_SCHEMA_VERSION,
+                lease_seconds=30,
+            )
+            campaign = next(
+                item
+                for item in recovery["campaigns"]
+                if item["campaign_id"] == "campaign/lane-restart"
+            )
+            assert campaign["state_lanes_requiring_reobservation"] == 1
+            assert campaign["unattributed_state_transitions"] == 1
+
+            store.create_state_scope(
+                "campaign/lane-restart",
+                "https://target.example",
+                _envelope(
+                    campaign_id="campaign/lane-restart",
+                    scope_id="scope-candidate",
+                    action_id="action-candidate",
+                    experiment_id=experiment_id,
+                ),
+            )
+            reobserve_claim = store.claim_state_scope_lease(
+                "scope-candidate",
+                target_authority="https://target.example",
+                principal_key="opaque_reference:identity:principal-one",
+                equivalence_key="shared-state",
+                claimant_id="reobserver",
+                lease_seconds=60,
+            )
+            assert reobserve_claim is not None
+            observed = store.reobserve_state_lane(
+                "scope-candidate",
+                2,
+                ("sha256:" + "a" * 64,),
+                claim_id=reobserve_claim,
+                claimant_id="reobserver",
+            )
+            assert (observed["revision"], observed["status"], observed["last_transition"]) == (
+                3,
+                "current",
+                "unattributed",
+            )
+            store.pause_state_scope(
+                "scope-candidate",
+                1,
+                _envelope(
+                    campaign_id="campaign/lane-restart",
+                    scope_id="scope-candidate",
+                    action_id="action-candidate",
+                    experiment_id=experiment_id,
+                    revision=2,
+                    isolation_lease_id=reobserve_claim,
+                ),
+                transition_disposition="infrastructure_failure",
+                isolation_disposition="shared_serialized",
+                cleanup_disposition="retained",
+                claim_id=reobserve_claim,
+                claimant_id="reobserver",
+            )
+            lane = connection.execute(
+                """SELECT revision, status, last_transition
+                   FROM merlin_storage.state_lanes
+                   WHERE campaign_id = %s AND experiment_id = %s""",
+                ("campaign/lane-restart", experiment_id),
+            ).fetchone()
+            assert lane is not None
+            assert (lane["revision"], lane["status"], lane["last_transition"]) == (
+                3,
+                "current",
+                "unattributed",
+            )
+            revisions = connection.execute(
+                """SELECT revision, transition FROM merlin_storage.state_lane_revisions
+                   WHERE lane_id = %s ORDER BY revision""",
+                (observed["id"],),
+            ).fetchall()
+            assert [(row["revision"], row["transition"]) for row in revisions] == [
+                (1, "created"),
+                (2, "unattributed"),
+                (3, "unattributed"),
+            ]

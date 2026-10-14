@@ -12,6 +12,7 @@ type JsonScalar = str | int | float | bool | None
 STATE_CAPABILITIES_SCHEMA_VERSION = "merlin.state-capabilities.v1"
 STATE_SELECTOR_SCHEMA_VERSION = "merlin.state-selector.v1"
 STATE_CHECKPOINT_SCHEMA_VERSION = "merlin.state-checkpoint.v1"
+STATE_ENUMERATION_SCHEMA_VERSION = "merlin.state-enumeration-declaration.v1"
 
 
 class TargetCapabilityContract(BaseModel):
@@ -182,6 +183,39 @@ class StateObservation(TargetCapabilityContract):
             StateValueType.NUMBER,
         }:
             raise ValueError("monotonicity requires an integer or number value_type")
+        return self
+
+
+class StateEnumerationShape(StrEnum):
+    FLAT = "flat"
+    SCOPED = "scoped"
+
+
+class StateEnumerationCompleteness(StrEnum):
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+
+
+class StateEnumerationDeclaration(TargetCapabilityContract):
+    """Reviewed extraction of a finite target-authored member domain."""
+
+    schema_version: Literal["merlin.state-enumeration-declaration.v1"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    selector: StateSelector
+    shape: StateEnumerationShape = StateEnumerationShape.FLAT
+    scope_dimension: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+    completeness: StateEnumerationCompleteness
+    evidence_refs: tuple[str, ...] = ()
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if (self.shape is StateEnumerationShape.SCOPED) != (
+            self.scope_dimension is not None
+        ):
+            raise ValueError("scoped enumerations require exactly one scope_dimension")
         return self
 
 
@@ -381,6 +415,7 @@ class StateCapabilities(TargetCapabilityContract):
     )
     identity: StateIdentity | None = None
     observations: tuple[StateObservation, ...] = ()
+    enumerations: tuple[StateEnumerationDeclaration, ...] = ()
     corroboration_rules: tuple[StateCorroborationRule, ...] = ()
     identity_equivalence_rules: tuple[IdentityEquivalenceRule, ...] = ()
     resource_ownership: tuple[ResourceOwnership, ...] = ()
@@ -401,6 +436,7 @@ class StateCapabilities(TargetCapabilityContract):
                 selectors.append(self.identity.result_selector)
         for observation in self.observations:
             selectors.extend((observation.baseline_selector, observation.result_selector))
+        selectors.extend(item.selector for item in self.enumerations)
         for rule in self.identity_equivalence_rules:
             selectors.extend((rule.left_selector, rule.right_selector))
         for ownership in self.resource_ownership:
@@ -433,6 +469,16 @@ class StateCapabilities(TargetCapabilityContract):
                 raise ValueError(
                     "versioned executable affordances require evidence references and confidence"
                 )
+            if any(
+                enumeration.schema_version is None
+                or not enumeration.evidence_refs
+                or enumeration.confidence is None
+                for enumeration in self.enumerations
+            ):
+                raise ValueError(
+                    "versioned state enumerations require versioned declarations, evidence "
+                    "references, and confidence"
+                )
         if (
             self.schema_version is not None
             and self.checkpoint is not None
@@ -443,6 +489,9 @@ class StateCapabilities(TargetCapabilityContract):
         if len(observation_names) != len(set(observation_names)):
             raise ValueError("state observation names must be unique")
         observation_name_set = set(observation_names)
+        enumeration_names = [item.name for item in self.enumerations]
+        if len(enumeration_names) != len(set(enumeration_names)):
+            raise ValueError("state enumeration names must be unique")
         rule_names = [item.name for item in self.corroboration_rules]
         if len(rule_names) != len(set(rule_names)):
             raise ValueError("state corroboration rule names must be unique")
@@ -593,6 +642,28 @@ def state_capabilities_semantic_projection(
                 **({"trust_class": item.trust_class.value} if item.trust_class is not None else {}),
             }
             for item in capabilities.observations
+        ]
+    if capabilities.enumerations:
+        result["enumerations"] = [
+            {
+                **(
+                    {"schema_version": item.schema_version}
+                    if item.schema_version is not None
+                    else {}
+                ),
+                "name": item.name,
+                "selector": item.selector.model_dump(
+                    mode="json", exclude={"evidence_refs", "confidence"}
+                ),
+                "shape": item.shape.value,
+                **(
+                    {"scope_dimension": item.scope_dimension}
+                    if item.scope_dimension is not None
+                    else {}
+                ),
+                "completeness": item.completeness.value,
+            }
+            for item in capabilities.enumerations
         ]
     if capabilities.corroboration_rules:
         result["corroboration_rules"] = [

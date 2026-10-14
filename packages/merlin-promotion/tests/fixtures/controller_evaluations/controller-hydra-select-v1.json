@@ -7,7 +7,7 @@
     "input_tokens": 0,
     "mean_cost": 0.0,
     "output_tokens": 0,
-    "p95_latency_ms": 1,
+    "p95_latency_ms": 5,
     "task_success_rate": 1.0,
     "total_tokens": 0
   },
@@ -17,13 +17,13 @@
   "candidate_kind": "routing",
   "cases": [
     {
-      "fixture_digest": "sha256:b8b776acd3708fd4bca8bad22684e33fc4260e3d7e08ab452d0d8eed3986461d",
+      "fixture_digest": "sha256:d434571e52ba182ac5c638bd68574d9168621011820934d218fb2afdbbbc034d",
       "id": "controller-hydra-bounded-selection",
       "source_group": "controller-fixture",
       "target_fixture": "controller-hydra-bounded-selection.json"
     }
   ],
-  "dataset_digest": "sha256:72d26b8714366ef0159fdf85ebdc6206faf26716123a00a7d33f173520ea8a17",
+  "dataset_digest": "sha256:dff2faa7b370188b41ed7803a4bed6fe856cc0fbb18fa3e5a40d0b3da5eb6de7",
   "dataset_provenance": "controller-fixture-2026-09-04",
   "held_out": true,
   "id": "controller-hydra-select-v1",

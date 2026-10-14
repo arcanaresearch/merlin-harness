@@ -15,7 +15,7 @@ from psycopg.errors import CheckViolation
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 87))
+    assert [migration.version for migration in migrations] == list(range(1, 88))
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -98,6 +98,8 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "CREATE TABLE merlin_storage.campaign_recovery" in migrations[84].sql
     assert "objective_satisfied" in migrations[85].sql
     assert "infrastructure_blocked_after_retry_policy" in migrations[85].sql
+    assert "CREATE TABLE merlin_storage.state_lanes" in migrations[86].sql
+    assert "CREATE TABLE merlin_storage.state_lane_revisions" in migrations[86].sql
     evidence = next(migration for migration in migrations if migration.version == 17)
     assert "CREATE TABLE merlin_storage.campaign_observations" in evidence.sql
     assert "CREATE TABLE IF NOT EXISTS merlin_storage.report_revisions" in migrations[17].sql

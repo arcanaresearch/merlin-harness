@@ -145,6 +145,7 @@ async def test_prepare_forwards_composition_into_the_sealed_manifest() -> None:
     ).manifest
     assert opinionated.digest != autonomous.digest
     assert stored["digest"] == autonomous.digest
+    assert stored["objective_contract"] is None
 
 
 async def test_prepare_without_composition_keeps_the_reviewed_default() -> None:
@@ -162,6 +163,7 @@ async def test_prepare_without_composition_keeps_the_reviewed_default() -> None:
     stored = store.rows["campaign-1"]["manifest"]["manifest"]
     assert stored["specialist_composition"] == "opinionated"
     assert stored["digest"] == prepared.manifest.digest
+    assert stored["objective_contract"] is None
 
 
 async def test_prepare_rejects_unknown_composition() -> None:

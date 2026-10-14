@@ -80,6 +80,41 @@ def _bounded_schedule_jsonb(value: object, *, artifact: str) -> tuple[Jsonb, str
     return Jsonb(value), sha256(encoded).hexdigest()
 
 
+def _physical_session_witness(metadata: Mapping[str, object]) -> str | None:
+    """Return a durable raw legacy ID or a secret-safe physical identity witness."""
+    legacy = metadata.get("remote_target_session_id")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+
+    identity = metadata.get("physical_state_identity")
+    if not isinstance(identity, Mapping):
+        return None
+    if identity.get("kind") == "keyed_digest" and all(
+        isinstance(identity.get(key), str) and identity.get(key)
+        for key in ("algorithm", "key_id", "digest")
+    ):
+        return ":".join(
+            (
+                "keyed_digest",
+                str(identity["algorithm"]),
+                str(identity["key_id"]),
+                str(identity["digest"]),
+            )
+        )
+    if identity.get("kind") == "opaque_reference" and all(
+        isinstance(identity.get(key), str) and identity.get(key)
+        for key in ("namespace", "reference_id")
+    ):
+        return ":".join(
+            (
+                "opaque_reference",
+                str(identity["namespace"]),
+                str(identity["reference_id"]),
+            )
+        )
+    return None
+
+
 def _serialized(method: Any) -> Any:
     @wraps(method)
     def wrapped(self: DurableSchedulerStore, *args: Any, **kwargs: Any) -> Any:
@@ -2936,9 +2971,7 @@ class DurableSchedulerStore:
             else:
                 observations.append(observation)
             assignment = by_stage.get(str(stage["stage"]), {})
-            effect_target_session_id = metadata.get(
-                "remote_target_session_id", metadata.get("target_session_id")
-            )
+            effect_target_session_id = _physical_session_witness(metadata)
             if effect is not None and (
                 str(effect["attempt_id"]) != str(stage["scheduler_attempt_id"])
                 or effect["target_id"] != assignment.get("target_profile_id")
@@ -4386,13 +4419,9 @@ class DurableSchedulerStore:
             effect["tool_name"] == "target_request" for effect in witness_effects
         )
         remote_target_session_ids = {
-            str(remote_id)
+            remote_id
             for effect in witness_effects
-            if isinstance(
-                remote_id := (effect["result_metadata"] or {}).get("remote_target_session_id"),
-                str,
-            )
-            and remote_id
+            if (remote_id := _physical_session_witness(effect["result_metadata"] or {})) is not None
         }
         receipt_target_session_id = (
             next(iter(remote_target_session_ids))

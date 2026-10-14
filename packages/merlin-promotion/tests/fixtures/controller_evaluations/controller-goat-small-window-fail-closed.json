@@ -42,12 +42,12 @@
     "version": "merlin.goat.v1"
   },
   "evidence_markers": [
-    "semantic:controller-eval/goat",
+    "worker request cannot fit the routed model context",
     "\"action\": \"continue\""
   ],
   "expected": {
-    "attacker_requests": 2,
-    "error_marker": "scripted attacker turns are exhausted",
+    "attacker_requests": 0,
+    "error_marker": "worker request cannot fit the routed model context",
     "objective_observed": false,
     "observations": 0,
     "proposal_action": "continue",

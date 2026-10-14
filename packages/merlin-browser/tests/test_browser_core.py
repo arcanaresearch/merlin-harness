@@ -2263,6 +2263,7 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                     "resetAt": "2030-01-01T00:00:00Z",
                     "status": "active",
                 },
+                "availableLanguages": ["en", "ms"],
             },
         },
         {
@@ -2440,6 +2441,18 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
                 "value_type": "string",
             },
         ],
+        "state_enumerations": [
+            {
+                "name": "language",
+                "selector": {
+                    "pointer": "/availableLanguages",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "shape": "flat",
+                "completeness": "complete",
+            }
+        ],
         "corroboration_rules": [
             {
                 "name": "score_fields_agree",
@@ -2555,6 +2568,16 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
         "objective_score_mirror",
         "remaining_allowance",
     }
+    assert len(capabilities["enumerations"]) == 1
+    enumeration = capabilities["enumerations"][0]
+    assert enumeration["name"] == "language"
+    assert enumeration["shape"] == "flat"
+    assert enumeration["completeness"] == "complete"
+    assert enumeration["selector"]["pointer"] == "/availableLanguages"
+    assert enumeration["selector"]["step_id"] == "observed-session-setup"
+    assert enumeration["selector"]["evidence_refs"][0].startswith(
+        "browser-api-response:sha256:"
+    )
     assert capabilities.get("affordances", []) == []
     assert capabilities.get("freshness_rules", []) == []
     assert capabilities["identity_equivalence_rules"][0]["relation"] == "equal"

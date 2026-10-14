@@ -44,13 +44,21 @@ from merlin_agents import (
     ObjectivePhaseGate,
     ReviewedTargetAdapter,
     WorkerAssignment,
+    WorkerHandoff,
+    WorkerProfile,
+    WorkerRuntime,
     compile_attack_campaign,
     compile_dynamic_specialist,
     compile_initial_campaign,
     compile_recon_campaign,
     manifest_with_objective_phase_gates,
 )
-from merlin_agents.campaign import TARGET_BRIEF_GUIDANCE_ID, manifest_with_bounded_regeneration
+from merlin_agents.campaign import (
+    TARGET_BRIEF_GUIDANCE_ID,
+    enumerate_language_candidate_references,
+    manifest_with_bounded_regeneration,
+    manifest_with_objective_contract,
+)
 from merlin_agents.campaign_service import (
     QUICKSCAN_FOLLOWUP_WAVE_LIMIT,
     QUICKSCAN_INITIAL_CELL_LIMIT,
@@ -59,6 +67,7 @@ from merlin_agents.campaign_service import (
     _arm_seed_snapshot,
     _assignment_context,
     _attempted_technique_outcomes,
+    _bind_method_objectives,
     _bind_recon_applicability_evidence,
     _bind_validation_equivalence,
     _bounded_frontier_projection,
@@ -90,6 +99,7 @@ from merlin_agents.campaign_service import (
     _merge_typed_worker_hypotheses,
     _normalize_adapter_evaluation_metadata,
     _objective_phase_gate_result,
+    _objective_progress_from_journal,
     _outcomes_are_defensive_only,
     _progress_snapshot_from_status,
     _receipt_refusal_negatives,
@@ -132,12 +142,21 @@ from merlin_agents.technique_history import entries_for_completion, technique_ce
 from merlin_agents.transforms import materialize_transform_envelope
 from merlin_contracts import (
     AgentTask,
+    CampaignTerminalReason,
     ProviderFailureKind,
+    StateEnumerationCompleteness,
+    StateEnumerationDeclaration,
+    StateEnumerationShape,
+    ToolCall,
     ToolContext,
+    ToolResult,
+    build_state_enumeration,
     candidate_id_for_identity,
+    compile_objective_contract,
     project_candidate_outcome,
 )
 from merlin_contracts.generation import GeneratorExecutionContract
+from merlin_contracts.target_capabilities import StateSelector
 
 
 def _receipt_oracle(pointer: str = "/reply") -> dict[str, object]:
@@ -567,7 +586,13 @@ async def test_objective_phase_gate_controller_retries_in_order_before_frontier(
     assert last_wave == 3
     assert service.gate_ids == ["baseline", "baseline", "progression"]
     assert store.paused is False
-    assert all(payload.get("frontier_claimed") is False for payload in store.lead)
+    gate_events = [
+        payload
+        for payload in store.lead
+        if payload.get("kind") == "objective_phase_gate_settled"
+    ]
+    assert gate_events
+    assert all(payload.get("frontier_claimed") is False for payload in gate_events)
 
 
 async def test_ambiguous_objective_gate_exhaustion_pauses_without_frontier_claim() -> None:
@@ -8404,6 +8429,919 @@ async def preparation(session_id, objective, profile):
     return CampaignPreparation(manifest, context)
 
 
+class ObjectiveAuthorityStore(Store):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lead: list[dict[str, object]] = []
+        self.paused = False
+        self.finished: tuple[str, str | None] | None = None
+
+    def list_waves(self, _campaign_id):
+        return []
+
+    def list_lead(self, _campaign_id):
+        return list(self.lead)
+
+    def append_lead(self, _campaign_id, wave, payload):
+        self.lead.append({"wave": wave, "payload": dict(payload)})
+        return self.lead[-1]
+
+    def commit_lead_decision(
+        self, _campaign_id, wave, _decision_id, payload, _directives, **_kwargs
+    ):
+        self.lead.append({"wave": wave, "payload": copy.deepcopy(payload)})
+        return self.lead[-1]
+
+    def pause(self, campaign_id):
+        self.rows[campaign_id]["status"] = "paused"
+        self.paused = True
+        return self.rows[campaign_id]
+
+    def finish(self, campaign_id, status, *, stop_reason=None):
+        self.rows[campaign_id]["status"] = status
+        self.rows[campaign_id]["stop_reason"] = stop_reason
+        self.finished = (status, stop_reason)
+        return self.rows[campaign_id]
+
+
+async def _objective_authority_service(objective: str = "Cover Tier 1 through Tier 4"):
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+    manifest = manifest_with_objective_contract(
+        prepared.manifest,
+        compile_objective_contract(objective),
+    )
+    store = ObjectiveAuthorityStore()
+    store.prepare(
+        manifest.id,
+        manifest.session_id,
+        {
+            "manifest": _json_value(asdict(manifest)),
+            "assignment_context": _json_value(asdict(prepared.assignment_context)),
+        },
+        manifest.digest,
+    )
+    store.rows[manifest.id]["status"] = "executing"
+    service = CampaignService(store, object(), preparation)  # type: ignore[arg-type]
+    return service, store, manifest
+
+
+async def test_sealed_objectives_project_durable_progress_and_block_false_completion() -> None:
+    service, store, manifest = await _objective_authority_service()
+
+    active = await service.status(manifest.id)
+    objective_id = active["objective_contract"]["objectives"][0]["id"]
+    assert active["campaign_outcome"]["lifecycle"] == "running"
+    assert active["campaign_outcome"]["unresolved_objective_ids"] == [objective_id]
+
+    terminalized = await service._finish_campaign(  # noqa: SLF001
+        manifest.id,
+        "completed",
+        CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+    )
+
+    assert terminalized is False
+    assert store.paused is True
+    assert store.finished is None
+    checkpoint = next(
+        item["payload"]
+        for item in store.lead
+        if item["payload"].get("kind") == "campaign_incomplete_checkpoint"
+    )
+    assert checkpoint["resumable"] is True
+    assert checkpoint["campaign_status"] == "paused"
+    assert "terminal_status" not in checkpoint
+    assert checkpoint["document"]["campaign_outcome"]["unresolved_objective_ids"] == [
+        objective_id
+    ]
+    assert not any(
+        item["payload"].get("kind") == "campaign_completion" for item in store.lead
+    )
+
+
+async def test_incomplete_objective_pause_failure_never_seals_terminal_receipt() -> None:
+    service, store, manifest = await _objective_authority_service()
+    pause = store.pause
+
+    def fail_pause(_campaign_id: str) -> None:
+        raise RuntimeError("simulated crash before pause")
+
+    store.pause = fail_pause  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated crash before pause"):
+        await service._finish_campaign(  # noqa: SLF001
+            manifest.id,
+            "completed",
+            CampaignTerminalReason.BUDGET_EXHAUSTED.value,
+        )
+
+    assert store.rows[manifest.id]["status"] == "executing"
+    checkpoint = next(
+        item["payload"]
+        for item in store.lead
+        if item["payload"].get("kind") == "campaign_incomplete_checkpoint"
+    )
+    assert checkpoint["resumable"] is True
+    assert checkpoint["stop_reason"] == "budget_exhausted"
+    assert not any(
+        item["payload"].get("kind") == "campaign_completion" for item in store.lead
+    )
+
+    # Restart/finalization retry reuses the nonterminal checkpoint and converges
+    # on a resumable campaign state without manufacturing completion authority.
+    store.pause = pause  # type: ignore[method-assign]
+    terminalized = await service._finish_campaign(  # noqa: SLF001
+        manifest.id,
+        "completed",
+        CampaignTerminalReason.BUDGET_EXHAUSTED.value,
+    )
+    assert terminalized is False
+    assert store.rows[manifest.id]["status"] == "paused"
+    assert not any(
+        item["payload"].get("kind") == "campaign_completion" for item in store.lead
+    )
+
+
+async def test_satisfied_sealed_objectives_allow_completed_reseal() -> None:
+    service, store, manifest = await _objective_authority_service()
+    active = await service.status(manifest.id)
+    objective_id = active["objective_contract"]["objectives"][0]["id"]
+    await service.record_objective_progress(
+        manifest.session_id,
+        manifest.id,
+        objective_id,
+        "satisfied_by_campaign",
+        evidence_refs=("target-state:tiers-1-4",),
+    )
+
+    terminalized = await service._finish_campaign(  # noqa: SLF001
+        manifest.id,
+        "completed",
+        CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
+    )
+
+    assert terminalized is True
+    assert store.paused is False
+    assert store.finished == ("completed", "objective_satisfied")
+    receipt = next(
+        item["payload"]
+        for item in store.lead
+        if item["payload"].get("kind") == "campaign_completion"
+    )
+    assert receipt["terminal_status"] == "completed"
+    assert receipt["document"]["campaign_outcome"]["unresolved_objective_ids"] == []
+
+
+async def test_authoritative_target_state_journal_disposes_sealed_range_objective() -> None:
+    service, store, manifest = await _objective_authority_service()
+    for index, (before, after) in enumerate(((1, 2), (2, 3), (3, 4)), start=1):
+        store.append_lead(
+            manifest.id,
+            index,
+            {
+                "kind": "target_state_attribution",
+                "schema": "merlin.target-state-attribution.v1",
+                "attribution_id": f"target-state-attribution:tier-{before}-{after}",
+                "provenance": "campaign",
+                "counts_as_campaign_progress": True,
+                "changes": (
+                    {
+                        "name": "tier",
+                        "status": "progress",
+                        "before_value": before,
+                        "after_value": after,
+                    },
+                ),
+            },
+        )
+
+    status = await service.status(manifest.id)
+
+    progress = status["objective_progress"][0]
+    assert progress["status"] == "satisfied_by_campaign"
+    assert progress["evidence_refs"] == [
+        "target-state-attribution:tier-1-2",
+        "target-state-attribution:tier-2-3",
+        "target-state-attribution:tier-3-4",
+    ]
+    assert status["campaign_outcome"]["unresolved_objective_ids"] == []
+
+
+async def test_attack_wave_target_transitions_advance_sealed_range_objective_once() -> None:
+    service, store, manifest = await _objective_authority_service()
+    task = AgentTask(
+        id=f"{manifest.id}/frontier/candidate-1",
+        objective="Execute one reviewed candidate",
+        status="completed",
+        technique_ids=("technique/role-spoof",),
+    )
+    receipts = {}
+    for index, (before, after) in enumerate(((1, 2), (2, 3), (3, 4)), start=1):
+        receipts[f"attack-call-{index}"] = {
+            "attempt_disposition": "valid",
+            "campaign_id": manifest.id,
+            "target_state_transition": {
+                "schema": "merlin.target-state-transition.v2",
+                "authority": "target",
+                "identity_match": True,
+                "outcome": "progress",
+                "observations": (
+                    {
+                        "name": "tier",
+                        "role": "progress_ordinal",
+                        "status": "progress",
+                        "before_value": before,
+                        "after_value": after,
+                        "validation_errors": (),
+                    },
+                ),
+                "validation_errors": (),
+                "quarantined_observations": (),
+            },
+        }
+    evidence = {
+        task.id: {
+            "digest": "sha256:" + "a" * 64,
+            "reference": f"merlin-result://{task.id}",
+            "target_evidence_receipts": receipts,
+        }
+    }
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:attack-1",
+        (task,),
+        evidence=evidence,
+    )
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:attack-1",
+        (task,),
+        evidence=evidence,
+    )
+
+    attributions = [
+        row["payload"]
+        for row in store.lead
+        if row["payload"].get("kind") == "target_state_attribution"
+    ]
+    assert len(attributions) == 3
+    assert {item["source_kind"] for item in attributions} == {"candidate"}
+    assert {item["action_purpose"] for item in attributions} == {"candidate"}
+    assert all(item["counts_as_campaign_progress"] is True for item in attributions)
+
+    status = await service.status(manifest.id)
+    assert status["objective_progress"][0]["status"] == "satisfied_by_campaign"
+    assert status["campaign_outcome"]["unresolved_objective_ids"] == []
+
+
+async def test_untrusted_target_state_values_cannot_complete_range_objective() -> None:
+    service, store, manifest = await _objective_authority_service()
+    store.append_lead(
+        manifest.id,
+        1,
+        {
+            "kind": "target_state_attribution",
+            "schema": "merlin.target-state-attribution.v1",
+            "attribution_id": "target-state-attribution:untrusted-1-3",
+            "provenance": "unverified_snapshot",
+            "counts_as_campaign_progress": False,
+            "changes": (
+                {
+                    "name": "tier",
+                    "status": "observed",
+                    "before_value": 1,
+                    "after_value": 3,
+                },
+            ),
+        },
+    )
+    store.append_lead(
+        manifest.id,
+        2,
+        {
+            "kind": "target_state_attribution",
+            "schema": "merlin.target-state-attribution.v1",
+            "attribution_id": "target-state-attribution:trusted-3-4",
+            "provenance": "campaign",
+            "counts_as_campaign_progress": True,
+            "changes": (
+                {
+                    "name": "tier",
+                    "status": "progress",
+                    "before_value": 3,
+                    "after_value": 4,
+                },
+            ),
+        },
+    )
+
+    status = await service.status(manifest.id)
+
+    progress = status["objective_progress"][0]
+    assert progress["status"] == "active"
+    assert progress["evidence_refs"] == ["target-state-attribution:trusted-3-4"]
+    assert "2 of 4" in progress["status_reason"]
+    assert status["campaign_outcome"]["unresolved_objective_ids"] == [
+        progress["objective"]["id"]
+    ]
+
+
+async def test_authoritative_attempt_receipts_dispose_explicit_method_list() -> None:
+    objective = "Attempt authority impersonation and payload injection."
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+    techniques = (
+        AssignmentTechnique(
+            id="merlin-injection-taxonomy/cat/agent-to-agent/agent-authority-relay",
+            objective="Exercise an authority relay",
+            tags=frozenset({"authority-impersonation"}),
+            guidance_ids=(),
+        ),
+        AssignmentTechnique(
+            id="merlin-injection-taxonomy/cat/agent-to-agent/agent-message-override",
+            objective="Exercise a message override",
+            tags=frozenset({"payload-injection"}),
+            guidance_ids=(),
+        ),
+    )
+    contract = _bind_method_objectives(compile_objective_contract(objective), techniques)
+    manifest = manifest_with_objective_contract(
+        prepared.manifest,
+        contract,
+    )
+    context = replace(prepared.assignment_context, techniques=techniques)
+    projected_waves = (
+        {
+            "tasks": (
+                {
+                    "technique_outcomes": {
+                        technique.id: "refuted" for technique in techniques
+                    },
+                    "evidence_references": tuple(
+                        f"receipt:{index}" for index in range(len(techniques))
+                    ),
+                },
+            ),
+        },
+    )
+
+    progress = _objective_progress_from_journal(
+        manifest,
+        (),
+        projected_waves=projected_waves,
+        assignment_context=context,
+    )
+
+    assert len(progress) == 1
+    assert progress[0].status.value == "satisfied_by_campaign"
+    assert progress[0].evidence_refs == ("receipt:0", "receipt:1")
+
+
+async def test_expanded_candidate_disposes_bound_semantic_method_family() -> None:
+    objective = "Attempt payload injection and authority impersonation."
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+    base_id = "merlin-injection-taxonomy/cat/agent-to-agent/agent-message-override"
+    base = AssignmentTechnique(
+        id=base_id,
+        objective="Exercise a message override",
+        tags=frozenset({"payload-injection"}),
+        guidance_ids=(),
+    )
+    authority = AssignmentTechnique(
+        id="merlin-injection-taxonomy/cat/agent-to-agent/agent-authority-relay",
+        objective="Exercise an authority relay",
+        tags=frozenset({"authority-impersonation"}),
+        guidance_ids=(),
+    )
+    manifest = manifest_with_objective_contract(
+        prepared.manifest,
+        _bind_method_objectives(
+            compile_objective_contract(objective), (base, authority)
+        ),
+    )
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "ms"),
+        code_switching=False,
+    )
+    context = replace(
+        prepared.assignment_context,
+        techniques=(base, authority),
+        language_frontier=frontier,
+    )
+    expanded_id = next(
+        reference.id
+        for reference in enumerate_language_candidate_references(
+            context.techniques, frontier
+        )
+        if reference.family_id == base_id
+        and reference.requested_language == "ms"
+        and reference.variant_id == "native"
+    )
+
+    progress = _objective_progress_from_journal(
+        manifest,
+        (),
+        projected_waves=(
+            {
+                "tasks": (
+                    {
+                        "technique_outcomes": {
+                            expanded_id: "refuted",
+                            authority.id: "refuted",
+                        },
+                        "evidence_references": (
+                            "receipt:expanded-ms",
+                            "receipt:authority",
+                        ),
+                    },
+                )
+            },
+        ),
+        assignment_context=context,
+    )
+
+    assert progress[0].status.value == "satisfied_by_campaign"
+    assert progress[0].evidence_refs == (
+        "receipt:authority",
+        "receipt:expanded-ms",
+    )
+
+
+def test_actual_campaign_methods_are_not_hardcoded_to_unrelated_catalogue_ids() -> None:
+    objective = (
+        "Then attempt prompt injection, role spoofing, judge manipulation, and "
+        "game-logic exploits"
+    )
+    techniques = (
+        AssignmentTechnique(
+            id="merlin-injection-taxonomy/cat/agent-to-agent/agent-authority-relay",
+            objective="Exercise an authority relay",
+            tags=frozenset({"authority-impersonation"}),
+            guidance_ids=(),
+        ),
+        AssignmentTechnique(
+            id="merlin-injection-taxonomy/cat/agent-to-agent/agent-message-override",
+            objective="Exercise a message override",
+            tags=frozenset({"payload-injection"}),
+            guidance_ids=(),
+        ),
+    )
+
+    contract = _bind_method_objectives(compile_objective_contract(objective), techniques)
+    bindings = contract.objectives[0].selectors[0].bindings
+
+    assert tuple(item.selector_value for item in bindings) == (
+        "prompt injection",
+        "role spoofing",
+        "judge manipulation",
+        "game-logic exploits",
+    )
+    assert all(item.status.value == "unresolved" for item in bindings)
+    assert all(item.candidate_ids == () for item in bindings)
+
+
+async def test_committed_discovery_resolution_binds_and_disposes_method_objective() -> None:
+    objective = "Attempt prompt injection and authority spoofing."
+    service, store, manifest = await _objective_authority_service(objective)
+    objective_id = manifest.objective_contract["objectives"][0]["id"]
+    proposal = {
+        "objective_id": objective_id,
+        "selector_dimension": "method",
+        "bindings": [
+            {"selector_value": "prompt injection", "candidate_ids": ["case:prompt"]},
+            {"selector_value": "authority spoofing", "candidate_ids": ["case:prompt"]},
+        ],
+        "evidence_refs": ["target-call:discovery-1"],
+    }
+    task = AgentTask(
+        id=f"{manifest.id}/adversarial-explorer/target-derived-discovery",
+        objective="Resolve sealed objective selectors",
+        status="completed",
+        result=json.dumps({"objective_selector_resolutions": [proposal]}),
+    )
+    evidence = {
+        task.id: {
+            "reference": "merlin-result://discovery-1",
+            "digest": "sha256:" + "a" * 64,
+            "target_call_ids": ("target-call:discovery-1",),
+            "structured_result": {"objective_selector_resolutions": [proposal]},
+        }
+    }
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:discovery-1",
+        (task,),
+        evidence=evidence,
+    )
+    progress = _objective_progress_from_journal(
+        manifest,
+        store.lead,
+        projected_waves=(
+            {
+                "tasks": (
+                    {
+                        "technique_outcomes": {"case:prompt": "refuted"},
+                        "evidence_references": ("target-call:attempt-1",),
+                    },
+                )
+            },
+        ),
+    )
+
+    assert sum(
+        row["payload"].get("kind") == "campaign_objective_selector_resolution"
+        for row in store.lead
+    ) == 1
+    assert progress[0].status.value == "satisfied_by_campaign"
+
+
+async def test_actual_campaign_method_clause_resolves_from_target_receipt_and_completes() -> None:
+    objective = (
+        "Then attempt prompt injection, role spoofing, judge manipulation, and "
+        "game-logic exploits"
+    )
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+    candidate_ids = (
+        "case:prompt-injection",
+        "case:role-spoofing",
+        "case:judge-manipulation",
+        "case:game-logic-exploit",
+    )
+    manifest = CampaignManifest.create(
+        id=prepared.manifest.id,
+        session_id=prepared.manifest.session_id,
+        objective=objective,
+        objective_contract=compile_objective_contract(objective),
+        profile=prepared.manifest.profile,
+        target=prepared.manifest.target,
+        provider_id=prepared.manifest.provider_id,
+        provider_model=prepared.manifest.provider_model,
+        provider_effort=prepared.manifest.provider_effort,
+        authority_ids=prepared.manifest.authority_ids,
+        catalogue=tuple(ContextDocument.create(item, item) for item in candidate_ids),
+        skill_documents=prepared.manifest.skill_documents,
+        tool_ids=prepared.manifest.tool_ids,
+        budget=prepared.manifest.budget,
+    )
+    store = ObjectiveAuthorityStore()
+    store.prepare(
+        manifest.id,
+        manifest.session_id,
+        {
+            "manifest": _json_value(asdict(manifest)),
+            "assignment_context": _json_value(asdict(prepared.assignment_context)),
+        },
+        manifest.digest,
+    )
+    store.rows[manifest.id]["status"] = "executing"
+    service = CampaignService(store, object(), preparation)  # type: ignore[arg-type]
+    objective_id = manifest.objective_contract["objectives"][0]["id"]
+    values = ("prompt injection", "role spoofing", "judge manipulation", "game-logic exploits")
+    proposal = {
+        "objective_id": objective_id,
+        "selector_dimension": "method",
+        "bindings": [
+            {"selector_value": value, "candidate_ids": [candidate_id]}
+            for value, candidate_id in zip(values, candidate_ids, strict=True)
+        ],
+        "evidence_refs": ["target-call:rizz-method-map"],
+    }
+    task = AgentTask(
+        id=f"{manifest.id}/adversarial-explorer/target-derived-discovery",
+        objective="Resolve sealed objective selectors",
+        status="completed",
+        result=json.dumps({"objective_selector_resolutions": [proposal]}),
+    )
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:rizz-method-discovery",
+        (task,),
+        evidence={
+            task.id: {
+                "reference": "merlin-result://rizz-method-discovery",
+                "digest": "sha256:" + "f" * 64,
+                "target_call_ids": ("target-call:rizz-method-map",),
+                "structured_result": {"objective_selector_resolutions": [proposal]},
+            }
+        },
+    )
+    progress = _objective_progress_from_journal(
+        manifest,
+        store.lead,
+        projected_waves=(
+            {
+                "tasks": (
+                    {
+                        "technique_outcomes": {
+                            candidate_id: "refuted" for candidate_id in candidate_ids
+                        },
+                        "evidence_references": tuple(
+                            f"target-call:attempt-{index}"
+                            for index in range(len(candidate_ids))
+                        ),
+                    },
+                )
+            },
+        ),
+    )
+
+    assert progress[0].status.value == "satisfied_by_campaign"
+    resolution = next(
+        row["payload"]
+        for row in store.lead
+        if row["payload"].get("kind") == "campaign_objective_selector_resolution"
+    )
+    assert resolution["source"]["kind"] == "authoritative_discovery"
+
+
+async def test_forged_discovery_evidence_cannot_bind_selector() -> None:
+    objective = "Attempt prompt injection and authority spoofing."
+    service, store, manifest = await _objective_authority_service(objective)
+    objective_id = manifest.objective_contract["objectives"][0]["id"]
+    proposal = {
+        "objective_id": objective_id,
+        "selector_dimension": "method",
+        "bindings": [
+            {"selector_value": "prompt injection", "candidate_ids": ["case:prompt"]},
+            {"selector_value": "authority spoofing", "candidate_ids": ["case:prompt"]},
+        ],
+        "evidence_refs": ["target-call:forged"],
+    }
+    task = AgentTask(
+        id=f"{manifest.id}/adversarial-explorer/target-derived-discovery",
+        objective="Resolve sealed objective selectors",
+        status="completed",
+        result=json.dumps({"objective_selector_resolutions": [proposal]}),
+    )
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:discovery-forged",
+        (task,),
+        evidence={
+            task.id: {
+                "reference": "merlin-result://discovery-forged",
+                "digest": "sha256:" + "b" * 64,
+                "target_call_ids": ("target-call:real",),
+                "structured_result": {"objective_selector_resolutions": [proposal]},
+            }
+        },
+    )
+
+    assert not any(
+        row["payload"].get("kind") == "campaign_objective_selector_resolution"
+        for row in store.lead
+    )
+
+
+async def test_discovery_resolution_cannot_shrink_bound_denominator() -> None:
+    objective = "Attempt prompt injection and authority spoofing."
+    service, store, manifest = await _objective_authority_service(objective)
+    objective_id = manifest.objective_contract["objectives"][0]["id"]
+
+    async def record(suffix: str, candidate_ids: list[str]) -> None:
+        call_id = f"target-call:{suffix}"
+        proposal = {
+            "objective_id": objective_id,
+            "selector_dimension": "method",
+            "bindings": [
+                {
+                    "selector_value": "prompt injection",
+                    "candidate_ids": candidate_ids,
+                },
+                {
+                    "selector_value": "authority spoofing",
+                    "candidate_ids": ["case:prompt"],
+                },
+            ],
+            "evidence_refs": [call_id],
+        }
+        task = AgentTask(
+            id=f"{manifest.id}/adversarial-explorer/{suffix}/target-derived-discovery",
+            objective="Resolve sealed objective selectors",
+            status="completed",
+            result=json.dumps({"objective_selector_resolutions": [proposal]}),
+        )
+        tasks = (
+            task,
+            AgentTask(
+                id=f"{manifest.id}/catalogue/alternate",
+                objective="Reviewed alternate",
+                status="completed",
+                technique_ids=("case:alternate",),
+            ),
+        ) if suffix == "cccc" else (task,)
+        await service._record_target_state_attributions(  # noqa: SLF001
+            manifest,
+            manifest.id,
+            1,
+            f"schedule:{suffix}",
+            tasks,
+            evidence={
+                task.id: {
+                    "reference": f"merlin-result://{suffix}",
+                    "digest": "sha256:" + suffix[0] * 64,
+                    "target_call_ids": (call_id,),
+                    "structured_result": {"objective_selector_resolutions": [proposal]},
+                }
+            },
+        )
+
+    await record("cccc", ["case:prompt", "case:alternate"])
+    await record("dddd", ["case:prompt"])
+
+    resolutions = [
+        row["payload"]
+        for row in store.lead
+        if row["payload"].get("kind") == "campaign_objective_selector_resolution"
+    ]
+    assert len(resolutions) == 1
+    assert tuple(resolutions[0]["bindings"][0]["candidate_ids"]) == (
+        "case:prompt",
+        "case:alternate",
+    )
+
+
+async def test_model_cannot_hallucinate_empty_all_available_denominator() -> None:
+    objective = "Test every available language."
+    service, store, manifest = await _objective_authority_service(objective)
+    objective_id = manifest.objective_contract["objectives"][0]["id"]
+    proposal = {
+        "objective_id": objective_id,
+        "selector_dimension": "language",
+        "bindings": [{"selector_value": "*", "candidate_ids": []}],
+        "evidence_refs": ["target-call:not-an-enumeration"],
+    }
+    task = AgentTask(
+        id=f"{manifest.id}/adversarial-explorer/target-derived-discovery",
+        objective="Resolve language coverage",
+        status="completed",
+        result=json.dumps({"objective_selector_resolutions": [proposal]}),
+    )
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:hallucinated-empty",
+        (task,),
+        evidence={
+            task.id: {
+                "reference": "merlin-result://hallucinated-empty",
+                "digest": "sha256:" + "1" * 64,
+                "target_call_ids": ("target-call:not-an-enumeration",),
+                "structured_result": {"objective_selector_resolutions": [proposal]},
+            }
+        },
+    )
+
+    assert not any(
+        row["payload"].get("kind") == "campaign_objective_selector_resolution"
+        for row in store.lead
+    )
+    assert _objective_progress_from_journal(manifest, store.lead)[0].status.value == "blocked"
+
+
+async def test_scoped_all_available_uses_typed_scope_receipts() -> None:
+    objective = "Cover tier 1 through tier 2 and every available character in each tier."
+    service, store, manifest = await _objective_authority_service(objective)
+    contract = manifest.objective_contract
+    character_objective = next(
+        item for item in contract["objectives"] if item["selectors"][0]["dimension"] == "character"
+    )
+    task = AgentTask(
+        id=f"{manifest.id}/adversarial-explorer/target-derived-discovery",
+        objective="Resolve character coverage",
+        status="completed",
+        result=json.dumps({"objective_selector_resolutions": []}),
+    )
+    declaration = StateEnumerationDeclaration(
+        schema_version="merlin.state-enumeration-declaration.v1",
+        name="character",
+        selector=StateSelector(
+            schema_version="merlin.state-selector.v1",
+            step_id="rules",
+            evaluation_root="response_body",
+            pointer="/characters_by_tier",
+            evidence_refs=("evidence:rules-response",),
+        ),
+        shape=StateEnumerationShape.SCOPED,
+        scope_dimension="tier",
+        completeness=StateEnumerationCompleteness.COMPLETE,
+        evidence_refs=("evidence:reviewed-adapter",),
+    )
+    enumeration = build_state_enumeration(
+        declaration,
+        selected_value={"1": ["character/a"], "2": ["character/b"]},
+        binding_context={"adapter_digest": "sha256:" + "9" * 64, "step_id": "rules"},
+    )
+    signed_receipts: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        signed_receipts,
+        WorkerHandoff(
+            manifest.session_id,
+            "/workspace",
+            "model-1",
+            WorkerProfile(
+                "adversarial-explorer",
+                1,
+                "summary",
+                "Discover target state.",
+                frozenset({"discover"}),
+            ),
+            WorkerAssignment(
+                id=task.id,
+                objective=task.objective,
+                profile_id="adversarial-explorer",
+                target_profile_id=manifest.target.id,
+                technique_ids=(),
+                guidance_ids=(),
+                tool_ids=("target_request",),
+                skill_ids=(),
+                provider_id=manifest.provider_id,
+                authority_ids=manifest.authority_ids,
+                budget=AssignmentBudget(max_turns=1, max_tokens=100, max_seconds=10),
+                input_schema='{"type":"object"}',
+                output_schema='{"type":"object"}',
+            ),
+        ),
+        ToolCall(
+            call_id="target-call:denominator",
+            name="target_request",
+            arguments={"input": "list characters"},
+        ),
+        ToolResult(
+            content='{"characters_by_tier":{"1":["character/a"],"2":["character/b"]}}',
+            metadata={
+                "attempt_disposition": "valid",
+                "target_exchanges": [{"interaction": True, "cleanup": False}],
+                "state_enumerations": [enumeration.model_dump(mode="json")],
+            },
+        ),
+    )
+    receipts = {"target-call:denominator": signed_receipts["target-call:denominator"]}
+    evidence = {
+        task.id: {
+            "reference": "merlin-result://scoped-discovery",
+            "digest": "sha256:" + "e" * 64,
+            "target_call_ids": tuple(receipts),
+            "structured_result": {"objective_selector_resolutions": []},
+            "target_evidence_receipts": receipts,
+        }
+    }
+
+    await service._record_target_state_attributions(  # noqa: SLF001
+        manifest,
+        manifest.id,
+        1,
+        "schedule:scoped-discovery",
+        (task,),
+        evidence=evidence,
+    )
+    progress = _objective_progress_from_journal(
+        manifest,
+        store.lead,
+        projected_waves=(
+            {
+                "tasks": (
+                    {
+                        "technique_outcomes": {
+                            "character/a": "refuted",
+                            "character/b": "refuted",
+                        },
+                        "evidence_references": (
+                            "target-call:character-a",
+                            "target-call:character-b",
+                        ),
+                    },
+                )
+            },
+        ),
+    )
+    character_progress = next(
+        item for item in progress if item.objective.id == character_objective["id"]
+    )
+
+    assert character_progress.status.value == "satisfied_by_campaign"
+    resolution = next(
+        row["payload"]
+        for row in store.lead
+        if row["payload"].get("kind") == "campaign_objective_selector_resolution"
+    )
+    assert resolution["source"]["kind"] == "reviewed_adapter"
+
+
 def _active_dynamic_specialist(prepared, label, technique_ids=(), context=None):
     """Compile an active wave-0 specialist record, as template admission would."""
 
@@ -15377,6 +16315,63 @@ async def test_campaign_lead_claims_typed_messages_and_commits_before_ack() -> N
     assert store.commits[0][1]["claim_id"] == "claim-1"
 
 
+async def test_campaign_lead_refreshes_durable_prompt_inputs_after_inference() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+    class Store:
+        def claim_worker_messages(self, campaign_id, claimant_id, lease_seconds):
+            return [
+                {
+                    "id": "message-1",
+                    "lead_claim_id": "claim-1",
+                    "source_task_id": "worker/source",
+                    "kind": "discovery",
+                    "content": "Initial observation.",
+                }
+            ]
+
+        def list_pending_worker_messages(self, campaign_id):
+            return [
+                {
+                    "id": "message-2",
+                    "source_task_id": "worker/new",
+                    "kind": "discovery",
+                    "content": "Observation committed during review.",
+                }
+            ]
+
+        def renew_worker_message_claim(self, claim_id, claimant_id, lease_seconds):
+            return 1
+
+        def list_waves(self, campaign_id):
+            return [{"wave": 3}]
+
+        def commit_lead_decision(self, *args, **kwargs):
+            return {"decision_id": args[2]}
+
+    refreshed: tuple[AgentTask, ...] = ()
+
+    async def lead_runner(campaign_id, profile, attempt, tasks, refresh_prompt_tasks):
+        nonlocal refreshed
+        refreshed = await refresh_prompt_tasks()
+        return LeadAssessment("reroute", False)
+
+    service = CampaignService(
+        Store(),
+        object(),
+        preparation,
+        lead_runner=lead_runner,  # type: ignore[arg-type]
+    )
+
+    await service._run_lead_with_policy(prepared.manifest, ())  # noqa: SLF001
+
+    coordination_results = tuple(
+        task.result or "" for task in refreshed if "/worker-message/" in task.id
+    )
+    assert any("Initial observation" in result for result in coordination_results)
+    assert any("Observation committed during review" in result for result in coordination_results)
+
+
 @pytest.mark.parametrize("receipt_exists, expected", [(True, "applied"), (False, "failed")])
 async def test_redirect_terminal_replay_requires_exact_mailbox_receipt(
     receipt_exists: bool, expected: str
@@ -21790,12 +22785,56 @@ async def test_adaptive_frontier_claim_scores_before_selection_and_keeps_rest_qu
         prepared.manifest.id, prepared.manifest, context, 2
     )
 
-    assert tuple(item.id for item in first.techniques) == ("cell/0",)
-    assert tuple(item.id for item in second.techniques) == ("cell/2",)
-    assert store.claims == [("cell/0",), ("cell/2",)]
-    assert store.queued == ["cell/1", "cell/3", "cell/4", "cell/5", "cell/6"]
+    first_id = first.techniques[0].id
+    second_id = second.techniques[0].id
+    assert first_id != second_id
+    assert store.claims == [(first_id,), (second_id,)]
+    assert set(store.queued) == {
+        technique.id for technique in techniques
+    }.difference({first_id, second_id})
     assert store.priorities["cell/1"] == 0.1
     assert store.priorities["cell/2"] == 0.9
+
+
+def test_execution_diversity_fills_batch_across_families_and_states():
+    base = AssignmentTechnique(
+        id="family/a/first",
+        objective="exercise first family",
+        tags=frozenset(),
+        guidance_ids=(),
+        semantic_id="family/a",
+        domain_id="chat",
+    )
+    candidates = (
+        base,
+        replace(base, id="family/a/second"),
+        replace(base, id="family/b", semantic_id="family/b"),
+        replace(base, id="family/c", semantic_id="family/c"),
+    )
+    ordered = CampaignService._diversify_execution_candidates(  # noqa: SLF001
+        "campaign/diversity",
+        candidates,
+        4,
+        3,
+        {
+            "family/a/first": {"state/one"},
+            "family/a/second": {"state/two"},
+            "family/b": {"state/one"},
+            "family/c": {"state/two"},
+        },
+        frozenset(item.id for item in candidates),
+        {item.id: index for index, item in enumerate(candidates)},
+    )
+
+    selected = ordered[:3]
+    assert len({item.semantic_id for item in selected}) == 3
+    assert len({state for item in selected for state in {
+        "family/a/first": {"state/one"},
+        "family/a/second": {"state/two"},
+        "family/b": {"state/one"},
+        "family/c": {"state/two"},
+    }[item.id]}) == 2
+    assert {item.id for item in ordered} == {item.id for item in candidates}
 
 
 async def test_frontier_records_measured_arm_outcomes_before_successor_claim_and_replays_once():
@@ -22379,6 +23418,7 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
     class ReconStore:
         def __init__(self) -> None:
             self.observations = {}
+            self.lead = []
 
         def get(self, _campaign_id):
             return {"created_at": datetime(2026, 10, 13, 18, 29, tzinfo=UTC)}
@@ -22392,6 +23432,12 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
             )
             self.observations.setdefault(key, observation)
             return self.observations[key]
+
+        def list_lead(self, _campaign_id):
+            return tuple(self.lead)
+
+        def append_lead(self, campaign_id, wave, payload):
+            self.lead.append({"campaign_id": campaign_id, "wave": wave, "payload": payload})
 
     async def read_recon(session_id, handoff_id, target_id):
         assert session_id == "session-1"
@@ -22426,4 +23472,132 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
     assert observation.outcome == "observed"
     assert observation.technique_id == "reconnaissance"
     assert observation.summary == "Browser reconnaissance observed score: 85 -> 100."
+    attributions = [row["payload"] for row in store.lead]
+    assert len(attributions) == 2
+    assert {
+        (item["provenance"], item["counts_as_campaign_progress"])
+        for item in attributions
+    } == {("campaign", True), ("preexisting", False)}
+    assert not hasattr(store, "arm_observations")
+
+
+@pytest.mark.asyncio
+async def test_recon_restart_counts_same_campaign_once_and_excludes_prior_campaign() -> None:
+    transition = {
+        "schema": "merlin.target-state-transition.v2",
+        "authority": "target",
+        "identity_match": True,
+        "outcome": "progress",
+        "observations": [
+            {
+                "name": "workflow_stage",
+                "role": "progress_ordinal",
+                "status": "progress",
+                "before_value": 1,
+                "after_value": 2,
+                "validation_errors": [],
+            }
+        ],
+        "validation_errors": [],
+        "quarantined_observations": [],
+    }
+    tasks = (
+        AgentTask(
+            id="campaign-1/recon",
+            objective="Map the reviewed workflow",
+            status="completed",
+            technique_ids=("reconnaissance",),
+        ),
+        AgentTask(
+            id="campaign-1/probe",
+            objective="Run one bounded capability probe",
+            status="completed",
+            technique_ids=("capability/language/en",),
+        ),
+        AgentTask(
+            id="campaign-1/prior-recon",
+            objective="Retain prior campaign provenance",
+            status="completed",
+            technique_ids=("reconnaissance",),
+        ),
+    )
+    evidence = {
+        task.id: {
+            "digest": "sha256:" + character * 64,
+            "reference": f"merlin-result://{task.id}",
+            "inherited_target_call_ids": (
+                (f"call-{index}",) if task is not tasks[0] else ()
+            ),
+            "target_evidence_receipts": {
+                f"call-{index}": {
+                    "attempt_disposition": "valid",
+                    "outcome_authority": "target",
+                    "campaign_id": "campaign-old" if task is tasks[2] else "campaign-1",
+                    "target_state_transition": transition,
+                }
+            },
+        }
+        for index, (task, character) in enumerate(
+            zip(tasks, ("a", "b", "c"), strict=True), start=1
+        )
+    }
+
+    class Store:
+        def __init__(self) -> None:
+            self.lead = []
+            self.observations = {}
+
+        def list_lead(self, _campaign_id):
+            return tuple(self.lead)
+
+        def append_lead(self, campaign_id, wave, payload):
+            self.lead.append({"campaign_id": campaign_id, "wave": wave, "payload": payload})
+
+        def record_observation(self, observation):
+            self.observations.setdefault(observation.id, observation)
+            return self.observations[observation.id]
+
+    class Agents:
+        async def completion_projection(self, schedule_id):
+            assert schedule_id == "schedule-1"
+            return {"evidence": evidence}
+
+    store = Store()
+    manifest = SimpleNamespace(
+        id="campaign-1",
+        target=SimpleNamespace(id="target-1"),
+        objective_contract=None,
+        catalogue=(),
+    )
+    service = CampaignService(store, Agents(), None)  # type: ignore[arg-type]
+
+    await service._record_target_state_attributions(  # type: ignore[arg-type]  # noqa: SLF001
+        manifest, "campaign-1", 0, "schedule-1", tasks
+    )
+    await service._record_target_state_attributions(  # type: ignore[arg-type]  # noqa: SLF001
+        manifest, "campaign-1", 0, "schedule-1", tasks
+    )
+
+    assert len(store.observations) == 2
+    payloads = [row["payload"] for row in store.lead]
+    assert len(payloads) == 3
+    assert {item["source_kind"] for item in payloads} == {
+        "reconnaissance",
+        "capability_probe",
+    }
+    assert {item["provenance"] for item in payloads} == {
+        "campaign",
+        "campaign_restart",
+        "preexisting",
+    }
+    assert {
+        (item["provenance"], item["counts_as_campaign_progress"])
+        for item in payloads
+    } == {
+        ("campaign", True),
+        ("campaign_restart", True),
+        ("preexisting", False),
+    }
+    assert all(item["changes"][0]["name"] == "workflow_stage" for item in payloads)
+    assert {item.technique_id for item in store.observations.values()} == {"reconnaissance"}
     assert not hasattr(store, "arm_observations")

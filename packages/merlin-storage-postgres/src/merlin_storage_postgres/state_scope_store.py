@@ -38,6 +38,16 @@ def _identity_key(
     return f"opaque_reference:{value.namespace}:{value.reference_id}"
 
 
+def _identity_mapping_key(value: Mapping[str, object] | None) -> str | None:
+    if value is None:
+        return None
+    if value.get("kind") == "keyed_digest":
+        return _identity_key(KeyedIdentityDigest.model_validate(value))
+    if value.get("kind") == "opaque_reference":
+        return _identity_key(OpaqueIdentityReference.model_validate(value))
+    raise ValueError("state lane identity must use a secret-safe identity reference")
+
+
 def _digest(value: Mapping[str, object]) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return "sha256:" + sha256(encoded).hexdigest()
@@ -48,6 +58,17 @@ def _required(value: str, label: str) -> str:
     if not normalized:
         raise ValueError(f"{label} cannot be empty")
     return normalized
+
+
+def _physical_lane_id(authority: str, principal_key: str, physical_state_key: str) -> str:
+    return (
+        "state-physical-lane:"
+        + sha256(f"{authority}\0{principal_key}\0{physical_state_key}".encode()).hexdigest()
+    )
+
+
+def _conservative_physical_lane_id(authority: str) -> str:
+    return _physical_lane_id(authority, "anonymous", "conservative-shared-state")
 
 
 def _scheduler_recovery_action(
@@ -135,6 +156,10 @@ class StateScopeRepository:
         document_digest = _digest(document)
         principal_key = _identity_key(value.principal_identity)
         physical_key = _identity_key(value.physical_state_identity)
+        lane_id = (
+            "state-lane:"
+            + sha256(f"{campaign}\0{value.experiment_id}\0{authority}".encode()).hexdigest()
+        )
         with self._lock, self.connection.transaction():
             format_row = self.connection.execute(
                 """SELECT claims_enabled FROM merlin_storage.scope_formats
@@ -158,12 +183,107 @@ class StateScopeRepository:
                    SET execution_format = %s, updated_at = now() WHERE id = %s""",
                 (value.schema_version, campaign),
             )
+            conservative_lane_id = _conservative_physical_lane_id(authority)
+            self.connection.execute(
+                """INSERT INTO merlin_storage.state_physical_lanes
+                       (id, target_authority, principal_key, physical_state_key)
+                   VALUES (%s, %s, 'anonymous', 'conservative-shared-state')
+                   ON CONFLICT (target_authority, principal_key, physical_state_key)
+                   DO NOTHING""",
+                (conservative_lane_id, authority),
+            )
+            conservative_lane = self.connection.execute(
+                """SELECT revision, ambiguity_revision
+                   FROM merlin_storage.state_physical_lanes
+                   WHERE id = %s FOR SHARE""",
+                (conservative_lane_id,),
+            ).fetchone()
+            if conservative_lane is None:
+                raise RuntimeError("conservative physical state lane disappeared")
+            initial_physical_lane_id: str | None = None
+            initial_physical_lane_revision: int | None = None
+            if physical_key is not None:
+                aggregate_principal = principal_key or "anonymous"
+                initial_physical_lane_id = _physical_lane_id(
+                    authority, aggregate_principal, physical_key
+                )
+                self.connection.execute(
+                    """INSERT INTO merlin_storage.state_physical_lanes
+                           (id, target_authority, principal_key, physical_state_key)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (target_authority, principal_key, physical_state_key)
+                       DO NOTHING""",
+                    (initial_physical_lane_id, authority, aggregate_principal, physical_key),
+                )
+                initial_physical = self.connection.execute(
+                    """SELECT revision FROM merlin_storage.state_physical_lanes
+                       WHERE id = %s FOR SHARE""",
+                    (initial_physical_lane_id,),
+                ).fetchone()
+                if initial_physical is None:
+                    raise RuntimeError("physical state lane disappeared during scope creation")
+                initial_physical_lane_revision = int(initial_physical["revision"])
+            created_lane = self.connection.execute(
+                """INSERT INTO merlin_storage.state_lanes
+                       (id, campaign_id, experiment_id, target_authority,
+                        principal_key, physical_state_key, physical_lane_id,
+                        physical_lane_revision, conservative_lane_revision,
+                        conservative_ambiguity_revision)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (campaign_id, experiment_id, target_authority)
+                   DO NOTHING RETURNING id""",
+                (
+                    lane_id,
+                    campaign,
+                    value.experiment_id,
+                    authority,
+                    principal_key,
+                    physical_key,
+                    initial_physical_lane_id,
+                    initial_physical_lane_revision,
+                    int(conservative_lane["revision"]),
+                    int(conservative_lane["ambiguity_revision"]),
+                ),
+            ).fetchone()
+            lane = self.connection.execute(
+                """SELECT * FROM merlin_storage.state_lanes
+                   WHERE campaign_id = %s AND experiment_id = %s
+                     AND target_authority = %s FOR UPDATE""",
+                (campaign, value.experiment_id, authority),
+            ).fetchone()
+            if lane is None:
+                raise RuntimeError("state lane disappeared during scope creation")
+            lane_id = str(lane["id"])
+            for stored_key, incoming_key in (
+                (lane["principal_key"], principal_key),
+                (lane["physical_state_key"], physical_key),
+            ):
+                if (
+                    stored_key is not None
+                    and incoming_key is not None
+                    and str(stored_key) != incoming_key
+                ):
+                    raise ValueError("state lane identity conflicts with durable state")
+            if created_lane is not None:
+                self.connection.execute(
+                    """INSERT INTO merlin_storage.state_lane_revisions
+                           (lane_id, revision, transition, principal_key,
+                            physical_state_key)
+                       VALUES (%s, 1, 'created', %s, %s)""",
+                    (lane_id, principal_key, physical_key),
+                )
+            expected_lane_revision = int(lane["revision"])
             self.connection.execute(
                 """INSERT INTO merlin_storage.state_scopes
                        (id, format_version, campaign_id, experiment_id, attempt_id, candidate_id,
                         action_id, action_kind, target_authority, principal_key,
-                        physical_state_key, isolation_disposition, current_revision)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                        physical_state_key, isolation_disposition, current_revision,
+                        lane_id, expected_lane_revision, expected_physical_lane_id,
+                        expected_physical_lane_revision,
+                        expected_conservative_lane_revision,
+                        expected_conservative_ambiguity_revision)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s,
+                           %s, %s, %s, %s)
                    ON CONFLICT (id) DO NOTHING""",
                 (
                     value.scope_id,
@@ -178,6 +298,12 @@ class StateScopeRepository:
                     principal_key,
                     physical_key,
                     isolation_disposition,
+                    lane_id,
+                    expected_lane_revision,
+                    lane["physical_lane_id"],
+                    lane["physical_lane_revision"],
+                    lane["conservative_lane_revision"],
+                    lane["conservative_ambiguity_revision"],
                 ),
             )
             stored = self.connection.execute(
@@ -312,6 +438,7 @@ class StateScopeRepository:
             revised = self._revise_state_scope_locked(
                 scope_id, expected_revision, value, claim_id=claim_id
             )
+            self._advance_state_lane_locked(scope_id, value)
             self.connection.execute(
                 """UPDATE merlin_storage.state_scopes
                    SET status = 'settled', transition_disposition = %s,
@@ -426,6 +553,103 @@ class StateScopeRepository:
             ).fetchone()
             return None if row is None else self._load_state_scope_locked(scope_id)
 
+    def reobserve_state_lane(
+        self,
+        scope_id: str,
+        expected_revision: int,
+        evidence_refs: Sequence[str],
+        *,
+        claim_id: str,
+        claimant_id: str,
+        principal_identity: Mapping[str, object] | None = None,
+        physical_state_identity: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Fence restart recovery with a fresh, authoritative before observation."""
+
+        refs = tuple(dict.fromkeys(ref for ref in evidence_refs if ref))
+        with self._lock, self.connection.transaction():
+            self._require_state_scope_lease_locked(scope_id, claim_id, claimant_id)
+            scope = self.connection.execute(
+                """SELECT lane_id, expected_lane_revision, principal_key,
+                          physical_state_key
+                   FROM merlin_storage.state_scopes
+                   WHERE id = %s FOR UPDATE""",
+                (scope_id,),
+            ).fetchone()
+            if scope is None:
+                raise KeyError(scope_id)
+            if scope["lane_id"] is None:
+                return {"revision": expected_revision, "status": "current"}
+            lane = self.connection.execute(
+                "SELECT * FROM merlin_storage.state_lanes WHERE id = %s FOR UPDATE",
+                (scope["lane_id"],),
+            ).fetchone()
+            if lane is None:
+                raise RuntimeError("state scope lane disappeared")
+            current_revision = int(lane["revision"])
+            if (
+                expected_revision != current_revision
+                or int(scope["expected_lane_revision"]) != current_revision
+            ):
+                raise ValueError("state scope expected state is stale")
+            if str(lane["status"]) == "current":
+                return dict(lane)
+            if not refs:
+                raise ValueError(
+                    "state lane restart recovery requires authoritative before evidence"
+                )
+            principal_key = _identity_mapping_key(principal_identity) or (
+                str(scope["principal_key"]) if scope["principal_key"] is not None else None
+            )
+            physical_key = _identity_mapping_key(physical_state_identity) or (
+                str(scope["physical_state_key"])
+                if scope["physical_state_key"] is not None
+                else None
+            )
+            next_revision = current_revision + 1
+            observation_digest = _digest({"evidence_refs": list(refs)})
+            self.connection.execute(
+                """INSERT INTO merlin_storage.state_lane_revisions
+                       (lane_id, revision, scope_id, transition, principal_key,
+                        physical_state_key, observation_digest)
+                   VALUES (%s, %s, %s, 'unattributed', %s, %s, %s)""",
+                (
+                    lane["id"],
+                    next_revision,
+                    scope_id,
+                    principal_key,
+                    physical_key,
+                    observation_digest,
+                ),
+            )
+            updated = self.connection.execute(
+                """UPDATE merlin_storage.state_lanes
+                   SET revision = %s, status = 'current',
+                       last_transition = 'unattributed', principal_key = %s,
+                       physical_state_key = %s, latest_observation_digest = %s,
+                       latest_scope_id = %s, reobserved_at = now(), updated_at = now()
+                   WHERE id = %s AND revision = %s RETURNING *""",
+                (
+                    next_revision,
+                    principal_key,
+                    physical_key,
+                    observation_digest,
+                    scope_id,
+                    lane["id"],
+                    current_revision,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise ValueError("state lane changed during authoritative re-observation")
+            self.connection.execute(
+                """UPDATE merlin_storage.state_scopes
+                   SET expected_lane_revision = %s, principal_key = COALESCE(%s, principal_key),
+                       physical_state_key = COALESCE(%s, physical_state_key), updated_at = now()
+                   WHERE id = %s""",
+                (next_revision, principal_key, physical_key, scope_id),
+            )
+            return dict(updated)
+
     def set_scope_claims_enabled(self, format_version: str, enabled: bool) -> bool:
         """Gate only new scopes; acknowledged effects remain settleable."""
 
@@ -460,14 +684,22 @@ class StateScopeRepository:
         lock_key = json.dumps((authority, principal, equivalence), separators=(",", ":"))
         with self._lock, self.connection.transaction():
             scope = self.connection.execute(
-                """SELECT target_authority, principal_key, status
-                   FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE""",
+                """SELECT scope.target_authority, scope.principal_key, scope.status,
+                          scope.expected_lane_revision, lane.revision AS lane_revision,
+                          lane.status AS lane_status, scope.action_kind
+                   FROM merlin_storage.state_scopes AS scope
+                   LEFT JOIN merlin_storage.state_lanes AS lane ON lane.id = scope.lane_id
+                   WHERE scope.id = %s FOR UPDATE OF scope""",
                 (scope_id,),
             ).fetchone()
             if scope is None:
                 raise KeyError(scope_id)
             if str(scope["status"]) not in {"open", "effect_acknowledged"}:
                 raise ValueError("state scope is not claimable")
+            if scope["expected_lane_revision"] is not None and int(
+                scope["expected_lane_revision"]
+            ) != int(scope["lane_revision"]):
+                raise ValueError("state scope expected state is stale")
             expected_principal = str(scope["principal_key"] or "anonymous")
             if str(scope["target_authority"]) != authority or expected_principal != principal:
                 raise ValueError("state scope lease authority or principal changed")
@@ -489,6 +721,7 @@ class StateScopeRepository:
                 (lease_seconds, authority, principal, equivalence, scope_id, claimant),
             ).fetchone()
             if existing is not None:
+                self._require_physical_lane_current_locked(scope_id)
                 return str(existing["claim_id"])
             row = self.connection.execute(
                 """INSERT INTO merlin_storage.state_scope_leases
@@ -500,7 +733,10 @@ class StateScopeRepository:
                    DO NOTHING RETURNING claim_id""",
                 (authority, principal, equivalence, claim_id, scope_id, claimant, lease_seconds),
             ).fetchone()
-            return None if row is None else str(row["claim_id"])
+            if row is None:
+                return None
+            self._require_physical_lane_current_locked(scope_id)
+            return str(row["claim_id"])
 
     def create_and_claim_state_scope(
         self,
@@ -1088,6 +1324,17 @@ class StateScopeRepository:
                        FROM merlin_storage.state_scopes WHERE campaign_id = %s""",
                     (campaign_id,),
                 ).fetchone()
+                lane_counts = self.connection.execute(
+                    """SELECT count(*) AS lane_count,
+                              count(*) FILTER (
+                                  WHERE status = 'reobservation_required'
+                              ) AS reobservation_count,
+                              count(*) FILTER (
+                                  WHERE last_transition = 'unattributed'
+                              ) AS unattributed_count
+                       FROM merlin_storage.state_lanes WHERE campaign_id = %s""",
+                    (campaign_id,),
+                ).fetchone()
                 cleanup = self.connection.execute(
                     """SELECT count(*) AS count FROM (
                            SELECT 1 FROM merlin_storage.campaign_api_sessions
@@ -1306,6 +1553,11 @@ class StateScopeRepository:
                         "acknowledged": acknowledged_count,
                         "target_calls": int(counts["target_call_count"] or 0),
                     },
+                    "state_lanes": {
+                        "total": int(lane_counts["lane_count"] or 0),
+                        "reobservation_required": int(lane_counts["reobservation_count"] or 0),
+                        "unattributed_transitions": int(lane_counts["unattributed_count"] or 0),
+                    },
                     "resource_reservations": reservations,
                     "frontier_transition": (
                         None
@@ -1363,6 +1615,12 @@ class StateScopeRepository:
                         "recovery_state_digest": recovery_state_digest,
                         "recovery_decision_digest": recovery_decision_digest,
                         "target_call_count": int(counts["target_call_count"] or 0),
+                        "state_lanes_requiring_reobservation": int(
+                            lane_counts["reobservation_count"] or 0
+                        ),
+                        "unattributed_state_transitions": int(
+                            lane_counts["unattributed_count"] or 0
+                        ),
                         "settled_acknowledged_state_scopes": recovered_acknowledged,
                         "resource_reservations": reservations,
                         "latest_wave": wave_projection,
@@ -1459,9 +1717,7 @@ class StateScopeRepository:
                     amount = int(reservation["amount"])
                     consumed = int(ledger["consumed"]) + amount
                     state = (
-                        "exhausted"
-                        if consumed >= int(ledger["capacity"])
-                        else str(ledger["state"])
+                        "exhausted" if consumed >= int(ledger["capacity"]) else str(ledger["state"])
                     )
                     self.connection.execute(
                         """UPDATE merlin_storage.principal_resources
@@ -1487,7 +1743,330 @@ class StateScopeRepository:
                        updated_at = now() WHERE id = %s""",
                 (terminal.revision, scope_id),
             )
+            self._require_state_lane_reobservation_locked(scope_id)
         return len(rows)
+
+    def _require_state_lane_reobservation_locked(self, scope_id: str) -> None:
+        """Fence attribution after restart loses the authoritative after-state."""
+
+        scope = self.connection.execute(
+            """SELECT lane_id, target_authority, principal_key, physical_state_key
+               FROM merlin_storage.state_scopes WHERE id = %s""",
+            (scope_id,),
+        ).fetchone()
+        if scope is None or scope["lane_id"] is None:
+            return
+        lane = self.connection.execute(
+            "SELECT * FROM merlin_storage.state_lanes WHERE id = %s FOR UPDATE",
+            (scope["lane_id"],),
+        ).fetchone()
+        if lane is None:
+            raise RuntimeError("state lane disappeared during restart recovery")
+        authority = str(scope["target_authority"])
+        principal_key = scope["principal_key"] or lane["principal_key"]
+        physical_state_key = scope["physical_state_key"] or lane["physical_state_key"]
+        conservative_lane_id = _conservative_physical_lane_id(authority)
+        conservative_lane = self.connection.execute(
+            """SELECT * FROM merlin_storage.state_physical_lanes
+               WHERE id = %s FOR UPDATE""",
+            (conservative_lane_id,),
+        ).fetchone()
+        if conservative_lane is None:
+            raise RuntimeError("conservative physical state lane disappeared during recovery")
+        known_physical_state = physical_state_key is not None
+        next_conservative_revision = int(conservative_lane["revision"]) + 1
+        next_ambiguity_revision = int(conservative_lane["ambiguity_revision"]) + int(
+            not known_physical_state
+        )
+        self.connection.execute(
+            """UPDATE merlin_storage.state_physical_lanes
+               SET revision = %s, ambiguity_revision = %s,
+                   latest_experiment_id = %s, latest_scope_id = %s,
+                   latest_observation_digest = NULL, updated_at = now()
+               WHERE id = %s""",
+            (
+                next_conservative_revision,
+                next_ambiguity_revision,
+                str(lane["experiment_id"]),
+                scope_id,
+                conservative_lane_id,
+            ),
+        )
+        if known_physical_state:
+            aggregate_principal = str(principal_key or "anonymous")
+            physical_lane_id = _physical_lane_id(
+                authority, aggregate_principal, str(physical_state_key)
+            )
+            self.connection.execute(
+                """INSERT INTO merlin_storage.state_physical_lanes
+                       (id, target_authority, principal_key, physical_state_key)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (target_authority, principal_key, physical_state_key)
+                   DO NOTHING""",
+                (physical_lane_id, authority, aggregate_principal, physical_state_key),
+            )
+            physical_lane = self.connection.execute(
+                """SELECT revision FROM merlin_storage.state_physical_lanes
+                   WHERE id = %s FOR UPDATE""",
+                (physical_lane_id,),
+            ).fetchone()
+            if physical_lane is None:
+                raise RuntimeError("physical state lane disappeared during recovery")
+            next_physical_revision = int(physical_lane["revision"]) + 1
+            self.connection.execute(
+                """UPDATE merlin_storage.state_physical_lanes
+                   SET revision = %s, latest_experiment_id = %s, latest_scope_id = %s,
+                       latest_observation_digest = NULL, updated_at = now()
+                   WHERE id = %s""",
+                (
+                    next_physical_revision,
+                    str(lane["experiment_id"]),
+                    scope_id,
+                    physical_lane_id,
+                ),
+            )
+        else:
+            physical_lane_id = conservative_lane_id
+            next_physical_revision = next_conservative_revision
+        next_revision = int(lane["revision"]) + 1
+        self.connection.execute(
+            """INSERT INTO merlin_storage.state_lane_revisions
+                   (lane_id, revision, scope_id, transition, principal_key,
+                    physical_state_key, observation_digest)
+               VALUES (%s, %s, %s, 'unattributed', %s, %s, NULL)""",
+            (
+                str(lane["id"]),
+                next_revision,
+                scope_id,
+                lane["principal_key"],
+                lane["physical_state_key"],
+            ),
+        )
+        self.connection.execute(
+            """UPDATE merlin_storage.state_lanes
+               SET revision = %s, status = 'reobservation_required',
+                   last_transition = 'unattributed', latest_observation_digest = NULL,
+                   principal_key = %s, physical_state_key = %s,
+                   physical_lane_id = %s, physical_lane_revision = %s,
+                   conservative_lane_revision = %s,
+                   conservative_ambiguity_revision = %s,
+                   latest_scope_id = %s, updated_at = now()
+               WHERE id = %s""",
+            (
+                next_revision,
+                principal_key,
+                physical_state_key,
+                physical_lane_id,
+                next_physical_revision,
+                next_conservative_revision,
+                next_ambiguity_revision,
+                scope_id,
+                str(lane["id"]),
+            ),
+        )
+
+    def _advance_state_lane_locked(
+        self,
+        scope_id: str,
+        envelope: StateScopeEnvelope,
+    ) -> dict[str, Any] | None:
+        """Advance the experiment lane exactly once after attributed settlement."""
+
+        scope = self.connection.execute(
+            """SELECT lane_id, expected_lane_revision, action_kind, experiment_id,
+                      target_authority, expected_physical_lane_id,
+                      expected_physical_lane_revision,
+                      expected_conservative_lane_revision,
+                      expected_conservative_ambiguity_revision
+               FROM merlin_storage.state_scopes WHERE id = %s FOR UPDATE""",
+            (scope_id,),
+        ).fetchone()
+        if scope is None or scope["lane_id"] is None:
+            return None
+        row = self.connection.execute(
+            "SELECT * FROM merlin_storage.state_lanes WHERE id = %s FOR UPDATE",
+            (scope["lane_id"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("state lane disappeared before settlement")
+        expected = int(scope["expected_lane_revision"])
+        current = int(row["revision"])
+        if current != expected:
+            raise ValueError("state lane revision changed before settlement")
+        principal_key = _identity_key(envelope.principal_identity)
+        physical_key = _identity_key(envelope.physical_state_identity)
+        stored_principal = None if row["principal_key"] is None else str(row["principal_key"])
+        stored_physical = (
+            None if row["physical_state_key"] is None else str(row["physical_state_key"])
+        )
+        identity_changed = any(
+            stored is not None and incoming is not None and stored != incoming
+            for stored, incoming in (
+                (stored_principal, principal_key),
+                (stored_physical, physical_key),
+            )
+        )
+        reobserving = str(row["status"]) == "reobservation_required" and str(
+            scope["action_kind"]
+        ) in {"reconnaissance", "baseline"}
+        transition = "unattributed" if identity_changed or reobserving else "attributed"
+        if identity_changed and not reobserving:
+            raise ValueError("state lane identity changed without authoritative re-observation")
+        next_revision = current + 1
+        observation_digest = _digest(envelope.after.model_dump(mode="json"))
+        next_principal = principal_key or stored_principal
+        next_physical = physical_key or stored_physical
+        authority = str(scope["target_authority"])
+        conservative_lane_id = _conservative_physical_lane_id(authority)
+        conservative_lane = self.connection.execute(
+            """SELECT * FROM merlin_storage.state_physical_lanes
+               WHERE id = %s FOR UPDATE""",
+            (conservative_lane_id,),
+        ).fetchone()
+        if conservative_lane is None:
+            raise RuntimeError("conservative physical state lane disappeared before settlement")
+        known_physical_state = next_physical is not None
+        if known_physical_state:
+            if int(scope["expected_conservative_ambiguity_revision"]) != int(
+                conservative_lane["ambiguity_revision"]
+            ):
+                raise ValueError("state scope expected physical state is stale")
+        elif int(scope["expected_conservative_lane_revision"]) != int(
+            conservative_lane["revision"]
+        ):
+            raise ValueError("state scope expected physical state is stale")
+
+        expected_physical_lane_id = scope["expected_physical_lane_id"]
+        if known_physical_state:
+            aggregate_principal = next_principal or "anonymous"
+            physical_lane_id = _physical_lane_id(authority, aggregate_principal, next_physical)
+            self.connection.execute(
+                """INSERT INTO merlin_storage.state_physical_lanes
+                       (id, target_authority, principal_key, physical_state_key)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (target_authority, principal_key, physical_state_key)
+                   DO NOTHING""",
+                (physical_lane_id, authority, aggregate_principal, next_physical),
+            )
+            physical_lane = self.connection.execute(
+                """SELECT * FROM merlin_storage.state_physical_lanes
+                   WHERE id = %s FOR UPDATE""",
+                (physical_lane_id,),
+            ).fetchone()
+            if physical_lane is None:
+                raise RuntimeError("physical state lane disappeared before settlement")
+        else:
+            physical_lane_id = conservative_lane_id
+            physical_lane = conservative_lane
+        expected_physical_lane_id = scope["expected_physical_lane_id"]
+        resolving_conservative_alias = (
+            known_physical_state
+            and expected_physical_lane_id is not None
+            and str(expected_physical_lane_id) == conservative_lane_id
+        )
+        if (
+            expected_physical_lane_id is not None
+            and not resolving_conservative_alias
+            and (
+                str(expected_physical_lane_id) != physical_lane_id
+                or scope["expected_physical_lane_revision"] is None
+                or int(scope["expected_physical_lane_revision"]) != int(physical_lane["revision"])
+            )
+        ):
+            raise ValueError("state scope expected physical state is stale")
+        next_conservative_revision = int(conservative_lane["revision"]) + 1
+        next_ambiguity_revision = int(conservative_lane["ambiguity_revision"]) + int(
+            not known_physical_state
+        )
+        advanced_conservative = self.connection.execute(
+            """UPDATE merlin_storage.state_physical_lanes
+               SET revision = %s, ambiguity_revision = %s,
+                   latest_experiment_id = %s, latest_scope_id = %s,
+                   latest_observation_digest = %s, updated_at = now()
+               WHERE id = %s AND revision = %s RETURNING id""",
+            (
+                next_conservative_revision,
+                next_ambiguity_revision,
+                str(scope["experiment_id"]),
+                scope_id,
+                observation_digest,
+                conservative_lane_id,
+                int(conservative_lane["revision"]),
+            ),
+        ).fetchone()
+        if advanced_conservative is None:
+            raise ValueError("conservative physical state lane changed before settlement")
+        if known_physical_state:
+            next_physical_revision = int(physical_lane["revision"]) + 1
+            advanced_physical = self.connection.execute(
+                """UPDATE merlin_storage.state_physical_lanes
+                   SET revision = %s, latest_experiment_id = %s, latest_scope_id = %s,
+                       latest_observation_digest = %s, updated_at = now()
+                   WHERE id = %s AND revision = %s RETURNING id""",
+                (
+                    next_physical_revision,
+                    str(scope["experiment_id"]),
+                    scope_id,
+                    observation_digest,
+                    physical_lane_id,
+                    int(physical_lane["revision"]),
+                ),
+            ).fetchone()
+        else:
+            next_physical_revision = next_conservative_revision
+            advanced_physical = advanced_conservative
+        if advanced_physical is None:
+            raise ValueError("physical state lane changed before settlement")
+        self.connection.execute(
+            """INSERT INTO merlin_storage.state_lane_revisions
+                   (lane_id, revision, scope_id, transition, principal_key,
+                    physical_state_key, observation_digest)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                str(scope["lane_id"]),
+                next_revision,
+                scope_id,
+                transition,
+                next_principal,
+                next_physical,
+                observation_digest,
+            ),
+        )
+        next_status = "current" if reobserving else str(row["status"])
+        self.connection.execute(
+            """UPDATE merlin_storage.state_lanes
+               SET revision = %s, status = %s, last_transition = %s,
+                   principal_key = %s, physical_state_key = %s,
+                   physical_lane_id = %s, physical_lane_revision = %s,
+                   conservative_lane_revision = %s,
+                   conservative_ambiguity_revision = %s,
+                   latest_observation_digest = %s, latest_scope_id = %s,
+                   reobserved_at = CASE WHEN %s THEN now() ELSE reobserved_at END,
+                   updated_at = now()
+               WHERE id = %s AND revision = %s""",
+            (
+                next_revision,
+                next_status,
+                transition,
+                next_principal,
+                next_physical,
+                physical_lane_id,
+                next_physical_revision,
+                next_conservative_revision,
+                next_ambiguity_revision,
+                observation_digest,
+                scope_id,
+                reobserving,
+                str(scope["lane_id"]),
+                expected,
+            ),
+        )
+        return {
+            "id": str(scope["lane_id"]),
+            "revision": next_revision,
+            "status": next_status,
+            "transition": transition,
+        }
 
     def _revise_state_scope_locked(
         self,
@@ -1601,6 +2180,63 @@ class StateScopeRepository:
         ):
             raise ValueError("resource identity does not match its state scope")
         return str(scope["status"])
+
+    def _require_physical_lane_current_locked(self, scope_id: str) -> None:
+        """Reject an experiment whose physical state changed between its actions."""
+
+        row = self.connection.execute(
+            """SELECT scope.expected_physical_lane_id,
+                      scope.expected_physical_lane_revision,
+                      scope.expected_conservative_lane_revision,
+                      scope.expected_conservative_ambiguity_revision,
+                      scope.target_authority,
+                      lane.physical_lane_id,
+                      lane.physical_lane_revision,
+                      lane.physical_state_key
+               FROM merlin_storage.state_scopes AS scope
+               JOIN merlin_storage.state_lanes AS lane ON lane.id = scope.lane_id
+               WHERE scope.id = %s
+               FOR UPDATE OF scope, lane""",
+            (scope_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(scope_id)
+        conservative = self.connection.execute(
+            """SELECT revision, ambiguity_revision
+               FROM merlin_storage.state_physical_lanes
+               WHERE id = %s FOR UPDATE""",
+            (_conservative_physical_lane_id(str(row["target_authority"])),),
+        ).fetchone()
+        if conservative is None:
+            raise RuntimeError("conservative physical state lane disappeared")
+        if row["physical_state_key"] is None:
+            conservative_stale = int(conservative["revision"]) != int(
+                row["expected_conservative_lane_revision"]
+            )
+        else:
+            conservative_stale = int(conservative["ambiguity_revision"]) != int(
+                row["expected_conservative_ambiguity_revision"]
+            )
+        if conservative_stale:
+            raise ValueError("state scope expected physical state is stale")
+        expected_lane_id = row["expected_physical_lane_id"]
+        if expected_lane_id is None:
+            return
+        physical = self.connection.execute(
+            """SELECT revision FROM merlin_storage.state_physical_lanes
+               WHERE id = %s FOR UPDATE""",
+            (expected_lane_id,),
+        ).fetchone()
+        if (
+            row["physical_lane_id"] is None
+            or str(row["physical_lane_id"]) != str(expected_lane_id)
+            or physical is None
+            or row["expected_physical_lane_revision"] is None
+            or int(physical["revision"]) != int(row["expected_physical_lane_revision"])
+            or row["physical_lane_revision"] is None
+            or int(row["physical_lane_revision"]) != int(row["expected_physical_lane_revision"])
+        ):
+            raise ValueError("state scope expected physical state is stale")
 
     def _require_state_scope_lease_locked(
         self, scope_id: str, claim_id: str, claimant_id: str

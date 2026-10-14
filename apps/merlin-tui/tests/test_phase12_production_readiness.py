@@ -40,7 +40,7 @@ from merlin_browser import (
     normalize_api_adapter_input_aliases,
 )
 from merlin_browser.core import BrowserSession
-from merlin_config import Config, ConfigPaths, CredentialStore
+from merlin_config import Config, ConfigPaths, CredentialCheckpointVault, CredentialStore
 from merlin_contracts import (
     AgentTask,
     ChatMessage,
@@ -3791,6 +3791,21 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
         "interface": "http_api",
         "endpoint": "https://target.invalid/api",
         "credential_handle": "target-token",
+        "state_capabilities": {
+            "identity": {
+                "baseline_selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "result_selector": {
+                    "step_id": "message",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "evidence_refs": ["reviewed:pair-session-identity"],
+            }
+        },
         "api_steps": [
             {
                 "step_id": "start",
@@ -3872,10 +3887,11 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
         return httpx.Response(
             200,
             json={
+                "sessionId": body["sessionId"],
                 "reply": {
                     "text": "observed",
                     "verdict": "violated" if violated else "safe",
-                }
+                },
             },
         )
 
@@ -3912,6 +3928,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
         provider_model="test",
     )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    test_credentials = {"api_key": "secret"}
     with Database(DatabaseConfig(data_dir=data_dir)) as database:
         monkeypatch.setattr(
             "merlin_config.load_config",
@@ -3923,7 +3940,16 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                 },
             ),
         )
-        monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
+        monkeypatch.setattr(
+            CredentialStore,
+            "load",
+            lambda self, environ=None: dict(test_credentials),
+        )
+        monkeypatch.setattr(
+            CredentialStore,
+            "save",
+            lambda self, credentials: test_credentials.update(credentials),
+        )
         first = build_backend(tmp_path / "workspace")
         session_id = await first.kernel.start()
         manifest = CampaignManifest.create(
@@ -3953,6 +3979,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                 lambda _campaign_id: adapter,
                 {"target-token": "opaque"},
                 client=client,
+                checkpoint_vault=CredentialCheckpointVault(),
             )
             adapter_digest = target._adapter(campaign_id, target_id).digest  # noqa: SLF001
             campaigns.prepare(
@@ -4116,6 +4143,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
             )
 
             forced_remote_sessions[:] = ["physical-a", "physical-b", "physical-a"]
+            collision_physical_identities: list[object] = []
             for stage, node_id, message in zip(
                 ("control", "direct", "replay"),
                 collision_nodes,
@@ -4143,14 +4171,9 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                     {"input": message},
                 )
                 assert result.is_error is False, (stage, result.content, result.metadata)
-                assert (
-                    result.metadata["remote_target_session_id"]
-                    == {
-                        "control": "physical-a",
-                        "direct": "physical-b",
-                        "replay": "physical-a",
-                    }[stage]
-                )
+                physical_identity = result.metadata["physical_state_identity"]
+                assert physical_identity["kind"] == "keyed_digest"
+                collision_physical_identities.append(physical_identity)
                 logical_session_id = result.metadata["target_session_id"]
                 assert isinstance(logical_session_id, str)
                 scheduler.commit_reducer(
@@ -4162,6 +4185,8 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                     target_session_id=logical_session_id,
                 )
                 await target.cleanup_assignment(node_id.removeprefix("worker:"))
+            assert collision_physical_identities[0] != collision_physical_identities[1]
+            assert collision_physical_identities[0] == collision_physical_identities[2]
             collision_stages = scheduler.baseline_gate(collision_schedule)["agendas"][
                 "agenda/aba-collision"
             ]

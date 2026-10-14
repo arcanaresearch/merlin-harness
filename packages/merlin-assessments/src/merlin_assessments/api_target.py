@@ -19,6 +19,7 @@ from merlin_contracts import (
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    build_state_enumeration,
     build_state_observation,
     evaluate_objective_gate_predicate,
     evaluate_state_transition,
@@ -26,6 +27,7 @@ from merlin_contracts import (
 )
 from merlin_contracts.request_bindings import RequestValueGenerator, bind_request_values
 from merlin_contracts.state_isolation import resolve_state_isolation
+from merlin_contracts.state_scope import StateScopeActionKind
 from merlin_contracts.state_scope_runtime import (
     CheckpointVault,
     ObjectiveCheckpointStore,
@@ -865,6 +867,17 @@ class ReviewedApiTargetTool:
             attempt_id=session_scope_id,
             action_id=claimant_id,
             candidate_id=context.agent_id,
+            experiment_id=str(
+                context.technique_attempt_id
+                or context.attempt_id
+                or context.agent_id
+                or session_scope_id
+            ),
+            action_kind=(
+                StateScopeActionKind(context.state_action_kind)
+                if context.state_action_kind is not None
+                else StateScopeActionKind.CANDIDATE
+            ),
         )
         state_scope_lease = _StateScopeLease(
             claimant_id=claimant_id,
@@ -1296,6 +1309,9 @@ class ReviewedApiTargetTool:
                     and state_scope_lease.pending_checkpoint_secret is not None
                 ):
                     variables[checkpoint.binding_name] = state_scope_lease.pending_checkpoint_secret
+                await state_scope_lease.lifecycle.ensure_authoritative_before(
+                    _state_observation_refs(exchanges, phase="baseline")
+                )
                 try:
                     item, variables, exchange = await self._execute(
                         context.campaign_id,
@@ -2528,6 +2544,9 @@ class ReviewedApiTargetTool:
         )
         evaluation_uncertainties = list(step.evaluation_uncertainties)
         response_state_observations = _state_observations(adapter, step, response_json, variables)
+        response_state_enumerations = _state_enumerations(
+            adapter, step, response_json, variables
+        )
         freshness_observations = _freshness_observations(adapter, step, response_json, variables)
         freshness_unproven = any(item.get("matched") is not True for item in freshness_observations)
         if step.expected_status is not None and status_code != step.expected_status:
@@ -2625,6 +2644,11 @@ class ReviewedApiTargetTool:
                         else {}
                     ),
                     **(
+                        {"state_enumerations": response_state_enumerations}
+                        if response_state_enumerations
+                        else {}
+                    ),
+                    **(
                         {"freshness_observations": freshness_observations}
                         if freshness_observations
                         else {}
@@ -2703,6 +2727,7 @@ class ReviewedApiTargetTool:
         freshness_unproven = any(item.get("matched") is not True for item in freshness_observations)
         oracle_observations = _oracle_observation(adapter, step, response_json)
         state_observations = _state_observations(adapter, step, response_json, variables)
+        state_enumerations = _state_enumerations(adapter, step, response_json, variables)
         if any(item.get("matched") is None for item in oracle_observations):
             evaluation_uncertainties.append(
                 _evaluation_uncertainty(
@@ -2737,6 +2762,7 @@ class ReviewedApiTargetTool:
                 else {}
             ),
             **({"state_observations": state_observations} if state_observations else {}),
+            **({"state_enumerations": state_enumerations} if state_enumerations else {}),
             **({"safe_state_bindings": safe_state_bindings} if safe_state_bindings else {}),
             **(
                 {
@@ -3664,6 +3690,51 @@ def _state_observations(
     return observations
 
 
+def _state_enumerations(
+    adapter: _ApiAdapter,
+    step: _ApiStep,
+    response_body: object,
+    captures: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Extract reviewed finite denominators from the attributable target response."""
+
+    capabilities = adapter.state_capabilities
+    if capabilities is None:
+        return []
+    receipts: list[dict[str, object]] = []
+    for declaration in capabilities.enumerations:
+        if declaration.selector.step_id != step.id:
+            continue
+        selected = _select_state_binding(
+            declaration.selector,
+            step,
+            response_body,
+            captures,
+        )
+        if selected is None:
+            continue
+        try:
+            receipt = build_state_enumeration(
+                declaration,
+                selected_value=selected,
+                binding_context={
+                    "adapter_digest": adapter.digest,
+                    "compiled_adapter_digest": adapter.compiled_digest,
+                    "target_id": adapter.target_id,
+                    "step_id": step.id,
+                    "evaluation_root": declaration.selector.evaluation_root,
+                    "pointer": declaration.selector.pointer,
+                },
+            )
+        except ValueError:
+            # A reviewed selector whose target value no longer matches its declared
+            # shape cannot create denominator authority. The raw response remains
+            # available to reconnaissance and adapter review.
+            continue
+        receipts.append(receipt.model_dump(mode="json"))
+    return receipts
+
+
 def _select_state_binding(
     selector: StateSelector,
     step: _ApiStep,
@@ -4130,6 +4201,7 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
     exchanges_value = metadata.get("current_target_exchanges", metadata.get("target_exchanges", ()))
     exchanges = exchanges_value if isinstance(exchanges_value, list) else []
     state_observations: list[dict[str, object]] = []
+    state_enumerations: list[dict[str, object]] = []
     constraint_observations: list[dict[str, object]] = []
     equivalence_matches: list[bool] = []
     contaminated = bool(metadata.get("session_reused"))
@@ -4137,6 +4209,7 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
         if not isinstance(exchange, Mapping):
             continue
         state_observations.extend(_mapping_list(exchange.get("state_observations")))
+        state_enumerations.extend(_mapping_list(exchange.get("state_enumerations")))
         constraint_observations.extend(
             _mapping_list(exchange.get("request_constraint_observations"))
         )
@@ -4148,6 +4221,8 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
                 if isinstance(item.get("matched"), bool)
             )
         contaminated = contaminated or exchange.get("attempt_disposition") == "contaminated"
+    if state_enumerations:
+        metadata["state_enumerations"] = state_enumerations
     if state_observations:
         metadata["state_observations"] = state_observations
         transition = _target_state_transition(

@@ -803,7 +803,7 @@ async def test_joined_crescendo_replacement_adopts_acknowledged_api_effect_witho
             )
             revision = backend._report_repository.list(campaign_id)[-1]  # type: ignore[attr-defined]
             internal = backend._report_repository.get(revision.revision_id)  # type: ignore[attr-defined]
-            assert internal.stop_reason == "capped"
+            assert internal.stop_reason == "budget_exhausted"
             assert internal.report_state == "incomplete"
             assert internal.coverage["confirmed"] == 0
             assert internal.coverage["blocked"] == 0
@@ -839,7 +839,21 @@ async def test_joined_crescendo_replacement_adopts_acknowledged_api_effect_witho
             ):
                 assert secret not in serialized
             assert "reviewed escalating prompt" in serialized
-            assert "objective reached" in serialized
+            assert "objective reached" not in serialized
+            interaction_exchanges = [
+                row for row in internal.exchanges if row.get("interaction") is True
+            ]
+            assert interaction_exchanges
+            assert all("response" not in row for row in interaction_exchanges)
+            assert all(
+                row["response_summary"] == {"kind": "str", "utf8_bytes": 19}
+                for row in interaction_exchanges
+            )
+            assert all(
+                row["response"] == ""
+                for row in customer["exchanges"]
+                if row["request"] == "reviewed escalating prompt"
+            )
             customer_lineage = [row for row in customer["lineage"] if row.get("stage") == "probe"]
             assert len(customer_lineage) == 2
             assert all(row["attempt"] == "[redacted]" for row in customer_lineage)

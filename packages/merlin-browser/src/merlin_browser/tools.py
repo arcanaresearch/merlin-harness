@@ -19,11 +19,13 @@ from urllib.parse import unquote, urljoin, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from merlin_contracts import (
+    StateEnumerationDeclaration,
     TargetDeliveryClass,
     ToolContext,
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
+    build_state_enumeration,
     build_state_observation,
     evaluate_objective_gate_predicate,
     evaluate_state_transition,
@@ -569,6 +571,7 @@ class BrowserTool:
                     target_authority=_browser_action_authority(session, action),
                     action_id=action_id,
                     candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
+                    experiment_id=_browser_experiment_id(context, action_id),
                     action_kind=_browser_action_kind(context, kind),
                     equivalence_key="conservative-shared-state",
                 )
@@ -631,6 +634,16 @@ class BrowserTool:
         recorded = action
         if action.redaction_status == "redacted":
             recorded = action.model_copy(update={"value": "[redacted]"})
+        if state_scope is not None:
+            try:
+                await state_scope.lifecycle.ensure_authoritative_before(before_refs)
+            except BaseException:
+                await state_scope.pause(
+                    MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                    before_refs=before_refs,
+                    action_refs=action.evidence_refs,
+                )
+                raise
         fingerprint = (
             action.context_id,
             context.session_id,
@@ -1034,6 +1047,7 @@ class BrowserOwnedSessionCleanupTool:
                 ),
                 action_id=action_id,
                 candidate_id=str(context.technique_attempt_id or context.agent_id or action_id),
+                experiment_id=_browser_experiment_id(context, action_id),
                 action_kind=StateScopeActionKind.CLEANUP,
                 equivalence_key="conservative-shared-state",
             )
@@ -1873,6 +1887,7 @@ class _BrowserStateScope:
         target_authority: str,
         action_id: str,
         candidate_id: str,
+        experiment_id: str | None = None,
         action_kind: StateScopeActionKind = StateScopeActionKind.CANDIDATE,
         equivalence_key: str,
         isolation_disposition: str = "shared_serialized",
@@ -1885,6 +1900,7 @@ class _BrowserStateScope:
             attempt_id=action_id,
             action_id=action_id,
             candidate_id=candidate_id,
+            experiment_id=experiment_id,
             action_kind=action_kind,
         )
         claimant_id = (
@@ -2138,6 +2154,8 @@ def _browser_action_authority(session: BrowserSession, action: BrowserAction) ->
 
 
 def _browser_action_kind(context: ToolContext, kind: str) -> StateScopeActionKind:
+    if context.state_action_kind is not None:
+        return StateScopeActionKind(context.state_action_kind)
     if kind == "close_tab":
         return StateScopeActionKind.CLEANUP
     if context.objective_phase_checkpoint_intent == "capture":
@@ -2145,6 +2163,17 @@ def _browser_action_kind(context: ToolContext, kind: str) -> StateScopeActionKin
     if context.technique_attempt_id or context.attempt_id:
         return StateScopeActionKind.CANDIDATE
     return StateScopeActionKind.RECONNAISSANCE
+
+
+def _browser_experiment_id(context: ToolContext, fallback: str) -> str:
+    """Keep every surface action for one scheduler experiment on one lane."""
+
+    return str(
+        context.technique_attempt_id
+        or context.attempt_id
+        or context.agent_id
+        or fallback
+    )
 
 
 def _checkpoint_context(context: ToolContext) -> tuple[str, str, str, str] | None:
@@ -2614,7 +2643,8 @@ class BrowserChatExchangeTool:
             target_authority=_browser_target_authority(executable_adapter.endpoint),
             action_id=action_id,
             candidate_id=str(context.agent_id or action_id),
-            action_kind=StateScopeActionKind.CANDIDATE,
+            experiment_id=_browser_experiment_id(context, action_id),
+            action_kind=_browser_action_kind(context, "chat_exchange"),
             equivalence_key="conservative-shared-state",
             wait_for_lease_seconds=(
                 2.0 if preliminary_isolation_plan.permits_parallel_delivery else 0.0
@@ -2732,6 +2762,14 @@ class BrowserChatExchangeTool:
             )
         tab_ref, current = compatible_tabs[0]
         before_ref = _browser_evidence_ref("before", current)
+        try:
+            await state_scope.lifecycle.ensure_authoritative_before((before_ref,))
+        except BaseException:
+            await state_scope.pause(
+                MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                before_refs=(before_ref,),
+            )
+            raise
         action_ref = _browser_evidence_ref(
             "action", {"adapter_digest": compiled_adapter_digest, "prompt": prompt}
         )
@@ -4473,6 +4511,47 @@ class CompiledApiReconHandoffTool:
                                 "role",
                                 "baseline_selector",
                                 "result_selector",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "state_enumerations": {
+                        "type": "array",
+                        "description": (
+                            "Optional reviewed finite target-authored member domains. The "
+                            "selector must exist in its captured lifecycle response."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "selector": {"$ref": "#/$defs/state_selector"},
+                                "shape": {
+                                    "type": "string",
+                                    "enum": ["flat", "scoped"],
+                                },
+                                "scope_dimension": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]*$",
+                                },
+                                "completeness": {
+                                    "type": "string",
+                                    "enum": ["complete", "partial"],
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1,
+                                },
+                            },
+                            "required": [
+                                "name",
+                                "selector",
+                                "shape",
+                                "completeness",
                             ],
                             "additionalProperties": False,
                         },
@@ -6505,6 +6584,64 @@ class CompiledApiReconHandoffTool:
                 observed_value,
             )
 
+        state_enumerations: list[dict[str, object]] = []
+        for raw_enumeration in arguments.get("state_enumerations", []):
+            if not isinstance(raw_enumeration, Mapping):
+                continue
+            compiled_selector = compile_state_selector(raw_enumeration.get("selector"))
+            if compiled_selector is None:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_enumerations",
+                        "A finite-domain selector was absent from its exact captured "
+                        "lifecycle response and was not made executable.",
+                    )
+                )
+                continue
+            selector, selected_value = compiled_selector
+            declaration_payload: dict[str, object] = {
+                "schema_version": "merlin.state-enumeration-declaration.v1",
+                "name": str(raw_enumeration.get("name") or ""),
+                "selector": selector,
+                "shape": str(raw_enumeration.get("shape") or "flat"),
+                "completeness": str(raw_enumeration.get("completeness") or "partial"),
+                "evidence_refs": list(selector.get("evidence_refs", ())),
+                "confidence": float(
+                    raw_enumeration.get("confidence", selector.get("confidence", 1.0))
+                ),
+                **(
+                    {"scope_dimension": str(raw_enumeration["scope_dimension"])}
+                    if raw_enumeration.get("scope_dimension") is not None
+                    else {}
+                ),
+            }
+            try:
+                declaration = StateEnumerationDeclaration.model_validate(
+                    declaration_payload
+                )
+                # Compile-time validation proves the captured target value has
+                # the declared flat/scoped member shape. Runtime builds a fresh
+                # target receipt from the actual response.
+                build_state_enumeration(
+                    declaration,
+                    selected_value=selected_value,
+                    binding_context={
+                        "compiled_from": "browser_api_recon_handoff",
+                        "step_id": selector["step_id"],
+                        "pointer": selector["pointer"],
+                    },
+                )
+            except ValueError:
+                evaluation_uncertainties.append(
+                    _evaluation_uncertainty(
+                        "browser_compile_api_handoff.state_enumerations",
+                        "A finite-domain declaration did not match the captured target "
+                        "value and was not made executable.",
+                    )
+                )
+                continue
+            state_enumerations.append(declaration.model_dump(mode="json"))
+
         for raw_rule in arguments.get("identity_equivalence_rules", []):
             if not isinstance(raw_rule, Mapping):
                 continue
@@ -7133,6 +7270,7 @@ class CompiledApiReconHandoffTool:
             )
         has_state_capabilities = bool(
             state_observations
+            or state_enumerations
             or state_affordances
             or supported_modalities
             or resource_controls
@@ -7160,6 +7298,7 @@ class CompiledApiReconHandoffTool:
             adapter["state_capabilities"] = {
                 "schema_version": "merlin.state-capabilities.v1",
                 "observations": state_observations,
+                **({"enumerations": state_enumerations} if state_enumerations else {}),
                 **({"corroboration_rules": corroboration_rules} if corroboration_rules else {}),
                 **(
                     {"identity_equivalence_rules": identity_equivalence_rules}

@@ -36,6 +36,7 @@ from merlin_agents import (
     compile_worker_context,
     expand_language_techniques,
     manifest_with_bounded_regeneration,
+    manifest_with_objective_contract,
     manifest_with_objective_phase_gates,
     manifest_with_target_brief,
     objective_phase_gate_from_mapping,
@@ -67,6 +68,7 @@ from merlin_agents.goat import GOAT_TOOLBOX_CATALOG_DIGEST, trusted_goat_toolbox
 from merlin_contracts import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
     HYDRA_SELECT_CATALOG_DIGEST,
+    compile_objective_contract,
     executable_adapter_digest,
     trusted_hydra_select_mechanisms,
 )
@@ -737,7 +739,15 @@ def test_execution_agenda_retains_target_derived_discovery_lane(
 
 
 def test_execution_agenda_separates_explorer_catalogue_work_from_discovery() -> None:
-    prepared = manifest()
+    prepared = manifest_with_objective_contract(
+        replace(
+            manifest(),
+            objective="Attempt prompt injection and authority spoofing.",
+        ),
+        compile_objective_contract(
+            "Attempt prompt injection and authority spoofing."
+        ),
+    )
     oracle = "sha256:" + "8" * 64
     techniques = expand_language_techniques(
         (
@@ -783,6 +793,10 @@ def test_execution_agenda_separates_explorer_catalogue_work_from_discovery() -> 
     assert len(discovery) == 1
     assert discovery[0].id.endswith("/target-derived-discovery")
     assert "Do not execute a catalogue technique" in discovery[0].objective
+    sealed_objective = prepared.objective_contract["objectives"][0]
+    assert f"objective_id={sealed_objective['id']}" in discovery[0].objective
+    assert "selector_dimension=method" in discovery[0].objective
+    assert "selector_value=prompt injection" in discovery[0].objective
     assert discovery[0].transform_bindings == ()
     assert discovery[0].planned_language == "und"
     assert discovery[0].requested_language == "und"
@@ -1681,6 +1695,27 @@ def test_objective_phase_gates_are_digest_bound_and_round_trip() -> None:
     restored.validate()
     assert restored.objective_phase_gates == prepared.objective_phase_gates
     assert objective_phase_gate_from_mapping(asdict(objective_gate())) == objective_gate()
+
+
+def test_objective_contract_is_digest_bound_round_trips_and_survives_resealing() -> None:
+    base = manifest()
+    contract = compile_objective_contract(
+        "Cover stage 1 through stage 4 and every available persona in each stage."
+    )
+    prepared = manifest_with_objective_contract(base, contract)
+
+    assert prepared.digest != base.digest
+    restored = CampaignManifest.from_mapping(json.loads(json.dumps(asdict(prepared))))
+    restored.validate()
+    assert restored.objective_contract == contract.model_dump(mode="json")
+    assert (
+        manifest_with_target_brief(prepared, None).objective_contract
+        == prepared.objective_contract
+    )
+    assert (
+        manifest_with_objective_phase_gates(prepared, (objective_gate(),)).objective_contract
+        == prepared.objective_contract
+    )
 
 
 def test_bounded_regeneration_is_digest_bound_round_trips_and_is_optional() -> None:

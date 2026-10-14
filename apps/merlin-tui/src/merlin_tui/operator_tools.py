@@ -254,6 +254,7 @@ class ConfiguredCampaignTool:
                         "approval_required",
                         "profile",
                         "objective",
+                        "objective_contract",
                         "specialist_composition",
                     )
                     if k in payload

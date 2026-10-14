@@ -22,13 +22,26 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from merlin_contracts import (
     EXECUTABLE_ADAPTER_IDENTITY_VERSION,
     AgentTask,
+    CampaignEndReason,
+    CampaignLifecycle,
+    CampaignObjectiveContract,
     CampaignObservation,
+    CampaignOutcomeProjection,
     CampaignTerminalReason,
     CapabilityGrant,
     EvidenceWitness,
     InfrastructureFailureCategory,
     ModelJsonError,
+    ObjectiveProgress,
+    ObjectiveSelectorBinding,
+    ObjectiveSelectorBindingSource,
+    ObjectiveSelectorBindingSourceKind,
+    ObjectiveSelectorBindingStatus,
+    ObjectiveSelectorQuantifier,
+    ObjectiveSelectorResolution,
+    ObjectiveStatus,
     ProviderFailureKind,
+    StateEnumerationReceipt,
     SwarmRequest,
     TargetDeliveryClass,
     ToolContext,
@@ -36,11 +49,15 @@ from merlin_contracts import (
     ToolSpec,
     candidate_evidence_digest,
     candidate_id_for_identity,
+    compile_objective_contract,
+    complete_enumeration_members,
     evaluate_objective_gate_predicate,
     model_authority_disagreement,
     parse_model_json,
+    project_campaign_outcome,
     project_candidate_outcome,
     read_campaign_terminal_reason,
+    resolve_all_available_selector,
     reviewed_adapter_target_delivery,
     validate_candidate_outcome_projection,
 )
@@ -87,6 +104,7 @@ from .campaign import (
     enumerate_language_candidate_references,
     expand_language_techniques,
     manifest_with_bounded_regeneration,
+    manifest_with_objective_contract,
     manifest_with_objective_phase_gates,
     manifest_with_target_brief,
     materialize_language_technique,
@@ -567,6 +585,524 @@ def _retryable_transaction_order_error(error: BaseException) -> bool:
     )
 
 
+def _objective_end_reason(reason: str) -> CampaignEndReason:
+    terminal_reason = read_campaign_terminal_reason(reason)
+    return {
+        CampaignTerminalReason.OBJECTIVE_SATISFIED: CampaignEndReason.ALL_SATISFIED,
+        CampaignTerminalReason.FRONTIER_EXHAUSTED: CampaignEndReason.FRONTIER_EXHAUSTED,
+        CampaignTerminalReason.BUDGET_EXHAUSTED: CampaignEndReason.BUDGET_EXHAUSTED,
+        CampaignTerminalReason.TARGET_TERMINAL: CampaignEndReason.TARGET_TERMINAL,
+        CampaignTerminalReason.OPERATOR_STOPPED: CampaignEndReason.OPERATOR_STOPPED,
+        CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY: (
+            CampaignEndReason.INFRASTRUCTURE_FAILURE
+        ),
+    }[terminal_reason]
+
+
+def _method_alias(value: object) -> str:
+    return "-".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _bind_method_objectives(
+    contract: CampaignObjectiveContract,
+    techniques: Sequence[AssignmentTechnique],
+) -> CampaignObjectiveContract:
+    """Bind explicit operator methods to exact reviewed catalogue aliases."""
+
+    catalogue_identity = hashlib.sha256(
+        json.dumps(
+            [
+                [technique.id, sorted(_method_alias(tag) for tag in technique.tags)]
+                for technique in sorted(techniques, key=lambda item: item.id)
+            ],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    evidence_ref = f"reviewed-catalogue:sha256:{catalogue_identity}"
+    source = ObjectiveSelectorBindingSource(
+        kind=ObjectiveSelectorBindingSourceKind.REVIEWED_CATALOGUE,
+        source_ref="assignment-context:techniques",
+        evidence_refs=(evidence_ref,),
+    )
+    aliases_by_id = {
+        technique.id: frozenset(
+            {
+                *(_method_alias(tag) for tag in technique.tags),
+                _method_alias(technique.id.rsplit("/", 1)[-1]),
+                _method_alias(technique.resolved_semantic_id.rsplit("/", 1)[-1]),
+            }
+        )
+        for technique in techniques
+    }
+    objectives = []
+    for objective in contract.objectives:
+        selectors = []
+        for selector in objective.selectors:
+            if not (
+                selector.dimension == "method"
+                and selector.quantifier is ObjectiveSelectorQuantifier.ALL_LISTED
+            ):
+                selectors.append(selector)
+                continue
+            bindings = []
+            for value in selector.values:
+                requested = _method_alias(value)
+                candidate_ids = tuple(
+                    technique_id
+                    for technique_id, aliases in aliases_by_id.items()
+                    if requested in aliases
+                )
+                bindings.append(
+                    ObjectiveSelectorBinding(
+                        selector_value=value,
+                        candidate_ids=candidate_ids,
+                        status=(
+                            ObjectiveSelectorBindingStatus.BOUND
+                            if candidate_ids
+                            else ObjectiveSelectorBindingStatus.UNRESOLVED
+                        ),
+                        reason=(
+                            None
+                            if candidate_ids
+                            else "no exact reviewed catalogue alias is bound; "
+                            "target-derived discovery is required"
+                        ),
+                        evidence_refs=(evidence_ref,) if candidate_ids else (),
+                    )
+                )
+            selectors.append(
+                selector.model_copy(
+                    update={"bindings": tuple(bindings), "binding_source": source}
+                )
+            )
+        objectives.append(objective.model_copy(update={"selectors": tuple(selectors)}))
+    return CampaignObjectiveContract.model_validate(
+        contract.model_copy(update={"objectives": tuple(objectives)}).model_dump()
+    )
+
+
+def _objective_progress_from_journal(
+    manifest: CampaignManifest,
+    lead: Sequence[Mapping[str, object]],
+    *,
+    projected_waves: Sequence[Mapping[str, object]] = (),
+    assignment_context: AssignmentContext | None = None,
+) -> tuple[ObjectiveProgress, ...]:
+    """Reduce durable objective events against the exact sealed contract."""
+
+    if manifest.objective_contract is None:
+        return ()
+    contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
+    objectives = {objective.id: objective for objective in contract.objectives}
+    # Selector resolutions are separate durable authority records. They can bind
+    # a prepare-time unresolved selector after reviewed discovery without
+    # mutating the approved manifest or weakening its original values.
+    for entry in lead:
+        payload = entry.get("payload") if isinstance(entry, Mapping) else None
+        if not isinstance(payload, Mapping) or payload.get("kind") != (
+            "campaign_objective_selector_resolution"
+        ):
+            continue
+        objective_id = str(payload.get("objective_id") or "")
+        objective = objectives.get(objective_id)
+        if objective is None:
+            raise RuntimeError(
+                f"durable selector resolution references unsealed objective {objective_id!r}"
+            )
+        dimension = str(payload.get("selector_dimension") or "")
+        matches = [
+            (index, selector)
+            for index, selector in enumerate(objective.selectors)
+            if selector.dimension == dimension
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("durable selector resolution must identify one sealed selector")
+        index, selector = matches[0]
+        source = ObjectiveSelectorBindingSource.model_validate(payload.get("source"))
+        raw_bindings = payload.get("bindings")
+        if not isinstance(raw_bindings, Sequence) or isinstance(raw_bindings, (str, bytes)):
+            raise RuntimeError("durable selector resolution bindings must be a sequence")
+        bindings = tuple(ObjectiveSelectorBinding.model_validate(item) for item in raw_bindings)
+        resolved_selector = (
+            resolve_all_available_selector(
+                selector,
+                candidate_ids_by_scope={
+                    item.selector_value: item.candidate_ids for item in bindings
+                },
+                source=source,
+            )
+            if selector.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE
+            else type(selector).model_validate(
+                selector.model_copy(
+                    update={"bindings": bindings, "binding_source": source}
+                ).model_dump()
+            )
+        )
+        prior_bindings = {item.selector_value: item for item in selector.bindings}
+        proposed_bindings = {item.selector_value: item for item in resolved_selector.bindings}
+        if any(
+            not set(prior.candidate_ids)
+            <= set(proposed_bindings.get(value, prior).candidate_ids)
+            for value, prior in prior_bindings.items()
+            if prior.status is ObjectiveSelectorBindingStatus.BOUND
+        ):
+            raise RuntimeError(
+                "durable selector resolution cannot shrink a previously bound denominator"
+            )
+        selectors = list(objective.selectors)
+        selectors[index] = resolved_selector
+        objectives[objective_id] = objective.model_copy(update={"selectors": tuple(selectors)})
+    contract = contract.model_copy(
+        update={
+            "objectives": tuple(objectives[item.id] for item in contract.objectives)
+        }
+    )
+    latest: dict[str, ObjectiveProgress] = {}
+    target_attributions: list[Mapping[str, object]] = []
+    for entry in lead:
+        payload = entry.get("payload") if isinstance(entry, Mapping) else None
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("kind") == "target_state_attribution"
+            and payload.get("schema") == "merlin.target-state-attribution.v1"
+        ):
+            target_attributions.append(payload)
+            continue
+        if not isinstance(payload, Mapping) or payload.get("kind") != "campaign_objective_progress":
+            continue
+        objective_id = str(payload.get("objective_id") or "")
+        objective = objectives.get(objective_id)
+        if objective is None:
+            raise RuntimeError(
+                f"durable objective progress references unsealed objective {objective_id!r}"
+            )
+        evidence = payload.get("evidence_refs", ())
+        if not isinstance(evidence, Sequence) or isinstance(evidence, (str, bytes)):
+            raise RuntimeError("durable objective progress evidence_refs must be a sequence")
+        latest[objective_id] = ObjectiveProgress(
+            objective=objective,
+            status=ObjectiveStatus(str(payload.get("status") or "unmet")),
+            evidence_refs=tuple(str(item) for item in evidence),
+            status_reason=(
+                str(payload["status_reason"])
+                if payload.get("status_reason") is not None
+                else None
+            ),
+        )
+
+    def normalized_dimension(value: object) -> str:
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        if normalized.endswith("ies") and len(normalized) > 3:
+            return normalized[:-3] + "y"
+        if normalized.endswith("s") and not normalized.endswith("ss"):
+            return normalized[:-1]
+        return normalized
+
+    def scalar_value(value: object) -> str | None:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return None
+        return str(value).strip().casefold() or None
+
+    attempted_candidates: dict[str, set[str]] = {}
+    semantic_id_by_candidate: dict[str, str] = {}
+    if assignment_context is not None:
+        technique_by_id = {
+            technique.id: technique for technique in assignment_context.techniques
+        }
+        semantic_id_by_candidate.update(
+            {
+                technique.id: technique.resolved_semantic_id
+                for technique in assignment_context.techniques
+            }
+        )
+        if assignment_context.language_frontier is not None:
+            semantic_id_by_candidate.update(
+                {
+                    reference.id: technique_by_id[reference.family_id].resolved_semantic_id
+                    for reference in enumerate_language_candidate_references(
+                        assignment_context.techniques,
+                        assignment_context.language_frontier,
+                    )
+                }
+            )
+    for wave in projected_waves:
+        tasks = wave.get("tasks") if isinstance(wave, Mapping) else None
+        if not isinstance(tasks, Sequence) or isinstance(tasks, (str, bytes)):
+            continue
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                continue
+            evidence = task.get("evidence_references")
+            refs = {
+                str(item)
+                for item in evidence or ()
+                if isinstance(item, str) and item.strip()
+            }
+            if not refs:
+                continue
+            for technique_id, outcome in _mapping_items(task.get("technique_outcomes")):
+                if str(outcome) not in {"confirmed", "refuted", "partial", "unclear"}:
+                    continue
+                candidate_id = str(technique_id)
+                attempted_candidates.setdefault(candidate_id, set()).update(refs)
+                semantic_id = semantic_id_by_candidate.get(candidate_id)
+                if semantic_id is not None:
+                    attempted_candidates.setdefault(semantic_id, set()).update(refs)
+
+    for objective in contract.objectives:
+        if objective.id in latest or len(objective.selectors) != 1:
+            continue
+        selector = objective.selectors[0]
+        if selector.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE:
+            binding_refs = tuple(
+                selector.binding_source.evidence_refs
+                if selector.binding_source is not None
+                else (f"manifest:{manifest.digest}:selector-denominator-unresolved",)
+            )
+            if not selector.has_finite_denominator():
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=ObjectiveStatus.BLOCKED,
+                    evidence_refs=binding_refs,
+                    status_reason=(
+                        f"the available {selector.dimension} denominator is unresolved; "
+                        "authoritative target-derived discovery is required"
+                    ),
+                )
+                continue
+            observed_by_scope: dict[str, set[str]] = {}
+            campaign_refs: set[str] = set()
+            preexisting_refs: set[str] = set()
+            for attribution in target_attributions:
+                reference = str(attribution.get("attribution_id") or "").strip()
+                counts_as_campaign_progress = (
+                    attribution.get("counts_as_campaign_progress") is True
+                )
+                is_preexisting = attribution.get("provenance") == "preexisting"
+                if not reference or (not counts_as_campaign_progress and not is_preexisting):
+                    continue
+                changes = attribution.get("changes")
+                if not isinstance(changes, Sequence) or isinstance(changes, (str, bytes)):
+                    continue
+                matched = False
+                for change in changes:
+                    if not isinstance(change, Mapping) or normalized_dimension(
+                        change.get("name")
+                    ) != normalized_dimension(selector.dimension):
+                        continue
+                    # State values count as coverage members only when the
+                    # adapter explicitly types them that way. Ordinal/score
+                    # transitions cannot stand in for executing a candidate.
+                    if change.get("role") not in {"coverage_member", "selector_member"}:
+                        continue
+                    if selector.scope_dimension is not None:
+                        if normalized_dimension(change.get("scope_dimension")) != (
+                            normalized_dimension(selector.scope_dimension)
+                        ):
+                            continue
+                        scope_value = scalar_value(change.get("scope_value"))
+                        if scope_value is None:
+                            continue
+                    else:
+                        scope_value = "*"
+                    values = {
+                        value
+                        for field in ("before_value", "after_value")
+                        if (value := scalar_value(change.get(field))) is not None
+                    }
+                    if values:
+                        observed_by_scope.setdefault(scope_value, set()).update(values)
+                        matched = True
+                if matched and counts_as_campaign_progress:
+                    campaign_refs.add(reference)
+                elif matched and is_preexisting:
+                    preexisting_refs.add(reference)
+            bindings = {item.selector_value: item for item in selector.bindings}
+            complete = all(
+                all(
+                    candidate in attempted_candidates
+                    or candidate.casefold()
+                    in observed_by_scope.get(scope.casefold(), set())
+                    for candidate in bindings[scope].candidate_ids
+                )
+                for scope in selector.expected_binding_values()
+            )
+            attempt_refs = {
+                ref
+                for binding in bindings.values()
+                for candidate in binding.candidate_ids
+                for ref in attempted_candidates.get(candidate, ())
+            }
+            attribution_refs = campaign_refs | preexisting_refs | attempt_refs
+            empty_denominator = all(
+                not item.candidate_ids for item in bindings.values()
+            )
+            if complete and (attribution_refs or empty_denominator):
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=(
+                        ObjectiveStatus.SATISFIED_BY_CAMPAIGN
+                        if campaign_refs or attempt_refs
+                        else ObjectiveStatus.PREEXISTING
+                    ),
+                    evidence_refs=tuple(sorted(set(binding_refs) | attribution_refs)),
+                )
+            elif observed_by_scope or attempt_refs:
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=ObjectiveStatus.ACTIVE,
+                    evidence_refs=tuple(sorted(set(binding_refs) | attribution_refs)),
+                    status_reason=f"available {selector.dimension} coverage remains incomplete",
+                )
+            continue
+        if (
+            selector.resolution is ObjectiveSelectorResolution.SEALED
+            and selector.quantifier is ObjectiveSelectorQuantifier.ALL_LISTED
+            and selector.dimension == "method"
+        ):
+            binding_evidence = tuple(
+                selector.binding_source.evidence_refs
+                if selector.binding_source is not None
+                else (f"manifest:{manifest.digest}:objective-binding-missing",)
+            )
+            bindings = {binding.selector_value: binding for binding in selector.bindings}
+            unresolved = tuple(
+                value
+                for value in selector.values
+                if value not in bindings
+                or bindings[value].status is ObjectiveSelectorBindingStatus.UNRESOLVED
+            )
+            if unresolved:
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=ObjectiveStatus.BLOCKED,
+                    evidence_refs=binding_evidence,
+                    status_reason=(
+                        "no reviewed candidate binding for: " + ", ".join(unresolved)
+                        + "; target-derived discovery is required"
+                    ),
+                )
+                continue
+            matched_refs: set[str] = set()
+            matched_values = 0
+            for value in selector.values:
+                binding = bindings[value]
+                refs = {
+                    ref
+                    for candidate_id in binding.candidate_ids
+                    for ref in attempted_candidates.get(candidate_id, ())
+                }
+                if refs:
+                    matched_values += 1
+                    matched_refs.update(refs)
+            if matched_values == len(selector.values) and matched_refs:
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+                    evidence_refs=tuple(sorted(matched_refs)),
+                )
+            elif matched_values:
+                latest[objective.id] = ObjectiveProgress(
+                    objective=objective,
+                    status=ObjectiveStatus.ACTIVE,
+                    evidence_refs=tuple(sorted(matched_refs)),
+                    status_reason=(
+                        f"attempted {matched_values} of {len(selector.values)} "
+                        "explicitly listed methods"
+                    ),
+                )
+            continue
+        if (
+            selector.resolution is not ObjectiveSelectorResolution.SEALED
+            or selector.quantifier is not ObjectiveSelectorQuantifier.INCLUSIVE_RANGE
+        ):
+            continue
+        required_values = {value.casefold() for value in selector.values}
+        observed_values: set[str] = set()
+        campaign_refs: set[str] = set()
+        preexisting_refs: set[str] = set()
+        for attribution in target_attributions:
+            reference = str(attribution.get("attribution_id") or "").strip()
+            if not reference:
+                continue
+            counts_as_campaign_progress = (
+                attribution.get("counts_as_campaign_progress") is True
+            )
+            is_preexisting = attribution.get("provenance") == "preexisting"
+            # Untrusted observations cannot contribute denominator values.  In
+            # particular, one trusted receipt must not bless values learned from
+            # unrelated or unattributed state snapshots.
+            if not counts_as_campaign_progress and not is_preexisting:
+                continue
+            changes = attribution.get("changes")
+            if not isinstance(changes, Sequence) or isinstance(changes, (str, bytes)):
+                continue
+            matched = False
+            for change in changes:
+                if not isinstance(change, Mapping) or normalized_dimension(
+                    change.get("name")
+                ) != normalized_dimension(selector.dimension):
+                    continue
+                values = {
+                    value
+                    for field in ("before_value", "after_value")
+                    if (value := scalar_value(change.get(field))) is not None
+                }
+                if values:
+                    observed_values.update(values)
+                    matched = True
+            if not matched:
+                continue
+            if counts_as_campaign_progress:
+                campaign_refs.add(reference)
+            elif is_preexisting:
+                preexisting_refs.add(reference)
+        evidence_refs = tuple(sorted(campaign_refs | preexisting_refs))
+        if required_values <= observed_values and evidence_refs:
+            status = (
+                ObjectiveStatus.SATISFIED_BY_CAMPAIGN
+                if campaign_refs
+                else ObjectiveStatus.PREEXISTING
+            )
+            latest[objective.id] = ObjectiveProgress(
+                objective=objective,
+                status=status,
+                evidence_refs=evidence_refs,
+            )
+        elif observed_values:
+            latest[objective.id] = ObjectiveProgress(
+                objective=objective,
+                status=ObjectiveStatus.ACTIVE,
+                evidence_refs=evidence_refs,
+                status_reason=(
+                    f"observed {len(required_values & observed_values)} of "
+                    f"{len(required_values)} sealed {selector.dimension} values"
+                ),
+            )
+    return tuple(
+        latest.get(objective.id, ObjectiveProgress(objective=objective))
+        for objective in contract.objectives
+    )
+
+
+def _objective_outcome(
+    progress: tuple[ObjectiveProgress, ...],
+    *,
+    lifecycle_status: str,
+    terminal_reason: str | None = None,
+) -> CampaignOutcomeProjection:
+    if terminal_reason is not None:
+        return project_campaign_outcome(
+            progress,
+            requested_end_reason=_objective_end_reason(terminal_reason),
+        )
+    active_lifecycle = {
+        "prepared": CampaignLifecycle.PREPARED,
+        "paused": CampaignLifecycle.PAUSED,
+    }.get(lifecycle_status, CampaignLifecycle.RUNNING)
+    return project_campaign_outcome(progress, active_lifecycle=active_lifecycle)
+
+
 def _retryable_supervision_error(error: BaseException) -> bool:
     """Return whether supervision can safely reattach to durable live work."""
 
@@ -1004,9 +1540,20 @@ class SaturationEvidence:
         )
 
 
-CampaignLeadRunner = Callable[
-    [str, CampaignProfile, int, tuple[AgentTask, ...]], Awaitable[LeadAssessment]
-]
+LeadPromptInputRefresher = Callable[[], Awaitable[tuple[AgentTask, ...]]]
+CampaignLeadRunner = (
+    Callable[[str, CampaignProfile, int, tuple[AgentTask, ...]], Awaitable[LeadAssessment]]
+    | Callable[
+        [
+            str,
+            CampaignProfile,
+            int,
+            tuple[AgentTask, ...],
+            LeadPromptInputRefresher,
+        ],
+        Awaitable[LeadAssessment],
+    ]
+)
 ExplorationReviewRunner = Callable[
     [str, CampaignProfile, int, LeadFollowUp, Mapping[str, Mapping[str, object]]],
     Awaitable[tuple[ExplorationCriticDecision, ExplorationExperimentPlan | None]],
@@ -1015,9 +1562,7 @@ CampaignReportRunner = Callable[[str, CampaignManifest, str], Awaitable[None]]
 InteractionLessonRunner = Callable[[str, CampaignManifest, AgentTask], Awaitable[str | None]]
 PreparationCleanup = Callable[[str], Awaitable[None]]
 ReviewedAdapterResolver = Callable[[str, Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
-ReconObservationReader = Callable[
-    [str, str, str], Awaitable[Sequence[Mapping[str, object]]]
-]
+ReconObservationReader = Callable[[str, str, str], Awaitable[Sequence[Mapping[str, object]]]]
 AutomationRunner = Callable[[CampaignManifest, LeadAutomationRequest], Awaitable[AutomationOutcome]]
 
 
@@ -1317,16 +1862,39 @@ class CampaignService:
         manifest: CampaignManifest,
         candidates: tuple[Any, ...],
         wave: int,
+        *,
+        selection_width: int | None = None,
+        exploration_candidate_ids: frozenset[str] | None = None,
     ) -> tuple[Any, ...]:
         """Refine the next dispatch shortlist without changing eligibility.
 
-        The incoming order carries coverage/history/ARM priorities. Preserve its
-        leading exploration candidate and compare at most two worker batches.
-        All remaining candidates stay queued, including negative or unavailable
+        The incoming order carries coverage/history/ARM priorities. Reserve one
+        deterministic exploration slot across technique families and target
+        states, then fill the dispatch width from the ranked candidates while
+        preferring dimensions not already represented in the batch. All
+        remaining candidates stay queued, including negative or unavailable
         judgments. Scores never become attack outcomes or retirement evidence.
         """
         if len(candidates) < 2:
             return candidates
+        diversity_enabled = selection_width is not None
+        dispatch_width = max(
+            1,
+            min(
+                len(candidates),
+                self._max_worker_concurrency if selection_width is None else int(selection_width),
+            ),
+        )
+        arm_state_ids: dict[str, set[str]] = {}
+        exploration_order = {
+            str(getattr(candidate, "id", "") or _followup_digest(candidate)): index
+            for index, candidate in enumerate(candidates)
+        }
+        exploration_ids = (
+            frozenset(exploration_order)
+            if exploration_candidate_ids is None
+            else exploration_candidate_ids.intersection(exploration_order)
+        )
         arm_source = self._arm_store
         arm_loader = getattr(arm_source, "list_arms", None)
         observation_loader = getattr(arm_source, "list_arm_observations", None)
@@ -1351,6 +1919,11 @@ class CampaignService:
                     if isinstance(arm, Mapping)
                     and str(arm.get("technique_id") or "") in candidate_ids
                 )
+                for arm in matching_arms:
+                    candidate_id = str(arm.get("technique_id") or "")
+                    state_id = str(arm.get("state_id") or "").strip()
+                    if state_id:
+                        arm_state_ids.setdefault(candidate_id, set()).add(state_id)
                 ranked = rank_frontier(matching_arms, tuple(observations))
             except Exception:  # noqa: BLE001 - advisory ranking cannot block execution
                 ranked = ()
@@ -1362,7 +1935,10 @@ class CampaignService:
                         item.score,
                         arm_scores.get(candidate_id, float("-inf")),
                     )
-                indexed = tuple(enumerate(candidates[1:], start=1))
+                unscored_ids = exploration_ids.difference(arm_scores)
+                if unscored_ids:
+                    exploration_ids = frozenset(unscored_ids)
+                indexed = tuple(enumerate(candidates if diversity_enabled else candidates[1:]))
                 arm_ranked = tuple(
                     candidate
                     for _, candidate in sorted(
@@ -1380,7 +1956,7 @@ class CampaignService:
                         ),
                     )
                 )
-                candidates = (candidates[0], *arm_ranked)
+                candidates = arm_ranked if diversity_enabled else (candidates[0], *arm_ranked)
                 priority_writer = getattr(self._store, "update_frontier_priorities", None)
                 if callable(priority_writer):
                     await asyncio.to_thread(priority_writer, campaign_id, arm_scores)
@@ -1412,9 +1988,19 @@ class CampaignService:
                     )
         client = self._jev_escalation_client()
         if client is None:
-            return candidates
+            if not diversity_enabled:
+                return candidates
+            return self._diversify_execution_candidates(
+                campaign_id,
+                candidates,
+                wave,
+                dispatch_width,
+                arm_state_ids,
+                exploration_ids,
+                exploration_order,
+            )
         width = max(1, self._max_worker_concurrency)
-        shortlist = candidates[1 : 1 + 2 * width]
+        shortlist = candidates[: 2 * width] if diversity_enabled else candidates[1 : 1 + 2 * width]
         semaphore = asyncio.Semaphore(width)
         deadline = time.monotonic() + client.timeout_seconds
 
@@ -1514,11 +2100,112 @@ class CampaignService:
                     "policy": "advisory ordering only; no candidate removed or retired",
                 },
             )
-        return (
-            candidates[0],
+        scored = (
             *(shortlist[index] for index, _ in ordered),
-            *candidates[1 + len(shortlist) :],
+            *candidates[(len(shortlist) if diversity_enabled else 1 + len(shortlist)) :],
         )
+        if not diversity_enabled:
+            return (candidates[0], *scored)
+        return self._diversify_execution_candidates(
+            campaign_id,
+            scored,
+            wave,
+            dispatch_width,
+            arm_state_ids,
+            exploration_ids,
+            exploration_order,
+        )
+
+    @staticmethod
+    def _diversify_execution_candidates(
+        campaign_id: str,
+        candidates: tuple[Any, ...],
+        wave: int,
+        selection_width: int,
+        arm_state_ids: Mapping[str, set[str]],
+        exploration_ids: frozenset[str],
+        exploration_order: Mapping[str, int],
+    ) -> tuple[Any, ...]:
+        """Order one bounded batch for family/state diversity without filtering.
+
+        Objective phase gates have already established eligibility before this
+        point. This function only reorders eligible candidates: one stable
+        wave-specific exploration choice is followed by the highest-ranked
+        candidates that add a new family and target state. The complete suffix
+        is retained in ranked order for later durable claims.
+        """
+
+        if len(candidates) < 2 or selection_width < 1:
+            return candidates
+
+        def candidate_id(candidate: Any) -> str:
+            return str(getattr(candidate, "id", "") or _followup_digest(candidate))
+
+        def family(candidate: Any) -> tuple[str, str]:
+            semantic_id = str(
+                getattr(candidate, "semantic_id", None)
+                or getattr(candidate, "resolved_semantic_id", None)
+                or candidate_id(candidate).split("@lang=", 1)[0]
+            )
+            return semantic_id, str(getattr(candidate, "domain_id", "unspecified"))
+
+        def states(candidate: Any) -> frozenset[str]:
+            values = arm_state_ids.get(candidate_id(candidate), set())
+            return frozenset(values or {"unobserved"})
+
+        family_order: list[tuple[str, str]] = []
+        family_first: dict[tuple[str, str], Any] = {}
+        for candidate in candidates:
+            if candidate_id(candidate) not in exploration_ids:
+                continue
+            key = family(candidate)
+            if key not in family_first:
+                family_order.append(key)
+                family_first[key] = candidate
+                continue
+            candidate_order = exploration_order.get(candidate_id(candidate), len(candidates))
+            current_order = exploration_order.get(candidate_id(family_first[key]), len(candidates))
+            if candidate_order < current_order:
+                family_first[key] = candidate
+
+        if not family_order:
+            family_order = [family(candidates[0])]
+            family_first[family_order[0]] = candidates[0]
+
+        # A stable digest avoids Python hash randomization while ensuring the
+        # exploration slot does not repeatedly select the lexicographic head.
+        seed = hashlib.sha256(f"{campaign_id}\n{wave}".encode()).digest()
+        exploration_family = family_order[int.from_bytes(seed[:8], "big") % len(family_order)]
+        exploration = family_first[exploration_family]
+        selected = [exploration]
+        selected_ids = {candidate_id(exploration)}
+        selected_families = {exploration_family}
+        selected_states = set(states(exploration))
+
+        def admit(predicate: Callable[[Any], bool]) -> None:
+            for candidate in candidates:
+                if len(selected) >= selection_width:
+                    return
+                identity = candidate_id(candidate)
+                if identity in selected_ids or not predicate(candidate):
+                    continue
+                selected.append(candidate)
+                selected_ids.add(identity)
+                selected_families.add(family(candidate))
+                selected_states.update(states(candidate))
+
+        # Prefer candidates that expand both axes, then either axis, before
+        # falling back to the authoritative adaptive ranking.
+        admit(
+            lambda candidate: (
+                family(candidate) not in selected_families
+                and states(candidate).isdisjoint(selected_states)
+            )
+        )
+        admit(lambda candidate: family(candidate) not in selected_families)
+        admit(lambda candidate: states(candidate).isdisjoint(selected_states))
+        admit(lambda _candidate: True)
+        return (*selected, *(item for item in candidates if candidate_id(item) not in selected_ids))
 
     async def _register_execution_frontier(
         self,
@@ -1678,7 +2365,7 @@ class CampaignService:
                 await asyncio.to_thread(
                     shortlist_loader,
                     campaign_id,
-                    min(1024, max(batch_limit + 1, batch_limit * 4)),
+                    min(1024, max(64, batch_limit * 8)),
                 )
             )
             shortlist_rows = tuple(
@@ -1704,8 +2391,24 @@ class CampaignService:
                     "candidates": (),
                 }
             shortlist = self._materialize_frontier_batch(context, {"candidates": shortlist_rows})
+            minimum_generation = min(
+                int(row.get("claim_generation", 0))
+                for row in shortlist_rows
+                if isinstance(row, Mapping)
+            )
+            exploration_candidate_ids = frozenset(
+                str(row.get("id") or "")
+                for row in shortlist_rows
+                if isinstance(row, Mapping)
+                and int(row.get("claim_generation", 0)) == minimum_generation
+            )
             prioritized = await self._prioritize_execution_candidates(
-                campaign_id, manifest, shortlist, wave
+                campaign_id,
+                manifest,
+                shortlist,
+                wave,
+                selection_width=batch_limit,
+                exploration_candidate_ids=exploration_candidate_ids,
             )
             selected_ids = tuple(item.id for item in prioritized[:batch_limit])
             shortlist_by_id = {
@@ -2678,6 +3381,10 @@ class CampaignService:
             prepared = await self._preparation_factory(
                 session_id, objective, profile, adapter, **composition_kwargs
             )
+        # Operator requirements are authority, not model guidance. Compile the
+        # common target-neutral selectors deterministically and seal both the
+        # exact source text and typed clauses into the reviewed manifest.
+        objective_contract = compile_objective_contract(prepared.manifest.objective)
         if objective_phase_gates:
             prepared = replace(
                 prepared,
@@ -2721,6 +3428,19 @@ class CampaignService:
             exact_history_priors,
         ) = await self._apply_technique_skip(prepared, adapter_generation)
         _prepare_mark = _prepare_stage("apply_technique_skip", _prepare_mark)
+        if objective_contract.objectives:
+            objective_contract = _bind_method_objectives(
+                objective_contract,
+                prepared.assignment_context.techniques,
+            )
+            prepared = replace(
+                prepared,
+                manifest=manifest_with_objective_contract(
+                    prepared.manifest,
+                    objective_contract,
+                ),
+            )
+            prepared.manifest.validate()
         if not prepared.assignment_context.techniques:
             # Zero runnable reviewed cells means every catalog cell on this
             # target generation already holds a terminal outcome (or the
@@ -3090,12 +3810,14 @@ class CampaignService:
             "campaign_id": prepared.manifest.id,
             "manifest_digest": reviewed_digest,
             "objective": prepared.manifest.objective,
+            "objective_contract": prepared.manifest.objective_contract,
             "profile": prepared.manifest.profile.value,
             "target": asdict(prepared.manifest.target),
             "specialist_team": len(compiled.assignments),
             "campaign_lead": 1,
             "maximum_concurrency": 1 + worker_concurrency,
             "review": {
+                "objective_contract": prepared.manifest.objective_contract,
                 "budget": {
                     "turns": budget.max_turns,
                     "tokens": budget.max_tokens,
@@ -3663,6 +4385,14 @@ class CampaignService:
                     }
                 else:
                     evidence = await self._source_evidence(str(live.id), tasks)
+                    await self._record_target_state_attributions(
+                        manifest,
+                        campaign_id,
+                        initial_wave,
+                        str(live.id),
+                        tasks,
+                        evidence=evidence,
+                    )
                     settled = await self._settle_objective_phase_gate(
                         campaign_id, manifest, gate, tasks, evidence
                     )
@@ -3792,6 +4522,13 @@ class CampaignService:
                 )
                 await self._record_capability_probe_results(
                     manifest, context, campaign_id, initial_wave, probe_results
+                )
+                await self._record_target_state_attributions(
+                    manifest,
+                    campaign_id,
+                    initial_wave,
+                    live.id,
+                    recon_tasks,
                 )
                 recon_failed = applicability is None
                 if recon_failed:
@@ -4062,6 +4799,15 @@ class CampaignService:
                     # Another local or remote supervisor settled this exact
                     # schedule while we waited for the transition lease.
                     return
+                frontier_evidence = await self._source_evidence(source_schedule_id, tasks)
+                await self._record_target_state_attributions(
+                    manifest,
+                    campaign_id,
+                    initial_wave,
+                    source_schedule_id,
+                    tasks,
+                    evidence=frontier_evidence,
+                )
                 if transition_batch is not None:
                     # ARM learning is part of the frontier transition, not
                     # post-settlement reporting.  Persist the canonical,
@@ -4069,7 +4815,6 @@ class CampaignService:
                     # or a successor can be claimed.  A failed write therefore
                     # leaves this scheduled batch available for exact restart;
                     # replay is idempotent on campaign + arm + attempt identity.
-                    frontier_evidence = await self._source_evidence(source_schedule_id, tasks)
                     await self._record_arm_outcomes(
                         campaign_id,
                         tasks,
@@ -5363,8 +6108,9 @@ class CampaignService:
                     "provider billing/quota exhausted during wave execution",
                 )
                 return
-            await self._finish_campaign(campaign_id, terminal, terminal_reason)
-            await self._generate_report(campaign_id, manifest, wave, terminal_reason)
+            terminalized = await self._finish_campaign(campaign_id, terminal, terminal_reason)
+            if terminalized is not False:
+                await self._generate_report(campaign_id, manifest, wave, terminal_reason)
         except _OperatorDrainComplete:
             waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
             wave = int(waves[-1]["wave"]) if waves else wave
@@ -5383,8 +6129,11 @@ class CampaignService:
                             "skipped": sum(task.status == "cancelled" for task in tasks),
                         },
                     )
-            await self._finish_campaign(campaign_id, "cancelled", "operator_stopped")
-            await self._generate_report(campaign_id, manifest, wave, "operator_stopped")
+            terminalized = await self._finish_campaign(
+                campaign_id, "cancelled", "operator_stopped"
+            )
+            if terminalized is not False:
+                await self._generate_report(campaign_id, manifest, wave, "operator_stopped")
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -5820,7 +6569,7 @@ class CampaignService:
                     return
                 raise
             try:
-                await self._finish_campaign(campaign_id, "failed", "failed")
+                terminalized = await self._finish_campaign(campaign_id, "failed", "failed")
             except ValueError as finalization_error:
                 # The final status update is conditional and can lose a race
                 # after the preceding read.  Suppress only a canonically visible
@@ -5835,7 +6584,8 @@ class CampaignService:
                         return
                     raise error from finalization_error
                 raise
-            await self._generate_report(campaign_id, manifest, initial_wave, "failed")
+            if terminalized is not False:
+                await self._generate_report(campaign_id, manifest, initial_wave, "failed")
         finally:
             # Recovery may install a replacement supervisor after this task has
             # reached a terminal boundary but before its ``finally`` runs.  An
@@ -8451,14 +9201,13 @@ class CampaignService:
 
     async def _seal_completion_receipt(
         self, campaign_id: str, status: str, reason: str
-    ) -> str | None:
-        """Journal the terminal completion receipt for the current evidence state.
+    ) -> tuple[str | None, bool]:
+        """Journal a terminal receipt or resumable incomplete checkpoint.
 
-        Returns the sealed completion digest, or None when the store lacks the
-        production completion surface.  Safe to re-run: the receipt decision id
-        is derived from the digest, so an unchanged projection commits nothing
-        new and a post-completion evidence change (e.g. late validation) seals
-        a fresh authoritative receipt.
+        Returns the sealed digest and whether the result remains resumable. The
+        decision id is derived from the digest, so an unchanged projection is
+        idempotent. Required objectives that remain unresolved are checkpointed,
+        never represented as terminal completion authority.
         """
         require_saturation_ready = reason.strip().casefold() == "saturated"
         reason = read_campaign_terminal_reason(reason).value
@@ -8467,7 +9216,7 @@ class CampaignService:
             for name in ("get", "list_waves", "list_lead", "commit_lead_decision")
         )
         if not production_completion_store:
-            return None
+            return None, False
         status_projection = self.status
         projection = (
             await status_projection(campaign_id, seal_frontier_snapshot=True)
@@ -8490,6 +9239,37 @@ class CampaignService:
         )
         if digest != expected_digest:
             raise RuntimeError("campaign completion authority digest is invalid")
+        resumable_incomplete = False
+        objective_contract_value = normalized_document.get("objective_contract")
+        if isinstance(objective_contract_value, Mapping):
+            contract = CampaignObjectiveContract.model_validate(objective_contract_value)
+            progress_value = normalized_document.get("objective_progress")
+            if not isinstance(progress_value, Sequence) or isinstance(
+                progress_value, (str, bytes)
+            ):
+                raise RuntimeError("sealed objective contract requires objective progress")
+            objective_progress = tuple(
+                ObjectiveProgress.model_validate(item) for item in progress_value
+            )
+            contract_ids = tuple(item.id for item in contract.objectives)
+            progress_ids = tuple(item.objective.id for item in objective_progress)
+            if progress_ids != contract_ids:
+                raise RuntimeError("objective progress does not match the sealed contract")
+            objective_outcome = project_campaign_outcome(
+                objective_progress,
+                requested_end_reason=_objective_end_reason(reason),
+            )
+            normalized_document["campaign_outcome"] = objective_outcome.model_dump(mode="json")
+            status = objective_outcome.lifecycle.value
+            resumable_incomplete = objective_outcome.lifecycle is CampaignLifecycle.INCOMPLETE
+            digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        normalized_document, sort_keys=True, separators=(",", ":")
+                    ).encode()
+                ).hexdigest()
+            )
         saturation = document.get("saturation")
         if require_saturation_ready and (
             not isinstance(saturation, Mapping) or saturation.get("ready") is not True
@@ -8497,30 +9277,50 @@ class CampaignService:
             raise RuntimeError("saturated campaign requires ready completion authority")
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         wave = int(waves[-1]["wave"]) if waves else 0
+        receipt_kind = (
+            "campaign_incomplete_checkpoint"
+            if resumable_incomplete
+            else "campaign_completion"
+        )
+        decision_namespace = (
+            "campaign-incomplete-checkpoint"
+            if resumable_incomplete
+            else "campaign-completion"
+        )
         receipt = {
-            "kind": "campaign_completion",
+            "kind": receipt_kind,
             "schema": str(document.get("schema") or "merlin.campaign-completion.v1"),
             "completion_digest": digest,
-            "terminal_status": status,
             "stop_reason": reason,
             "document": normalized_document,
+            **(
+                {
+                    "campaign_status": "paused",
+                    "resumable": True,
+                    "incomplete_status": status,
+                }
+                if resumable_incomplete
+                else {"terminal_status": status}
+            ),
         }
         commit = self._store.commit_lead_decision
         await asyncio.to_thread(
             commit,
             campaign_id,
             wave,
-            f"campaign-completion/{status}/{reason}/{digest}",
+            f"{decision_namespace}/{status}/{reason}/{digest}",
             receipt,
             (),
         )
-        return digest
+        return digest, resumable_incomplete
 
-    async def _finish_campaign(self, campaign_id: str, status: str, reason: str) -> None:
+    async def _finish_campaign(self, campaign_id: str, status: str, reason: str) -> bool:
         # Production stores expose the full projection/decision surface.  Tiny legacy
         # protocol fakes retain terminal compatibility, but cannot claim a completion
         # receipt or generate a production report.
-        digest = await self._seal_completion_receipt(campaign_id, status, reason)
+        digest, resumable_incomplete = await self._seal_completion_receipt(
+            campaign_id, status, reason
+        )
         reason = read_campaign_terminal_reason(reason).value
         if digest is not None:
             status_projection = self.status
@@ -8531,12 +9331,16 @@ class CampaignService:
             )
             document = projection["completion_document"]
             await self._record_technique_history(campaign_id, document)
+        if resumable_incomplete:
+            await asyncio.to_thread(self._store.pause, campaign_id)
+            return False
         await self._retire_campaign_terminal_dynamic_specialists(campaign_id)
         finish = self._store.finish
         if "stop_reason" in inspect.signature(finish).parameters:
             await asyncio.to_thread(finish, campaign_id, status, stop_reason=reason)
         else:  # Compatibility for stores implementing the earlier protocol.
             await asyncio.to_thread(finish, campaign_id, status)
+        return True
 
     async def _record_technique_history(
         self, campaign_id: str, document: Mapping[str, object]
@@ -8863,9 +9667,16 @@ class CampaignService:
                 return False
             degraded_lead_decision = True
         try:
-            await self._finish_campaign(campaign_id, "completed", "completed_with_limitations")
+            terminalized = await self._finish_campaign(
+                campaign_id, "completed", "completed_with_limitations"
+            )
         except Exception:
             return False
+        if terminalized is False:
+            # The completion attempt became a resumable objective checkpoint.
+            # That is a successful diversion from the failing terminal path,
+            # but it is not completion authority and must not be described as one.
+            return True
         if degraded_lead_decision:
             divert_payload: dict[str, object] = {
                 "kind": "lead_decision_degraded",
@@ -9711,13 +10522,557 @@ class CampaignService:
             )
         await self._record_browser_recon_observations(manifest)
 
+    async def _record_target_state_attributions(
+        self,
+        manifest: CampaignManifest,
+        campaign_id: str,
+        wave: int,
+        schedule_id: str,
+        tasks: Sequence[AgentTask],
+        *,
+        evidence: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
+        """Project authoritative target transitions into campaign progress.
+
+        Any campaign action may advance authoritative target state, including
+        reconnaissance, prerequisites, candidates, and validation. The
+        transition journal is separate from candidate/ARM outcomes so state
+        progress never manufactures attack-quality credit. Receipts inherited
+        by a replacement attempt count once when their authenticated campaign
+        identity matches; evidence owned by another campaign remains
+        provenance only.
+        """
+
+        writer = getattr(self._store, "record_observation", None)
+        append_lead = getattr(self._store, "append_lead", None)
+        commit_lead = getattr(self._store, "commit_lead_decision", None)
+        if not callable(writer) and not callable(append_lead) and not callable(commit_lead):
+            return
+        if evidence is None:
+            evidence = await self._source_evidence(schedule_id, tasks)
+        await self._record_authoritative_selector_denominators(
+            manifest,
+            campaign_id,
+            wave,
+            tasks,
+            evidence,
+        )
+        await self._record_worker_objective_selector_resolutions(
+            manifest,
+            campaign_id,
+            wave,
+            tasks,
+            evidence,
+        )
+        existing = (
+            await asyncio.to_thread(self._store.list_lead, campaign_id)
+            if callable(getattr(self._store, "list_lead", None))
+            else ()
+        )
+        recorded = {
+            str(payload.get("attribution_id"))
+            for row in existing
+            if isinstance(row, Mapping)
+            if isinstance((payload := row.get("payload")), Mapping)
+            if payload.get("kind") == "target_state_attribution"
+        }
+        for task in tasks:
+            committed = evidence.get(task.id)
+            if not isinstance(committed, Mapping):
+                continue
+            inherited_calls = {
+                str(value)
+                for value in committed.get("inherited_target_call_ids", ())
+                if isinstance(value, str)
+            }
+            receipts = committed.get("target_evidence_receipts")
+            for call_id, receipt in _mapping_items(receipts):
+                if not isinstance(receipt, Mapping):
+                    continue
+                transition = receipt.get("target_state_transition")
+                changes = _authoritative_progress_changes(transition)
+                if not changes or receipt.get("attempt_disposition") != "valid":
+                    continue
+                transition_digest = (
+                    "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(transition, sort_keys=True, default=str).encode()
+                    ).hexdigest()
+                )
+                attribution_id = (
+                    "target-state-attribution:"
+                    + hashlib.sha256(
+                        f"{campaign_id}\n{task.id}\n{call_id}\n{transition_digest}".encode()
+                    ).hexdigest()
+                )
+                if attribution_id in recorded:
+                    continue
+                technique_ids = tuple(task.technique_ids)
+                source_kind = _target_state_source_kind(task)
+                inherited_lineage = call_id in inherited_calls
+                receipt_campaign_id = receipt.get("campaign_id")
+                current_campaign_effect = (
+                    receipt_campaign_id == campaign_id
+                    or receipt_campaign_id is None
+                    and not inherited_lineage
+                )
+                provenance = (
+                    "campaign_restart"
+                    if current_campaign_effect and inherited_lineage
+                    else "campaign"
+                    if current_campaign_effect
+                    else "preexisting"
+                    if isinstance(receipt_campaign_id, str) and receipt_campaign_id
+                    else "unverified_inherited"
+                )
+                payload = {
+                    "kind": "target_state_attribution",
+                    "schema": "merlin.target-state-attribution.v1",
+                    "attribution_id": attribution_id,
+                    "campaign_id": campaign_id,
+                    "target_id": manifest.target.id,
+                    "task_id": task.id,
+                    "schedule_id": schedule_id,
+                    "source_kind": source_kind,
+                    "action_purpose": _target_state_action_purpose(source_kind),
+                    "technique_ids": technique_ids,
+                    "provenance": provenance,
+                    "counts_as_campaign_progress": current_campaign_effect,
+                    "target_call_id": call_id,
+                    "transition_digest": transition_digest,
+                    "transition_outcome": str(transition.get("outcome")),
+                    "changes": changes,
+                }
+                if callable(commit_lead):
+                    await asyncio.to_thread(
+                        commit_lead,
+                        campaign_id,
+                        wave,
+                        attribution_id,
+                        payload,
+                        (),
+                    )
+                elif callable(append_lead):
+                    await asyncio.to_thread(append_lead, campaign_id, wave, payload)
+                if (
+                    current_campaign_effect
+                    and source_kind in {"reconnaissance", "capability_probe"}
+                    and callable(writer)
+                ):
+                    digest = committed.get("digest")
+                    reference = committed.get("reference")
+                    witnesses = []
+                    if (
+                        isinstance(digest, str)
+                        and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                        and isinstance(reference, str)
+                        and reference
+                    ):
+                        witnesses.append(
+                            EvidenceWitness(
+                                reference=reference,
+                                digest=digest,
+                                source="authenticated-target-transition",
+                            )
+                        )
+                    summary = "; ".join(
+                        f"{item['name']}: {item.get('before_value')!r} -> "
+                        f"{item.get('after_value')!r}"
+                        for item in changes
+                    )
+                    await asyncio.to_thread(
+                        writer,
+                        CampaignObservation(
+                            id=attribution_id,
+                            campaign_id=campaign_id,
+                            task_id=task.id,
+                            target_id=manifest.target.id,
+                            technique_id="reconnaissance",
+                            outcome="observed",
+                            summary=f"{source_kind.replace('_', ' ').title()} changed {summary}.",
+                            coverage="authoritative target state transition",
+                            witnesses=witnesses,
+                        ),
+                    )
+                recorded.add(attribution_id)
+
+    async def _record_authoritative_selector_denominators(
+        self,
+        manifest: CampaignManifest,
+        campaign_id: str,
+        wave: int,
+        tasks: Sequence[AgentTask],
+        evidence: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        """Bind open-world denominators only from typed target enumeration receipts."""
+
+        if manifest.objective_contract is None:
+            return
+        append_lead = getattr(self._store, "append_lead", None)
+        if not callable(append_lead):
+            return
+        contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
+        objectives = {item.id: item for item in contract.objectives}
+        existing = (
+            await asyncio.to_thread(self._store.list_lead, campaign_id)
+            if callable(getattr(self._store, "list_lead", None))
+            else ()
+        )
+        latest_bindings: dict[tuple[str, str], dict[str, frozenset[str]]] = {}
+        existing_payloads: set[str] = set()
+        for row in existing:
+            payload = row.get("payload") if isinstance(row, Mapping) else None
+            if not isinstance(payload, Mapping) or payload.get("kind") != (
+                "campaign_objective_selector_resolution"
+            ):
+                continue
+            key = (
+                str(payload.get("objective_id") or ""),
+                str(payload.get("selector_dimension") or ""),
+            )
+            latest_bindings[key] = {
+                str(raw.get("selector_value") or ""): frozenset(
+                    str(item) for item in raw.get("candidate_ids", ())
+                )
+                for raw in payload.get("bindings", ())
+                if isinstance(raw, Mapping)
+            }
+            existing_payloads.add(
+                json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), default=str)
+            )
+        for task in tasks:
+            committed = evidence.get(task.id)
+            if not isinstance(committed, Mapping):
+                continue
+            for call_id, receipt in _mapping_items(committed.get("target_evidence_receipts")):
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("attempt_disposition") != "valid"
+                ):
+                    continue
+                raw_enumerations = receipt.get("state_enumerations")
+                if not isinstance(raw_enumerations, Sequence) or isinstance(
+                    raw_enumerations, (str, bytes)
+                ):
+                    continue
+                for raw_enumeration in raw_enumerations:
+                    try:
+                        enumeration = StateEnumerationReceipt.model_validate(raw_enumeration)
+                        members_by_scope = complete_enumeration_members(enumeration)
+                    except ValueError:
+                        continue
+                    if members_by_scope is None:
+                        continue
+                    for objective in objectives.values():
+                        selectors = tuple(
+                            item
+                            for item in objective.selectors
+                            if item.dimension == enumeration.name
+                            and item.quantifier
+                            is ObjectiveSelectorQuantifier.ALL_AVAILABLE
+                        )
+                        for selector in selectors:
+                            if selector.scope_dimension != enumeration.scope_dimension:
+                                continue
+                            key = (objective.id, selector.dimension)
+                            previous = latest_bindings.get(key, {})
+                            if any(
+                                not set(previous.get(scope, ())) <= set(members)
+                                for scope, members in members_by_scope.items()
+                            ) or any(scope not in members_by_scope for scope in previous):
+                                # A later target response cannot shrink a previously
+                                # authorized denominator and retroactively complete work.
+                                continue
+                            source = ObjectiveSelectorBindingSource(
+                                kind=ObjectiveSelectorBindingSourceKind.REVIEWED_ADAPTER,
+                                source_ref=f"target-call:{call_id}",
+                                evidence_refs=tuple(
+                                    dict.fromkeys(
+                                        (str(call_id), *enumeration.evidence_refs)
+                                    )
+                                ),
+                            )
+                            try:
+                                resolved = resolve_all_available_selector(
+                                    selector,
+                                    candidate_ids_by_scope=members_by_scope,
+                                    source=source,
+                                )
+                            except ValueError:
+                                continue
+                            payload: dict[str, object] = {
+                                "kind": "campaign_objective_selector_resolution",
+                                "objective_id": objective.id,
+                                "selector_dimension": selector.dimension,
+                                "bindings": tuple(
+                                    item.model_dump(mode="json")
+                                    for item in resolved.bindings
+                                ),
+                                "source": source.model_dump(mode="json"),
+                                "source_task_id": task.id,
+                                "enumeration_digest": enumeration.enumeration_digest,
+                            }
+                            identity = json.dumps(
+                                payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                            if identity in existing_payloads:
+                                continue
+                            await asyncio.to_thread(
+                                append_lead, campaign_id, wave, payload
+                            )
+                            existing_payloads.add(identity)
+                            latest_bindings[key] = {
+                                scope: frozenset(members)
+                                for scope, members in members_by_scope.items()
+                            }
+
+    async def _record_worker_objective_selector_resolutions(
+        self,
+        manifest: CampaignManifest,
+        campaign_id: str,
+        wave: int,
+        tasks: Sequence[AgentTask],
+        evidence: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        """Admit exact selector bindings only from committed discovery receipts.
+
+        Worker JSON is a proposal. Authority comes from the committed result
+        receipt, the sealed objective scope, and (for listed methods) the
+        reviewed catalogue. Invalid or forged proposals remain ordinary worker
+        output and never enter the objective journal.
+        """
+
+        if manifest.objective_contract is None:
+            return
+        append_lead = getattr(self._store, "append_lead", None)
+        if not callable(append_lead):
+            return
+        contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
+        objectives = {item.id: item for item in contract.objectives}
+        catalogue_ids = {str(item.id) for item in manifest.catalogue}
+        catalogue_ids.update(
+            technique_id for task in tasks for technique_id in task.technique_ids
+        )
+        existing = (
+            await asyncio.to_thread(self._store.list_lead, campaign_id)
+            if callable(getattr(self._store, "list_lead", None))
+            else ()
+        )
+        latest_bindings: dict[tuple[str, str], dict[str, frozenset[str]]] = {}
+        existing_payloads: set[str] = set()
+        for row in existing:
+            payload = row.get("payload") if isinstance(row, Mapping) else None
+            if not isinstance(payload, Mapping) or payload.get("kind") != (
+                "campaign_objective_selector_resolution"
+            ):
+                continue
+            objective_id = str(payload.get("objective_id") or "")
+            dimension = str(payload.get("selector_dimension") or "")
+            parsed: dict[str, frozenset[str]] = {}
+            for raw in payload.get("bindings", ()):
+                if isinstance(raw, Mapping):
+                    parsed[str(raw.get("selector_value") or "")] = frozenset(
+                        str(item) for item in raw.get("candidate_ids", ())
+                    )
+            latest_bindings[(objective_id, dimension)] = parsed
+            existing_payloads.add(
+                json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), default=str)
+            )
+
+        for task in tasks:
+            # Only the dedicated discovery lane may propose a new meaning for a
+            # sealed selector. An ordinary attack result cannot authorize itself.
+            if "target-derived-discovery" not in task.id or task.status != "completed":
+                continue
+            committed = evidence.get(task.id)
+            if not isinstance(committed, Mapping):
+                continue
+            structured = committed.get("structured_result")
+            if not isinstance(structured, Mapping):
+                try:
+                    parsed_result = parse_model_json(task.result or "")
+                except ValueError:
+                    continue
+                structured = parsed_result if isinstance(parsed_result, Mapping) else None
+            if not isinstance(structured, Mapping):
+                continue
+            proposals = structured.get("objective_selector_resolutions")
+            if not isinstance(proposals, Sequence) or isinstance(proposals, (str, bytes)):
+                continue
+            raw_target_call_ids = committed.get("target_call_ids")
+            target_call_ids = (
+                tuple(raw_target_call_ids)
+                if isinstance(raw_target_call_ids, Sequence)
+                and not isinstance(raw_target_call_ids, (str, bytes))
+                else ()
+            )
+            # A committed model result authenticates who proposed a binding;
+            # only target-call receipts authenticate what is actually
+            # available or which reviewed candidate the target supports.
+            trusted_refs = {
+                str(value)
+                for value in target_call_ids
+                if isinstance(value, str) and value.strip()
+            }
+            source_ref = str(committed.get("reference") or "").strip()
+            if not trusted_refs or not source_ref:
+                continue
+            for proposal in proposals:
+                if not isinstance(proposal, Mapping) or set(proposal) != {
+                    "objective_id",
+                    "selector_dimension",
+                    "bindings",
+                    "evidence_refs",
+                }:
+                    continue
+                objective_id = str(proposal.get("objective_id") or "")
+                dimension = str(proposal.get("selector_dimension") or "")
+                objective = objectives.get(objective_id)
+                selectors = (
+                    tuple(item for item in objective.selectors if item.dimension == dimension)
+                    if objective is not None
+                    else ()
+                )
+                refs = tuple(
+                    str(item)
+                    for item in proposal.get("evidence_refs", ())
+                    if isinstance(item, str) and item.strip()
+                )
+                raw_bindings = proposal.get("bindings")
+                if (
+                    len(selectors) != 1
+                    or not refs
+                    or not set(refs) <= trusted_refs
+                    or not isinstance(raw_bindings, Sequence)
+                    or isinstance(raw_bindings, (str, bytes))
+                ):
+                    continue
+                selector = selectors[0]
+                if not (
+                    selector.dimension == "method"
+                    and selector.quantifier is ObjectiveSelectorQuantifier.ALL_LISTED
+                ):
+                    continue
+                supplied: dict[str, tuple[str, ...]] = {}
+                malformed = False
+                for raw in raw_bindings:
+                    if not isinstance(raw, Mapping) or set(raw) != {
+                        "selector_value",
+                        "candidate_ids",
+                    }:
+                        malformed = True
+                        break
+                    value = str(raw.get("selector_value") or "")
+                    candidates_raw = raw.get("candidate_ids")
+                    if (
+                        not value
+                        or value in supplied
+                        or not isinstance(candidates_raw, Sequence)
+                        or isinstance(candidates_raw, (str, bytes))
+                    ):
+                        malformed = True
+                        break
+                    candidates = tuple(
+                        dict.fromkeys(
+                            str(item)
+                            for item in candidates_raw
+                            if isinstance(item, str) and item.strip()
+                        )
+                    )
+                    supplied[value] = candidates
+                expected = set(selector.expected_binding_values())
+                if (
+                    selector.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE
+                    and selector.scope_dimension is not None
+                    and not selector.scope_values
+                    and not expected
+                ):
+                    expected = set(supplied)
+                if malformed or set(supplied) != expected:
+                    continue
+                if selector.quantifier is ObjectiveSelectorQuantifier.ALL_LISTED and (
+                    any(not values for values in supplied.values())
+                    or any(
+                        candidate not in catalogue_ids
+                        for values in supplied.values()
+                        for candidate in values
+                    )
+                ):
+                    continue
+                previous = latest_bindings.get((objective_id, dimension), {})
+                if any(
+                    not set(previous.get(value, ())) <= set(supplied[value])
+                    for value in expected
+                ):
+                    continue
+                ordered_values = (
+                    selector.expected_binding_values()
+                    if selector.expected_binding_values()
+                    else tuple(supplied)
+                )
+                bindings = tuple(
+                    ObjectiveSelectorBinding(
+                        selector_value=value,
+                        candidate_ids=supplied[value],
+                        status=ObjectiveSelectorBindingStatus.BOUND,
+                        evidence_refs=refs,
+                    )
+                    for value in ordered_values
+                )
+                source = ObjectiveSelectorBindingSource(
+                    kind=ObjectiveSelectorBindingSourceKind.AUTHORITATIVE_DISCOVERY,
+                    source_ref=source_ref,
+                    evidence_refs=refs,
+                )
+                if selector.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE:
+                    resolve_all_available_selector(
+                        selector,
+                        candidate_ids_by_scope={
+                            item.selector_value: item.candidate_ids for item in bindings
+                        },
+                        source=source,
+                    )
+                else:
+                    type(selector).model_validate(
+                        selector.model_copy(
+                            update={"bindings": bindings, "binding_source": source}
+                        ).model_dump()
+                    )
+                payload: dict[str, object] = {
+                    "kind": "campaign_objective_selector_resolution",
+                    "objective_id": objective_id,
+                    "selector_dimension": dimension,
+                    "bindings": tuple(binding.model_dump(mode="json") for binding in bindings),
+                    "source": source.model_dump(mode="json"),
+                    "source_task_id": task.id,
+                }
+                identity = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), default=str
+                )
+                if identity in existing_payloads:
+                    continue
+                await asyncio.to_thread(append_lead, campaign_id, wave, payload)
+                existing_payloads.add(identity)
+                latest_bindings[(objective_id, dimension)] = {
+                    value: frozenset(candidate_ids)
+                    for value, candidate_ids in supplied.items()
+                }
+
     async def _record_browser_recon_observations(self, manifest: CampaignManifest) -> None:
         """Attribute reviewed browser progress without fabricating candidate credit."""
         reader = self._recon_observation_reader
         writer = getattr(self._store, "record_observation", None)
+        append_lead = getattr(self._store, "append_lead", None)
         adapter = _reviewed_adapter_value(manifest)
         handoff_id = adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None
-        if reader is None or not callable(writer) or not isinstance(handoff_id, str):
+        if (
+            reader is None
+            or (not callable(writer) and not callable(append_lead))
+            or not isinstance(handoff_id, str)
+        ):
             return
         campaign = await asyncio.to_thread(self._store.get, manifest.id)
         created_at = campaign.get("created_at") if isinstance(campaign, Mapping) else None
@@ -9730,6 +11085,18 @@ class CampaignService:
             return
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=UTC)
+        existing = (
+            await asyncio.to_thread(self._store.list_lead, manifest.id)
+            if callable(getattr(self._store, "list_lead", None))
+            else ()
+        )
+        recorded = {
+            str(payload.get("attribution_id"))
+            for row in existing
+            if isinstance(row, Mapping)
+            if isinstance((payload := row.get("payload")), Mapping)
+            if payload.get("kind") == "target_state_attribution"
+        }
         receipts = await reader(manifest.session_id, handoff_id, manifest.target.id)
         for receipt in receipts:
             if not isinstance(receipt, Mapping):
@@ -9741,8 +11108,6 @@ class CampaignService:
                 continue
             if observed.tzinfo is None:
                 observed = observed.replace(tzinfo=UTC)
-            if observed < created_at:
-                continue
             receipt_digest = str(receipt.get("digest") or "")
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_digest):
                 continue
@@ -9765,20 +11130,54 @@ class CampaignService:
             name = str(receipt.get("name") or "target_state")
             baseline = receipt.get("baseline")
             result = receipt.get("result")
-            await asyncio.to_thread(
-                writer,
-                CampaignObservation(
-                    id="recon-observation:" + receipt_digest.removeprefix("sha256:"),
-                    campaign_id=manifest.id,
-                    task_id="browser-recon:" + receipt_digest.removeprefix("sha256:"),
-                    target_id=manifest.target.id,
-                    technique_id="reconnaissance",
-                    outcome=("observed" if receipt.get("outcome") == "observed" else "partial"),
-                    summary=f"Browser reconnaissance observed {name}: {baseline!r} -> {result!r}.",
-                    coverage=f"reviewed target state field {name}",
-                    witnesses=witnesses,
-                ),
-            )
+            attribution_id = "target-state-attribution:" + receipt_digest.removeprefix("sha256:")
+            current_campaign = observed >= created_at
+            if attribution_id not in recorded and callable(append_lead):
+                await asyncio.to_thread(
+                    append_lead,
+                    manifest.id,
+                    0,
+                    {
+                        "kind": "target_state_attribution",
+                        "schema": "merlin.target-state-attribution.v1",
+                        "attribution_id": attribution_id,
+                        "campaign_id": manifest.id,
+                        "target_id": manifest.target.id,
+                        "task_id": "browser-recon:" + receipt_digest.removeprefix("sha256:"),
+                        "source_kind": "reconnaissance",
+                        "provenance": "campaign" if current_campaign else "preexisting",
+                        "counts_as_campaign_progress": current_campaign,
+                        "target_call_id": None,
+                        "transition_digest": receipt_digest,
+                        "transition_outcome": str(receipt.get("outcome") or "partial"),
+                        "changes": (
+                            {
+                                "name": name,
+                                "status": str(receipt.get("outcome") or "partial"),
+                                "before_value": baseline,
+                                "after_value": result,
+                            },
+                        ),
+                    },
+                )
+                recorded.add(attribution_id)
+            if current_campaign and callable(writer):
+                await asyncio.to_thread(
+                    writer,
+                    CampaignObservation(
+                        id="recon-observation:" + receipt_digest.removeprefix("sha256:"),
+                        campaign_id=manifest.id,
+                        task_id="browser-recon:" + receipt_digest.removeprefix("sha256:"),
+                        target_id=manifest.target.id,
+                        technique_id="reconnaissance",
+                        outcome=("observed" if receipt.get("outcome") == "observed" else "partial"),
+                        summary=(
+                            f"Browser reconnaissance observed {name}: {baseline!r} -> {result!r}."
+                        ),
+                        coverage=f"reviewed target state field {name}",
+                        witnesses=witnesses,
+                    ),
+                )
 
     async def _reusable_capability_observations(
         self, manifest: CampaignManifest, context: AssignmentContext
@@ -10313,6 +11712,15 @@ class CampaignService:
         assert live.execution is not None
         await self._await_wave_budget(campaign_id, manifest, wave, live)
         tasks = tuple(await self._agents.list_schedule_tasks(live.id))
+        evidence = await self._source_evidence(str(live.id), tasks)
+        await self._record_target_state_attributions(
+            manifest,
+            campaign_id,
+            wave,
+            str(live.id),
+            tasks,
+            evidence=evidence,
+        )
         failed = sum(task.status != "completed" for task in tasks)
         completed = len(tasks) - failed
         budget_capped = await self._campaign_budget_capped(campaign_id)
@@ -12124,23 +13532,46 @@ class CampaignService:
                 if pending_loader is not None
                 else []
             )
-        coordination_tasks = tuple(
-            AgentTask(
-                id=f"{manifest.id}/worker-message/{row['id']}",
-                objective="Consume attributable worker coordination before deciding the frontier.",
-                status="completed",
-                result=(
-                    f"Worker {row['source_task_id']} reports {row.get('kind', 'discovery')} "
-                    "to the Campaign Lead:\n"
-                    f"{row['content']}\n"
-                    f"Related task: {row.get('related_task_id') or row['source_task_id']}\n"
-                    "Requested specialist profile (advisory until the Lead emits a handoff): "
-                    f"{row.get('requested_profile_id') or 'none'}"
-                ),
+        def coordination_projection(
+            rows: Sequence[Mapping[str, object]],
+        ) -> tuple[AgentTask, ...]:
+            return tuple(
+                AgentTask(
+                    id=f"{manifest.id}/worker-message/{row['id']}",
+                    objective=(
+                        "Consume attributable worker coordination before deciding the frontier."
+                    ),
+                    status="completed",
+                    result=(
+                        f"Worker {row['source_task_id']} reports "
+                        f"{row.get('kind', 'discovery')} to the Campaign Lead:\n"
+                        f"{row['content']}\n"
+                        f"Related task: {row.get('related_task_id') or row['source_task_id']}\n"
+                        "Requested specialist profile (advisory until the Lead emits a handoff): "
+                        f"{row.get('requested_profile_id') or 'none'}"
+                    ),
+                )
+                for row in rows
             )
-            for row in pending
-        )
+
+        coordination_tasks = coordination_projection(pending)
         model_control_tasks = control_plane_tasks
+
+        async def refresh_prompt_tasks() -> tuple[AgentTask, ...]:
+            refreshed_controls = await self._lead_control_plane_tasks(manifest, tasks)
+            pending_loader = getattr(self._store, "list_pending_worker_messages", None)
+            newly_pending = (
+                await asyncio.to_thread(pending_loader, manifest.id)
+                if callable(pending_loader)
+                else []
+            )
+            coordination_by_id = {
+                str(row["id"]): row for row in (*pending, *newly_pending)
+            }
+            refreshed_coordination = coordination_projection(
+                tuple(coordination_by_id.values())
+            )
+            return (*tasks, *refreshed_controls, *refreshed_coordination)
         renewal: asyncio.Task[None] | None = None
         if claim_id is not None:
             renewal = asyncio.create_task(
@@ -12164,12 +13595,31 @@ class CampaignService:
         for attempt in range(attempts):
             attempt_usage: dict[str, object] | None = None
             try:
-                assessment = await self._lead_runner(
-                    manifest.id,
-                    manifest.profile,
-                    attempt,
-                    (*tasks, *model_control_tasks, *coordination_tasks),
-                )
+                runner_parameters = inspect.signature(self._lead_runner).parameters.values()
+                accepts_refresh = any(
+                    parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                    for parameter in runner_parameters
+                ) or sum(
+                    parameter.kind
+                    in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+                    for parameter in runner_parameters
+                ) >= 5
+                runner_tasks = (*tasks, *model_control_tasks, *coordination_tasks)
+                if accepts_refresh:
+                    assessment = await self._lead_runner(
+                        manifest.id,
+                        manifest.profile,
+                        attempt,
+                        runner_tasks,
+                        refresh_prompt_tasks,
+                    )
+                else:
+                    assessment = await self._lead_runner(
+                        manifest.id,
+                        manifest.profile,
+                        attempt,
+                        runner_tasks,
+                    )
                 if assessment.finish_current_work:
                     if not operator_guidance:
                         raise ValueError(
@@ -12626,7 +14076,13 @@ class CampaignService:
                     if isinstance(attempt, Mapping)
                 ),
                 "omitted_technique_attempt_count": max(0, len(technique_attempts) - history_limit),
-                "lead_journal_entry_count": len(lead_rows),
+                # Review lifecycle telemetry is appended to the same journal while a
+                # Lead call is in flight.  Count only committed decisions here so the
+                # prompt projection does not invalidate itself after
+                # ``lead_review_started`` (or progress/drop telemetry) is recorded.
+                "lead_journal_entry_count": sum(
+                    1 for item in lead_rows if item.get("decision_id") is not None
+                ),
             },
             "campaign_state_get": {
                 "status": None if not isinstance(row, Mapping) else row.get("status"),
@@ -13941,6 +15397,13 @@ class CampaignService:
                     int(prior["wave"]),
                     probe_results,
                 )
+                await self._record_target_state_attributions(
+                    manifest,
+                    campaign_id,
+                    int(prior["wave"]),
+                    prior_live.id,
+                    recon_tasks,
+                )
                 context = replace(
                     context,
                     techniques=reconcile_techniques_for_surfaces(
@@ -14208,9 +15671,7 @@ class CampaignService:
                 )
                 continue
             try:
-                await self._agents.pause_schedule(
-                    wave_schedule_id, reason="daemon-recovery-pause"
-                )
+                await self._agents.pause_schedule(wave_schedule_id, reason="daemon-recovery-pause")
             except ValueError:
                 # The scheduler may terminalize between the status probe and
                 # pause. Suppress only that proven race; a still-running
@@ -14405,6 +15866,50 @@ class CampaignService:
             }
             for record in records[-bounded_limit:]
         )
+
+    async def record_objective_progress(
+        self,
+        session_id: str,
+        campaign_id: str,
+        objective_id: str,
+        status: str,
+        *,
+        evidence_refs: Sequence[str] = (),
+        status_reason: str | None = None,
+    ) -> Mapping[str, object]:
+        """Persist one evidence-backed update for a sealed campaign objective."""
+
+        row = await asyncio.to_thread(self._store.get, campaign_id)
+        if row is None or str(row.get("session_id")) != session_id:
+            raise KeyError(f"unknown campaign {campaign_id!r}")
+        manifest = _manifest(row["manifest"]["manifest"])
+        if manifest.objective_contract is None:
+            raise ValueError("campaign has no sealed objective contract")
+        contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
+        objective = next(
+            (item for item in contract.objectives if item.id == objective_id),
+            None,
+        )
+        if objective is None:
+            raise ValueError("objective is not part of the sealed campaign contract")
+        progress = ObjectiveProgress(
+            objective=objective,
+            status=ObjectiveStatus(status),
+            evidence_refs=tuple(str(item) for item in evidence_refs),
+            status_reason=status_reason,
+        )
+        waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+        wave = max((int(item.get("wave") or 0) for item in waves), default=0)
+        payload: dict[str, object] = {
+            "kind": "campaign_objective_progress",
+            "objective_id": objective.id,
+            "status": progress.status.value,
+            "evidence_refs": progress.evidence_refs,
+        }
+        if progress.status_reason is not None:
+            payload["status_reason"] = progress.status_reason
+        await asyncio.to_thread(self._store.append_lead, campaign_id, wave, payload)
+        return payload
 
     async def waive_objective_phase_gate(
         self,
@@ -14751,6 +16256,26 @@ class CampaignService:
         envelope = row["manifest"]
         manifest = _manifest(envelope["manifest"])
         assignment_context = _assignment_context(envelope["assignment_context"])
+        objective_progress = _objective_progress_from_journal(
+            manifest,
+            lead,
+            projected_waves=projected_waves,
+            assignment_context=assignment_context,
+        )
+        objective_outcome = (
+            _objective_outcome(
+                objective_progress,
+                lifecycle_status=str(row["status"]),
+                terminal_reason=(
+                    str(row["stop_reason"])
+                    if row.get("stop_reason") is not None
+                    and str(row["status"]) in {"completed", "cancelled", "failed"}
+                    else None
+                ),
+            )
+            if manifest.objective_contract is not None
+            else None
+        )
         objective_phase_gates = _objective_phase_gate_projection(manifest, lead)
         capability_results = _capability_probe_results_from_lead(lead)
         observed_capability_surfaces = tuple(
@@ -15367,6 +16892,17 @@ class CampaignService:
             "saturation": saturation_document,
             "service_objectives": service_objectives,
             "objective_phase_gates": objective_phase_gates,
+            **(
+                {
+                    "objective_contract": dict(manifest.objective_contract),
+                    "objective_progress": tuple(
+                        item.model_dump(mode="json") for item in objective_progress
+                    ),
+                    "campaign_outcome": objective_outcome.model_dump(mode="json"),
+                }
+                if objective_outcome is not None and manifest.objective_contract is not None
+                else {}
+            ),
         }
         if frontier_snapshot is not None:
             completion_document["frontier_snapshot"] = frontier_snapshot
@@ -15437,6 +16973,17 @@ class CampaignService:
             "budget": budget,
             "service_objectives": service_objectives,
             "objective_phase_gates": objective_phase_gates,
+            **(
+                {
+                    "objective_contract": dict(manifest.objective_contract),
+                    "objective_progress": tuple(
+                        item.model_dump(mode="json") for item in objective_progress
+                    ),
+                    "campaign_outcome": objective_outcome.model_dump(mode="json"),
+                }
+                if objective_outcome is not None and manifest.objective_contract is not None
+                else {}
+            ),
             "pace": _campaign_pace(tuple(pace_waves), datetime.now(UTC)),
             "dynamic_specialists": tuple(
                 {
@@ -15760,6 +17307,61 @@ class CampaignService:
         latest = waves[-1]
         lead_loader = getattr(self._store, "list_lead", None)
         lead = await asyncio.to_thread(lead_loader, campaign_id) if callable(lead_loader) else ()
+        review_events = [
+            item["payload"]
+            for item in lead
+            if isinstance(item.get("payload"), Mapping)
+            and item["payload"].get("kind")
+            in {
+                "lead_review_started",
+                "lead_review_progress",
+                "lead_review_completed",
+                "lead_review_stale",
+                "lead_review_failed",
+            }
+        ]
+        review_progress: dict[str, object] = {}
+        if review_events:
+            latest_review = review_events[-1]
+            review_id = latest_review.get("review_id")
+            if latest_review.get("state") == "reviewing" and isinstance(review_id, str):
+                started = next(
+                    (
+                        event
+                        for event in reversed(review_events)
+                        if event.get("review_id") == review_id
+                        and event.get("kind") == "lead_review_started"
+                    ),
+                    latest_review,
+                )
+                started_at = started.get("started_at")
+                elapsed = latest_review.get("elapsed_seconds")
+                if elapsed is None and isinstance(started_at, str):
+                    try:
+                        elapsed = max(
+                            0.0,
+                            (
+                                datetime.now(UTC) - datetime.fromisoformat(started_at)
+                            ).total_seconds(),
+                        )
+                    except ValueError:
+                        elapsed = None
+                review_progress = {
+                    "review_kind": str(latest_review.get("review_kind") or "wave results"),
+                    "state": "reviewing",
+                    "blocking": latest_review.get("blocking") is True,
+                    "advisory": latest_review.get("advisory") is True,
+                    "started_at": started_at,
+                    "last_activity": str(
+                        latest_review.get("last_activity") or "review snapshot sealed"
+                    ),
+                    "waiting_for": str(latest_review.get("waiting_for") or "Lead decision"),
+                }
+                if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                    review_progress["elapsed_seconds"] = round(float(elapsed), 3)
+                completed_chunks = latest_review.get("completed_chunks")
+                if isinstance(completed_chunks, int) and not isinstance(completed_chunks, bool):
+                    review_progress["completed_chunks"] = completed_chunks
         draining = any(
             isinstance(item.get("payload"), Mapping)
             and item["payload"].get("kind") == "operator_drain_requested"
@@ -15792,6 +17394,7 @@ class CampaignService:
                 else ""
             ),
             "target_progress": target_progress,
+            "review_progress": review_progress,
         }
 
     async def console_context(self, session_id: str) -> str | None:
@@ -15856,15 +17459,18 @@ class CampaignService:
                     "cancelled",
                     {"reason": "operator-campaign-cancel"},
                 )
+            terminalized = True
             if str(row["status"]) in {"prepared", "executing", "paused"}:
-                await self._finish_campaign(identifier, "cancelled", "operator_stopped")
+                terminalized = await self._finish_campaign(
+                    identifier, "cancelled", "operator_stopped"
+                )
             await asyncio.to_thread(
                 self._store.append_lead,
                 identifier,
                 int(waves[-1]["wave"]) if waves else 0,
                 {"stop_reason": "operator_stopped"},
             )
-            if self._report_runner is not None:
+            if self._report_runner is not None and terminalized is not False:
                 report_wave = int(waves[-1]["wave"]) if waves else 0
                 try:
                     envelope = row["manifest"]
@@ -20644,6 +22250,89 @@ def _objective_gate_transitions(
         ):
             transitions.append(transition)
     return tuple(transitions)
+
+
+def _authoritative_progress_changes(value: object) -> tuple[Mapping[str, object], ...]:
+    """Return only validated target-reported progress from a transition receipt."""
+
+    if not isinstance(value, Mapping):
+        return ()
+    if (
+        value.get("schema") != "merlin.target-state-transition.v2"
+        or value.get("authority") != "target"
+        or value.get("identity_match") is not True
+        or value.get("outcome") not in {"success", "progress"}
+        or value.get("conflict") is True
+        or value.get("validation_errors")
+    ):
+        return ()
+    quarantined = {
+        str(item) for item in value.get("quarantined_observations", ()) if isinstance(item, str)
+    }
+    observations = value.get("observations")
+    if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
+        return ()
+    return tuple(
+        {
+            key: item.get(key)
+            for key in (
+                "name",
+                "role",
+                "status",
+                "before_value",
+                "after_value",
+                "scope_dimension",
+                "scope_value",
+            )
+            if key in item
+            and (
+                key not in {"scope_dimension", "scope_value"}
+                or isinstance(item.get(key), (str, int, float))
+                and not isinstance(item.get(key), bool)
+            )
+        }
+        for item in observations
+        if isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and item.get("name") not in quarantined
+        and item.get("status") in {"success", "progress"}
+        and not item.get("validation_errors")
+        and (
+            ("scope_dimension" in item) == ("scope_value" in item)
+        )
+    )
+
+
+def _target_state_source_kind(task: AgentTask) -> str:
+    """Describe the action that produced a target transition without target coupling."""
+
+    technique_ids = tuple(task.technique_ids)
+    if any(item.startswith("capability/") for item in technique_ids):
+        return "capability_probe"
+    if "target-derived-discovery" in task.id:
+        return "target_derived_discovery"
+    if task.id.endswith("/recon") or "reconnaissance" in technique_ids:
+        return "reconnaissance"
+    if "/objective-gate/" in task.id or any(
+        item.startswith("objective-phase-gate/") for item in technique_ids
+    ):
+        return "objective_prerequisite"
+    if "/validation/" in task.id or any(
+        item.startswith("validation/") for item in technique_ids
+    ):
+        return "validation"
+    return "candidate"
+
+
+def _target_state_action_purpose(source_kind: str) -> str:
+    return {
+        "capability_probe": "reconnaissance",
+        "target_derived_discovery": "reconnaissance",
+        "reconnaissance": "reconnaissance",
+        "objective_prerequisite": "baseline",
+        "validation": "validation",
+        "candidate": "candidate",
+    }[source_kind]
 
 
 _SERVICE_OBJECTIVE_SCHEMA = "merlin.campaign-service-objectives.v1"

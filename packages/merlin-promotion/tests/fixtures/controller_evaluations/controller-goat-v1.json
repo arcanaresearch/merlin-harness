@@ -7,7 +7,7 @@
     "input_tokens": 0,
     "mean_cost": 0.0,
     "output_tokens": 0,
-    "p95_latency_ms": 2,
+    "p95_latency_ms": 5,
     "task_success_rate": 1.0,
     "total_tokens": 0
   },
@@ -17,19 +17,19 @@
   "candidate_kind": "routing",
   "cases": [
     {
-      "fixture_digest": "sha256:63ec74a04851a1fbe58c9e76fba36b515bfd5e3b6d7382146a688daf00c3d4d3",
+      "fixture_digest": "sha256:80c5b37b08433a53cd5725c964e4f2223aed9d6eef99eceec10be838b68e217a",
       "id": "controller-goat-oracle-outcome",
       "source_group": "controller-fixture",
       "target_fixture": "controller-goat-oracle-outcome.json"
     },
     {
-      "fixture_digest": "sha256:d1594183eedccf9deaa03a6465f575b5afafe6ad06e02a2a523490f7db536110",
+      "fixture_digest": "sha256:947cac074c7212f364fcd22810987d8f09ea0503cc977a13f10de7166415b737",
       "id": "controller-goat-small-window-fail-closed",
       "source_group": "controller-fixture",
       "target_fixture": "controller-goat-small-window-fail-closed.json"
     }
   ],
-  "dataset_digest": "sha256:6b160dd0ed44da29b29d71e70ff2cee974d52710c671da8da9a3123f0b492f7d",
+  "dataset_digest": "sha256:68a4a268b9fa32aca01880b02c265632026beb4e8335a5acec3f7d0827fd3166",
   "dataset_provenance": "controller-fixture-2026-09-04",
   "held_out": true,
   "id": "controller-goat-v1",

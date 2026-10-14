@@ -573,7 +573,7 @@ async def test_crescendo_zero_step_terminal_report_is_incomplete(
             technique = next(row for row in report.techniques if row["strategy_id"] == "crescendo")
             assert technique["outcome"] == "unclear"
             assert report.report_state == "incomplete"
-            assert report.stop_reason == "capped"
+            assert report.stop_reason == "budget_exhausted"
             assert not [row for row in report.lineage if row.get("pack") == "adaptive-strategy"]
         finally:
             await backend.close()

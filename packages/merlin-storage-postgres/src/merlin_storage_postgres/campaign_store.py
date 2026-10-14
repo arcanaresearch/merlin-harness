@@ -697,12 +697,21 @@ class CampaignStore:
         if after_ordinal is not None and after_ordinal < 0:
             raise ValueError("frontier shortlist cursor must be non-negative")
         rows = self.connection.execute(
-            """SELECT id, family_id, ordinal, requested_language, variant_id,
+            """WITH ranked AS (
+                   SELECT id, family_id, ordinal, requested_language, variant_id,
+                          variant, priority, claim_generation,
+                          row_number() OVER (
+                              PARTITION BY family_id
+                              ORDER BY claim_generation, ordinal, id
+                          ) AS family_rank
+                   FROM merlin_storage.campaign_frontier_candidates
+                   WHERE campaign_id = %s AND state = 'queued'
+                     AND (%s::bigint IS NULL OR ordinal > %s::bigint)
+               )
+               SELECT id, family_id, ordinal, requested_language, variant_id,
                       variant, priority, claim_generation
-               FROM merlin_storage.campaign_frontier_candidates
-               WHERE campaign_id = %s AND state = 'queued'
-                 AND (%s::bigint IS NULL OR ordinal > %s::bigint)
-               ORDER BY ordinal, id LIMIT %s""",
+               FROM ranked
+               ORDER BY claim_generation, family_rank, ordinal, id LIMIT %s""",
             (campaign_id, after_ordinal, after_ordinal, limit),
         ).fetchall()
         return tuple(

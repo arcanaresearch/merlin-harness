@@ -834,6 +834,7 @@ async def run_browser_lane(workdir: Path, target: FixtureTargetServer) -> dict[s
             _prepare_campaign_store(connection, campaign_id, str(session.id), manifest, context)
             scheduler = DurableSchedulerStore(connection)
             browser_store = PostgresBrowserStore(connection)
+            state_scope_store = CampaignApiSessionRepository(connection)
             owner = BrowserOwner(
                 session_id=str(session.id),
                 worker_id="worker:seeded-browser",
@@ -851,6 +852,7 @@ async def run_browser_lane(workdir: Path, target: FixtureTargetServer) -> dict[s
                         lambda _session_id: browser,
                         browser_store,
                         adapter_resolver=lambda _campaign_id: adapter,
+                        state_scope_store=state_scope_store,
                     ),
                     confirmer=_allow,
                     effect_store=PostgresToolEffectStore(ToolEffectRepository(connection)),
@@ -994,6 +996,7 @@ async def run_hybrid_lane(workdir: Path, target: FixtureTargetServer) -> dict[st
             _prepare_campaign_store(connection, campaign_id, str(session.id), manifest, context)
             scheduler = DurableSchedulerStore(connection)
             browser_store = PostgresBrowserStore(connection)
+            state_scope_store = CampaignApiSessionRepository(connection)
             owner = BrowserOwner(
                 session_id=str(session.id),
                 worker_id="worker:seeded-hybrid",
@@ -1008,7 +1011,7 @@ async def run_hybrid_lane(workdir: Path, target: FixtureTargetServer) -> dict[st
                 await browser_store.save_metadata(browser.metadata(restart=True))
                 async with httpx.AsyncClient() as client:
                     api_target = ReviewedApiTargetTool(
-                        CampaignApiSessionRepository(connection),
+                        state_scope_store,
                         lambda _campaign_id: adapter,
                         {},
                         browser_api_requester=(
@@ -1021,7 +1024,11 @@ async def run_hybrid_lane(workdir: Path, target: FixtureTargetServer) -> dict[st
                     broker = ToolBroker(
                         (
                             api_target,
-                            *browser_tools(lambda _session_id: browser, browser_store),
+                            *browser_tools(
+                                lambda _session_id: browser,
+                                browser_store,
+                                state_scope_store=state_scope_store,
+                            ),
                         ),
                         confirmer=_allow,
                         effect_store=PostgresToolEffectStore(ToolEffectRepository(connection)),

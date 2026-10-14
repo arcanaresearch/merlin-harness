@@ -31,13 +31,7 @@ from merlin_storage_postgres import (
 class FindingsSwarmProvider:
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
         prompt = "\n".join(message.content for message in request.messages).lower()
-        if "split this assessment" in prompt:
-            content = (
-                '{"tasks":['
-                '{"id":"headers","objective":"Test response header security"},'
-                '{"id":"errors","objective":"Test error data exposure"}]}'
-            )
-        elif "header" in prompt:
+        if "assignment: test response header security" in prompt:
             content = json.dumps(
                 {
                     "title": "Missing content security policy",
@@ -47,7 +41,7 @@ class FindingsSwarmProvider:
                     "remediation": "Set a restrictive CSP header.",
                 }
             )
-        else:
+        elif "assignment: test error data exposure" in prompt:
             content = json.dumps(
                 {
                     "title": "Verbose error response",
@@ -56,6 +50,12 @@ class FindingsSwarmProvider:
                     "reproduction": "Send malformed JSON.",
                     "remediation": "Return a generic client error.",
                 }
+            )
+        else:
+            content = (
+                '{"tasks":['
+                '{"id":"headers","objective":"Test response header security"},'
+                '{"id":"errors","objective":"Test error data exposure"}]}'
             )
         yield TextDelta(text=content)
         yield ModelCompleted(finish_reason="stop")

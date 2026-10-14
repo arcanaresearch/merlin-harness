@@ -6348,6 +6348,79 @@ def test_live_swarm_displays_durable_wave_and_lead_review(state):
         assert "Reviewing wave results" not in text
 
 
+def test_live_swarm_explains_blocking_review_without_changing_target_progress():
+    campaign = CampaignView(
+        "campaign/review-progress",
+        "session-demo",
+        "Stateful assessment",
+        "recommended",
+        "executing",
+        "digest",
+        4,
+        "frontier",
+        "completed",
+        target_progress={
+            "current_state": (
+                {"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},
+            ),
+            "target_exchange_count": 19,
+            "freshness": "current",
+        },
+        review_progress={
+            "review_kind": "wave_results",
+            "state": "reviewing",
+            "blocking": True,
+            "advisory": False,
+            "elapsed_seconds": 132,
+            "last_activity": "Comparing target-state transitions with required objectives",
+            "completed_chunks": 3,
+            "total_chunks": 5,
+            "waiting_for": "The next wave needs the reviewed objective and strategy decision.",
+        },
+    )
+
+    rendered = app_module._render_live_swarm((), (campaign,), 0).plain
+
+    assert "Review: Wave results · BLOCKING · 2m 12s" in rendered
+    assert "Activity: Comparing target-state transitions with required objectives" in rendered
+    assert "Progress: 3/5 review chunks complete" in rendered
+    assert "Waiting: The next wave needs the reviewed objective and strategy decision." in rendered
+    assert campaign.target_progress == {
+        "current_state": (
+            {"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},
+        ),
+        "target_exchange_count": 19,
+        "freshness": "current",
+    }
+
+
+def test_live_swarm_explains_advisory_review_is_not_blocking_execution():
+    campaign = CampaignView(
+        "campaign/advisory-review",
+        "session-demo",
+        "Parallel assessment",
+        "exploration",
+        "executing",
+        "digest",
+        3,
+        "attack",
+        "running",
+        review_progress={
+            "kind": "novelty_analysis",
+            "blocking": False,
+            "elapsed_seconds": 8,
+            "last_activity": "Reviewing novel technique families",
+        },
+    )
+
+    agent = AgentView("worker", "lead", "Continue safe work", "demo", "8s", "running")
+    rendered = app_module._render_live_swarm((agent,), (campaign,), 0).plain
+
+    assert "Review: Novelty analysis · ADVISORY · 8s" in rendered
+    assert "Waiting: No execution is waiting; safe work may continue in parallel." in rendered
+    assert "Working" in rendered
+
+
 @pytest.mark.asyncio
 async def test_agent_workspace_header_and_campaign_list_show_wave():
     from textual.widgets import Static

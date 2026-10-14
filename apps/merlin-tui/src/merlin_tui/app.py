@@ -6786,6 +6786,20 @@ def _render_campaign_review(value: str) -> Panel:
         if configured_budget
         else "No campaign-wide turn, token, time, or cost cap configured",
     )
+    objective_contract = review.get("objective_contract") or payload.get("objective_contract")
+    if isinstance(objective_contract, Mapping):
+        objectives = objective_contract.get("objectives")
+        if isinstance(objectives, (list, tuple)):
+            required = [
+                str(item.get("description"))
+                for item in objectives
+                if isinstance(item, Mapping) and item.get("required", True)
+            ]
+            if required:
+                table.add_row(
+                    "Required objectives",
+                    "\n".join(f"[ ] {description}" for description in required),
+                )
     table.add_row(
         "Admitted coverage",
         f"{coverage['technique_count']} techniques · {listing(coverage['technique_ids'])}",
@@ -7253,6 +7267,60 @@ def _target_progress_field(field: Mapping[str, object]) -> str:
     return f"{label} {value}"
 
 
+def _review_duration(seconds: object) -> str:
+    try:
+        elapsed = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "elapsed time unavailable"
+    minutes, remaining_seconds = divmod(elapsed, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {remaining_minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {remaining_seconds:02d}s"
+    return f"{remaining_seconds}s"
+
+
+def _render_review_progress(progress: Mapping[str, object]) -> Text:
+    """Render operator-facing Lead review detail without changing swarm accounting."""
+    rendered = Text()
+    kind = str(progress.get("review_kind") or progress.get("kind") or "wave results")
+    kind = kind.replace("_", " ").replace("-", " ").strip().capitalize()
+    blocking = progress.get("blocking") is True
+    advisory = progress.get("advisory") is True or not blocking
+    disposition = "BLOCKING" if blocking else "ADVISORY" if advisory else "REVIEW"
+    rendered.append("│  Review: ", style="dim")
+    rendered.append(kind, style="bold")
+    rendered.append(f" · {disposition}", style="bold yellow" if blocking else "cyan")
+    rendered.append(f" · {_review_duration(progress.get('elapsed_seconds'))}\n", style="dim")
+
+    activity = str(progress.get("last_activity") or "Reasoning is active; no detail reported yet")
+    rendered.append(f"│  Activity: {_short_activity(activity, 108)}\n", style="dim")
+
+    completed = progress.get("completed_chunks", progress.get("chunks_completed"))
+    total = progress.get("total_chunks", progress.get("chunks_total"))
+    if isinstance(completed, int) and isinstance(total, int) and total > 0:
+        rendered.append(f"│  Progress: {completed}/{total} review chunks complete\n", style="dim")
+    elif progress.get("progress"):
+        rendered.append(
+            f"│  Progress: {_short_activity(str(progress['progress']), 108)}\n",
+            style="dim",
+        )
+
+    waiting = str(progress.get("waiting_for") or "").strip()
+    if not waiting:
+        waiting = (
+            "Next dependent campaign action is waiting for this decision."
+            if blocking
+            else "No execution is waiting; safe work may continue in parallel."
+        )
+    rendered.append(
+        f"│  Waiting: {_short_activity(waiting, 107)}\n",
+        style="yellow" if blocking else "dim",
+    )
+    return rendered
+
+
 def _render_live_swarm(
     agents: tuple[AgentView, ...], campaigns: tuple[CampaignView, ...], spinner_index: int
 ) -> Text:
@@ -7321,6 +7389,8 @@ def _render_live_swarm(
         if lead.lead_activity:
             lead_state = lead.lead_activity
         rendered.append(f"├─ Campaign Lead · {lead_state}\n", style="bold")
+        if lead.review_progress:
+            rendered.append_text(_render_review_progress(lead.review_progress))
     working = tuple(
         agent for agent in ordered if _agent_state_group(agent.latest_event) == "working"
     )

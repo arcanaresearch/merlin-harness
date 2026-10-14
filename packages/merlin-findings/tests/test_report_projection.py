@@ -3235,3 +3235,158 @@ def test_browser_page_snapshot_is_not_presented_as_assistant_dialogue():
     )
     assert "Browser observation" in rendered
     assert ">Assistant<" not in rendered
+
+
+def _objective_contract(*objective_ids: str) -> dict[str, object]:
+    return {
+        "objectives": [
+            {
+                "schema_version": "merlin.campaign-objective.v1",
+                "id": objective_id,
+                "description": f"Reach {objective_id}",
+                "kind": "state",
+                "temporal_semantics": "at_campaign_end",
+                "provenance": {
+                    "kind": "operator",
+                    "source_ref": "operator:campaign-request",
+                    "evidence_refs": [],
+                },
+                "required": True,
+                "depends_on": [],
+            }
+            for objective_id in objective_ids
+        ]
+    }
+
+
+def _campaign_outcome(
+    *,
+    lifecycle: str,
+    verdict: str,
+    end_reason: str,
+    unresolved: tuple[str, ...],
+) -> dict[str, object]:
+    required = ("tier-1", "tier-2")
+    satisfied = tuple(item for item in required if item not in unresolved)
+    return {
+        "schema_version": "merlin.campaign-outcome.v1",
+        "lifecycle": lifecycle,
+        "verdict": verdict,
+        "end_reason": end_reason,
+        "required_objective_ids": required,
+        "unresolved_objective_ids": unresolved,
+        "satisfied_by_campaign_ids": satisfied,
+        "preexisting_objective_ids": [],
+        "waived_objective_ids": [],
+    }
+
+
+def _objective_report_kwargs(metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "stop_reason": "saturated",
+        "cleanup_status": "completed",
+        "findings": (),
+        "tasks": (),
+        "evidence": (),
+        "usage": {},
+        "metadata": metadata,
+        "created_at": datetime(2030, 1, 1, tzinfo=UTC),
+    }
+
+
+def test_unresolved_objective_authority_makes_inferred_report_incomplete() -> None:
+    service = DurableReportService(Repository())
+    report = service.create(
+        "campaign-objectives-incomplete",
+        **_objective_report_kwargs(
+            {
+                "objective_contract": _objective_contract("tier-1", "tier-2"),
+                "campaign_outcome": _campaign_outcome(
+                    lifecycle="incomplete",
+                    verdict="partial",
+                    end_reason="budget_exhausted",
+                    unresolved=("tier-2",),
+                ),
+            }
+        ),
+    )
+
+    assert report.report_state == "incomplete"
+    assert "Scan ended with unresolved results" in service.export(report.revision_id, "html")
+
+
+def test_explicit_complete_report_rejects_unresolved_required_objectives() -> None:
+    service = DurableReportService(Repository())
+    with pytest.raises(ValueError, match="required objectives remain unresolved"):
+        service.create(
+            "campaign-objectives-false-success",
+            report_state="complete",
+            **_objective_report_kwargs(
+                {
+                    "objective_contract": _objective_contract("tier-1", "tier-2"),
+                    "campaign_outcome": _campaign_outcome(
+                        lifecycle="incomplete",
+                        verdict="partial",
+                        end_reason="frontier_exhausted",
+                        unresolved=("tier-2",),
+                    ),
+                }
+            ),
+        )
+
+
+def test_sealed_objective_contract_requires_typed_outcome_projection() -> None:
+    service = DurableReportService(Repository())
+    with pytest.raises(ValueError, match="requires a typed campaign outcome"):
+        service.create(
+            "campaign-objectives-missing-outcome",
+            **_objective_report_kwargs(
+                {"objective_contract": _objective_contract("tier-1", "tier-2")}
+            ),
+        )
+
+
+def test_completion_seal_cannot_say_completed_when_objectives_are_unresolved() -> None:
+    service = DurableReportService(Repository())
+    contract = _objective_contract("tier-1", "tier-2")
+    outcome = _campaign_outcome(
+        lifecycle="incomplete",
+        verdict="partial",
+        end_reason="profile_exhausted",
+        unresolved=("tier-2",),
+    )
+    with pytest.raises(ValueError, match="successful completion seal conflicts"):
+        service.create(
+            "campaign-objectives-bad-seal",
+            completion_digest="sha256:" + "0" * 64,
+            completion_document={
+                "terminal_status": "completed",
+                "document": {
+                    "objective_contract": contract,
+                    "campaign_outcome": outcome,
+                },
+            },
+            **_objective_report_kwargs(
+                {"objective_contract": contract, "campaign_outcome": outcome}
+            ),
+        )
+
+
+def test_discharged_objective_contract_preserves_successful_legacy_report_path() -> None:
+    service = DurableReportService(Repository())
+    report = service.create(
+        "campaign-objectives-complete",
+        **_objective_report_kwargs(
+            {
+                "objective_contract": _objective_contract("tier-1", "tier-2"),
+                "campaign_outcome": _campaign_outcome(
+                    lifecycle="completed",
+                    verdict="satisfied",
+                    end_reason="all_satisfied",
+                    unresolved=(),
+                ),
+            }
+        ),
+    )
+
+    assert report.report_state == "complete"
