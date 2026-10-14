@@ -4238,9 +4238,7 @@ async def test_existing_session_dialog_quits_or_starts_here(replace) -> None:
 
 
 @pytest.mark.asyncio
-async def test_existing_session_replacement_failure_can_quit() -> None:
-    from merlin_tui.app import ExistingSessionScreen
-
+async def test_existing_session_replacement_failure_exits_without_reopening_dialog() -> None:
     class OccupiedBackend(DemoBackend):
         async def acquire_foreground_lease(self, **kwargs):
             raise RuntimeError("Merlin already has a foreground owner")
@@ -4256,10 +4254,37 @@ async def test_existing_session_replacement_failure_can_quit() -> None:
         await pilot.pause()
         app.screen.query_one("#existing-session-replace", Button).press()
         await pilot.pause()
-        assert isinstance(app.screen, ExistingSessionScreen)
-        assert app._exit is False
-        await pilot.press("escape")
+        assert app._exit is True
+
+
+@pytest.mark.asyncio
+async def test_foreground_close_releases_lease_before_app_teardown() -> None:
+    close_requested = asyncio.Event()
+
+    class ClosingBackend(DemoBackend):
+        def __init__(self):
+            super().__init__()
+            self.released = False
+
+        async def acquire_foreground_lease(self, *, close_notifications=False):
+            assert close_notifications
+
+        async def wait_for_foreground_close(self):
+            await close_requested.wait()
+
+        async def release_foreground_lease(self):
+            self.released = True
+
+    backend = ClosingBackend()
+    app = MerlinApp(backend)
+    async with app.run_test() as pilot:
         await pilot.pause()
+        close_requested.set()
+        for _ in range(20):
+            await pilot.pause()
+            if app._exit:
+                break
+        assert backend.released is True
         assert app._exit is True
 
 

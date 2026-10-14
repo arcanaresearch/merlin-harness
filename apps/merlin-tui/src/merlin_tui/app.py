@@ -4019,29 +4019,43 @@ class MerlinApp(App[None]):
             if not self._unmounting:
                 self.exit(return_code=1, message=Text(str(exc)))
         else:
+            release = getattr(self.backend, "release_foreground_lease", None)
+            if callable(release):
+                try:
+                    await release()
+                except Exception as exc:
+                    self.log.error(
+                        "foreground lease release failed: " + _scrub_secrets(str(exc))
+                    )
             self.exit(message=Text("This Merlin session was closed from another window."))
 
     async def _resolve_existing_session(self, *, recover: bool = False) -> bool:
-        while True:
-            choice: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        choice: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
-            def resolved(replace: bool, result: asyncio.Future[bool] = choice) -> None:
-                if not result.done():
-                    result.set_result(replace)
+        def resolved(replace: bool, result: asyncio.Future[bool] = choice) -> None:
+            if not result.done():
+                result.set_result(replace)
 
-            self.push_screen(ExistingSessionScreen(recover=recover), resolved)
-            if not await choice:
-                self.exit()
-                return False
-            self._set_status("restarting Merlin · preserving saved sessions…")
-            try:
-                await self.backend.replace_foreground()
-                await self.backend.acquire_foreground_lease(close_notifications=True)
-            except Exception as exc:
-                self.notify(f"Could not start here: {exc}", severity="error", timeout=15)
-            else:
-                self._spawn(self._watch_foreground_close())
-                return True
+        self.push_screen(ExistingSessionScreen(recover=recover), resolved)
+        if not await choice:
+            self.exit()
+            return False
+        self._set_status("restarting Merlin · preserving saved sessions…")
+        try:
+            await self.backend.replace_foreground()
+            await self.backend.acquire_foreground_lease(close_notifications=True)
+        except Exception as exc:
+            detail = _scrub_secrets(str(exc))
+            self.exit(
+                return_code=1,
+                message=Text(
+                    "Merlin could not move this session here: "
+                    f"{detail}. Saved sessions were preserved; run ./merlin again shortly."
+                ),
+            )
+            return False
+        self._spawn(self._watch_foreground_close())
+        return True
 
     async def _show_startup_session_gate(self) -> None:
         screen = StartupSessionScreen(())

@@ -1469,6 +1469,51 @@ async def test_replace_foreground_waits_for_existing_session_cleanup(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_replace_foreground_completes_after_owner_releases_lease(monkeypatch) -> None:
+    from uuid import uuid4
+
+    backend = Backend()
+    path = Path(f"/tmp/merlin-release-replace-{uuid4().hex[:12]}.sock")
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    owner = LocalControlClient(socket_path=path)
+    observer = LocalControlClient(socket_path=path)
+    starts = []
+
+    async def start(socket_path):
+        assert backend.closed
+        starts.append(socket_path)
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    close_owner = None
+    try:
+        async with asyncio.timeout(5):
+            for _ in range(500):
+                if await asyncio.to_thread(path.exists):
+                    break
+                await asyncio.sleep(0.01)
+            await owner.acquire_foreground_lease(close_notifications=True)
+
+            async def release_owner():
+                await owner.wait_for_foreground_close()
+                await owner.release_foreground_lease()
+
+            close_owner = asyncio.create_task(release_owner())
+            await observer.replace_foreground()
+            await close_owner
+            await server
+            assert starts == [path]
+    finally:
+        for task in (close_owner, server):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (close_owner, server) if task is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_legacy_foreground_owner_is_not_closed_without_notification_support() -> None:
     from uuid import uuid4
 
@@ -1542,6 +1587,35 @@ async def test_foreground_close_monitor_survives_model_route_restart(monkeypatch
             if not task.done():
                 task.cancel()
         await asyncio.gather(monitor, restart, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_release_foreground_lease_closes_owner_channel() -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+            self.waited = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.waited = True
+
+    client = LocalControlClient(socket_path=Path("/tmp/merlin-release-test.sock"))
+    reader = asyncio.StreamReader()
+    writer = Writer()
+    client._lease_reader = reader
+    client._lease_writer = writer
+    client._lease_id = "lease-1"
+
+    await client.release_foreground_lease()
+
+    assert writer.closed is True
+    assert writer.waited is True
+    assert client._lease_reader is None
+    assert client._lease_writer is None
+    assert client._lease_id is None
 
 
 @pytest.mark.asyncio

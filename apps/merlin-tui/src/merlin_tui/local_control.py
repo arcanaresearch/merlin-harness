@@ -999,6 +999,15 @@ class LocalControlClient:
                 raise RuntimeError("Unexpected foreground session notification")
             return
 
+    async def release_foreground_lease(self) -> None:
+        """Release foreground ownership before terminal teardown can suspend the TUI."""
+        writer = self._lease_writer
+        self._lease_reader = None
+        self._lease_writer = None
+        self._lease_id = None
+        if writer is not None:
+            await _close_writer(writer)
+
     async def replace_foreground(self, *, restart: bool = False) -> None:
         """Ask the existing window to quit, then wait for owned-resource cleanup."""
         writer: asyncio.StreamWriter | None = None
