@@ -20672,11 +20672,19 @@ async def test_language_catalogue_stays_durable_while_wave0_admits_first_bounded
             assert campaign_id == manifest.id
             self.families = tuple(families)
             self.candidates = tuple(candidates)
-            return {"queued": len(self.candidates), "total": len(self.candidates)}
+            return {
+                "queued": sum(item["state"] == "queued" for item in self.candidates),
+                "dormant": sum(item["state"] == "dormant" for item in self.candidates),
+                "total": len(self.candidates),
+            }
 
         def frontier_counts(self, campaign_id):
             assert campaign_id == manifest.id
-            return {"queued": len(self.candidates), "total": len(self.candidates)}
+            return {
+                "queued": sum(item["state"] == "queued" for item in self.candidates),
+                "dormant": sum(item["state"] == "dormant" for item in self.candidates),
+                "total": len(self.candidates),
+            }
 
         def claim_frontier_batch(self, campaign_id, wave, batch_id, limit):
             assert campaign_id == manifest.id
@@ -20693,7 +20701,9 @@ async def test_language_catalogue_stays_durable_while_wave0_admits_first_bounded
                         "claim_generation": 1,
                         "family_document": family_documents[str(candidate["family_id"])],
                     }
-                    for candidate in self.candidates[:limit]
+                    for candidate in tuple(
+                        item for item in self.candidates if item["state"] == "queued"
+                    )[:limit]
                 ),
             }
 
@@ -20767,7 +20777,11 @@ async def test_language_catalogue_stays_durable_while_wave0_admits_first_bounded
     assert store.finished_waves[0][0:2] == (0, "completed")
     assert service.frontier_batch_id is not None
     assert service.attack is not None
-    claimed_ids = {str(item["id"]) for item in store.candidates[:1]}
+    claimed_ids = {
+        str(item["id"])
+        for item in store.candidates
+        if item["state"] == "queued"
+    }
     submitted_ids = {
         technique_id
         for assignment in service.attack.assignments
@@ -20786,8 +20800,8 @@ async def test_language_catalogue_stays_durable_while_wave0_admits_first_bounded
     } == claimed_languages
 
 
-async def test_normalized_frontier_registers_12765_compact_candidates_and_claims_one_batch():
-    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+async def test_exhaustive_frontier_registers_12765_compact_candidates_and_claims_one_batch():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.EXHAUSTIVE)
     base = prepared.assignment_context.techniques[0]
     techniques = tuple(
         replace(base, id=f"family/{index}", objective=f"Technique family {index}")
@@ -20862,7 +20876,7 @@ async def test_normalized_frontier_registers_12765_compact_candidates_and_claims
     assert len(context.techniques) == 69
 
 
-async def test_prepare_review_projects_lazy_language_frontier_without_rich_expansion():
+async def test_recommended_review_projects_representative_language_frontier():
     source = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
     base = source.assignment_context.techniques[0]
     languages = tuple(
@@ -20895,13 +20909,63 @@ async def test_prepare_review_projects_lazy_language_frontier_without_rich_expan
 
     coverage = review["review"]["admitted_coverage"]
     language_plan = review["review"]["language_plan"]
-    assert coverage["variant_count"] == 12_765
+    assert coverage["variant_count"] == 69
     assert len(coverage["variant_ids"]) == 32
-    assert coverage["variant_ids_omitted"] == 12_733
+    assert coverage["variant_ids_omitted"] == 37
     assert language_plan["planned_languages"] == languages
     assert len(language_plan["language_evasion_cells"]) == 32
-    assert language_plan["language_evasion_cells_omitted"] == 12_733
+    assert language_plan["language_evasion_cells_omitted"] == 37
     assert len(prepared.assignment_context.techniques) == 69
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_candidates"),
+    (
+        (CampaignProfile.QUICKSCAN, 20),
+        (CampaignProfile.EXPLORATION, 10),
+        (CampaignProfile.RECOMMENDED, 69),
+        (CampaignProfile.EXHAUSTIVE, 12_765),
+    ),
+)
+async def test_profile_controls_concrete_frontier_admission(
+    profile: CampaignProfile,
+    expected_candidates: int,
+) -> None:
+    source = await preparation("session-profile", "Assess target", profile)
+    base = source.assignment_context.techniques[0]
+    languages = tuple(
+        f"{first}{second}"
+        for first in "abcdefghijklmnopqrstuvwxyz"
+        for second in "abcdefghijklmnopqrstuvwxyz"
+    )[:47]
+    prepared = replace(
+        source,
+        assignment_context=replace(
+            source.assignment_context,
+            techniques=tuple(
+                replace(base, id=f"family/{index}", objective=f"Family {index}")
+                for index in range(69)
+            ),
+            language_frontier=LanguageFrontierSpec(
+                default_language=languages[0],
+                planned_languages=languages,
+                code_switching=True,
+            ),
+        ),
+    )
+
+    families, candidates = CampaignService._execution_frontier_rows(prepared)  # noqa: SLF001
+
+    assert len(families) == 69
+    assert len(candidates) == 12_765
+    assert sum(item["state"] == "queued" for item in candidates) == expected_candidates
+    assert sum(item["state"] == "dormant" for item in candidates) == 12_765 - expected_candidates
+    if profile is not CampaignProfile.EXHAUSTIVE:
+        assert {
+            str(item["requested_language"])
+            for item in candidates
+            if item["state"] == "queued"
+        } == {languages[0]}
 
 
 async def test_lazy_frontier_status_and_receipt_projection_stay_bounded_at_12765():

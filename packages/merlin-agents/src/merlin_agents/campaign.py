@@ -576,6 +576,70 @@ def bound_recommended_techniques(
     return tuple(selected)
 
 
+QUICKSCAN_PROFILE_CANDIDATE_LIMIT = 20
+EXPLORATION_PROFILE_SEED_LIMIT = 10
+
+
+def select_profile_techniques(
+    techniques: tuple[AssignmentTechnique, ...],
+    profile: CampaignProfile,
+) -> tuple[AssignmentTechnique, ...]:
+    """Select diverse authored families for a profile's starting frontier."""
+
+    if profile is CampaignProfile.EXHAUSTIVE:
+        return techniques
+    selected = bound_recommended_techniques(techniques)
+    if profile is CampaignProfile.QUICKSCAN:
+        return selected[:QUICKSCAN_PROFILE_CANDIDATE_LIMIT]
+    if profile is CampaignProfile.EXPLORATION:
+        return selected[:EXPLORATION_PROFILE_SEED_LIMIT]
+    return selected
+
+
+def select_profile_candidate_references(
+    techniques: tuple[AssignmentTechnique, ...],
+    frontier: LanguageFrontierSpec,
+    profile: CampaignProfile,
+) -> tuple[LanguageCandidateReference, ...]:
+    """Admit the concrete starting frontier selected by a campaign profile.
+
+    The authored technique families remain the durable catalogue.  Only an
+    exhaustive campaign eagerly admits their complete language/transform cross
+    product.  Other profiles start from one representative concrete cell per
+    selected family and let measured outcomes drive later mutations and typed
+    hypotheses.  This keeps the profile choice meaningful and prevents every
+    scan from presenting the exhaustive Cartesian product as queued work.
+    """
+
+    references = enumerate_language_candidate_references(techniques, frontier)
+    if profile is CampaignProfile.EXHAUSTIVE:
+        return references
+
+    representative_families = select_profile_techniques(techniques, profile)
+
+    references_by_family: dict[str, list[LanguageCandidateReference]] = {}
+    for reference in references:
+        references_by_family.setdefault(reference.family_id, []).append(reference)
+
+    selected: list[LanguageCandidateReference] = []
+    for family in representative_families:
+        family_references = references_by_family.get(family.id, ())
+        if not family_references:
+            continue
+        selected.append(
+            min(
+                family_references,
+                key=lambda reference: (
+                    reference.requested_language != frontier.default_language,
+                    reference.variant_id not in {"baseline", "native"},
+                    reference.ordinal,
+                    reference.id,
+                ),
+            )
+        )
+    return tuple(selected)
+
+
 class CampaignStopReason(StrEnum):
     """Why a campaign ended; status alone must not erase this distinction."""
 

@@ -97,6 +97,8 @@ from .campaign import (
     remediation_output_schema,
     reviewed_adapter_supports_multi_turn,
     scenario_fingerprint_for,
+    select_profile_candidate_references,
+    select_profile_techniques,
     validator_output_schema,
 )
 from .capability_probe_execution import (
@@ -1550,6 +1552,13 @@ class CampaignService:
             for technique in context.techniques
         )
         if spec is None:
+            queued_ids = {
+                technique.id
+                for technique in select_profile_techniques(
+                    context.techniques,
+                    prepared.manifest.profile,
+                )
+            }
             candidates = tuple(
                 {
                     "id": technique.id,
@@ -1559,11 +1568,19 @@ class CampaignService:
                     "variant_id": technique.transform_id,
                     "variant": {},
                     "priority": priority_by_id.get(technique.id),
-                    "state": "queued",
+                    "state": "queued" if technique.id in queued_ids else "dormant",
                 }
                 for ordinal, technique in enumerate(context.techniques)
             )
         else:
+            queued_ids = {
+                reference.id
+                for reference in select_profile_candidate_references(
+                    context.techniques,
+                    spec,
+                    prepared.manifest.profile,
+                )
+            }
             candidates = tuple(
                 {
                     "id": reference.id,
@@ -1573,9 +1590,12 @@ class CampaignService:
                     "variant_id": reference.variant_id,
                     "variant": {},
                     "priority": priority_by_id.get(reference.id),
-                    "state": "queued",
+                    "state": "queued" if reference.id in queued_ids else "dormant",
                 }
-                for reference in enumerate_language_candidate_references(context.techniques, spec)
+                for reference in enumerate_language_candidate_references(
+                    context.techniques,
+                    spec,
+                )
             )
         return families, candidates
 
@@ -2364,7 +2384,12 @@ class CampaignService:
                     if kind == "initial"
                     else compile_attack_campaign(manifest, batch_context)
                 )
-                compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                compiled = compile_execution_agenda(
+                    manifest,
+                    batch_context,
+                    compiled,
+                    include_discovery=kind == "initial",
+                )
                 compiled = _seal_compilation_candidate_identities(manifest, batch_context, compiled)
                 try:
                     return await self._start_wave(
@@ -2790,9 +2815,10 @@ class CampaignService:
             )
         )
         language_references = (
-            enumerate_language_candidate_references(
+            select_profile_candidate_references(
                 prepared.assignment_context.techniques,
                 prepared.assignment_context.language_frontier,
+                prepared.manifest.profile,
             )
             if prepared.assignment_context.language_frontier is not None
             else ()
@@ -4078,17 +4104,39 @@ class CampaignService:
                         > int(frontier_counts.get("retry_exhausted_candidates", 0))
                     )
                 )
+                quickscan_frontier_limit_reached = bool(
+                    manifest.profile is CampaignProfile.QUICKSCAN
+                    and initial_wave >= QUICKSCAN_FOLLOWUP_WAVE_LIMIT
+                )
                 continue_frontier = bool(
                     frontier_counts is not None
                     and frontier_counts.get("queued", 0) > 0
                     and (summary["completed"] > 0 or frontier_retry_available)
                     and not budget_capped
                     and not service_objective_state.get("violations")
-                    and not (
-                        manifest.profile is CampaignProfile.QUICKSCAN
-                        and initial_wave >= QUICKSCAN_FOLLOWUP_WAVE_LIMIT
-                    )
+                    and not quickscan_frontier_limit_reached
                 )
+                if (
+                    quickscan_frontier_limit_reached
+                    and frontier_counts is not None
+                    and frontier_counts.get("queued", 0) > 0
+                ):
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        initial_wave,
+                        {
+                            "kind": "quickscan_frontier_limit_reached",
+                            "state": "capped",
+                            "queued": frontier_counts.get("queued", 0),
+                            "limit": QUICKSCAN_FOLLOWUP_WAVE_LIMIT,
+                            "reason": (
+                                "quickscan reached its reviewed wave limit; remaining admitted "
+                                "candidates are reported as coverage limitations"
+                            ),
+                            "retryable": False,
+                        },
+                    )
                 if (
                     frontier_counts is not None
                     and frontier_counts.get("queued", 0) > 0
@@ -4116,6 +4164,7 @@ class CampaignService:
                     and frontier_counts.get("queued", 0) > 0
                     and not continue_frontier
                     and not budget_capped
+                    and not quickscan_frontier_limit_reached
                 ):
                     await asyncio.to_thread(
                         self._store.append_lead,
@@ -4163,7 +4212,12 @@ class CampaignService:
                     )
                     if batch_context.techniques:
                         compiled = compile_attack_campaign(manifest, batch_context)
-                        compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                        compiled = compile_execution_agenda(
+                            manifest,
+                            batch_context,
+                            compiled,
+                            include_discovery=False,
+                        )
                         compiled = _seal_compilation_candidate_identities(
                             manifest, batch_context, compiled
                         )
@@ -4202,7 +4256,10 @@ class CampaignService:
                                     return
                                 compiled = compile_attack_campaign(manifest, batch_context)
                                 compiled = compile_execution_agenda(
-                                    manifest, batch_context, compiled
+                                    manifest,
+                                    batch_context,
+                                    compiled,
+                                    include_discovery=False,
                                 )
                                 compiled = _seal_compilation_candidate_identities(
                                     manifest, batch_context, compiled
@@ -13639,7 +13696,12 @@ class CampaignService:
             if not batch_context.techniques or frontier_batch is None:
                 return None
             compiled = compile_attack_campaign(manifest, batch_context)
-            compiled = compile_execution_agenda(manifest, batch_context, compiled)
+            compiled = compile_execution_agenda(
+                manifest,
+                batch_context,
+                compiled,
+                include_discovery=False,
+            )
             compiled = _seal_compilation_candidate_identities(manifest, batch_context, compiled)
             while True:
                 try:
@@ -13663,7 +13725,12 @@ class CampaignService:
                         error,
                     )
                     compiled = compile_attack_campaign(manifest, batch_context)
-                    compiled = compile_execution_agenda(manifest, batch_context, compiled)
+                    compiled = compile_execution_agenda(
+                        manifest,
+                        batch_context,
+                        compiled,
+                        include_discovery=False,
+                    )
                     compiled = _seal_compilation_candidate_identities(
                         manifest, batch_context, compiled
                     )

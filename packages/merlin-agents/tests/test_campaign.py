@@ -60,6 +60,8 @@ from merlin_agents.campaign import (
     reconcile_techniques_for_surfaces,
     reviewed_adapter_supports_multi_turn,
     scenario_fingerprint_for,
+    select_profile_candidate_references,
+    select_profile_techniques,
 )
 from merlin_agents.goat import GOAT_TOOLBOX_CATALOG_DIGEST, trusted_goat_toolbox
 from merlin_contracts import (
@@ -790,6 +792,45 @@ def test_execution_agenda_separates_explorer_catalogue_work_from_discovery() -> 
     assert all("DIRECT OBSERVATION" in item.objective for item in observations)
 
 
+def test_followup_execution_agenda_omits_repeated_discovery_lane() -> None:
+    prepared = manifest()
+    context = AssignmentContext(
+        target_profile_id="target-1",
+        techniques=(
+            AssignmentTechnique(
+                "unclassified-direct-cell",
+                "Try a distinct prompt override",
+                frozenset({"prompt", "text", "single"}),
+                (),
+                execution_role="direct",
+            ),
+        ),
+        tool_ids=prepared.tool_ids,
+        skill_ids=(),
+        provider_id=prepared.provider_id,
+        authority_ids=prepared.authority_ids,
+        budget=prepared.budget,
+        input_schema="merlin.worker-input/v1",
+        output_schema="merlin.worker-result/v1",
+    )
+
+    compiled = compile_execution_agenda(
+        prepared,
+        context,
+        _owned_attack_compilation(
+            compile_attack_campaign(prepared, context), ("unclassified-direct-cell",)
+        ),
+        include_discovery=False,
+    )
+
+    assert compiled.assignments
+    assert all(not item.id.endswith("/target-derived-discovery") for item in compiled.assignments)
+    attempted = {
+        technique_id for item in compiled.assignments for technique_id in item.technique_ids
+    }
+    assert attempted == {"unclassified-direct-cell"}
+
+
 def test_attack_compilation_accepts_only_a_reviewed_applicable_subset() -> None:
     prepared = manifest()
     context = AssignmentContext(
@@ -1422,6 +1463,52 @@ def test_recommended_frontier_uses_semantic_dimension_representatives() -> None:
     assert bound_recommended_techniques(wide_expanded) == wide_bounded
     assert bound_recommended_techniques(tuple(reversed(wide_expanded))) == wide_bounded
     assert bound_recommended_techniques(wide_expanded[::2] + wide_expanded[1::2]) == wide_bounded
+
+
+def test_quickscan_seed_is_a_diverse_portfolio_instead_of_a_catalogue_prefix() -> None:
+    techniques = tuple(
+        AssignmentTechnique(
+            (
+                "merlin-injection-taxonomy/cat/direct/override-baseline"
+                if index == 0
+                else f"family/{index:02d}"
+            ),
+            f"Exercise semantic family {index}",
+            frozenset({"direct-user-channel"}),
+            (),
+            semantic_id=(
+                "merlin-injection-taxonomy/cat/direct/override-baseline"
+                if index == 0
+                else f"semantic/{index:02d}"
+            ),
+            strategy_id=("crescendo", "hydra-select", "goat")[index - 1]
+            if 1 <= index <= 3
+            else "direct",
+        )
+        for index in range(30)
+    )
+    frontier = language_frontier_spec(
+        {
+            "default_language": "en",
+            "planned_languages": ("en", "es", "ar"),
+            "code_switching": True,
+        }
+    )
+    assert frontier is not None
+
+    selected = select_profile_techniques(techniques, CampaignProfile.QUICKSCAN)
+    references = select_profile_candidate_references(
+        techniques,
+        frontier,
+        CampaignProfile.QUICKSCAN,
+    )
+
+    assert len(selected) == 20
+    assert len({item.resolved_semantic_id for item in selected}) == 20
+    assert {item.strategy_id for item in selected} >= {"crescendo", "hydra-select", "goat"}
+    assert len(references) == 20
+    assert {item.family_id for item in references} == {item.id for item in selected}
+    assert {item.requested_language for item in references} == {"en"}
 
 
 def test_recommended_projection_does_not_collapse_incomplete_arm_history() -> None:
