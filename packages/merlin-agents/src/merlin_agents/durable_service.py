@@ -40,6 +40,7 @@ from merlin_contracts import (
     candidate_evidence_digest,
     candidate_id_for_identity,
     project_candidate_outcome,
+    project_target_progress,
     validate_candidate_outcome_projection,
 )
 
@@ -1813,6 +1814,27 @@ class DurableAgentService:
         return tuple(
             attempt.model_dump(mode="json") if hasattr(attempt, "model_dump") else dict(attempt)
             for attempt in attempts
+        )
+
+    async def target_progress(
+        self, campaign_id: str, target_id: str
+    ) -> Mapping[str, object]:
+        """Project campaign target state from committed effects without model interpretation."""
+        evidence_limit = 512
+        loader = getattr(self._tools, "list_effects_for_campaign", None)
+        effects = (
+            tuple(await loader(campaign_id, limit=evidence_limit + 1))
+            if callable(loader)
+            else ()
+        )
+        history_truncated = len(effects) > evidence_limit
+        if history_truncated:
+            effects = effects[-evidence_limit:]
+        return project_target_progress(
+            effects,
+            campaign_id=campaign_id,
+            target_id=target_id,
+            history_truncated=history_truncated,
         )
 
     async def baseline_gate(self, schedule_id: str) -> Mapping[str, object]:

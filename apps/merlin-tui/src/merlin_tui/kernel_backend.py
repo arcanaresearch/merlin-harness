@@ -1549,6 +1549,11 @@ class KernelBackend:
                     wave_status=str(progress.get("wave_status", "")),
                     lead_activity=str(progress.get("lead_activity", "")),
                     stop_reason=str(item.get("stop_reason") or ""),
+                    target_progress=(
+                        dict(progress["target_progress"])
+                        if isinstance(progress.get("target_progress"), Mapping)
+                        else None
+                    ),
                 )
             )
         return tuple(campaigns)

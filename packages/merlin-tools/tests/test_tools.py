@@ -627,6 +627,10 @@ class EffectStore:
     async def list_for_attempt(self, attempt_id: str):
         return [item for item in self.records.values() if item.attempt_id == attempt_id]
 
+    async def list_for_campaign(self, campaign_id: str, *, limit: int | None = None):
+        records = [item for item in self.records.values() if item.campaign_id == campaign_id]
+        return records if limit is None else records[-limit:]
+
 
 def test_broker_exposes_read_only_attempt_effect_lookup() -> None:
     store = EffectStore()
@@ -648,6 +652,9 @@ def test_broker_exposes_read_only_attempt_effect_lookup() -> None:
 
     assert asyncio.run(broker.list_effects_for_attempt("attempt-1")) == (record,)
     assert asyncio.run(ToolBroker().list_effects_for_attempt("attempt-1")) == ()
+    assert asyncio.run(broker.list_effects_for_campaign("campaign-1")) == (record,)
+    assert asyncio.run(broker.list_effects_for_campaign("campaign-1", limit=1)) == (record,)
+    assert asyncio.run(ToolBroker().list_effects_for_campaign("campaign-1")) == ()
 
 
 class CountingEffectTool(NamedTool):

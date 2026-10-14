@@ -377,10 +377,14 @@ async def test_attempt_owned_effects_do_not_collide_and_survive_postgres_restart
             MigrationRunner(connection).apply()
             restored = ToolEffectRepository(connection)
             rows = [restored.list_for_attempt(attempt_id) for attempt_id in attempt_ids]
+            campaign_rows = restored.list_for_campaign("campaign/owned")
+            recent_campaign_rows = restored.list_for_campaign("campaign/owned", limit=1)
             replayed = [restored.begin(record) for record in records]
             restored_campaign = CampaignStore(connection).get("campaign/owned")
 
     assert [items[0].idempotency_key for items in rows] == keys
+    assert [item.idempotency_key for item in campaign_rows] == keys
+    assert [item.idempotency_key for item in recent_campaign_rows] == keys[-1:]
     assert all(items[0].state is ToolEffectState.ACKNOWLEDGED for items in rows)
     assert all(created is False for _item, created in replayed)
     assert all(

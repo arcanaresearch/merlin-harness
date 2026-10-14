@@ -151,6 +151,7 @@ from .target_adapter import (
     reviewed_adapter_target_delivery,
 )
 from .target_capabilities import StateCapabilities, SupportedModality, TargetModality
+from .target_progress import project_target_progress
 from .tools import (
     LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     TargetDeliveryClass,
@@ -297,6 +298,7 @@ __all__ = [
     "ToolCall",
     "ToolEffectRecord",
     "ToolEffectState",
+    "project_target_progress",
     "ToolContext",
     "ToolInteractionRole",
     "TargetDeliveryClass",

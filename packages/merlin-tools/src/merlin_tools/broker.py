@@ -65,6 +65,10 @@ class ToolEffectStore(Protocol):
 
     async def list_for_attempt(self, attempt_id: str) -> list[ToolEffectRecord]: ...
 
+    async def list_for_campaign(
+        self, campaign_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]: ...
+
 
 class DurableGrantResolver(Protocol):
     async def __call__(
@@ -241,6 +245,17 @@ class ToolBroker:
         if not callable(loader):
             return ()
         return tuple(await loader(attempt_id))
+
+    async def list_effects_for_campaign(
+        self, campaign_id: str, *, limit: int | None = None
+    ) -> tuple[ToolEffectRecord, ...]:
+        """Expose immutable durable effects for one campaign's read projection."""
+        if self._effect_store is None:
+            return ()
+        loader = getattr(self._effect_store, "list_for_campaign", None)
+        if not callable(loader):
+            return ()
+        return tuple(await loader(campaign_id, limit=limit))
 
     async def invoke(
         self,

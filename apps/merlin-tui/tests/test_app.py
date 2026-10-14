@@ -38,7 +38,7 @@ from merlin_tui.backend import (
 from merlin_tui.bootstrap import build_app
 from merlin_tui.client_state import ClientState, TranscriptEntry
 from rich.console import Console
-from textual.widgets import Button, Checkbox, Input, RichLog, Select, TextArea
+from textual.widgets import Button, Checkbox, Input, RichLog, Select, Static, TextArea
 
 
 def _safe_command(command: str) -> str:
@@ -6077,6 +6077,87 @@ async def test_recovered_review_waits_for_operator_then_executes_exact_binding()
         await app.action_send()
         await pilot.pause()
         assert backend.executions == [("campaign/recovered", "sha256:saved")]
+
+
+def test_target_progress_renderer_shows_state_without_changing_swarm_summary():
+    rendered = app_module._render_target_progress(
+        {
+            "status": "observed",
+            "freshness": "current",
+            "target_exchange_count": 3,
+            "current_state": (
+                {"name": "tier", "label": "Tier", "value": 2},
+                {
+                    "name": "score",
+                    "label": "Score",
+                    "value": 61,
+                    "maximum_value": 100,
+                },
+                {"name": "turns_left", "label": "Turns Left", "value": 18},
+            ),
+            "latest_transition": {
+                "outcome": "regression",
+                "observations": (
+                    {"name": "score", "before_value": 72, "after_value": 61},
+                ),
+            },
+            "conflicts": (),
+        }
+    )
+
+    assert "Tier 2 · Score 61/100 · Turns Left 18" in rendered.plain
+    assert "Latest: Score 72 → 61 · regression" in rendered.plain
+
+
+def test_target_progress_renderer_explains_unknown_state() -> None:
+    rendered = app_module._render_target_progress(
+        {
+            "status": "unknown",
+            "freshness": "unknown",
+            "target_exchange_count": 1,
+            "current_state": (),
+        }
+    )
+
+    assert "State not discovered yet · 1 target exchange observed" in rendered.plain
+    assert "execution continues" in rendered.plain
+
+
+@pytest.mark.asyncio
+async def test_live_target_progress_card_is_separate_from_agent_swarm() -> None:
+    class ProgressBackend(DemoBackend):
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/progress",
+                    "session-demo",
+                    "Stateful assessment",
+                    "quickscan",
+                    "executing",
+                    "digest",
+                    target_progress={
+                        "status": "observed",
+                        "freshness": "current",
+                        "target_exchange_count": 2,
+                        "current_state": (
+                            {"name": "stage", "label": "Stage", "value": 3},
+                        ),
+                        "conflicts": (),
+                    },
+                ),
+            )
+
+    app = build_app(ProgressBackend())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        progress = app.query_one("#target-progress", Static)
+        swarm = app.query_one("#swarm-live", app_module.LiveSwarmLog)
+        assert progress.has_class("visible")
+        rendered = progress.render()
+        assert "Target progress\nStage 3" in getattr(rendered, "plain", str(rendered))
+        assert "Agent swarm" in "\n".join(line.text for line in swarm.lines)
 
 
 @pytest.mark.asyncio

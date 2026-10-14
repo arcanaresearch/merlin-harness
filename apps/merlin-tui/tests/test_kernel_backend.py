@@ -2048,8 +2048,26 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
                 {"wave": 1, "kind": "attack", "status": "running"},
             ]
 
+        def get(self, campaign_id):
+            assert campaign_id == "campaign/live"
+            row = _sealed_review_row()
+            row["id"] = campaign_id
+            return row
+
     service = object.__new__(CampaignService)
     service._store = Store()
+
+    class Agents:
+        async def target_progress(self, campaign_id, target_id):
+            assert campaign_id == "campaign/live"
+            assert target_id == "target"
+            return {
+                "schema": "merlin.target-progress.v1",
+                "status": "unknown",
+                "current_state": (),
+            }
+
+    service._agents = Agents()
 
     class Campaigns:
         async def list_all(self):
@@ -2075,6 +2093,7 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
     backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())
     campaigns = await backend.list_campaigns()
     assert campaigns[0].wave_number == 2
+    assert campaigns[0].target_progress["status"] == "unknown"
     assert campaigns[0].wave_kind == "attack"
     assert campaigns[0].wave_status == "running"
 

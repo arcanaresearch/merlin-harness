@@ -3774,6 +3774,12 @@ class MerlinApp(App[None]):
         background: #111820; scrollbar-size: 1 1;
     }
     #swarm-live.visible { display: block; }
+    #target-progress {
+        display: none; height: auto; max-height: 7; margin: 0 3;
+        padding: 0 1; border-left: thick #5f87af;
+        background: #10151a; color: #d7d7d7;
+    }
+    #target-progress.visible { display: block; }
     #scan-actions { display: none; height: 3; margin: 0 3; }
     #scan-actions.visible { display: block; }
     #scan-next { display: none; height: auto; margin: 0 3; color: $text-muted; }
@@ -3868,6 +3874,7 @@ class MerlinApp(App[None]):
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._swarm_refresh_lock = asyncio.Lock()
         self._swarm_rendered = ""
+        self._target_progress_rendered = ""
         self._scan_summary_report: ReportView | None = None
         self._unmounting = False
         self._active_session_id = ""
@@ -3889,6 +3896,7 @@ class MerlinApp(App[None]):
             )
             yield LiveTranscript(id="transcript", wrap=True, markup=True)
         yield Static("", id="activity", markup=False)
+        yield Static("", id="target-progress", markup=False)
         yield LiveSwarmLog(
             id="swarm-live",
             wrap=True,
@@ -5318,6 +5326,7 @@ class MerlinApp(App[None]):
                 return
             session_campaigns = _campaigns_for_session(campaigns, self._active_session_id)
             self._last_swarm_campaigns = (self._active_session_id, session_campaigns)
+            self._update_target_progress(session_campaigns)
             active_campaigns = tuple(
                 campaign
                 for campaign in _current_campaigns(session_campaigns)
@@ -5467,6 +5476,33 @@ class MerlinApp(App[None]):
             view.clear()
             view.write(rendered, expand=True, shrink=True)
             view.add_class("visible")
+
+    def _update_target_progress(self, campaigns: tuple[CampaignView, ...]) -> None:
+        """Render target state beside the swarm without changing worker presentation."""
+        rows = list(self.query("#target-progress"))
+        if not rows:
+            return
+        view = rows[0]
+        selected = next(
+            (
+                campaign
+                for campaign in _current_campaigns(campaigns)
+                if campaign.status != "prepared"
+            ),
+            None,
+        )
+        progress = getattr(selected, "target_progress", None) if selected is not None else None
+        if selected is None or not isinstance(progress, Mapping):
+            self._target_progress_rendered = ""
+            view.update("")
+            view.remove_class("visible")
+            return
+        rendered = _render_target_progress(progress)
+        if rendered.plain == self._target_progress_rendered and view.has_class("visible"):
+            return
+        self._target_progress_rendered = rendered.plain
+        view.update(rendered)
+        view.set_class(True, "visible")
 
     def _offer_saturation_choice(
         self,
@@ -7146,6 +7182,72 @@ def _campaign_wave_label(campaign: CampaignView) -> str:
         return ""
     kind = getattr(campaign, "wave_kind", "").replace("_", " ").replace("-", " ")
     return f"Wave {number} · {kind or 'execution'}"
+
+
+def _render_target_progress(progress: Mapping[str, object]) -> Text:
+    rendered = Text()
+    rendered.append("Target progress\n", style="bold cyan")
+    fields_value = progress.get("current_state")
+    fields = (
+        tuple(item for item in fields_value if isinstance(item, Mapping))
+        if isinstance(fields_value, (list, tuple))
+        else ()
+    )
+    exchanges = int(progress.get("target_exchange_count") or 0)
+    history_truncated = progress.get("history_truncated") is True
+    exchange_summary = (
+        f"{exchanges}+ target exchanges in recent evidence"
+        if history_truncated
+        else f"{exchanges} target exchange{'s' if exchanges != 1 else ''} observed"
+    )
+    if not fields:
+        rendered.append("State not discovered yet", style="bold yellow")
+        rendered.append(f" · {exchange_summary}\n")
+        rendered.append(
+            "Waiting for reviewed target-state observations; execution continues.",
+            style="dim",
+        )
+        return rendered
+
+    summaries = [_target_progress_field(item) for item in fields[:4]]
+    rendered.append(" · ".join(summaries) + "\n", style="bold")
+    transition = progress.get("latest_transition")
+    if isinstance(transition, Mapping):
+        changes = tuple(
+            item
+            for item in transition.get("observations", ())
+            if isinstance(item, Mapping)
+            and "before_value" in item
+            and "after_value" in item
+        )
+        if changes:
+            change = changes[0]
+            rendered.append(
+                "Latest: "
+                + str(change.get("name", "state")).replace("_", " ").title()
+                + f" {change['before_value']} → {change['after_value']}"
+                + f" · {transition.get('outcome', 'unclear')}\n",
+                style=(
+                    "green"
+                    if transition.get("outcome") in {"confirmed", "progress"}
+                    else "yellow"
+                ),
+            )
+    freshness = str(progress.get("freshness") or "unknown")
+    rendered.append(f"Evidence: {freshness} · {exchange_summary}", style="dim")
+    conflicts = progress.get("conflicts")
+    if isinstance(conflicts, (list, tuple)) and conflicts:
+        rendered.append(f" · {len(conflicts)} conflicting update(s) withheld", style="yellow")
+    return rendered
+
+
+def _target_progress_field(field: Mapping[str, object]) -> str:
+    label = str(field.get("label") or field.get("name") or "State")
+    value = field.get("value")
+    maximum = field.get("maximum_value")
+    if maximum is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{label} {value}/{maximum}"
+    return f"{label} {value}"
 
 
 def _render_live_swarm(

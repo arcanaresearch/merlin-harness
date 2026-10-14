@@ -255,6 +255,26 @@ class ToolEffectRepository:
         ).fetchall()
         return [self._record(row) for row in rows]
 
+    def list_for_campaign(
+        self, campaign_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]:
+        if limit is None:
+            rows = self.connection.execute(
+                """SELECT * FROM merlin_storage.tool_effects
+                   WHERE campaign_id = %s ORDER BY created_at, idempotency_key""",
+                (campaign_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """SELECT * FROM (
+                       SELECT * FROM merlin_storage.tool_effects
+                       WHERE campaign_id = %s
+                       ORDER BY created_at DESC, idempotency_key DESC LIMIT %s
+                   ) AS recent ORDER BY created_at, idempotency_key""",
+                (campaign_id, max(1, limit)),
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
     @staticmethod
     def _record(row: Any) -> ToolEffectRecord:
         value = dict(row)
@@ -287,3 +307,10 @@ class PostgresToolEffectStore:
 
     async def list_for_attempt(self, attempt_id: str) -> list[ToolEffectRecord]:
         return await asyncio.to_thread(self._repository.list_for_attempt, attempt_id)
+
+    async def list_for_campaign(
+        self, campaign_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]:
+        return await asyncio.to_thread(
+            self._repository.list_for_campaign, campaign_id, limit=limit
+        )

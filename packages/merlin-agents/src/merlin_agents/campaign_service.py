@@ -15766,6 +15766,20 @@ class CampaignService:
             for item in lead
         )
         pending = await self._pending_operator_guidance(campaign_id)
+        target_progress_reader = getattr(getattr(self, "_agents", None), "target_progress", None)
+        target_progress: Mapping[str, object] = {}
+        if callable(target_progress_reader):
+            try:
+                target_id = str(latest.get("target_id") or "")
+                if not target_id:
+                    row = await asyncio.to_thread(self._store.get, campaign_id)
+                    if row is not None:
+                        target_id = _manifest(row["manifest"]["manifest"]).target.id
+                if target_id:
+                    target_progress = await target_progress_reader(campaign_id, target_id)
+            except Exception:  # noqa: BLE001 - progress projection must not hide campaign state
+                _LOGGER.exception("target progress projection failed for %s", campaign_id)
+                target_progress = {}
         return {
             "wave_number": len(waves),
             "wave_kind": str(latest["kind"]),
@@ -15777,6 +15791,7 @@ class CampaignService:
                 if pending
                 else ""
             ),
+            "target_progress": target_progress,
         }
 
     async def console_context(self, session_id: str) -> str | None:
