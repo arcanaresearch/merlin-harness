@@ -4475,6 +4475,8 @@ class MerlinApp(App[None]):
         render_timer: Any | None = None
         operator_commands: list[tuple[str, str]] = []
         input_request = None
+        input_context = None
+        campaign_review_text: str | None = None
 
         def cancel_render() -> None:
             nonlocal pending_render, render_timer
@@ -4545,6 +4547,7 @@ class MerlinApp(App[None]):
             async for event in self.backend.stream(prompt):
                 if event.kind == "campaign_review":
                     self._web_review = event.text
+                    campaign_review_text = event.text
                 console = getattr(self, "_web_console", None)
                 if console:
                     if event.kind == "status" and event.text in {"new session", "session resumed"}:
@@ -4584,6 +4587,8 @@ class MerlinApp(App[None]):
 
                     self._clear_pending_decision()
                     input_request = InputRequest.model_validate_json(event.text)
+                    if campaign_review_text is not None:
+                        input_context = _render_campaign_review(campaign_review_text)
                     self._remember("user_input", event.text)
                     transcript.write(
                         Text(
@@ -4761,7 +4766,10 @@ class MerlinApp(App[None]):
                     self._remember("user", value)
                     await self._start_backend(value, show_assistant=True)
 
-            self.push_screen(UserInputScreen(input_request), answered)
+            self.push_screen(
+                UserInputScreen(input_request, context=input_context),
+                answered,
+            )
         for request_id, command in operator_commands:
             marker = f"Operator command dispatched: {request_id}"
             dispatched = getattr(self, "_operator_command_ids", set())

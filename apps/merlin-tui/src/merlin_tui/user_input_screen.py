@@ -1,6 +1,7 @@
 """Terminal rendering for the shared structured-question contract."""
 
 from merlin_contracts.user_input import InputAnswer, InputRequest, InputResponse, answer_prompt
+from rich.console import RenderableType
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
@@ -20,15 +21,19 @@ class UserInputScreen(ModalScreen[str | None]):
     #operator-question RadioButton, #operator-question Checkbox { width: 100%; height: auto; }
     #operator-question Input { margin-top: 1; }
     #operator-question Button { margin-top: 1; }
+    #question-context { height: auto; margin-bottom: 1; }
     #question-error { color: $error; height: auto; }
     """
 
-    def __init__(self, request: InputRequest) -> None:
+    def __init__(self, request: InputRequest, *, context: RenderableType | None = None) -> None:
         super().__init__()
         self.request = request
+        self.context = context
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="operator-question"):
+            if self.context is not None:
+                yield Static(self.context, id="question-context")
             for index, question in enumerate(self.request.questions):
                 yield Label(Text(question.question))
                 if question.multiple:

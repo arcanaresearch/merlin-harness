@@ -13,8 +13,10 @@ from merlin_contracts.user_input import (
 from merlin_tui.kernel_backend import KernelBackend
 from merlin_tui.user_input_screen import UserInputScreen
 from merlin_tui.user_input_tool import RequestUserInputTool
+from rich.console import Console
 from textual.app import App
-from textual.widgets import Input
+from textual.containers import VerticalScroll
+from textual.widgets import Input, Static
 
 QUESTIONS = [
     {
@@ -235,6 +237,68 @@ async def test_terminal_app_opens_structured_question_and_continues():
         answer = InputResponse.model_validate_json(received[1][len(ANSWER_PREFIX) :])
         assert answer.answers["auth"].option_ids == ["existing"]
         assert any("Continuing the retained" in entry.text for entry in app._transcript_entries)
+
+
+@pytest.mark.asyncio
+async def test_campaign_approval_modal_contains_scrollable_review_summary() -> None:
+    from merlin_tui.app import MerlinApp
+    from merlin_tui.backend import DemoBackend, StreamEvent
+
+    request = InputRequest(
+        request_id="campaign-approval",
+        questions=[
+            {
+                "id": "approval",
+                "question": "Approve execution of the prepared campaign manifest?",
+                "options": [
+                    {
+                        "id": "approve",
+                        "label": "Approve & execute",
+                        "description": "Run the reviewed campaign",
+                    },
+                    {
+                        "id": "revise",
+                        "label": "Revise something",
+                        "description": "Hold execution",
+                    },
+                ],
+            }
+        ],
+    )
+    review = {
+        "campaign_id": "campaign/review-visible",
+        "manifest_digest": "sha256:review-visible",
+        "objective": "Assess the local game safely",
+        "profile": "quickscan",
+        "review": {
+            "recovered_fields": {
+                "Target": "http://localhost:3100",
+                "Coverage": "20 active candidates; remaining catalogue dormant",
+            }
+        },
+    }
+
+    class Backend(DemoBackend):
+        async def stream(self, prompt):
+            del prompt
+            yield StreamEvent("campaign_review", json.dumps(review))
+            yield StreamEvent("user_input", request.model_dump_json())
+
+    app = MerlinApp(Backend())
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#composer").text = "prepare campaign"
+        await app.action_send()
+        await pilot.pause()
+        assert isinstance(app.screen, UserInputScreen)
+        assert app.screen.query_one("#question-context", Static)
+        console = Console(record=True, width=100)
+        console.print(app.screen.context)
+        rendered = console.export_text()
+        assert "campaign/review-visible" in rendered
+        assert "sha256:review-visible" in rendered
+        assert "Assess the local game safely" in rendered
+        assert "20 active candidates" in rendered
+        assert isinstance(app.screen.query_one("#operator-question"), VerticalScroll)
 
 
 def test_every_choice_has_default_and_free_text_stays_empty():
