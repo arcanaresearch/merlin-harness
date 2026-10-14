@@ -755,6 +755,86 @@ def _recorded_cost_details(
     return cost_text, pricing_source, pricing_source_url
 
 
+def _target_progress(value: CampaignReportProjection) -> Mapping[str, Any] | None:
+    progress = value.metadata.get("target_progress")
+    if not isinstance(progress, Mapping) or progress.get("schema") != "merlin.target-progress.v1":
+        return None
+    return progress
+
+
+def _target_progress_fields(progress: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    fields = progress.get("current_state")
+    if not isinstance(fields, (tuple, list)):
+        return ()
+    return tuple(field for field in fields if isinstance(field, Mapping))
+
+
+def _target_progress_field_text(field: Mapping[str, Any]) -> str:
+    label = str(field.get("label") or field.get("name") or "State")
+    value = field.get("value")
+    maximum = field.get("maximum_value")
+    if maximum is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{label}: {value}/{maximum}"
+    return f"{label}: {value}"
+
+
+def _customer_target_progress(progress: Mapping[str, Any]) -> dict[str, Any]:
+    transition = progress.get("latest_transition")
+    transition_fields = (
+        tuple(
+            _allowed(item, ("name", "role", "status", "before_value", "after_value"))
+            for item in transition.get("observations", ())
+            if isinstance(item, Mapping)
+        )
+        if isinstance(transition, Mapping)
+        and isinstance(transition.get("observations"), (tuple, list))
+        else ()
+    )
+    return {
+        "schema": "merlin.target-progress.v1",
+        "status": str(progress.get("status") or "unknown"),
+        "observed_at": progress.get("observed_at"),
+        "target_exchange_count": int(progress.get("target_exchange_count") or 0),
+        "history_truncated": progress.get("history_truncated") is True,
+        "current_state": tuple(
+            _allowed(
+                field,
+                (
+                    "name",
+                    "label",
+                    "role",
+                    "value",
+                    "value_type",
+                    "trust_class",
+                    "minimum_value",
+                    "maximum_value",
+                    "observed_at",
+                ),
+            )
+            for field in _target_progress_fields(progress)
+        ),
+        "latest_transition": (
+            {
+                "outcome": str(transition.get("outcome") or "unclear"),
+                "observed_at": transition.get("observed_at"),
+                "observations": transition_fields,
+            }
+            if isinstance(transition, Mapping)
+            else None
+        ),
+        "conflict_count": len(progress.get("conflicts", ()))
+        if isinstance(progress.get("conflicts"), (tuple, list))
+        else 0,
+        "limitations": tuple(
+            str(item)
+            for item in progress.get("limitations", ())
+            if isinstance(item, str) and item.strip()
+        )
+        if isinstance(progress.get("limitations"), (tuple, list))
+        else (),
+    }
+
+
 def _markdown_report(projection: CampaignReportProjection) -> str:
     exploration = _exploration_metrics(projection)
     all_observability = _report_observability(projection)
@@ -762,6 +842,7 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
         row for row in all_observability if row.get("category") != "Capability probe"
     )
     audience_label = "Customer report" if projection.audience == "customer" else "Internal report"
+    target_progress = _target_progress(projection)
     lines = [
         f"# Campaign report {projection.campaign_id}",
         "",
@@ -771,6 +852,7 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
         "",
         "- [Executive summary](#executive-summary)",
         "- [Integrity and provenance](#integrity-and-provenance)",
+        *(("- [Target progress](#target-progress)",) if target_progress else ()),
         "- [Coverage](#coverage)",
         "- [Coverage provenance](#coverage-provenance)",
         "- [Language coverage](#language-coverage)",
@@ -814,10 +896,39 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
         f"- Projection digest: `{_markdown_code(projection.digest)}`",
         f"- Completion digest: `{_markdown_code(projection.completion_digest or 'not sealed')}`",
         f"- Source seal: {_markdown_text(projection.source_seal_state)}",
-        "",
-        "## Coverage",
-        "",
     ]
+    if target_progress is not None:
+        lines.extend(("", "## Target progress", ""))
+        fields = _target_progress_fields(target_progress)
+        if fields:
+            lines.extend(
+                f"- {_markdown_text(_target_progress_field_text(field))}" for field in fields
+            )
+        else:
+            lines.append("- Target state was not discovered from reviewed observations.")
+        lines.append(
+            f"- Target exchanges observed: {int(target_progress.get('target_exchange_count') or 0)}"
+        )
+        transition = target_progress.get("latest_transition")
+        if isinstance(transition, Mapping):
+            changes = tuple(
+                item
+                for item in transition.get("observations", ())
+                if isinstance(item, Mapping) and "before_value" in item and "after_value" in item
+            )
+            if changes:
+                change = changes[0]
+                lines.append(
+                    "- Latest measured change: "
+                    + _markdown_text(str(change.get("name") or "state").replace("_", " ").title())
+                    + f" {_markdown_text(change['before_value'])} → {_markdown_text(change['after_value'])}"
+                    + f" ({_markdown_text(transition.get('outcome', 'unclear'))})"
+                )
+        if target_progress.get("history_truncated") is True:
+            lines.append(
+                "- Evidence window: recent evidence only; older observations are retained durably."
+            )
+    lines.extend(("", "## Coverage", ""))
     coverage = _coverage(projection)
     for key, label in (
         ("planned", "Attack techniques selected"),
@@ -1008,6 +1119,9 @@ def _customer_projection(value: CampaignReportProjection) -> CampaignReportProje
             ).items()
             if item is not None and item != ""
         }
+    target_progress = _target_progress(value)
+    if target_progress is not None:
+        metadata["target_progress"] = _customer_target_progress(target_progress)
     metadata["title"] = "Merlin customer assessment"
     metadata["dynamic_specialists"] = tuple(
         _allowed(row, ("name", "state", "admitted_wave", "retired_wave"))
@@ -3056,6 +3170,58 @@ def _html_report(
         '<p class="empty">No validated security finding was established. '
         "The coverage below defines exactly what this statement includes.</p>"
     )
+    target_progress = _target_progress(value)
+    target_progress_html = ""
+    if target_progress is not None:
+        progress_fields = _target_progress_fields(target_progress)
+        progress_cards = "".join(
+            '<div class="metric"><strong>'
+            + html.escape(str(field.get("value")))
+            + (
+                " / " + html.escape(str(field.get("maximum_value")))
+                if field.get("maximum_value") is not None
+                else ""
+            )
+            + "</strong><span>"
+            + html.escape(str(field.get("label") or field.get("name") or "State"))
+            + "</span></div>"
+            for field in progress_fields
+        )
+        if not progress_cards:
+            progress_cards = (
+                '<p class="empty">Target state was not discovered from reviewed observations.</p>'
+            )
+        transition_note = ""
+        transition = target_progress.get("latest_transition")
+        if isinstance(transition, Mapping):
+            changes = tuple(
+                item
+                for item in transition.get("observations", ())
+                if isinstance(item, Mapping) and "before_value" in item and "after_value" in item
+            )
+            if changes:
+                change = changes[0]
+                transition_note = (
+                    '<p class="scope-note"><strong>Latest measured change:</strong> '
+                    + html.escape(str(change.get("name") or "state").replace("_", " ").title())
+                    + " "
+                    + html.escape(str(change["before_value"]))
+                    + " → "
+                    + html.escape(str(change["after_value"]))
+                    + " · "
+                    + html.escape(str(transition.get("outcome") or "unclear"))
+                    + "</p>"
+                )
+        exchange_count = int(target_progress.get("target_exchange_count") or 0)
+        evidence_window = " in recent evidence" if target_progress.get("history_truncated") else ""
+        target_progress_html = (
+            '<section id="target-progress"><h2>Target progress</h2>'
+            '<p class="scope-note">Authoritative state observed from the target during this campaign. '
+            "Security findings and target progress are separate measurements.</p>"
+            f'<div class="metrics">{progress_cards}</div>{transition_note}'
+            f'<p class="scope-note">{exchange_count} target exchange'
+            f"{'s' if exchange_count != 1 else ''} observed{evidence_window}.</p></section>"
+        )
     coverage_cards = "".join(
         f'<div class="metric"><strong>{count}</strong><span>{label}</span></div>'
         for count, label in (
@@ -3460,6 +3626,7 @@ def _html_report(
     )
     nav_items = (
         ("summary", "Executive summary"),
+        *((("target-progress", "Target progress"),) if target_progress_html else ()),
         ("findings", "Findings"),
         *((("remediation", "Actions"),) if value.findings else ()),
         ("coverage", "Coverage"),
@@ -3489,7 +3656,7 @@ def _html_report(
 <strong>{html.escape(verdict_label)}</strong><span>{html.escape(verdict)}</span></div>
 <div class="metrics summary-metrics">{summary_cards}</div></header>
 <details class="mobile-nav"><summary>Report contents</summary>{nav}</details>
-<section id="findings"><h2>Findings</h2>{findings}</section>{remediation}
+{target_progress_html}<section id="findings"><h2>Findings</h2>{findings}</section>{remediation}
 <section id="coverage"><h2>Coverage</h2><p class="scope-note">Attack techniques are counted once by catalogue identity. Language, mutation, encoding, and strategy variations are candidates beneath those techniques. Specialist agents and scheduler task records are operational counts, not additional techniques.</p>
 {coverage_chart}<div class="metrics">{coverage_cards}</div></section>
 <section id="coverage-provenance"><h2>Coverage provenance</h2><p class="scope-note">These are candidate-variation counts, not additional attack techniques. They separate work performed now from conclusive results imported from the same reviewed target generation. Inconclusive, retryable, and unstarted work stays unresolved and remains eligible for future execution; durably unreachable work is reported separately.</p><div class="metrics">{provenance_cards}</div></section>
@@ -3655,6 +3822,7 @@ def _display(value: Any) -> str:
 
 def _csv_bundle(value: CampaignReportProjection) -> bytes:
     cost_details = _recorded_cost_details(value)
+    target_progress = _target_progress(value)
     techniques = tuple(
         {
             **dict(row),
@@ -3814,6 +3982,40 @@ def _csv_bundle(value: CampaignReportProjection) -> bytes:
     if exploration:
         tables["exploration-metrics.csv"] = exploration
         schemas["exploration-metrics.csv"] = ("metric", "value")
+    if target_progress is not None:
+        fields = _target_progress_fields(target_progress)
+        tables["target-progress.csv"] = tuple(
+            {
+                "name": field.get("name"),
+                "label": field.get("label"),
+                "role": field.get("role"),
+                "value": field.get("value"),
+                "minimum_value": field.get("minimum_value"),
+                "maximum_value": field.get("maximum_value"),
+                "trust_class": field.get("trust_class"),
+                "observed_at": field.get("observed_at"),
+                "target_exchange_count": target_progress.get("target_exchange_count"),
+            }
+            for field in fields
+        ) or (
+            {
+                "name": "target_state",
+                "label": "Target state",
+                "value": "not discovered",
+                "target_exchange_count": target_progress.get("target_exchange_count"),
+            },
+        )
+        schemas["target-progress.csv"] = (
+            "name",
+            "label",
+            "role",
+            "value",
+            "minimum_value",
+            "maximum_value",
+            "trust_class",
+            "observed_at",
+            "target_exchange_count",
+        )
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, rows in tables.items():

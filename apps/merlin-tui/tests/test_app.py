@@ -4597,6 +4597,21 @@ async def test_resumed_finished_session_restores_inline_summary_and_report_actio
                     stop_reason="failed" if report_state == "incomplete" else "saturated",
                     cleanup_status="completed",
                     coverage=(("planned", 8), ("attempted", 8), ("confirmed", 2)),
+                    target_progress={
+                        "schema": "merlin.target-progress.v1",
+                        "status": "observed",
+                        "freshness": "stale",
+                        "target_exchange_count": 17,
+                        "current_state": (
+                            {"name": "tier", "label": "Tier", "value": 2},
+                            {
+                                "name": "score",
+                                "label": "Score",
+                                "value": 61,
+                                "maximum_value": 100,
+                            },
+                        ),
+                    },
                 ),
             )
 
@@ -4620,6 +4635,8 @@ async def test_resumed_finished_session_restores_inline_summary_and_report_actio
         if report_state == "incomplete":
             assert "Execution stopped after an error; completed work is retained" in summary
         assert "Findings: 2" in summary
+        assert "Target progress" in summary
+        assert "Tier 2 · Score 61/100" in summary
         assert "attempted: 8" in summary
         assert "completed.html" in summary
         assert "unrelated" not in summary.casefold()

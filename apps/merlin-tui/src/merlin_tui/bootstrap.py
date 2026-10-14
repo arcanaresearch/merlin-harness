@@ -8937,6 +8937,11 @@ def build_backend(
                     canonical_target = _browser_origin(manifest.target.endpoint)
                 except ValueError:
                     canonical_target = manifest.target.endpoint
+            try:
+                target_progress = await agents.target_progress(campaign_id, manifest.target.id)
+            except Exception:
+                # Reporting remains available when optional target-state projection fails.
+                target_progress = {}
             projection = await asyncio.to_thread(
                 durable_reports.create,
                 campaign_id,
@@ -8953,6 +8958,11 @@ def build_backend(
                     "objective": manifest.objective,
                     "target": canonical_target,
                     "target_endpoint": manifest.target.endpoint,
+                    **(
+                        {"target_progress": dict(target_progress)}
+                        if isinstance(target_progress, Mapping) and target_progress
+                        else {}
+                    ),
                     "profile": sealed_profile,
                     "specialist_composition": report_composition,
                     "dynamic_specialists": _dynamic_specialist_report_rows(specialist_rows),

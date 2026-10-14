@@ -7159,6 +7159,9 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
     rendered.append(
         f"Findings: {report.finding_count} · Target exchanges: {report.exchange_count}\n"
     )
+    if report.target_progress:
+        rendered.append_text(_render_target_progress(report.target_progress))
+        rendered.append("\n")
     # Keep the export above potentially lengthy coverage and limitations so it
     # stays visible in the bounded main-screen region.
     rendered.append("HTML report: ", style="bold")

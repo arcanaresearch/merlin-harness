@@ -167,6 +167,7 @@ class ReportView:
     cleanup_status: str = ""
     coverage: tuple[tuple[str, int], ...] = ()
     limitations: tuple[str, ...] = ()
+    target_progress: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

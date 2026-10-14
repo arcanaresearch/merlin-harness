@@ -91,6 +91,70 @@ def create(service, summary="confirmed"):
     )
 
 
+def test_target_progress_is_preserved_across_report_exports() -> None:
+    service = DurableReportService(Repository())
+    progress = {
+        "schema": "merlin.target-progress.v1",
+        "campaign_id": "campaign-progress",
+        "target_id": "target-progress",
+        "status": "observed",
+        "freshness": "current",
+        "observed_at": "2030-01-01T00:00:00+00:00",
+        "target_exchange_count": 19,
+        "history_truncated": False,
+        "current_state": (
+            {"name": "tier", "label": "Tier", "role": "progress_ordinal", "value": 2},
+            {
+                "name": "score",
+                "label": "Score",
+                "role": "score",
+                "value": 61,
+                "maximum_value": 100,
+            },
+        ),
+        "latest_transition": {
+            "outcome": "progress",
+            "source_call_id": "call-secret",
+            "observations": ({"name": "tier", "before_value": 1, "after_value": 2},),
+        },
+        "conflicts": (),
+        "limitations": (),
+        "snapshot_revision": "sha256:secret",
+    }
+    report = service.create(
+        "campaign-progress",
+        stop_reason="operator_stopped",
+        cleanup_status="complete",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"target_progress": progress},
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    markdown = service.export(report.revision_id, "markdown")
+    assert "## Target progress" in markdown
+    assert "Tier: 2" in markdown
+    assert "Score: 61/100" in markdown
+    assert "Target exchanges observed: 19" in markdown
+
+    html = service.export(report.revision_id, "html", "customer")
+    assert 'id="target-progress"' in html
+    assert "Security findings and target progress are separate measurements" in html
+    assert "call-secret" not in html
+    assert "sha256:secret" not in html
+
+    exported = json.loads(service.export(report.revision_id, "json", "customer"))
+    exported_progress = exported["metadata"]["target_progress"]
+    assert exported_progress["current_state"][0]["value"] == 2
+    assert "source_call_id" not in json.dumps(exported_progress)
+
+    archive = ZipFile(BytesIO(service.export(report.revision_id, "csv", "customer")))
+    rows = list(csv.DictReader(archive.read("target-progress.csv").decode().splitlines()))
+    assert [(row["label"], row["value"]) for row in rows] == [("Tier", "2"), ("Score", "61")]
+
+
 def test_report_counts_unique_candidates_separately_from_repeat_attempts() -> None:
     service = DurableReportService(Repository())
     attempts = tuple(

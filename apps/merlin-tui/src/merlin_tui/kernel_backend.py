@@ -1127,6 +1127,11 @@ class KernelBackend:
                             for key, value in (getattr(revision, "coverage", {}) or {}).items()
                         ),
                         limitations=tuple(getattr(revision, "limitations", ())),
+                        target_progress=(
+                            dict(revision.metadata["target_progress"])
+                            if isinstance(revision.metadata.get("target_progress"), Mapping)
+                            else None
+                        ),
                     )
                     for revision in revisions
                 )
@@ -1180,6 +1185,11 @@ class KernelBackend:
             report_state=str(getattr(revision, "report_state", "")),
             stop_reason=revision.stop_reason,
             cleanup_status=revision.cleanup_status,
+            target_progress=(
+                dict(revision.metadata["target_progress"])
+                if isinstance(revision.metadata.get("target_progress"), Mapping)
+                else None
+            ),
         )
         self._report_history.append(view)
         return view
