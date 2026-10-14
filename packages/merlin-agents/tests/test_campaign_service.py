@@ -20437,6 +20437,58 @@ async def test_restart_recovery_pauses_recon_before_reopening_workers() -> None:
     assert await service.recover() == 0
 
 
+async def test_restart_recovery_ignores_missing_stale_schedule() -> None:
+    calls = []
+
+    class Store:
+        status = "executing"
+
+        def list_executing(self):
+            return [{"id": "campaign/stale"}] if self.status == "executing" else []
+
+        def get(self, campaign_id):
+            assert campaign_id == "campaign/stale"
+            return {"status": self.status}
+
+        def list_waves(self, campaign_id):
+            assert campaign_id == "campaign/stale"
+            return [{"wave": 11, "status": "running", "schedule_id": "missing-schedule"}]
+
+        def pause(self, campaign_id):
+            assert campaign_id == "campaign/stale"
+            self.status = "paused"
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            calls.append(dict(payload))
+
+        def list_report_retryable(self):
+            return []
+
+    class Agents:
+        async def schedule_status(self, schedule_id):
+            assert schedule_id == "missing-schedule"
+            return None
+
+        async def pause_schedule(self, *_args, **_kwargs):
+            raise AssertionError("a missing scheduler must not be paused")
+
+    store = Store()
+    service = CampaignService(store, Agents(), preparation)  # type: ignore[arg-type]
+
+    assert await service.recover(resume_execution=False) == 1
+    assert store.status == "paused"
+    assert calls == [
+        {
+            "state": "paused",
+            "kind": "daemon_recovery_paused",
+            "reason": "daemon replacement paused durable campaign execution",
+            "non_running_schedules": [
+                {"schedule_id": "missing-schedule", "status": "missing"}
+            ],
+        }
+    ]
+
+
 async def test_execution_priority_scores_shortlist_in_parallel_without_removing_candidates():
     manifest, context = await _api_probe_manifest(
         (_api_adapter_document([_text_message_step()]), _memory_probe_plan())

@@ -14115,7 +14115,62 @@ class CampaignService:
                 },
             )
             return
-        await self.pause(campaign_id)
+        # Startup recovery must be idempotent with scheduler settlement. A
+        # schedule can finish (or be removed) after the campaign wave was
+        # persisted as running, so the interactive pause path is too strict:
+        # it assumes every recorded running wave still has a live scheduler.
+        await self._stop_supervisor(campaign_id)
+        running = [wave for wave in waves if str(wave.get("status")) == "running"]
+        skipped: list[Mapping[str, object]] = []
+        for wave in running:
+            wave_schedule_id = str(wave.get("schedule_id") or "")
+            current_status = (
+                await status_loader(wave_schedule_id)
+                if wave_schedule_id and callable(status_loader)
+                else None
+            )
+            if callable(status_loader) and current_status != "running":
+                skipped.append(
+                    {
+                        "schedule_id": wave_schedule_id,
+                        "status": current_status or "missing",
+                    }
+                )
+                continue
+            try:
+                await self._agents.pause_schedule(
+                    wave_schedule_id, reason="daemon-recovery-pause"
+                )
+            except ValueError:
+                # The scheduler may terminalize between the status probe and
+                # pause. Suppress only that proven race; a still-running
+                # schedule or a store without status inspection remains an
+                # actionable recovery failure.
+                refreshed = (
+                    await status_loader(wave_schedule_id)
+                    if wave_schedule_id and callable(status_loader)
+                    else "running"
+                )
+                if refreshed == "running":
+                    raise
+                skipped.append(
+                    {
+                        "schedule_id": wave_schedule_id,
+                        "status": refreshed or "missing",
+                    }
+                )
+        await asyncio.to_thread(self._store.pause, campaign_id)
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            int(running[-1]["wave"]) if running else 0,
+            {
+                "state": "paused",
+                "kind": "daemon_recovery_paused",
+                "reason": "daemon replacement paused durable campaign execution",
+                "non_running_schedules": skipped,
+            },
+        )
 
     async def _quarantine_unrecoverable_campaign(
         self,
