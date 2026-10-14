@@ -873,7 +873,7 @@ class BrowserTool:
                 response_refs=observation.evidence_refs,
                 after_refs=observation.evidence_refs,
                 transition_disposition="unchanged",
-                cleanup_disposition=("released" if kind == "close_tab" else "retained"),
+                cleanup_disposition=("completed" if kind == "close_tab" else "retained"),
             )
             metadata["state_scope_id"] = state_scope.lifecycle.scope_id
         elif session_recon_scope:
@@ -1182,7 +1182,7 @@ class BrowserOwnedSessionCleanupTool:
                     response_refs=response_refs,
                     after_refs=response_refs,
                     transition_disposition="unchanged",
-                    cleanup_disposition="released",
+                    cleanup_disposition="completed",
                 )
         return result.model_copy(
             update={
@@ -2679,17 +2679,51 @@ class BrowserChatExchangeTool:
                 )
         if compilation_uncertainties:
             adapter_identity_metadata["evaluation_uncertainties"] = compilation_uncertainties
-        open_tabs = [tab.tab_ref for tab in session.metadata().tabs if tab.state == "open"]
-        if len(open_tabs) != 1:
+        endpoint_parts = urlsplit(executable_adapter.endpoint)
+        endpoint_origin = f"{endpoint_parts.scheme.casefold()}://{endpoint_parts.netloc.casefold()}"
+        open_tabs = [
+            tab
+            for tab in session.metadata().tabs
+            if tab.state == "open"
+            and (parts := urlsplit(tab.url)).scheme.casefold() in {"http", "https"}
+            and f"{parts.scheme.casefold()}://{parts.netloc.casefold()}" == endpoint_origin
+        ]
+        compatible_tabs: list[tuple[str, BrowserObservation]] = []
+        for tab in open_tabs:
+            observation = await session.snapshot(tab.tab_ref)
+            await self._recorder.append_observation(observation)
+            if all(
+                _resolve_reviewed_element(
+                    observation,
+                    compiled_step.arguments.get("locator"),
+                    default_role=(
+                        "button" if compiled_step.tool == "browser_click" else "textbox"
+                    ),
+                )
+                is not None
+                for compiled_step in executable_adapter.steps
+            ):
+                compatible_tabs.append((tab.tab_ref, observation))
+        if len(compatible_tabs) > 1:
+            exact_endpoint_tabs = [
+                item
+                for item in compatible_tabs
+                if next(tab.url for tab in open_tabs if tab.tab_ref == item[0])
+                == executable_adapter.endpoint
+            ]
+            if len(exact_endpoint_tabs) == 1:
+                compatible_tabs = exact_endpoint_tabs
+        if len(compatible_tabs) != 1:
             await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
             return ToolResult(
-                content="compiled browser flow requires exactly one reviewed open tab",
+                content=(
+                    "compiled browser flow requires exactly one open target tab matching "
+                    "the reviewed interaction contract"
+                ),
                 is_error=True,
                 metadata=adapter_identity_metadata,
             )
-        tab_ref = open_tabs[0]
-        current = await session.snapshot(tab_ref)
-        await self._recorder.append_observation(current)
+        tab_ref, current = compatible_tabs[0]
         before_ref = _browser_evidence_ref("before", current)
         action_ref = _browser_evidence_ref(
             "action", {"adapter_digest": compiled_adapter_digest, "prompt": prompt}
@@ -3712,6 +3746,108 @@ async def _reviewed_interaction_input(
     )
 
 
+async def _reviewed_dom_input_constraint(
+    session: BrowserSession,
+    recorder: BrowserRecorder,
+    event: Mapping[str, object],
+    input_pointer: str,
+) -> tuple[dict[str, object], tuple[str, dict[str, object]]] | None:
+    """Derive a string-length constraint from the exact reviewed DOM input."""
+    list_actions = getattr(recorder, "list_actions", None)
+    list_observations = getattr(recorder, "list_observations", None)
+    input_action_refs = event.get("input_action_refs")
+    if (
+        not callable(list_actions)
+        or not callable(list_observations)
+        or not isinstance(input_action_refs, Mapping)
+    ):
+        return None
+    input_action_ref = input_action_refs.get(input_pointer)
+    if not isinstance(input_action_ref, str):
+        return None
+
+    actions_value = list_actions(session.context_id)
+    observations_value = list_observations(session.context_id)
+    actions = await actions_value if isawaitable(actions_value) else actions_value
+    observations = (
+        await observations_value if isawaitable(observations_value) else observations_value
+    )
+    fills = [
+        action
+        for action in actions
+        if isinstance(action, BrowserAction)
+        and action.context_id == session.context_id
+        and action.target_id == session.bounds.target_id
+        and action.owner == session.owner
+        and action.kind == "fill"
+        and action.element_ref is not None
+        and (
+            input_action_ref in action.evidence_refs
+            or _browser_action_evidence(action)[0] == input_action_ref
+        )
+    ]
+    if len(fills) != 1:
+        return None
+    fill = fills[0]
+    matches = [
+        (observation, element)
+        for observation in observations
+        if isinstance(observation, BrowserObservation)
+        and observation.context_id == session.context_id
+        and observation.target_id == session.bounds.target_id
+        and observation.owner == session.owner
+        and observation.tab_ref == fill.tab_ref
+        and observation.observed_at <= fill.created_at
+        for element in observation.elements
+        if element.ref == fill.element_ref
+        and element.role.casefold() == "textbox"
+        and element.max_length is not None
+    ]
+    if not matches:
+        return None
+    observation, element = max(matches, key=lambda item: item[0].observed_at)
+    maximum = element.max_length
+    assert maximum is not None
+    payload: dict[str, object] = {
+        "schema": "merlin.browser.input-constraint-evidence.v1",
+        "context_id": session.context_id,
+        "target_id": session.bounds.target_id,
+        "tab_ref": fill.tab_ref,
+        "frame_ref": element.frame_ref,
+        "element_ref": element.ref,
+        "role": element.role,
+        "input_action_ref": input_action_ref,
+        "observation_step": observation.step,
+        "constraint": {
+            "kind": "string_length",
+            "maximum": maximum,
+            "unit": "unicode_characters",
+            "source": "dom_attribute",
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    evidence_ref = f"browser-input-constraint:sha256:{digest}"
+    return (
+        {
+            "path": input_pointer,
+            "step_id": "observed-message-exchange",
+            "evaluation_root": "request_body",
+            "kind": "string_length",
+            "maximum": maximum,
+            "unit": "unicode_characters",
+            "source": "dom_attribute",
+            "evidence_refs": [evidence_ref],
+            "evidence_bindings": [
+                {"evidence_ref": evidence_ref, "observed_maximum": maximum}
+            ],
+            "confidence": 1.0,
+        },
+        (evidence_ref, payload),
+    )
+
+
 async def _reviewed_cleanup_action(
     session: BrowserSession,
     recorder: BrowserRecorder,
@@ -3981,11 +4117,15 @@ class CompiledApiReconHandoffTool:
                         "type": "object",
                         "additionalProperties": {"type": "string", "enum": ["uuid4", "hex32"]},
                         "description": (
-                            "Optional exact request JSON Pointers to client-generated per-message "
-                            "values, e.g. /envelope/nonce: uuid4. Based on frontend or multiple "
-                            "exchange evidence, not field names. A fresh value is persisted before "
-                            "each request; transport retries reuse that value. Session captures "
-                            "and input fields cannot be overridden."
+                            "Optional request JSON Pointers to client-generated per-message "
+                            "values, "
+                            "e.g. /envelope/nonce: uuid4. Exact pointers are preferred; an "
+                            "unambiguous leaf field name is also accepted and canonicalized to its "
+                            "exact pointer. Bindings must be based on frontend or multiple "
+                            "exchange "
+                            "evidence. A fresh value is persisted before each request; transport "
+                            "retries reuse that value. Session captures and input fields cannot be "
+                            "overridden."
                         ),
                     },
                     "response_selector": {
@@ -6109,6 +6249,15 @@ class CompiledApiReconHandoffTool:
                 }
             )
 
+        if not any(item["path"] == input_pointer for item in request_constraints):
+            reviewed_dom_constraint = await _reviewed_dom_input_constraint(
+                session, self._recorder, event, input_pointer
+            )
+            if reviewed_dom_constraint is not None:
+                constraint, (evidence_ref, evidence_payload) = reviewed_dom_constraint
+                request_constraints.append(constraint)
+                capability_evidence_by_ref[evidence_ref] = evidence_payload
+
         state_observations: list[dict[str, object]] = []
         observation_values_by_name: dict[str, dict[str, object]] = {}
         reviewed_state_identities: list[dict[str, object]] = []
@@ -6833,7 +6982,9 @@ class CompiledApiReconHandoffTool:
                 request_json, request_template, exchanges, method, url, input_pointer
             )
             bindings.update(
-                validate_request_bindings(request_template, arguments.get("request_bindings", {}))
+                _validated_request_bindings(
+                    request_template, arguments.get("request_bindings", {})
+                )
             )
         except ValueError as error:
             return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
@@ -7248,6 +7399,44 @@ def _observed_request_bindings(
         if len(observations) >= 2 and len(set(observations.values())) == len(observations):
             bindings[pointer] = "uuid4"
     return bindings
+
+
+def _validated_request_bindings(
+    request_template: object, bindings: object
+) -> dict[str, str]:
+    """Canonicalize an unambiguous leaf name before strict binding validation."""
+    if not isinstance(bindings, Mapping):
+        return validate_request_bindings(request_template, bindings)
+    scalar_paths = _string_scalar_paths(request_template)
+    scalar_path_names = {candidate for candidate, _value in scalar_paths}
+    canonical: dict[object, object] = {}
+    for destination, generator in bindings.items():
+        pointer = destination
+        if isinstance(destination, str):
+            normalized = destination.strip()
+            if normalized.startswith("/"):
+                pointer = normalized
+            elif "/" in normalized and f"/{normalized.lstrip('/')}" in scalar_path_names:
+                pointer = f"/{normalized.lstrip('/')}"
+            else:
+                pointer = normalized
+        if isinstance(pointer, str) and pointer and not pointer.startswith("/"):
+            matches = [
+                candidate
+                for candidate, _value in scalar_paths
+                if candidate.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
+                == pointer
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "request binding leaf name must identify exactly one request field; "
+                    "use an exact JSON Pointer"
+                )
+            pointer = matches[0]
+        if pointer in canonical and canonical[pointer] != generator:
+            raise ValueError("request binding destination has conflicting generators")
+        canonical[pointer] = generator
+    return validate_request_bindings(request_template, canonical)
 
 
 def _render_template(value: object, variables: Mapping[str, object], input_text: str) -> object:

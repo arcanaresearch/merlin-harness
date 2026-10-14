@@ -89,6 +89,7 @@ class _StateScopeFixtureStore:
         self.claims: dict[str, tuple[str, str, str]] = {}
         self.claim_calls: list[dict[str, object]] = []
         self.rekey_calls: list[dict[str, object]] = []
+        self.settle_calls: list[dict[str, object]] = []
 
     def create_state_scope(self, *args, **kwargs):
         self.events.append("created")
@@ -129,6 +130,7 @@ class _StateScopeFixtureStore:
 
     def settle_state_scope(self, *args, **kwargs):
         self.events.append("settled")
+        self.settle_calls.append(dict(kwargs))
         return {}
 
     def pause_state_scope(self, *args, **kwargs):
@@ -564,6 +566,54 @@ async def test_browser_close_tab_outside_campaign_still_releases_actor() -> None
     )
 
     assert closed.is_error is False
+    assert released == ["worker-1"]
+
+
+@pytest.mark.asyncio
+async def test_browser_close_tab_records_completed_state_scope_cleanup() -> None:
+    released: list[str] = []
+    session = _fake_persistent_session(released)
+    session.mode = "isolated"
+    observation = SimpleNamespace(
+        evidence_refs=("browser-evidence:after",),
+        model_dump_json=lambda: "{}",
+    )
+
+    async def snapshot(_tab_ref, _frame_ref, *, step):
+        return SimpleNamespace(
+            evidence_refs=("browser-evidence:before",),
+            model_dump_json=lambda: json.dumps({"step": step}),
+        )
+
+    async def act(_action, *, actor_id):
+        return observation
+
+    session.snapshot = snapshot
+    session.act = act
+    session.metadata = lambda **_kwargs: SimpleNamespace(
+        tabs=(SimpleNamespace(tab_ref="tab-1", url="https://target.test/chat"),)
+    )
+    scope_store = _StateScopeFixtureStore()
+    tool = BrowserTool(
+        "browser_close_tab",
+        lambda _session_id: session,
+        state_scope_store=scope_store,
+    )
+
+    closed = await tool.invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            agent_id="worker-1",
+            campaign_id="campaign/1",
+            call_id="close-tab-call",
+            technique_attempt_id="attempt/1",
+        ),
+        {"tab_ref": "tab-1"},
+    )
+
+    assert closed.is_error is False
+    assert scope_store.settle_calls[-1]["cleanup_disposition"] == "completed"
     assert released == ["worker-1"]
 
 
@@ -1069,6 +1119,51 @@ async def test_isolated_snapshot_stale_recovery_popup_and_frame_bounds() -> None
             assert '"state":"restart_required"' in encoded
             assert '"launch_mode":"headless"' in encoded
             assert '"schema_version":"merlin.browser.metadata.v1"' in encoded
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_preserves_selected_duplicate_label_occurrence() -> None:
+    body = b"""
+    <button aria-label="Test Wallet"
+      onclick="document.getElementById('result').textContent='first'">First</button>
+    <button aria-label="Test Wallet"
+      onclick="document.getElementById('result').textContent='second'">Second</button>
+    <div id="result"></div>
+    """
+    async with web_fixture(body) as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        async with await launch_isolated(bounds, owner()) as session:
+            tab = await session.new_tab(origin)
+            first = await session.snapshot(tab)
+            duplicate = [element for element in first.elements if element.name == "Test Wallet"]
+            assert len(duplicate) == 2
+
+            await session.snapshot(tab)
+            await session.act(action(session, tab, "click", element_ref=duplicate[1].ref))
+
+            assert "second" in (await session.snapshot(tab)).text
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_uses_the_snapshot_rendered_name() -> None:
+    body = b"""
+    <button style="text-transform: uppercase"
+      onclick="document.getElementById('result').textContent='clicked'">Connect wallet</button>
+    <div id="result"></div>
+    """
+    async with web_fixture(body) as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        async with await launch_isolated(bounds, owner()) as session:
+            tab = await session.new_tab(origin)
+            first = await session.snapshot(tab)
+            connect = next(
+                element for element in first.elements if element.name == "CONNECT WALLET"
+            )
+
+            await session.snapshot(tab)
+            await session.act(action(session, tab, "click", element_ref=connect.ref))
+
+            assert "clicked" in (await session.snapshot(tab)).text
 
 
 @pytest.mark.asyncio
@@ -8231,6 +8326,7 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
         async with await launch_isolated(
             BrowserBounds(target_id="target", allowed_origins={origin}), owner()
         ) as session:
+            stale_tab = await session.new_tab(f"{origin}/api/message")
             tab = await session.new_tab(origin)
             snapshot = await session.snapshot(tab)
             message = next(item for item in snapshot.elements if item.name == "Message")
@@ -8336,6 +8432,8 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
             assert result.metadata["input_value_verified"] is True
             assert result.metadata["response_witness"] == "assistant:hello"
             assert [item.kind for item in recorder.actions] == ["fill", "click"]
+            assert {item.tab_ref for item in recorder.actions} == {tab}
+            assert stale_tab != tab
             assert "assistant:hello" in result.content
             exchange = result.metadata["target_exchanges"][0]
             assert isinstance(exchange["latency_ms"], int)

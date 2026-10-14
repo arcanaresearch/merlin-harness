@@ -91,6 +91,7 @@ from .strategy_plugin import (
     DirectStrategyAdapter,
     GoatStrategyAdapter,
     HydraStrategyAdapter,
+    StrategyDeviation,
     StrategyPlugin,
     StrategyProvenance,
     StrategySession,
@@ -2380,6 +2381,35 @@ class WorkerRuntime:
         ) -> None:
             nonlocal strategy_session
             if not isinstance(strategy_plugin, DirectStrategyAdapter) or strategy_session is None:
+                return
+            if (
+                result.is_error
+                and self._target_attempt_disposition(
+                    result.metadata, is_error=result.is_error
+                )
+                == "protocol_invalid"
+            ):
+                reason = result.metadata.get("disposition_reason")
+                transition = strategy_plugin.observe_deviation(
+                    strategy_session,
+                    StrategyDeviation(
+                        kind="execution_deviation",
+                        source="runtime.request_constraints",
+                        reason=(
+                            str(reason).strip()
+                            if isinstance(reason, str) and reason.strip()
+                            else "rendered target input violated a reviewed protocol constraint"
+                        ),
+                        repairable=True,
+                    ),
+                )
+                strategy_session = transition.session
+                for uncertainty in strategy_session.uncertainties:
+                    record_evaluation_uncertainty(
+                        uncertainty.source,
+                        uncertainty.reason,
+                        uncertainty.confidence,
+                    )
                 return
             exchanges = result.metadata.get(
                 "current_target_exchanges", result.metadata.get("target_exchanges")

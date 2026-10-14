@@ -1224,7 +1224,17 @@ async def test_retryable_malformed_tool_call_is_repaired_inside_interactive_turn
     await kernel.wait_for_turn()
 
     assert len(provider.requests) == 2
-    assert "Emit exactly one complete JSON object" in provider.requests[1].messages[-2].content
+    repair_request = provider.requests[1]
+    assert repair_request.messages[-1].role == "system"
+    assert "Emit exactly one complete JSON object" in repair_request.messages[-1].content
+    assert (
+        next(
+            index
+            for index, message in enumerate(repair_request.messages)
+            if message.role == "user" and message.content == "inspect"
+        )
+        < len(repair_request.messages) - 1
+    )
     assert provider.requests[1].reasoning == "disabled"
     assert store.messages[kernel.session_id][-1].content == "Recovered"
 
@@ -1327,7 +1337,7 @@ async def test_reasoning_only_completion_is_retried_inside_the_same_turn() -> No
 
     assert len(provider.requests) == 2
     assert "neither user-visible content nor a tool call" in (
-        provider.requests[1].messages[-2].content
+        provider.requests[1].messages[-1].content
     )
     assert store.messages[kernel.session_id][-1] == ChatMessage(
         role="assistant", content="Recovered with a visible response."
@@ -1819,7 +1829,7 @@ async def test_repeated_malformed_tool_calls_switch_to_simpler_recovery_strategy
     assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
         "read_file",
     ]
-    assert "repeatedly malformed tool is unavailable" in provider.requests[2].messages[-2].content
+    assert "repeatedly malformed tool is unavailable" in provider.requests[2].messages[-1].content
     assert store.messages[kernel.session_id][-1].content.startswith("Recovered")
 
 
@@ -1915,7 +1925,7 @@ async def test_final_recovery_keeps_failed_tool_available() -> None:
     assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["browser_snapshot"]
     assert not provider.requests[2].tools
     assert not provider.requests[3].tools
-    assert "Tools are disabled" not in provider.requests[3].messages[-2].content
+    assert "Tools are disabled" not in provider.requests[3].messages[-1].content
     assert tools.calls == [("browser_snapshot", {"context_id": "ctx", "tab_ref": "tab:1"})]
     assert store.messages[kernel.session_id][-1].content == "Reconnaissance continued."
 
@@ -1960,7 +1970,7 @@ async def test_malformed_tool_retry_exposes_only_the_failed_tool_schema() -> Non
     assert [tool["function"]["name"] for tool in provider.requests[1].tools] == [
         "assessment_prepare"
     ]
-    assert "Call only `assessment_prepare`" in provider.requests[1].messages[-2].content
+    assert "Call only `assessment_prepare`" in provider.requests[1].messages[-1].content
 
 
 @pytest.mark.asyncio

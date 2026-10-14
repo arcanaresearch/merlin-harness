@@ -124,6 +124,42 @@ _INTERNAL_NON_CAMPAIGN_TOOL_IDS = frozenset(
 )
 
 
+def _browser_target_objective(messages: Sequence[ChatMessage]) -> str:
+    """Use the reviewed campaign objective when resolving a browser target."""
+
+    for message in reversed(messages):
+        if message.role != "tool" or message.name != "campaign_configure":
+            continue
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(message.content.lstrip())
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, Mapping) or payload.get("status") != "configured":
+            continue
+        settings = payload.get("settings")
+        objective = settings.get("objective") if isinstance(settings, Mapping) else None
+        if isinstance(objective, str) and objective.strip():
+            return objective
+    return "\n".join(message.content for message in messages if message.role == "user")
+
+
+def _same_schedule_id(persisted: object, requested: object) -> bool:
+    return bool(persisted and requested) and str(persisted) == str(requested)
+
+
+def _campaign_status_allows_provider(
+    campaign: Mapping[str, object], *, allow_settlement_pause: bool
+) -> bool:
+    if campaign.get("status") == "executing":
+        return True
+    return bool(
+        allow_settlement_pause
+        and campaign.get("status") == "paused"
+        and campaign.get("lifecycle_pause_reason") == "acknowledged_settlement"
+        and campaign.get("lifecycle_resume_status") == "executing"
+    )
+
+
 def _canonical_report_candidate_projections(
     arm_outcomes: Sequence[object],
 ) -> tuple[dict[str, object], ...]:
@@ -4309,19 +4345,28 @@ def build_backend(
             agent_id: str | None,
             grant_digest: str | None,
             schedule_id: str | None = None,
+            *,
+            require_context_digest: bool = True,
+            allow_settlement_pause: bool = False,
         ) -> tuple[Mapping[str, object], Mapping[str, object]] | None:
-            if not (campaign_id and agent_id and grant_digest):
+            if not (campaign_id and agent_id) or (require_context_digest and not grant_digest):
                 return None
             campaign = await asyncio.to_thread(campaign_store.get, campaign_id)
             if (
                 campaign is None
-                or campaign["status"] != "executing"
+                or not _campaign_status_allows_provider(
+                    campaign, allow_settlement_pause=allow_settlement_pause
+                )
                 or str(campaign["session_id"]) != str(session_id)
             ):
                 return None
             waves = await asyncio.to_thread(campaign_store.list_waves, campaign_id)
             matching_waves = (
-                tuple(wave for wave in waves if str(wave.get("schedule_id") or "") == schedule_id)
+                tuple(
+                    wave
+                    for wave in waves
+                    if _same_schedule_id(wave.get("schedule_id"), schedule_id)
+                )
                 if schedule_id
                 else tuple(reversed(waves))
             )
@@ -4340,7 +4385,10 @@ def build_backend(
                 if (
                     assignment is not None
                     and worker_context is not None
-                    and worker_context.get("digest") == grant_digest
+                    and (
+                        not require_context_digest
+                        or worker_context.get("digest") == grant_digest
+                    )
                 ):
                     return assignment, graph.get("grants", {})
             return None
@@ -4448,9 +4496,7 @@ def build_backend(
             )
             if selected is None:
                 messages = await store.load_messages(_session_id)
-                objective = "\n".join(
-                    message.content for message in messages if message.role == "user"
-                )
+                objective = _browser_target_objective(messages)
                 try:
                     await assessments.resolve_target(objective)
                 except ValueError as error:
@@ -4670,6 +4716,8 @@ def build_backend(
                 assignment.id,
                 worker_context.digest if worker_context is not None else None,
                 handoff.schedule_id,
+                require_context_digest=False,
+                allow_settlement_pause=True,
             )
             if admitted is None or admitted[0].get("provider_id") != assignment.provider_id:
                 return False

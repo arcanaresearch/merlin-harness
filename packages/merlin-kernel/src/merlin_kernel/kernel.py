@@ -935,8 +935,12 @@ class Kernel:
                     MERLIN_IDENTITY,
                     *campaign_messages,
                     *skill_messages,
-                    *request_repair_messages,
                     *transcript,
+                    # Recovery guidance must be the final instruction in the
+                    # request.  Placing it before a large retained transcript
+                    # lets later historical messages drown out the one-shot
+                    # repair constraint and can repeat the malformed call.
+                    *request_repair_messages,
                 ]
                 capabilities_for_model = getattr(self._provider, "capabilities_for_model", None)
                 capabilities = (

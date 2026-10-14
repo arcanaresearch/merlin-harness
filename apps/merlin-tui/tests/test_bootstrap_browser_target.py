@@ -1,0 +1,74 @@
+import json
+from uuid import UUID
+
+from merlin_contracts import ChatMessage
+from merlin_tui.bootstrap import (
+    _browser_target_objective,
+    _campaign_status_allows_provider,
+    _same_schedule_id,
+)
+
+
+def test_browser_target_prefers_latest_configured_campaign_objective() -> None:
+    messages = [
+        ChatMessage(role="user", content="Test http://localhost:3100.Open the game"),
+        ChatMessage(
+            role="tool",
+            name="campaign_configure",
+            tool_call_id="configure",
+            content=json.dumps(
+                {
+                    "status": "configured",
+                    "settings": {"objective": "http://localhost:3100"},
+                }
+            ),
+        ),
+    ]
+
+    assert _browser_target_objective(messages) == "http://localhost:3100"
+
+
+def test_browser_target_falls_back_to_user_objective_without_configuration() -> None:
+    messages = [
+        ChatMessage(role="user", content="Test https://example.test"),
+        ChatMessage(role="assistant", content="I will inspect it."),
+    ]
+
+    assert _browser_target_objective(messages) == "Test https://example.test"
+
+
+def test_campaign_schedule_identity_accepts_uuid_retry_value() -> None:
+    value = "4e9ffdc8-cfcd-5a84-811a-0e02cf3df983"
+
+    assert _same_schedule_id(value, UUID(value))
+    assert not _same_schedule_id(value, UUID("e438c3ad-01dc-42e7-a9b7-ea48d9aa95d3"))
+
+
+def test_campaign_provider_continues_only_during_acknowledged_settlement() -> None:
+    assert _campaign_status_allows_provider(
+        {"status": "executing"}, allow_settlement_pause=False
+    )
+    settlement = {
+        "status": "paused",
+        "lifecycle_pause_reason": "acknowledged_settlement",
+        "lifecycle_resume_status": "executing",
+    }
+    assert _campaign_status_allows_provider(settlement, allow_settlement_pause=True)
+    assert not _campaign_status_allows_provider(settlement, allow_settlement_pause=False)
+    for reason in ("quota", "cleanup", "fixed_forward"):
+        assert not _campaign_status_allows_provider(
+            {
+                "status": "paused",
+                "lifecycle_pause_reason": reason,
+                "lifecycle_resume_status": "executing",
+            },
+            allow_settlement_pause=True,
+        )
+    assert not _campaign_status_allows_provider(
+        {
+            "status": "paused",
+            "lifecycle_pause_reason": "acknowledged_settlement",
+            "lifecycle_resume_status": "prepared",
+        },
+        allow_settlement_pause=True,
+    )

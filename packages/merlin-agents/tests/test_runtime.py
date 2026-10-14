@@ -1998,6 +1998,118 @@ async def test_baseline_first_turn_advertises_only_reviewed_target_delivery() ->
     assert [tool["function"]["name"] for tool in provider.requests[0].tools] == ["target_request"]
 
 
+async def test_direct_strategy_repairs_protocol_invalid_target_input() -> None:
+    class ConstraintTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="target_request", description="Target", input_schema={"type": "object"}
+                ),
+            )
+
+        def effect(self, name: str) -> str | None:
+            return "target_network" if name == "target_request" else None
+
+        async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
+            self.calls.append(dict(arguments))
+            if len(self.calls) == 1:
+                return ToolResult(
+                    content="rendered request violates reviewed constraints",
+                    is_error=True,
+                    metadata={
+                        "attempt_disposition": "protocol_invalid",
+                        "disposition_reason": "rendered request exceeded reviewed maximum",
+                        "retryable": True,
+                        "target_call_budget_charge": 0,
+                        "limit_interaction_count": 0,
+                        "request_constraint_observations": [
+                            {
+                                "kind": "string_length",
+                                "path": "/json/text",
+                                "maximum": 12,
+                                "observed": 20,
+                                "satisfied": False,
+                            }
+                        ],
+                        "target_exchanges": [
+                            {
+                                "interaction": False,
+                                "cleanup": False,
+                                "outcome": "request_constraint_violation",
+                                "request": dict(arguments),
+                            }
+                        ],
+                    },
+                )
+            return ToolResult(
+                content="target reply",
+                metadata={
+                    "target_session_id": "api:session-1",
+                    "target_exchanges": [
+                        {
+                            "interaction": True,
+                            "cleanup": False,
+                            "request": dict(arguments),
+                            "response": {"reply": "accepted"},
+                        }
+                    ],
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="target-too-long",
+                    name="target_request",
+                    arguments={"input": "this payload is too long"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+            [
+                ToolCall(
+                    call_id="target-repaired",
+                    name="target_request",
+                    arguments={"input": "short"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+        ]
+    )
+    tools = ConstraintTools()
+    base = reviewed_handoff(
+        interface="http_api", tools=("target_request",), execution_stage="direct"
+    )
+    candidate = CompletionCandidateIdentity(
+        campaign_id="campaign/protocol-repair",
+        target_id=base.assignment.target_profile_id,
+        target_generation="generation-1",
+        scenario_fingerprint="scenario-1",
+        technique_id="t1",
+        controller_id="direct",
+        payload_family="native",
+        requested_language="en",
+        mutation_id="native",
+    )
+
+    result = await WorkerRuntime(provider, tools).run(
+        replace(base, attempt_id="attempt-protocol-repair", candidate_identity=candidate)
+    )
+
+    assert result.status == "completed", result.error
+    assert tools.calls == [
+        {"input": "this payload is too long"},
+        {"input": "short"},
+    ]
+    assert result.error_code is None
+    assert result.checkpoint is not None
+    assert result.checkpoint["effect_observed"] is True
+    assert any(
+        item["source"] == "runtime.request_constraints"
+        for item in result.evaluation_uncertainties
+    )
+
+
 async def test_observed_target_session_is_checkpointed_and_restored() -> None:
     class TargetTools(Tools):
         def describe(self):

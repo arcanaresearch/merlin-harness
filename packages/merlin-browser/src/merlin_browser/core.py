@@ -125,6 +125,7 @@ class _Element:
     frame_ref: str
     role: str
     name: str
+    match_index: int
     locator: Locator
 
 
@@ -446,18 +447,15 @@ class BrowserSession:
         generation = self._generation.get(tab_ref, 0) + 1
         self._generation[tab_ref] = generation
         elements: list[ElementRef] = []
+        match_counts: dict[tuple[str, str], int] = {}
         for role in ("button", "link", "textbox", "checkbox", "radio", "combobox"):
             locators = frame.get_by_role(role)
             for index in range(min(await locators.count(), 50)):
                 locator = locators.nth(index)
-                name = (
-                    (await locator.get_attribute("aria-label"))
-                    or (await locator.get_attribute("placeholder"))
-                    or (await locator.get_attribute("name"))
-                    or (await locator.inner_text())
-                    or f"{role.title()} {index + 1}"
-                )
-                name = " ".join(name.split())[:200]
+                name = await self._element_name(locator, role, index)
+                match_key = (role, name)
+                match_index = match_counts.get(match_key, 0)
+                match_counts[match_key] = match_index + 1
                 input_type = await locator.get_attribute("type")
                 raw_max_length = await locator.get_attribute("maxlength")
                 max_length = (
@@ -466,7 +464,14 @@ class BrowserSession:
                     else None
                 )
                 ref = f"{tab_ref}:{generation}:{len(elements)}"
-                self._elements[ref] = _Element(generation, resolved_frame_ref, role, name, locator)
+                self._elements[ref] = _Element(
+                    generation,
+                    resolved_frame_ref,
+                    role,
+                    name,
+                    match_index,
+                    locator,
+                )
                 elements.append(
                     ElementRef(
                         ref=ref,
@@ -485,7 +490,17 @@ class BrowserSession:
             locator = uploads.nth(index)
             name = (await locator.get_attribute("aria-label")) or f"File upload {index + 1}"
             ref = f"{tab_ref}:{generation}:{len(elements)}"
-            self._elements[ref] = _Element(generation, resolved_frame_ref, "file", name, locator)
+            match_key = ("file", name)
+            match_index = match_counts.get(match_key, 0)
+            match_counts[match_key] = match_index + 1
+            self._elements[ref] = _Element(
+                generation,
+                resolved_frame_ref,
+                "file",
+                name,
+                match_index,
+                locator,
+            )
             elements.append(
                 ElementRef(
                     ref=ref,
@@ -872,11 +887,38 @@ class BrowserSession:
         recovered = (
             frame.locator('input[type="file"]')
             if element.role == "file"
-            else frame.get_by_role(element.role, name=element.name, exact=True)
+            else frame.get_by_role(element.role)
         )
-        if await recovered.count() != 1:
+        matches: list[Locator] = []
+        limit = 20 if element.role == "file" else 50
+        for index in range(min(await recovered.count(), limit)):
+            candidate = recovered.nth(index)
+            if await self._element_name(candidate, element.role, index) == element.name:
+                matches.append(candidate)
+        if len(matches) == 1:
+            return matches[0]
+        if element.match_index >= len(matches):
             raise StaleReference("element reference could not be recovered uniquely")
-        return recovered
+        # Repeated labels are common in responsive navigation and wallet
+        # dialogs. Preserve the occurrence selected in the reviewed snapshot
+        # instead of rejecting every action after an unrelated re-render.
+        candidate = matches[element.match_index]
+        if not await candidate.is_visible():
+            visible = [item for item in matches if await item.is_visible()]
+            if len(visible) != 1:
+                raise StaleReference("element reference could not be recovered uniquely")
+            return visible[0]
+        return candidate
+
+    async def _element_name(self, locator: Locator, role: str, index: int) -> str:
+        name = (
+            (await locator.get_attribute("aria-label"))
+            or (await locator.get_attribute("placeholder"))
+            or (await locator.get_attribute("name"))
+            or (await locator.inner_text())
+            or f"{role.title()} {index + 1}"
+        )
+        return " ".join(name.split())[:200]
 
     def _frame(self, page: Page, frame_ref: str | None) -> tuple[Frame, str]:
         if frame_ref in (None, "main"):

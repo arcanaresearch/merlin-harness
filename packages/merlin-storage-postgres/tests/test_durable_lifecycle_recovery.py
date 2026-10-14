@@ -294,6 +294,32 @@ def test_fixed_forward_pause_cannot_be_resumed_by_generic_campaign_path(
                 campaigns.resume(campaign_id)
 
 
+def test_terminal_campaign_clears_durable_lifecycle_pause(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaigns, campaign_id = _prepare_campaign(connection, "terminal-pause")
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'paused',
+                       lifecycle_pause_reason = 'acknowledged_settlement',
+                       lifecycle_resume_status = 'executing'
+                   WHERE id = %s""",
+                (campaign_id,),
+            )
+
+            terminal = campaigns.finish(
+                campaign_id,
+                "cancelled",
+                stop_reason="operator_stopped",
+            )
+
+            assert terminal["status"] == "cancelled"
+            assert terminal["lifecycle_pause_reason"] is None
+            assert terminal["lifecycle_resume_status"] is None
+            assert terminal["lifecycle_wake_at"] is None
+
+
 def test_legacy_only_rollback_settles_new_effect_once_without_rewriting_legacy(
     tmp_path: Path,
 ) -> None:

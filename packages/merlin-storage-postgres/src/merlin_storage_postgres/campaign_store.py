@@ -2246,7 +2246,11 @@ class CampaignStore:
         with self.connection.transaction():
             row = self.connection.execute(
                 """UPDATE merlin_storage.assessment_campaigns
-                   SET status = %s, stop_reason = %s, updated_at = now()
+                   SET status = %s, stop_reason = %s,
+                       lifecycle_pause_reason = NULL,
+                       lifecycle_resume_status = NULL,
+                       lifecycle_wake_at = NULL,
+                       updated_at = now()
                    WHERE id = %s AND status IN ('prepared', 'executing', 'paused') RETURNING *""",
                 (status, stop_reason, campaign_id),
             ).fetchone()
