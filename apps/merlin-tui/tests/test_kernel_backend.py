@@ -1624,6 +1624,7 @@ async def test_campaign_list_is_daemon_wide_across_console_sessions() -> None:
                     "profile": "recommended",
                     "status": "executing",
                     "manifest_digest": "sha256:def",
+                    "stop_reason": "infrastructure_blocked_after_retry_policy",
                 },
             )
 
@@ -1639,6 +1640,7 @@ async def test_campaign_list_is_daemon_wide_across_console_sessions() -> None:
     campaigns = await backend.list_campaigns()
 
     assert [campaign.id for campaign in campaigns] == ["campaign/current"]
+    assert campaigns[0].stop_reason == "infrastructure_blocked_after_retry_policy"
 
 
 @pytest.mark.asyncio

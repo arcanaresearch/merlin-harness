@@ -1548,6 +1548,7 @@ class KernelBackend:
                     wave_kind=str(progress.get("wave_kind", "")),
                     wave_status=str(progress.get("wave_status", "")),
                     lead_activity=str(progress.get("lead_activity", "")),
+                    stop_reason=str(item.get("stop_reason") or ""),
                 )
             )
         return tuple(campaigns)

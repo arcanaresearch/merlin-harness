@@ -4036,6 +4036,52 @@ async def test_main_body_shows_replaceable_live_swarm_region() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_campaign_appends_one_notice_that_supersedes_stale_approval() -> None:
+    class TerminalCampaignBackend(DemoBackend):
+        def __init__(self) -> None:
+            self.status = "executing"
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/terminal-notice",
+                    "session-demo",
+                    "Assess the target",
+                    "quickscan",
+                    self.status,
+                    "sha256:terminal-notice",
+                    stop_reason=(
+                        "infrastructure_blocked_after_retry_policy"
+                        if self.status == "failed"
+                        else ""
+                    ),
+                ),
+            )
+
+        async def list_reports(self):
+            return ()
+
+    backend = TerminalCampaignBackend()
+    app = MerlinApp(backend)
+    async with app.run_test() as pilot:
+        app._activate_conversation()  # noqa: SLF001
+        transcript = app.query_one("#transcript", RichLog)
+        transcript.write("The manifest is prepared. Approve execution?")
+        await app._poll_swarm_progress()  # noqa: SLF001
+
+        backend.status = "failed"
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        content = "\n".join(line.text for line in transcript.lines)
+        assert content.count("Campaign failed after partial execution") == 1
+        assert "Infrastructure retries exhausted" in content
+        assert "The earlier approval request is no longer active" in content
+        assert "final report is unavailable after failure" in content
+
+
+@pytest.mark.asyncio
 async def test_swarm_poll_reconciles_late_new_session_before_filtering_campaigns() -> None:
     class LateSessionBackend(DemoBackend):
         async def conversation_context(self):
@@ -4470,7 +4516,7 @@ async def test_halfway_quit_resume_restores_swarm_and_presents_completion_report
     "report_state,title",
     [
         ("complete", "Scan complete"),
-        ("incomplete", "Scan partially completed"),
+        ("incomplete", "Scan failed — partial results retained"),
     ],
 )
 async def test_resumed_finished_session_restores_inline_summary_and_report_actions(
@@ -4865,6 +4911,7 @@ async def test_failed_campaign_replaces_running_swarm_even_when_worker_refresh_f
                     "recommended",
                     "failed" if self.failed else "executing",
                     "digest",
+                    stop_reason="infrastructure_blocked_after_retry_policy" if self.failed else "",
                 ),
             )
 
@@ -4905,8 +4952,8 @@ async def test_failed_campaign_replaces_running_swarm_even_when_worker_refresh_f
         await pilot.pause()
         text = "".join(line.text for line in live.lines)
         assert "Working" not in text
-        assert "Scan partially completed" in text
-        assert "Execution stopped after an error; completed work is retained" in text
+        assert "Scan failed — partial results retained" in text
+        assert "Infrastructure retries exhausted" in text
         assert "/saved/assessment.html" in text
         assert not live.animating
         assert app.query_one("#scan-actions").has_class("visible")
@@ -4920,19 +4967,25 @@ async def test_failed_campaign_replaces_running_swarm_even_when_worker_refresh_f
         await app._poll_swarm_progress()  # noqa: SLF001
         text = "".join(line.text for line in live.lines)
         assert "retrying automatically" in text
-        assert "Scan partially completed" in text
+        assert "Scan failed — partial results retained" in text
         assert "campaign connection lost" in text
         assert "not-for-display" not in text
         assert "/saved/assessment.html" in text
         assert not live.animating
         backend.status_unavailable = False
         await app._poll_swarm_progress()  # noqa: SLF001
-        assert "Scan partially completed" in "".join(line.text for line in live.lines)
+        assert "Scan failed — partial results retained" in "".join(line.text for line in live.lines)
 
 
 def test_partial_campaign_labels_and_report_access() -> None:
     campaign = CampaignView(
-        "campaign/partial", "session-demo", "Target assessment", "recommended", "failed", "digest"
+        "campaign/partial",
+        "session-demo",
+        "Target assessment",
+        "recommended",
+        "failed",
+        "digest",
+        stop_reason="infrastructure_blocked_after_retry_policy",
     )
     report = ReportView(
         "campaign/partial",
@@ -4943,14 +4996,49 @@ def test_partial_campaign_labels_and_report_access() -> None:
         report_state="incomplete",
         stop_reason="failed",
     )
-    assert "Partially completed" in app_module._render_campaigns((campaign,))
-    status = app_module._render_campaign_status({"status": "failed", "stop_reason": "failed"})
-    assert "Status: Partially completed" in status
-    assert "Stop reason: failed" not in status
+    campaigns = app_module._render_campaigns((campaign,))
+    assert "Failed · partial results retained" in campaigns
+    assert "Infrastructure retries exhausted" in campaigns
+    status = app_module._render_campaign_status(
+        {"status": "failed", "stop_reason": "infrastructure_blocked_after_retry_policy"}
+    )
+    assert "Status: Failed · partial results retained" in status
+    assert "Stop reason: Infrastructure retries exhausted" in status
     reports = app_module._render_reports((report,))
-    assert "Partially completed · report ready" in reports
+    assert "Failed after partial execution · report ready" in reports
     assert "/saved/partial.html" in reports
-    assert "failed" not in reports
+    assert "ready · failed" not in reports
+    limited = ReportView(
+        "campaign/limited",
+        "durable-revision",
+        "/saved/limited.html",
+        "ready",
+        1,
+        report_state="incomplete",
+        stop_reason="frontier_exhausted",
+    )
+    assert "Completed with partial results · report ready" in app_module._render_reports((limited,))
+
+
+def test_failed_scan_without_report_is_terminal_and_actionable() -> None:
+    campaign = CampaignView(
+        "campaign/failed",
+        "session-demo",
+        "Target assessment",
+        "quickscan",
+        "failed",
+        "digest",
+        stop_reason="infrastructure_blocked_after_retry_policy",
+    )
+
+    rendered = app_module._render_scan_summary(campaign, None).plain
+
+    assert "Scan failed — partial results retained" in rendered
+    assert "State: Failed · partial results retained" in rendered
+    assert "Infrastructure retries exhausted" in rendered
+    assert "Final report: unavailable after failure" in rendered
+    assert "report pending" not in rendered
+    assert "/campaign status" in rendered
 
 
 @pytest.mark.asyncio

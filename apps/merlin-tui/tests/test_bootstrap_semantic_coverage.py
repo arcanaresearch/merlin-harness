@@ -8,6 +8,7 @@ from merlin_findings import DurableReportService
 from merlin_tui.bootstrap import (
     _apply_pair_verdict,
     _canonical_report_candidate_projections,
+    _current_terminal_report_authority,
     _fold_attempted_technique_outcome,
     _language_evidence_disagreement,
     _language_observation_for_technique,
@@ -35,6 +36,228 @@ class _ReportRepository:
 
     def list(self, campaign_id):
         return tuple(item for item in self.values.values() if item.campaign_id == campaign_id)
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_authority_uses_normalized_frontier_snapshot() -> None:
+    calls = []
+
+    class Campaigns:
+        async def status(
+            self, campaign_id: str, *, seal_frontier_snapshot: bool = False
+        ) -> dict[str, object]:
+            calls.append(seal_frontier_snapshot)
+            return {
+                "campaign_id": campaign_id,
+                "completion_document": {
+                    "schema": (
+                        "merlin.campaign-completion.v2"
+                        if seal_frontier_snapshot
+                        else "merlin.campaign-completion.live.v2"
+                    )
+                },
+            }
+
+    authority = await _current_terminal_report_authority(Campaigns(), "campaign/example")
+
+    assert calls == [True]
+    assert authority["completion_document"] == {"schema": "merlin.campaign-completion.v2"}
+
+
+@pytest.mark.asyncio
+async def test_large_frontier_report_authority_is_idempotent_and_rejects_late_evidence() -> None:
+    campaign_id = "campaign/large-frontier"
+    snapshot_id = "frontier-final/large"
+    rows = tuple(
+        {
+            "position": position,
+            "candidate_id": f"candidate/{position}",
+            "state": "queued",
+            "outcome": "unattempted",
+            "attempt_id": None,
+            "task_id": None,
+            "evidence_refs": [],
+            "disposition_reason": None,
+        }
+        for position in range(12_765)
+    )
+    counts = {
+        "states": {"queued": 12_765, "claimed": 0, "scheduled": 0, "terminal": 0},
+        "outcomes": {
+            "confirmed": 0,
+            "refuted": 0,
+            "partial": 0,
+            "unclear": 0,
+            "blocked": 0,
+            "retryable": 0,
+            "unattempted": 12_765,
+        },
+    }
+    row_digest = hashlib.sha256(
+        json.dumps(
+            {"schema_version": 1, "rows": rows},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    snapshot = {
+        "id": snapshot_id,
+        "kind": "final",
+        "wave": None,
+        "row_digest": row_digest,
+        "total_count": len(rows),
+        "counts": counts,
+        "reference": f"merlin-frontier-snapshot:{campaign_id}:{snapshot_id}",
+        "sample": rows[:2],
+    }
+    document = {
+        "schema": "merlin.campaign-completion.v2",
+        "campaign_id": campaign_id,
+        "manifest_digest": "sha256:" + "a" * 64,
+        "target_id": "target/large",
+        "profile": "quickscan",
+        "frontier_snapshot": snapshot,
+        "waves": (),
+        "receipts": (),
+        "findings": (),
+        "cleanup": {
+            "expected": (),
+            "states": (),
+            "authority": {"status": "acknowledged"},
+        },
+        "saturation": {"ready": True},
+    }
+
+    def digest(value) -> str:
+        return (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+
+    completion_digest = digest(document)
+    receipt = {
+        "kind": "campaign_completion",
+        "schema": "merlin.campaign-completion.v2",
+        "completion_digest": completion_digest,
+        "terminal_status": "completed",
+        "stop_reason": "frontier_exhausted",
+        "document": document,
+    }
+    receipt_digest = digest(receipt)
+
+    class Snapshots:
+        def get_frontier_completion_snapshot(self, requested_campaign_id, requested_snapshot_id):
+            assert (requested_campaign_id, requested_snapshot_id) == (campaign_id, snapshot_id)
+            return snapshot
+
+        def frontier_completion_counts(self, requested_campaign_id, requested_snapshot_id):
+            return self.get_frontier_completion_snapshot(
+                requested_campaign_id, requested_snapshot_id
+            )
+
+        def list_frontier_completion_page(
+            self,
+            requested_campaign_id,
+            requested_snapshot_id,
+            *,
+            limit=100,
+            after_position=-1,
+        ):
+            assert (requested_campaign_id, requested_snapshot_id) == (campaign_id, snapshot_id)
+            return rows[after_position + 1 : after_position + 1 + limit]
+
+    class Repository:
+        def __init__(self) -> None:
+            self.values = {}
+
+        def next_revision(self, _campaign_id):
+            return len(self.values) + 1
+
+        def save(self, projection):
+            self.values[projection.revision_id] = projection
+
+        def get(self, revision_id):
+            return self.values.get(revision_id)
+
+        def list(self, requested_campaign_id):
+            return tuple(
+                item for item in self.values.values() if item.campaign_id == requested_campaign_id
+            )
+
+        def find_by_completion_digest(self, requested_campaign_id, requested_digest):
+            return next(
+                (
+                    item
+                    for item in self.list(requested_campaign_id)
+                    if item.completion_digest == requested_digest
+                ),
+                None,
+            )
+
+    class Campaigns:
+        late_evidence = False
+
+        async def status(self, requested_campaign_id: str, *, seal_frontier_snapshot: bool = False):
+            assert requested_campaign_id == campaign_id
+            assert seal_frontier_snapshot is True
+            current = document
+            if self.late_evidence:
+                current = {**document, "receipts": ({"kind": "late-evidence"},)}
+            return {
+                "campaign_id": campaign_id,
+                "status": "completed",
+                "stop_reason": "frontier_exhausted",
+                "completion_digest": digest(current),
+                "completion_document": current,
+            }
+
+    campaigns = Campaigns()
+    repository = Repository()
+    reports = DurableReportService(repository, frontier_snapshot_provider=Snapshots())
+
+    for _ in range(2):
+        authority = await _current_terminal_report_authority(campaigns, campaign_id)
+        _require_terminal_report_authority(
+            campaign_id,
+            "frontier_exhausted",
+            authority,
+            completion_digest=completion_digest,
+            cleanup_status="completed",
+            report_state="complete",
+        )
+        projection = reports.create(
+            campaign_id,
+            stop_reason="frontier_exhausted",
+            cleanup_status="completed",
+            report_state="complete",
+            findings=(),
+            tasks=(),
+            evidence=(),
+            usage={},
+            metadata={
+                "manifest_digest": document["manifest_digest"],
+                "profile": document["profile"],
+            },
+            completion_document=receipt,
+            completion_digest=receipt_digest,
+        )
+
+    assert projection.revision == 1
+    assert len(repository.list(campaign_id)) == 1
+
+    campaigns.late_evidence = True
+    changed = await _current_terminal_report_authority(campaigns, campaign_id)
+    with pytest.raises(RuntimeError, match="campaign evidence changed"):
+        _require_terminal_report_authority(
+            campaign_id,
+            "frontier_exhausted",
+            changed,
+            completion_digest=completion_digest,
+            cleanup_status="completed",
+            report_state="complete",
+        )
 
 
 def test_campaign_report_projects_unique_candidates_and_repeated_attempts() -> None:

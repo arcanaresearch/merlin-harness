@@ -8808,7 +8808,7 @@ def build_backend(
                 and cleanup_status == "completed"
                 else "incomplete"
             )
-            live_completion = await campaigns.status(campaign_id)
+            live_completion = await _current_terminal_report_authority(campaigns, campaign_id)
             _require_terminal_report_authority(
                 campaign_id,
                 stop_reason,
@@ -9105,7 +9105,7 @@ def build_backend(
             # receipt was written.  Re-read canonical state immediately before the
             # user-visible file is published; an obsolete seal must never describe
             # a live campaign as completed.
-            publication_authority = await campaigns.status(campaign_id)
+            publication_authority = await _current_terminal_report_authority(campaigns, campaign_id)
             _require_terminal_report_authority(
                 campaign_id,
                 stop_reason,
@@ -9848,6 +9848,24 @@ def build_backend(
             automation_connection.close()
         database.stop()
         raise
+
+
+async def _current_terminal_report_authority(
+    campaigns: Any, campaign_id: str
+) -> Mapping[str, object]:
+    """Project current evidence with the same normalized frontier used by the seal.
+
+    Large language frontiers are stored as normalized completion snapshots.  A
+    default status projection intentionally returns a bounded live summary, whose
+    schema and digest differ from that snapshot even when no evidence changed.
+    Report publication must therefore compare the receipt with a freshly normalized
+    snapshot.  Recording that snapshot is atomic and idempotent; genuine late
+    evidence produces a different snapshot and still fails the authority check.
+    """
+    status = campaigns.status
+    if "seal_frontier_snapshot" in inspect.signature(status).parameters:
+        return await status(campaign_id, seal_frontier_snapshot=True)
+    return await status(campaign_id)
 
 
 def _require_terminal_report_authority(

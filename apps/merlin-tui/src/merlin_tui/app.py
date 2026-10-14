@@ -3864,6 +3864,7 @@ class MerlinApp(App[None]):
         self._active_saturation_request: str | None = None
         self._known_report_revisions: set[tuple[str, str]] | None = None
         self._pending_report_notifications: dict[tuple[str, str], ReportView] = {}
+        self._announced_terminal_campaigns: set[tuple[str, str]] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._swarm_refresh_lock = asyncio.Lock()
         self._swarm_rendered = ""
@@ -5395,6 +5396,45 @@ class MerlinApp(App[None]):
                         and report is not None
                         and report.stop_reason == "failed"
                     )
+                    announcement_key = (campaign.id, campaign.status)
+                    transcripts = self.query("#transcript")
+                    if (
+                        announcement_key not in self._announced_terminal_campaigns
+                        and self.screen is self.default_screen
+                        and transcripts
+                    ):
+                        message = Text()
+                        if campaign.status == "completed":
+                            message.append(
+                                "\u2713 Campaign execution complete\n", style="bold green"
+                            )
+                        elif campaign.status == "cancelled":
+                            message.append("\u25a0 Campaign stopped\n", style="bold yellow")
+                        else:
+                            message.append(
+                                "\u2715 Campaign failed after partial execution\n",
+                                style="bold red",
+                            )
+                        message.append("  Campaign: ")
+                        message.append(campaign.id, style="bold")
+                        if campaign.stop_reason:
+                            message.append(
+                                "\n  Reason: " + _campaign_stop_reason_label(campaign.stop_reason)
+                            )
+                        message.append("\n  The earlier approval request is no longer active. ")
+                        if report is not None:
+                            message.append("The durable report is ready; run ")
+                            message.append("/report", style="bold")
+                            message.append(" to inspect it.")
+                        elif campaign.status == "failed":
+                            message.append(
+                                "Completed work is retained, but the final report is unavailable "
+                                "after failure."
+                            )
+                        else:
+                            message.append("The durable report is still pending.")
+                        transcripts.first(RichLog).write(message)
+                        self._announced_terminal_campaigns.add(announcement_key)
                     rendered = _render_scan_summary(campaign, report)
                     if action_rows:
                         action_rows[0].set_class(report is not None, "visible")
@@ -7027,13 +7067,18 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
         title = (
             "Scan stopped"
             if campaign.status == "cancelled"
-            else "Scan partially completed"
+            else "Scan failed — partial results retained"
             if campaign.status == "failed"
             else "Scan ended"
         )
+    elif campaign.status == "failed" or report.stop_reason in {
+        "failed",
+        "infrastructure_blocked_after_retry_policy",
+    }:
+        title = "Scan failed — partial results retained"
     elif report.stop_reason in {"operator_stopped", "interrupted"}:
         title = "Scan stopped"
-    elif report.report_state in {"incomplete", "provisional"} or report.stop_reason == "failed":
+    elif report.report_state in {"incomplete", "provisional"}:
         title = "Scan partially completed"
     else:
         title = "Scan complete"
@@ -7041,20 +7086,25 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
     rendered.append(f"{title} — {_short_activity(campaign.objective, 100)}\n", style="bold cyan")
     rendered.append(f"Campaign: {campaign.id}\n", style="dim")
     if report is None:
-        state = "Partially completed" if campaign.status == "failed" else campaign.status
-        rendered.append(f"State: {state} · report pending\n", style="yellow")
+        state = _campaign_display_status(campaign.status)
         rendered.append(
-            "Waiting for the durable report. /report shows saved revisions.", style="dim"
+            f"State: {state}\n",
+            style="bold red" if campaign.status == "failed" else "yellow",
+        )
+        if campaign.stop_reason:
+            rendered.append(f"Reason: {_campaign_stop_reason_label(campaign.stop_reason)}\n")
+        if campaign.status == "failed":
+            rendered.append("Final report: unavailable after failure\n", style="yellow")
+        else:
+            rendered.append("Final report: not available yet\n", style="yellow")
+        rendered.append(
+            "/campaign status shows durable details. /report shows any saved revisions.",
+            style="dim",
         )
         return rendered
-    reason = {
-        "saturated": "Coverage complete",
-        "completed_with_limitations": "Finished with limitations",
-        "capped": "Authorized budget reached",
-        "operator_stopped": "Stopped by you",
-        "interrupted": "Interrupted",
-        "failed": "Execution stopped after an error; completed work is retained",
-    }.get(report.stop_reason, report.stop_reason.replace("_", " ") or report.status)
+    reason = (
+        _campaign_stop_reason_label(campaign.stop_reason or report.stop_reason) or report.status
+    )
     rendered.append(f"Reason: {reason}\n")
     rendered.append(
         f"Findings: {report.finding_count} · Target exchanges: {report.exchange_count}\n"
@@ -7102,9 +7152,7 @@ def _render_live_swarm(
     filled = 0 if total == 0 else round(width * finished / total)
     bar = "█" * filled + "░" * (width - filled)
     spinner = ("◐", "◓", "◑", "◒")[spinner_index % 4]
-    pause_requested = bool(campaigns) and all(
-        campaign.status == "paused" for campaign in campaigns
-    )
+    pause_requested = bool(campaigns) and all(campaign.status == "paused" for campaign in campaigns)
     paused = pause_requested and counts["working"] == 0
     pausing = pause_requested and counts["working"] > 0
     title = campaigns[0].objective if campaigns else "Active campaign"
@@ -7478,12 +7526,41 @@ def _render_schedules(schedules: tuple[ScheduleView, ...]) -> str:
 
 
 def _campaign_display_status(status: object) -> str:
-    return "Partially completed" if status == "failed" else str(status)
+    return "Failed · partial results retained" if status == "failed" else str(status)
+
+
+def _campaign_stop_reason_label(reason: object) -> str:
+    value = str(reason or "").strip()
+    labels = {
+        "objective_satisfied": "Objective satisfied",
+        "frontier_exhausted": "Candidate frontier exhausted",
+        "budget_exhausted": "Authorized budget exhausted",
+        "target_terminal": "Target reached a terminal state",
+        "operator_stopped": "Stopped by you",
+        "infrastructure_blocked_after_retry_policy": "Infrastructure retries exhausted",
+        # Persisted legacy values remain readable during migrations.
+        "saturated": "Coverage complete",
+        "completed_with_limitations": "Finished with limitations",
+        "coverage_incomplete": "Budget ended before coverage completed",
+        "capped": "Authorized budget reached",
+        "interrupted": "Interrupted by infrastructure",
+        "failed": "Execution stopped after an error; completed work is retained",
+    }
+    label = labels.get(value, value.replace("_", " "))
+    if not label:
+        return ""
+    if value and value not in labels:
+        return label
+    if value == "infrastructure_blocked_after_retry_policy":
+        return f"{label} ({value})"
+    return label
 
 
 def _report_display_status(report: ReportView) -> str:
-    if report.stop_reason == "failed" or report.report_state in {"incomplete", "provisional"}:
-        return "Partially completed · report ready"
+    if report.stop_reason in {"failed", "infrastructure_blocked_after_retry_policy"}:
+        return "Failed after partial execution · report ready"
+    if report.report_state in {"incomplete", "provisional"}:
+        return "Completed with partial results · report ready"
     return report.status
 
 
@@ -7493,7 +7570,13 @@ def _render_campaigns(campaigns: tuple[CampaignView, ...]) -> str:
     return "\n\n".join(
         f"{campaign.id} · {_campaign_display_status(campaign.status)} · {campaign.profile}\n"
         + (f"  {_campaign_wave_label(campaign)}\n" if _campaign_wave_label(campaign) else "")
-        + f"  {campaign.objective}\n  Manifest: {_display_digest(campaign.manifest_digest)}"
+        + f"  {campaign.objective}\n"
+        + (
+            f"  Reason: {_campaign_stop_reason_label(campaign.stop_reason)}\n"
+            if campaign.stop_reason
+            else ""
+        )
+        + f"  Manifest: {_display_digest(campaign.manifest_digest)}"
         for campaign in campaigns
     )
 
@@ -7531,12 +7614,7 @@ def _render_campaign_status(status: object) -> str:
         return str(status)
     lines = [
         f"Status: {_campaign_display_status(status.get('status', 'unknown'))}",
-        "Stop reason: "
-        + (
-            "Execution stopped early; completed work is retained"
-            if status.get("stop_reason") == "failed"
-            else str(status.get("stop_reason") or "not stopped")
-        ),
+        "Stop reason: " + (_campaign_stop_reason_label(status.get("stop_reason")) or "not stopped"),
         f"Manifest: {_display_digest(status.get('manifest_digest', 'unknown'))}",
     ]
     composition = status.get("specialist_composition") or status.get("composition_policy")

@@ -181,6 +181,7 @@ class CampaignView:
     wave_kind: str = ""
     wave_status: str = ""
     lead_activity: str = ""
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
