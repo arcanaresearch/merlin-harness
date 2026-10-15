@@ -571,22 +571,25 @@ class OpenAICompatibleProvider:
                     return
                 lines = response.aiter_lines().__aiter__()
                 received_output = False
+                progress_deadline = time.monotonic() + self.config.read_timeout
                 while True:
                     try:
-                        if received_output:
-                            line = await asyncio.wait_for(
-                                lines.__anext__(), timeout=self.config.partial_read_timeout
-                            )
-                        else:
-                            line = await lines.__anext__()
+                        remaining = progress_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        line = await asyncio.wait_for(lines.__anext__(), timeout=remaining)
                     except StopAsyncIteration:
                         break
                     except TimeoutError:
                         yield ModelError(
-                            message="provider stopped producing events after partial output",
+                            message=(
+                                "provider stopped producing events after partial output"
+                                if received_output
+                                else "provider produced no events before its idle deadline"
+                            ),
                             retryable=True,
                             code="read_timeout",
-                            partial=True,
+                            partial=received_output,
                             failure_kind=ProviderFailureKind.TRANSIENT,
                         )
                         return
@@ -606,7 +609,11 @@ class OpenAICompatibleProvider:
                     if chunk is None:
                         continue
                     assert isinstance(chunk, dict)
-                    received_output = True
+                    if _stream_chunk_made_progress(chunk):
+                        received_output = True
+                        progress_deadline = (
+                            time.monotonic() + self.config.partial_read_timeout
+                        )
                     refused = self._observe_refusal(chunk, refused)
                     chunk_events: list[ModelEvent] = []
                     if self._consume(chunk, chunk_events, tools):
@@ -1370,6 +1377,26 @@ def _parse_sse_line(line: str) -> dict[str, Any] | object | None:
     if not isinstance(chunk, dict):
         raise ProviderError("provider returned a non-object event")
     return chunk
+
+
+def _stream_chunk_made_progress(chunk: Mapping[str, Any]) -> bool:
+    """Return whether a chunk advances model output rather than keeping SSE alive."""
+    if "error" in chunk or chunk.get("usage"):
+        return True
+    choices = chunk.get("choices") or []
+    if not choices:
+        return False
+    choice = choices[0]
+    if choice.get("finish_reason") is not None:
+        return True
+    delta = choice.get("delta") or {}
+    if any(delta.get(key) for key in ("content", "reasoning_content", "reasoning", "refusal")):
+        return True
+    for part in delta.get("tool_calls") or []:
+        function = part.get("function") or {}
+        if part.get("id") or function.get("name") or function.get("arguments") not in {None, ""}:
+            return True
+    return False
 
 
 def _retry_after(value: str | None) -> float | None:

@@ -156,6 +156,23 @@ class _StalledAfterPartialStream(httpx.AsyncByteStream):
         await asyncio.Event().wait()
 
 
+class _KeepaliveOnlyStream(httpx.AsyncByteStream):
+    async def __aiter__(self):  # type: ignore[override]
+        while True:
+            yield b": keep-alive\n\n"
+            yield b'data: {"choices":[]}\n\n'
+            await asyncio.sleep(0.001)
+
+
+class _KeepaliveAfterPartialStream(httpx.AsyncByteStream):
+    async def __aiter__(self):  # type: ignore[override]
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        while True:
+            yield b": keep-alive\n\n"
+            yield b'data: {"choices":[{"delta":{},"finish_reason":null}]}\n\n'
+            await asyncio.sleep(0.001)
+
+
 class _DisconnectedStream(httpx.AsyncByteStream):
     async def __aiter__(self):  # type: ignore[override]
         yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n'
@@ -791,6 +808,83 @@ def test_partial_stream_uses_shorter_progress_deadline_without_replaying_request
         nonlocal calls
         calls += 1
         return httpx.Response(200, stream=_StalledAfterPartialStream())
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://models.example/v1",
+                    "",
+                    "model",
+                    read_timeout=5,
+                    partial_read_timeout=0.01,
+                    max_attempts=3,
+                ),
+                client=client,
+            )
+            return [
+                event async for event in provider.stream(ChatRequest(model="model", messages=[]))
+            ]
+
+    events = asyncio.run(run())
+    assert calls == 1
+    assert events == [
+        TextDelta(text="partial"),
+        ModelUsage(usage_complete=False, attempt_count=1),
+        ModelError(
+            message="provider stopped producing events after partial output",
+            retryable=True,
+            code="read_timeout",
+            partial=True,
+            failure_kind=ProviderFailureKind.TRANSIENT,
+        ),
+    ]
+
+
+def test_sse_keepalives_do_not_defeat_initial_idle_deadline() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, stream=_KeepaliveOnlyStream())
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://models.example/v1",
+                    "",
+                    "model",
+                    read_timeout=0.01,
+                    max_attempts=1,
+                ),
+                client=client,
+            )
+            return [
+                event async for event in provider.stream(ChatRequest(model="model", messages=[]))
+            ]
+
+    events = asyncio.run(run())
+    assert calls == 1
+    assert events == [
+        ModelError(
+            message="provider produced no events before its idle deadline",
+            retryable=True,
+            code="read_timeout",
+            partial=False,
+            failure_kind=ProviderFailureKind.TRANSIENT,
+        )
+    ]
+
+
+def test_sse_keepalives_do_not_defeat_partial_progress_deadline() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, stream=_KeepaliveAfterPartialStream())
 
     async def run() -> list[object]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
