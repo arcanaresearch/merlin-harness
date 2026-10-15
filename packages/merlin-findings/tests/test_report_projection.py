@@ -3315,6 +3315,87 @@ def test_unresolved_objective_authority_makes_inferred_report_incomplete() -> No
     assert "Scan ended with unresolved results" in service.export(report.revision_id, "html")
 
 
+def test_report_renders_objective_progress_and_campaign_result() -> None:
+    service = DurableReportService(Repository())
+    campaign_id = "campaign-objective-progress"
+    contract = _objective_contract("tier-1", "tier-2")
+    outcome = _campaign_outcome(
+        lifecycle="failed",
+        verdict="none",
+        end_reason="infrastructure_failure",
+        unresolved=("tier-1", "tier-2"),
+    )
+    progress = (
+        {
+            "objective": contract["objectives"][0],
+            "status": "unmet",
+            "evidence_refs": [],
+            "status_reason": None,
+        },
+        {
+            "objective": contract["objectives"][1],
+            "status": "blocked",
+            "evidence_refs": ["evidence://target/discovery"],
+            "status_reason": "the authoritative target state was not resolved",
+        },
+    )
+    completion_receipt, _ = _completion_seal(
+        campaign_id, stop_reason="infrastructure_blocked_after_retry_policy"
+    )
+    completion_receipt["terminal_status"] = "failed"
+    completion_receipt["document"]["objective_contract"] = contract
+    completion_receipt["document"]["objective_progress"] = progress
+    completion_receipt["document"]["campaign_outcome"] = outcome
+    completion_receipt["completion_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                completion_receipt["document"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    )
+    completion_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(completion_receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    report = service.create(
+        campaign_id,
+        stop_reason="infrastructure_blocked_after_retry_policy",
+        cleanup_status="completed",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={
+            "manifest_digest": "sha256:" + "a" * 64,
+            "profile": "recommended",
+            "objective_contract": contract,
+            "campaign_outcome": outcome,
+        },
+        completion_digest=completion_digest,
+        completion_document=completion_receipt,
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    markdown = service.export(report.revision_id, "markdown")
+    assert "### Required objectives" in markdown
+    assert "○ Reach tier\\-1 — Not completed" in markdown
+    assert "■ Reach tier\\-2 — Blocked: the authoritative target state was not resolved" in markdown
+    assert "Failed · No verdict · Infrastructure Failure" in markdown
+    assert "Required objectives unresolved: 2" in markdown
+
+    rendered = service.export(report.revision_id, "html")
+    assert "Required objectives" in rendered
+    assert "Reach tier-1" in rendered
+    assert "Not completed" in rendered
+    assert "Reach tier-2" in rendered
+    assert "Blocked: the authoritative target state was not resolved" in rendered
+    assert "Failed · No verdict · Infrastructure Failure" in rendered
+    assert "2 required objectives unresolved." in rendered
+
+
 def test_explicit_complete_report_rejects_unresolved_required_objectives() -> None:
     service = DurableReportService(Repository())
     with pytest.raises(ValueError, match="required objectives remain unresolved"):

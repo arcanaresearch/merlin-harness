@@ -21,6 +21,7 @@ from merlin_contracts import (
     CampaignOutcomeProjection,
     CampaignTerminalReason,
     CampaignVerdict,
+    ObjectiveProgress,
     assert_candidate_outcome_match,
     candidate_id_for_identity,
     read_campaign_terminal_reason,
@@ -882,6 +883,88 @@ def _target_progress(value: CampaignReportProjection) -> Mapping[str, Any] | Non
     return progress
 
 
+def _objective_progress_rows(
+    value: CampaignReportProjection,
+) -> tuple[tuple[Mapping[str, Any], ...], CampaignOutcomeProjection | None]:
+    """Project the sealed objective checklist used by operator-facing reports."""
+
+    authority = _completion_authority_document(value.completion_document)
+    raw_contract = value.metadata.get("objective_contract")
+    if raw_contract is None:
+        raw_contract = authority.get("objective_contract")
+    objectives = _reviewed_objective_contract(raw_contract)
+    raw_outcome = value.metadata.get("campaign_outcome")
+    if raw_outcome is None:
+        raw_outcome = authority.get("campaign_outcome")
+    outcome = _reviewed_campaign_outcome(raw_outcome)
+    if objectives is None:
+        return (), outcome
+
+    raw_progress = value.metadata.get("objective_progress")
+    if raw_progress is None:
+        raw_progress = authority.get("objective_progress")
+    progress_by_id: dict[str, ObjectiveProgress] = {}
+    if isinstance(raw_progress, Sequence) and not isinstance(raw_progress, (str, bytes)):
+        for raw_item in raw_progress:
+            progress = ObjectiveProgress.model_validate(raw_item)
+            progress_by_id[progress.objective.id] = progress
+
+    rows: list[Mapping[str, Any]] = []
+    for objective in objectives:
+        progress = progress_by_id.get(objective.id)
+        if progress is not None:
+            status = progress.status.value
+            reason = progress.status_reason
+        elif outcome is not None and objective.id in outcome.satisfied_by_campaign_ids:
+            status = "satisfied_by_campaign"
+            reason = None
+        elif outcome is not None and objective.id in outcome.preexisting_objective_ids:
+            status = "preexisting"
+            reason = None
+        elif outcome is not None and objective.id in outcome.waived_objective_ids:
+            status = "waived"
+            reason = None
+        elif outcome is not None and objective.id in outcome.unresolved_objective_ids:
+            status = "unmet"
+            reason = None
+        else:
+            status = "unmet"
+            reason = None
+        rows.append(
+            {
+                "id": objective.id,
+                "description": objective.description,
+                "required": objective.required,
+                "status": status,
+                "status_reason": reason,
+            }
+        )
+    return tuple(rows), outcome
+
+
+def _objective_status_presentation(status: object) -> tuple[str, str, str]:
+    return {
+        "satisfied_by_campaign": ("✓", "Completed", "complete"),
+        "preexisting": ("✓", "Already satisfied", "complete"),
+        "active": ("●", "In progress", "active"),
+        "blocked": ("■", "Blocked", "blocked"),
+        "waived": ("◇", "Waived", "waived"),
+        "indeterminate": ("?", "Indeterminate", "indeterminate"),
+        "unmet": ("○", "Not completed", "unmet"),
+    }.get(str(status), ("?", str(status).replace("_", " ").title(), "indeterminate"))
+
+
+def _campaign_outcome_text(outcome: CampaignOutcomeProjection) -> str:
+    lifecycle = outcome.lifecycle.value.replace("_", " ").title()
+    verdict = (
+        "No verdict"
+        if outcome.verdict is CampaignVerdict.NONE
+        else outcome.verdict.value.replace("_", " ").title()
+    )
+    reason = outcome.end_reason.value.replace("_", " ").title() if outcome.end_reason else ""
+    return " · ".join(item for item in (lifecycle, verdict, reason) if item)
+
+
 def _target_progress_fields(progress: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     fields = progress.get("current_state")
     if not isinstance(fields, (tuple, list)):
@@ -963,6 +1046,8 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
     )
     audience_label = "Customer report" if projection.audience == "customer" else "Internal report"
     target_progress = _target_progress(projection)
+    objective_rows, campaign_outcome = _objective_progress_rows(projection)
+    has_target_progress = bool(target_progress or objective_rows or campaign_outcome)
     lines = [
         f"# Campaign report {projection.campaign_id}",
         "",
@@ -972,7 +1057,7 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
         "",
         "- [Executive summary](#executive-summary)",
         "- [Integrity and provenance](#integrity-and-provenance)",
-        *(("- [Target progress](#target-progress)",) if target_progress else ()),
+        *(("- [Target progress](#target-progress)",) if has_target_progress else ()),
         "- [Coverage](#coverage)",
         "- [Coverage provenance](#coverage-provenance)",
         "- [Language coverage](#language-coverage)",
@@ -1017,36 +1102,69 @@ def _markdown_report(projection: CampaignReportProjection) -> str:
         f"- Completion digest: `{_markdown_code(projection.completion_digest or 'not sealed')}`",
         f"- Source seal: {_markdown_text(projection.source_seal_state)}",
     ]
-    if target_progress is not None:
+    if has_target_progress:
         lines.extend(("", "## Target progress", ""))
-        fields = _target_progress_fields(target_progress)
+        lines.extend(("### Current state", ""))
+        fields = _target_progress_fields(target_progress) if target_progress is not None else ()
         if fields:
             lines.extend(
                 f"- {_markdown_text(_target_progress_field_text(field))}" for field in fields
             )
         else:
-            lines.append("- Target state was not discovered from reviewed observations.")
-        lines.append(
-            f"- Target exchanges observed: {int(target_progress.get('target_exchange_count') or 0)}"
-        )
-        transition = target_progress.get("latest_transition")
-        if isinstance(transition, Mapping):
-            changes = tuple(
-                item
-                for item in transition.get("observations", ())
-                if isinstance(item, Mapping) and "before_value" in item and "after_value" in item
-            )
-            if changes:
-                change = changes[0]
-                lines.append(
-                    "- Latest measured change: "
-                    + _markdown_text(str(change.get("name") or "state").replace("_", " ").title())
-                    + f" {_markdown_text(change['before_value'])} → {_markdown_text(change['after_value'])}"
-                    + f" ({_markdown_text(transition.get('outcome', 'unclear'))})"
-                )
-        if target_progress.get("history_truncated") is True:
             lines.append(
-                "- Evidence window: recent evidence only; older observations are retained durably."
+                "- No authoritative target-state fields were captured from reviewed observations."
+            )
+        if target_progress is not None:
+            lines.append(
+                f"- Target exchanges observed: {int(target_progress.get('target_exchange_count') or 0)}"
+            )
+            transition = target_progress.get("latest_transition")
+            if isinstance(transition, Mapping):
+                changes = tuple(
+                    item
+                    for item in transition.get("observations", ())
+                    if isinstance(item, Mapping)
+                    and "before_value" in item
+                    and "after_value" in item
+                )
+                if changes:
+                    change = changes[0]
+                    lines.append(
+                        "- Latest measured change: "
+                        + _markdown_text(
+                            str(change.get("name") or "state").replace("_", " ").title()
+                        )
+                        + f" {_markdown_text(change['before_value'])} → {_markdown_text(change['after_value'])}"
+                        + f" ({_markdown_text(transition.get('outcome', 'unclear'))})"
+                    )
+            if target_progress.get("history_truncated") is True:
+                lines.append(
+                    "- Evidence window: recent evidence only; older observations are retained durably."
+                )
+        if objective_rows:
+            heading = (
+                "Required objectives"
+                if any(row.get("required") is True for row in objective_rows)
+                else "Campaign objectives"
+            )
+            lines.extend(("", f"### {heading}", ""))
+            for row in objective_rows:
+                icon, status_label, _ = _objective_status_presentation(row.get("status"))
+                reason = str(row.get("status_reason") or "").strip()
+                suffix = f" — {status_label}" + (f": {reason}" if reason else "")
+                lines.append(
+                    f"- {icon} {_markdown_text(row.get('description') or row.get('id'))}"
+                    + _markdown_text(suffix)
+                )
+        if campaign_outcome is not None:
+            lines.extend(
+                (
+                    "",
+                    "### Campaign result",
+                    "",
+                    f"- {_markdown_text(_campaign_outcome_text(campaign_outcome))}",
+                    f"- Required objectives unresolved: {len(campaign_outcome.unresolved_objective_ids)}",
+                )
             )
     lines.extend(("", "## Coverage", ""))
     coverage = _coverage(projection)
@@ -3309,9 +3427,12 @@ def _html_report(
         "The coverage below defines exactly what this statement includes.</p>"
     )
     target_progress = _target_progress(value)
+    objective_rows, campaign_outcome = _objective_progress_rows(value)
     target_progress_html = ""
-    if target_progress is not None:
-        progress_fields = _target_progress_fields(target_progress)
+    if target_progress is not None or objective_rows or campaign_outcome is not None:
+        progress_fields = (
+            _target_progress_fields(target_progress) if target_progress is not None else ()
+        )
         progress_cards = "".join(
             '<div class="metric"><strong>'
             + html.escape(str(field.get("value")))
@@ -3327,10 +3448,13 @@ def _html_report(
         )
         if not progress_cards:
             progress_cards = (
-                '<p class="empty">Target state was not discovered from reviewed observations.</p>'
+                '<p class="empty">No authoritative target-state fields were captured from '
+                "reviewed observations.</p>"
             )
         transition_note = ""
-        transition = target_progress.get("latest_transition")
+        transition = (
+            target_progress.get("latest_transition") if target_progress is not None else None
+        )
         if isinstance(transition, Mapping):
             changes = tuple(
                 item
@@ -3350,15 +3474,66 @@ def _html_report(
                     + html.escape(str(transition.get("outcome") or "unclear"))
                     + "</p>"
                 )
-        exchange_count = int(target_progress.get("target_exchange_count") or 0)
-        evidence_window = " in recent evidence" if target_progress.get("history_truncated") else ""
+        exchange_note = ""
+        if target_progress is not None:
+            exchange_count = int(target_progress.get("target_exchange_count") or 0)
+            evidence_window = (
+                " in recent evidence" if target_progress.get("history_truncated") else ""
+            )
+            exchange_note = (
+                f'<p class="scope-note">{exchange_count} target exchange'
+                f"{'s' if exchange_count != 1 else ''} observed{evidence_window}.</p>"
+            )
+        objective_list = ""
+        if objective_rows:
+            objective_items = "".join(
+                '<li class="objective-row objective-'
+                + _objective_status_presentation(row.get("status"))[2]
+                + '"><span class="objective-icon" aria-hidden="true">'
+                + html.escape(_objective_status_presentation(row.get("status"))[0])
+                + '</span><span class="objective-copy"><strong>'
+                + html.escape(str(row.get("description") or row.get("id") or "Objective"))
+                + '</strong><span class="objective-status">'
+                + html.escape(_objective_status_presentation(row.get("status"))[1])
+                + (
+                    ": " + html.escape(str(row.get("status_reason")))
+                    if str(row.get("status_reason") or "").strip()
+                    else ""
+                )
+                + "</span></span></li>"
+                for row in objective_rows
+            )
+            objective_heading = (
+                "Required objectives"
+                if any(row.get("required") is True for row in objective_rows)
+                else "Campaign objectives"
+            )
+            objective_list = (
+                "<h3>"
+                + objective_heading
+                + '</h3><ul class="objective-list">'
+                + objective_items
+                + "</ul>"
+            )
+        outcome_html = ""
+        if campaign_outcome is not None:
+            unresolved_count = len(campaign_outcome.unresolved_objective_ids)
+            outcome_html = (
+                '<div class="campaign-result"><h3>Campaign result</h3><strong>'
+                + html.escape(_campaign_outcome_text(campaign_outcome))
+                + "</strong><span>"
+                + html.escape(
+                    f"{unresolved_count} required objective"
+                    f"{'s' if unresolved_count != 1 else ''} unresolved."
+                )
+                + "</span></div>"
+            )
         target_progress_html = (
             '<section id="target-progress"><h2>Target progress</h2>'
             '<p class="scope-note">Authoritative state observed from the target during this campaign. '
             "Security findings and target progress are separate measurements.</p>"
-            f'<div class="metrics">{progress_cards}</div>{transition_note}'
-            f'<p class="scope-note">{exchange_count} target exchange'
-            f"{'s' if exchange_count != 1 else ''} observed{evidence_window}.</p></section>"
+            f'<h3>Current state</h3><div class="metrics">{progress_cards}</div>{transition_note}'
+            f"{exchange_note}{objective_list}{outcome_html}</section>"
         )
     coverage_cards = "".join(
         f'<div class="metric"><strong>{count}</strong><span>{label}</span></div>'
@@ -3783,7 +3958,7 @@ def _html_report(
     audience_label = "Customer report" if value.audience == "customer" else "Internal report"
     rendered = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Merlin assessment report</title><style>
 :root{{--ink:#20262d;--muted:#5e6873;--line:#dce1e5;--paper:#fbfbfa;--panel:#f1f3f4;--accent:#a92835;--good:#176b4d;--warn:#885f00;--user:#dce9ff;--assistant:#eceff1}}*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}a{{color:#2458a6}}a:focus-visible,summary:focus-visible{{outline:3px solid #2458a6;outline-offset:3px}}.layout{{display:grid;grid-template-columns:190px minmax(0,820px);gap:48px;max-width:1120px;margin:auto;padding:40px 28px 80px}}nav{{position:sticky;top:24px;align-self:start;border-right:1px solid var(--line);padding-right:20px}}nav strong{{display:block;margin-bottom:10px}}nav a{{display:block;min-height:44px;padding:10px 4px;text-decoration:none}}main{{min-width:0}}header{{padding-bottom:32px;border-bottom:1px solid var(--line)}}.eyebrow{{font-weight:700;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}}h1{{font:600 clamp(34px,4vw,46px)/1.08 ui-serif,Georgia,serif;margin:8px 0}}h2{{font:600 28px/1.2 ui-serif,Georgia,serif;margin:56px 0 18px;padding-top:10px;border-top:1px solid var(--line)}}h3,h4{{margin:0 0 8px}}.target,.meta,.scope-note,.empty{{color:var(--muted)}}.verdict{{border-left:5px solid var(--warn);background:#fff7df;padding:18px 20px;margin-top:22px}}.verdict.success{{border-color:var(--good);background:#eaf6f0}}.verdict.danger{{border-color:var(--accent);background:#fff0f1}}.verdict strong{{display:block;font-size:19px;margin-bottom:4px}}.finding{{background:var(--panel);border-left:4px solid var(--accent);padding:20px;margin:12px 0}}.finding-heading{{display:flex;gap:12px;justify-content:space-between;align-items:start}}.finding-heading span,.outcome{{font-size:13px;font-weight:700;background:white;border:1px solid var(--line);border-radius:999px;padding:3px 8px}}.action-list{{padding-left:22px}}.action-list li{{margin:12px 0}}.action-list span{{display:block;color:var(--muted)}}.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.metric{{background:var(--panel);padding:15px;min-height:92px;min-width:0}}.metric strong,.metric span{{display:block}}.metric strong{{font-size:25px;overflow-wrap:anywhere}}.metric-detail{{display:block;margin-top:6px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}.metric span{{color:var(--muted)}}.scope-note{{max-width:72ch}}.conversations,.turns{{list-style:none;padding:0;margin:0}}.exchange{{border-bottom:1px solid var(--line);padding:18px 0}}.turn{{display:flex;flex-direction:column;align-items:flex-start;margin:12px 0}}.turn.user{{align-items:flex-end}}.speaker{{font-size:12px;font-weight:700;color:var(--muted);margin:0 8px 4px}}.bubble{{max-width:min(75ch,82%);padding:12px 15px;border-radius:16px 16px 16px 4px;background:var(--assistant);white-space:pre-wrap;overflow-wrap:anywhere}}.user .bubble{{background:var(--user);border-radius:16px 16px 4px 16px}}.techniques{{list-style:none;padding:0;display:grid;gap:8px}}.technique{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}}.detail-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}}.detail-card{{background:var(--panel);padding:16px}}.detail-card dt{{font-weight:700}}.detail-card dd{{margin:3px 0 0;color:var(--muted)}}.mobile-nav{{display:none}}@media(max-width:760px){{.layout{{display:block;padding:24px 18px 60px}}nav{{display:none}}.mobile-nav{{display:block;margin:20px 0}}.mobile-nav summary{{min-height:44px;padding:10px;border:1px solid var(--line);cursor:pointer}}.mobile-nav a{{display:block;min-height:44px;padding:10px}}.metrics,.detail-grid{{grid-template-columns:1fr 1fr}}.bubble{{max-width:92%}}h2{{margin-top:44px}}}}@media(max-width:430px){{.metrics,.detail-grid{{grid-template-columns:1fr}}}}@media print{{nav,.mobile-nav{{display:none}}.layout{{display:block;max-width:none;padding:0}}.bubble{{max-width:80%}}}}
-.summary-metrics{{margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}.language-chart{{list-style:none;padding:0;margin:0;display:grid;gap:14px}}.language-row>div:first-child{{display:flex;justify-content:space-between;gap:20px}}.language-row span{{color:var(--muted)}}.coverage-bar{{height:10px;background:#e1e5e8;border-radius:999px;overflow:hidden;margin-top:7px}}.coverage-bar span{{display:block;height:100%;background:var(--good)}}.table-wrap{{overflow-x:auto}}.result-table{{width:100%;border-collapse:collapse;text-align:left}}.result-table th,.result-table td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.result-table thead th{{font-size:13px;color:var(--muted);background:var(--panel)}}.result-table tbody th{{font-weight:600}}@media(max-width:760px){{.summary-metrics{{grid-template-columns:1fr 1fr}}.language-row>div:first-child{{display:block}}}}@media(max-width:430px){{.summary-metrics{{grid-template-columns:1fr}}}}
+.summary-metrics{{margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}.language-chart{{list-style:none;padding:0;margin:0;display:grid;gap:14px}}.language-row>div:first-child{{display:flex;justify-content:space-between;gap:20px}}.language-row span{{color:var(--muted)}}.coverage-bar{{height:10px;background:#e1e5e8;border-radius:999px;overflow:hidden;margin-top:7px}}.coverage-bar span{{display:block;height:100%;background:var(--good)}}.table-wrap{{overflow-x:auto}}.result-table{{width:100%;border-collapse:collapse;text-align:left}}.result-table th,.result-table td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.result-table thead th{{font-size:13px;color:var(--muted);background:var(--panel)}}.result-table tbody th{{font-weight:600}}.objective-list{{list-style:none;padding:0;margin:12px 0 22px;display:grid;gap:8px}}.objective-row{{display:flex;gap:12px;align-items:flex-start;background:var(--panel);border-left:4px solid var(--line);padding:13px 15px}}.objective-icon{{font-size:19px;line-height:1.2;font-weight:700}}.objective-copy,.objective-copy strong,.objective-status,.campaign-result strong,.campaign-result span{{display:block}}.objective-status,.campaign-result span{{color:var(--muted)}}.objective-complete{{border-color:var(--good)}}.objective-active{{border-color:#2458a6}}.objective-blocked{{border-color:var(--warn)}}.objective-unmet,.objective-indeterminate{{border-color:var(--accent)}}.campaign-result{{border-left:5px solid var(--warn);background:#fff7df;padding:16px 18px;margin-top:18px}}@media(max-width:760px){{.summary-metrics{{grid-template-columns:1fr 1fr}}.language-row>div:first-child{{display:block}}}}@media(max-width:430px){{.summary-metrics{{grid-template-columns:1fr}}}}
 .conversation-details{{border:1px solid var(--line);background:#fff;padding:0 16px}}.conversation-details summary{{cursor:pointer;min-height:44px;padding:12px 0;font-weight:700}}.message-time{{display:block;margin:4px 8px 0;color:var(--muted);font-size:11px}}.technique-caption{{margin:18px 8px 2px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}}.hypotheses{{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:minmax(0,1fr);gap:10px}}.hypothesis{{min-width:0;background:var(--panel);padding:14px 16px}}.hypothesis p{{margin:8px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}}
 @media(max-width:760px){{main{{display:flex;flex-direction:column}}.mobile-nav{{order:-1;position:sticky;top:0;z-index:10;margin:0 0 20px;background:var(--paper);border-bottom:1px solid var(--line)}}.mobile-nav summary{{position:relative;padding-right:64px;font-weight:700;background:var(--paper)}}.mobile-nav summary::after{{content:"Menu";position:absolute;right:10px;font-size:12px;color:var(--muted);font-weight:600}}.mobile-nav[open] summary::after{{content:"Close"}}.mobile-nav a{{background:var(--paper);border-top:1px solid var(--line);text-decoration:none}}}}
 :root{{--retryable:#b96657;--unreachable:#7c6aa6;--unresolved:#c9ced3;--partial:#4f7ba6}}.coverage-overview{{display:flex;align-items:center;gap:32px;margin:22px 0}}.coverage-donut{{position:relative;width:190px;aspect-ratio:1;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--good) 0 var(--clear-end),var(--partial) var(--clear-end) var(--partial-end),#d5a234 var(--partial-end) var(--unclear-end),var(--retryable) var(--unclear-end) var(--retryable-end),var(--unreachable) var(--retryable-end) var(--unreachable-end),var(--unresolved) var(--unreachable-end) 100%)}}.coverage-donut::before{{content:"";position:absolute;width:118px;aspect-ratio:1;border-radius:50%;background:var(--paper)}}.coverage-donut span{{position:relative;text-align:center}}.coverage-donut strong,.coverage-donut small{{display:block}}.coverage-donut strong{{font-size:24px}}.coverage-donut small{{color:var(--muted)}}.coverage-legend{{list-style:none;padding:0;margin:0;display:grid;gap:8px}}.coverage-legend i{{display:inline-block;width:11px;height:11px;margin-right:8px;background:var(--unresolved)}}.coverage-legend i.clear{{background:var(--good)}}.coverage-legend i.partial{{background:var(--partial)}}.coverage-legend i.unclear{{background:#d5a234}}.coverage-legend i.retryable{{background:var(--retryable)}}.coverage-legend i.unreachable{{background:var(--unreachable)}}.coverage-legend i.unresolved{{background:var(--unresolved)}}.coverage-bar{{display:flex}}.coverage-bar span{{background:none}}.coverage-bar .clear{{background:var(--good)}}.coverage-bar .partial{{background:var(--partial)}}.coverage-bar .unclear{{background:#d5a234}}.coverage-bar .blocked{{background:var(--unresolved)}}@media(max-width:430px){{.coverage-overview{{align-items:flex-start;flex-direction:column}}}}
