@@ -7996,6 +7996,71 @@ async def test_recon_recall_excludes_auth_or_tenant_mismatch_and_handles_cold_st
 
 
 @pytest.mark.asyncio
+async def test_browser_open_tab_requires_recall_when_durable_recon_exists() -> None:
+    class Recorder:
+        def __init__(self, handoff):
+            self.handoff = handoff
+
+        async def list_handoffs(self, target_id, limit=20):
+            return (self.handoff,) if self.handoff.target_id == target_id else ()
+
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            handoff = ApiReconHandoff(
+                id="handoff:existing",
+                context_id=session.context_id,
+                target_id="target",
+                owner=owner(),
+                method="POST",
+                url=f"{origin}/api/message",
+                request_evidence_ref="evidence:req",
+                response_evidence_ref="evidence:res",
+                adapter='{"interface":"http_api"}',
+                reusable_adapter='{"interface":"http_api"}',
+                reusable_site_facts='{"origin":"target.test"}',
+                recon_scope={"surface": "browser", "agent_or_bot": "support-bot"},
+            )
+            tools = browser_tools(lambda _: session, Recorder(handoff))
+            open_tab = next(item for item in tools if item.describe().name == "browser_open_tab")
+            recall = next(
+                item
+                for item in tools
+                if item.describe().name == "browser_recall_reconnaissance"
+            )
+            context = ToolContext(session_id="s1", workspace_root="/tmp")
+
+            blocked = await open_tab.invoke(context, {"url": origin})
+
+            assert blocked.is_error is True
+            assert blocked.metadata["failure_code"] == "recon_recall_required"
+            assert blocked.metadata["required_tool"] == "browser_recall_reconnaissance"
+            assert blocked.metadata["target_effect_attempted"] is False
+
+            recalled = await recall.invoke(
+                context,
+                {"surface": "browser", "agent_or_bot": "support-bot"},
+            )
+            opened = await open_tab.invoke(context, {"url": origin})
+
+            assert recalled.is_error is False
+            assert opened.is_error is False
+
+
+@pytest.mark.asyncio
 async def test_api_handoff_tool_rejects_ambiguous_adapter_and_fallback_choice() -> None:
     class Recorder:
         async def record_handoff(self, value):

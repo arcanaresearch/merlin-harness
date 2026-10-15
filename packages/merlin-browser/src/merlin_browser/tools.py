@@ -396,6 +396,7 @@ class BrowserTool:
         failure_tracker: dict[tuple[str, ...], int] | None = None,
         network_seen: dict[tuple[str, ...], deque[str]] | None = None,
         state_scope_store: object | None = None,
+        recalled_recon: set[tuple[str, str]] | None = None,
     ) -> None:
         if name not in _SPECS:
             raise ValueError(f"unknown browser tool: {name}")
@@ -405,6 +406,7 @@ class BrowserTool:
         self._failures = failure_tracker if failure_tracker is not None else {}
         self._network_seen = network_seen if network_seen is not None else {}
         self._state_scope_store = state_scope_store
+        self._recalled_recon = recalled_recon
 
     def describe(self) -> ToolSpec:
         kind, properties = _SPECS[self.name][:2]
@@ -443,6 +445,37 @@ class BrowserTool:
                     "target_session_id": f"browser:{session.context_id}",
                 },
             )
+        recall_key = (context.session_id, session.bounds.target_id)
+        handoff_loader = (
+            getattr(self._recorder, "list_handoffs", None)
+            if self._recorder is not None
+            else None
+        )
+        if (
+            kind == "open_tab"
+            and callable(handoff_loader)
+            and self._recalled_recon is not None
+            and recall_key not in self._recalled_recon
+        ):
+            reusable_handoffs = await handoff_loader(session.bounds.target_id)
+            if reusable_handoffs:
+                return ToolResult(
+                    content=(
+                        "durable reconnaissance exists for this target; call "
+                        "browser_recall_reconnaissance once before browser_open_tab so prior "
+                        "evidence can be reused or narrowed"
+                    ),
+                    is_error=True,
+                    metadata={
+                        "effect": self.effect,
+                        "failure_code": "recon_recall_required",
+                        "required_tool": "browser_recall_reconnaissance",
+                        "reusable_handoff_count": len(reusable_handoffs),
+                        "target": session.bounds.target_id,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                    },
+                )
         action_value = _string(arguments.get("url", arguments.get("value")))
         evidence_refs = ["browser-action:sha256:" + uuid4().hex + uuid4().hex]
         if kind == "fill" and arguments.get("connection_probe") is True:
@@ -8488,9 +8521,15 @@ class ReconRecallTool:
     name = "browser_recall_reconnaissance"
     effect = "workspace_read"
 
-    def __init__(self, resolver: BrowserSessionResolver, recorder: BrowserRecorder) -> None:
+    def __init__(
+        self,
+        resolver: BrowserSessionResolver,
+        recorder: BrowserRecorder,
+        recalled_recon: set[tuple[str, str]] | None = None,
+    ) -> None:
         self._resolver = resolver
         self._recorder = recorder
+        self._recalled_recon = recalled_recon
 
     def describe(self) -> ToolSpec:
         properties = {
@@ -8536,6 +8575,8 @@ class ReconRecallTool:
         exact: list[dict[str, object]] = []
         partial: list[dict[str, object]] = []
         handoffs = await self._recorder.list_handoffs(session.bounds.target_id)
+        if self._recalled_recon is not None:
+            self._recalled_recon.add((context.session_id, session.bounds.target_id))
         compatible_tenants = {
             tuple(sorted(_scope_tokens(str(handoff.recon_scope["tenant"]))))
             for handoff in handoffs
@@ -8755,6 +8796,7 @@ def browser_tools(
 ]:
     failures: dict[tuple[str, ...], int] = {}
     network_seen: dict[tuple[str, ...], deque[str]] = {}
+    recalled_recon: set[tuple[str, str]] | None = set() if recorder is not None else None
     actions: tuple[
         BrowserTool
         | BrowserOwnedSessionCleanupTool
@@ -8764,7 +8806,15 @@ def browser_tools(
         | CompiledApiReconHandoffTool,
         ...,
     ] = tuple(
-        BrowserTool(name, resolver, recorder, failures, network_seen, state_scope_store)
+        BrowserTool(
+            name,
+            resolver,
+            recorder,
+            failures,
+            network_seen,
+            state_scope_store,
+            recalled_recon,
+        )
         for name in _SPECS
     )
     actions = (
@@ -8779,7 +8829,7 @@ def browser_tools(
     if recorder is not None:
         actions = (
             *actions,
-            ReconRecallTool(resolver, recorder),
+            ReconRecallTool(resolver, recorder, recalled_recon),
             ApiReconHandoffTool(resolver, recorder),
             CompiledApiReconHandoffTool(resolver, recorder),
         )
