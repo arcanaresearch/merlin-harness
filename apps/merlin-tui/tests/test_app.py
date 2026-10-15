@@ -266,6 +266,93 @@ def test_campaign_status_renders_exhaustive_evidence_without_raw_json() -> None:
     assert '"saturation"' not in rendered
 
 
+def test_campaign_progress_renders_target_state_and_sealed_objectives() -> None:
+    objective = {
+        "id": "operator/cover-tier-range/example",
+        "description": "Cover every tier from 1 through 4",
+        "required": True,
+    }
+    rendered = app_module._render_campaign_progress(  # noqa: SLF001
+        {
+            "campaign_id": "campaign/progress",
+            "status": "executing",
+            "target_progress": {
+                "current_state": (
+                    {"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},
+                ),
+                "target_exchange_count": 19,
+                "freshness": "current",
+            },
+            "objective_contract": {"objectives": (objective,)},
+            "objective_progress": (
+                {"objective": objective, "status": "active", "evidence_refs": ()},
+            ),
+            "campaign_outcome": {
+                "lifecycle": "running",
+                "verdict": "none",
+                "end_reason": None,
+            },
+            "pace": {"elapsed_seconds": 125, "current_wave": {"wave": 7}},
+        }
+    )
+
+    assert "Tier 2/4" in rendered
+    assert "Progress: 0/1 discharged" in rendered
+    assert "Cover every tier from 1 through 4 · in progress" in rendered
+    assert "running · none" in rendered
+    assert "Wave: 7 · elapsed 2m05s" in rendered
+
+
+def test_campaign_status_labels_legacy_objective_tracking() -> None:
+    rendered = app_module._render_campaign_status(  # noqa: SLF001
+        {"status": "executing", "manifest_digest": "sha256:legacy", "waves": ()}
+    )
+
+    assert "Unavailable — this campaign has no sealed objective contract." in rendered
+    assert "Older campaigns predate tracking" in rendered
+
+
+@pytest.mark.asyncio
+async def test_progress_command_resolves_current_campaign_without_copied_id() -> None:
+    class ProgressBackend(DemoBackend):
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/current",
+                    "session-demo",
+                    "Cover Tier 1 through Tier 4",
+                    "recommended",
+                    "executing",
+                    "sha256:reviewed",
+                    target_progress={
+                        "current_state": ({"name": "tier", "label": "Tier", "value": 3},),
+                        "target_exchange_count": 8,
+                        "freshness": "current",
+                    },
+                ),
+            )
+
+        async def campaign_status(self, campaign_id: str) -> object:
+            assert campaign_id == "campaign/current"
+            return {
+                "campaign_id": campaign_id,
+                "status": "executing",
+                "manifest_digest": "sha256:reviewed",
+                "waves": (),
+            }
+
+    app = MerlinApp(ProgressBackend())
+    async with app.run_test() as pilot:
+        await app._run_command("/progress")  # noqa: SLF001
+        await pilot.pause()
+        rendered = str(app.screen.query_one("#overview-content").render())
+
+    assert "Campaign progress" in rendered
+    assert "campaign/current" in rendered
+    assert "Tier 3" in rendered
+    assert "no sealed objective contract" in rendered
+
+
 def test_campaign_status_renders_pace_with_lower_bound_and_estimating_states() -> None:
     rendered = app_module._render_campaign_status(  # noqa: SLF001
         {
@@ -692,7 +779,7 @@ async def test_ctrl_z_exits_without_mouse() -> None:
         ("/", "unknown command"),
         ("/definitely-unknown", "unknown command"),
         ("/mode impossible", "Mode failed"),
-        ("/campaign status", "Usage: /campaign status ID"),
+        ("/progress one two", "Usage: /progress [ID]"),
         ("/campaign cancel one two", "Usage: /campaign status ID"),
         ("/cancel campaign", "Usage: /cancel all|campaign ID|task ID"),
     ),

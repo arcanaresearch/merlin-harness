@@ -114,6 +114,8 @@ COMMANDS = (
     "/agents kill all",
     "/tasks",
     "/campaigns",
+    "/progress",
+    "/progress ID",
     "/campaign status ID",
     "/campaign saturation ID stop|continue|limit N",
     "/campaign message ID GUIDANCE",
@@ -258,6 +260,8 @@ COMMAND_HINTS = {
     "/agents kill all": "stop active campaigns and agents in the current session",
     "/tasks": "inspect the durable task graph",
     "/campaigns": "inspect and stop campaigns in the current session",
+    "/progress": "show target state and required objectives for the current campaign",
+    "/progress ID": "show target state and required objectives for one campaign",
     "/campaign status ID": "show campaign waves, progress, and worker results",
     "/campaign saturation ID stop|continue|limit N": (
         "answer a pending exhaustive-saturation decision"
@@ -4965,6 +4969,13 @@ class MerlinApp(App[None]):
         if command_line.strip() == "/campaigns":
             await self._show_campaigns()
             return
+        if command == "/progress":
+            values = command_line.split()
+            if len(values) <= 2:
+                await self._show_campaign_progress(values[1] if len(values) == 2 else None)
+                return
+            self.query_one("#transcript", RichLog).write("[bold red]✕ Usage: /progress [ID][/]")
+            return
         if command == "/cancel":
             values = command_line.split()
             if values == ["/cancel", "all"]:
@@ -4987,6 +4998,9 @@ class MerlinApp(App[None]):
                 return
             if len(values) == 3 and values[1] == "status":
                 await self._show_campaign_status(values[2])
+                return
+            if values == ["/campaign", "status"]:
+                await self._show_campaign_progress(None)
                 return
             if values[1:2] == ["cancel"] and len(values) <= 3:
                 await self._cancel_campaign(values[2] if len(values) == 3 else "*")
@@ -5182,6 +5196,16 @@ class MerlinApp(App[None]):
     async def _show_campaign_status(self, campaign_id: str) -> None:
         try:
             status = await self.backend.campaign_status(campaign_id)
+            try:
+                campaigns = _campaigns_for_session(
+                    await self.backend.list_campaigns(), self._active_session_id
+                )
+                campaign = next((item for item in campaigns if item.id == campaign_id), None)
+                status = _campaign_status_with_view(status, campaign)
+            except Exception:
+                # Durable status remains useful when the lightweight campaign
+                # projection is temporarily unavailable.
+                pass
             if isinstance(status, Mapping):
                 decision = status.get("saturation_decision")
                 if isinstance(decision, Mapping) and decision.get("state") == "awaiting_operator":
@@ -5193,6 +5217,36 @@ class MerlinApp(App[None]):
         except Exception as exc:
             self.query_one("#transcript", RichLog).write(
                 _transcript_text("✕ Campaign status failed: ", exc, "bold red")
+            )
+
+    async def _show_campaign_progress(self, campaign_id: str | None) -> None:
+        """Show objective and target progress without requiring a copied campaign id."""
+        try:
+            campaigns = _campaigns_for_session(
+                await self.backend.list_campaigns(), self._active_session_id
+            )
+            selected = None
+            if campaign_id is not None:
+                selected = next((item for item in campaigns if item.id == campaign_id), None)
+                if selected is None:
+                    raise KeyError(f"unknown campaign {campaign_id!r} in this session")
+            else:
+                current = _current_campaigns(campaigns)
+                selected = current[0] if current else (campaigns[0] if campaigns else None)
+                if selected is None:
+                    raise ValueError("no campaign is recorded for this session")
+            status = _campaign_status_with_view(
+                await self.backend.campaign_status(selected.id), selected
+            )
+            self.push_screen(
+                OverviewScreen(
+                    f"Campaign progress · {selected.id}",
+                    _render_campaign_progress(status),
+                )
+            )
+        except Exception as exc:
+            self.query_one("#transcript", RichLog).write(
+                _transcript_text("✕ Campaign progress failed: ", exc, "bold red")
             )
 
     async def _poll_saturation_decisions(self) -> None:
@@ -7796,6 +7850,127 @@ def _dynamic_creation_reason(record: Mapping[str, object]) -> str:
     return ""
 
 
+def _campaign_status_with_view(status: object, campaign: CampaignView | None) -> object:
+    """Add lightweight live projection fields to the authoritative status document."""
+    if not isinstance(status, Mapping) or campaign is None:
+        return status
+    merged = dict(status)
+    merged.setdefault("campaign_id", campaign.id)
+    if isinstance(campaign.target_progress, Mapping):
+        merged["target_progress"] = dict(campaign.target_progress)
+    return merged
+
+
+def _objective_progress_lines(status: Mapping[str, object]) -> list[str]:
+    contract = status.get("objective_contract")
+    progress_value = status.get("objective_progress")
+    if not isinstance(contract, Mapping):
+        return [
+            "Required objectives",
+            "  Unavailable — this campaign has no sealed objective contract.",
+            "  Older campaigns predate tracking; start a new campaign to track requirements.",
+        ]
+    objectives_value = contract.get("objectives")
+    objectives = (
+        tuple(item for item in objectives_value if isinstance(item, Mapping))
+        if isinstance(objectives_value, (tuple, list))
+        else ()
+    )
+    progress_items = (
+        tuple(item for item in progress_value if isinstance(item, Mapping))
+        if isinstance(progress_value, (tuple, list))
+        else ()
+    )
+    by_id: dict[str, Mapping[str, object]] = {}
+    for item in progress_items:
+        objective = item.get("objective")
+        if isinstance(objective, Mapping) and objective.get("id"):
+            by_id[str(objective["id"])] = item
+
+    discharged = {"satisfied_by_campaign", "preexisting", "waived"}
+    required = tuple(item for item in objectives if item.get("required", True) is True)
+    completed = sum(
+        1
+        for objective in required
+        if str(by_id.get(str(objective.get("id")), {}).get("status", "unmet")) in discharged
+    )
+    lines = ["Required objectives", f"  Progress: {completed}/{len(required)} discharged"]
+    labels = {
+        "satisfied_by_campaign": ("✓", "satisfied by this campaign"),
+        "preexisting": ("◈", "already satisfied before this campaign"),
+        "blocked": ("✕", "blocked"),
+        "waived": ("~", "waived"),
+        "active": ("●", "in progress"),
+        "indeterminate": ("?", "indeterminate"),
+        "unmet": ("□", "not yet satisfied"),
+    }
+    for objective in objectives:
+        objective_id = str(objective.get("id", ""))
+        item = by_id.get(objective_id, {})
+        state = str(item.get("status", "unmet"))
+        marker, label = labels.get(state, ("?", state.replace("_", " ")))
+        required_label = "" if objective.get("required", True) is True else " · optional"
+        lines.append(
+            f"  {marker} {_short_activity(str(objective.get('description') or objective_id), 96)}"
+            f" · {label}{required_label}"
+        )
+        reason = item.get("status_reason")
+        if reason:
+            lines.append(f"      {_short_activity(str(reason), 104)}")
+    if not objectives:
+        lines.append("  No typed objectives were compiled from the operator request.")
+    return lines
+
+
+def _campaign_outcome_lines(status: Mapping[str, object]) -> list[str]:
+    outcome = status.get("campaign_outcome")
+    if not isinstance(outcome, Mapping):
+        return []
+    lifecycle = str(outcome.get("lifecycle", "unknown")).replace("_", " ")
+    verdict = str(outcome.get("verdict", "none")).replace("_", " ")
+    reason = outcome.get("end_reason")
+    suffix = f" · {str(reason).replace('_', ' ')}" if reason else ""
+    return ["", "Objective outcome", f"  {lifecycle} · {verdict}{suffix}"]
+
+
+def _render_campaign_progress(status: object) -> str:
+    if not isinstance(status, Mapping) and hasattr(status, "__dict__"):
+        status = vars(status)
+    if not isinstance(status, Mapping):
+        return str(status)
+    lines = [
+        "Campaign progress",
+        f"  Campaign: {status.get('campaign_id', 'unknown')}",
+        f"  State: {_campaign_display_status(status.get('status', 'unknown'))}",
+    ]
+    progress = status.get("target_progress")
+    if isinstance(progress, Mapping):
+        lines.extend(("", _render_target_progress(progress).plain))
+    else:
+        lines.extend(
+            (
+                "",
+                "Target progress",
+                "  No reviewed target-state projection is available.",
+            )
+        )
+    lines.extend(("", *_objective_progress_lines(status)))
+    lines.extend(_campaign_outcome_lines(status))
+    pace = status.get("pace")
+    if isinstance(pace, Mapping):
+        current_wave = pace.get("current_wave")
+        wave = current_wave.get("wave") if isinstance(current_wave, Mapping) else None
+        lines.extend(
+            (
+                "",
+                "Execution",
+                f"  Wave: {wave if wave is not None else '?'}"
+                f" · elapsed {_format_duration(pace.get('elapsed_seconds'))}",
+            )
+        )
+    return "\n".join(lines)
+
+
 def _render_campaign_status(status: object) -> str:
     if not isinstance(status, Mapping) and hasattr(status, "__dict__"):
         status = vars(status)
@@ -7806,6 +7981,11 @@ def _render_campaign_status(status: object) -> str:
         "Stop reason: " + (_campaign_stop_reason_label(status.get("stop_reason")) or "not stopped"),
         f"Manifest: {_display_digest(status.get('manifest_digest', 'unknown'))}",
     ]
+    target_progress = status.get("target_progress")
+    if isinstance(target_progress, Mapping):
+        lines.extend(("", _render_target_progress(target_progress).plain))
+    lines.extend(("", *_objective_progress_lines(status)))
+    lines.extend(_campaign_outcome_lines(status))
     composition = status.get("specialist_composition") or status.get("composition_policy")
     if composition:
         lines.append(f"Specialist composition: {composition}")
