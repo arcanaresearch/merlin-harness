@@ -772,6 +772,30 @@ async def test_ctrl_z_exits_without_mouse() -> None:
         assert not app.is_running
 
 
+def test_real_suspend_signal_exits_instead_of_stopping_process(monkeypatch) -> None:
+    suspend = getattr(app_module.signal, "SIGTSTP", None)
+    if suspend is None:
+        pytest.skip("SIGTSTP is not available on this platform")
+    previous = object()
+    installed: list[tuple[object, object]] = []
+    monkeypatch.setattr(app_module.signal, "getsignal", lambda _signal: previous)
+    monkeypatch.setattr(
+        app_module.signal,
+        "signal",
+        lambda target, handler: installed.append((target, handler)),
+    )
+    app = MerlinApp(DemoBackend())
+    app._driver = SimpleNamespace(can_suspend=True)
+
+    app._install_suspend_exit_handler()
+    assert installed[-1][0] == suspend
+    installed[-1][1](suspend, None)
+    assert app._exit is True
+
+    app._restore_suspend_handler()
+    assert installed[-1] == (suspend, previous)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("command", "expected"),

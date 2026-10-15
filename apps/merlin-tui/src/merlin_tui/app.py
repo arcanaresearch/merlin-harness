@@ -5,6 +5,7 @@ import difflib
 import json
 import re
 import shlex
+import signal
 import textwrap
 import time
 import webbrowser
@@ -3942,6 +3943,7 @@ class MerlinApp(App[None]):
         self._scan_summary_report: ReportView | None = None
         self._unmounting = False
         self._active_session_id = ""
+        self._previous_suspend_handler: Any | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="conversation"):
@@ -4003,10 +4005,38 @@ class MerlinApp(App[None]):
         yield Static("ready · /help for commands", id="status")
 
     def on_mount(self) -> None:
+        self._install_suspend_exit_handler()
         composer = self.query_one("#composer", Composer)
         composer.focus()
         self.set_interval(0.12, self._refresh_work_indicator)
         self._spawn(self._initialize_foreground())
+
+    def _install_suspend_exit_handler(self) -> None:
+        """Turn a real terminal Ctrl+Z signal into the advertised clean exit."""
+        suspend = getattr(signal, "SIGTSTP", None)
+        driver = getattr(self, "_driver", None)
+        if suspend is None or driver is None or not driver.can_suspend:
+            return
+        try:
+            self._previous_suspend_handler = signal.getsignal(suspend)
+            signal.signal(suspend, self._exit_on_suspend_signal)
+        except (OSError, ValueError):
+            self._previous_suspend_handler = None
+
+    def _exit_on_suspend_signal(self, _signum: int, _frame: Any) -> None:
+        """Exit instead of letting Textual convert SIGTSTP into SIGSTOP."""
+        self.action_quit_app()
+
+    def _restore_suspend_handler(self) -> None:
+        suspend = getattr(signal, "SIGTSTP", None)
+        previous = self._previous_suspend_handler
+        self._previous_suspend_handler = None
+        if suspend is None or previous is None:
+            return
+        try:
+            signal.signal(suspend, previous)
+        except (OSError, ValueError):
+            pass
 
     async def _initialize_foreground(self) -> None:
         if not await self._acquire_foreground_lease():
@@ -6504,38 +6534,41 @@ class MerlinApp(App[None]):
     async def on_unmount(self) -> None:
         self._unmounting = True
         try:
-            draft = self.query_one("#composer", Composer).text
-        except NoMatches:
-            draft = ""
-        self._save_client_state(draft)
-        tasks = tuple(self._background_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._background_tasks.clear()
-        console = getattr(self, "_web_console", None)
-        if console:
-            await console.close()
-        shutdown = getattr(self.backend, "shutdown", None)
-        cleanup = shutdown if callable(shutdown) else self.backend.close
-        cleanup_task = asyncio.create_task(cleanup())
-        try:
-            async with asyncio.timeout(_SHUTDOWN_TIMEOUT_SECONDS):
-                await asyncio.shield(cleanup_task)
-        except TimeoutError:
-            cleanup_task.cancel()
             try:
-                async with asyncio.timeout(_SHUTDOWN_CANCEL_SECONDS):
-                    await asyncio.gather(cleanup_task, return_exceptions=True)
+                draft = self.query_one("#composer", Composer).text
+            except NoMatches:
+                draft = ""
+            self._save_client_state(draft)
+            tasks = tuple(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.clear()
+            console = getattr(self, "_web_console", None)
+            if console:
+                await console.close()
+            shutdown = getattr(self.backend, "shutdown", None)
+            cleanup = shutdown if callable(shutdown) else self.backend.close
+            cleanup_task = asyncio.create_task(cleanup())
+            try:
+                async with asyncio.timeout(_SHUTDOWN_TIMEOUT_SECONDS):
+                    await asyncio.shield(cleanup_task)
             except TimeoutError:
-                pass
-            self.log.error(
-                f"runtime cleanup exceeded the {_SHUTDOWN_TIMEOUT_SECONDS:.1f} "
-                "second shutdown deadline"
-            )
-        except Exception as exc:
-            self.log.error("runtime cleanup reported errors: " + _scrub_secrets(str(exc)))
+                cleanup_task.cancel()
+                try:
+                    async with asyncio.timeout(_SHUTDOWN_CANCEL_SECONDS):
+                        await asyncio.gather(cleanup_task, return_exceptions=True)
+                except TimeoutError:
+                    pass
+                self.log.error(
+                    f"runtime cleanup exceeded the {_SHUTDOWN_TIMEOUT_SECONDS:.1f} "
+                    "second shutdown deadline"
+                )
+            except Exception as exc:
+                self.log.error("runtime cleanup reported errors: " + _scrub_secrets(str(exc)))
+        finally:
+            self._restore_suspend_handler()
 
 
 def _entry_style(kind: str) -> str:
