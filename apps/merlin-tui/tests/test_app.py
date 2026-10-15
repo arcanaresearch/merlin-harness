@@ -2360,6 +2360,52 @@ async def test_setup_masks_secret_and_never_renders_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_setup_reconnects_daemon_before_accepting_another_prompt(
+    monkeypatch,
+) -> None:
+    class ReconnectingBackend(DemoBackend):
+        reconnected = False
+
+        async def configure_provider(
+            self,
+            base_url,
+            model,
+            api_key,
+            vision=False,
+            context_window_tokens=None,
+            effort="default",
+        ):  # noqa: ANN001, ANN202
+            return "Provider configuration saved securely; restart Merlin to reconnect."
+
+        async def apply_saved_model_routing(self):  # noqa: ANN202
+            self.reconnected = True
+            return "Daemon reconnected automatically; new campaigns use this provider."
+
+    backend = ReconnectingBackend()
+    app = build_app(backend)
+    writes = []
+    monkeypatch.setattr(
+        RichLog,
+        "write",
+        lambda _self, value, *args, **kwargs: writes.append(str(value)),
+    )
+    async with app.run_test() as pilot:
+        await app._configure_provider(
+            ProviderSetup(
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+                "opaque-secret",
+            )
+        )
+        await pilot.pause()
+
+        assert backend.reconnected is True
+        transcript = "".join(writes)
+        assert "Daemon reconnected automatically" in transcript
+        assert "restart Merlin to reconnect" not in transcript
+
+
+@pytest.mark.asyncio
 async def test_setup_jev_key_entry_saves_token_without_leaking_it(monkeypatch) -> None:
     secret = "jev-secret-value"
     saved = []

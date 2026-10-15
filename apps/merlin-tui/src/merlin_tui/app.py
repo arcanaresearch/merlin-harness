@@ -6086,6 +6086,10 @@ class MerlinApp(App[None]):
                 setup.context_window_tokens,
                 setup.effort,
             )
+            apply_saved = getattr(self.backend, "apply_saved_model_routing", None)
+            if callable(apply_saved):
+                reconnect_message = await apply_saved()
+                message = f"Provider configuration saved securely. {reconnect_message}"
             self.query_one("#transcript", RichLog).write(_transcript_text("", message, "green"))
             self.push_screen(
                 ChoiceScreen(
