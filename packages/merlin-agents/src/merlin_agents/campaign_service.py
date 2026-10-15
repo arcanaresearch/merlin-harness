@@ -1430,6 +1430,213 @@ class LeadAssessment:
     plan_update: LeadPlanUpdate | None = None
     automation_requests: tuple[LeadAutomationRequest, ...] = ()
     finish_current_work: bool = False
+    task_reviews: tuple[IncrementalTaskReview, ...] = ()
+    candidate_priorities: tuple[CandidatePriorityRecommendation, ...] = ()
+    objective_progress: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePriorityRecommendation:
+    candidate_id: str
+    score: float
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id.strip() or not self.reason.strip():
+            raise ValueError("candidate priority recommendation fields cannot be blank")
+        if isinstance(self.score, bool) or not math.isfinite(self.score):
+            raise ValueError("candidate priority score must be finite")
+        if not 0.0 <= self.score <= 1.0:
+            raise ValueError("candidate priority score must be between zero and one")
+
+
+@dataclass(frozen=True, slots=True)
+class IncrementalTaskReview:
+    task_id: str
+    evidence_digest: str
+    summary: str
+    signal: str
+    confidence: float
+    findings: tuple[Mapping[str, object], ...] = ()
+    objective_progress: tuple[Mapping[str, object], ...] = ()
+    hypotheses: tuple[LeadFollowUp, ...] = ()
+    candidate_priorities: tuple[CandidatePriorityRecommendation, ...] = ()
+    usage: Mapping[str, int | float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.task_id.strip() or not self.evidence_digest.strip() or not self.summary.strip():
+            raise ValueError("incremental task review identity and summary cannot be blank")
+        if self.signal not in {
+            "positive",
+            "negative",
+            "ambiguous",
+            "blocked",
+            "infrastructure",
+        }:
+            raise ValueError("incremental task review signal is invalid")
+        if isinstance(self.confidence, bool) or not math.isfinite(self.confidence):
+            raise ValueError("incremental task review confidence must be finite")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("incremental task review confidence must be between zero and one")
+
+
+def _lead_followup_projection(value: LeadFollowUp) -> Mapping[str, object]:
+    return cast(Mapping[str, object], _json_value(asdict(value)))
+
+
+def _lead_followup_from_projection(value: Mapping[str, object]) -> LeadFollowUp:
+    hypothesis_value = value.get("hypothesis")
+    hypothesis = None
+    if isinstance(hypothesis_value, Mapping):
+        hypothesis = FrontierHypothesis(
+            surface=str(hypothesis_value.get("surface") or ""),
+            assertion=str(hypothesis_value.get("assertion") or ""),
+            oracle=str(hypothesis_value.get("oracle") or ""),
+            novelty_basis=str(hypothesis_value.get("novelty_basis") or ""),
+            oracle_contract=(
+                dict(hypothesis_value["oracle_contract"])
+                if isinstance(hypothesis_value.get("oracle_contract"), Mapping)
+                else None
+            ),
+            target_id=str(hypothesis_value.get("target_id") or ""),
+            scenario_fingerprint=str(hypothesis_value.get("scenario_fingerprint") or ""),
+        )
+    return LeadFollowUp(
+        profile_id=str(value.get("profile_id") or ""),
+        objective=str(value.get("objective") or ""),
+        source_task_ids=tuple(str(item) for item in value.get("source_task_ids", ())),
+        hypothesis=hypothesis,
+        arm=dict(value["arm"]) if isinstance(value.get("arm"), Mapping) else None,
+        evaluation_uncertainties=tuple(
+            dict(item)
+            for item in value.get("evaluation_uncertainties", ())
+            if isinstance(item, Mapping)
+        ),
+    )
+
+
+def _incremental_task_review_projection(
+    value: IncrementalTaskReview,
+) -> Mapping[str, object]:
+    return {
+        "task_id": value.task_id,
+        "evidence_digest": value.evidence_digest,
+        "summary": value.summary,
+        "signal": value.signal,
+        "confidence": value.confidence,
+        "findings": tuple(_json_value(item) for item in value.findings),
+        "objective_progress": tuple(_json_value(item) for item in value.objective_progress),
+        "hypotheses": tuple(_lead_followup_projection(item) for item in value.hypotheses),
+        "candidate_priorities": tuple(asdict(item) for item in value.candidate_priorities),
+        "usage": dict(value.usage),
+    }
+
+
+def _incremental_task_review_from_projection(
+    value: Mapping[str, object],
+) -> IncrementalTaskReview:
+    return IncrementalTaskReview(
+        task_id=str(value.get("task_id") or ""),
+        evidence_digest=str(value.get("evidence_digest") or ""),
+        summary=str(value.get("summary") or ""),
+        signal=str(value.get("signal") or ""),
+        confidence=float(value.get("confidence") or 0.0),
+        findings=tuple(
+            dict(item) for item in value.get("findings", ()) if isinstance(item, Mapping)
+        ),
+        objective_progress=tuple(
+            dict(item) for item in value.get("objective_progress", ()) if isinstance(item, Mapping)
+        ),
+        hypotheses=tuple(
+            _lead_followup_from_projection(item)
+            for item in value.get("hypotheses", ())
+            if isinstance(item, Mapping)
+        ),
+        candidate_priorities=tuple(
+            CandidatePriorityRecommendation(
+                candidate_id=str(item.get("candidate_id") or ""),
+                score=float(item.get("score") or 0.0),
+                reason=str(item.get("reason") or ""),
+            )
+            for item in value.get("candidate_priorities", ())
+            if isinstance(item, Mapping)
+        ),
+        usage={
+            str(key): cast(int | float, item)
+            for key, item in (
+                value.get("usage", {}).items() if isinstance(value.get("usage"), Mapping) else ()
+            )
+            if isinstance(item, (int, float)) and not isinstance(item, bool)
+        },
+    )
+
+
+def _incremental_review_evidence_digest(task: AgentTask, evidence: Mapping[str, object]) -> str:
+    body = json.dumps(
+        {
+            "task_id": task.id,
+            "status": task.status,
+            "result": task.result or "",
+            "technique_ids": task.technique_ids,
+            "evidence": _json_value(evidence),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+
+
+def _incremental_review_result(value: str | None) -> Mapping[str, object]:
+    text = value or ""
+    limit = 12_000
+    digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    if len(text) <= limit:
+        return {"text": text, "characters": len(text), "digest": digest, "truncated": False}
+    head = limit * 3 // 4
+    tail = limit - head
+    return {
+        "text": text[:head] + "\n...[middle omitted]...\n" + text[-tail:],
+        "characters": len(text),
+        "digest": digest,
+        "truncated": True,
+    }
+
+
+def _incremental_review_fallback(
+    reviews: tuple[IncrementalTaskReview, ...],
+) -> LeadAssessment:
+    priority_by_id: dict[str, CandidatePriorityRecommendation] = {}
+    followups: list[LeadFollowUp] = []
+    followup_keys: set[tuple[object, ...]] = set()
+    objective_progress: list[Mapping[str, object]] = []
+    for review in reviews:
+        for priority in review.candidate_priorities:
+            current = priority_by_id.get(priority.candidate_id)
+            if current is None or priority.score > current.score:
+                priority_by_id[priority.candidate_id] = priority
+        for followup in review.hypotheses:
+            key = (
+                followup.profile_id,
+                followup.objective,
+                followup.source_task_ids,
+                None if followup.hypothesis is None else followup.hypothesis.id,
+            )
+            if key not in followup_keys:
+                followup_keys.add(key)
+                followups.append(followup)
+        objective_progress.extend(review.objective_progress)
+    return LeadAssessment(
+        summary=(
+            "Incremental task reviews completed; the merge provider failed, so the next "
+            "wave uses the union of their typed recommendations."
+        ),
+        coverage_complete=False,
+        followups=tuple(followups),
+        task_reviews=reviews,
+        candidate_priorities=tuple(priority_by_id[key] for key in sorted(priority_by_id)),
+        objective_progress=tuple(objective_progress),
+    )
 
 
 class _OperatorDrainComplete(Exception):
@@ -1555,6 +1762,20 @@ CampaignLeadRunner = (
         Awaitable[LeadAssessment],
     ]
 )
+IncrementalTaskReviewRunner = Callable[
+    [str, CampaignProfile, int, AgentTask, Mapping[str, object]],
+    Awaitable[IncrementalTaskReview],
+]
+IncrementalReviewMergeRunner = Callable[
+    [
+        str,
+        CampaignProfile,
+        int,
+        tuple[IncrementalTaskReview, ...],
+        Mapping[str, object],
+    ],
+    Awaitable[LeadAssessment],
+]
 ExplorationReviewRunner = Callable[
     [str, CampaignProfile, int, LeadFollowUp, Mapping[str, Mapping[str, object]]],
     Awaitable[tuple[ExplorationCriticDecision, ExplorationExperimentPlan | None]],
@@ -1603,6 +1824,8 @@ class CampaignService:
         arm_trial_min_attempts: int = DEFAULT_TRIAL_MIN_ATTEMPTS,
         refusal_judge: RefusalJudge | None = None,
         state_scope_store: Any | None = None,
+        task_review_runner: IncrementalTaskReviewRunner | None = None,
+        review_merge_runner: IncrementalReviewMergeRunner | None = None,
     ) -> None:
         if stalled_after_seconds <= 0:
             raise ValueError("campaign stall interval must be positive")
@@ -1657,6 +1880,8 @@ class CampaignService:
         self._arm_trial_min_attempts = arm_trial_min_attempts
         self._refusal_judge = refusal_judge
         self._state_scope_store = state_scope_store
+        self._task_review_runner = task_review_runner
+        self._review_merge_runner = review_merge_runner
         # Judgments are advisory and cached per evidence digest so repeated
         # status() projections never re-run a model call for the same evidence.
         self._judgment_cache: dict[str, RefusalJudgment | None] = {}
@@ -4737,6 +4962,9 @@ class CampaignService:
                 live_assessment = (
                     None
                     if terminal_frontier_batch
+                    and (
+                        self._task_review_runner is None or self._review_merge_runner is None
+                    )
                     else await self._monitor_live(campaign_id, manifest, initial_wave, live)
                 )
             # Monitoring can span the entire worker run.  The projection loaded
@@ -4875,6 +5103,13 @@ class CampaignService:
                     tasks,
                     manifest=manifest,
                     transition_lease=transition_lease,
+                )
+                # Incremental semantic reviewers finish while sibling workers are
+                # still running. Their typed merge is now available at this exact
+                # transition boundary, so its candidate recommendations can steer
+                # the next durable claim without removing any queued coverage.
+                await self._apply_incremental_review_priorities(
+                    campaign_id, initial_wave, live_assessment
                 )
                 frontier_retry_available = bool(
                     frontier_counts is not None
@@ -10046,6 +10281,252 @@ class CampaignService:
                 return
             await asyncio.sleep(wait)
 
+    async def _incremental_review_context(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        wave: int,
+        schedule_id: str,
+        task: AgentTask,
+        tasks: tuple[AgentTask, ...],
+    ) -> Mapping[str, object]:
+        evidence = await self._source_evidence(schedule_id, (task,))
+        task_evidence = evidence.get(task.id, {})
+        evidence_digest = _incremental_review_evidence_digest(task, task_evidence)
+        target_progress: Mapping[str, object] = {}
+        try:
+            target_progress = await self.target_progress(campaign_id, manifest.target.id)
+        except Exception:  # noqa: BLE001 - review context may degrade without hiding work
+            _LOGGER.exception("incremental target progress failed for %s", campaign_id)
+        history_loader = getattr(self._store, "list_technique_attempts", None)
+        history = (
+            tuple(await asyncio.to_thread(history_loader, campaign_id))
+            if callable(history_loader)
+            else ()
+        )
+        technique_ids = set(task.technique_ids)
+        nearby_history = tuple(
+            _json_value(item)
+            for item in history
+            if isinstance(item, Mapping)
+            and (
+                str(item.get("technique_id") or "") in technique_ids
+                or str(item.get("task_id") or "") == task.id
+            )
+        )[-16:]
+        counts_loader = getattr(self._store, "frontier_counts", None)
+        frontier_counts = (
+            await asyncio.to_thread(counts_loader, campaign_id) if callable(counts_loader) else {}
+        )
+        shortlist_loader = getattr(self._store, "list_frontier_shortlist", None)
+        shortlist = (
+            tuple(await asyncio.to_thread(shortlist_loader, campaign_id, 32))
+            if callable(shortlist_loader)
+            else ()
+        )
+        return {
+            "review_contract": "merlin.incremental-task-review.v1",
+            "schedule_id": schedule_id,
+            "task": {
+                "id": task.id,
+                "objective": task.objective,
+                "status": task.status,
+                "technique_ids": task.technique_ids,
+                "result": _incremental_review_result(task.result),
+            },
+            "evidence_digest": evidence_digest,
+            "evidence_delta": _json_value(task_evidence),
+            "campaign_objective": manifest.objective,
+            "objective_contract": _json_value(manifest.objective_contract or {}),
+            "target_state": _json_value(target_progress),
+            "nearby_technique_history": nearby_history,
+            "campaign_summary": {
+                "profile": manifest.profile.value,
+                "wave": wave,
+                "task_counts": {
+                    status: sum(item.status == status for item in tasks)
+                    for status in {
+                        "queued",
+                        "ready",
+                        "leased",
+                        "running",
+                        "completed",
+                        "failed",
+                        "quarantined",
+                        "cancelled",
+                    }
+                },
+                "frontier": _json_value(frontier_counts),
+            },
+            "next_candidate_shortlist": tuple(
+                {
+                    "id": str(item.get("id") or ""),
+                    "family_id": str(item.get("family_id") or ""),
+                    "requested_language": str(item.get("requested_language") or ""),
+                    "variant_id": str(item.get("variant_id") or ""),
+                    "variant": _json_value(item.get("variant") or {}),
+                    "priority": item.get("priority"),
+                }
+                for item in shortlist
+                if isinstance(item, Mapping)
+            ),
+        }
+
+    async def _review_terminal_task(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        wave: int,
+        schedule_id: str,
+        task: AgentTask,
+        tasks: tuple[AgentTask, ...],
+    ) -> IncrementalTaskReview:
+        assert self._task_review_runner is not None
+        context = await self._incremental_review_context(
+            campaign_id, manifest, wave, schedule_id, task, tasks
+        )
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "incremental_task_review_started",
+                "schedule_id": schedule_id,
+                "task_id": task.id,
+                "evidence_digest": context["evidence_digest"],
+                "state": "reviewing",
+                "blocking": False,
+                "advisory": True,
+            },
+        )
+        started = time.monotonic()
+        try:
+            review = await self._task_review_runner(
+                campaign_id, manifest.profile, wave, task, context
+            )
+        except BaseException as error:
+            await asyncio.to_thread(
+                self._store.append_lead,
+                campaign_id,
+                wave,
+                {
+                    "kind": "incremental_task_review_failed",
+                    "schedule_id": schedule_id,
+                    "task_id": task.id,
+                    "evidence_digest": context["evidence_digest"],
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+                    "state": "cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                },
+            )
+            raise
+        if review.task_id != task.id or review.evidence_digest != context["evidence_digest"]:
+            raise CampaignLeadDecisionError(
+                "incremental task review identity does not match its sealed evidence"
+            )
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "incremental_task_review_completed",
+                "schedule_id": schedule_id,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "review": _incremental_task_review_projection(review),
+                "state": "completed",
+                "blocking": False,
+                "advisory": True,
+                "usage": dict(review.usage),
+            },
+        )
+        return review
+
+    async def _merge_incremental_reviews(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        wave: int,
+        reviews: tuple[IncrementalTaskReview, ...],
+        context: Mapping[str, object],
+    ) -> LeadAssessment | None:
+        if not reviews or self._review_merge_runner is None:
+            return None
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "incremental_review_merge_started",
+                "schedule_id": str(context.get("schedule_id") or ""),
+                "task_ids": tuple(review.task_id for review in reviews),
+                "review_count": len(reviews),
+                "state": "reviewing",
+                "blocking": True,
+                "advisory": False,
+                "waiting_for": "typed review merge before selecting the next wave",
+            },
+        )
+        started = time.monotonic()
+        assessment = await self._review_merge_runner(
+            campaign_id, manifest.profile, wave, reviews, context
+        )
+        assessment = replace(assessment, task_reviews=reviews)
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "incremental_review_merge_completed",
+                "schedule_id": str(context.get("schedule_id") or ""),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "review_count": len(reviews),
+                "summary": assessment.summary,
+                "objective_progress": tuple(
+                    _json_value(item) for item in assessment.objective_progress
+                ),
+                "candidate_priorities": tuple(
+                    asdict(item) for item in assessment.candidate_priorities
+                ),
+                "followups": tuple(
+                    _lead_followup_projection(item) for item in assessment.followups
+                ),
+                "usage": dict(assessment.usage),
+                "state": "completed",
+                "blocking": False,
+                "advisory": False,
+            },
+        )
+        return assessment
+
+    async def _apply_incremental_review_priorities(
+        self,
+        campaign_id: str,
+        wave: int,
+        assessment: LeadAssessment | None,
+    ) -> None:
+        if assessment is None or not assessment.candidate_priorities:
+            return
+        priorities = {item.candidate_id: item.score for item in assessment.candidate_priorities}
+        writer = getattr(self._store, "update_frontier_priorities", None)
+        updated = (
+            await asyncio.to_thread(writer, campaign_id, priorities) if callable(writer) else 0
+        )
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "incremental_review_priorities_applied",
+                "recommended": len(priorities),
+                "updated": updated,
+                "recommendations": tuple(asdict(item) for item in assessment.candidate_priorities),
+                "policy": (
+                    "semantic review changes queued-candidate ordering only; every admitted "
+                    "candidate remains eligible"
+                ),
+            },
+        )
+
     async def _monitor_live(
         self,
         campaign_id: str,
@@ -10056,6 +10537,45 @@ class CampaignService:
         if live.execution is None:
             return None
         draining = await self._restore_operator_drain(campaign_id, wave, live)
+        initial_frontier_batch = await self._frontier_batch_for_schedule(campaign_id, str(live.id))
+        incremental_review_enabled = bool(
+            isinstance(initial_frontier_batch, Mapping)
+            and initial_frontier_batch.get("id")
+            and self._task_review_runner is not None
+            and self._review_merge_runner is not None
+        )
+        incremental_reviews: dict[str, IncrementalTaskReview] = {}
+        incremental_review_tasks: dict[str, asyncio.Task[IncrementalTaskReview]] = {}
+        monitor_task = asyncio.current_task()
+        if monitor_task is not None:
+
+            def cancel_outstanding_reviews(_: asyncio.Task[object]) -> None:
+                for review_task in incremental_review_tasks.values():
+                    if not review_task.done():
+                        review_task.cancel()
+
+            monitor_task.add_done_callback(cancel_outstanding_reviews)
+        if incremental_review_enabled:
+            lead_loader = getattr(self._store, "list_lead", None)
+            lead_rows = (
+                tuple(await asyncio.to_thread(lead_loader, campaign_id))
+                if callable(lead_loader)
+                else ()
+            )
+            for row in lead_rows:
+                payload = row.get("payload") if isinstance(row, Mapping) else None
+                review_value = payload.get("review") if isinstance(payload, Mapping) else None
+                if (
+                    isinstance(payload, Mapping)
+                    and payload.get("kind") == "incremental_task_review_completed"
+                    and str(payload.get("schedule_id") or "") == str(live.id)
+                    and isinstance(review_value, Mapping)
+                ):
+                    try:
+                        restored = _incremental_task_review_from_projection(review_value)
+                    except (TypeError, ValueError):
+                        continue
+                    incremental_reviews[restored.task_id] = restored
         last_projection: tuple[object, ...] | None = None
         last_lead_terminal: tuple[tuple[str, str], ...] | None = None
         latest: LeadAssessment | None = None
@@ -10071,6 +10591,30 @@ class CampaignService:
         frontier_review_deferred = False
         while not live.execution.done():
             tasks = tuple(await self._agents.list_schedule_tasks(live.id))
+            if incremental_review_enabled:
+                for task in tasks:
+                    if (
+                        task.status
+                        in {
+                            "completed",
+                            "failed",
+                            "quarantined",
+                            "cancelled",
+                            "interrupted",
+                        }
+                        and task.id not in incremental_reviews
+                        and task.id not in incremental_review_tasks
+                    ):
+                        incremental_review_tasks[task.id] = asyncio.create_task(
+                            self._review_terminal_task(
+                                campaign_id,
+                                manifest,
+                                wave,
+                                str(live.id),
+                                task,
+                                tasks,
+                            )
+                        )
             pending_guidance = await self._pending_operator_guidance(campaign_id)
             guidance_ids = tuple(item.get("guidance_id") for item in pending_guidance)
             guidance_due = bool(guidance_ids) and guidance_ids != last_operator_guidance
@@ -10124,27 +10668,22 @@ class CampaignService:
                     else ()
                 )
                 terminal_wave = bool(tasks) and len(terminal_projection) == len(tasks)
-                frontier_batch = await self._frontier_batch_for_schedule(
-                    campaign_id, str(live.id)
-                )
+                frontier_batch = await self._frontier_batch_for_schedule(campaign_id, str(live.id))
                 frontier_schedule = bool(
                     isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
                 )
-                # An execution-frontier batch has a deterministic reducer:
-                # _supervise records attribution/ARM outcomes, settles the batch, and
-                # either starts its durable successor or falls through to the Lead when
-                # no successor exists. Automatic mid-wave review would block the
-                # monitor from observing completion, then become stale; terminal review
-                # would duplicate the deterministic reduction. Operator guidance and
-                # worker coordination remain semantic gates and still receive an
-                # immediate Lead assessment.
+                # Frontier task reviews are launched above as soon as each task
+                # becomes terminal. They read a compact immutable evidence delta
+                # and overlap with still-running workers. The old whole-wave Lead
+                # call remains suppressed here; one typed merge runs at the wave
+                # boundary after the independent reviews are ready.
                 frontier_transition_ready = bool(
                     terminal_wave
                     and frontier_schedule
                     and not pending_messages
                     and not pending_guidance
                 )
-                if frontier_transition_ready:
+                if frontier_transition_ready and not incremental_review_enabled:
                     if not frontier_review_deferred:
                         await asyncio.to_thread(
                             self._store.append_lead,
@@ -10295,9 +10834,85 @@ class CampaignService:
             await self._durable_progress_projection(live.id),
         )
         frontier_batch = await self._frontier_batch_for_schedule(campaign_id, str(live.id))
-        frontier_schedule = bool(
-            isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
-        )
+        frontier_schedule = bool(isinstance(frontier_batch, Mapping) and frontier_batch.get("id"))
+        if frontier_schedule and incremental_review_enabled:
+            for task in tasks:
+                if (
+                    task.status
+                    in {
+                        "completed",
+                        "failed",
+                        "quarantined",
+                        "cancelled",
+                        "interrupted",
+                    }
+                    and task.id not in incremental_reviews
+                    and task.id not in incremental_review_tasks
+                ):
+                    incremental_review_tasks[task.id] = asyncio.create_task(
+                        self._review_terminal_task(
+                            campaign_id,
+                            manifest,
+                            wave,
+                            str(live.id),
+                            task,
+                            tasks,
+                        )
+                    )
+            if incremental_review_tasks:
+                completed = await asyncio.gather(
+                    *incremental_review_tasks.values(), return_exceptions=True
+                )
+                for task_id, value in zip(incremental_review_tasks, completed, strict=True):
+                    if isinstance(value, IncrementalTaskReview):
+                        incremental_reviews[task_id] = value
+            ordered_reviews = tuple(
+                incremental_reviews[task.id] for task in tasks if task.id in incremental_reviews
+            )
+            if ordered_reviews:
+                merge_source = next(
+                    (task for task in tasks if task.id == ordered_reviews[-1].task_id),
+                    tasks[-1],
+                )
+                full_context = await self._incremental_review_context(
+                    campaign_id,
+                    manifest,
+                    wave,
+                    str(live.id),
+                    merge_source,
+                    tasks,
+                )
+                merge_context = {
+                    key: value
+                    for key, value in full_context.items()
+                    if key not in {"task", "evidence_delta", "evidence_digest"}
+                }
+                try:
+                    latest = await self._merge_incremental_reviews(
+                        campaign_id,
+                        manifest,
+                        wave,
+                        ordered_reviews,
+                        merge_context,
+                    )
+                except Exception as error:  # noqa: BLE001 - preserve reviewed task guidance
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        wave,
+                        {
+                            "kind": "incremental_review_merge_failed",
+                            "schedule_id": str(live.id),
+                            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+                            "reason": str(error),
+                            "review_count": len(ordered_reviews),
+                            "state": "failed",
+                            "blocking": False,
+                            "advisory": True,
+                        },
+                    )
+                    latest = _incremental_review_fallback(ordered_reviews)
+            return latest
         if projection != last_projection and not frontier_schedule:
             try:
                 latest = await self._assess_and_journal(campaign_id, manifest, wave, tasks)
@@ -17434,10 +18049,85 @@ class CampaignService:
                 "lead_review_completed",
                 "lead_review_stale",
                 "lead_review_failed",
+                "incremental_task_review_started",
+                "incremental_task_review_completed",
+                "incremental_task_review_failed",
+                "incremental_review_merge_started",
+                "incremental_review_merge_completed",
+                "incremental_review_merge_failed",
             }
         ]
         review_progress: dict[str, object] = {}
-        if review_events:
+        incremental_events = [
+            event
+            for event in review_events
+            if str(event.get("kind") or "").startswith("incremental_")
+            and (event.get("schedule_id") in {None, str(latest.get("schedule_id") or "")})
+        ]
+        if incremental_events:
+            started_tasks = {
+                str(event.get("task_id"))
+                for event in incremental_events
+                if event.get("kind") == "incremental_task_review_started"
+            }
+            finished_tasks = {
+                str(
+                    event.get("task_id")
+                    or (
+                        event.get("review", {}).get("task_id")
+                        if isinstance(event.get("review"), Mapping)
+                        else ""
+                    )
+                )
+                for event in incremental_events
+                if event.get("kind")
+                in {"incremental_task_review_completed", "incremental_task_review_failed"}
+            }
+            active_tasks = started_tasks.difference(finished_tasks)
+            merge_started = max(
+                (
+                    index
+                    for index, event in enumerate(incremental_events)
+                    if event.get("kind") == "incremental_review_merge_started"
+                ),
+                default=-1,
+            )
+            merge_finished = max(
+                (
+                    index
+                    for index, event in enumerate(incremental_events)
+                    if event.get("kind")
+                    in {"incremental_review_merge_completed", "incremental_review_merge_failed"}
+                ),
+                default=-1,
+            )
+            if merge_started > merge_finished:
+                event = incremental_events[merge_started]
+                review_progress = {
+                    "review_kind": "Merging task reviews",
+                    "state": "reviewing",
+                    "blocking": True,
+                    "advisory": False,
+                    "last_activity": "independent task reviews completed",
+                    "waiting_for": str(
+                        event.get("waiting_for")
+                        or "typed review merge before selecting the next wave"
+                    ),
+                    "completed_chunks": int(event.get("review_count") or len(finished_tasks)),
+                }
+            elif active_tasks:
+                review_progress = {
+                    "review_kind": "Reviewing task evidence in parallel",
+                    "state": "reviewing",
+                    "blocking": False,
+                    "advisory": True,
+                    "last_activity": (
+                        f"{len(finished_tasks)} task reviews completed; {len(active_tasks)} running"
+                    ),
+                    "waiting_for": "active workers and independent reviewers continue",
+                    "completed_chunks": len(finished_tasks),
+                }
+        if review_events and not review_progress:
             latest_review = review_events[-1]
             review_id = latest_review.get("review_id")
             if latest_review.get("state") == "reviewing" and isinstance(review_id, str):

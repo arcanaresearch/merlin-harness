@@ -64,6 +64,8 @@ from merlin_agents.campaign_service import (
     QUICKSCAN_INITIAL_CELL_LIMIT,
     CampaignLeadDecisionError,
     CampaignLeadProviderBillingError,
+    CandidatePriorityRecommendation,
+    IncrementalTaskReview,
     _arm_seed_snapshot,
     _assignment_context,
     _attempted_technique_outcomes,
@@ -15302,6 +15304,160 @@ async def test_monitor_skips_automatic_review_while_frontier_schedule_is_active(
         event.get("kind") == "lead_assessment_deferred_frontier_transition"
         for event in events
     ) == 1
+
+
+async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[dict[str, object]] = []
+    applied_priorities: list[dict[str, float]] = []
+
+    class Store:
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(dict(payload))
+
+        def list_lead(self, _campaign_id):
+            return ()
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            return {
+                "id": "batch-frontier",
+                "schedule_id": schedule_id,
+                "state": "scheduled",
+            }
+
+        def list_technique_attempts(self, _campaign_id):
+            return ()
+
+        def frontier_counts(self, _campaign_id):
+            return {"queued": 2, "attempted": 2}
+
+        def list_frontier_shortlist(self, _campaign_id, _limit):
+            return (
+                {
+                    "id": "candidate-a",
+                    "family_id": "family-a",
+                    "requested_language": "en",
+                    "variant_id": "native",
+                    "variant": {},
+                    "priority": None,
+                },
+                {
+                    "id": "candidate-b",
+                    "family_id": "family-b",
+                    "requested_language": "en",
+                    "variant_id": "native",
+                    "variant": {},
+                    "priority": None,
+                },
+            )
+
+        def update_frontier_priorities(self, _campaign_id, priorities):
+            applied_priorities.append(dict(priorities))
+            return len(priorities)
+
+    execution = asyncio.get_running_loop().create_future()
+
+    class Agents:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        async def list_schedule_tasks(self, _schedule_id):
+            self.polls += 1
+            terminal = self.polls >= 2
+            if terminal and not execution.done():
+                execution.set_result(None)
+            return (
+                AgentTask(
+                    id="task-1",
+                    objective="probe one",
+                    status="completed",
+                    result="evidence one",
+                    technique_ids=("technique-1",),
+                ),
+                AgentTask(
+                    id="task-2",
+                    objective="probe two",
+                    status="completed" if terminal else "running",
+                    result="evidence two" if terminal else None,
+                    technique_ids=("technique-2",),
+                ),
+            )
+
+        async def schedule_progress(self, _schedule_id):
+            return ()
+
+    reviewers_started: set[str] = set()
+    release_reviews = asyncio.Event()
+
+    async def review_task(_campaign_id, _profile, _wave, task, context):
+        reviewers_started.add(task.id)
+        if len(reviewers_started) == 2:
+            release_reviews.set()
+        await release_reviews.wait()
+        assert context["campaign_objective"] == prepared.manifest.objective
+        assert context["evidence_digest"].startswith("sha256:")
+        assert "campaign_summary" in context
+        assert "target_state" in context
+        assert "nearby_technique_history" in context
+        return IncrementalTaskReview(
+            task_id=task.id,
+            evidence_digest=str(context["evidence_digest"]),
+            summary=f"reviewed {task.id}",
+            signal="negative",
+            confidence=0.8,
+            candidate_priorities=(
+                CandidatePriorityRecommendation(
+                    candidate_id="candidate-b",
+                    score=0.9,
+                    reason="different technique family",
+                ),
+            ),
+        )
+
+    async def merge_reviews(_campaign_id, _profile, _wave, reviews, context):
+        assert {review.task_id for review in reviews} == {"task-1", "task-2"}
+        assert {item["id"] for item in context["next_candidate_shortlist"]} == {
+            "candidate-a",
+            "candidate-b",
+        }
+        return LeadAssessment(
+            "rank the different family next",
+            False,
+            candidate_priorities=(
+                CandidatePriorityRecommendation(
+                    candidate_id="candidate-b",
+                    score=0.95,
+                    reason="merged reviewers prefer a distinct family",
+                ),
+            ),
+        )
+
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(),
+        Agents(),
+        preparation,
+        task_review_runner=review_task,
+        review_merge_runner=merge_reviews,
+    )
+
+    result = await service._monitor_live(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        SimpleNamespace(id="schedule-frontier", execution=execution, assignments=()),
+    )
+    await service._apply_incremental_review_priorities(  # noqa: SLF001
+        prepared.manifest.id, 3, result
+    )
+
+    assert reviewers_started == {"task-1", "task-2"}
+    assert result is not None
+    assert tuple(review.task_id for review in result.task_reviews) == ("task-1", "task-2")
+    assert applied_priorities == [{"candidate-b": 0.95}]
+    assert any(event.get("kind") == "incremental_task_review_completed" for event in events)
+    assert any(event.get("kind") == "incremental_review_merge_completed" for event in events)
 
 
 async def test_monitor_skips_final_review_for_completed_frontier_schedule() -> None:

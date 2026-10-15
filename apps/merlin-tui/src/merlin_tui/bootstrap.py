@@ -3824,6 +3824,8 @@ def build_backend(
     from merlin_agents.campaign import language_frontier_spec
     from merlin_agents.campaign_service import (
         CampaignLeadDecisionError,
+        CandidatePriorityRecommendation,
+        IncrementalTaskReview,
         _dynamic_specialist_proposal,
         _json_value,
     )
@@ -6186,6 +6188,257 @@ def build_backend(
                 snapshot.revision,
                 execute,
                 scope=campaign_id,
+            )
+
+        def _incremental_priority_rows(
+            value: object,
+            *,
+            allowed_candidate_ids: frozenset[str],
+        ) -> tuple[CandidatePriorityRecommendation, ...]:
+            if not isinstance(value, list):
+                return ()
+            rows: list[CandidatePriorityRecommendation] = []
+            seen: set[str] = set()
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                candidate_id = str(item.get("candidate_id") or "").strip()
+                if candidate_id in seen or candidate_id not in allowed_candidate_ids:
+                    continue
+                try:
+                    recommendation = CandidatePriorityRecommendation(
+                        candidate_id=candidate_id,
+                        score=float(item.get("score")),
+                        reason=str(item.get("reason") or ""),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                rows.append(recommendation)
+                seen.add(candidate_id)
+            return tuple(rows)
+
+        def _incremental_followup_rows(
+            value: object,
+            *,
+            allowed_task_ids: frozenset[str],
+        ) -> tuple[LeadFollowUp, ...]:
+            if not isinstance(value, list):
+                return ()
+            rows: list[LeadFollowUp] = []
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                source_ids = tuple(
+                    str(source)
+                    for source in item.get("source_task_ids", ())
+                    if str(source) in allowed_task_ids
+                )
+                hypothesis_value = item.get("hypothesis")
+                if not source_ids or not isinstance(hypothesis_value, Mapping):
+                    continue
+                try:
+                    hypothesis = FrontierHypothesis(
+                        surface=str(hypothesis_value["surface"]),
+                        assertion=str(hypothesis_value["assertion"]),
+                        oracle=str(hypothesis_value["oracle"]),
+                        novelty_basis=str(hypothesis_value["novelty_basis"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                profile_id = str(item.get("profile_id") or "adversarial-explorer").strip()
+                objective = str(item.get("objective") or "").strip()
+                if not profile_id or not objective:
+                    continue
+                rows.append(
+                    LeadFollowUp(
+                        profile_id=profile_id,
+                        objective=objective,
+                        source_task_ids=source_ids,
+                        hypothesis=hypothesis,
+                    )
+                )
+            return tuple(rows)
+
+        async def run_incremental_task_review(
+            campaign_id: str,
+            campaign_profile: CampaignProfile,
+            wave: int,
+            task: object,
+            context: Mapping[str, object],
+        ) -> IncrementalTaskReview:
+            selected_model = _structured_model_for_role(config, "lead", model)
+            usage_records: list[Mapping[str, object]] = []
+            candidate_rows = context.get("next_candidate_shortlist", ())
+            allowed_candidate_ids = frozenset(
+                str(item.get("id") or "")
+                for item in candidate_rows
+                if isinstance(item, Mapping) and item.get("id")
+            )
+            value = await _request_structured_json(
+                provider=provider,
+                capability_registry=capability_registry,
+                selected_model=selected_model,
+                messages=(
+                    ChatMessage(
+                        role="system",
+                        content=(
+                            "You are one independent Campaign Lead evidence reviewer. Review only "
+                            "the supplied completed task and its compact campaign context. Return "
+                            "one JSON object with task_id, evidence_digest, summary, signal "
+                            "(positive|negative|ambiguous|blocked|infrastructure), confidence "
+                            "(0..1), findings (typed JSON objects), objective_progress (typed JSON "
+                            "objects naming objective/status/evidence), hypotheses, and "
+                            "candidate_priorities. A hypothesis must include profile_id, "
+                            "objective, "
+                            "source_task_ids, and hypothesis {surface, assertion, oracle, "
+                            "novelty_basis}. A priority must copy candidate_id from the supplied "
+                            "shortlist and include score 0..1 plus reason. Distinguish provider or "
+                            "transport failure from attack failure. Do not declare campaign "
+                            "completion, remove coverage, invent evidence, or return prose outside "
+                            "the JSON object."
+                        ),
+                    ),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(context, sort_keys=True, separators=(",", ":")),
+                    ),
+                ),
+                expected_container="object",
+                max_attempts=config.provider_runtime.worker_retry_attempts,
+                budget_id=campaign_id,
+                usage_sink=lambda event: usage_records.append(
+                    stream_usage_record(selected_model, event)
+                ),
+            )
+            if not isinstance(value, Mapping):
+                raise ValueError("incremental task reviewer returned no JSON object")
+            task_id = str(getattr(task, "id", ""))
+            evidence_digest = str(context.get("evidence_digest") or "")
+            findings = tuple(
+                dict(item) for item in value.get("findings", ()) if isinstance(item, Mapping)
+            )
+            objective_progress = tuple(
+                dict(item)
+                for item in value.get("objective_progress", ())
+                if isinstance(item, Mapping)
+            )
+            return IncrementalTaskReview(
+                task_id=str(value.get("task_id") or task_id),
+                evidence_digest=str(value.get("evidence_digest") or evidence_digest),
+                summary=str(value.get("summary") or "").strip(),
+                signal=str(value.get("signal") or "ambiguous").casefold(),
+                confidence=float(value.get("confidence", 0.0)),
+                findings=findings,
+                objective_progress=objective_progress,
+                hypotheses=_incremental_followup_rows(
+                    value.get("hypotheses"), allowed_task_ids=frozenset({task_id})
+                ),
+                candidate_priorities=_incremental_priority_rows(
+                    value.get("candidate_priorities"),
+                    allowed_candidate_ids=allowed_candidate_ids,
+                ),
+                usage=merge_usage_records(usage_records),
+            )
+
+        async def run_incremental_review_merge(
+            campaign_id: str,
+            campaign_profile: CampaignProfile,
+            wave: int,
+            reviews: tuple[IncrementalTaskReview, ...],
+            context: Mapping[str, object],
+        ) -> LeadAssessment:
+            selected_model = _structured_model_for_role(config, "lead", model)
+            usage_records: list[Mapping[str, object]] = []
+            candidate_rows = context.get("next_candidate_shortlist", ())
+            allowed_candidate_ids = frozenset(
+                str(item.get("id") or "")
+                for item in candidate_rows
+                if isinstance(item, Mapping) and item.get("id")
+            )
+            allowed_task_ids = frozenset(review.task_id for review in reviews)
+            payload = {
+                "merge_contract": "merlin.incremental-review-merge.v1",
+                "profile": campaign_profile.value,
+                "wave": wave,
+                "campaign_context": context,
+                "task_reviews": tuple(
+                    {
+                        "task_id": review.task_id,
+                        "evidence_digest": review.evidence_digest,
+                        "summary": review.summary,
+                        "signal": review.signal,
+                        "confidence": review.confidence,
+                        "findings": review.findings,
+                        "objective_progress": review.objective_progress,
+                        "hypotheses": tuple(
+                            {
+                                "profile_id": item.profile_id,
+                                "objective": item.objective,
+                                "source_task_ids": item.source_task_ids,
+                                "hypothesis": (
+                                    None if item.hypothesis is None else asdict(item.hypothesis)
+                                ),
+                            }
+                            for item in review.hypotheses
+                        ),
+                        "candidate_priorities": tuple(
+                            asdict(item) for item in review.candidate_priorities
+                        ),
+                    }
+                    for review in reviews
+                ),
+            }
+            value = await _request_structured_json(
+                provider=provider,
+                capability_registry=capability_registry,
+                selected_model=selected_model,
+                messages=(
+                    ChatMessage(
+                        role="system",
+                        content=(
+                            "You are the Campaign Lead merging independent typed task reviews. "
+                            "Return one compact JSON object with summary, objective_progress, "
+                            "followups, and candidate_priorities. Resolve contradictions using "
+                            "evidence digests and confidence. Followups use the same typed "
+                            "hypothesis schema as the task reviews and must cite supplied task "
+                            "IDs. "
+                            "Candidate priorities must copy IDs from the supplied next-candidate "
+                            "shortlist and include score 0..1 plus reason. Plan the next wave by "
+                            "ranking useful diverse experiments and preserving exploration. Do not "
+                            "remove or retire admitted coverage, invent evidence, declare campaign "
+                            "completion, or repeat raw task transcripts. Return JSON only."
+                        ),
+                    ),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    ),
+                ),
+                expected_container="object",
+                max_attempts=config.provider_runtime.worker_retry_attempts,
+                budget_id=campaign_id,
+                usage_sink=lambda event: usage_records.append(
+                    stream_usage_record(selected_model, event)
+                ),
+            )
+            if not isinstance(value, Mapping):
+                raise ValueError("incremental review merger returned no JSON object")
+            return LeadAssessment(
+                summary=str(value.get("summary") or "").strip(),
+                coverage_complete=False,
+                followups=_incremental_followup_rows(
+                    value.get("followups"), allowed_task_ids=allowed_task_ids
+                ),
+                usage=merge_usage_records(usage_records),
+                candidate_priorities=_incremental_priority_rows(
+                    value.get("candidate_priorities"),
+                    allowed_candidate_ids=allowed_candidate_ids,
+                ),
+                objective_progress=tuple(
+                    dict(item)
+                    for item in value.get("objective_progress", ())
+                    if isinstance(item, Mapping)
+                ),
             )
 
         async def run_exploration_review(
@@ -9912,6 +10165,8 @@ def build_backend(
             lead_assessment_batch_seconds=config.runtime.campaign_lead_assessment_batch_seconds,
             preflight_max_tokens=config.runtime.campaign_preflight_max_tokens,
             preflight_max_cost_usd=config.runtime.campaign_preflight_max_cost_usd,
+            task_review_runner=run_incremental_task_review,
+            review_merge_runner=run_incremental_review_merge,
             # Shared advisory refusal judge (constructed above, alongside the
             # worker wiring).  Complements deterministic receipt grading.
             refusal_judge=refusal_judge,
