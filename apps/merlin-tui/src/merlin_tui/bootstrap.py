@@ -60,6 +60,7 @@ from .lead_review import (
     guidance_revision,
     prompt_input_revision,
 )
+from .review_batch import AsyncReviewMicrobatcher
 
 # Advertised languages describe expected behavior; they are not a security-test
 # allowlist. The frontier leads with the forty most-spoken languages (ordered
@@ -6259,6 +6260,120 @@ def build_backend(
                 )
             return tuple(rows)
 
+        incremental_review_provider_slots = asyncio.Semaphore(
+            max(1, min(4, config.provider_runtime.max_concurrent_requests))
+        )
+
+        async def request_incremental_task_review_batch(
+            key: object,
+            requests: tuple[tuple[object, Mapping[str, object]], ...],
+        ) -> tuple[IncrementalTaskReview, ...]:
+            if not isinstance(key, tuple) or len(key) != 3:
+                raise ValueError("incremental review batch key is invalid")
+            campaign_id = str(key[0])
+            selected_model = _structured_model_for_role(config, "lead", model)
+            usage_records: list[Mapping[str, object]] = []
+            payload = {
+                "review_contract": "merlin.incremental-task-review-batch.v1",
+                "tasks": tuple(context for _task, context in requests),
+            }
+            async with incremental_review_provider_slots:
+                value = await _request_structured_json(
+                    provider=provider,
+                    capability_registry=capability_registry,
+                    selected_model=selected_model,
+                    messages=(
+                        ChatMessage(
+                            role="system",
+                            content=(
+                                "You are a Campaign Lead evidence reviewer. Review each supplied "
+                                "completed task independently using only that task's compact "
+                                "context. Return one JSON object with a reviews array in the same "
+                                "order as the supplied tasks. Each review must contain task_id, "
+                                "evidence_digest, summary, signal "
+                                "(positive|negative|ambiguous|blocked|infrastructure), confidence "
+                                "(0..1), findings (typed JSON objects), objective_progress (typed "
+                                "JSON objects naming objective/status/evidence), hypotheses, and "
+                                "candidate_priorities. A hypothesis must include profile_id, "
+                                "objective, source_task_ids, and hypothesis {surface, assertion, "
+                                "oracle, novelty_basis}. A priority must copy candidate_id from "
+                                "that task's supplied shortlist and include score 0..1 plus "
+                                "reason. Do not use one task's outcome as evidence for another. "
+                                "Distinguish "
+                                "provider or transport failure from attack failure. Do not declare "
+                                "campaign completion, remove coverage, invent evidence, or return "
+                                "prose outside the JSON object."
+                            ),
+                        ),
+                        ChatMessage(
+                            role="user",
+                            content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                        ),
+                    ),
+                    expected_container="object",
+                    max_attempts=config.provider_runtime.worker_retry_attempts,
+                    budget_id=campaign_id,
+                    usage_sink=lambda event: usage_records.append(
+                        stream_usage_record(selected_model, event)
+                    ),
+                )
+            if not isinstance(value, Mapping):
+                raise ValueError("incremental task review batch returned no JSON object")
+            review_rows = value.get("reviews")
+            if not isinstance(review_rows, list) or len(review_rows) != len(requests):
+                raise ValueError("incremental task review batch returned the wrong review count")
+            batch_usage = merge_usage_records(usage_records)
+            reviews: list[IncrementalTaskReview] = []
+            for index, ((task, context), row) in enumerate(
+                zip(requests, review_rows, strict=True)
+            ):
+                if not isinstance(row, Mapping):
+                    raise ValueError("incremental task review batch row is not an object")
+                task_id = str(getattr(task, "id", ""))
+                evidence_digest = str(context.get("evidence_digest") or "")
+                candidate_rows = context.get("next_candidate_shortlist", ())
+                allowed_candidate_ids = frozenset(
+                    str(item.get("id") or "")
+                    for item in candidate_rows
+                    if isinstance(item, Mapping) and item.get("id")
+                )
+                reviews.append(
+                    IncrementalTaskReview(
+                        task_id=str(row.get("task_id") or task_id),
+                        evidence_digest=str(row.get("evidence_digest") or evidence_digest),
+                        summary=str(row.get("summary") or "").strip(),
+                        signal=str(row.get("signal") or "ambiguous").casefold(),
+                        confidence=float(row.get("confidence", 0.0)),
+                        findings=tuple(
+                            dict(item)
+                            for item in row.get("findings", ())
+                            if isinstance(item, Mapping)
+                        ),
+                        objective_progress=tuple(
+                            dict(item)
+                            for item in row.get("objective_progress", ())
+                            if isinstance(item, Mapping)
+                        ),
+                        hypotheses=_incremental_followup_rows(
+                            row.get("hypotheses"), allowed_task_ids=frozenset({task_id})
+                        ),
+                        candidate_priorities=_incremental_priority_rows(
+                            row.get("candidate_priorities"),
+                            allowed_candidate_ids=allowed_candidate_ids,
+                        ),
+                        # Provider usage belongs to the batch. Attach it once so aggregate
+                        # campaign accounting does not multiply it by the number of tasks.
+                        usage=batch_usage if index == 0 else {},
+                    )
+                )
+            return tuple(reviews)
+
+        incremental_review_batcher = AsyncReviewMicrobatcher(
+            request_incremental_task_review_batch,
+            maximum_batch_size=4,
+            maximum_wait_seconds=1.0,
+        )
+
         async def run_incremental_task_review(
             campaign_id: str,
             campaign_profile: CampaignProfile,
@@ -6266,78 +6381,9 @@ def build_backend(
             task: object,
             context: Mapping[str, object],
         ) -> IncrementalTaskReview:
-            selected_model = _structured_model_for_role(config, "lead", model)
-            usage_records: list[Mapping[str, object]] = []
-            candidate_rows = context.get("next_candidate_shortlist", ())
-            allowed_candidate_ids = frozenset(
-                str(item.get("id") or "")
-                for item in candidate_rows
-                if isinstance(item, Mapping) and item.get("id")
-            )
-            value = await _request_structured_json(
-                provider=provider,
-                capability_registry=capability_registry,
-                selected_model=selected_model,
-                messages=(
-                    ChatMessage(
-                        role="system",
-                        content=(
-                            "You are one independent Campaign Lead evidence reviewer. Review only "
-                            "the supplied completed task and its compact campaign context. Return "
-                            "one JSON object with task_id, evidence_digest, summary, signal "
-                            "(positive|negative|ambiguous|blocked|infrastructure), confidence "
-                            "(0..1), findings (typed JSON objects), objective_progress (typed JSON "
-                            "objects naming objective/status/evidence), hypotheses, and "
-                            "candidate_priorities. A hypothesis must include profile_id, "
-                            "objective, "
-                            "source_task_ids, and hypothesis {surface, assertion, oracle, "
-                            "novelty_basis}. A priority must copy candidate_id from the supplied "
-                            "shortlist and include score 0..1 plus reason. Distinguish provider or "
-                            "transport failure from attack failure. Do not declare campaign "
-                            "completion, remove coverage, invent evidence, or return prose outside "
-                            "the JSON object."
-                        ),
-                    ),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(context, sort_keys=True, separators=(",", ":")),
-                    ),
-                ),
-                expected_container="object",
-                max_attempts=config.provider_runtime.worker_retry_attempts,
-                budget_id=campaign_id,
-                usage_sink=lambda event: usage_records.append(
-                    stream_usage_record(selected_model, event)
-                ),
-            )
-            if not isinstance(value, Mapping):
-                raise ValueError("incremental task reviewer returned no JSON object")
-            task_id = str(getattr(task, "id", ""))
-            evidence_digest = str(context.get("evidence_digest") or "")
-            findings = tuple(
-                dict(item) for item in value.get("findings", ()) if isinstance(item, Mapping)
-            )
-            objective_progress = tuple(
-                dict(item)
-                for item in value.get("objective_progress", ())
-                if isinstance(item, Mapping)
-            )
-            return IncrementalTaskReview(
-                task_id=str(value.get("task_id") or task_id),
-                evidence_digest=str(value.get("evidence_digest") or evidence_digest),
-                summary=str(value.get("summary") or "").strip(),
-                signal=str(value.get("signal") or "ambiguous").casefold(),
-                confidence=float(value.get("confidence", 0.0)),
-                findings=findings,
-                objective_progress=objective_progress,
-                hypotheses=_incremental_followup_rows(
-                    value.get("hypotheses"), allowed_task_ids=frozenset({task_id})
-                ),
-                candidate_priorities=_incremental_priority_rows(
-                    value.get("candidate_priorities"),
-                    allowed_candidate_ids=allowed_candidate_ids,
-                ),
-                usage=merge_usage_records(usage_records),
+            return await incremental_review_batcher.submit(
+                (campaign_id, campaign_profile.value, wave),
+                (task, context),
             )
 
         async def run_incremental_review_merge(
