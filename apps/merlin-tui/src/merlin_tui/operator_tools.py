@@ -85,6 +85,18 @@ def _settings(messages: Sequence[ChatMessage]) -> dict[str, Any]:
     return {}
 
 
+def _latest_prepared_campaign(messages: Sequence[ChatMessage]) -> tuple[str, str] | None:
+    for message in reversed(messages):
+        if message.role != "tool" or message.name != "assessment_prepare":
+            continue
+        payload = _payload(message)
+        campaign_id = str(payload.get("campaign_id") or "").strip()
+        manifest_digest = str(payload.get("manifest_digest") or "").strip()
+        if campaign_id and manifest_digest:
+            return campaign_id, manifest_digest
+    return None
+
+
 class CampaignConfigureTool:
     effect = "workspace_write"
 
@@ -219,6 +231,20 @@ class ConfiguredCampaignTool:
                     "execution_mode": settings["execution_mode"],
                 }
         elif self.describe().name == "assessment_execute":
+            latest = _latest_prepared_campaign(messages)
+            requested = (
+                str(values.get("campaign_id") or "").strip(),
+                str(values.get("manifest_digest") or "").strip(),
+            )
+            if latest is not None and requested != latest:
+                return ToolResult(
+                    content=(
+                        f"That campaign approval is superseded by {latest[0]} ({latest[1]}). "
+                        "Display the latest prepared review and stop this turn; only the Merlin "
+                        "client can approve and execute that exact manifest."
+                    ),
+                    is_error=True,
+                )
             return ToolResult(
                 content=(
                     "Campaign execution requires the operator's explicit approval in the "

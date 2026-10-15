@@ -141,6 +141,8 @@ async def test_top_level_model_cannot_execute_campaign_before_operator_approval(
         context(), {"campaign_id": "campaign/L4", "manifest_digest": "sha256:old"}
     )
     assert mismatched.is_error
+    assert "superseded" in mismatched.content
+    assert "campaign/L3" in mismatched.content
     assert not delegate.calls
     denied = await wrapper.invoke(context(), review)
     assert denied.is_error
