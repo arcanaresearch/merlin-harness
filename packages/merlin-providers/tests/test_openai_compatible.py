@@ -573,6 +573,50 @@ def test_stream_payload_quota_error_is_terminal_and_typed() -> None:
     ]
 
 
+def test_stream_payload_provider_processing_timeout_is_retried() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                text=(
+                    'data: {"error":{"message":"We were unable to start processing your '
+                    'request within the 900-second timeout limit. Please try again later."}}\n\n'
+                ),
+            )
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"recovered"},'
+                '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+            ),
+        )
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://models.example/v1",
+                    "secret",
+                    "model",
+                    retry_base_seconds=0.001,
+                ),
+                client=client,
+            )
+            return [
+                event async for event in provider.stream(ChatRequest(model="model", messages=[]))
+            ]
+
+    assert asyncio.run(run()) == [
+        TextDelta(text="recovered"),
+        ModelCompleted(finish_reason="stop"),
+    ]
+    assert calls == 2
+
+
 def test_invalid_stream_json_has_stable_error() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="data: not-json\n")

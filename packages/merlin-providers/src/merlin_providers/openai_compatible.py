@@ -1262,6 +1262,7 @@ def _classify_payload_failure(
     value: object,
 ) -> tuple[str, ProviderFailureKind, bool]:
     identities = _provider_error_identity(value)
+    message = _provider_error_message(value)
     if identities & {
         "billing_hard_limit_reached",
         "billing_error",
@@ -1308,7 +1309,18 @@ def _classify_payload_failure(
         return "provider_configuration_error", ProviderFailureKind.CONFIGURATION, False
     if "-32603" in identities:
         return "provider_transient_error", ProviderFailureKind.TRANSIENT, True
+    if "timeout limit" in message or "timed out" in message:
+        return "provider_transient_error", ProviderFailureKind.TRANSIENT, True
     return "provider_error", ProviderFailureKind.UNKNOWN, False
+
+
+def _provider_error_message(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return str(value).strip().casefold()
+    raw = value.get("error", value)
+    if not isinstance(raw, Mapping):
+        return str(raw).strip().casefold()
+    return str(raw.get("message") or "").strip().casefold()
 
 
 def _admission_group(budget_id: str | None) -> str:
