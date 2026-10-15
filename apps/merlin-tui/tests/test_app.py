@@ -5779,6 +5779,8 @@ async def test_startup_chooser_renders_before_slow_history_finishes(tmp_path) ->
         release.set()
         await pilot.pause()
         assert not app.screen.query_one("#startup-resume").disabled
+        assert app.screen.query_one("#startup-resume").has_focus
+        assert "default" in str(app.screen.query_one("#startup-resume").label)
 
 
 def test_structural_worker_label_uses_actual_owner() -> None:

@@ -3128,13 +3128,17 @@ class StartupSessionScreen(ModalScreen[str]):
         self.query_one("#startup-detail", Static).update(
             f"Last session: {latest.updated_at or 'unknown time'}\n{latest.title}"
         )
-        self.query_one("#startup-resume", Button).disabled = False
+        resume = self.query_one("#startup-resume", Button)
+        resume.label = "1. Resume last session — default"
+        resume.disabled = False
+        self.query_one("#startup-new", Button).label = "2. New session"
         browse = self.query_one("#startup-browse", Button)
         browse.label = "3. Browse previous sessions…"
         browse.disabled = False
         self.query_one("#startup-help", Static).update(
-            "Enter starts a new session · 1 resumes · 3 browses recent history"
+            "Enter resumes the last session · 2 starts new · 3 browses recent history"
         )
+        resume.focus()
 
     def action_previous_choice(self) -> None:
         self._move_choice(-1)
