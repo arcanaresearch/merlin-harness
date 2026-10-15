@@ -5626,28 +5626,35 @@ class CompiledApiReconHandoffTool:
                     continue
                 baseline_pointer = baseline_selector.get("pointer")
                 result_pointer = result_selector.get("pointer")
-                result_identity = (
-                    _json_pointer_value_or_missing(event.get("response_json"), result_pointer)
-                    if isinstance(result_pointer, str)
-                    else _MISSING
+                observation_name = str(raw_observation.get("name") or "")
+                resolved_result = _resolve_reviewed_scalar_pointer(
+                    event.get("response_json"),
+                    result_pointer,
+                    observation_name,
                 )
+                result_identity = resolved_result[1] if resolved_result is not None else _MISSING
                 if not isinstance(result_identity, str) or not result_identity:
                     continue
                 matching_baselines = [
-                    candidate
+                    (candidate, resolved_baseline[0])
                     for candidate in exchanges[:event_index]
                     if str(candidate.get("method") or "").upper() in {"GET", "HEAD"}
                     and type(candidate.get("status")) is int
                     and 200 <= int(candidate["status"]) <= 299
-                    and isinstance(baseline_pointer, str)
-                    and _json_pointer_value_or_missing(
-                        candidate.get("response_json"), baseline_pointer
+                    and (
+                        resolved_baseline := _resolve_reviewed_scalar_pointer(
+                            candidate.get("response_json"),
+                            baseline_pointer,
+                            observation_name,
+                        )
                     )
-                    == result_identity
+                    is not None
+                    and resolved_baseline[1] == result_identity
                 ]
                 if matching_baselines:
+                    baseline_event, resolved_baseline_pointer = matching_baselines[-1]
                     passive_identity_baselines.append(
-                        (matching_baselines[-1], str(baseline_pointer), result_identity)
+                        (baseline_event, resolved_baseline_pointer, result_identity)
                     )
         passive_identity_baseline = (
             passive_identity_baselines[0] if len(passive_identity_baselines) == 1 else None
@@ -6439,6 +6446,7 @@ class CompiledApiReconHandoffTool:
         for raw_observation in arguments.get("state_observations", []):
             if not isinstance(raw_observation, Mapping):
                 continue
+            observation_name = str(raw_observation.get("name") or "")
             selectors: dict[str, dict[str, object]] = {}
             observation_evidence_refs: list[str] = []
             observed_values: dict[str, object] = {}
@@ -6458,13 +6466,18 @@ class CompiledApiReconHandoffTool:
                 observed_event, observed_evidence = state_evidence_by_step_id.get(
                     str(step_id), (None, ())
                 )
-                observed_value = (
-                    _json_pointer_value_or_missing(observed_event.get("response_json"), pointer)
-                    if observed_event is not None and isinstance(pointer, str)
-                    else _MISSING
+                resolved = (
+                    _resolve_reviewed_scalar_pointer(
+                        observed_event.get("response_json"),
+                        pointer,
+                        observation_name,
+                    )
+                    if observed_event is not None
+                    else None
                 )
-                if observed_value is _MISSING:
+                if resolved is None:
                     break
+                resolved_pointer, observed_value = resolved
                 response_evidence = tuple(
                     (reference, payload)
                     for reference, payload in observed_evidence
@@ -6475,7 +6488,7 @@ class CompiledApiReconHandoffTool:
                     "schema_version": "merlin.state-selector.v1",
                     "step_id": str(step_id),
                     "evaluation_root": "response_body",
-                    "pointer": str(pointer),
+                    "pointer": resolved_pointer,
                     "evidence_refs": selector_evidence_refs,
                     "confidence": float(raw_selector.get("confidence", 1.0)),
                 }
@@ -7835,6 +7848,41 @@ def _json_scalar_paths(value: object, pointer: str = "") -> tuple[tuple[str, obj
     elif value is None or type(value) in {str, int, float, bool}:
         found.append((pointer, value))
     return tuple(found)
+
+
+def _resolve_reviewed_scalar_pointer(
+    response: object,
+    pointer: object,
+    observation_name: str,
+) -> tuple[str, object] | None:
+    """Resolve a reviewed state selector across a mismatched response envelope.
+
+    The declared pointer wins whenever it exists. A fallback is accepted only
+    when the reviewed observation name identifies exactly one scalar leaf in
+    the same captured response. This repairs transport wrappers without
+    guessing the meaning of an ambiguous target field.
+    """
+
+    if isinstance(pointer, str) and (pointer == "" or pointer.startswith("/")):
+        exact = _json_pointer_value_or_missing(response, pointer)
+        if exact is not _MISSING and _json_scalar(exact):
+            return pointer, exact
+    normalized_name = "".join(
+        character for character in observation_name.casefold() if character.isalnum()
+    )
+    if not normalized_name:
+        return None
+    matches = tuple(
+        (path, value)
+        for path, value in _json_scalar_paths(response)
+        if "".join(
+            character
+            for character in path.rsplit("/", 1)[-1].casefold()
+            if character.isalnum()
+        )
+        == normalized_name
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 def _reviewed_recon_observations(

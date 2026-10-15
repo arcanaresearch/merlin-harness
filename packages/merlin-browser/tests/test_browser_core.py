@@ -2244,9 +2244,13 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
             "status": 200,
             "request_json": None,
             "response_json": {
-                "json": {
-                    "run": {"runId": "run-1", "tier": 1},
-                    "session": {"score": 43},
+                "result": {
+                    "data": {
+                        "json": {
+                            "run": {"runId": "run-1", "tier": 1},
+                            "session": {"score": 43},
+                        }
+                    }
                 }
             },
         },
@@ -2256,9 +2260,13 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
             "status": 200,
             "request_json": {"clientTurnId": "turn-1", "text": "harmless probe"},
             "response_json": {
-                "json": {
-                    "run": {"runId": "run-1", "tier": 1},
-                    "turn": {"reply": "observed response", "score": 49},
+                "result": {
+                    "data": {
+                        "json": {
+                            "run": {"runId": "run-1", "tier": 1},
+                            "turn": {"reply": "observed response", "score": 49},
+                        }
+                    }
                 }
             },
         },
@@ -2293,7 +2301,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
         "method": "POST",
         "url": "https://target.test/api/turn",
         "input_pointer": "/text",
-        "response_selector": "/json/turn/reply",
+        "response_selector": "/result/data/json/turn/reply",
         "success_witness": "reply is returned",
         "authentication": "reviewed cookie session",
         "session_constraint": "one active run per authenticated principal",
@@ -2335,12 +2343,12 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
                 "name": "score",
                 "role": "score",
                 "baseline_selector": {
-                    "pointer": "/json/session/score",
+                    "pointer": "/result/data/json/turn/score",
                     "step_id": "observed-session-setup",
                     "evaluation_root": "response_body",
                 },
                 "result_selector": {
-                    "pointer": "/json/turn/score",
+                    "pointer": "/result/data/json/turn/score",
                     "step_id": "observed-message-exchange",
                     "evaluation_root": "response_body",
                 },
@@ -2369,13 +2377,20 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
     assert adapter["api_steps"][0]["method"] == "GET"
     assert adapter["session_cardinality"]["status"] == "unverified"
     capabilities = adapter["state_capabilities"]
-    assert capabilities["identity"]["baseline_selector"]["pointer"] == "/json/run/runId"
-    assert capabilities["identity"]["result_selector"]["pointer"] == "/json/run/runId"
+    assert capabilities["identity"]["baseline_selector"]["pointer"] == (
+        "/result/data/json/run/runId"
+    )
+    assert capabilities["identity"]["result_selector"]["pointer"] == (
+        "/result/data/json/run/runId"
+    )
     assert {item["name"] for item in capabilities["observations"]} == {
         "run_id",
         "tier",
         "score",
     }
+    score = next(item for item in capabilities["observations"] if item["name"] == "score")
+    assert score["baseline_selector"]["pointer"] == "/result/data/json/session/score"
+    assert score["result_selector"]["pointer"] == "/result/data/json/turn/score"
 
 
 @pytest.mark.asyncio
