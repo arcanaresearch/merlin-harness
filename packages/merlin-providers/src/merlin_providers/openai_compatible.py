@@ -562,9 +562,7 @@ class OpenAICompatibleProvider:
                         response.status_code, body
                     )
                     yield ModelError(
-                        message=self._redact(
-                            f"provider returned HTTP {response.status_code}: {body}"
-                        ),
+                        message=self._redact(_http_failure_message(response.status_code, body)),
                         retryable=retryable,
                         code=code,
                         retry_after_seconds=retry,
@@ -1212,6 +1210,20 @@ def _provider_error_identity(value: object) -> frozenset[str]:
         for field in ("code", "status", "type")
         if (text := str(raw.get(field) or "").strip().casefold())
     )
+
+
+def _http_failure_message(status_code: int, body: str) -> str:
+    if status_code == 401:
+        return (
+            "provider authentication failed (HTTP 401); update the provider API key "
+            "with /setup, then restart Merlin"
+        )
+    if status_code == 403:
+        return (
+            "provider denied this request (HTTP 403); verify the API key permissions, "
+            "account access, and selected model"
+        )
+    return f"provider returned HTTP {status_code}: {body}"
 
 
 def _classify_http_failure(status_code: int, body: str) -> tuple[str, ProviderFailureKind, bool]:

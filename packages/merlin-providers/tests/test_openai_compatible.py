@@ -434,7 +434,10 @@ def test_redacts_api_key_from_http_error() -> None:
             ]
             assert events == [
                 ModelError(
-                    message="provider returned HTTP 401: invalid token [REDACTED]",
+                    message=(
+                        "provider authentication failed (HTTP 401); update the provider API key "
+                        "with /setup, then restart Merlin"
+                    ),
                     code="provider_auth_error",
                     failure_kind=ProviderFailureKind.AUTHORIZATION,
                 )

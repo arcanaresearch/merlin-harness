@@ -18,6 +18,16 @@ _NO_CREDENTIAL_ADVICE = (
     "(/setup endpoint in the TUI, or [provider.model_endpoints] in config.toml)"
 )
 _EFFORTS = {"default", "minimal", "low", "medium", "high", "xhigh"}
+_OBVIOUS_CREDENTIAL_PLACEHOLDERS = {
+    "api-key",
+    "apikey",
+    "change-me",
+    "changeme",
+    "placeholder",
+    "secret",
+    "test-key",
+    "your-api-key",
+}
 
 
 def _validate_effort(effort: str) -> None:
@@ -27,6 +37,14 @@ def _validate_effort(effort: str) -> None:
 
 def _is_local_base_url(base_url: str) -> bool:
     return urlsplit(base_url.strip()).hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_obvious_credential_placeholder(api_key: str, base_url: str) -> bool:
+    """Reject unmistakable setup placeholders without constraining real key formats."""
+    host = (urlsplit(base_url.strip()).hostname or "").casefold()
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".test"):
+        return False
+    return api_key.strip().casefold() in _OBVIOUS_CREDENTIAL_PLACEHOLDERS
 
 
 def missing_route_credentials(
@@ -43,8 +61,12 @@ def missing_route_credentials(
     if isinstance(role_models, Mapping):
         models.update(str(model).strip() for model in role_models.values() if str(model).strip())
     models.update(str(model).strip() for model in transports if str(model).strip())
+    primary_base_url = str(provider.get("base_url", ""))
     primary_key = str(credentials.get("api_key", "")).strip()
-    primary_local = _is_local_base_url(str(provider.get("base_url", "")))
+    primary_local = _is_local_base_url(primary_base_url)
+    primary_key_missing = not primary_key or _is_obvious_credential_placeholder(
+        primary_key, primary_base_url
+    )
     missing = []
     for model in sorted(models):
         transport = str(transports.get(model, "openai_compatible"))
@@ -52,14 +74,18 @@ def missing_route_credentials(
             continue
         endpoint = endpoints.get(model)
         if isinstance(endpoint, Mapping):
-            if str(endpoint.get("api_key", "")).strip():
+            endpoint_base_url = str(endpoint.get("base_url", ""))
+            endpoint_key = str(endpoint.get("api_key", "")).strip()
+            if endpoint_key and not _is_obvious_credential_placeholder(
+                endpoint_key, endpoint_base_url
+            ):
                 continue
-            if _is_local_base_url(str(endpoint.get("base_url", ""))):
+            if _is_local_base_url(endpoint_base_url):
                 continue
             missing.append(model)
             continue
         if transport == "openai_compatible":
-            if not primary_key and not primary_local:
+            if primary_key_missing and not primary_local:
                 missing.append(model)
             continue
         if transport in _NATIVE_HTTP_TRANSPORTS:
@@ -87,6 +113,8 @@ class ProviderConfiguration:
     ) -> None:
         if not base_url.strip() or not model.strip():
             raise ValueError("base URL and model are required")
+        if api_key is not None and _is_obvious_credential_placeholder(api_key, base_url):
+            raise ValueError("API key is an obvious placeholder; enter the real provider key")
         current = load_config(self.paths, environ={}).values
         values = dict(current)
         provider = values.get("provider", {})
@@ -391,6 +419,8 @@ class ProviderConfiguration:
         base_url = base_url.strip()
         if not model or not base_url:
             raise ValueError("model and base URL are required")
+        if api_key is not None and _is_obvious_credential_placeholder(api_key, base_url):
+            raise ValueError("API key is an obvious placeholder; enter the real provider key")
         values = dict(load_config(self.paths, environ={}).values)
         provider = values.get("provider", {})
         provider_values = dict(provider) if isinstance(provider, Mapping) else {}

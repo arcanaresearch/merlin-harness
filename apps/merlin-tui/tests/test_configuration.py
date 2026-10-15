@@ -41,6 +41,29 @@ def test_provider_configuration_uses_owner_only_files(tmp_path: Path) -> None:
     assert mode(paths.credentials) == 0o600
 
 
+def test_provider_configuration_rejects_obvious_remote_placeholder_key(
+    tmp_path: Path,
+) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+
+    with pytest.raises(ValueError, match="obvious placeholder"):
+        ProviderConfiguration(paths).save(
+            "https://api.deepseek.com/v1", "deepseek-chat", "secret"
+        )
+
+    assert not paths.config.exists()
+    assert not paths.credentials.exists()
+
+
+def test_missing_route_credentials_treats_remote_placeholder_as_missing() -> None:
+    provider = {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+    }
+
+    assert missing_route_credentials(provider, {"api_key": "secret"}) == ["deepseek-chat"]
+
+
 def test_provider_effort_is_persisted_by_setup_and_model_routing(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path / "merlin")
     configuration = ProviderConfiguration(paths)
