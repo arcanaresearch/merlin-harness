@@ -802,14 +802,14 @@ it("renders streamed profile and agent choices and submits named selections once
         {
             cursor: 3,
             kind: "content",
-            value: "file:**\n1. Quickscan [default]\n2. Recommended\n3. Exhaustive\n4. Exploration / learning\n\nSeparately, agent composition:\n1. Autonomous [default]\n2. Opinionated",
+            value: "file:**\n1. Recommended [default]\n2. Quickscan\n3. Exhaustive\n4. Exploration / learning\n\nSeparately, agent composition:\n1. Autonomous [default]\n2. Opinionated",
         },
         { cursor: 4, kind: "turn_end", value: "" },
     ];
     render(<App />);
     await screen.findByRole("heading", { name: "Choose how Merlin works" });
     expect(
-        (screen.getByRole("radio", { name: /Quickscan/ }) as HTMLInputElement)
+        (screen.getByRole("radio", { name: /Recommended/ }) as HTMLInputElement)
             .checked,
     ).toBe(true);
     expect(

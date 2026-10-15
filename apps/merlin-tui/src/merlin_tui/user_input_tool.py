@@ -43,7 +43,7 @@ class RequestUserInputTool:
                 "and ambiguous targets. Use stable question/option IDs, clear labels and "
                 "descriptions. Do not output numbered choices as prose. Every choice question "
                 "must have a default. Put the default first and provide its option ID in default. "
-                "Campaign defaults are Quickscan and Autonomous, not Recommended or Opinionated. "
+                "Campaign defaults are Recommended and Autonomous, not Quickscan or Opinionated. "
                 "Defaults never submit automatically. Allow free text when "
                 "useful. Never request passwords, API keys or verification codes here; use "
                 "secure setup or browser takeover. The client renders the question and pauses "

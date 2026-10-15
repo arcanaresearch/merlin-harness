@@ -4865,16 +4865,16 @@ class MerlinApp(App[None]):
         ):
             return
         self._pending_choice = (
-            ("Quickscan [default]", "quickscan"),
-            ("Recommended", "recommended"),
+            ("Recommended [default]", "recommended"),
+            ("Quickscan", "quickscan"),
             ("Exhaustive", "exhaustive"),
             ("Exploration / learning", "exploration"),
         )
-        self._pending_choice_default = "quickscan"
+        self._pending_choice_default = "recommended"
         self._pending_choice_kind = "profile"
         if (
-            "1. quickscan [default]" in normalized
-            and "2. recommended" in normalized
+            "1. recommended [default]" in normalized
+            and "2. quickscan" in normalized
             and "3. exhaustive" in normalized
             and "4. exploration / learning" in normalized
             and "press enter or 1" in normalized

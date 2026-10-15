@@ -29,8 +29,8 @@ export function requestedCampaignChoices(content: string) {
 }
 
 const profiles = [
-    ["quickscan", "Quickscan", "Fast smoke pass with bounded investigation."],
     ["recommended", "Recommended", "Representative coverage for the target."],
+    ["quickscan", "Quickscan", "Fast smoke pass with bounded investigation."],
     ["exhaustive", "Exhaustive", "Broader testing of applicable techniques."],
     [
         "exploration",
@@ -83,7 +83,7 @@ export function CampaignChoices({
                     value: profile,
                     options: profiles,
                     select: onProfile,
-                    defaultValue: "quickscan",
+                    defaultValue: "recommended",
                 },
                 {
                     show: showFormation,

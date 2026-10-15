@@ -399,11 +399,11 @@ async def test_campaign_profile_gate_precedes_provider_and_preserves_objective()
 
     assert kernel.submissions == []
     assert len(choices) == 1
-    assert "1. Quickscan [default]" in choices[0].text
+    assert "1. Recommended [default]" in choices[0].text
     assert "3. Exhaustive" in choices[0].text
     assert "4. Exploration / learning" in choices[0].text
 
-    events = [event async for event in backend.stream("2")]
+    events = [event async for event in backend.stream("1")]
 
     assert events == []
     assert kernel.submissions == [
@@ -449,7 +449,7 @@ async def test_campaign_route_preflight_blocks_before_provider_and_retries() -> 
     backend = KernelBackend(kernel, route_preflight=preflight)  # type: ignore[arg-type]
     _ = [event async for event in backend.stream("Run a merlin scan on https://target.test")]
 
-    blocked = [event async for event in backend.stream("2")]
+    blocked = [event async for event in backend.stream("1")]
     assert kernel.submissions == []
     assert "lead route unavailable" in blocked[0].text
     assert "2. Retry preflight" in blocked[1].text
@@ -504,7 +504,7 @@ async def test_chat_campaign_prompt_honors_configured_autonomous_composition() -
     backend = KernelBackend(kernel, settings=settings)  # type: ignore[arg-type]
 
     _ = [event async for event in backend.stream("Run a merlin scan on https://target.test")]
-    _ = [event async for event in backend.stream("2")]
+    _ = [event async for event in backend.stream("1")]
 
     assert kernel.submissions == [
         "Run a merlin scan on https://target.test\n"

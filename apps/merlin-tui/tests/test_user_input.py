@@ -342,7 +342,7 @@ async def test_campaign_defaults_reach_tool_receipt_and_tui_without_submitting()
     )
     assert not result.is_error
     request = InputRequest.model_validate(json.loads(result.content)["request"])
-    assert [question.default for question in request.questions] == [["quick"], ["auto"]]
+    assert [question.default for question in request.questions] == [["recommended"], ["auto"]]
     assert request.questions[1].options[0].label == "Opinionated"
 
     from textual.widgets import RadioButton
@@ -355,9 +355,9 @@ async def test_campaign_defaults_reach_tool_receipt_and_tui_without_submitting()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert isinstance(app.screen, UserInputScreen)
-        assert app.screen.query_one("#answer-0-1", RadioButton).value
+        assert app.screen.query_one("#answer-0-0", RadioButton).value
         assert app.screen.query_one("#answer-1-1", RadioButton).value
-        assert not app.screen.query_one("#answer-0-0", RadioButton).value
+        assert not app.screen.query_one("#answer-0-1", RadioButton).value
         assert not app.screen.query_one("#answer-1-0", RadioButton).value
         # Merely opening the screen leaves it pending; Continue is required.
         assert isinstance(app.screen, UserInputScreen)

@@ -40,7 +40,7 @@ async def test_enter_during_recon_uses_one_reader_and_keeps_output_and_followup(
         await pilot.pause()
         reader = app._stream_task
         # A stale profile prompt cannot intercept conversational follow-ups.
-        app._pending_choice = (("Quickscan [default]", "quickscan"),)
+        app._pending_choice = (("Recommended [default]", "recommended"),)
         app._pending_choice_kind = "profile"
         composer = app.query_one("#composer", Composer)
         composer.text = "What are you checking?"

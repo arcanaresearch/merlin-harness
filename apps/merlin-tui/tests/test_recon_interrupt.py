@@ -12,8 +12,8 @@ async def test_interrupt_reaches_daemon_without_ui_stream_during_pending_profile
     backend.interrupt = AsyncMock()
     app = MerlinApp(backend)
     async with app.run_test(size=(100, 30)) as pilot:
-        app._pending_choice = (("Quickscan [default]", "quickscan"),)
-        app._pending_choice_default = "quickscan"
+        app._pending_choice = (("Recommended [default]", "recommended"),)
+        app._pending_choice_default = "recommended"
         app._pending_choice_kind = "profile"
         assert app._stream_task is None
         composer = app.query_one("#composer", Composer)

@@ -45,16 +45,16 @@ from .configuration import ProviderConfiguration
 
 _CAMPAIGN_PROFILE_PROMPT = (
     "Choose the campaign profile:\n"
-    "1. Quickscan [default]\n"
-    "   Fast smoke pass · bounded hypotheses, review-only validation · usually under an hour\n"
-    "2. Recommended\n"
+    "1. Recommended [default]\n"
     "   Representative applicable coverage · usually 1–3 hours\n"
+    "2. Quickscan\n"
+    "   Fast smoke pass · bounded hypotheses, review-only validation · usually under an hour\n"
     "3. Exhaustive\n"
     "   Every technically executable technique · often several hours\n"
     "4. Exploration / learning\n"
     "   Discovery-led hypotheses and adaptive testing · duration varies\n"
     "Times are estimates; target limits, model speed, and retries can extend a scan.\n"
-    "Press Enter or 1 for Quickscan · 2 for Recommended · 3 for Exhaustive · 4 for Exploration"
+    "Press Enter or 1 for Recommended · 2 for Quickscan · 3 for Exhaustive · 4 for Exploration"
 )
 
 _ROUTE_PREFLIGHT_ACTIONS = (
@@ -85,13 +85,13 @@ def _campaign_profile_selection(prompt: str) -> str | None:
     if _campaign_choice_composition(prompt) is None:
         return None
     normalized = " ".join(prompt.strip().split("\n", 1)[0].lower().split()).rstrip(".")
-    if normalized in {"2", "recommended"}:
+    if normalized in {"", "1", "recommended"}:
         return "recommended"
     if normalized in {"3", "exhaustive"}:
         return "exhaustive"
     if normalized in {"4", "exploration", "exploration / learning", "learning"}:
         return "exploration"
-    if normalized in {"", "1", "quickscan", "quick scan", "quick"}:
+    if normalized in {"2", "quickscan", "quick scan", "quick"}:
         return "quickscan"
     return None
 

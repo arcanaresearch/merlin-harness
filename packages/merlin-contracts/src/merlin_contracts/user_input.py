@@ -51,8 +51,8 @@ class InputQuestion(BaseModel):
         composition = {"autonomous", "opinionated"}
         preferred = None
         if not self.multiple and len(labels) > 1:
-            if set(labels) <= profiles and "quickscan" in labels:
-                preferred = "quickscan"
+            if set(labels) <= profiles and "recommended" in labels:
+                preferred = "recommended"
             elif set(labels) == composition:
                 preferred = "autonomous"
         if preferred is not None:

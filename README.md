@@ -272,7 +272,7 @@ infrastructure state, cleanup, and reviewed limits—not merely because the Lead
 1. Run `./merlin`. If this is your first launch, Merlin guides you through setup automatically.
 2. Describe an authorized target and objective in ordinary language.
 3. Let reconnaissance establish how the target works.
-4. Choose Quickscan (default), Recommended, Exhaustive, or Exploration/learning coverage, then
+4. Choose Recommended (default), Quickscan, Exhaustive, or Exploration/learning coverage, then
    Autonomous (default) or Opinionated agent composition.
 5. Review the sealed campaign before anything executes.
 6. Approve, then watch and steer the investigation.
@@ -293,8 +293,8 @@ may differ by version. The findings and outputs shown are not benchmark results.
 
 ### Choose coverage and team
 
-Coverage and agent composition are separate choices. Quickscan is the default and offers a
-smaller starting campaign; Recommended provides representative coverage, Exhaustive broadens it,
+Coverage and agent composition are separate choices. Recommended is the default and provides
+representative coverage; Quickscan offers a smaller starting campaign, Exhaustive broadens it,
 and Exploration/learning emphasizes investigation. Autonomous is the default agent composition;
 Opinionated uses the reviewed team template.
 

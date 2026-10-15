@@ -1670,9 +1670,9 @@ async def test_streamed_response_keeps_transcript_viewport_width(size) -> None:
 @pytest.mark.parametrize(
     ("reply", "expected"),
     (
-        ("", "quickscan"),
-        ("1", "quickscan"),
-        ("2", "recommended"),
+        ("", "recommended"),
+        ("1", "recommended"),
+        ("2", "quickscan"),
         ("3", "exhaustive"),
         ("4", "exploration"),
     ),
@@ -1702,7 +1702,7 @@ async def test_campaign_profile_choice_accepts_enter_or_number(reply, expected) 
         await app.action_send()
         await pilot.pause()
         transcript = "".join(line.text for line in app.query_one("#transcript").lines)
-        assert "1. Quickscan [default]" in transcript
+        assert "1. Recommended [default]" in transcript
         assert "Representative applicable coverage" in transcript
         app.query_one("#composer").text = reply
         await app.action_send()
@@ -1747,7 +1747,7 @@ async def test_specialist_composition_choice_threads_autonomous_selection() -> N
         app.query_one("#composer").text = "assess target"
         await app.action_send()
         await pilot.pause()
-        app.query_one("#composer").text = "2"
+        app.query_one("#composer").text = "1"
         await app.action_send()
         await pilot.pause()
         transcript = "".join(line.text for line in app.query_one("#transcript").lines)
@@ -1770,11 +1770,11 @@ async def test_complete_campaign_profile_menu_is_not_rendered_twice() -> None:
             yield StreamEvent(
                 "content",
                 "Choose the campaign profile:\n"
-                "1. Quickscan [default]\n"
-                "2. Recommended\n"
+                "1. Recommended [default]\n"
+                "2. Quickscan\n"
                 "3. Exhaustive\n"
                 "4. Exploration / learning\n"
-                "Press Enter or 1 for Quickscan · 2 for Recommended · "
+                "Press Enter or 1 for Recommended · 2 for Quickscan · "
                 "3 for Exhaustive · 4 for Exploration",
             )
 
@@ -1784,8 +1784,8 @@ async def test_complete_campaign_profile_menu_is_not_rendered_twice() -> None:
         await app.action_send()
         await pilot.pause()
         transcript = "".join(line.text for line in app.query_one("#transcript").lines)
-        assert transcript.count("1. Quickscan [default]") == 1
-        assert transcript.count("2. Recommended") == 1
+        assert transcript.count("1. Recommended [default]") == 1
+        assert transcript.count("2. Quickscan") == 1
         assert transcript.count("4. Exploration / learning") == 1
 
 
@@ -6060,8 +6060,8 @@ def test_removed_command_aliases_are_not_advertised() -> None:
 @pytest.mark.parametrize(
     "profile_number, profile",
     [
-        ("1", "quickscan"),
-        ("2", "recommended"),
+        ("1", "recommended"),
+        ("2", "quickscan"),
         ("3", "exhaustive"),
         ("4", "exploration"),
     ],

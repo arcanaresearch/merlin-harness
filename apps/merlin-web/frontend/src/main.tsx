@@ -228,7 +228,7 @@ export function App() {
     const [visibleCount, setVisibleCount] = useState(25);
     useEffect(() => setVisibleCount(25), [page, search]);
     const [formation, setFormation] = useState("autonomous");
-    const [profile, setProfile] = useState("quickscan");
+    const [profile, setProfile] = useState("recommended");
     const [target, setTarget] = useState("");
     const [objective, setObjective] = useState("");
     const [endpoint, setEndpoint] = useState("http://127.0.0.1:11434/v1");
@@ -2838,11 +2838,11 @@ export function App() {
                                             setProfile(e.target.value)
                                         }
                                     >
-                                        <option value="quickscan">
-                                            Quickscan — default
-                                        </option>
                                         <option value="recommended">
-                                            Recommended
+                                            Recommended — default
+                                        </option>
+                                        <option value="quickscan">
+                                            Quickscan
                                         </option>
                                         <option value="exhaustive">
                                             Exhaustive
