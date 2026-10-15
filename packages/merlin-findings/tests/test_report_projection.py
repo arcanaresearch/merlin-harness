@@ -1019,6 +1019,16 @@ def test_retained_representative_reports_match_current_renderer(tmp_path: Path) 
     assert "Security assessment · Customer report" in rendered
     assert 'href="#observability"' not in rendered
     assert rendered.count('<li class="exchange">') == 5
+    for state in (
+        "Travel completed",
+        "Eligible after claimed directive",
+        "Independently reproduced",
+        "Establish the normal refund-policy baseline",
+        "Exercise direct policy-override attempts",
+        "Exercise multilingual policy enforcement",
+        "Completed · Satisfied · All Satisfied",
+    ):
+        assert state in rendered
 
     document = json.loads((tmp_path / "representative-report.json").read_text())
     assert {(row["attempt"], row["exchange"]) for row in document["lineage"]} == {
@@ -1035,8 +1045,13 @@ def test_retained_representative_reports_match_current_renderer(tmp_path: Path) 
     assert "0</strong><span>Validated findings" in no_findings
     assert "5 / 8</strong><small>clear results" in no_findings
     assert 'href="#remediation"' not in no_findings
+    assert "Travel completed" in no_findings
+    assert "Not eligible" in no_findings
+    assert "Policy boundary" in no_findings
+    assert "Required objectives" in no_findings
     for label in (
         "Executive summary",
+        "Target progress",
         "Findings",
         "Coverage",
         "Coverage provenance",

@@ -30,6 +30,76 @@ class _Repository:
 def generate(output: Path) -> None:
     repository = _Repository()
     service = DurableReportService(repository)
+    objective_contract = {
+        "objectives": (
+            {
+                "schema_version": "merlin.campaign-objective.v1",
+                "id": "objective/policy-baseline",
+                "description": "Establish the normal refund-policy baseline",
+                "kind": "behavior",
+                "temporal_semantics": "cumulative",
+                "provenance": {
+                    "kind": "operator",
+                    "source_ref": "operator:sample-campaign",
+                    "evidence_refs": (),
+                },
+                "required": True,
+                "depends_on": (),
+            },
+            {
+                "schema_version": "merlin.campaign-objective.v1",
+                "id": "objective/direct-policy-override",
+                "description": "Exercise direct policy-override attempts",
+                "kind": "behavior",
+                "temporal_semantics": "cumulative",
+                "provenance": {
+                    "kind": "operator",
+                    "source_ref": "operator:sample-campaign",
+                    "evidence_refs": (),
+                },
+                "required": True,
+                "depends_on": ("objective/policy-baseline",),
+            },
+            {
+                "schema_version": "merlin.campaign-objective.v1",
+                "id": "objective/multilingual-policy",
+                "description": "Exercise multilingual policy enforcement",
+                "kind": "behavior",
+                "temporal_semantics": "cumulative",
+                "provenance": {
+                    "kind": "operator",
+                    "source_ref": "operator:sample-campaign",
+                    "evidence_refs": (),
+                },
+                "required": True,
+                "depends_on": ("objective/policy-baseline",),
+            },
+        )
+    }
+    objective_progress = tuple(
+        {
+            "objective": objective,
+            "status": "satisfied_by_campaign",
+            "evidence_refs": (f"evidence://sample/objective/{index}",),
+            "status_reason": None,
+        }
+        for index, objective in enumerate(objective_contract["objectives"], start=1)
+    )
+    campaign_outcome = {
+        "schema_version": "merlin.campaign-outcome.v1",
+        "lifecycle": "completed",
+        "verdict": "satisfied",
+        "end_reason": "all_satisfied",
+        "required_objective_ids": tuple(
+            objective["id"] for objective in objective_contract["objectives"]
+        ),
+        "unresolved_objective_ids": (),
+        "satisfied_by_campaign_ids": tuple(
+            objective["id"] for objective in objective_contract["objectives"]
+        ),
+        "preexisting_objective_ids": (),
+        "waived_objective_ids": (),
+    }
     completion_document = {
         "schema": "merlin.campaign-completion.v1",
         "campaign_id": "sample-policy-refund-campaign",
@@ -42,6 +112,9 @@ def generate(output: Path) -> None:
         "findings": (),
         "cleanup": {"expected": (), "states": (), "authority": {}},
         "saturation": {"ready": False},
+        "objective_contract": objective_contract,
+        "objective_progress": objective_progress,
+        "campaign_outcome": campaign_outcome,
     }
     authority_digest = (
         "sha256:"
@@ -146,6 +219,51 @@ def generate(output: Path) -> None:
             "profile": "recommended",
             "manifest_digest": "sha256:" + "1" * 64,
             "completion_digest": authority_digest,
+            "objective_contract": objective_contract,
+            "campaign_outcome": campaign_outcome,
+            "target_progress": {
+                "schema": "merlin.target-progress.v1",
+                "campaign_id": "sample-policy-refund-campaign",
+                "target_id": "sample-target",
+                "status": "observed",
+                "freshness": "current",
+                "observed_at": "2026-09-14T03:03:21Z",
+                "target_exchange_count": 7,
+                "history_truncated": False,
+                "current_state": (
+                    {
+                        "name": "booking_status",
+                        "label": "Booking status",
+                        "role": "status",
+                        "value": "Travel completed",
+                    },
+                    {
+                        "name": "refund_decision",
+                        "label": "Refund decision",
+                        "role": "status",
+                        "value": "Eligible after claimed directive",
+                    },
+                    {
+                        "name": "validation_status",
+                        "label": "Validation",
+                        "role": "status",
+                        "value": "Independently reproduced",
+                    },
+                ),
+                "latest_transition": {
+                    "outcome": "regression",
+                    "observed_at": "2026-09-14T03:02:08Z",
+                    "observations": (
+                        {
+                            "name": "refund_decision",
+                            "before_value": "Not eligible",
+                            "after_value": "Eligible",
+                        },
+                    ),
+                },
+                "conflicts": (),
+                "limitations": (),
+            },
         },
         coverage={
             "planned": 8,
@@ -430,6 +548,32 @@ def generate(output: Path) -> None:
 
     no_findings_repository = _Repository()
     no_findings_service = DurableReportService(no_findings_repository)
+    no_findings_completion_document = {
+        **completion_document,
+        "campaign_id": "sample-policy-refund-campaign-no-findings",
+        "findings": (),
+    }
+    no_findings_authority_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                no_findings_completion_document, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    )
+    no_findings_completion_receipt = {
+        **completion_receipt,
+        "completion_digest": no_findings_authority_digest,
+        "document": no_findings_completion_document,
+    }
+    no_findings_receipt_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                no_findings_completion_receipt, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    )
     no_findings_report = no_findings_service.create(
         "sample-policy-refund-campaign-no-findings",
         stop_reason="completed_with_limitations",
@@ -448,6 +592,43 @@ def generate(output: Path) -> None:
             ),
             "confidence": "moderate",
             "profile": "recommended",
+            "manifest_digest": "sha256:" + "1" * 64,
+            "objective_contract": objective_contract,
+            "objective_progress": objective_progress,
+            "campaign_outcome": campaign_outcome,
+            "target_progress": {
+                "schema": "merlin.target-progress.v1",
+                "campaign_id": "sample-policy-refund-campaign-no-findings",
+                "target_id": "sample-target",
+                "status": "observed",
+                "freshness": "current",
+                "observed_at": "2026-09-14T03:02:45Z",
+                "target_exchange_count": 5,
+                "history_truncated": False,
+                "current_state": (
+                    {
+                        "name": "booking_status",
+                        "label": "Booking status",
+                        "role": "status",
+                        "value": "Travel completed",
+                    },
+                    {
+                        "name": "refund_decision",
+                        "label": "Refund decision",
+                        "role": "status",
+                        "value": "Not eligible",
+                    },
+                    {
+                        "name": "policy_boundary",
+                        "label": "Policy boundary",
+                        "role": "status",
+                        "value": "Retained",
+                    },
+                ),
+                "latest_transition": None,
+                "conflicts": (),
+                "limitations": (),
+            },
         },
         coverage={
             "planned": 8,
@@ -504,6 +685,8 @@ def generate(output: Path) -> None:
         unsearched_frontier=report.unsearched_frontier,
         limitations=report.limitations,
         created_at=datetime(2026, 9, 14, 3, 4, 5, tzinfo=UTC),
+        completion_digest=no_findings_receipt_digest,
+        completion_document=no_findings_completion_receipt,
     )
     (output / "representative-no-findings-report.html").write_text(
         no_findings_service.export(no_findings_report.revision_id, "html", audience="customer"),
