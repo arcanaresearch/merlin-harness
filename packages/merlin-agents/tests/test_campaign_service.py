@@ -22198,7 +22198,7 @@ async def test_frontier_settlement_requeues_infrastructure_failures_without_reti
         ("terminality", "retryable", "canonical normalization"),
     ),
 )
-async def test_frontier_settlement_rejects_drifted_canonical_projection(
+async def test_frontier_settlement_quarantines_drifted_projection_and_advances_retry(
     field: str,
     drifted: str,
     error: str,
@@ -22223,15 +22223,24 @@ async def test_frontier_settlement_rejects_drifted_canonical_projection(
     )
 
     class FrontierStore(Store):
+        def __init__(self) -> None:
+            self.lead = []
+            self.settled = {}
+
         def load_active_frontier_batch(self, _campaign_id):
             return {
                 "id": "batch-1",
                 "schedule_id": "schedule-1",
+                "wave": 7,
                 "candidates": ({"id": "cell/completed", "claim_generation": 1},),
             }
 
-        def settle_frontier_batch(self, *_args, **_kwargs):
-            raise AssertionError("drifted settlement must not reach durable frontier state")
+        def append_lead(self, campaign_id, wave, payload):
+            self.lead.append((campaign_id, wave, dict(payload)))
+
+        def settle_frontier_batch(self, _campaign_id, _batch_id, dispositions):
+            self.settled.update(dispositions)
+            return {"queued": 1, "terminal": 0, "total": 1}
 
     class OutcomeAgents:
         async def technique_attempts(self, _schedule_id):
@@ -22252,20 +22261,39 @@ async def test_frontier_settlement_rejects_drifted_canonical_projection(
                 },
             )
 
-    service = CampaignService(FrontierStore(), OutcomeAgents(), None)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match=error):
-        await service._settle_execution_frontier_batch(  # noqa: SLF001
-            "campaign-1",
-            SimpleNamespace(id="schedule-1"),
-            (
-                AgentTask(
-                    id="task/completed",
-                    objective="completed",
-                    status="completed",
-                    technique_ids=("cell/completed",),
-                ),
+    store = FrontierStore()
+    service = CampaignService(store, OutcomeAgents(), None)  # type: ignore[arg-type]
+    counts = await service._settle_execution_frontier_batch(  # noqa: SLF001
+        "campaign-1",
+        SimpleNamespace(id="schedule-1"),
+        (
+            AgentTask(
+                id="task/completed",
+                objective="completed",
+                status="completed",
+                technique_ids=("cell/completed",),
             ),
-        )
+        ),
+    )
+
+    assert store.settled["cell/completed"]["disposition"] == "retryable"
+    assert counts == {
+        "queued": 1,
+        "terminal": 0,
+        "total": 1,
+        "max_claim_generation": 1,
+        "retryable_claims_below_cap": 1,
+        "retry_exhausted_candidates": 0,
+    }
+    assert len(store.lead) == 1
+    campaign_id, wave, rejection = store.lead[0]
+    assert campaign_id == "campaign-1"
+    assert wave == 7
+    assert rejection["kind"] == "frontier_outcome_projection_rejected"
+    assert rejection["task_id"] == "task/completed"
+    assert rejection["technique_id"] == "cell/completed"
+    assert error in rejection["reason"]
+    assert rejection["retryable"] is True
 
 
 async def test_frontier_settlement_registers_generated_protocol_child_and_requeues_parent():

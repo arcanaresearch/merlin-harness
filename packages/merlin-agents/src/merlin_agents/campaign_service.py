@@ -2647,40 +2647,71 @@ class CampaignService:
             projection_value = strategy.get("candidate_outcome_projection")
             canonical_projection = None
             if isinstance(projection_value, Mapping):
-                identity_value = strategy.get("candidate_identity")
-                if not isinstance(identity_value, Mapping):
-                    raise ValueError(
-                        "frontier settlement projection has no canonical candidate identity"
+                try:
+                    identity_value = strategy.get("candidate_identity")
+                    if not isinstance(identity_value, Mapping):
+                        raise ValueError(
+                            "frontier settlement projection has no canonical candidate identity"
+                        )
+                    canonical_projection = validate_candidate_outcome_projection(
+                        projection_value,
+                        expected_candidate_id=candidate_id_for_identity(identity_value),
                     )
-                canonical_projection = validate_candidate_outcome_projection(
-                    projection_value,
-                    expected_candidate_id=candidate_id_for_identity(identity_value),
-                )
-                identity_technique_id = str(identity_value.get("technique_id") or "").strip()
-                if not isinstance(technique_id, str) or identity_technique_id != technique_id:
-                    raise ValueError(
-                        "frontier settlement projection conflicts with attempted candidate"
-                    )
-                if canonical_projection["attempt_disposition"] != disposition:
-                    raise ValueError(
-                        "frontier settlement disposition conflicts with canonical projection"
-                    )
-                if canonical_projection["outcome_authority"] != authority_kind:
-                    raise ValueError(
-                        "frontier settlement authority conflicts with canonical projection"
-                    )
-                if canonical_projection["terminality"] == "terminal" and (
-                    not isinstance(authority, Mapping)
-                    or str(authority.get("outcome") or "").casefold()
-                    != canonical_projection["outcome"]
-                ):
-                    raise ValueError(
-                        "frontier settlement authority outcome conflicts with canonical projection"
-                    )
-                if state in {"confirmed", "refuted"} and canonical_projection["outcome"] != state:
-                    raise ValueError(
-                        "frontier settlement outcome conflicts with canonical projection"
-                    )
+                    identity_technique_id = str(
+                        identity_value.get("technique_id") or ""
+                    ).strip()
+                    if not isinstance(technique_id, str) or identity_technique_id != technique_id:
+                        raise ValueError(
+                            "frontier settlement projection conflicts with attempted candidate"
+                        )
+                    if canonical_projection["attempt_disposition"] != disposition:
+                        raise ValueError(
+                            "frontier settlement disposition conflicts with canonical projection"
+                        )
+                    if canonical_projection["outcome_authority"] != authority_kind:
+                        raise ValueError(
+                            "frontier settlement authority conflicts with canonical projection"
+                        )
+                    if canonical_projection["terminality"] == "terminal" and (
+                        not isinstance(authority, Mapping)
+                        or str(authority.get("outcome") or "").casefold()
+                        != canonical_projection["outcome"]
+                    ):
+                        raise ValueError(
+                            "frontier settlement authority outcome conflicts with canonical "
+                            "projection"
+                        )
+                    if (
+                        state in {"confirmed", "refuted"}
+                        and canonical_projection["outcome"] != state
+                    ):
+                        raise ValueError(
+                            "frontier settlement outcome conflicts with canonical projection"
+                        )
+                except ValueError as error:
+                    # Projection drift is evidence-integrity uncertainty for this
+                    # attempt. It must never abort settlement for the whole batch:
+                    # doing so leaves every claimed candidate at the same generation
+                    # and can make recovery schedule the identical batch forever.
+                    canonical_projection = None
+                    append_lead = getattr(self._store, "append_lead", None)
+                    if callable(append_lead):
+                        await asyncio.to_thread(
+                            append_lead,
+                            campaign_id,
+                            int(batch.get("wave", 0)),
+                            {
+                                "kind": "frontier_outcome_projection_rejected",
+                                "task_id": str(attempt.get("task_id") or ""),
+                                "technique_id": str(technique_id or ""),
+                                "reason": str(error),
+                                "intervention": (
+                                    "keep the candidate unresolved and advance its bounded "
+                                    "retry generation"
+                                ),
+                                "retryable": True,
+                            },
+                        )
             child = strategy.get("bounded_child_candidate")
             protocol_request = strategy.get("protocol_invalid_request")
             if (
