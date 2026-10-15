@@ -119,7 +119,7 @@ def main() -> None:
         except (RuntimeError, TimeoutError) as error:
             print(f"Merlin could not restart: {error}", file=sys.stderr)
             raise SystemExit(1) from None
-        print("Merlin daemon ready")
+        print("Merlin daemon restarted; it will stop automatically if no UI connects")
         return
     if sys.argv[1:] in (["storage", "stop"], ["storage", "purge"]):
         _manage_embedded_storage(purge=sys.argv[2] == "purge")
@@ -513,7 +513,7 @@ def _run_first_setup(
 
 async def _ensure_daemon_with_splash() -> None:
     from .app import WORDMARK
-    from .local_control import ensure_daemon
+    from .local_control import _arm_unclaimed_shutdown, ensure_daemon
 
     frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     status = Text("Preparing Merlin…", style="dim")
@@ -532,7 +532,9 @@ async def _ensure_daemon_with_splash() -> None:
             live.refresh()
 
         try:
-            await ensure_daemon(progress=progress)
+            started_daemon = await ensure_daemon(progress=progress)
+            if started_daemon:
+                await _arm_unclaimed_shutdown()
         except RuntimeError:
             from .local_control import _SOCKET, _daemon_lock_released, _ping
 

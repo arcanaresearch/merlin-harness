@@ -70,6 +70,9 @@ _SNAPSHOT_METHODS = frozenset(
 _BATCHABLE_STREAM_KINDS = frozenset({"status", "content", "thinking"})
 _STARTER_EXIT_GRACE_SECONDS = 0.5
 _RECOVERY_WATCHDOG_SECONDS = 5.0
+_FOREGROUND_HEARTBEAT_SECONDS = 1.0
+_FOREGROUND_LEASE_TIMEOUT_SECONDS = 5.0
+_FOREGROUND_ATTACH_GRACE_SECONDS = 10.0
 _PROCESS_LIFETIME_LOCKS: list[BinaryIO] = []
 _ALLOWED = {
     "configure_provider",
@@ -510,6 +513,15 @@ async def serve(
     foreground_lease_id: str | None = None
     foreground_channel: _Channel | None = None
     foreground_accepts_close = False
+    unclaimed_shutdown: asyncio.Task[None] | None = None
+
+    async def stop_if_daemon_remains_unclaimed() -> None:
+        """Retire a newly started daemon when no foreground UI claims it."""
+        nonlocal clean_shutdown
+        await asyncio.sleep(_FOREGROUND_ATTACH_GRACE_SECONDS)
+        if foreground_lease_id is None and not shutdown.is_set():
+            clean_shutdown = True
+            shutdown.set()
 
     async def watch_configuration() -> None:
         from merlin_config import ConfigPaths, load_config
@@ -668,7 +680,9 @@ async def serve(
             await channel.send({"type": "event", "cursor": cursor, "value": value})
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal clean_shutdown, foreground_lease_id, foreground_channel, foreground_accepts_close
+        nonlocal clean_shutdown
+        nonlocal foreground_lease_id, foreground_channel, foreground_accepts_close
+        nonlocal unclaimed_shutdown
         channel = _Channel(reader, writer)
         try:
             if not _peer_is_owner(writer):
@@ -700,6 +714,20 @@ async def serve(
                 else:
                     await channel.send({"type": "result", "value": "no_owner"})
                 return
+            if method == "arm_unclaimed_shutdown":
+                if foreground_lease_id is None:
+                    if unclaimed_shutdown is not None:
+                        unclaimed_shutdown.cancel()
+                        await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+                    unclaimed_shutdown = asyncio.create_task(
+                        stop_if_daemon_remains_unclaimed(),
+                        name="local-control:foreground-attach-watchdog",
+                    )
+                    value = "armed"
+                else:
+                    value = "claimed"
+                await channel.send({"type": "result", "value": value})
+                return
             if method == "foreground_lease":
                 if foreground_lease_id is not None:
                     raise RuntimeError("Merlin already has a foreground owner")
@@ -707,11 +735,34 @@ async def serve(
                 foreground_lease_id = lease_id
                 foreground_channel = channel
                 foreground_accepts_close = request.get("close_notifications") is True
-                await channel.send({"type": "result", "value": "attached", "lease_id": lease_id})
+                if unclaimed_shutdown is not None:
+                    unclaimed_shutdown.cancel()
+                    await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+                    unclaimed_shutdown = None
+                await channel.send(
+                    {
+                        "type": "result",
+                        "value": "attached",
+                        "lease_id": lease_id,
+                        "heartbeat_seconds": _FOREGROUND_HEARTBEAT_SECONDS,
+                    }
+                )
                 try:
-                    # The kernel closes this socket even when the terminal or TUI
-                    # is killed abruptly. EOF is the foreground-owner lifetime signal.
-                    await reader.read()
+                    # EOF handles normal and abrupt exits. Heartbeats also detect a
+                    # suspended frontend, which otherwise keeps its Unix socket open
+                    # forever while the daemon continues serving stale code.
+                    while True:
+                        try:
+                            heartbeat = await channel.receive(
+                                deadline_seconds=_FOREGROUND_LEASE_TIMEOUT_SECONDS
+                            )
+                        except TimeoutError:
+                            break
+                        if (
+                            heartbeat.get("method") != "foreground_heartbeat"
+                            or heartbeat.get("lease_id") != lease_id
+                        ):
+                            raise ValueError("invalid foreground lease heartbeat")
                 finally:
                     if foreground_lease_id == lease_id:
                         foreground_lease_id = None
@@ -784,6 +835,9 @@ async def serve(
         async with server:
             await shutdown.wait()
     finally:
+        if unclaimed_shutdown is not None:
+            unclaimed_shutdown.cancel()
+            await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
         if config_watcher is not None:
             config_watcher.cancel()
             await asyncio.gather(config_watcher, return_exceptions=True)
@@ -951,6 +1005,7 @@ class LocalControlClient:
         self._lease_reader: asyncio.StreamReader | None = None
         self._lease_writer: asyncio.StreamWriter | None = None
         self._lease_id: str | None = None
+        self._lease_heartbeat: asyncio.Task[None] | None = None
 
     async def acquire_foreground_lease(self, *, close_notifications: bool = False) -> None:
         """Keep the daemon alive only while this foreground TUI exists."""
@@ -972,13 +1027,67 @@ class LocalControlClient:
             lease_id = response.get("lease_id")
             if not isinstance(lease_id, str) or not lease_id:
                 raise RuntimeError("Merlin daemon returned an invalid foreground lease")
+            heartbeat_seconds = response.get("heartbeat_seconds")
+            legacy_lease = heartbeat_seconds is None
+            if not legacy_lease and (
+                not isinstance(heartbeat_seconds, (int, float)) or heartbeat_seconds <= 0
+            ):
+                raise RuntimeError("Merlin daemon returned an invalid heartbeat interval")
         except BaseException:
             await _close_writer(writer)
             raise
+        if legacy_lease:
+            # A daemon from before renewable foreground leases can keep stale code
+            # alive forever after its TUI is suspended. We own this just-acquired
+            # idle lease, so replace it cleanly before exposing the new UI.
+            try:
+                await stop_daemon(self._socket_path, lease_id=lease_id)
+            finally:
+                await _close_writer(writer)
+            self._owns_daemon = bool(await ensure_daemon(self._socket_path))
+            await self.acquire_foreground_lease(close_notifications=close_notifications)
+            return
         self._close_notifications = close_notifications
         self._lease_reader = reader
         self._lease_writer = writer
         self._lease_id = lease_id
+        self._lease_heartbeat = asyncio.create_task(
+            self._renew_foreground_lease(writer, lease_id, float(heartbeat_seconds)),
+            name="local-control:foreground-heartbeat",
+        )
+
+    async def _renew_foreground_lease(
+        self,
+        writer: asyncio.StreamWriter,
+        lease_id: str,
+        heartbeat_seconds: float,
+    ) -> None:
+        """Prove that the foreground event loop is still running."""
+        try:
+            while writer is self._lease_writer and lease_id == self._lease_id:
+                await asyncio.sleep(heartbeat_seconds)
+                if writer is not self._lease_writer or lease_id != self._lease_id:
+                    return
+                frame = json.dumps(
+                    {"method": "foreground_heartbeat", "lease_id": lease_id},
+                    separators=(",", ":"),
+                )
+                writer.write((frame + "\n").encode())
+                await writer.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            return
+
+    async def _drop_foreground_lease(self) -> asyncio.StreamWriter | None:
+        heartbeat = self._lease_heartbeat
+        self._lease_heartbeat = None
+        self._lease_reader = None
+        writer = self._lease_writer
+        self._lease_writer = None
+        self._lease_id = None
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        return writer
 
     async def wait_for_foreground_close(self) -> None:
         """Wait for another window's explicit request to close this session."""
@@ -989,7 +1098,8 @@ class LocalControlClient:
             reader = self._lease_reader
             if reader is None:
                 raise RuntimeError("No foreground session is attached")
-            # Lease lifetime has no request timeout: an idle window remains valid.
+            # The server owns liveness expiry; this reader only receives explicit
+            # close requests or EOF after lease expiry.
             line = await reader.readline()
             if getattr(self, "_reconnecting", False) or reader is not self._lease_reader:
                 continue
@@ -1001,10 +1111,7 @@ class LocalControlClient:
 
     async def release_foreground_lease(self) -> None:
         """Release foreground ownership before terminal teardown can suspend the TUI."""
-        writer = self._lease_writer
-        self._lease_reader = None
-        self._lease_writer = None
-        self._lease_id = None
+        writer = await self._drop_foreground_lease()
         if writer is not None:
             await _close_writer(writer)
 
@@ -1163,10 +1270,7 @@ class LocalControlClient:
         try:
             had_lease = self._lease_writer is not None
             self._owns_daemon = bool(await ensure_daemon(self._socket_path))
-            writer = self._lease_writer
-            self._lease_reader = None
-            self._lease_writer = None
-            self._lease_id = None
+            writer = await self._drop_foreground_lease()
             if writer is not None:
                 await _close_writer(writer)
             if had_lease:
@@ -1196,10 +1300,7 @@ class LocalControlClient:
             self._owns_daemon = False
         finally:
             await _close_writer(writer)
-            lease_writer = self._lease_writer
-            self._lease_reader = None
-            self._lease_writer = None
-            self._lease_id = None
+            lease_writer = await self._drop_foreground_lease()
             if lease_writer is not None:
                 await _close_writer(lease_writer)
 
@@ -1220,10 +1321,7 @@ class LocalControlClient:
             stopped = await stop_daemon(self._socket_path, lease_id=self._lease_id)
             if not stopped:
                 raise RuntimeError("model routing was saved, but the daemon did not stop cleanly")
-            lease_writer = self._lease_writer
-            self._lease_reader = None
-            self._lease_writer = None
-            self._lease_id = None
+            lease_writer = await self._drop_foreground_lease()
             if lease_writer is not None:
                 await _close_writer(lease_writer)
             self._owns_daemon = bool(await ensure_daemon(self._socket_path))
@@ -1399,6 +1497,25 @@ def _daemon_lock_released(socket_path: Path) -> bool:
 async def restart_daemon(socket_path: Path = _SOCKET) -> None:
     """Close the owning TUI and wait for resource cleanup before starting anew."""
     await LocalControlClient(socket_path=socket_path).replace_foreground(restart=True)
+    if await _ping(socket_path):
+        await _arm_unclaimed_shutdown(socket_path)
+
+
+async def _arm_unclaimed_shutdown(socket_path: Path = _SOCKET) -> None:
+    """Give a newly started daemon a bounded window for a TUI to attach."""
+    reader, writer = await asyncio.open_unix_connection(
+        socket_path, limit=_MAX_FRAME_BYTES + 1
+    )
+    try:
+        channel = _Channel(reader, writer)
+        await channel.send({"method": "arm_unclaimed_shutdown"})
+        response = await channel.receive()
+        if response.get("type") == "error":
+            raise RuntimeError(str(response.get("error", "idle shutdown was rejected")))
+        if response.get("value") not in {"armed", "claimed"}:
+            raise RuntimeError("Merlin daemon did not acknowledge restart ownership")
+    finally:
+        await _close_writer(writer)
 
 
 async def stop_daemon(

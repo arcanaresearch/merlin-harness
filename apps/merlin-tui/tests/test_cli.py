@@ -2051,7 +2051,7 @@ def test_restart_stops_before_starting(monkeypatch, capsys):
     monkeypatch.setattr(local_control, "restart_daemon", restart)
     main()
     assert calls == ["restart"]
-    assert "Merlin daemon ready" in capsys.readouterr().out
+    assert "will stop automatically if no UI connects" in capsys.readouterr().out
 
 
 def test_restart_delegates_to_coordinated_lifecycle(monkeypatch, capsys) -> None:
@@ -2072,7 +2072,9 @@ def test_restart_delegates_to_coordinated_lifecycle(monkeypatch, capsys) -> None
 
     assert calls == ["restart"]
     captured = capsys.readouterr()
-    assert captured.out == "Merlin daemon ready\n"
+    assert captured.out == (
+        "Merlin daemon restarted; it will stop automatically if no UI connects\n"
+    )
     assert captured.err == ""
 
 
@@ -2095,3 +2097,27 @@ def test_restart_reports_coordination_failure_without_traceback(
     assert captured.err == (
         "Merlin could not restart: The existing session is still closing. Try again shortly.\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_interactive_daemon_start_arms_unclaimed_shutdown(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def ensure_daemon(*, progress):
+        calls.append("ensure")
+        progress(0)
+        return True
+
+    async def arm_unclaimed_shutdown():
+        calls.append("arm")
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", ensure_daemon)
+    monkeypatch.setattr(
+        "merlin_tui.local_control._arm_unclaimed_shutdown", arm_unclaimed_shutdown
+    )
+
+    from merlin_tui.cli import _ensure_daemon_with_splash
+
+    await _ensure_daemon_with_splash()
+
+    assert calls == ["ensure", "arm"]

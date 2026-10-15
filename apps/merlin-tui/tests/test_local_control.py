@@ -829,13 +829,195 @@ async def test_foreground_lease_disconnect_stops_daemon_and_owned_resources() ->
     client = LocalControlClient(socket_path=socket_path)
     await client.acquire_foreground_lease()
     assert client._lease_writer is not None
-    await _close_writer(client._lease_writer)
-    client._lease_writer = None
-    client._lease_reader = None
+    await client.release_foreground_lease()
 
     await asyncio.wait_for(task, timeout=2)
     assert backend.closed
     assert not await asyncio.to_thread(socket_path.exists)
+
+
+@pytest.mark.asyncio
+async def test_foreground_lease_heartbeat_keeps_daemon_alive(monkeypatch) -> None:
+    from uuid import uuid4
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_LEASE_TIMEOUT_SECONDS", 0.05)
+    backend = Backend()
+    socket_path = Path(f"/tmp/merlin-heartbeat-live-{uuid4().hex[:12]}.sock")
+    task = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    client = LocalControlClient(socket_path=socket_path)
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await client.acquire_foreground_lease()
+        await asyncio.sleep(0.15)
+        assert not task.done()
+        assert not backend.closed
+        await client.shutdown()
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_legacy_idle_daemon_is_replaced_before_foreground_attach(
+    monkeypatch,
+) -> None:
+    from uuid import uuid4
+
+    path = Path(f"/tmp/merlin-legacy-upgrade-{uuid4().hex[:12]}.sock")
+    state = {"legacy": True}
+    calls: list[tuple[str, str | None]] = []
+    handlers: set[asyncio.Task[None]] = set()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            request = json.loads(await reader.readline())
+            assert request["method"] == "foreground_lease"
+            response: dict[str, object] = {
+                "type": "result",
+                "value": "attached",
+                "lease_id": "legacy-lease" if state["legacy"] else "current-lease",
+            }
+            if not state["legacy"]:
+                response["heartbeat_seconds"] = 0.01
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def tracked_handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.add(task)
+        try:
+            await handle(reader, writer)
+        finally:
+            handlers.discard(task)
+
+    server = await asyncio.start_unix_server(tracked_handle, path)
+
+    async def stop(_path: Path, *, lease_id: str | None = None) -> bool:
+        calls.append(("stop", lease_id))
+        state["legacy"] = False
+        return True
+
+    async def start(_path: Path) -> bool:
+        calls.append(("start", None))
+        return True
+
+    monkeypatch.setattr("merlin_tui.local_control.stop_daemon", stop)
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
+    client = LocalControlClient(socket_path=path)
+    try:
+        await client.acquire_foreground_lease(close_notifications=True)
+        assert client._lease_id == "current-lease"
+        assert calls == [("stop", "legacy-lease"), ("start", None)]
+        await client.release_foreground_lease()
+    finally:
+        server.close()
+        await server.wait_closed()
+        if handlers:
+            await asyncio.gather(*handlers)
+
+
+@pytest.mark.asyncio
+async def test_foreground_lease_without_heartbeats_stops_daemon(monkeypatch) -> None:
+    from uuid import uuid4
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_LEASE_TIMEOUT_SECONDS", 0.05)
+    backend = Backend()
+    socket_path = Path(f"/tmp/merlin-heartbeat-expired-{uuid4().hex[:12]}.sock")
+    task = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    client = LocalControlClient(socket_path=socket_path)
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await client.acquire_foreground_lease()
+        assert client._lease_heartbeat is not None
+        client._lease_heartbeat.cancel()
+        await asyncio.gather(client._lease_heartbeat, return_exceptions=True)
+        client._lease_heartbeat = None
+
+        await asyncio.wait_for(task, timeout=1)
+        assert backend.closed
+        assert not await asyncio.to_thread(socket_path.exists)
+    finally:
+        await client.release_foreground_lease()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_suspended_foreground_process_expires_its_daemon(monkeypatch, tmp_path) -> None:
+    import signal
+    from uuid import uuid4
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_LEASE_TIMEOUT_SECONDS", 0.1)
+    backend = Backend()
+    socket_path = Path(f"/tmp/merlin-heartbeat-suspended-{uuid4().hex[:12]}.sock")
+    task = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    script = tmp_path / "suspended_lease.py"
+    await asyncio.to_thread(
+        script.write_text,
+        f"""import asyncio, os, signal
+from pathlib import Path
+from merlin_tui.local_control import LocalControlClient
+
+async def main():
+    client = LocalControlClient(socket_path=Path({str(socket_path)!r}))
+    await client.acquire_foreground_lease()
+    print('attached', flush=True)
+    os.kill(os.getpid(), signal.SIGSTOP)
+    try:
+        await client.wait_for_foreground_close()
+    except (ConnectionError, OSError, RuntimeError):
+        pass
+    finally:
+        await client.release_foreground_lease()
+
+asyncio.run(main())
+""",
+    )
+    process = None
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        assert await process.stdout.readline() == b"attached\n"
+        await asyncio.wait_for(task, timeout=1)
+        assert backend.closed
+        assert not await asyncio.to_thread(socket_path.exists)
+        os.kill(process.pid, signal.SIGCONT)
+        assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    finally:
+        if process is not None and process.returncode is None:
+            os.kill(process.pid, signal.SIGCONT)
+            process.terminate()
+            await process.wait()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -2074,7 +2256,7 @@ async def test_restart_foreground_waits_for_lease_eof_and_backend_cleanup(monkey
                 await owner.wait_for_foreground_close()
                 owner_notified.set()
                 assert owner._lease_writer is not None
-                await _close_writer(owner._lease_writer)
+                await owner.release_foreground_lease()
 
             quit_owner = asyncio.create_task(release_on_notification())
             restarting = asyncio.create_task(restart_daemon(path))
@@ -2130,6 +2312,60 @@ async def test_restart_idle_daemon_cleans_resources_before_start(monkeypatch) ->
             server.cancel()
         await asyncio.gather(server, return_exceptions=True)
         path.with_suffix(".journal.json").unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_restarted_daemon_stops_when_no_foreground_attaches(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import _arm_unclaimed_shutdown
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_ATTACH_GRACE_SECONDS", 0.05)
+    backend = Backend()
+    path = Path(f"/tmp/merlin-restart-unclaimed-{uuid4().hex[:12]}.sock")
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await _arm_unclaimed_shutdown(path)
+        await asyncio.wait_for(server, timeout=1)
+        assert backend.closed
+        assert not await asyncio.to_thread(path.exists)
+    finally:
+        if not server.done():
+            server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_foreground_claim_cancels_restart_idle_shutdown(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from merlin_tui.local_control import _arm_unclaimed_shutdown
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_ATTACH_GRACE_SECONDS", 0.05)
+    backend = Backend()
+    path = Path(f"/tmp/merlin-restart-claimed-{uuid4().hex[:12]}.sock")
+    server = asyncio.create_task(serve(path, backend_factory=lambda **_: backend))
+    client = LocalControlClient(socket_path=path)
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await _arm_unclaimed_shutdown(path)
+        await client.acquire_foreground_lease()
+        await asyncio.sleep(0.1)
+        assert not server.done()
+        assert not backend.closed
+        await client.shutdown()
+        await server
+    finally:
+        if not server.done():
+            server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
 
 
 @pytest.mark.asyncio
