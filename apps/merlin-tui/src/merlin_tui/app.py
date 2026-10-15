@@ -687,14 +687,25 @@ class SetupScreen(ModalScreen[ProviderSetup | None]):
             await self._discover_models()
             return
         if event.button.id == "save":
+            base_url_input = self.query_one("#setup-base-url", Input)
+            model_input = self.query_one("#setup-model", Input)
+            base_url = base_url_input.value.strip()
+            model = model_input.value.strip()
+            if not base_url:
+                self.notify("Provider base URL is required", severity="error")
+                base_url_input.focus()
+                return
+            if not model:
+                await self._discover_models()
+                return
             raw_window = self.query_one("#setup-context-window", Input).value.strip()
             if raw_window and (not raw_window.isdigit() or int(raw_window) < 1_024):
                 self.notify("Context window must be an integer of at least 1024", severity="error")
                 return
             self.dismiss(
                 ProviderSetup(
-                    self.query_one("#setup-base-url", Input).value,
-                    self.query_one("#setup-model", Input).value,
+                    base_url,
+                    model,
                     self.query_one("#setup-api-key", Input).value,
                     self.query_one("#setup-vision", Checkbox).value,
                     int(raw_window) if raw_window else None,
@@ -6036,15 +6047,19 @@ class MerlinApp(App[None]):
             return
         route = next(route for route in PROVIDER_ROUTES if route.label == choice)
         effort = "default"
+        model = ""
         try:
             from merlin_config import load_config
 
             provider = load_config().values.get("provider", {})
             if isinstance(provider, Mapping):
                 effort = str(provider.get("effort", "default"))
+                configured_base_url = str(provider.get("base_url", "")).rstrip("/")
+                if configured_base_url == route.base_url.rstrip("/"):
+                    model = str(provider.get("model", ""))
         except (OSError, TypeError, ValueError):
             pass
-        self.push_screen(SetupScreen(route, route.base_url, "", effort), self._save_provider)
+        self.push_screen(SetupScreen(route, route.base_url, model, effort), self._save_provider)
 
     def _save_remote_mcp(self, setup: RemoteMcpSetup | None) -> None:
         if setup is not None:

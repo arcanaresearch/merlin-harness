@@ -1513,16 +1513,54 @@ async def test_setup_screen_preserves_current_reasoning_effort() -> None:
 async def test_provider_setup_flow_loads_persisted_reasoning_effort(monkeypatch) -> None:
     from merlin_tui.provider_catalog import PROVIDER_ROUTES
 
+    route = PROVIDER_ROUTES[3]
     monkeypatch.setattr(
         "merlin_config.load_config",
-        lambda: SimpleNamespace(values={"provider": {"effort": "high"}}),
+        lambda: SimpleNamespace(
+            values={
+                "provider": {
+                    "base_url": route.base_url,
+                    "model": "deepseek-v4-pro",
+                    "effort": "high",
+                }
+            }
+        ),
     )
     app = build_app(DemoBackend())
     async with app.run_test() as pilot:
-        app._pick_provider(PROVIDER_ROUTES[0].label)
+        app._pick_provider(route.label)
         await pilot.pause()
 
         assert app.screen.query_one("#setup-effort", Select).value == "high"
+        assert app.screen.query_one("#setup-model", Input).value == "deepseek-v4-pro"
+
+
+@pytest.mark.asyncio
+async def test_provider_setup_save_discovers_a_missing_model(monkeypatch) -> None:
+    from merlin_tui.provider_catalog import (
+        PROVIDER_ROUTES,
+        ModelCandidate,
+        ModelDiscovery,
+    )
+
+    route = PROVIDER_ROUTES[3]
+    monkeypatch.setattr(
+        "merlin_tui.provider_catalog.discover_model_catalog",
+        lambda *args, **kwargs: ModelDiscovery((ModelCandidate("deepseek-v4-pro"),)),
+    )
+    app = build_app(DemoBackend())
+    async with app.run_test() as pilot:
+        app.push_screen(SetupScreen(route, route.base_url))
+        await pilot.pause()
+        app.screen.query_one("#setup-api-key", Input).value = "opaque-secret"
+        app.screen.query_one("#save", Button).press()
+        await pilot.pause()
+
+        assert isinstance(app.screen, app_module.ChoiceScreen)
+        await pilot.press("1")
+        await pilot.pause()
+        assert isinstance(app.screen, SetupScreen)
+        assert app.screen.query_one("#setup-model", Input).value == "deepseek-v4-pro"
 
 
 @pytest.mark.asyncio
