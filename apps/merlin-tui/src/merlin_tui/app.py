@@ -2205,23 +2205,207 @@ def _lead_event_summary(payload: Mapping[str, object]) -> str:
     return "\n".join(parts)
 
 
+_LEAD_LIFECYCLE_EVENTS = frozenset(
+    {
+        "execution_priority",
+        "incremental_task_review_started",
+        "incremental_review_merge_started",
+        "incremental_review_priorities_applied",
+        "lead_review_started",
+        "lead_review_progress",
+        "lead_review_completed",
+    }
+)
+_LEAD_READABLE_EVENT_LIMIT = 10
+
+
+def _lead_journal_entries(
+    rows: Iterable[str],
+) -> tuple[tuple[Mapping[str, object], Mapping[str, object]], ...]:
+    entries: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    for raw_row in rows:
+        _, payload = _log_json(str(raw_row))
+        if payload is None:
+            continue
+        nested = payload.get("payload")
+        lead_payload = nested if isinstance(nested, Mapping) else payload
+        entries.append((payload, lead_payload))
+    return tuple(entries)
+
+
+def _lead_task_review_body(payload: Mapping[str, object]) -> str:
+    review = payload.get("review")
+    review = review if isinstance(review, Mapping) else {}
+    signal = str(review.get("signal") or "reviewed").replace("_", " ")
+    confidence = review.get("confidence")
+    heading = signal.capitalize()
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        heading += f" · {float(confidence):.0%} confidence"
+    body = [heading]
+    summary = review.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        body.append(summary.strip())
+    counts = []
+    for key, label in (
+        ("findings", "findings"),
+        ("objective_progress", "objective updates"),
+        ("hypotheses", "follow-up hypotheses"),
+    ):
+        values = review.get(key)
+        if isinstance(values, (tuple, list)) and values:
+            counts.append(f"{len(values)} {label}")
+    if counts:
+        body.append("Produced: " + " · ".join(counts))
+    return "\n".join(body)
+
+
+def _lead_operator_summary(
+    entries: tuple[tuple[Mapping[str, object], Mapping[str, object]], ...],
+    width: int,
+) -> str:
+    if not entries:
+        return ""
+    wave_values = [outer.get("wave") for outer, _ in entries if outer.get("wave") is not None]
+    current_wave = wave_values[-1] if wave_values else None
+    current = tuple(
+        entry for entry in entries if current_wave is None or entry[0].get("wave") == current_wave
+    )
+    task_states: dict[str, str] = {}
+    merge_state = "not started"
+    review_state = "coordinating"
+    for _, payload in current:
+        kind = str(payload.get("kind") or "")
+        review = payload.get("review")
+        review = review if isinstance(review, Mapping) else {}
+        task_id = str(payload.get("task_id") or review.get("task_id") or "")
+        if kind == "incremental_task_review_started" and task_id:
+            task_states[task_id] = "reviewing"
+            review_state = "reviewing task evidence"
+            if merge_state == "complete":
+                merge_state = "waiting for current reviews"
+        elif kind == "incremental_task_review_completed" and task_id:
+            task_states[task_id] = "completed"
+            review_state = "reviewing task evidence"
+            if merge_state == "complete":
+                merge_state = "waiting for current reviews"
+        elif kind == "incremental_task_review_failed" and task_id:
+            task_states[task_id] = "failed"
+            review_state = "reviewing task evidence"
+        elif kind == "incremental_review_merge_started":
+            merge_state = "in progress"
+            review_state = "merging reviewed evidence"
+        elif kind == "incremental_review_merge_completed":
+            merge_state = "complete"
+            review_state = "selecting the next work"
+        elif kind in {"lead_review_started", "lead_review_progress"}:
+            review_state = "reviewing the next decision"
+        elif kind == "lead_review_completed":
+            review_state = "validating the next decision"
+        elif kind == "lead_decision_rejected":
+            review_state = "correcting a rejected plan"
+        elif kind == "execution_priority":
+            review_state = "running the selected work"
+
+    completed = sum(state == "completed" for state in task_states.values())
+    reviewing = sum(state == "reviewing" for state in task_states.values())
+    failed = sum(state == "failed" for state in task_states.values())
+    lines = [
+        (f"Wave {current_wave} · " if current_wave is not None else "") + review_state.capitalize()
+    ]
+    if task_states:
+        task_line = f"Task reviews: {completed} complete"
+        if reviewing:
+            task_line += f" · {reviewing} running"
+        if failed:
+            task_line += f" · {failed} failed"
+        lines.append(task_line)
+    if merge_state != "not started":
+        lines.append("Review merge: " + merge_state)
+    rejected = [
+        payload
+        for _, payload in current
+        if str(payload.get("kind") or "") == "lead_decision_rejected"
+    ]
+    if rejected:
+        lines.append(f"Plan corrections: {len(rejected)} · latest rejection retained below")
+    lines.append("Lifecycle pings are collapsed here; press R for the complete journal.")
+    return _bubble("Campaign Lead · current", "\n".join(lines), width)
+
+
+def _readable_lead_log(rows: Iterable[str], *, width: int) -> str:
+    entries = _lead_journal_entries(rows)
+    if not entries:
+        return ""
+    latest_merge_by_wave = {
+        outer.get("wave"): index
+        for index, (outer, payload) in enumerate(entries)
+        if str(payload.get("kind") or "") == "incremental_review_merge_completed"
+    }
+    latest_rejection_by_reason = {
+        str(payload.get("reason") or "No rejection reason recorded.").strip(): index
+        for index, (_, payload) in enumerate(entries)
+        if str(payload.get("kind") or "") == "lead_decision_rejected"
+    }
+    details: list[str] = []
+    for index, (outer, payload) in enumerate(entries):
+        kind = str(payload.get("kind") or "update")
+        wave = outer.get("wave")
+        if kind in _LEAD_LIFECYCLE_EVENTS:
+            continue
+        if kind == "incremental_task_review_completed":
+            review = payload.get("review")
+            review = review if isinstance(review, Mapping) else {}
+            if (
+                str(review.get("signal") or "") == "negative"
+                and index <= latest_merge_by_wave.get(wave, -1)
+            ):
+                continue
+        timestamp = str(outer.get("created_at") or "time unavailable")
+        timestamp = timestamp.replace("T", " ").replace("+00:00", "Z")
+        if kind == "incremental_task_review_completed":
+            title = f"Task review · {timestamp}" + (f" · Wave {wave}" if wave is not None else "")
+            body = _lead_task_review_body(payload)
+        elif kind == "incremental_review_merge_completed":
+            title = f"Lead conclusion · {timestamp}" + (
+                f" · Wave {wave}" if wave is not None else ""
+            )
+            body = _lead_event_summary(payload)
+            review_count = payload.get("review_count")
+            if isinstance(review_count, int) and not isinstance(review_count, bool):
+                body = f"Reviews merged: {review_count}\n" + body
+        elif kind == "lead_decision_rejected":
+            reason = str(payload.get("reason") or "No rejection reason recorded.").strip()
+            if latest_rejection_by_reason.get(reason) != index:
+                continue
+            title = f"Plan correction · {timestamp}" + (
+                f" · Wave {wave}" if wave is not None else ""
+            )
+            body = "Rejected proposal; Lead will retry.\nReason: " + reason
+        elif kind in {
+            "incremental_task_review_failed",
+            "lead_review_failed",
+            "lead_review_stale",
+        }:
+            title = f"Review problem · {timestamp}" + (
+                f" · Wave {wave}" if wave is not None else ""
+            )
+            body = _lead_event_summary(payload)
+        else:
+            title = f"Lead · {timestamp}" + (f" · Wave {wave}" if wave is not None else "")
+            body = kind.replace("_", " ").title() + "\n" + _lead_event_summary(payload)
+        details.append(_bubble(title, body, width))
+    rendered = [_lead_operator_summary(entries, width), *details[-_LEAD_READABLE_EVENT_LIMIT:]]
+    return "\n\n".join(item for item in rendered if item)
+
+
 def _readable_log(rows: Iterable[str], *, width: int, lead: bool = False) -> str:
+    if lead:
+        return _readable_lead_log(rows, width=width)
     rendered: list[str] = []
     for raw_row in rows:
         row = str(raw_row)
         prefix, payload = _log_json(row)
-        if lead and payload is not None:
-            lead_payload = payload.get("payload")
-            lead_payload = lead_payload if isinstance(lead_payload, Mapping) else payload
-            timestamp = str(payload.get("created_at") or "time unavailable")
-            timestamp = timestamp.replace("T", " ").replace("+00:00", "Z")
-            wave = payload.get("wave")
-            kind = str(lead_payload.get("kind") or "update").replace("_", " ")
-            title = f"Lead · {timestamp}" + (f" · Wave {wave}" if wave is not None else "")
-            rendered.append(
-                _bubble(title, kind.title() + "\n" + _lead_event_summary(lead_payload), width)
-            )
-        elif prefix.casefold() == "tool call" and payload is not None:
+        if prefix.casefold() == "tool call" and payload is not None:
             title, body = _tool_call_summary(payload)
             rendered.append(_bubble(title, body, width))
         elif prefix.casefold() == "tool" and payload is not None:

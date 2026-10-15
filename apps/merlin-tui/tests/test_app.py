@@ -4983,6 +4983,119 @@ def test_readable_log_summarizes_embedded_browser_failure_diagnostics() -> None:
     assert "private raw payload" not in readable
 
 
+def test_readable_lead_log_collapses_lifecycle_noise_and_keeps_conclusions() -> None:
+    def row(sequence: int, kind: str, **payload):
+        return json.dumps(
+            {
+                "sequence": sequence,
+                "wave": 4,
+                "created_at": f"2026-10-15T14:47:{sequence:02d}+00:00",
+                "payload": {"kind": kind, **payload},
+            }
+        )
+
+    rows = (
+        row(1, "incremental_task_review_started", task_id="task-1"),
+        row(
+            2,
+            "incremental_task_review_completed",
+            review={
+                "task_id": "task-1",
+                "summary": "HTTP 409 left no attributable target receipt.",
+                "signal": "infrastructure",
+                "confidence": 0.95,
+            },
+        ),
+        row(3, "incremental_task_review_started", task_id="task-2"),
+        row(
+            4,
+            "incremental_task_review_completed",
+            review={
+                "task_id": "task-2",
+                "summary": "The target rejected the injection.",
+                "signal": "negative",
+                "confidence": 0.8,
+            },
+        ),
+        row(5, "incremental_review_merge_started", review_count=2),
+        row(
+            6,
+            "incremental_review_merge_completed",
+            review_count=2,
+            summary="One task lacked receipts; the other produced a defensive rejection.",
+            followups=[{"profile_id": "adversarial-explorer"}],
+        ),
+        row(7, "execution_priority"),
+        row(8, "lead_review_started"),
+        row(9, "lead_review_progress", completed_chunks=12),
+        row(10, "lead_review_completed"),
+        row(11, "lead_decision_rejected", reason="unknown attack-graph node"),
+        row(12, "lead_decision_rejected", reason="unknown attack-graph node"),
+    )
+
+    readable = app_module._readable_log(rows, width=100, lead=True)  # noqa: SLF001
+
+    assert "Campaign Lead · current" in readable
+    assert "Wave 4 · Correcting a rejected plan" in readable
+    assert "Task reviews: 2 complete" in readable
+    assert "Review merge: complete" in readable
+    assert "Plan corrections: 2" in readable
+    assert "Lifecycle pings are collapsed here; press R for the complete journal." in readable
+    assert "Lead conclusion" in readable
+    assert "Reviews merged: 2" in readable
+    assert "One task lacked receipts" in readable
+    assert "Follow-ups dispatched: 1 · adversarial-explorer" in readable
+    assert readable.count("unknown attack-graph node") == 1
+    assert "Plan correction · 2026-10-15 14:47:12Z" in readable
+    assert "Plan correction · 2026-10-15 14:47:11Z" not in readable
+    assert "Incremental Task Review Started" not in readable
+    assert "Lead Review Progress" not in readable
+    assert "Execution Priority" not in readable
+    assert "HTTP 409 left no attributable target receipt." in readable
+    assert "The target rejected the injection." not in readable
+
+
+def test_readable_lead_log_shows_unmerged_task_signal_while_reviews_continue() -> None:
+    rows = (
+        json.dumps(
+            {
+                "sequence": 1,
+                "wave": 5,
+                "created_at": "2026-10-15T14:48:28+00:00",
+                "payload": {
+                    "kind": "incremental_task_review_completed",
+                    "review": {
+                        "task_id": "task-1",
+                        "summary": "The request completed without target-bound evidence.",
+                        "signal": "ambiguous",
+                        "confidence": 0.7,
+                        "findings": [{"kind": "missing_receipt"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "sequence": 2,
+                "wave": 5,
+                "created_at": "2026-10-15T14:48:29+00:00",
+                "payload": {
+                    "kind": "incremental_task_review_started",
+                    "task_id": "task-2",
+                },
+            }
+        ),
+    )
+
+    readable = app_module._readable_log(rows, width=100, lead=True)  # noqa: SLF001
+
+    assert "Task reviews: 1 complete · 1 running" in readable
+    assert "Task review · 2026-10-15 14:48:28Z · Wave 5" in readable
+    assert "Ambiguous · 70% confidence" in readable
+    assert "The request completed without target-bound evidence." in readable
+    assert "Produced: 1 findings" in readable
+
+
 @pytest.mark.asyncio
 async def test_agent_workspace_renders_lead_journal_and_worker_chat_with_raw_toggle() -> None:
     class ReadableLogsBackend(DemoBackend):
