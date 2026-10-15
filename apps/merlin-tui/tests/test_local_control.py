@@ -337,6 +337,73 @@ def test_write_journal_preserves_tool_events_under_budget_pressure(tmp_path: Pat
     assert persisted["first_cursor"] == 1 + 236
 
 
+def test_completed_replay_payload_is_byte_bounded_with_idempotency_tombstones(
+    tmp_path: Path,
+) -> None:
+    from merlin_tui.local_control import _load_journal, _write_journal
+
+    journal = tmp_path / "daemon.journal.json"
+    completed = {f"request-{index}": {"type": "result", "value": "x" * 300} for index in range(6)}
+
+    _write_journal(journal, completed, {}, max_completed_bytes=700)
+
+    persisted = json.loads(journal.read_text(encoding="utf-8"))["completed"]
+    assert list(persisted) == list(completed)
+    assert persisted["request-5"] == completed["request-5"]
+    assert persisted["request-4"] == completed["request-4"]
+    assert persisted["request-0"]["type"] == "error"
+    assert "no longer available for replay" in persisted["request-0"]["error"]
+
+    loaded, _ = _load_journal(journal, max_completed_bytes=700)
+    assert loaded == persisted
+
+
+@pytest.mark.asyncio
+async def test_expired_completed_replay_cannot_repeat_command(tmp_path: Path) -> None:
+    del tmp_path
+    socket_path = Path(f"/tmp/merlin-expired-replay-{os.getpid()}.sock")
+    journal = socket_path.with_suffix(".journal.json")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    await asyncio.to_thread(journal.unlink, missing_ok=True)
+    journal.write_text(
+        json.dumps(
+            {
+                "completed": {
+                    "old-command": {
+                        "type": "error",
+                        "error": "The completed command result is no longer available for replay",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = Backend()
+    daemon = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        response = await _request(
+            socket_path,
+            {
+                "method": "get_permission_mode",
+                "request_id": "old-command",
+                "args": [],
+                "kwargs": {},
+            },
+        )
+        assert response["type"] == "error"
+        assert backend.permission_reads == 0
+    finally:
+        daemon.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await daemon
+        await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+        await asyncio.to_thread(journal.unlink, missing_ok=True)
+
+
 @pytest.mark.asyncio
 async def test_protocol_reports_cursor_gap_instead_of_silent_event_loss() -> None:
     socket_path = Path(f"/tmp/merlin-cursor-gap-{os.getpid()}.sock")

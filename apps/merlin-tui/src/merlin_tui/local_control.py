@@ -47,6 +47,14 @@ _MAX_FRAME_BYTES = 1_000_000
 _MAX_CHUNK_BYTES = 700_000
 _MAX_MESSAGE_BYTES = 64_000_000
 _MAX_CACHED_REQUESTS = 256
+_MAX_COMPLETED_REPLAY_BYTES = 16_000_000
+_EXPIRED_COMPLETED_REPLAY = {
+    "type": "error",
+    "error": (
+        "The completed command result is no longer available for replay; "
+        "refresh Merlin state instead of repeating the command."
+    ),
+}
 # These snapshots can be queried again safely after reconnecting. Persisting
 # every UI poll serializes reads behind command replay writes and accumulates
 # hundreds of copies of large agent/history responses in the journal.
@@ -325,9 +333,35 @@ def _trim_stream_events(
     return kept, noise - spent, spent
 
 
+def _bounded_completed_replays(
+    completed: Mapping[str, dict[str, Any]],
+    max_bytes: int = _MAX_COMPLETED_REPLAY_BYTES,
+) -> dict[str, dict[str, Any]]:
+    """Bound persisted results without allowing an old command to execute twice.
+
+    Recent responses remain replayable after a daemon restart. Older or unusually
+    large responses retain a small request-id tombstone: a reconnect receives an
+    explicit replay-expired error instead of causing a mutating command to rerun.
+    """
+    items = list(completed.items())[-_MAX_CACHED_REQUESTS:]
+    retained: dict[str, dict[str, Any]] = {}
+    remaining = max(0, max_bytes)
+    for request_id, response in reversed(items):
+        encoded_size = len(
+            json.dumps(response, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        if encoded_size <= remaining:
+            retained[request_id] = response
+            remaining -= encoded_size
+        else:
+            retained[request_id] = _EXPIRED_COMPLETED_REPLAY
+    return {request_id: retained[request_id] for request_id, _ in items}
+
+
 def _load_journal(
     path: Path,
     max_stream_events: int = _DEFAULT_LOCAL_CONTROL_TUNING.max_stream_events,
+    max_completed_bytes: int = _MAX_COMPLETED_REPLAY_BYTES,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, _StreamState]]:
     if not path.exists():
         return {}, {}
@@ -385,7 +419,7 @@ def _load_journal(
         for key, value in completed.items()
         if isinstance(key, str) and isinstance(value, dict)
     }
-    return dict(list(safe_completed.items())[-_MAX_CACHED_REQUESTS:]), streams
+    return _bounded_completed_replays(safe_completed, max_completed_bytes), streams
 
 
 def _write_journal(
@@ -393,6 +427,7 @@ def _write_journal(
     completed: dict[str, dict[str, Any]],
     streams: dict[str, _StreamState],
     max_stream_events: int = _DEFAULT_LOCAL_CONTROL_TUNING.max_stream_events,
+    max_completed_bytes: int = _MAX_COMPLETED_REPLAY_BYTES,
 ) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     remaining = max_stream_events
@@ -408,7 +443,7 @@ def _write_journal(
         }
         remaining -= spent
     payload = {
-        "completed": completed,
+        "completed": _bounded_completed_replays(completed, max_completed_bytes),
         # Preserve insertion order after allocating the global replay budget
         # from newest to oldest.  Live in-memory streams remain unabridged so a
         # connected slow client cannot be overtaken by a fast provider.
