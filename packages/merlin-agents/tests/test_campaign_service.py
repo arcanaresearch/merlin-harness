@@ -3828,6 +3828,132 @@ async def test_completed_wave_settles_active_batch_and_advances_without_lead() -
     assert started == [(4, "frontier", "batch-4")]
 
 
+async def test_live_terminal_frontier_without_successor_falls_back_to_lead_after_settlement():
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    events: list[str] = []
+
+    class ReviewReached(RuntimeError):
+        pass
+
+    class Store:
+        active = {
+            "id": "batch-3",
+            "wave": 3,
+            "state": "scheduled",
+            "schedule_id": "schedule-3",
+            "candidates": ({"id": "prompt", "claim_generation": 1},),
+        }
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            return self.active if schedule_id == "schedule-3" else None
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return self.active
+
+        def claim_frontier_transition(self, *_args):
+            return "claim-1"
+
+        def renew_frontier_transition(self, *_args):
+            return True
+
+        def release_frontier_transition(self, *_args):
+            return True
+
+        def settle_frontier_batch(self, _campaign_id, _batch_id, _dispositions, **_kwargs):
+            events.append("settled")
+            self.active = None
+            return {"queued": 0, "terminal": 1, "total": 1}
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            if payload.get("kind") == "lead_assessment_deferred_frontier_transition":
+                events.append("deferred")
+
+    execution = asyncio.get_running_loop().create_future()
+
+    class Agents:
+        polls = 0
+
+        async def list_schedule_tasks(self, _schedule_id):
+            self.polls += 1
+            if self.polls == 1:
+                return (
+                    AgentTask(
+                        id="task/prompt",
+                        objective="attempt",
+                        status="running",
+                        technique_ids=("prompt",),
+                    ),
+                )
+            if not execution.done():
+                execution.set_result(None)
+            return (
+                AgentTask(
+                    id="task/prompt",
+                    objective="attempt",
+                    status="completed",
+                    technique_ids=("prompt",),
+                ),
+            )
+
+        async def schedule_progress(self, _schedule_id):
+            return ()
+
+        async def technique_attempts(self, _schedule_id):
+            return (
+                {
+                    "task_id": "task/prompt",
+                    "technique_id": "prompt",
+                    "state": "confirmed",
+                    "disposition": "valid",
+                    "strategy_state": {
+                        "outcome_authority": {"kind": "target", "outcome": "confirmed"}
+                    },
+                },
+            )
+
+    class Service(CampaignService):
+        async def _record_lessons(self, *_args, **_kwargs):
+            return None
+
+        async def _record_target_state_attributions(self, *_args, **_kwargs):
+            return None
+
+        async def _record_arm_outcomes(self, *_args, **_kwargs):
+            return None
+
+        async def _retire_terminal_dynamic_specialists(self, *_args):
+            return None
+
+        async def _campaign_budget_capped(self, _campaign_id):
+            return False
+
+        async def _campaign_service_objective_state(self, *_args):
+            return {"violations": (), "metrics": {}}
+
+        async def _assess_and_journal(self, *_args, **_kwargs):
+            events.append("lead")
+            return LeadAssessment("semantic terminal review completed", True)
+
+        async def _finish_campaign(self, *_args, **_kwargs):
+            raise ReviewReached
+
+    service = Service(Store(), Agents(), preparation)  # type: ignore[arg-type]
+
+    with pytest.raises(ReviewReached):
+        await service._supervise(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            prepared.assignment_context,
+            SimpleNamespace(
+                id="schedule-3", assignments=(), execution=execution
+            ),
+            initial_wave=3,
+            wave_running=False,
+        )
+
+    assert events == ["deferred", "settled", "lead"]
+
+
 async def test_completed_wave_claims_arm_ranked_successor_and_keeps_other_candidates_queued():
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     base = prepared.assignment_context.techniques[0]
@@ -15023,6 +15149,86 @@ async def test_monitor_wave_boundary_assessment_is_not_batched() -> None:
     )
 
     assert observed_terminal == [1]
+
+
+@pytest.mark.parametrize(
+    ("semantic_gate", "expected_lead_calls"),
+    ((None, 0), ("guidance", 1), ("worker_message", 1)),
+)
+async def test_monitor_defers_terminal_frontier_review_only_without_semantic_gate(
+    semantic_gate: str | None, expected_lead_calls: int
+) -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[dict[str, object]] = []
+
+    class Store:
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(dict(payload))
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            assert schedule_id == "schedule-frontier"
+            return {
+                "id": "batch-frontier",
+                "schedule_id": schedule_id,
+                "state": "scheduled",
+            }
+
+        def list_pending_worker_messages(self, _campaign_id):
+            if semantic_gate != "worker_message":
+                return ()
+            return (
+                {
+                    "id": "message-1",
+                    "source_task_id": "worker-1",
+                    "content": "A new attributable observation needs Lead review.",
+                },
+            )
+
+    execution = asyncio.get_running_loop().create_future()
+
+    class Agents:
+        async def list_schedule_tasks(self, _schedule_id):
+            if not execution.done():
+                execution.set_result(None)
+            return (AgentTask(id="worker-1", objective="probe", status="completed"),)
+
+        async def schedule_progress(self, _schedule_id):
+            return ()
+
+    class Service(CampaignService):
+        def __init__(self):
+            super().__init__(Store(), Agents(), preparation)  # type: ignore[arg-type]
+            self.lead_calls = 0
+
+        async def _pending_operator_guidance(self, _campaign_id):
+            if semantic_gate == "guidance":
+                return ({"guidance_id": "guidance-1"},)
+            return ()
+
+        async def _assess_and_journal(self, *_args, **_kwargs):
+            self.lead_calls += 1
+            return LeadAssessment("semantic review completed", False)
+
+    service = Service()
+    result = await service._monitor_live(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        SimpleNamespace(id="schedule-frontier", execution=execution, assignments=()),
+    )
+
+    assert service.lead_calls == expected_lead_calls
+    assert (result is not None) is bool(expected_lead_calls)
+    deferred = [
+        event
+        for event in events
+        if event.get("kind") == "lead_assessment_deferred_frontier_transition"
+    ]
+    assert len(deferred) == (0 if semantic_gate else 1)
+    if deferred:
+        assert deferred[0]["frontier_batch_id"] == "batch-frontier"
 
 
 async def test_monitor_records_final_provider_timeout_without_false_stall() -> None:

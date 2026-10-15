@@ -10122,6 +10122,37 @@ class CampaignService:
                     if pending_loader is not None
                     else ()
                 )
+                terminal_wave = bool(tasks) and len(terminal_projection) == len(tasks)
+                # A terminal execution-frontier batch has a deterministic reducer:
+                # _supervise records attribution/ARM outcomes, settles the batch, and
+                # either starts its durable successor or falls through to the Lead when
+                # no successor exists.  Do not put that transition behind a broad model
+                # review. Operator guidance and worker coordination remain semantic
+                # gates and therefore still receive an immediate Lead assessment.
+                frontier_transition_ready = False
+                if terminal_wave and not pending_messages and not pending_guidance:
+                    frontier_batch = await self._frontier_batch_for_schedule(
+                        campaign_id, str(live.id)
+                    )
+                    frontier_transition_ready = bool(
+                        isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
+                    )
+                    if frontier_transition_ready:
+                        await asyncio.to_thread(
+                            self._store.append_lead,
+                            campaign_id,
+                            wave,
+                            {
+                                "kind": "lead_assessment_deferred_frontier_transition",
+                                "schedule_id": str(live.id),
+                                "frontier_batch_id": str(frontier_batch["id"]),
+                                "reason": (
+                                    "terminal frontier reduction and successor selection are "
+                                    "deterministic; semantic Lead review remains due only if "
+                                    "no runnable successor exists"
+                                ),
+                            },
+                        )
                 # Mid-wave Lead inferences are batched: a full ~40K-token
                 # assessment is due only once enough new terminal evidence
                 # accumulated or the batch interval elapsed. Wave-boundary
@@ -10132,8 +10163,9 @@ class CampaignService:
                     or bool(pending_guidance)
                     or (
                         not draining
+                        and not frontier_transition_ready
                         and (
-                            (bool(tasks) and len(terminal_projection) == len(tasks))
+                            terminal_wave
                             or new_terminal >= self._lead_assessment_batch_size
                             or timed_assessment_due
                         )
