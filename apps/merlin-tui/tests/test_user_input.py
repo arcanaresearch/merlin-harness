@@ -81,6 +81,38 @@ async def test_question_tool_rejects_worker_and_forged_identity():
     ).is_error
 
 
+@pytest.mark.asyncio
+async def test_campaign_execution_approval_cannot_replace_client_review():
+    result = await RequestUserInputTool().invoke(
+        ToolContext(session_id="s1", call_id="approval", workspace_root="."),
+        {
+            "questions": [
+                {
+                    "id": "approve_execute",
+                    "question": "The prepared campaign manifest is ready. Execute it?",
+                    "options": [
+                        {
+                            "id": "approve",
+                            "label": "Approve & execute",
+                            "description": "Begin the reviewed campaign.",
+                        },
+                        {
+                            "id": "review_more",
+                            "label": "Hold for review",
+                            "description": "Keep the manifest prepared.",
+                        },
+                    ],
+                    "default": ["approve"],
+                }
+            ]
+        },
+    )
+
+    assert result.is_error
+    assert "client's sealed-review control" in result.content
+    assert "request_user_input" in result.content
+
+
 @pytest.mark.parametrize(
     "answers",
     [

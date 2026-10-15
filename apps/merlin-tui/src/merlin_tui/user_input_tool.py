@@ -28,6 +28,21 @@ def _is_composition_question(question: InputQuestion) -> bool:
     return {"autonomous", "opinionated"} <= names
 
 
+def _is_campaign_execution_approval_question(question: InputQuestion) -> bool:
+    """Reject approval prompts owned by the client's sealed-review control."""
+    subject = " ".join(
+        (
+            question.id,
+            question.question,
+            *(option.id for option in question.options),
+            *(option.label for option in question.options),
+        )
+    ).casefold()
+    return any(term in subject for term in ("campaign", "manifest", "assessment")) and any(
+        term in subject for term in ("approve", "execute", "start campaign")
+    )
+
+
 class RequestUserInputTool:
     effect = "workspace_read"
 
@@ -50,7 +65,11 @@ class RequestUserInputTool:
                 "this foreground turn. The operator's response arrives in the durable "
                 "conversation with MERLIN_USER_INPUT_RESPONSE and exact selected IDs, or "
                 "as ordinary language. Continue from retained work after the answer; do not "
-                "repeat reconnaissance. A choice does not approve execution or expand scope."
+                "repeat reconnaissance. A choice does not approve execution or expand scope. "
+                "Never ask for approval of a prepared campaign or manifest with this tool. "
+                "assessment_prepare makes the client render the sealed review and approval "
+                "control; after it succeeds, end the turn without calling request_user_input "
+                "or assessment_execute."
             ),
             input_schema=schema,
         )
@@ -64,6 +83,15 @@ class RequestUserInputTool:
             request = InputRequest(
                 request_id=f"{context.session_id}:{context.call_id}", **dict(arguments)
             )
+            if any(
+                _is_campaign_execution_approval_question(question)
+                for question in request.questions
+            ):
+                raise ValueError(
+                    "Campaign execution approval belongs to the Merlin client's sealed-review "
+                    "control. The review is already displayed there; stop this turn without "
+                    "calling request_user_input or assessment_execute."
+                )
             has_profile = any(
                 _is_campaign_profile_question(question) for question in request.questions
             )
