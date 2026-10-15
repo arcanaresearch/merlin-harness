@@ -132,18 +132,20 @@ async def test_no_recon_when_route_preflight_fails_and_worker_cannot_configure()
 
 
 @pytest.mark.asyncio
-async def test_superseded_review_and_settings_change_cannot_execute_old_campaign():
+async def test_top_level_model_cannot_execute_campaign_before_operator_approval():
     review = {"campaign_id": "campaign/L3", "manifest_digest": "sha256:new"}
     history = [saved("assessment_prepare", review)]
     delegate = Delegate("assessment_execute")
     wrapper = ConfiguredCampaignTool(delegate, AsyncMock(side_effect=lambda _: tuple(history)))
-    denied = await wrapper.invoke(
+    mismatched = await wrapper.invoke(
         context(), {"campaign_id": "campaign/L4", "manifest_digest": "sha256:old"}
     )
-    assert denied.is_error
+    assert mismatched.is_error
     assert not delegate.calls
-    allowed = await wrapper.invoke(context(), review)
-    assert not allowed.is_error
+    denied = await wrapper.invoke(context(), review)
+    assert denied.is_error
+    assert "explicit approval" in denied.content
+    assert not delegate.calls
     history.append(
         saved(
             "campaign_configure",
@@ -151,7 +153,19 @@ async def test_superseded_review_and_settings_change_cannot_execute_old_campaign
         )
     )
     assert (await wrapper.invoke(context(), review)).is_error
-    assert len(delegate.calls) == 1
+    assert not delegate.calls
+
+
+@pytest.mark.asyncio
+async def test_internal_campaign_protocol_can_execute_reviewed_manifest():
+    review = {"campaign_id": "campaign/L3", "manifest_digest": "sha256:new"}
+    delegate = Delegate("assessment_execute")
+    wrapper = ConfiguredCampaignTool(delegate, AsyncMock(return_value=()))
+
+    result = await wrapper.invoke(context(agent_id="worker/1"), review)
+
+    assert not result.is_error
+    assert delegate.calls == [review]
 
 
 @pytest.mark.asyncio

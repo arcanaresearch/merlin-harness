@@ -68,7 +68,6 @@ async def test_new_preparation_hides_previous_report_until_execution(restore_pre
         assert not live.has_class("visible")
         await app._execute_approved_campaign(backend.latest.id, "new-digest")
         await pilot.pause()
-        await app._poll_swarm_progress()
         await pilot.pause()
         assert live.has_class("visible")
         assert live.animating

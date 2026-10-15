@@ -219,26 +219,14 @@ class ConfiguredCampaignTool:
                     "execution_mode": settings["execution_mode"],
                 }
         elif self.describe().name == "assessment_execute":
-            for message in reversed(messages):
-                if message.role != "tool":
-                    continue
-                payload = _payload(message)
-                if message.name == "campaign_configure" and payload.get("status") == "configured":
-                    return ToolResult(
-                        content="Campaign settings changed. Prepare and display a new "
-                        "review before requesting approval.",
-                        is_error=True,
-                    )
-                if message.name == "assessment_prepare" and payload.get("campaign_id"):
-                    if any(
-                        values.get(k) != payload.get(k) for k in ("campaign_id", "manifest_digest")
-                    ):
-                        return ToolResult(
-                            content="This approval refers to a superseded campaign "
-                            "review. Display the intended campaign review first.",
-                            is_error=True,
-                        )
-                    break
+            return ToolResult(
+                content=(
+                    "Campaign execution requires the operator's explicit approval in the "
+                    "Merlin client. Display the prepared review and stop this turn; the client "
+                    "will execute the exact reviewed manifest after approval."
+                ),
+                is_error=True,
+            )
         result = await self._tool.invoke(context, values)
         if self.describe().name == "assessment_prepare" and not result.is_error:
             # Keep the binding parseable in durable tool history even when the

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from hashlib import sha256
@@ -1501,9 +1501,22 @@ def _json(value: Any) -> Any:
     return str(value)
 
 
+class _DecodedObject(SimpleNamespace, Mapping[str, Any]):
+    """Attribute-friendly IPC object that preserves mapping semantics."""
+
+    def __getitem__(self, key: str) -> Any:
+        return vars(self)[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(vars(self))
+
+    def __len__(self) -> int:
+        return len(vars(self))
+
+
 def _decode(value: Any) -> Any:
     if isinstance(value, dict):
-        return SimpleNamespace(**{key: _decode(item) for key, item in value.items()})
+        return _DecodedObject(**{key: _decode(item) for key, item in value.items()})
     if isinstance(value, list):
         return tuple(_decode(item) for item in value)
     return value

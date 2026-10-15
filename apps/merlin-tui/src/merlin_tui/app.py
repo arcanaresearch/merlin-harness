@@ -4494,7 +4494,10 @@ class MerlinApp(App[None]):
         )
         self._remember("status", f"Campaign {campaign_id} executing")
         self._operator_preparing_session = ""
-        self._schedule_swarm_refresh()
+        # Approval is a state transition the operator must see immediately.
+        # Waiting for the periodic timer can leave both progress panels hidden
+        # behind an earlier prepared-state refresh.
+        await self._poll_swarm_progress()
 
     def _clear_pending_decision(self) -> None:
         self._pending_choice = ()

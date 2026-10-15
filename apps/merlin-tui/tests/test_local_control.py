@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -214,6 +215,9 @@ async def test_client_reassembles_status_larger_than_one_physical_frame() -> Non
         status = await LocalControlClient(socket_path=socket_path).campaign_status("campaign-1")
         assert status.campaign_id == "campaign-1"
         assert status.status == "completed"
+        assert isinstance(status, Mapping)
+        assert isinstance(status.completion_document, Mapping)
+        assert status.completion_document.get("receipts") == ("x" * 1_100_000,)
         assert len(status.completion_document.receipts[0]) == 1_100_000
     finally:
         daemon.cancel()
