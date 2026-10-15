@@ -4955,6 +4955,11 @@ class CompiledApiReconHandoffTool:
                 )
         await self._recorder.record_handoff(handoff)
         cleanup_discovery = adapter.get("cleanup_discovery")
+        state_observation_repair_available = any(
+            isinstance(item, Mapping)
+            and item.get("source") == "browser_compile_api_handoff.state_observations"
+            for item in adapter.get("evaluation_uncertainties", ())
+        )
         preferred_next_tool = (
             "browser_end_owned_session"
             if isinstance(cleanup_discovery, Mapping)
@@ -4972,7 +4977,12 @@ class CompiledApiReconHandoffTool:
                 # executable either way. When this context provably owns a fresh
                 # disposable session, direct reconnaissance to its visible exit so
                 # the superseding handoff can retain the complete lifecycle.
-                "preferred_next_tool": preferred_next_tool,
+                **(
+                    {"preferred_next_tool": preferred_next_tool}
+                    if preferred_next_tool != "assessment_prepare"
+                    or not state_observation_repair_available
+                    else {"state_observation_repair_available": True}
+                ),
                 **(
                     {"cleanup_discovery": adapter["cleanup_discovery"]}
                     if "cleanup_discovery" in adapter

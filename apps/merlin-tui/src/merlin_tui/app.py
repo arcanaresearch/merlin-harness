@@ -5648,7 +5648,7 @@ class MerlinApp(App[None]):
             view.update("")
             view.remove_class("visible")
             return
-        rendered = _render_target_progress(progress)
+        rendered = _render_target_progress(progress, campaign_status=selected.status)
         if rendered.plain == self._target_progress_rendered and view.has_class("visible"):
             return
         self._target_progress_rendered = rendered.plain
@@ -7336,7 +7336,9 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
         f"Findings: {report.finding_count} · Target exchanges: {report.exchange_count}\n"
     )
     if report.target_progress:
-        rendered.append_text(_render_target_progress(report.target_progress))
+        rendered.append_text(
+            _render_target_progress(report.target_progress, campaign_status=campaign.status)
+        )
         rendered.append("\n")
     # Keep the export above potentially lengthy coverage and limitations so it
     # stays visible in the bounded main-screen region.
@@ -7363,7 +7365,9 @@ def _campaign_wave_label(campaign: CampaignView) -> str:
     return f"Wave {number} · {kind or 'execution'}"
 
 
-def _render_target_progress(progress: Mapping[str, object]) -> Text:
+def _render_target_progress(
+    progress: Mapping[str, object], *, campaign_status: object = None
+) -> Text:
     rendered = Text()
     rendered.append("Target progress\n", style="bold cyan")
     fields_value = progress.get("current_state")
@@ -7382,10 +7386,31 @@ def _render_target_progress(progress: Mapping[str, object]) -> Text:
     if not fields:
         rendered.append("State not discovered yet", style="bold yellow")
         rendered.append(f" · {exchange_summary}\n")
-        rendered.append(
-            "Waiting for reviewed target-state observations; execution continues.",
-            style="dim",
-        )
+        lifecycle = str(campaign_status or progress.get("campaign_status") or "").casefold()
+        terminal_labels = {
+            "failed": "the campaign failed",
+            "completed": "the campaign ended",
+            "cancelled": "the campaign was cancelled",
+            "stopped": "the campaign was stopped",
+            "incomplete": "the campaign ended incomplete",
+        }
+        if lifecycle in terminal_labels:
+            rendered.append(
+                "No reviewed target-state observations were captured before "
+                + terminal_labels[lifecycle]
+                + ".",
+                style="dim",
+            )
+        elif lifecycle == "paused":
+            rendered.append(
+                "Waiting for reviewed target-state observations; the campaign is paused.",
+                style="dim",
+            )
+        else:
+            rendered.append(
+                "Waiting for reviewed target-state observations; execution continues.",
+                style="dim",
+            )
         return rendered
 
     summaries = [_target_progress_field(item) for item in fields[:4]]
@@ -8053,7 +8078,12 @@ def _render_campaign_progress(status: object) -> str:
     ]
     progress = status.get("target_progress")
     if isinstance(progress, Mapping):
-        lines.extend(("", _render_target_progress(progress).plain))
+        lines.extend(
+            (
+                "",
+                _render_target_progress(progress, campaign_status=status.get("status")).plain,
+            )
+        )
     else:
         lines.extend(
             (
@@ -8091,7 +8121,14 @@ def _render_campaign_status(status: object) -> str:
     ]
     target_progress = status.get("target_progress")
     if isinstance(target_progress, Mapping):
-        lines.extend(("", _render_target_progress(target_progress).plain))
+        lines.extend(
+            (
+                "",
+                _render_target_progress(
+                    target_progress, campaign_status=status.get("status")
+                ).plain,
+            )
+        )
     lines.extend(("", *_objective_progress_lines(status)))
     lines.extend(_campaign_outcome_lines(status))
     composition = status.get("specialist_composition") or status.get("composition_policy")

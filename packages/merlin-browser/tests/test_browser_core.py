@@ -3982,6 +3982,68 @@ async def test_api_handoff_keeps_full_response_when_evaluator_hints_are_stale() 
 
 
 @pytest.mark.asyncio
+async def test_api_handoff_keeps_recompile_available_for_invalid_state_selector() -> None:
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = owner()
+
+        def api_exchange_events(self):
+            return (
+                {
+                    "method": "POST",
+                    "url": "https://target.test/api/message",
+                    "status": 200,
+                    "request_json": {"message": "harmless probe"},
+                    "response_json": {"reply": "observed response", "score": 10},
+                },
+            )
+
+    class Recorder:
+        handoff = None
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    arguments = _compile_arguments()
+    arguments["state_observations"] = [
+        {
+            "name": "score",
+            "role": "score",
+            "baseline_selector": {
+                "step_id": "observed-session-setup",
+                "evaluation_root": "response_body",
+                "pointer": "/missing/score",
+            },
+            "result_selector": {
+                "step_id": "observed-message-exchange",
+                "evaluation_root": "response_body",
+                "pointer": "/score",
+            },
+            "value_type": "integer",
+        }
+    ]
+    recorder = Recorder()
+    tool = next(
+        item
+        for item in browser_tools(lambda _: Session(), recorder)
+        if item.describe().name == "browser_compile_api_handoff"
+    )
+
+    result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    adapter = json.loads(recorder.handoff.adapter)
+    assert any(
+        item["source"] == "browser_compile_api_handoff.state_observations"
+        for item in adapter["evaluation_uncertainties"]
+    )
+    assert result.metadata["state_observation_repair_available"] is True
+    assert "preferred_next_tool" not in result.metadata
+
+
+@pytest.mark.asyncio
 async def test_api_handoff_replays_compiled_adapter_against_fresh_session_state() -> None:
     captured = (
         {

@@ -6360,6 +6360,22 @@ def test_target_progress_renderer_explains_unknown_state() -> None:
     assert "execution continues" in rendered.plain
 
 
+def test_target_progress_renderer_does_not_claim_failed_campaign_continues() -> None:
+    rendered = app_module._render_target_progress(
+        {
+            "status": "unknown",
+            "freshness": "unknown",
+            "target_exchange_count": 23,
+            "current_state": (),
+        },
+        campaign_status="failed",
+    )
+
+    assert "State not discovered yet · 23 target exchanges observed" in rendered.plain
+    assert "before the campaign failed" in rendered.plain
+    assert "execution continues" not in rendered.plain
+
+
 @pytest.mark.asyncio
 async def test_live_target_progress_card_is_separate_from_agent_swarm() -> None:
     class ProgressBackend(DemoBackend):
