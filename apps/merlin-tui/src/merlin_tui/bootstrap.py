@@ -9187,7 +9187,9 @@ def build_backend(
                 except ValueError:
                     canonical_target = manifest.target.endpoint
             try:
-                target_progress = await agents.target_progress(campaign_id, manifest.target.id)
+                target_progress = await campaigns.target_progress(
+                    campaign_id, manifest.target.id
+                )
             except Exception:
                 # Reporting remains available when optional target-state projection fails.
                 target_progress = {}

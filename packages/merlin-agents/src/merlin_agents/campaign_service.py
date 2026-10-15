@@ -211,6 +211,7 @@ from .specialists import (
     is_dynamic_specialist_label,
     retire_dynamic_specialist,
 )
+from .target_progress_attribution import merge_target_progress_attributions
 from .technique_history import (
     LANGUAGE_DEFERRAL_OUTCOME,
     entries_for_completion,
@@ -17330,6 +17331,29 @@ class CampaignService:
         rows = await asyncio.to_thread(self._store.list_all, limit=None)
         return tuple(_campaign_list_projection(row) for row in rows)
 
+    async def target_progress(
+        self,
+        campaign_id: str,
+        target_id: str,
+        *,
+        lead: Sequence[Mapping[str, object]] | None = None,
+    ) -> Mapping[str, object]:
+        """Project target state from tool effects and durable campaign attribution."""
+
+        reader = getattr(self._agents, "target_progress", None)
+        base = await reader(campaign_id, target_id) if callable(reader) else {}
+        journal = (
+            tuple(lead)
+            if lead is not None
+            else tuple(await asyncio.to_thread(self._store.list_lead, campaign_id))
+        )
+        return merge_target_progress_attributions(
+            base if isinstance(base, Mapping) else {},
+            journal,
+            campaign_id=campaign_id,
+            target_id=target_id,
+        )
+
     async def wave_progress(self, campaign_id: str) -> Mapping[str, object]:
         """Lightweight durable wave identity for the live campaign display."""
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
@@ -17399,20 +17423,22 @@ class CampaignService:
             for item in lead
         )
         pending = await self._pending_operator_guidance(campaign_id)
-        target_progress_reader = getattr(getattr(self, "_agents", None), "target_progress", None)
         target_progress: Mapping[str, object] = {}
-        if callable(target_progress_reader):
-            try:
-                target_id = str(latest.get("target_id") or "")
-                if not target_id:
-                    row = await asyncio.to_thread(self._store.get, campaign_id)
-                    if row is not None:
-                        target_id = _manifest(row["manifest"]["manifest"]).target.id
-                if target_id:
-                    target_progress = await target_progress_reader(campaign_id, target_id)
-            except Exception:  # noqa: BLE001 - progress projection must not hide campaign state
-                _LOGGER.exception("target progress projection failed for %s", campaign_id)
-                target_progress = {}
+        try:
+            target_id = str(latest.get("target_id") or "")
+            if not target_id:
+                row = await asyncio.to_thread(self._store.get, campaign_id)
+                if row is not None:
+                    target_id = _manifest(row["manifest"]["manifest"]).target.id
+            if target_id:
+                target_progress = await self.target_progress(
+                    campaign_id,
+                    target_id,
+                    lead=lead,
+                )
+        except Exception:  # noqa: BLE001 - progress projection must not hide campaign state
+            _LOGGER.exception("target progress projection failed for %s", campaign_id)
+            target_progress = {}
         return {
             "wave_number": len(waves),
             "wave_kind": str(latest["kind"]),
