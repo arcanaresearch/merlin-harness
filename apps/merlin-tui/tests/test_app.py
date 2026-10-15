@@ -4936,6 +4936,29 @@ async def test_agent_workspace_panes_unread_transcript_and_failure_are_session_s
         assert not app._exit  # noqa: SLF001
 
 
+def test_readable_log_summarizes_embedded_browser_failure_diagnostics() -> None:
+    row = (
+        "tool: browser_boundary: tab limit reached\n"
+        "Automatic failure diagnostics:\n"
+        '{"network":{"evidence_refs":[],"observed_at":"2026-10-15T11:28:20Z",'
+        '"origin":"http://localhost:3100","target_id":"web-localhost",'
+        '"text":"{\\"response_json\\":{\\"transcript\\":[\\"private raw payload\\"]}}"}}\n'
+        "Inspect the captured diagnostics before changing strategy."
+    )
+
+    readable = app_module._readable_log((row,), width=100)  # noqa: SLF001
+
+    assert "Tool failure · Browser Boundary" in readable
+    assert "tab limit reached" in readable
+    assert "Diagnostics captured: network" in readable
+    assert "Origin: http://localhost:3100" in readable
+    assert "Target Id: web-localhost" in readable
+    assert "Open Raw JSON for the full captured diagnostics." in readable
+    assert "response_json" not in readable
+    assert "transcript" not in readable
+    assert "private raw payload" not in readable
+
+
 @pytest.mark.asyncio
 async def test_agent_workspace_renders_lead_journal_and_worker_chat_with_raw_toggle() -> None:
     class ReadableLogsBackend(DemoBackend):

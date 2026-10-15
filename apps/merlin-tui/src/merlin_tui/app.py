@@ -2120,6 +2120,47 @@ def _tool_result_summary(payload: Mapping[str, object]) -> tuple[str, str]:
     return f"Target · {kind}", detail or "Response recorded; open Raw JSON for the full payload."
 
 
+def _automatic_failure_summary(value: str) -> tuple[str, str] | None:
+    marker = "Automatic failure diagnostics:"
+    headline, separator, remainder = value.partition(marker)
+    if not separator:
+        return None
+
+    category, detail_separator, detail = headline.strip().partition(":")
+    category_label = (category or "tool").replace("_", " ").strip().title()
+    body = [detail.strip() if detail_separator and detail.strip() else headline.strip()]
+    diagnostic_text = remainder.lstrip()
+    diagnostics: Mapping[str, object] | None = None
+    try:
+        decoded, _ = json.JSONDecoder().raw_decode(diagnostic_text)
+        if isinstance(decoded, Mapping):
+            diagnostics = decoded
+    except (TypeError, ValueError):
+        pass
+
+    if diagnostics is None:
+        body.append("Automatic diagnostics were captured but could not be summarized.")
+    else:
+        kinds = tuple(str(key).replace("_", " ") for key in diagnostics)
+        body.append("Diagnostics captured: " + (", ".join(kinds) if kinds else "none"))
+        safe = _first_log_values(
+            diagnostics,
+            ("origin", "target_id", "observed_at", "capture_error", "error"),
+        )
+        body.extend(
+            f"{key.replace('_', ' ').title()}: {value}" for key, value in safe.items()
+        )
+        evidence_count = sum(
+            len(item.get("evidence_refs", ()))
+            for item in diagnostics.values()
+            if isinstance(item, Mapping) and isinstance(item.get("evidence_refs"), (tuple, list))
+        )
+        if evidence_count:
+            body.append(f"Evidence references: {evidence_count}")
+    body.append("Open Raw JSON for the full captured diagnostics.")
+    return f"Tool failure · {category_label}", "\n".join(item for item in body if item)
+
+
 def _lead_event_summary(payload: Mapping[str, object]) -> str:
     kind = str(payload.get("kind") or "lead update").replace("_", " ")
     parts: list[str] = []
@@ -2185,6 +2226,14 @@ def _readable_log(rows: Iterable[str], *, width: int, lead: bool = False) -> str
         elif prefix.casefold() == "tool" and payload is not None:
             title, body = _tool_result_summary(payload)
             rendered.append(_bubble(title, body, width))
+        elif prefix.casefold() == "tool":
+            content = row.partition(":")[2]
+            failure_summary = _automatic_failure_summary(content)
+            if failure_summary is None:
+                rendered.append(_bubble(prefix or "Event", content or row, width))
+            else:
+                title, body = failure_summary
+                rendered.append(_bubble(title, body, width))
         elif prefix.casefold() == "assistant":
             rendered.append(_bubble("Worker reasoning", row.partition(":")[2], width))
         elif prefix.casefold() in {"result", "assessment"}:
