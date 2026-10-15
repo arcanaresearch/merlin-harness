@@ -10068,6 +10068,7 @@ class CampaignService:
         last_lead_assessment_at = loop.time()
         lead_decision_retries = 0
         lead_decision_retry_at = 0.0
+        frontier_review_deferred = False
         while not live.execution.done():
             tasks = tuple(await self._agents.list_schedule_tasks(live.id))
             pending_guidance = await self._pending_operator_guidance(campaign_id)
@@ -10123,21 +10124,28 @@ class CampaignService:
                     else ()
                 )
                 terminal_wave = bool(tasks) and len(terminal_projection) == len(tasks)
-                # A terminal execution-frontier batch has a deterministic reducer:
+                frontier_batch = await self._frontier_batch_for_schedule(
+                    campaign_id, str(live.id)
+                )
+                frontier_schedule = bool(
+                    isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
+                )
+                # An execution-frontier batch has a deterministic reducer:
                 # _supervise records attribution/ARM outcomes, settles the batch, and
                 # either starts its durable successor or falls through to the Lead when
-                # no successor exists.  Do not put that transition behind a broad model
-                # review. Operator guidance and worker coordination remain semantic
-                # gates and therefore still receive an immediate Lead assessment.
-                frontier_transition_ready = False
-                if terminal_wave and not pending_messages and not pending_guidance:
-                    frontier_batch = await self._frontier_batch_for_schedule(
-                        campaign_id, str(live.id)
-                    )
-                    frontier_transition_ready = bool(
-                        isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
-                    )
-                    if frontier_transition_ready:
+                # no successor exists. Automatic mid-wave review would block the
+                # monitor from observing completion, then become stale; terminal review
+                # would duplicate the deterministic reduction. Operator guidance and
+                # worker coordination remain semantic gates and still receive an
+                # immediate Lead assessment.
+                frontier_transition_ready = bool(
+                    terminal_wave
+                    and frontier_schedule
+                    and not pending_messages
+                    and not pending_guidance
+                )
+                if frontier_transition_ready:
+                    if not frontier_review_deferred:
                         await asyncio.to_thread(
                             self._store.append_lead,
                             campaign_id,
@@ -10153,6 +10161,7 @@ class CampaignService:
                                 ),
                             },
                         )
+                        frontier_review_deferred = True
                 # Mid-wave Lead inferences are batched: a full ~40K-token
                 # assessment is due only once enough new terminal evidence
                 # accumulated or the batch interval elapsed. Wave-boundary
@@ -10163,7 +10172,7 @@ class CampaignService:
                     or bool(pending_guidance)
                     or (
                         not draining
-                        and not frontier_transition_ready
+                        and not frontier_schedule
                         and (
                             terminal_wave
                             or new_terminal >= self._lead_assessment_batch_size
@@ -10285,7 +10294,11 @@ class CampaignService:
             tuple((task.id, task.status, task.result) for task in tasks),
             await self._durable_progress_projection(live.id),
         )
-        if projection != last_projection:
+        frontier_batch = await self._frontier_batch_for_schedule(campaign_id, str(live.id))
+        frontier_schedule = bool(
+            isinstance(frontier_batch, Mapping) and frontier_batch.get("id")
+        )
+        if projection != last_projection and not frontier_schedule:
             try:
                 latest = await self._assess_and_journal(campaign_id, manifest, wave, tasks)
             except TimeoutError:
@@ -10321,6 +10334,22 @@ class CampaignService:
                         "retryable": True,
                     },
                 )
+        elif projection != last_projection and not frontier_review_deferred:
+            await asyncio.to_thread(
+                self._store.append_lead,
+                campaign_id,
+                wave,
+                {
+                    "kind": "lead_assessment_deferred_frontier_transition",
+                    "schedule_id": str(live.id),
+                    "frontier_batch_id": str(frontier_batch["id"]),
+                    "reason": (
+                        "terminal frontier reduction and successor selection are "
+                        "deterministic; semantic Lead review remains due only if "
+                        "no runnable successor exists"
+                    ),
+                },
+            )
         return latest
 
     async def _durable_progress_projection(

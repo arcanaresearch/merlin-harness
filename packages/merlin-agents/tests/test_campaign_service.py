@@ -15231,6 +15231,134 @@ async def test_monitor_defers_terminal_frontier_review_only_without_semantic_gat
         assert deferred[0]["frontier_batch_id"] == "batch-frontier"
 
 
+async def test_monitor_skips_automatic_review_while_frontier_schedule_is_active() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[dict[str, object]] = []
+
+    class Store:
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(dict(payload))
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            return {
+                "id": "batch-frontier",
+                "schedule_id": schedule_id,
+                "state": "scheduled",
+            }
+
+    execution = asyncio.get_running_loop().create_future()
+
+    class Agents:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        async def list_schedule_tasks(self, _schedule_id):
+            self.polls += 1
+            terminal = self.polls >= 2
+            if terminal and not execution.done():
+                execution.set_result(None)
+            return (
+                AgentTask(id="worker-1", objective="probe", status="completed"),
+                AgentTask(
+                    id="worker-2",
+                    objective="probe",
+                    status="completed" if terminal else "running",
+                ),
+            )
+
+        async def schedule_progress(self, _schedule_id):
+            return ()
+
+    lead_calls = 0
+
+    async def lead(*_args):
+        nonlocal lead_calls
+        lead_calls += 1
+        return LeadAssessment("automatic review should be deferred", False)
+
+    agents = Agents()
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(),
+        agents,
+        preparation,
+        lead,
+        lead_assessment_batch_size=1,
+        lead_assessment_batch_seconds=0.01,
+    )
+
+    result = await service._monitor_live(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        SimpleNamespace(id="schedule-frontier", execution=execution, assignments=()),
+    )
+
+    assert agents.polls >= 2
+    assert result is None
+    assert lead_calls == 0
+    assert sum(
+        event.get("kind") == "lead_assessment_deferred_frontier_transition"
+        for event in events
+    ) == 1
+
+
+async def test_monitor_skips_final_review_for_completed_frontier_schedule() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[dict[str, object]] = []
+
+    class Store:
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(dict(payload))
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            return {
+                "id": "batch-frontier",
+                "schedule_id": schedule_id,
+                "state": "scheduled",
+            }
+
+    class Agents:
+        async def list_schedule_tasks(self, _schedule_id):
+            return (AgentTask(id="worker-1", objective="probe", status="completed"),)
+
+        async def schedule_progress(self, _schedule_id):
+            return ()
+
+    lead_calls = 0
+
+    async def lead(*_args):
+        nonlocal lead_calls
+        lead_calls += 1
+        return LeadAssessment("final review should be deferred", False)
+
+    execution = asyncio.get_running_loop().create_future()
+    execution.set_result(None)
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(), Agents(), preparation, lead
+    )
+
+    result = await service._monitor_live(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        SimpleNamespace(id="schedule-frontier", execution=execution, assignments=()),
+    )
+
+    assert result is None
+    assert lead_calls == 0
+    deferred = [
+        event
+        for event in events
+        if event.get("kind") == "lead_assessment_deferred_frontier_transition"
+    ]
+    assert len(deferred) == 1
+    assert deferred[0]["frontier_batch_id"] == "batch-frontier"
+
+
 async def test_monitor_records_final_provider_timeout_without_false_stall() -> None:
     prepared = await preparation(
         "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
