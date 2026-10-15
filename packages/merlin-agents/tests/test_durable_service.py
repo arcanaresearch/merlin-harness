@@ -31,6 +31,7 @@ from merlin_agents.durable_service import (
     _advisory_evaluation_failure,
     _assignment,
     _capability_grant_narrows,
+    _sealed_assignment_candidate_identity,
     _transport_retry_backoff_seconds,
     _usage_with_assignment_cost,
     _validated_target_evidence_receipts,
@@ -7680,14 +7681,45 @@ async def test_sealed_direct_candidate_binds_attempt_without_oracle_digest() -> 
     assert metadata["strategy_state"]["candidate_identity"] == identity
 
 
-@pytest.mark.parametrize("outcome", ["confirmed", "refuted"])
-async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome: str) -> None:
+def test_sealed_assignment_candidate_identity_uses_executable_id() -> None:
+    executable_technique_id = "technique/one@lang=en@variant=native"
     identity = {
         "campaign_id": "campaign/one",
         "target_id": "target",
         "target_generation": "generation-1",
         "scenario_fingerprint": "scenario-1",
-        "technique_id": "technique/one",
+        "technique_id": executable_technique_id,
+        "controller_id": "crescendo",
+        "payload_family": "native",
+        "requested_language": "en",
+        "mutation_id": "mutation-1",
+    }
+    assignment = SimpleNamespace(
+        id="campaign/one/crescendo",
+        objective=(
+            "execute\n\nSealed candidate identities: "
+            + json.dumps([identity], sort_keys=True, separators=(",", ":"))
+        ),
+        target_profile_id="target",
+        technique_ids=(executable_technique_id,),
+        semantic_technique_id="technique/one",
+        strategy_id="crescendo",
+        requested_language="en",
+        requested_transform_id="native",
+    )
+
+    assert _sealed_assignment_candidate_identity(assignment, sealed_arm=None) == identity
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "refuted"])
+async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome: str) -> None:
+    executable_technique_id = "technique/one@lang=und@variant=native"
+    identity = {
+        "campaign_id": "campaign/one",
+        "target_id": "target",
+        "target_generation": "generation-1",
+        "scenario_fingerprint": "scenario-1",
+        "technique_id": executable_technique_id,
         "controller_id": "direct",
         "payload_family": "baseline",
         "requested_language": "und",
@@ -7714,7 +7746,7 @@ async def test_target_authoritative_receipt_terminalizes_exact_candidate(outcome
         requested_language="und",
         requested_transform_id="baseline",
         semantic_technique_id="technique/one",
-        technique_ids=("technique/one",),
+        technique_ids=(executable_technique_id,),
         objective=(
             "execute\n\nSealed candidate identities: "
             + json.dumps([identity], sort_keys=True, separators=(",", ":"))

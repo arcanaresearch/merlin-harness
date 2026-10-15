@@ -3834,21 +3834,9 @@ class DurableAgentService:
                     and technique_id.startswith("hypothesis:")
                     and sealed_arm is not None
                 )
-                candidate_identity = _sealed_candidate_identity(
-                    assignment.objective,
-                    campaign_id=_campaign_id_for_assignment(assignment.id),
-                    target_id=assignment.target_profile_id,
-                    technique_id=technique_id,
-                    controller_id=str(
-                        sealed_arm.get("controller_id") or assignment.strategy_id
-                        if sealed_arm is not None
-                        else assignment.strategy_id
-                    ),
-                    requested_language=assignment.requested_language,
-                    payload_family=assignment.requested_transform_id,
-                    mutation_id=(
-                        str(sealed_arm.get("mutation_id")) if sealed_arm is not None else None
-                    ),
+                candidate_identity = _sealed_assignment_candidate_identity(
+                    assignment,
+                    sealed_arm=sealed_arm,
                 )
                 oracle_digest = assignment.oracle_digest or (
                     "sha256:" + hashlib.sha256(assignment.objective.encode()).hexdigest()
@@ -5026,28 +5014,9 @@ class DurableAgentService:
                     None,
                 )
                 sealed_arm = _sealed_arm_contract(assignment.objective)
-                candidate_identity = _sealed_candidate_identity(
-                    assignment.objective,
-                    campaign_id=_campaign_id_for_assignment(assignment.id),
-                    target_id=assignment.target_profile_id,
-                    technique_id=(
-                        assignment.semantic_technique_id
-                        or (
-                            assignment.technique_ids[0]
-                            if len(assignment.technique_ids) == 1
-                            else None
-                        )
-                    ),
-                    controller_id=str(
-                        sealed_arm.get("controller_id") or assignment.strategy_id
-                        if sealed_arm is not None
-                        else assignment.strategy_id
-                    ),
-                    requested_language=assignment.requested_language,
-                    payload_family=assignment.requested_transform_id,
-                    mutation_id=(
-                        str(sealed_arm.get("mutation_id")) if sealed_arm is not None else None
-                    ),
+                candidate_identity = _sealed_assignment_candidate_identity(
+                    assignment,
+                    sealed_arm=sealed_arm,
                 )
                 if isinstance(receipt_projection, Mapping) and candidate_identity is not None:
                     receipt_projection = validate_candidate_outcome_projection(
@@ -5202,22 +5171,10 @@ class DurableAgentService:
             if physical_state_identity is not None and len(state_identity_matches) == 1
             else None
         )
-        technique_id = assignment.semantic_technique_id or (
-            assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None
-        )
-        candidate_identity = _sealed_candidate_identity(
-            assignment.objective,
-            campaign_id=_campaign_id_for_assignment(assignment.id),
-            target_id=assignment.target_profile_id,
-            technique_id=technique_id,
-            controller_id=str(
-                sealed_arm.get("controller_id") or assignment.strategy_id
-                if (sealed_arm := _sealed_arm_contract(assignment.objective)) is not None
-                else assignment.strategy_id
-            ),
-            requested_language=assignment.requested_language,
-            payload_family=assignment.requested_transform_id,
-            mutation_id=(str(sealed_arm.get("mutation_id")) if sealed_arm is not None else None),
+        sealed_arm = _sealed_arm_contract(assignment.objective)
+        candidate_identity = _sealed_assignment_candidate_identity(
+            assignment,
+            sealed_arm=sealed_arm,
         )
         if candidate_identity is None:
             # The target receipt belongs to this task, but the task's executed
@@ -5352,16 +5309,9 @@ class DurableAgentService:
                 "state_id",
             )
         }
-        canonical_identity = _sealed_candidate_identity(
-            assignment.objective,
-            campaign_id=_campaign_id_for_assignment(assignment.id),
-            target_id=assignment.target_profile_id,
-            technique_id=assignment.semantic_technique_id
-            or (assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None),
-            controller_id=str(arm.get("controller_id") or assignment.strategy_id),
-            requested_language=assignment.requested_language,
-            payload_family=assignment.requested_transform_id,
-            mutation_id=str(arm.get("mutation_id") or "") or None,
+        canonical_identity = _sealed_assignment_candidate_identity(
+            assignment,
+            sealed_arm=arm,
         )
         if canonical_identity is None:
             raise ValueError("ARM outcome has no sealed canonical candidate identity")
@@ -7292,6 +7242,55 @@ def _sealed_candidate_identity(
         and (mutation_id is None or value.get("mutation_id") == mutation_id)
     )
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _sealed_assignment_candidate_identity(
+    assignment: WorkerAssignment,
+    *,
+    sealed_arm: Mapping[str, object] | None,
+) -> Mapping[str, str] | None:
+    """Resolve exactly one sealed identity from an assignment's executable candidates."""
+
+    technique_ids = tuple(
+        dict.fromkeys(
+            (
+                *assignment.technique_ids,
+                *(
+                    (assignment.semantic_technique_id,)
+                    if assignment.semantic_technique_id is not None
+                    else ()
+                ),
+            )
+        )
+    )
+    matches = tuple(
+        identity
+        for technique_id in technique_ids
+        if (
+            identity := _sealed_candidate_identity(
+                assignment.objective,
+                campaign_id=_campaign_id_for_assignment(assignment.id),
+                target_id=assignment.target_profile_id,
+                technique_id=technique_id,
+                controller_id=str(
+                    sealed_arm.get("controller_id") or assignment.strategy_id
+                    if sealed_arm is not None
+                    else assignment.strategy_id
+                ),
+                requested_language=assignment.requested_language,
+                payload_family=assignment.requested_transform_id,
+                mutation_id=(
+                    str(sealed_arm.get("mutation_id")) if sealed_arm is not None else None
+                ),
+            )
+        )
+        is not None
+    )
+    unique = {
+        json.dumps(identity, sort_keys=True, separators=(",", ":")): identity
+        for identity in matches
+    }
+    return next(iter(unique.values())) if len(unique) == 1 else None
 
 
 def _sealed_arm_contract(objective: str) -> Mapping[str, object] | None:
