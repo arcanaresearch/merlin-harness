@@ -2236,6 +2236,149 @@ def _compile_arguments() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() -> None:
+    captured = (
+        {
+            "method": "GET",
+            "url": "https://target.test/api/state",
+            "status": 200,
+            "request_json": None,
+            "response_json": {
+                "json": {
+                    "run": {"runId": "run-1", "tier": 1},
+                    "session": {"score": 43},
+                }
+            },
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "request_json": {"clientTurnId": "turn-1", "text": "harmless probe"},
+            "response_json": {
+                "json": {
+                    "run": {"runId": "run-1", "tier": 1},
+                    "turn": {"reply": "observed response", "score": 49},
+                }
+            },
+        },
+    )
+
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = owner()
+
+        def api_exchange_events(self):
+            return captured
+
+    class Recorder:
+        handoff = None
+
+        async def reviewed_native_input_receipt(self, context_id, _event, input_pointer):
+            return {
+                "context_id": context_id,
+                "target_id": "target",
+                "input_pointer": input_pointer,
+                "evidence_ref": "native-request:sha256:" + "f" * 64,
+            }
+
+        async def record_evidence(self, *_args):
+            return None
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    arguments = {
+        "method": "POST",
+        "url": "https://target.test/api/turn",
+        "input_pointer": "/text",
+        "response_selector": "/json/turn/reply",
+        "success_witness": "reply is returned",
+        "authentication": "reviewed cookie session",
+        "session_constraint": "one active run per authenticated principal",
+        "state_observations": [
+            {
+                "name": "run_id",
+                "role": "state_identity",
+                "baseline_selector": {
+                    "pointer": "/json/run/runId",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/json/run/runId",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "value_type": "string",
+            },
+            {
+                "name": "tier",
+                "role": "progress_ordinal",
+                "baseline_selector": {
+                    "pointer": "/json/run/tier",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/json/run/tier",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "value_type": "integer",
+                "minimum_value": 1,
+                "preferred_direction": "increase",
+                "monotonicity": "nondecreasing",
+            },
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "pointer": "/json/session/score",
+                    "step_id": "observed-session-setup",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/json/turn/score",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "value_type": "integer",
+                "minimum_value": 0,
+                "maximum_value": 100,
+                "preferred_direction": "increase",
+            },
+        ],
+    }
+    recorder = Recorder()
+
+    result = await next(
+        tool
+        for tool in browser_tools(lambda _: Session(), recorder)
+        if tool.describe().name == "browser_compile_api_handoff"
+    ).invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    adapter = json.loads(recorder.handoff.adapter)
+    assert [step["endpoint"] for step in adapter["api_steps"]] == [
+        "https://target.test/api/state",
+        "https://target.test/api/turn",
+    ]
+    assert adapter["api_steps"][0]["method"] == "GET"
+    assert adapter["session_cardinality"]["status"] == "unverified"
+    capabilities = adapter["state_capabilities"]
+    assert capabilities["identity"]["baseline_selector"]["pointer"] == "/json/run/runId"
+    assert capabilities["identity"]["result_selector"]["pointer"] == "/json/run/runId"
+    assert {item["name"] for item in capabilities["observations"]} == {
+        "run_id",
+        "tier",
+        "score",
+    }
+
+
+@pytest.mark.asyncio
 async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabilities() -> None:
     captured = (
         {

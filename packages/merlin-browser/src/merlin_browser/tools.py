@@ -4142,7 +4142,13 @@ class CompiledApiReconHandoffTool:
                 "and binds durable evidence references. Field names are target data, never "
                 "hardcoded runtime semantics. Declare state_identity only for a target-authored "
                 "physical mutable-state identifier observed before and after interaction; never "
-                "promote a cookie, lease, credential, or logical session token."
+                "promote a cookie, lease, credential, or logical session token. When "
+                "authentication is cookie-bound and the interaction request therefore carries no "
+                "state identifier, "
+                "a captured read-only GET state response may supply the baseline selectors while "
+                "the interaction response supplies the result selectors. Include every observed "
+                "state field needed to measure the operator's objectives before sealing the "
+                "handoff."
             ),
             input_schema={
                 "type": "object",
@@ -4437,8 +4443,13 @@ class CompiledApiReconHandoffTool:
                     "state_observations": {
                         "type": "array",
                         "description": (
-                            "Optional target-authored state fields. Each pointer must exist in the "
-                            "captured response for its declared lifecycle step."
+                            "Reviewed target-authored state fields. Include the physical state "
+                            "identity and every captured field needed to measure the operator's "
+                            "objectives. Each pointer must exist in the captured response for its "
+                            "declared lifecycle step. For cookie-bound APIs, the baseline may be a "
+                            "read-only GET state response even when the interaction request does "
+                            "not echo the state identifier. Use an empty array only when no exact "
+                            "target-authored state field was observed."
                         ),
                         "items": {
                             "type": "object",
@@ -5578,9 +5589,9 @@ class CompiledApiReconHandoffTool:
         session_ownership = "not_applicable"
         creation_transition_evidence: tuple[tuple[str, dict[str, object]], ...] = ()
         request_scalars = _string_scalar_paths(request_json)
-        sourced_session_values: set[str] = set()
+        request_sourced_session_values: set[str] = set()
         for candidate in exchanges[:event_index]:
-            sourced_session_values.update(
+            request_sourced_session_values.update(
                 value
                 for response_pointer, value in _string_scalar_paths(candidate.get("response_json"))
                 if any(
@@ -5590,11 +5601,68 @@ class CompiledApiReconHandoffTool:
                 )
             )
         if physical_session_id is not None:
-            sourced_session_values.intersection_update({physical_session_id})
+            request_sourced_session_values.intersection_update({physical_session_id})
+
+        # Cookie-authenticated APIs often keep physical state out of the request
+        # body.  In that lifecycle, an exact reviewed state-identity declaration
+        # can bind a passive GET snapshot to the interaction response without
+        # treating the cookie itself as target state or inventing field semantics.
+        passive_identity_baselines: list[tuple[Mapping[str, object], str, str]] = []
+        if not request_sourced_session_values:
+            for raw_observation in arguments.get("state_observations", []):
+                if (
+                    not isinstance(raw_observation, Mapping)
+                    or raw_observation.get("role") != "state_identity"
+                ):
+                    continue
+                baseline_selector = raw_observation.get("baseline_selector")
+                result_selector = raw_observation.get("result_selector")
+                if (
+                    not isinstance(baseline_selector, Mapping)
+                    or not isinstance(result_selector, Mapping)
+                    or baseline_selector.get("step_id") != "observed-session-setup"
+                    or result_selector.get("step_id") != "observed-message-exchange"
+                ):
+                    continue
+                baseline_pointer = baseline_selector.get("pointer")
+                result_pointer = result_selector.get("pointer")
+                result_identity = (
+                    _json_pointer_value_or_missing(event.get("response_json"), result_pointer)
+                    if isinstance(result_pointer, str)
+                    else _MISSING
+                )
+                if not isinstance(result_identity, str) or not result_identity:
+                    continue
+                matching_baselines = [
+                    candidate
+                    for candidate in exchanges[:event_index]
+                    if str(candidate.get("method") or "").upper() in {"GET", "HEAD"}
+                    and type(candidate.get("status")) is int
+                    and 200 <= int(candidate["status"]) <= 299
+                    and isinstance(baseline_pointer, str)
+                    and _json_pointer_value_or_missing(
+                        candidate.get("response_json"), baseline_pointer
+                    )
+                    == result_identity
+                ]
+                if matching_baselines:
+                    passive_identity_baselines.append(
+                        (matching_baselines[-1], str(baseline_pointer), result_identity)
+                    )
+        passive_identity_baseline = (
+            passive_identity_baselines[0] if len(passive_identity_baselines) == 1 else None
+        )
+        sourced_session_values = set(request_sourced_session_values)
+        if passive_identity_baseline is not None:
+            sourced_session_values.add(passive_identity_baseline[2])
         if sourced_session_values:
             session_ownership = "unknown"
             cleanup_values = _string_scalar_values(cleanup_request)
-            if cleanup_event is not None and not sourced_session_values.issubset(cleanup_values):
+            if (
+                cleanup_event is not None
+                and request_sourced_session_values
+                and not request_sourced_session_values.issubset(cleanup_values)
+            ):
                 return ToolResult(
                     content=(
                         "captured cleanup does not consume the interaction's ephemeral session "
@@ -5604,35 +5672,38 @@ class CompiledApiReconHandoffTool:
                     metadata={"effect": self.effect},
                 )
             setup_candidates: dict[str, tuple[Mapping[str, object], str, str]] = {}
-            for candidate in exchanges[:event_index]:
-                candidate_response = candidate.get("response_json")
-                for pointer, value in _string_scalar_paths(candidate_response):
-                    # A setup exchange introduces the ephemeral session value.  Normal
-                    # message/status responses may echo that same value after consuming
-                    # it; treating every echo as another setup makes an ordinary live
-                    # session look like several conflicting creations.
-                    if value in sourced_session_values:
-                        # Preserve the first observation. A later request may legitimately
-                        # echo or auto-resume the same physical session identifier, but it
-                        # cannot become a competing setup candidate.  A first observation
-                        # that already consumed the value is retained and fails ownership
-                        # checks below instead of disappearing as malformed evidence.
-                        existing = setup_candidates.get(value)
-                        if existing is None:
-                            setup_candidates[value] = (candidate, pointer, value)
-                        elif value not in _string_scalar_values(candidate.get("request_json")):
-                            identity = json.dumps(
-                                {
-                                    "method": candidate.get("method"),
-                                    "url": candidate.get("url"),
-                                    "request": candidate.get("request_json"),
-                                    "pointer": pointer,
-                                    "value": value,
-                                },
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            setup_candidates.setdefault(identity, (candidate, pointer, value))
+            if passive_identity_baseline is not None:
+                setup_candidates[passive_identity_baseline[2]] = passive_identity_baseline
+            else:
+                for candidate in exchanges[:event_index]:
+                    candidate_response = candidate.get("response_json")
+                    for pointer, value in _string_scalar_paths(candidate_response):
+                        # A setup exchange introduces the ephemeral session value.  Normal
+                        # message/status responses may echo that same value after consuming
+                        # it; treating every echo as another setup makes an ordinary live
+                        # session look like several conflicting creations.
+                        if value in sourced_session_values:
+                            # Preserve the first observation. A later request may legitimately
+                            # echo or auto-resume the same physical session identifier, but it
+                            # cannot become a competing setup candidate.  A first observation
+                            # that already consumed the value is retained and fails ownership
+                            # checks below instead of disappearing as malformed evidence.
+                            existing = setup_candidates.get(value)
+                            if existing is None:
+                                setup_candidates[value] = (candidate, pointer, value)
+                            elif value not in _string_scalar_values(candidate.get("request_json")):
+                                identity = json.dumps(
+                                    {
+                                        "method": candidate.get("method"),
+                                        "url": candidate.get("url"),
+                                        "request": candidate.get("request_json"),
+                                        "pointer": pointer,
+                                        "value": value,
+                                    },
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                                setup_candidates.setdefault(identity, (candidate, pointer, value))
             if not setup_candidates:
                 return ToolResult(
                     content=(
