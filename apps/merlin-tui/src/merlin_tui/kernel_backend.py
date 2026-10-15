@@ -852,7 +852,6 @@ class KernelBackend:
     async def _snapshot_agent_views(
         self, snapshots: Sequence[SwarmSnapshot]
     ) -> tuple[AgentView, ...]:
-        provider = await self._settings.get_model() if self._settings is not None else ""
         return tuple(
             AgentView(
                 name=(f"{specialist.specialist_instance_id}/{assignment.execution_stage}"),
@@ -864,7 +863,7 @@ class KernelBackend:
                 task=assignment.objective or assignment.assignment_id,
                 activity=assignment.activity,
                 output=assignment.output,
-                provider=provider,
+                provider=assignment.provider_model,
                 elapsed="durable history",
                 latest_event=(
                     assignment.current_attempt.lifecycle.value

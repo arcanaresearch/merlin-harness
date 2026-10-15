@@ -6635,6 +6635,11 @@ def _project_durable_swarm_rows(
                     "execution_stage",
                     fallback=str(assignment.get("execution_stage") or "execute"),
                 ),
+                provider_model=_projection_text(
+                    assignment,
+                    "provider_model",
+                    fallback="legacy:unknown",
+                ),
                 current_attempt=_snapshot_current_attempt(row),
                 candidate_evaluation=_snapshot_candidate_evaluation(row),
                 successful_result=_snapshot_successful_result(row),

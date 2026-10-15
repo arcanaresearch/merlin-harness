@@ -141,6 +141,7 @@ class SwarmProjectionRecord:
     assignment_lifecycle: NodeLifecycle
     candidate: CandidateAxes
     execution_stage: str
+    provider_model: str
     current_attempt: CurrentAttempt | None = None
     candidate_evaluation: CandidateEvaluationState = CandidateEvaluationState()
     successful_result: SuccessfulResultSummary | None = None
@@ -157,6 +158,7 @@ class SwarmProjectionRecord:
             assignment_id=self.assignment_id,
             schedule_id=self.schedule_id,
             execution_stage=self.execution_stage,
+            provider_model=self.provider_model,
         )
         if self.specialist_display_name is not None:
             _require_non_blank(specialist_display_name=self.specialist_display_name)
@@ -175,6 +177,7 @@ class AssignmentSnapshot:
     lifecycle: NodeLifecycle
     candidate: CandidateAxes
     execution_stage: str
+    provider_model: str
     current_attempt: CurrentAttempt | None
     candidate_evaluation: CandidateEvaluationState
     successful_result: SuccessfulResultSummary | None
@@ -271,6 +274,7 @@ def _project_assignments(
                 lifecycle=first.assignment_lifecycle,
                 candidate=first.candidate,
                 execution_stage=first.execution_stage,
+                provider_model=first.provider_model,
                 current_attempt=first.current_attempt,
                 candidate_evaluation=first.candidate_evaluation,
                 successful_result=first.successful_result,

@@ -47,6 +47,7 @@ def _record(
             mutation_id="mutation/rot13",
         ),
         execution_stage="direct",
+        provider_model="worker-model",
         current_attempt=CurrentAttempt(
             attempt_id="attempt/current",
             lifecycle=AttemptLifecycle.FINALIZING,
@@ -111,6 +112,7 @@ def test_preserves_node_attempt_evaluation_and_success_as_separate_facts() -> No
     assert assignment.candidate_evaluation.state is CandidateEvaluation.EVALUATION_UNCERTAIN
     assert assignment.successful_result is not None
     assert assignment.successful_result.result_id == "result/previous"
+    assert assignment.provider_model == "worker-model"
 
 
 def test_exact_candidate_axes_keep_target_scenario_language_and_mutation_distinct() -> None:

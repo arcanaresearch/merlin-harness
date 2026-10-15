@@ -980,6 +980,7 @@ async def test_backend_agents_use_one_snapshot_read_without_recovery_or_schedule
                                         mutation_id="mutation/rot13",
                                     ),
                                     execution_stage="direct",
+                                    provider_model="deepseek-v4-flash",
                                     current_attempt=CurrentAttempt(
                                         attempt_id="attempt/current",
                                         lifecycle=AttemptLifecycle.RUNNING,
@@ -1017,6 +1018,7 @@ async def test_backend_agents_use_one_snapshot_read_without_recovery_or_schedule
                                         mutation_id="none",
                                     ),
                                     execution_stage="execute",
+                                    provider_model="deepseek-v4-flash",
                                     current_attempt=None,
                                     candidate_evaluation=CandidateEvaluationState(),
                                     successful_result=None,
@@ -1041,6 +1043,7 @@ async def test_backend_agents_use_one_snapshot_read_without_recovery_or_schedule
     assert views[0].assignment_id == "task/first"
     assert views[0].evaluation_state == "evaluation_uncertain"
     assert views[0].result == "previous target reply"
+    assert views[0].provider == views[1].provider == "deepseek-v4-flash"
     assert views[1].requested_language == "am"
 
 
