@@ -4179,7 +4179,9 @@ class CompiledApiReconHandoffTool:
                 "authentication is cookie-bound and the interaction request therefore carries no "
                 "state identifier, "
                 "a captured read-only GET state response may supply the baseline selectors while "
-                "the interaction response supplies the result selectors. Include every observed "
+                "the interaction response supplies the result selectors. That cookie-bound shape "
+                "must include exactly one observation with role=state_identity whose baseline and "
+                "result selectors identify the same physical target state. Include every observed "
                 "state field needed to measure the operator's objectives before sealing the "
                 "handoff."
             ),
@@ -4960,6 +4962,13 @@ class CompiledApiReconHandoffTool:
             and item.get("source") == "browser_compile_api_handoff.state_observations"
             for item in adapter.get("evaluation_uncertainties", ())
         )
+        state_observation_failures = [
+            str(item.get("reason") or "").strip()
+            for item in adapter.get("evaluation_uncertainties", ())
+            if isinstance(item, Mapping)
+            and item.get("source") == "browser_compile_api_handoff.state_observations"
+            and str(item.get("reason") or "").strip()
+        ]
         preferred_next_tool = (
             "browser_end_owned_session"
             if isinstance(cleanup_discovery, Mapping)
@@ -4983,10 +4992,8 @@ class CompiledApiReconHandoffTool:
                 **(
                     {
                         "state_observation_repair_available": True,
-                        "state_observation_repair": (
-                            "Recompile this handoff with a captured physical state identity "
-                            "and valid baseline/result selectors before preparing the campaign."
-                        ),
+                        "state_observation_repair": " ".join(state_observation_failures),
+                        "state_observation_failures": state_observation_failures,
                     }
                     if state_observation_repair_available
                     else {}
@@ -6501,9 +6508,11 @@ class CompiledApiReconHandoffTool:
             selectors: dict[str, dict[str, object]] = {}
             observation_evidence_refs: list[str] = []
             observed_values: dict[str, object] = {}
+            selector_failure: str | None = None
             for selector_name in ("baseline_selector", "result_selector"):
                 raw_selector = raw_observation.get(selector_name)
                 if not isinstance(raw_selector, Mapping):
+                    selector_failure = f"{selector_name} is missing"
                     break
                 step_id = raw_selector.get("step_id")
                 expected_step_id = (
@@ -6512,6 +6521,10 @@ class CompiledApiReconHandoffTool:
                     else "observed-message-exchange"
                 )
                 if step_id != expected_step_id:
+                    selector_failure = (
+                        f"{selector_name} uses step {step_id!r}; expected "
+                        f"{expected_step_id!r}"
+                    )
                     break
                 pointer = raw_selector.get("pointer")
                 observed_event, observed_evidence = state_evidence_by_step_id.get(
@@ -6527,6 +6540,22 @@ class CompiledApiReconHandoffTool:
                     else None
                 )
                 if resolved is None:
+                    if observed_event is None and selector_name == "baseline_selector":
+                        selector_failure = (
+                            "no pre-interaction baseline was selected; cookie-bound state "
+                            "requires exactly one observation with role='state_identity' whose "
+                            "baseline selector matches a captured read-only GET response and "
+                            "whose result selector matches the interaction response"
+                        )
+                    elif observed_event is None:
+                        selector_failure = (
+                            f"no captured response exists for {expected_step_id!r}"
+                        )
+                    else:
+                        selector_failure = (
+                            f"{selector_name} pointer {pointer!r} does not resolve to a scalar "
+                            f"in the exact {expected_step_id!r} response"
+                        )
                     break
                 resolved_pointer, observed_value = resolved
                 response_evidence = tuple(
@@ -6550,8 +6579,8 @@ class CompiledApiReconHandoffTool:
                 evaluation_uncertainties.append(
                     _evaluation_uncertainty(
                         "browser_compile_api_handoff.state_observations",
-                        "A state observation selector was absent from its exact captured "
-                        "lifecycle response and was not made executable.",
+                        f"State observation {observation_name!r} was not made executable: "
+                        f"{selector_failure or 'its selectors were incomplete'}.",
                     )
                 )
                 continue

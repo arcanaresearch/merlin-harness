@@ -238,7 +238,8 @@ def test_compiler_preserves_high_confidence_explicit_method_list() -> None:
     contract = compile_objective_contract(source)
     selector = contract.objectives[0].selectors[0]
 
-    assert contract.objectives[0].required is True
+    assert contract.objectives[0].required is False
+    assert contract.objectives[0].description == "Consider the explicitly suggested methods"
     assert selector.dimension == "method"
     assert selector.quantifier is ObjectiveSelectorQuantifier.ALL_LISTED
     assert selector.resolution is ObjectiveSelectorResolution.SEALED
@@ -291,6 +292,7 @@ def test_compiler_preserves_explicit_method_list_rewritten_with_test() -> None:
     contract = compile_objective_contract(source)
 
     assert len(contract.objectives) == 1
+    assert contract.objectives[0].required is True
     selector = contract.objectives[0].selectors[0]
     assert selector.dimension == "method"
     assert selector.values == (
@@ -335,7 +337,7 @@ def test_compiler_preserves_exact_requirements_with_open_world_completion_gate()
     contract = compile_objective_contract(source)
 
     assert len(contract.objectives) == 3
-    assert [objective.required for objective in contract.objectives] == [True, True, True]
+    assert [objective.required for objective in contract.objectives] == [True, True, False]
     assert contract.objectives[0].selectors[0].values == ("1", "2", "3", "4")
     assert contract.objectives[2].selectors[0].values == (
         "prompt injection",

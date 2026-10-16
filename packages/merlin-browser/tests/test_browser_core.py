@@ -4041,7 +4041,13 @@ async def test_api_handoff_keeps_recompile_available_for_invalid_state_selector(
     )
     assert result.metadata["state_observation_repair_available"] is True
     assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
-    assert "physical state identity" in result.metadata["state_observation_repair"]
+    assert "no pre-interaction baseline was selected" in result.metadata[
+        "state_observation_repair"
+    ]
+    assert "role='state_identity'" in result.metadata["state_observation_repair"]
+    assert result.metadata["state_observation_failures"] == [
+        result.metadata["state_observation_repair"]
+    ]
 
 
 @pytest.mark.asyncio

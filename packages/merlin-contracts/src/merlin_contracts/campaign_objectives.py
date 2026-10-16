@@ -285,7 +285,7 @@ _ALL_AVAILABLE_PATTERN = re.compile(
 )
 _EXPLICIT_LIST_PATTERN = re.compile(
     r"(?:^|(?<=[.!?\n]))[ \t]*(?:then[ \t]+)?"
-    r"(?:try|test|attempt|attempted|exercise|assess)[ \t]+"
+    r"(?P<verb>try|test|attempt|attempted|exercise|assess)[ \t]+"
     r"(?P<items>[^.!?\n]{1,300}?)"
     r"(?=[ \t]+(?:to|that[ \t]+(?:attempts?|tries|seeks?)[ \t]+to)"
     r"[ \t]+[A-Za-z]|[.!?\n]|$)",
@@ -411,6 +411,7 @@ def compile_objective_contract(
         )
 
     for match in _EXPLICIT_LIST_PATTERN.finditer(text):
+        advisory = match.group("verb").casefold() == "try"
         raw_items = match.group("items").strip()
         raw_items = re.sub(r"[ \t]+in[ \t]+order$", "", raw_items, flags=re.IGNORECASE)
         # Require an explicit final conjunction. Comma-separated lists retain the
@@ -450,10 +451,15 @@ def compile_objective_contract(
         objectives.append(
             CampaignObjective(
                 id=_objective_id("exercise-listed-methods", span),
-                description="Exercise every explicitly listed method",
+                description=(
+                    "Consider the explicitly suggested methods"
+                    if advisory
+                    else "Exercise every explicitly listed method"
+                ),
                 kind=ObjectiveKind.BEHAVIOR,
                 temporal_semantics=ObjectiveTemporalSemantics.CUMULATIVE,
                 provenance=ObjectiveProvenance(kind="operator", source_ref=source_ref),
+                required=not advisory,
                 source_span=span,
                 selectors=(
                     ObjectiveSelector(
