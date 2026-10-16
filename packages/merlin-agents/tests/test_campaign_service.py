@@ -11547,6 +11547,43 @@ async def test_concurrent_execute_adopts_shared_deterministic_schedule() -> None
 
 
 @pytest.mark.asyncio
+async def test_recovery_waits_for_execution_ownership_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    service = CampaignService(store, Agents(store), preparation)  # type: ignore[arg-type]
+    startup_entered = asyncio.Event()
+    release_startup = asyncio.Event()
+    recovery_entered = asyncio.Event()
+
+    async def execute_owned(*_args, **_kwargs):
+        startup_entered.set()
+        await release_startup.wait()
+        return {"campaign_id": "campaign-1", "status": "executing"}
+
+    async def recover_owned(*, resume_execution=True):
+        assert resume_execution is True
+        recovery_entered.set()
+        return 0
+
+    monkeypatch.setattr(service, "_execute_owned", execute_owned)
+    monkeypatch.setattr(service, "_recover_owned", recover_owned)
+
+    executing = asyncio.create_task(
+        service.execute("session-1", "campaign-1", "sha256:reviewed")
+    )
+    await startup_entered.wait()
+    recovering = asyncio.create_task(service.recover())
+    await asyncio.sleep(0)
+    assert not recovery_entered.is_set()
+
+    release_startup.set()
+    assert await executing == {"campaign_id": "campaign-1", "status": "executing"}
+    assert await recovering == 0
+    assert recovery_entered.is_set()
+
+
+@pytest.mark.asyncio
 async def test_prepare_accepts_codex_dynamic_tools_for_tool_bearing_worker() -> None:
     async def routed_preparation(session_id, objective, profile):
         prepared = await preparation(session_id, objective, profile)

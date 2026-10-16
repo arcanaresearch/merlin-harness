@@ -2004,6 +2004,13 @@ class CampaignService:
         self._lead_claimant_id = f"campaign-lead:{uuid4()}"
         self._lead_claim_lease_seconds = 30.0
         self._frontier_transition_locks: dict[str, asyncio.Lock] = {}
+        # Execution startup makes the campaign durable before installing its
+        # in-process supervisor. Concurrent approvals may still race through
+        # their deterministic schedule handoff, while recovery must wait until
+        # every startup has either installed ownership or stood down.
+        self._ownership_condition = asyncio.Condition()
+        self._execution_startups = 0
+        self._recovery_active = False
         self._supervisors: dict[str, asyncio.Task[None]] = {}
 
     def _target_exchange_tool_ids(self, assignments: Sequence[WorkerAssignment]) -> tuple[str, ...]:
@@ -4393,6 +4400,29 @@ class CampaignService:
                 )
 
     async def execute(
+        self,
+        session_id: str,
+        campaign_id: str,
+        manifest_digest: str,
+        *,
+        approve_over_budget: bool = False,
+    ) -> Mapping[str, object]:
+        async with self._ownership_condition:
+            await self._ownership_condition.wait_for(lambda: not self._recovery_active)
+            self._execution_startups += 1
+        try:
+            return await self._execute_owned(
+                session_id,
+                campaign_id,
+                manifest_digest,
+                approve_over_budget=approve_over_budget,
+            )
+        finally:
+            async with self._ownership_condition:
+                self._execution_startups -= 1
+                self._ownership_condition.notify_all()
+
+    async def _execute_owned(
         self,
         session_id: str,
         campaign_id: str,
@@ -16069,6 +16099,19 @@ class CampaignService:
                     )
 
     async def recover(self, *, resume_execution: bool = True) -> int:
+        async with self._ownership_condition:
+            await self._ownership_condition.wait_for(
+                lambda: self._execution_startups == 0 and not self._recovery_active
+            )
+            self._recovery_active = True
+        try:
+            return await self._recover_owned(resume_execution=resume_execution)
+        finally:
+            async with self._ownership_condition:
+                self._recovery_active = False
+                self._ownership_condition.notify_all()
+
+    async def _recover_owned(self, *, resume_execution: bool = True) -> int:
         # A process/database failure can terminalize the campaign row before
         # its scheduler cancellation commits. Fence those workers before the
         # generic scheduler recovery is allowed to reopen active schedules.
