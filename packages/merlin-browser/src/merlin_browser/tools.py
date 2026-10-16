@@ -8705,7 +8705,9 @@ class ReconRecallTool:
                 "validation or narrower bot-specific reconnaissance. Omit authentication_context "
                 "when it has not been observed; never guess it. An authentication mismatch may "
                 "return only authentication-neutral site facts and a blueprint without request "
-                "values. Tenant mismatches are never returned. "
+                "values. Explicit tenant mismatches are never returned. When the request omits "
+                "tenant and historical labels are ambiguous, only a sanitized blueprint and its "
+                "recorded scope are returned for Lead review; tenant facts remain withheld. "
                 "This lookup is synchronous: its returned result is "
                 "final, no callback will arrive, and it must not be repeated while waiting. Follow "
                 "the returned next_action immediately."
@@ -8752,12 +8754,11 @@ class ReconRecallTool:
                 desired_tenant, stored_tenant
             ):
                 continue
-            if (
+            tenant_review_required = (
                 desired_tenant is None
                 and stored_tenant is not None
                 and not tenant_omission_is_unambiguous
-            ):
-                continue
+            )
             authentication_matches = desired.get(
                 "authentication_context"
             ) is not None and _scope_values_match(
@@ -8767,7 +8768,12 @@ class ReconRecallTool:
             site_facts = handoff.reusable_site_facts
             if not authentication_matches:
                 site_facts = _authentication_neutral_site_facts(site_facts)
-            if site_facts is None:
+            if tenant_review_required:
+                site_facts = None
+            adapter_blueprint = _recon_adapter_blueprint(
+                handoff.adapter or handoff.reusable_adapter
+            )
+            if site_facts is None and adapter_blueprint is None:
                 continue
             shared = {
                 "handoff_id": handoff.id,
@@ -8775,12 +8781,10 @@ class ReconRecallTool:
                 "request_evidence_ref": handoff.request_evidence_ref,
                 "response_evidence_ref": handoff.response_evidence_ref,
                 "recon_scope": dict(scope),
-                "shared_site_facts": site_facts,
                 "authentication_reusable": authentication_matches,
+                "tenant_review_required": tenant_review_required,
+                **({"shared_site_facts": site_facts} if site_facts is not None else {}),
             }
-            adapter_blueprint = _recon_adapter_blueprint(
-                handoff.adapter or handoff.reusable_adapter
-            )
             differing = sorted(
                 key
                 for key in (
@@ -8795,6 +8799,7 @@ class ReconRecallTool:
             )
             if (
                 not differing
+                and not tenant_review_required
                 and authentication_matches
                 and handoff.reusable_adapter is not None
                 and not _passive_session_observation_only(handoff.reusable_adapter)

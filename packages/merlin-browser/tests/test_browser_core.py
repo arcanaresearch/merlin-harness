@@ -7963,7 +7963,18 @@ async def test_recon_recall_tolerates_scope_drift_and_reuses_exact_adapter() -> 
                 },
             )
             assert ambiguous_result.metadata["exact_matches"] == []
-            assert ambiguous_result.metadata["partial_matches"] == []
+            assert ambiguous_result.metadata["default_action"] == "semantic_scope_review"
+            assert [
+                item["handoff_id"] for item in ambiguous_result.metadata["partial_matches"]
+            ] == ["handoff:recorded"]
+            candidate = ambiguous_result.metadata["partial_matches"][0]
+            assert candidate["tenant_review_required"] is True
+            assert candidate["candidate_reuse_status"] == "semantic_review_required"
+            assert candidate["candidate_adapter_blueprint"] == {"interface": "http_api"}
+            assert "shared_site_facts" not in candidate
+            assert ambiguous_result.metadata["match_projection"]["partial"][
+                "eligible_count"
+            ] == 2
 
 
 @pytest.mark.asyncio
