@@ -30,6 +30,7 @@ def _install_durable_campaign(
 ):
     class Client:
         def __init__(self) -> None:
+            self.build_calls = 0
             self.list_calls = 0
             # The approval phase interrupts the preparation stream once the
             # durable prepared campaign is verified; execution then starts
@@ -88,6 +89,7 @@ def _install_durable_campaign(
 
     async def build_client(*, confirmer=None):
         assert confirmer is None
+        client.build_calls += 1
         return client
 
     monkeypatch.setattr("merlin_tui.cli._client", build_client)
@@ -943,6 +945,7 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
         ),
     ]
     # Execution starts through the deterministic daemon RPC, not a model turn.
+    assert client.build_calls == 1
     assert client.execute_calls == [("campaign/one", "sha256:reviewed")]
     assert not any(str(prompt).startswith("Approve and execute") for prompt, *_ in calls)
 

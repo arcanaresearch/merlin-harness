@@ -1126,7 +1126,12 @@ async def _submit_campaign(arguments: list[str]) -> None:
             await _bounded_task_teardown(campaign_poll)
         if not preparation.done():
             await _bounded_task_teardown(preparation)
-        await _bounded_stream_teardown(campaign_client.close())
+        # Keep the client that owns the preparation daemon alive through direct
+        # execution. Closing it here can stop that daemon; a replacement daemon
+        # then has no active preparation session and correctly rejects the
+        # campaign as belonging to a different session.
+        if durable_review is None:
+            await _bounded_stream_teardown(campaign_client.close())
     if durable_review is None:
         note = ""
         if isinstance(streamed_review, dict):
@@ -1138,36 +1143,35 @@ async def _submit_campaign(arguments: list[str]) -> None:
         if campaign_poll_error is not None:
             note += "; durable campaign polling also failed"
         raise SystemExit("campaign was not durably prepared; refusing approval" + note)
-    if (
-        streamed_review is not None
-        and "campaign_id" in streamed_review
-        and (
-            streamed_review.get("campaign_id") != durable_review["campaign_id"]
-            or streamed_review.get("manifest_digest") != durable_review["manifest_digest"]
-        )
-    ):
-        raise SystemExit("streamed campaign review conflicts with durable prepared campaign")
-    _validate_campaign_review(
-        durable_review,
-        expected_profile=profile,
-        expected_limits=limits,
-        expected_composition=composition,
-    )
-    campaign_id = durable_review.get("campaign_id")
-    digest = durable_review.get("manifest_digest")
-    if not isinstance(campaign_id, str) or not isinstance(digest, str):
-        raise SystemExit("prepared campaign review omitted its ID or manifest digest")
-    # The durable review is verified; from here execution must not depend on a
-    # model turn choosing to call assessment_execute. Run15/run16 ended that
-    # turn without the tool call and stranded the prepared campaign silently.
-    # Trigger execution directly against the daemon, then verify durable state.
-    execution_client = await _client()
     try:
+        if (
+            streamed_review is not None
+            and "campaign_id" in streamed_review
+            and (
+                streamed_review.get("campaign_id") != durable_review["campaign_id"]
+                or streamed_review.get("manifest_digest") != durable_review["manifest_digest"]
+            )
+        ):
+            raise SystemExit("streamed campaign review conflicts with durable prepared campaign")
+        _validate_campaign_review(
+            durable_review,
+            expected_profile=profile,
+            expected_limits=limits,
+            expected_composition=composition,
+        )
+        campaign_id = durable_review.get("campaign_id")
+        digest = durable_review.get("manifest_digest")
+        if not isinstance(campaign_id, str) or not isinstance(digest, str):
+            raise SystemExit("prepared campaign review omitted its ID or manifest digest")
+        # The durable review is verified; from here execution must not depend on
+        # a model turn choosing to call assessment_execute. Keep using the client
+        # attached to the preparation daemon so the reviewed session identity is
+        # preserved through the execute RPC.
         try:
-            await execution_client.execute_campaign(campaign_id, digest)
+            await campaign_client.execute_campaign(campaign_id, digest)
         except RuntimeError as error:
             raise SystemExit(f"campaign {campaign_id} execution was rejected: {error}") from None
-        final = _plain(await execution_client.campaign_status(campaign_id))
+        final = _plain(await campaign_client.campaign_status(campaign_id))
         if not isinstance(final, dict) or final.get("status") == "prepared":
             raise SystemExit(
                 f"campaign {campaign_id} is still prepared after the execute call: "
@@ -1177,7 +1181,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
         print(f"Campaign started: {campaign_id}")
         print(f"Monitor: merlin campaign status {campaign_id}")
     finally:
-        await _bounded_stream_teardown(execution_client.close())
+        await _bounded_stream_teardown(campaign_client.close())
 
 
 def _validate_campaign_review(
