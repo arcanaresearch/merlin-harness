@@ -864,6 +864,14 @@ async def _revalidate_handoff_cross_session(
     return True
 
 
+def _handoff_context_is_current(browser: Any, handoff: Any) -> bool:
+    """Reject a handoff whose isolated browser credentials were lost on restart."""
+    checker = getattr(browser, "handoff_context_is_current", None)
+    if not callable(checker):
+        return True
+    return bool(checker(str(handoff.context_id), handoff.created_at))
+
+
 def _persisted_reviewed_api_adapter(
     row: Mapping[str, Any],
 ) -> Mapping[str, object] | None:
@@ -6713,6 +6721,13 @@ def build_backend(
                     target = handoff_target or target
                     target_profile_id = handoff.target_id
                     await assessments.reselect_target(handoff.target_id)
+                if not _handoff_context_is_current(browser, handoff):
+                    raise ValueError(
+                        "the reviewed browser context restarted after this reconnaissance "
+                        "handoff was sealed, so its isolated authentication is no longer live; "
+                        "authenticate again and compile a new browser API handoff before "
+                        "preparing the campaign"
+                    )
                 if str(handoff.owner.session_id) != session_id:
                     if not await _revalidate_handoff_cross_session(browser, session_id, handoff):
                         raise ValueError(
@@ -9777,6 +9792,11 @@ def build_backend(
                 handoff = await browser_store.load_handoff(handoff_id)
                 if handoff is None:
                     raise ValueError("reviewed reconnaissance handoff is unavailable")
+                if not _handoff_context_is_current(browser, handoff):
+                    raise ValueError(
+                        "the reviewed browser context restarted after this reconnaissance "
+                        "handoff was sealed; authenticate again and compile a new handoff"
+                    )
                 if str(handoff.owner.session_id) != session_id:
                     if not await _revalidate_handoff_cross_session(browser, session_id, handoff):
                         raise ValueError(

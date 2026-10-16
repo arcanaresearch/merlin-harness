@@ -10200,6 +10200,8 @@ async def test_browser_service_persists_takeover_cleanup_and_resume() -> None:
         live = await service.for_tool("s1")
         tab = await live.new_tab(origin)
         context_id = live.context_id
+        sealed_at = datetime.now(UTC)
+        assert service.handoff_context_is_current(context_id, sealed_at) is True
         await service.takeover("s1", context_id)
         listed = (await service.list_contexts("s1"))[0]
         assert listed["worker_id"] == "operator"
@@ -10211,6 +10213,8 @@ async def test_browser_service_persists_takeover_cleanup_and_resume() -> None:
 
         restarted = BrowserService(store, targets)
         await restarted.resume("s1", context_id)
+        assert restarted.handoff_context_is_current(context_id, sealed_at) is False
+        assert restarted.handoff_context_is_current(context_id, datetime.now(UTC)) is True
         assert (await restarted.list_tabs("s1", context_id))[0]["tab_ref"] == tab
         cleaned = await restarted.cleanup("s1", context_id)
         assert cleaned["state"] == "cleaned"

@@ -425,6 +425,7 @@ async def test_prepare_records_unresolved_cleanup_advisory_for_every_ownership(
         )
         monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
         backend = build_backend(tmp_path / "workspace-cleanup-holds")
+        _admit_synthetic_live_handoff(backend)
         try:
             session_id = await backend.kernel.start()
             owner = BrowserOwner(
@@ -606,6 +607,7 @@ async def test_two_physical_recon_sessions_cleanup_and_prepare_only_the_selected
         )
         monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
         backend = build_backend(tmp_path / "workspace-two-physical-sessions")
+        _admit_synthetic_live_handoff(backend)
         try:
             console_session_id = await backend.kernel.start()
             target_id = "two-physical-sessions-target"
@@ -1486,6 +1488,7 @@ Preserve attributable evidence and reviewed authority.
             lambda self: {"api_key": "secret", "target_reviewed": "opaque-target-secret"},
         )
         backend = build_backend(workspace)
+        _admit_synthetic_live_handoff(backend)
         try:
             session_id = await backend.kernel.start()
             await backend._assessments.add_target(  # type: ignore[attr-defined]
@@ -1942,6 +1945,7 @@ async def test_preparation_reanchors_path_level_objective_target_to_reviewed_han
             },
         )
         backend = build_backend(tmp_path / "workspace")
+        _admit_synthetic_live_handoff(backend)
         try:
             session_id = await backend.kernel.start()
             await backend._assessments.add_target(  # type: ignore[attr-defined]
@@ -2050,6 +2054,7 @@ async def test_assessment_prepare_canonicalizes_legacy_handoff_before_persistenc
         )
         monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
         backend = build_backend(tmp_path / "workspace")
+        _admit_synthetic_live_handoff(backend)
         try:
             session_id = await backend.kernel.start()
             await backend._assessments.add_target(  # type: ignore[attr-defined]
@@ -4589,12 +4594,33 @@ class _ProbeBrowser:
         return self._session
 
 
+def _admit_synthetic_live_handoff(backend) -> None:
+    """Mark fixture-only handoffs live when no Playwright context is constructed."""
+    backend._browser.handoff_context_is_current = lambda *_args: True  # type: ignore[attr-defined,method-assign]
+
+
 def _probe_handoff(adapter: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(
         adapter=json.dumps(adapter, sort_keys=True, separators=(",", ":")),
         reusable_adapter=None,
         owner=SimpleNamespace(session_id="earlier-session"),
     )
+
+
+def test_handoff_context_current_delegates_to_browser_incarnation() -> None:
+    from merlin_tui.bootstrap import _handoff_context_is_current
+
+    sealed_at = datetime.now(UTC)
+    calls: list[tuple[str, datetime]] = []
+
+    class Browser:
+        def handoff_context_is_current(self, context_id: str, created_at: datetime) -> bool:
+            calls.append((context_id, created_at))
+            return False
+
+    handoff = SimpleNamespace(context_id="context-1", created_at=sealed_at)
+    assert _handoff_context_is_current(Browser(), handoff) is False
+    assert calls == [("context-1", sealed_at)]
 
 
 @pytest.mark.asyncio

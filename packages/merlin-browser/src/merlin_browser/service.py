@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -45,7 +46,24 @@ class BrowserService:
         self._session_context: dict[str, str] = {}
         self._shared_target_context: dict[str, str] = {}
         self._shared_origin_context: dict[frozenset[str], str] = {}
+        self._restarted_context_at: dict[str, datetime] = {}
         self._closed = False
+
+    def handoff_context_is_current(self, context_id: str, sealed_at: datetime) -> bool:
+        """Return whether a handoff still belongs to this live browser incarnation.
+
+        Restarting an isolated Playwright context restores its tabs but intentionally
+        does not persist cookies or other browser credentials.  A handoff sealed before
+        that restart must therefore be re-established after authentication.  Persistent
+        profiles retain their own browser state and remain reusable.
+        """
+        session = self._live.get(context_id)
+        if session is None:
+            return False
+        if session.mode == "persistent":
+            return True
+        restarted_at = self._restarted_context_at.get(context_id)
+        return restarted_at is None or sealed_at >= restarted_at
 
     async def for_tool(self, session_id: str) -> BrowserSession:
         if self._closed:
@@ -288,6 +306,7 @@ class BrowserService:
             bounds = await self._targets(session_id)
             if metadata.mode == "isolated":
                 session = await restart_isolated(metadata, bounds, metadata.owner)
+                self._restarted_context_at[context_id] = datetime.now(UTC)
             elif metadata.mode == "persistent":
                 if self._persistent_profile is None:
                     raise BrowserBoundaryError(
