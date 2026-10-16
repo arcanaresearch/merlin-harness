@@ -897,7 +897,15 @@ async def _submit_campaign(arguments: list[str]) -> None:
         f"{composition_instruction}"
         "\nPass the operator objective text above verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; Merlin "
-        "anchors the reviewed target itself."
+        "anchors the reviewed target itself. Before assessment_prepare, verify that the "
+        "sealed handoff has executable state observations for every explicitly requested "
+        "state dimension (for example tier, character, score, status, and remaining turns). "
+        "If an exact captured response contains those fields but the handoff omits their "
+        "selectors, repair the handoff from that captured evidence first. Include one reviewed "
+        "phase_gate for each explicit setup or normal-play prerequisite whenever the reviewed "
+        "adapter supplies an exact action and authoritative success observation. Do not prepare "
+        "a manifest that silently drops an explicit prerequisite or cannot measure an explicit "
+        "state objective."
     )
     if not approve:
         await _print_stream(preparation_prompt, concise=True)
@@ -936,7 +944,9 @@ async def _submit_campaign(arguments: list[str]) -> None:
                             else "no budget caps"
                         )
                     )
-                    + ". Do not ask for confirmation."
+                    + ". Verify executable state observations and include every evidenced "
+                    "operator-required setup or normal-play phase_gate before preparing. Do not "
+                    "ask for confirmation."
                 )
             preparation = asyncio.create_task(
                 _print_stream(

@@ -938,7 +938,16 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
             "max_tokens, max_seconds, and max_cost_usd unset; do not invent safety caps."
             "\nPass the operator objective text above verbatim as the assessment_prepare "
             "objective: do not reword, paraphrase, or substitute the target line; Merlin "
-            "anchors the reviewed target itself.",
+            "anchors the reviewed target itself. Before assessment_prepare, verify that the "
+            "sealed handoff has executable state observations for every explicitly requested "
+            "state dimension (for example tier, character, score, status, and remaining turns). "
+            "If an exact captured response contains those fields but the handoff omits their "
+            "selectors, repair the handoff from that captured evidence first. Include one reviewed "
+            "phase_gate for each explicit setup or normal-play prerequisite whenever the reviewed "
+            "adapter supplies an exact action and authoritative success observation. Do not "
+            "prepare "
+            "a manifest that silently drops an explicit prerequisite or cannot measure an explicit "
+            "state objective.",
             True,
             "assessment_prepare",
             True,
@@ -1746,7 +1755,15 @@ def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch
         "max_cost_usd=12.5, max_seconds=3600, max_tokens=100000, max_turns=50."
         "\nPass the operator objective text above verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; Merlin "
-        "anchors the reviewed target itself.",
+        "anchors the reviewed target itself. Before assessment_prepare, verify that the "
+        "sealed handoff has executable state observations for every explicitly requested "
+        "state dimension (for example tier, character, score, status, and remaining turns). "
+        "If an exact captured response contains those fields but the handoff omits their "
+        "selectors, repair the handoff from that captured evidence first. Include one reviewed "
+        "phase_gate for each explicit setup or normal-play prerequisite whenever the reviewed "
+        "adapter supplies an exact action and authoritative success observation. Do not prepare "
+        "a manifest that silently drops an explicit prerequisite or cannot measure an explicit "
+        "state objective.",
         False,
     )
 
