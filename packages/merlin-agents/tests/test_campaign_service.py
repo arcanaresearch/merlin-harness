@@ -8558,6 +8558,29 @@ async def preparation(session_id, objective, profile):
     return CampaignPreparation(manifest, context)
 
 
+async def reviewed_adapter_preparation(session_id, objective, profile):
+    source = await preparation(session_id, objective, profile)
+    manifest = CampaignManifest.create(
+        id=source.manifest.id,
+        session_id=source.manifest.session_id,
+        objective=source.manifest.objective,
+        profile=source.manifest.profile,
+        target=source.manifest.target,
+        provider_id=source.manifest.provider_id,
+        provider_model=source.manifest.provider_model,
+        provider_effort=source.manifest.provider_effort,
+        authority_ids=source.manifest.authority_ids,
+        catalogue=(
+            *source.manifest.catalogue,
+            _api_adapter_document([_text_message_step()]),
+        ),
+        skill_documents=source.manifest.skill_documents,
+        tool_ids=source.manifest.tool_ids,
+        budget=source.manifest.budget,
+    )
+    return CampaignPreparation(manifest, source.assignment_context)
+
+
 class ObjectiveAuthorityStore(Store):
     def __init__(self) -> None:
         super().__init__()
@@ -9606,6 +9629,35 @@ async def test_prepare_review_execute_binds_digest_before_workers_start() -> Non
         "status": "executing",
     }
     assert store.events == ["prepared", "admitted", "bound", "started"]
+
+
+async def test_execute_rejects_a_reviewed_adapter_that_became_stale_before_approval() -> None:
+    store = Store()
+    agents = Agents(store)
+
+    async def reject_stale_adapter(_session_id, _adapter):
+        raise ValueError(
+            "the reviewed browser context restarted after this reconnaissance "
+            "handoff was sealed; authenticate again and compile a new handoff"
+        )
+
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        agents,
+        reviewed_adapter_preparation,
+        reviewed_adapter_resolver=reject_stale_adapter,
+    )
+    review = await service.prepare(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    with pytest.raises(ValueError, match="authenticate again and compile a new handoff"):
+        await service.execute(
+            "session-1", str(review["campaign_id"]), str(review["manifest_digest"])
+        )
+
+    assert store.rows["campaign-1"]["status"] == "prepared"
+    assert store.events == ["prepared"]
 
 
 async def test_prepare_review_includes_preflight_estimate() -> None:
@@ -16204,6 +16256,57 @@ async def test_campaign_pause_and_resume_preserve_the_reviewed_wave() -> None:
         ("resumed", "schedule-1"),
     ]
     await service.detach()
+
+
+async def test_campaign_resume_rejects_a_stale_reviewed_browser_adapter() -> None:
+    class ResumeStore:
+        def __init__(self, manifest):
+            self.row = {
+                "id": manifest.manifest.id,
+                "session_id": manifest.manifest.session_id,
+                "manifest": _json_value(asdict(manifest)),
+                "manifest_digest": manifest.manifest.digest,
+                "status": "paused",
+            }
+            self.wave = {"wave": 0, "status": "paused", "schedule_id": "schedule-1"}
+
+        def get(self, _campaign_id):
+            return self.row
+
+        def list_waves(self, _campaign_id):
+            return [dict(self.wave)]
+
+    class ResumeAgents:
+        def __init__(self):
+            self.resume_calls = 0
+
+        async def resume_schedule(self, _schedule_id):
+            self.resume_calls += 1
+            raise AssertionError("stale campaign must be rejected before scheduler resume")
+
+    async def reject_stale_adapter(_session_id, _adapter):
+        raise ValueError(
+            "the reviewed browser context restarted after this reconnaissance "
+            "handoff was sealed; authenticate again and compile a new handoff"
+        )
+
+    prepared = await reviewed_adapter_preparation(
+        "session-1", "Assess", CampaignProfile.RECOMMENDED
+    )
+    store = ResumeStore(prepared)
+    agents = ResumeAgents()
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        agents,
+        reviewed_adapter_preparation,
+        reviewed_adapter_resolver=reject_stale_adapter,
+    )
+
+    with pytest.raises(ValueError, match="authenticate again and compile a new handoff"):
+        await service.resume(prepared.manifest.id)
+
+    assert store.row["status"] == "paused"
+    assert agents.resume_calls == 0
 
 
 async def test_campaign_resume_at_lead_boundary_requires_no_paused_wave() -> None:

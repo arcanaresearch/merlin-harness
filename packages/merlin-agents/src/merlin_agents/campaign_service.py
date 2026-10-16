@@ -4404,6 +4404,9 @@ class CampaignService:
         manifest = _manifest(envelope["manifest"])
         context = _assignment_context(envelope["assignment_context"])
         manifest.validate()
+        reviewed_adapter = _reviewed_adapter_value(manifest)
+        if isinstance(reviewed_adapter, Mapping):
+            await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
         reviewed_digest = _reviewed_preparation_digest(manifest, context)
         persisted_digest = _reviewed_preparation_digest_values(
             manifest.digest, envelope["assignment_context"]
@@ -18603,11 +18606,14 @@ class CampaignService:
             completed = [wave for wave in waves if str(wave["status"]) == "completed"]
             if not completed:
                 raise ValueError("failed campaign has no durable completed wave")
+            envelope = row["manifest"]
+            manifest = _manifest(envelope["manifest"])
+            reviewed_adapter = _reviewed_adapter_value(manifest)
+            if isinstance(reviewed_adapter, Mapping):
+                await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
             latest = completed[-1]
             live = await self._agents.reopen(str(latest["schedule_id"]), resume_execution=False)
             await asyncio.to_thread(retry_incomplete, campaign_id)
-            envelope = row["manifest"]
-            manifest = _manifest(envelope["manifest"])
             context = _assignment_context(envelope["assignment_context"])
             await self._stop_supervisor(campaign_id)
             self._supervisors[campaign_id] = asyncio.create_task(
@@ -18633,6 +18639,11 @@ class CampaignService:
             return {"campaign_id": campaign_id, "status": "executing"}
         if str(row["status"]) != "paused":
             raise ValueError("campaign is unknown, not paused, or not retryable")
+        envelope = row["manifest"]
+        manifest = _manifest(envelope["manifest"])
+        reviewed_adapter = _reviewed_adapter_value(manifest)
+        if isinstance(reviewed_adapter, Mapping):
+            await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         paused = [wave for wave in waves if str(wave["status"]) == "paused"]
         if not paused:
@@ -18719,8 +18730,6 @@ class CampaignService:
                 return {"campaign_id": campaign_id, "status": "executing"}
             live = await self._agents.reopen(str(latest["schedule_id"]), resume_execution=False)
             await asyncio.to_thread(self._store.resume, campaign_id)
-            envelope = row["manifest"]
-            manifest = _manifest(envelope["manifest"])
             context = _assignment_context(envelope["assignment_context"])
             await self._stop_supervisor(campaign_id)
             self._supervisors[campaign_id] = asyncio.create_task(
@@ -18753,8 +18762,6 @@ class CampaignService:
                 str(latest["schedule_id"]), reason="campaign-resume-rollback"
             )
             raise
-        envelope = row["manifest"]
-        manifest = _manifest(envelope["manifest"])
         context = _assignment_context(envelope["assignment_context"])
         await self._stop_supervisor(campaign_id)
         self._supervisors[campaign_id] = asyncio.create_task(
