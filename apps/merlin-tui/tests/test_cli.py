@@ -959,6 +959,52 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
     assert not any(str(prompt).startswith("Approve and execute") for prompt, *_ in calls)
 
 
+@pytest.mark.asyncio
+async def test_campaign_submit_claims_daemon_until_direct_execution(monkeypatch) -> None:
+    objective = "Assess lease-bound target"
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=objective,
+        campaign_id="campaign/lease-bound",
+        composition="opinionated",
+    )
+    acquired = []
+    stream_clients = []
+
+    async def acquire_foreground_lease():
+        acquired.append(True)
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        from merlin_tui.cli import _STREAM_CLIENT_OVERRIDE
+
+        stream_clients.append(_STREAM_CLIENT_OVERRIDE.get())
+        if prompt == "/new":
+            return None
+        return {
+            "campaign_id": "campaign/lease-bound",
+            "manifest_digest": "sha256:reviewed",
+            "objective": objective,
+            "profile": "recommended",
+            "review": {"budget": {}},
+        }
+
+    monkeypatch.setattr(
+        client,
+        "acquire_foreground_lease",
+        acquire_foreground_lease,
+        raising=False,
+    )
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+
+    from merlin_tui.cli import _submit_campaign
+
+    await _submit_campaign(["--approve", objective])
+
+    assert acquired == [True]
+    assert stream_clients == [client, client]
+    assert client.execute_calls == [("campaign/lease-bound", "sha256:reviewed")]
+
+
 def test_campaign_approve_uses_new_durable_campaign_when_stream_omits_review(monkeypatch) -> None:
     calls = []
     client = _install_durable_campaign(

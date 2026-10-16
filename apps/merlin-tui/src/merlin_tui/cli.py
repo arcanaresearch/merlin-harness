@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 from collections.abc import Callable, Coroutine
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
@@ -18,6 +19,9 @@ from rich.text import Text
 
 _STREAM_TEARDOWN_TIMEOUT_SECONDS = 1.0
 _CAMPAIGN_POLL_TIMEOUT_SECONDS = 5.0
+_STREAM_CLIENT_OVERRIDE: ContextVar[object | None] = ContextVar(
+    "merlin_cli_stream_client", default=None
+)
 
 
 async def _bounded_stream_teardown(operation: Coroutine[Any, Any, object]) -> None:
@@ -602,15 +606,26 @@ async def _print_stream(
 ) -> dict[str, object] | None:
     from .local_control import LocalControlClient, ensure_daemon
 
-    owns_daemon = bool(await ensure_daemon())
+    client = _STREAM_CLIENT_OVERRIDE.get()
+    created_client = client is None
+    original_confirmer: object | None = None
+    if client is None:
+        owns_daemon = bool(await ensure_daemon())
 
-    async def confirmer(*_args: object) -> str:
-        return "allow_once"
+        async def confirmer(*_args: object) -> str:
+            return "allow_once"
 
-    client = LocalControlClient(
-        confirmer=confirmer if approve_once else None,
-        owns_daemon=owns_daemon,
-    )
+        client = LocalControlClient(
+            confirmer=confirmer if approve_once else None,
+            owns_daemon=owns_daemon,
+        )
+    elif approve_once:
+        original_confirmer = getattr(client, "_confirmer", None)
+
+        async def confirmer(*_args: object) -> str:
+            return "allow_once"
+
+        client._confirmer = confirmer  # type: ignore[attr-defined]
     campaign_review: dict[str, object] | None = None
     last_message = ""
     display_stream = _coalesced_display_stream(client, prompt)
@@ -651,11 +666,34 @@ async def _print_stream(
     finally:
         await _bounded_stream_teardown(display_stream.aclose())
         close = getattr(client, "close", None)
-        if close is not None:
+        if created_client and close is not None:
             await _bounded_stream_teardown(close())
+        elif approve_once:
+            client._confirmer = original_confirmer  # type: ignore[attr-defined]
     if campaign_review is None and last_message:
         return {"preparation_note": last_message}
     return campaign_review
+
+
+async def _print_stream_on(
+    client: object,
+    prompt: str,
+    *,
+    approve_once: bool = False,
+    stop_after_tool: str | None = None,
+    concise: bool = False,
+) -> dict[str, object] | None:
+    """Run one stream on a command-owned client without transferring ownership."""
+    token = _STREAM_CLIENT_OVERRIDE.set(client)
+    try:
+        return await _print_stream(
+            prompt,
+            approve_once=approve_once,
+            stop_after_tool=stop_after_tool,
+            concise=concise,
+        )
+    finally:
+        _STREAM_CLIENT_OVERRIDE.reset(token)
 
 
 async def _coalesced_display_stream(client: object, prompt: str):
@@ -874,8 +912,15 @@ async def _submit_campaign(arguments: list[str]) -> None:
     # A submitted campaign is a new reviewed workflow. Reusing whatever
     # conversation happened to be active can leak stale permission failures,
     # target assumptions, or an interrupted manifest into its reconnaissance.
-    await _print_stream("/new")
-    campaign_client = await _client() if approve else None
+    campaign_client = None
+    if approve:
+        campaign_client = await _client()
+        acquire_foreground_lease = getattr(campaign_client, "acquire_foreground_lease", None)
+        if callable(acquire_foreground_lease):
+            await acquire_foreground_lease()
+        await _print_stream_on(campaign_client, "/new")
+    else:
+        await _print_stream("/new")
     existing_campaign_ids = (
         {
             str(item.get("id", ""))
@@ -989,7 +1034,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     "ask for confirmation."
                 )
             preparation = asyncio.create_task(
-                _print_stream(
+                _print_stream_on(
+                    campaign_client,
                     preparation_prompt,
                     approve_once=True,
                     stop_after_tool="assessment_prepare",
