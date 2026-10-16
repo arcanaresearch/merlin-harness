@@ -1491,6 +1491,15 @@ class KernelBackend:
                     await recover(resume_execution=False)
             self._agents_recovered = True
 
+    async def has_active_background_work(self) -> bool:
+        """Report whether durable campaign execution still needs this daemon."""
+        if self._campaigns is None:
+            return False
+        return any(
+            str(campaign.get("status", "")) == "executing"
+            for campaign in await self._campaigns.list_all()
+        )
+
     async def campaign_status(self, campaign_id: str) -> Mapping[str, object]:
         if self._campaigns is None:
             raise RuntimeError("campaign support is not configured")

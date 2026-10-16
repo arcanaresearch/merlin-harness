@@ -550,13 +550,37 @@ async def serve(
     foreground_accepts_close = False
     unclaimed_shutdown: asyncio.Task[None] | None = None
 
-    async def stop_if_daemon_remains_unclaimed() -> None:
-        """Retire a newly started daemon when no foreground UI claims it."""
+    async def stop_if_daemon_remains_unclaimed(*, grace_seconds: float) -> None:
+        """Retire an unclaimed daemon after its durable background work settles."""
         nonlocal clean_shutdown
-        await asyncio.sleep(_FOREGROUND_ATTACH_GRACE_SECONDS)
-        if foreground_lease_id is None and not shutdown.is_set():
-            clean_shutdown = True
-            shutdown.set()
+        if grace_seconds:
+            await asyncio.sleep(grace_seconds)
+        activity_reader = getattr(backend, "has_active_background_work", None)
+        while foreground_lease_id is None and not shutdown.is_set():
+            try:
+                active = bool(await activity_reader()) if callable(activity_reader) else False
+            except Exception:
+                # Losing the daemon would pause and invalidate live target contexts.
+                # Preserve possible work and retry the authoritative activity check.
+                active = True
+            if not active:
+                clean_shutdown = True
+                shutdown.set()
+                return
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=_RECOVERY_WATCHDOG_SECONDS)
+            except TimeoutError:
+                pass
+
+    async def arm_idle_shutdown(*, grace_seconds: float) -> None:
+        nonlocal unclaimed_shutdown
+        if unclaimed_shutdown is not None:
+            unclaimed_shutdown.cancel()
+            await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+        unclaimed_shutdown = asyncio.create_task(
+            stop_if_daemon_remains_unclaimed(grace_seconds=grace_seconds),
+            name="local-control:foreground-idle-watchdog",
+        )
 
     async def watch_configuration() -> None:
         from merlin_config import ConfigPaths, load_config
@@ -751,13 +775,7 @@ async def serve(
                 return
             if method == "arm_unclaimed_shutdown":
                 if foreground_lease_id is None:
-                    if unclaimed_shutdown is not None:
-                        unclaimed_shutdown.cancel()
-                        await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
-                    unclaimed_shutdown = asyncio.create_task(
-                        stop_if_daemon_remains_unclaimed(),
-                        name="local-control:foreground-attach-watchdog",
-                    )
+                    await arm_idle_shutdown(grace_seconds=_FOREGROUND_ATTACH_GRACE_SECONDS)
                     value = "armed"
                 else:
                     value = "claimed"
@@ -804,8 +822,7 @@ async def serve(
                         foreground_channel = None
                         foreground_accepts_close = False
                     if not shutdown.is_set():
-                        clean_shutdown = True
-                        shutdown.set()
+                        await arm_idle_shutdown(grace_seconds=0)
                 return
             if method == "stream":
                 request_id = _request_id(request)

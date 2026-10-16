@@ -156,6 +156,33 @@ async def test_close_pauses_only_current_session_campaigns_before_resource_shutd
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (("completed", "paused"), False),
+        (("completed", "executing"), True),
+    ],
+)
+async def test_active_background_work_reads_daemon_wide_campaign_state(
+    statuses: tuple[str, ...], expected: bool
+) -> None:
+    class Campaigns:
+        async def list_all(self):
+            return tuple(
+                {
+                    "campaign_id": f"campaign/{index}",
+                    "session_id": f"session-{index}",
+                    "status": status,
+                }
+                for index, status in enumerate(statuses)
+            )
+
+    backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())  # type: ignore[arg-type]
+
+    assert await backend.has_active_background_work() is expected
+
+
+@pytest.mark.asyncio
 async def test_close_continues_teardown_when_one_campaign_pause_fails() -> None:
     calls: list[str] = []
 
