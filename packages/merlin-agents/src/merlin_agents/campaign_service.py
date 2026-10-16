@@ -19344,6 +19344,17 @@ class AssessmentPrepareTool:
         if error is not None:
             return ToolResult(content=error, is_error=True)
         assert isinstance(adapter, Mapping)
+        observability_error = _validate_objective_state_observability(objective, adapter)
+        if observability_error is not None:
+            return ToolResult(
+                content=observability_error,
+                is_error=True,
+                metadata={
+                    "retryable": True,
+                    "preferred_next_tool": "browser_compile_api_handoff",
+                    "failure_code": "objective_state_observability_missing",
+                },
+            )
         # The objective is scope evidence: anchor it to the reviewed target URL so a
         # model-authored objective can never silently drop the target identity.
         target_anchor = str(adapter.get("url") or adapter.get("endpoint") or "").strip()
@@ -19713,6 +19724,54 @@ def _adapter_target_authority(endpoint: str) -> str:
     )
     port = "" if parsed.port is None or default_port else f":{parsed.port}"
     return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
+
+
+def _validate_objective_state_observability(
+    objective: str, adapter: Mapping[str, Any]
+) -> str | None:
+    """Require reviewed state bindings for typed state-coverage selectors.
+
+    The objective compiler preserves only explicit operator selectors. This check
+    does not infer target semantics: it requires the reconnaissance reviewer to
+    bind each non-method selector to an executable observation with the exact same
+    target-neutral name. Missing bindings return a repairable preparation error;
+    they never suppress, retire, or score an attack candidate.
+    """
+
+    contract = compile_objective_contract(objective)
+    required_dimensions = {
+        selector.dimension
+        for campaign_objective in contract.objectives
+        for selector in campaign_objective.selectors
+        if selector.dimension != "method"
+    }
+    if not required_dimensions:
+        return None
+    raw_capabilities = adapter.get("state_capabilities")
+    try:
+        capabilities = (
+            StateCapabilities.model_validate(raw_capabilities)
+            if isinstance(raw_capabilities, Mapping)
+            else None
+        )
+    except (TypeError, ValueError):
+        capabilities = None
+    observed_names = (
+        {observation.name for observation in capabilities.observations}
+        if capabilities is not None
+        else set()
+    )
+    missing = sorted(required_dimensions - observed_names)
+    if not missing:
+        return None
+    available = ", ".join(sorted(observed_names)) or "none"
+    return (
+        "the sealed objective contract requires executable target-state observations named "
+        f"{', '.join(missing)}, but the reviewed adapter provides: {available}. "
+        "Recompile the same reconnaissance handoff with exact captured baseline/result "
+        "selectors for those objective dimensions, then retry assessment_prepare. The "
+        "campaign was not prepared and no attack candidate was suppressed."
+    )
 
 
 def _validate_reviewed_adapter(

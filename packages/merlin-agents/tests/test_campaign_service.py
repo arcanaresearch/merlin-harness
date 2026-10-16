@@ -12273,6 +12273,113 @@ async def test_prepare_tool_passes_structured_objective_phase_gates() -> None:
     assert captured[0][0].success_predicate.expected_values == ("ready",)
 
 
+async def test_prepare_tool_rejects_state_coverage_without_executable_observations() -> None:
+    prepared = False
+
+    class Service:
+        async def prepare(self, *_args, **_kwargs):
+            nonlocal prepared
+            prepared = True
+            return {"campaign_id": "campaign-1"}
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": (
+                "Test Tier 1 through Tier 4, including every available character in each tier."
+            ),
+            "campaign_profile": "recommended",
+            "adapter": {
+                "interface": "browser",
+                "endpoint": "https://target.test",
+                "authentication": "browser_session",
+                "observed_evidence": ["snapshot call-1"],
+                "browser_steps": [
+                    {
+                        "step_id": "message",
+                        "tool": "browser_fill",
+                        "arguments": {"locator": "textbox"},
+                    }
+                ],
+                "interaction_contract": {
+                    "input_locator": "textbox",
+                    "submit_action": "press Enter",
+                    "success_indicator": "new response",
+                    "probe": {"response_witness": "assistant response"},
+                },
+            },
+        },
+    )
+
+    assert result.is_error is True
+    assert prepared is False
+    assert "observations named character, tier" in result.content
+    assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
+    assert result.metadata["retryable"] is True
+
+
+async def test_prepare_tool_accepts_state_coverage_with_reviewed_observations() -> None:
+    captured: list[Mapping[str, object]] = []
+
+    class Service:
+        async def prepare(self, _session_id, _objective, _profile, adapter, **_kwargs):
+            captured.append(adapter)
+            return {"campaign_id": "campaign-1"}
+
+    selector = {
+        "step_id": "message",
+        "evaluation_root": "response_body",
+        "pointer": "/value",
+    }
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": (
+                "Test Tier 1 through Tier 4, including every available character in each tier."
+            ),
+            "campaign_profile": "recommended",
+            "adapter": {
+                "interface": "browser",
+                "endpoint": "https://target.test",
+                "authentication": "browser_session",
+                "observed_evidence": ["snapshot call-1"],
+                "browser_steps": [
+                    {
+                        "step_id": "message",
+                        "tool": "browser_fill",
+                        "arguments": {"locator": "textbox"},
+                    }
+                ],
+                "interaction_contract": {
+                    "input_locator": "textbox",
+                    "submit_action": "press Enter",
+                    "success_indicator": "new response",
+                    "probe": {"response_witness": "assistant response"},
+                },
+                "state_capabilities": {
+                    "observations": [
+                        {
+                            "name": "tier",
+                            "role": "progress_ordinal",
+                            "baseline_selector": selector,
+                            "result_selector": selector,
+                        },
+                        {
+                            "name": "character",
+                            "role": "custom",
+                            "baseline_selector": selector,
+                            "result_selector": selector,
+                        },
+                    ]
+                },
+            },
+        },
+    )
+
+    assert result.is_error is False
+    assert len(captured) == 1
+
+
 async def test_prepare_tool_passes_reviewed_bounded_regeneration_contract() -> None:
     captured: list[GeneratorExecutionContract] = []
 
