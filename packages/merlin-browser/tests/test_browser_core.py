@@ -4040,7 +4040,8 @@ async def test_api_handoff_keeps_recompile_available_for_invalid_state_selector(
         for item in adapter["evaluation_uncertainties"]
     )
     assert result.metadata["state_observation_repair_available"] is True
-    assert "preferred_next_tool" not in result.metadata
+    assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
+    assert "physical state identity" in result.metadata["state_observation_repair"]
 
 
 @pytest.mark.asyncio

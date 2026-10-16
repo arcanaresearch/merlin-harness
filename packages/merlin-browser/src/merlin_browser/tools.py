@@ -4965,6 +4965,8 @@ class CompiledApiReconHandoffTool:
             if isinstance(cleanup_discovery, Mapping)
             and cleanup_discovery.get("status") == "required_before_target_execution"
             and cleanup_discovery.get("session_ownership") == "owned"
+            else "browser_compile_api_handoff"
+            if state_observation_repair_available
             else "assessment_prepare"
         )
         return ToolResult(
@@ -4977,11 +4979,17 @@ class CompiledApiReconHandoffTool:
                 # executable either way. When this context provably owns a fresh
                 # disposable session, direct reconnaissance to its visible exit so
                 # the superseding handoff can retain the complete lifecycle.
+                "preferred_next_tool": preferred_next_tool,
                 **(
-                    {"preferred_next_tool": preferred_next_tool}
-                    if preferred_next_tool != "assessment_prepare"
-                    or not state_observation_repair_available
-                    else {"state_observation_repair_available": True}
+                    {
+                        "state_observation_repair_available": True,
+                        "state_observation_repair": (
+                            "Recompile this handoff with a captured physical state identity "
+                            "and valid baseline/result selectors before preparing the campaign."
+                        ),
+                    }
+                    if state_observation_repair_available
+                    else {}
                 ),
                 **(
                     {"cleanup_discovery": adapter["cleanup_discovery"]}
