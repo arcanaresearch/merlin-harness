@@ -3825,18 +3825,21 @@ class DurableAgentService:
                     live.scheduler.cancel(node_id, "operator_stopped", next_tick())
                     return None
                 technique_attempt_id: str | None = None
-                technique_id = assignment.semantic_technique_id or (
-                    assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None
-                )
                 sealed_arm = _sealed_arm_contract(assignment.objective)
+                candidate_identity = _sealed_assignment_candidate_identity(
+                    assignment,
+                    sealed_arm=sealed_arm,
+                )
+                technique_id = (
+                    str(candidate_identity["technique_id"])
+                    if candidate_identity is not None
+                    else assignment.semantic_technique_id
+                    or (assignment.technique_ids[0] if len(assignment.technique_ids) == 1 else None)
+                )
                 hypothesis_arm = (
                     technique_id is not None
                     and technique_id.startswith("hypothesis:")
                     and sealed_arm is not None
-                )
-                candidate_identity = _sealed_assignment_candidate_identity(
-                    assignment,
-                    sealed_arm=sealed_arm,
                 )
                 oracle_digest = assignment.oracle_digest or (
                     "sha256:" + hashlib.sha256(assignment.objective.encode()).hexdigest()

@@ -7681,6 +7681,64 @@ async def test_sealed_direct_candidate_binds_attempt_without_oracle_digest() -> 
     assert metadata["strategy_state"]["candidate_identity"] == identity
 
 
+async def test_sealed_variant_binds_executable_technique_id() -> None:
+    executable_technique_id = "technique/one@lang=en@variant=native"
+    identity = {
+        "campaign_id": "campaign/one",
+        "target_id": "target",
+        "target_generation": "generation-1",
+        "scenario_fingerprint": "scenario-1",
+        "technique_id": executable_technique_id,
+        "controller_id": "crescendo",
+        "payload_family": "native",
+        "requested_language": "en",
+        "mutation_id": "mutation-1",
+    }
+
+    class BindingStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bindings = []
+
+        def bind_technique_attempt(self, *args, **metadata):
+            self.bindings.append((args, metadata))
+            return "technique-attempt-1"
+
+    store = BindingStore()
+    assignment = WorkerAssignment(
+        id="campaign/one/crescendo",
+        objective=(
+            "execute\n\nSealed candidate identities: "
+            + json.dumps([identity], sort_keys=True, separators=(",", ":"))
+        ),
+        profile_id="adversarial-explorer",
+        target_profile_id="target",
+        technique_ids=(executable_technique_id,),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("session",),
+        budget=AssignmentBudget(3, 10_000, 30),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        semantic_technique_id="technique/one",
+        strategy_id="crescendo",
+        requested_language="en",
+        requested_transform_id="native",
+    )
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+
+    live = await service.submit("session", (assignment,), max_workers=1, minimum_workers=1)
+    assert live.execution is not None
+    await live.execution
+
+    assert len(store.bindings) == 1
+    _, metadata = store.bindings[0]
+    assert metadata["technique_id"] == executable_technique_id
+    assert metadata["strategy_state"]["candidate_identity"] == identity
+
+
 def test_sealed_assignment_candidate_identity_uses_executable_id() -> None:
     executable_technique_id = "technique/one@lang=en@variant=native"
     identity = {
