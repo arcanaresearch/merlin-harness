@@ -1251,6 +1251,13 @@ class Kernel:
                     if isinstance(next_tool, str):
                         preferred_next_tool_name = next_tool
                         preferred_tool_follow_through_failures = 0
+                    elif (
+                        not result.is_error
+                        and automatic_recon_continuation is not None
+                        and call.name == "browser_compile_api_handoff"
+                    ):
+                        preferred_next_tool_name = "assessment_prepare"
+                        preferred_tool_follow_through_failures = 0
                     if call.name == _RECON_RECALL_TOOL and not result.is_error:
                         recon_recall_completed = True
                     if is_required_owned_cleanup and not duplicate_owned_cleanup:

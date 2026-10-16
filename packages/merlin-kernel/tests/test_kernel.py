@@ -2752,6 +2752,72 @@ async def test_dynamic_preferred_tool_rejects_stale_advertised_tool_in_same_requ
 
 
 @pytest.mark.asyncio
+async def test_dynamic_cleanup_compile_admits_prepare_in_same_request() -> None:
+    class DynamicTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("browser_compile_api_handoff", "assessment_prepare")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare" and self.calls.count(name) == 1:
+                return ToolResult(
+                    content="held",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:dynamic-batch"
+                        )
+                    },
+                )
+            return ToolResult(content="compiled" if name.startswith("browser_") else "prepared")
+
+    class DynamicProvider:
+        def __init__(self):
+            self.requests = 0
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests += 1
+            if self.requests == 1:
+                held = await handler(
+                    ToolCall(call_id="held", name="assessment_prepare", arguments={})
+                )
+                assert held.success is False
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            compiled = await handler(
+                ToolCall(call_id="compile", name="browser_compile_api_handoff", arguments={})
+            )
+            assert compiled.success is True
+            prepared = await handler(
+                ToolCall(call_id="prepare", name="assessment_prepare", arguments={})
+            )
+            assert prepared.success is True
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = DynamicTools()
+    kernel = Kernel(DynamicProvider(), Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("continue cleanup reconnaissance")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+        "assessment_prepare",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cleanup_discovery_continues_recon_without_operator_prompt() -> None:
     class ReconTools(Tools):
         def __init__(self):
