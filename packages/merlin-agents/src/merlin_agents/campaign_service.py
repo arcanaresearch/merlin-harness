@@ -10707,8 +10707,11 @@ class CampaignService:
                 # (all tasks terminal) and operator/worker messages still
                 # trigger an immediate assessment.
                 lead_due = (
-                    bool(pending_messages)
-                    or bool(pending_guidance)
+                    bool(pending_guidance)
+                    or (
+                        bool(pending_messages)
+                        and not (frontier_schedule and incremental_review_enabled)
+                    )
                     or (
                         not draining
                         and not frontier_schedule
@@ -10870,6 +10873,12 @@ class CampaignService:
                 incremental_reviews[task.id] for task in tasks if task.id in incremental_reviews
             )
             if ordered_reviews:
+                pending_loader = getattr(self._store, "list_pending_worker_messages", None)
+                pending_worker_messages = (
+                    tuple(await asyncio.to_thread(pending_loader, campaign_id))
+                    if callable(pending_loader)
+                    else ()
+                )
                 merge_source = next(
                     (task for task in tasks if task.id == ordered_reviews[-1].task_id),
                     tasks[-1],
@@ -10887,6 +10896,23 @@ class CampaignService:
                     for key, value in full_context.items()
                     if key not in {"task", "evidence_delta", "evidence_digest"}
                 }
+                if pending_worker_messages:
+                    merge_context["worker_messages"] = tuple(
+                        {
+                            "id": str(item.get("id") or ""),
+                            "kind": str(item.get("kind") or "discovery"),
+                            "source_task_id": str(item.get("source_task_id") or ""),
+                            "related_task_id": str(item.get("related_task_id") or ""),
+                            "requested_profile_id": str(
+                                item.get("requested_profile_id") or ""
+                            ),
+                            "message": _incremental_review_result(
+                                str(item.get("content") or "")
+                            ),
+                        }
+                        for item in pending_worker_messages
+                        if isinstance(item, Mapping)
+                    )
                 try:
                     latest = await self._merge_incremental_reviews(
                         campaign_id,
@@ -10895,6 +10921,28 @@ class CampaignService:
                         ordered_reviews,
                         merge_context,
                     )
+                    acknowledge = getattr(self._store, "acknowledge_worker_messages", None)
+                    if latest is not None and callable(acknowledge) and pending_worker_messages:
+                        message_ids = tuple(
+                            str(item.get("id") or "")
+                            for item in pending_worker_messages
+                            if isinstance(item, Mapping) and item.get("id")
+                        )
+                        acknowledged = await asyncio.to_thread(acknowledge, message_ids)
+                        await asyncio.to_thread(
+                            self._store.append_lead,
+                            campaign_id,
+                            wave,
+                            {
+                                "kind": "incremental_worker_messages_acknowledged",
+                                "schedule_id": str(live.id),
+                                "message_ids": message_ids,
+                                "acknowledged": acknowledged,
+                                "state": "completed",
+                                "blocking": False,
+                                "advisory": True,
+                            },
+                        )
                 except Exception as error:  # noqa: BLE001 - preserve reviewed task guidance
                     await asyncio.to_thread(
                         self._store.append_lead,

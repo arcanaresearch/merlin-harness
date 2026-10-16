@@ -6451,6 +6451,8 @@ def build_backend(
                             "Candidate priorities must copy IDs from the supplied next-candidate "
                             "shortlist and include score 0..1 plus reason. Plan the next wave by "
                             "ranking useful diverse experiments and preserving exploration. Do not "
+                            "ignore campaign_context.worker_messages: they are attributable typed "
+                            "worker coordination to incorporate alongside the task reviews. "
                             "remove or retire admitted coverage, invent evidence, declare campaign "
                             "completion, or repeat raw task transcripts. Return JSON only."
                         ),

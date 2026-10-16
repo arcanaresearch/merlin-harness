@@ -15314,6 +15314,9 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
     applied_priorities: list[dict[str, float]] = []
 
     class Store:
+        def __init__(self) -> None:
+            self.acknowledged: list[str] = []
+
         def append_lead(self, _campaign_id, _wave, payload):
             events.append(dict(payload))
 
@@ -15356,6 +15359,22 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
         def update_frontier_priorities(self, _campaign_id, priorities):
             applied_priorities.append(dict(priorities))
             return len(priorities)
+
+        def list_pending_worker_messages(self, _campaign_id):
+            if self.acknowledged:
+                return ()
+            return (
+                {
+                    "id": "message-1",
+                    "kind": "blocker",
+                    "source_task_id": "task-1",
+                    "content": "The reviewed adapter rejected delivery with HTTP 409.",
+                },
+            )
+
+        def acknowledge_worker_messages(self, message_ids):
+            self.acknowledged.extend(message_ids)
+            return len(message_ids)
 
     execution = asyncio.get_running_loop().create_future()
 
@@ -15422,6 +15441,24 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
             "candidate-a",
             "candidate-b",
         }
+        assert context["worker_messages"] == (
+            {
+                "id": "message-1",
+                "kind": "blocker",
+                "source_task_id": "task-1",
+                "related_task_id": "",
+                "requested_profile_id": "",
+                "message": {
+                    "text": "The reviewed adapter rejected delivery with HTTP 409.",
+                    "characters": 53,
+                    "digest": (
+                        "sha256:"
+                        "f1f3e2b2bfa873c4caaa0ef10b340c8c82365ae9d574b6cd1e2b4bbf175f34bc"
+                    ),
+                    "truncated": False,
+                },
+            },
+        )
         return LeadAssessment(
             "rank the different family next",
             False,
@@ -15434,10 +15471,19 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
             ),
         )
 
+    lead_calls = 0
+
+    async def lead(*_args):
+        nonlocal lead_calls
+        lead_calls += 1
+        return LeadAssessment("full review should not run", False)
+
+    store = Store()
     service = CampaignService(  # type: ignore[arg-type]
-        Store(),
+        store,
         Agents(),
         preparation,
+        lead,
         task_review_runner=review_task,
         review_merge_runner=merge_reviews,
     )
@@ -15455,6 +15501,8 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
     assert reviewers_started == {"task-1", "task-2"}
     assert result is not None
     assert tuple(review.task_id for review in result.task_reviews) == ("task-1", "task-2")
+    assert lead_calls == 0
+    assert store.acknowledged == ["message-1"]
     assert applied_priorities == [{"candidate-b": 0.95}]
     assert any(event.get("kind") == "incremental_task_review_completed" for event in events)
     assert any(event.get("kind") == "incremental_review_merge_completed" for event in events)
