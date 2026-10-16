@@ -1267,6 +1267,23 @@ def _compile_browser_steps(
     return tuple(compiled), normalized_interaction
 
 
+def _validation_failure(error: ValidationError, *, prefix: str) -> AdapterCompileError:
+    details = error.errors(include_url=False, include_context=False, include_input=False)
+    rendered: list[str] = []
+    for detail in details[:3]:
+        location = ".".join(str(part) for part in detail.get("loc", ())) or "adapter"
+        message = str(detail.get("msg") or detail.get("type") or "validation failed")
+        rendered.append(f"{location}: {message}")
+    failure_path = (
+        ".".join(str(part) for part in details[0].get("loc", ())) if details else "adapter"
+    )
+    return AdapterCompileError(
+        AdapterCompileFailureKind.CONTRACT_VALIDATION,
+        failure_path or "adapter",
+        prefix + (f": {'; '.join(rendered)}" if rendered else ""),
+    )
+
+
 def _typed_compile_errors(
     function: Callable[[Mapping[str, object]], AdapterCompilation],
 ) -> Callable[[Mapping[str, object]], AdapterCompilation]:
@@ -1277,10 +1294,8 @@ def _typed_compile_errors(
         except AdapterCompileError:
             raise
         except ValidationError as error:
-            raise AdapterCompileError(
-                AdapterCompileFailureKind.CONTRACT_VALIDATION,
-                "adapter",
-                "compiled adapter contract validation failed",
+            raise _validation_failure(
+                error, prefix="compiled adapter contract validation failed"
             ) from error
 
     return wrapped
@@ -1474,10 +1489,8 @@ def read_target_adapter(value: object) -> AdapterCompilation:
         if value.get("schema_version") == COMPILED_TARGET_ADAPTER_VERSION:
             return AdapterCompilation(executable=_COMPILED_ADAPTER.validate_python(value))
     except ValidationError as error:
-        raise AdapterCompileError(
-            AdapterCompileFailureKind.CONTRACT_VALIDATION,
-            "adapter",
-            "persisted compiled adapter contract validation failed",
+        raise _validation_failure(
+            error, prefix="persisted compiled adapter contract validation failed"
         ) from error
     return compile_target_adapter(value)
 

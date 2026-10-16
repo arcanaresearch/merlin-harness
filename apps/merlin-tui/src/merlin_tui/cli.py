@@ -777,8 +777,22 @@ async def _output_stream(
 def _prepared_objective_preserves_operator_scope(operator: str, prepared: str) -> bool:
     """Accept verbatim scope or an exact operator clause plus a same-origin target anchor."""
 
-    operator_normalized = " ".join(operator.split())
-    prepared_normalized = " ".join(prepared.split())
+    typography = str.maketrans(
+        {
+            "\N{LEFT SINGLE QUOTATION MARK}": "'",
+            "\N{RIGHT SINGLE QUOTATION MARK}": "'",
+            "\N{SINGLE LOW-9 QUOTATION MARK}": "'",
+            "\N{LEFT DOUBLE QUOTATION MARK}": '"',
+            "\N{RIGHT DOUBLE QUOTATION MARK}": '"',
+            "\N{DOUBLE LOW-9 QUOTATION MARK}": '"',
+        }
+    )
+
+    def normalized(value: str) -> str:
+        return " ".join(value.translate(typography).split())
+
+    operator_normalized = normalized(operator)
+    prepared_normalized = normalized(prepared)
     if operator_normalized in prepared_normalized:
         return True
 
@@ -787,7 +801,7 @@ def _prepared_objective_preserves_operator_scope(operator: str, prepared: str) -
     semantic_lines = [line for line in lines if line not in target_lines]
     if not target_lines or not semantic_lines:
         return False
-    if any(" ".join(line.split()) not in operator_normalized for line in semantic_lines):
+    if any(normalized(line) not in operator_normalized for line in semantic_lines):
         return False
 
     operator_origins = {

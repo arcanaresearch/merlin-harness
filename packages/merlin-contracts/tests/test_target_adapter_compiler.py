@@ -932,6 +932,8 @@ def test_pydantic_reader_failures_are_wrapped_as_typed_compile_errors() -> None:
     with pytest.raises(AdapterCompileError) as caught:
         read_target_adapter(payload)
     assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+    assert caught.value.path == "executable.http_api.steps.0.repeat"
+    assert "Input should be greater than or equal to 1" in str(caught.value)
 
 
 def test_source_aliases_are_class_metadata_not_executable_digest_fields() -> None:

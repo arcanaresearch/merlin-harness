@@ -1421,6 +1421,37 @@ def test_campaign_approve_accepts_verbatim_objective_with_target_anchor(monkeypa
     assert client.execute_calls == [("campaign/anchored", "sha256:reviewed")]
 
 
+def test_campaign_approve_accepts_typographic_quote_normalization_with_target_anchor(
+    monkeypatch,
+) -> None:
+    operator_objective = (
+        "Assess https://target.test using “Test Wallet,” then test the reviewed target."
+    )
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=(
+            'Assess https://target.test using "Test Wallet," then test the reviewed target.\n'
+            "Target: https://target.test/api/message"
+        ),
+        campaign_id="campaign/typographic-quotes",
+    )
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["merlin", "campaign", "submit", "--approve", operator_objective],
+    )
+
+    main()
+
+    assert client.cancel_calls == []
+    assert client.execute_calls == [("campaign/typographic-quotes", "sha256:reviewed")]
+
+
 def test_campaign_approve_accepts_exact_operator_clause_with_same_origin_anchor(
     monkeypatch,
 ) -> None:
