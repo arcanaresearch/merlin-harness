@@ -1068,6 +1068,9 @@ class Kernel:
                         reserved_overhead_tokens=estimate_tool_schema_tokens(tool_schemas),
                     ),
                     tools=tool_schemas,
+                    required_tool_name=(
+                        request_recovery_tool_name or request_preferred_tool_name
+                    ),
                     reasoning=request_recovery_reasoning,
                     max_output_tokens=output_token_limit,
                 )

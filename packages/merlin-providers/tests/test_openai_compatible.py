@@ -1932,6 +1932,40 @@ def test_deepseek_effort_uses_native_thinking_toggle_on_the_streaming_path() -> 
     assert "reasoning_effort" not in observed
 
 
+def test_deepseek_forces_required_tool_with_thinking_disabled() -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            "https://api.deepseek.com/v1",
+            "secret",
+            "deepseek-v4-pro",
+            reasoning_parameter="thinking",
+            reasoning_effort="high",
+        )
+    )
+    request = ChatRequest(
+        model="deepseek-v4-pro",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_compile_api_handoff",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        required_tool_name="browser_compile_api_handoff",
+    )
+
+    payload = provider._payload(request)
+
+    assert payload["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "browser_compile_api_handoff"},
+    }
+    assert payload["thinking"] == {"type": "disabled"}
+
+
 def test_deepseek_disables_thinking_for_incomplete_reasoning_replay() -> None:
     provider = OpenAICompatibleProvider(
         ProviderConfig(

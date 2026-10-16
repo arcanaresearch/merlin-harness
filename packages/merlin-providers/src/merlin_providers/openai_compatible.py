@@ -1164,6 +1164,11 @@ class OpenAICompatibleProvider:
         }
         if request.tools:
             payload["tools"] = [_plain(x) for x in request.tools]
+        if request.required_tool_name is not None:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": request.required_tool_name},
+            }
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if self.config.reasoning_parameter == "thinking":
@@ -1181,6 +1186,8 @@ class OpenAICompatibleProvider:
         reasoning = request.reasoning
         if self.config.reasoning_parameter != "thinking":
             return reasoning, False
+        if request.required_tool_name is not None:
+            return "disabled", reasoning == "enabled"
         requires_replay = self.config.effective_requires_reasoning_content_for_tool_calls
         if reasoning is None and (self.config.reasoning_effort != "default" or requires_replay):
             reasoning = "enabled"

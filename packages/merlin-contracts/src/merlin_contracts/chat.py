@@ -36,10 +36,25 @@ class ChatRequest(ContractModel):
     model: str
     messages: list[ChatMessage]
     tools: list[dict[str, object]] = Field(default_factory=list)
+    required_tool_name: str | None = Field(default=None, min_length=1)
     temperature: float | None = None
     reasoning: Literal["enabled", "disabled"] | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     budget_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_advertised_tool(self) -> "ChatRequest":
+        if self.required_tool_name is None:
+            return self
+        advertised = {
+            str(function["name"])
+            for tool in self.tools
+            if isinstance((function := tool.get("function")), dict)
+            and isinstance(function.get("name"), str)
+        }
+        if self.required_tool_name not in advertised:
+            raise ValueError("required tool must be present in tools")
+        return self
 
 
 class TextDelta(ContractModel):

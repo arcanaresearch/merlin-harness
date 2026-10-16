@@ -114,6 +114,29 @@ def test_chat_request_rejects_unknown_roles() -> None:
         )
 
 
+def test_chat_request_requires_an_advertised_tool() -> None:
+    tool = {
+        "type": "function",
+        "function": {"name": "observe", "parameters": {"type": "object"}},
+    }
+
+    request = ChatRequest(
+        model="test-model",
+        messages=[],
+        tools=[tool],
+        required_tool_name="observe",
+    )
+
+    assert request.required_tool_name == "observe"
+    with pytest.raises(ValidationError, match="required tool must be present"):
+        ChatRequest(
+            model="test-model",
+            messages=[],
+            tools=[tool],
+            required_tool_name="prepare",
+        )
+
+
 def test_model_event_is_discriminated() -> None:
     event = TypeAdapter(ModelEvent).validate_python({"type": "text_delta", "text": "hello"})
 

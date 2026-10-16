@@ -2290,6 +2290,10 @@ async def test_preferred_tool_refusal_is_uncertain_then_cooperates() -> None:
         [tool["function"]["name"] for tool in request.tools] == ["assessment_prepare"]
         for request in provider.requests[1:3]
     )
+    assert all(
+        request.required_tool_name == "assessment_prepare"
+        for request in provider.requests[1:3]
+    )
     assert "Durable tool evidence takes precedence" in provider.requests[2].messages[-1].content
     assert tools.calls == ["observe", "assessment_prepare"]
     uncertainties = [
