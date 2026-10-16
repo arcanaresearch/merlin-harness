@@ -951,7 +951,10 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
             "If an exact captured response contains those fields but the handoff omits their "
             "selectors, repair the handoff from that captured evidence first. Include one reviewed "
             "phase_gate for each explicit setup or normal-play prerequisite whenever the reviewed "
-            "adapter supplies an exact action and authoritative success observation. Do not "
+            "adapter supplies an exact action and authoritative success observation. A normal-play "
+            "gate is exactly one bounded ordinary interaction that establishes the baseline before "
+            "attacks; tier progression, character coverage, repeated play, and reporting remain "
+            "cumulative campaign objectives and must never be folded into that gate. Do not "
             "prepare "
             "a manifest that silently drops an explicit prerequisite or cannot measure an explicit "
             "state objective.",
@@ -1980,7 +1983,10 @@ def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch
         "If an exact captured response contains those fields but the handoff omits their "
         "selectors, repair the handoff from that captured evidence first. Include one reviewed "
         "phase_gate for each explicit setup or normal-play prerequisite whenever the reviewed "
-        "adapter supplies an exact action and authoritative success observation. Do not prepare "
+        "adapter supplies an exact action and authoritative success observation. A normal-play "
+        "gate is exactly one bounded ordinary interaction that establishes the baseline before "
+        "attacks; tier progression, character coverage, repeated play, and reporting remain "
+        "cumulative campaign objectives and must never be folded into that gate. Do not prepare "
         "a manifest that silently drops an explicit prerequisite or cannot measure an explicit "
         "state objective.",
         False,

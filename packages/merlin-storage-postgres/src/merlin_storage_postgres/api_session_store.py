@@ -500,6 +500,27 @@ class CampaignApiSessionRepository(StateScopeRepository):
                        ORDER BY updated_at, campaign_id, session_scope_id""",
                     (target_id, identity, campaign_id, session_scope_id),
                 ).fetchall()
+                # Match adopt_remote_session(): a terminal campaign cannot still
+                # be executing against the physical target. Keep its history and
+                # cleanup disposition, but release the orphaned live-identity
+                # claim so a later reviewed serialized scope can adopt it.
+                self.connection.execute(
+                    """UPDATE merlin_storage.campaign_api_sessions s
+                       SET remote_session_id = NULL, updated_at = now()
+                       FROM merlin_storage.assessment_campaigns c
+                       WHERE s.campaign_id = c.id
+                         AND c.status IN ('completed', 'failed', 'cancelled')
+                         AND s.target_id = %s AND s.remote_session_id = %s
+                         AND s.state <> 'cleaned'""",
+                    (target_id, identity),
+                )
+                self.connection.execute(
+                    """UPDATE merlin_storage.campaign_api_sessions
+                       SET remote_session_id = NULL, updated_at = now()
+                       WHERE target_id = %s AND remote_session_id = %s
+                         AND state = 'ambiguous'""",
+                    (target_id, identity),
+                )
                 row = self.connection.execute(
                     """UPDATE merlin_storage.campaign_api_sessions
                        SET remote_session_id = %s, physical_state_identity = %s,

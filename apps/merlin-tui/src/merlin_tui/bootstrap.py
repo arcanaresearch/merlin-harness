@@ -3868,8 +3868,6 @@ def _compile_objective_phase_gate_audit(
         predicate = proposal.get("success_predicate")
         if not key or not gate_objective:
             raise ValueError("objective prerequisite gate proposals require key and objective")
-        if key in compiled_by_key:
-            raise ValueError(f"objective prerequisite audit returned duplicate gate key {key!r}")
         if not isinstance(actions, list) or not actions:
             raise ValueError("objective prerequisite gate proposals require actions")
         if not isinstance(predicate, Mapping):
@@ -3915,8 +3913,8 @@ def _compile_objective_phase_gate_audit(
         ).lower()
         if not slug:
             slug = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        gate_id = f"phase-gate/{slug}"
-        if gate_id in used_ids:
+        gate_id = final_id_by_key.get(key, f"phase-gate/{slug}")
+        if key not in existing_by_key and gate_id in used_ids:
             gate_id = f"{gate_id}-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:8]}"
         used_ids.add(gate_id)
         final_id_by_key[key] = gate_id
@@ -10446,13 +10444,20 @@ def build_backend(
                             "not require a second browser navigation, wallet connection, or "
                             "signature. Multiple exact source requirements may map to that one "
                             "verification gate. A request to play normally first remains a "
-                            "separate baseline gate using the reviewed interaction step. Return "
+                            "separate baseline gate using exactly one bounded ordinary target "
+                            "interaction. That baseline gate must not advance tiers, cover "
+                            "characters, repeat play, or perform reporting; those remain "
+                            "cumulative campaign objectives. Audit existing proposed gates as "
+                            "critically as missing gates. When an existing gate is over-broad or "
+                            "does not express the exact prerequisite, replace it by emitting a "
+                            "gate_proposals entry whose key is that existing gate id. Return "
                             "one JSON object only with keys requirements, gate_proposals, and "
                             "unresolved_requirements. requirements is an ordered array of "
                             "{source_quote, gate_key}; source_quote "
                             "must be an exact non-empty substring of the operator objective. "
                             "gate_key is either an existing proposed gate id or the key of one "
-                            "new gate_proposals entry. gate_proposals contains only missing gates, "
+                            "gate_proposals entry. gate_proposals contains missing gates and any "
+                            "semantically corrected replacement for an existing gate, "
                             "each as {key, objective, actions, success_predicate}. Each action has "
                             "only {step_id, input_text}; input_text may be omitted for a "
                             "state-read step. Each success_predicate has "
@@ -10511,12 +10516,6 @@ def build_backend(
                     "objective prerequisite audit dropped proposed gate(s): "
                     + ", ".join(sorted(missing_existing))
                 )
-            for gate_id, existing in existing_by_id.items():
-                candidate = audited_by_id[gate_id]
-                if asdict(replace(existing, ordinal=candidate.ordinal)) != asdict(candidate):
-                    raise ValueError(
-                        f"objective prerequisite audit changed proposed gate {gate_id!r}"
-                    )
             return tuple(replace(gate, ordinal=index) for index, gate in enumerate(audited))
 
         campaigns = CampaignService(

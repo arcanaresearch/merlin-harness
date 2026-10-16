@@ -8662,6 +8662,11 @@ async def test_phase_gates_share_the_required_objective_contract_and_progress() 
         contract,
     )
 
+    assert [item.id for item in contract.objectives[:2]] == [
+        "phase-gate/authenticate-test-wallet",
+        "phase-gate/normal-play-baseline",
+    ]
+
     progress = _objective_progress_from_journal(
         manifest,
         (
@@ -9670,6 +9675,29 @@ async def test_prepare_semantic_audit_adds_missing_explicit_phase_gate() -> None
         "phase-gate/authenticate",
         "phase-gate/normal-play",
     ]
+
+
+async def test_prepare_does_not_double_prefix_compiled_phase_gate_objective_ids() -> None:
+    store = Store()
+    agents = Agents(store)
+    gate = replace(_objective_gate("authenticate", 0), id="phase-gate/authenticate")
+
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        agents,
+        preparation,
+    )
+    await service.prepare(
+        "session-1",
+        "Authenticate with Test Wallet.",
+        CampaignProfile.RECOMMENDED,
+        objective_phase_gates=(gate,),
+    )
+
+    persisted = store.rows["campaign-1"]["manifest"]["manifest"]
+    assert persisted["objective_contract"]["objectives"][0]["id"] == (
+        "phase-gate/authenticate"
+    )
 
 
 async def test_execute_rejects_a_reviewed_adapter_that_became_stale_before_approval() -> None:

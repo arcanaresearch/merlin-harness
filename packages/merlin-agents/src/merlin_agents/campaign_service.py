@@ -1150,7 +1150,7 @@ def _objective_progress_from_journal(
 
 
 def _phase_gate_objective_id(gate: ObjectivePhaseGate) -> str:
-    return f"phase-gate/{gate.id}"
+    return gate.id if gate.id.startswith("phase-gate/") else f"phase-gate/{gate.id}"
 
 
 def _objective_contract_with_phase_gates(

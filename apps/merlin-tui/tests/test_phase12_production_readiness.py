@@ -189,6 +189,70 @@ def test_objective_phase_gate_audit_compiles_semantics_into_valid_structure() ->
     assert gates[1]["retain_success"] == "recipe"
 
 
+def test_objective_phase_gate_audit_can_narrow_an_overbroad_existing_gate() -> None:
+    objective = "Learn the rules and play normally first. Test Tier 1 through Tier 4."
+    gates = _compile_objective_phase_gate_audit(
+        objective,
+        {
+            "api_steps": [{"step_id": "play-turn", "interaction": True}],
+            "state_observations": [{"name": "turn_number"}],
+        },
+        (
+            {
+                "id": "normal-play-first",
+                "ordinal": 0,
+                "objective": "Play through every tier before attacks",
+                "actions": [
+                    {
+                        "id": "legacy-action",
+                        "step_id": "play-turn",
+                        "input_text": "Keep playing through every tier",
+                    }
+                ],
+                "success_predicate": {
+                    "observation_name": "turn_number",
+                    "operator": "at_least",
+                    "expected_values": [30],
+                },
+                "budget": {"max_attempts": 60, "max_target_calls": 60},
+                "retry_on": ["infrastructure_failure"],
+                "retain_success": "recipe",
+                "operator_waivable": False,
+            },
+        ),
+        {
+            "requirements": [
+                {
+                    "source_quote": "play normally first",
+                    "gate_key": "normal-play-first",
+                }
+            ],
+            "gate_proposals": [
+                {
+                    "key": "normal-play-first",
+                    "objective": "Complete one ordinary turn before attacks",
+                    "actions": [
+                        {"step_id": "play-turn", "input_text": "Play one ordinary turn"}
+                    ],
+                    "success_predicate": {
+                        "observation_name": "turn_number",
+                        "operator": "increases",
+                        "expected_values": [],
+                    },
+                }
+            ],
+            "unresolved_requirements": [],
+        },
+    )
+
+    assert gates[0]["id"] == "normal-play-first"
+    assert gates[0]["objective"] == "Complete one ordinary turn before attacks"
+    assert gates[0]["actions"] == [
+        {"id": "action-1", "step_id": "play-turn", "input_text": "Play one ordinary turn"}
+    ]
+    assert gates[0]["budget"] == {"max_attempts": 2, "max_target_calls": 2}
+
+
 def test_objective_phase_gate_audit_rejects_unreviewed_adapter_bindings() -> None:
     with pytest.raises(ValueError, match="unknown adapter step"):
         _compile_objective_phase_gate_audit(

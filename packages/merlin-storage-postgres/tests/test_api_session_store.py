@@ -483,6 +483,49 @@ def test_adopt_remote_session_releases_orphaned_claims_of_terminal_campaigns(
             assert orphaned.remote_session_id is None
 
 
+def test_claim_physical_state_releases_orphaned_terminal_campaign_claim(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-physical-orphan")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _prepare_campaign(connection, "campaign/dead")
+            _prepare_campaign(connection, "campaign/live")
+            sessions = CampaignApiSessionRepository(connection)
+            sessions.create(
+                "campaign/dead", "target-1", "sha256:adapter", session_scope_id="scope:old"
+            )
+            sessions.claim_physical_state(
+                "campaign/dead",
+                "physical-state:shared",
+                target_id="target-1",
+                session_scope_id="scope:old",
+            )
+            sessions.create(
+                "campaign/live", "target-1", "sha256:adapter", session_scope_id="scope:new"
+            )
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'cancelled' WHERE id = 'campaign/dead'"""
+            )
+
+            adopted = sessions.claim_physical_state(
+                "campaign/live",
+                "physical-state:shared",
+                target_id="target-1",
+                session_scope_id="scope:new",
+            )
+
+            assert adopted.previously_observed
+            assert adopted.prior_session_scope_ids == ("scope:old",)
+            assert adopted.session.remote_session_id == "physical-state:shared"
+            orphaned = sessions.load(
+                "campaign/dead", target_id="target-1", session_scope_id="scope:old"
+            )
+            assert orphaned is not None
+            assert orphaned.remote_session_id is None
+
+
 def test_scope_cleanup_and_release_never_touch_sibling_assignment(tmp_path: Path) -> None:
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres-scope-cleanup")) as database:
         with database.connect() as connection:
