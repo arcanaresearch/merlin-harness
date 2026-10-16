@@ -3775,6 +3775,195 @@ def _salvage_truncated_lead_decision(
     return recovered
 
 
+def _compile_objective_phase_gate_audit(
+    objective: str,
+    reviewed_adapter: Mapping[str, Any],
+    proposed_gates: Sequence[Mapping[str, object]],
+    audit: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    """Compile Lead-owned prerequisite decisions into the sealed gate schema.
+
+    The Lead decides the requirement, adapter action, and success meaning. This
+    compiler supplies only structural fields and validates that every selected
+    action and observation came from the reviewed adapter.
+    """
+
+    requirements = audit.get("requirements")
+    proposals = audit.get("gate_proposals")
+    unresolved = audit.get("unresolved_requirements")
+    if not isinstance(requirements, list) or not isinstance(proposals, list):
+        raise ValueError(
+            "objective prerequisite audit omitted requirements or gate_proposals"
+        )
+    if not isinstance(unresolved, list):
+        raise ValueError("objective prerequisite audit omitted unresolved_requirements")
+    if unresolved:
+        reasons: list[str] = []
+        for item in unresolved:
+            if not isinstance(item, Mapping):
+                raise ValueError("objective prerequisite audit returned invalid blockers")
+            quote = str(item.get("source_quote") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if not quote or quote not in objective or not reason:
+                raise ValueError("objective prerequisite blocker lacks exact operator provenance")
+            reasons.append(f"{quote!r}: {reason}")
+        raise ValueError(
+            "reviewed adapter cannot express explicit objective prerequisite(s): "
+            + "; ".join(reasons)
+        )
+
+    step_ids = {
+        str(step.get("step_id") or "").strip()
+        for collection_name in ("api_steps", "browser_steps")
+        for step in (
+            reviewed_adapter.get(collection_name)
+            if isinstance(reviewed_adapter.get(collection_name), list)
+            else ()
+        )
+        if isinstance(step, Mapping) and str(step.get("step_id") or "").strip()
+    }
+
+    observation_names: set[str] = set()
+
+    def collect_observation_names(value: object) -> None:
+        if isinstance(value, Mapping):
+            for field in ("name", "observation_name"):
+                name = str(value.get(field) or "").strip()
+                if name:
+                    observation_names.add(name)
+            for child in value.values():
+                collect_observation_names(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect_observation_names(child)
+
+    collect_observation_names(reviewed_adapter.get("state_observations"))
+    collect_observation_names(reviewed_adapter.get("state_capabilities"))
+
+    existing_by_key: dict[str, dict[str, object]] = {}
+    for gate in proposed_gates:
+        gate_id = str(gate.get("id") or "").strip()
+        if not gate_id or gate_id in existing_by_key:
+            raise ValueError("proposed objective phase gates require unique ids")
+        existing_by_key[gate_id] = dict(gate)
+
+    operators = {
+        "equals",
+        "one_of",
+        "at_least",
+        "at_most",
+        "increases",
+        "decreases",
+        "terminal_success",
+    }
+    compiled_by_key = dict(existing_by_key)
+    final_id_by_key = {key: key for key in existing_by_key}
+    used_ids = set(existing_by_key)
+    for index, proposal in enumerate(proposals):
+        if not isinstance(proposal, Mapping):
+            raise ValueError("objective prerequisite audit returned an invalid gate proposal")
+        key = str(proposal.get("key") or "").strip()
+        gate_objective = str(proposal.get("objective") or "").strip()
+        actions = proposal.get("actions")
+        predicate = proposal.get("success_predicate")
+        if not key or not gate_objective:
+            raise ValueError("objective prerequisite gate proposals require key and objective")
+        if key in compiled_by_key:
+            raise ValueError(f"objective prerequisite audit returned duplicate gate key {key!r}")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("objective prerequisite gate proposals require actions")
+        if not isinstance(predicate, Mapping):
+            raise ValueError("objective prerequisite gate proposals require a success predicate")
+
+        compiled_actions: list[dict[str, str]] = []
+        for action_index, action in enumerate(actions):
+            if not isinstance(action, Mapping):
+                raise ValueError("objective prerequisite audit returned an invalid action")
+            step_id = str(action.get("step_id") or "").strip()
+            if step_id not in step_ids:
+                raise ValueError(
+                    f"objective prerequisite audit selected unknown adapter step {step_id!r}"
+                )
+            input_text = str(action.get("input_text") or gate_objective).strip()
+            compiled_actions.append(
+                {
+                    "id": f"action-{action_index + 1}",
+                    "step_id": step_id,
+                    "input_text": input_text,
+                }
+            )
+
+        observation_name = str(predicate.get("observation_name") or "").strip()
+        operator = str(predicate.get("operator") or "").strip()
+        if observation_name not in observation_names:
+            raise ValueError(
+                "objective prerequisite audit selected unknown authoritative observation "
+                f"{observation_name!r}"
+            )
+        if operator not in operators:
+            raise ValueError(
+                f"objective prerequisite audit selected unknown predicate operator {operator!r}"
+            )
+        expected_values = predicate.get("expected_values", [])
+        if not isinstance(expected_values, list):
+            raise ValueError("objective prerequisite expected_values must be an array")
+
+        slug = "-".join(
+            part
+            for part in "".join(char if char.isalnum() else " " for char in key).split()
+            if part
+        ).lower()
+        if not slug:
+            slug = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        gate_id = f"phase-gate/{slug}"
+        if gate_id in used_ids:
+            gate_id = f"{gate_id}-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:8]}"
+        used_ids.add(gate_id)
+        final_id_by_key[key] = gate_id
+        compiled_by_key[key] = {
+            "id": gate_id,
+            "ordinal": index,
+            "objective": gate_objective,
+            "actions": compiled_actions,
+            "success_predicate": {
+                "observation_name": observation_name,
+                "operator": operator,
+                "expected_values": expected_values,
+            },
+            "budget": {
+                "max_attempts": 2,
+                "max_target_calls": max(2, len(compiled_actions) * 2),
+            },
+            "retry_on": ["infrastructure_failure", "ambiguous_transition"],
+            "retain_success": "recipe",
+            "operator_waivable": False,
+        }
+
+    ordered_keys: list[str] = []
+    mapped_ids: set[str] = set()
+    for item in requirements:
+        if not isinstance(item, Mapping):
+            raise ValueError("objective prerequisite audit returned invalid requirements")
+        quote = str(item.get("source_quote") or "").strip()
+        key = str(item.get("gate_key") or "").strip()
+        if not quote or quote not in objective:
+            raise ValueError("objective prerequisite requirement lacks exact operator provenance")
+        if key not in compiled_by_key:
+            raise ValueError("objective prerequisite requirement references an unknown gate key")
+        final_id = final_id_by_key[key]
+        mapped_ids.add(final_id)
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    all_ids = {final_id_by_key[key] for key in compiled_by_key}
+    if mapped_ids != all_ids:
+        raise ValueError("objective prerequisite audit did not map every gate to operator text")
+    return tuple(
+        {**compiled_by_key[key], "ordinal": ordinal}
+        for ordinal, key in enumerate(ordered_keys)
+    )
+
+
 def build_backend(
     workspace_root: Path | str = ".",
     *,
@@ -10258,26 +10447,26 @@ def build_backend(
                             "signature. Multiple exact source requirements may map to that one "
                             "verification gate. A request to play normally first remains a "
                             "separate baseline gate using the reviewed interaction step. Return "
-                            "one JSON object only with keys "
-                            "requirements, phase_gates, and unresolved_requirements. "
-                            "requirements is an array of {source_quote, gate_id}; source_quote "
+                            "one JSON object only with keys requirements, gate_proposals, and "
+                            "unresolved_requirements. requirements is an ordered array of "
+                            "{source_quote, gate_key}; source_quote "
                             "must be an exact non-empty substring of the operator objective. "
-                            "phase_gates is the complete ordered gate array using the supplied "
-                            "gate schema. Preserve every supplied gate without changing its "
-                            "content, though you may reorder ordinals to match the objective. Add "
-                            "a missing gate only from reviewed adapter step IDs and authoritative "
-                            "state observations. unresolved_requirements is an array of "
+                            "gate_key is either an existing proposed gate id or the key of one "
+                            "new gate_proposals entry. gate_proposals contains only missing gates, "
+                            "each as {key, objective, actions, success_predicate}. Each action has "
+                            "only {step_id, input_text}; input_text may be omitted for a "
+                            "state-read step. Each success_predicate has "
+                            "{observation_name, operator, "
+                            "expected_values}. Select only reviewed adapter step IDs and "
+                            "authoritative state observation names. Do not emit ids, ordinals, "
+                            "budgets, retry policies, retention, or existing gates; the compiler "
+                            "owns those structural fields. unresolved_requirements is an array of "
                             "{source_quote, reason} only when a true pre-attack prerequisite has "
                             "neither reviewed evidence nor an adapter action that can verify or "
                             "perform it. Never put cumulative coverage or reporting work in that "
-                            "array. Never silently omit a true prerequisite. Gate "
+                            "array. Never silently omit a true prerequisite. Predicate "
                             "operators are equals, one_of, at_least, at_most, increases, "
-                            "decreases, or terminal_success; retention is recipe or checkpoint; "
-                            "retry reasons are infrastructure_failure, ambiguous_transition, or "
-                            "unchanged. Each gate requires id, ordinal, objective, non-empty "
-                            "actions [{id, step_id, input_text}], success_predicate "
-                            "{observation_name, operator, expected_values when required}, and "
-                            "budget {max_attempts, max_target_calls, optional max_seconds}."
+                            "decreases, or terminal_success."
                         ),
                     ),
                     ChatMessage(
@@ -10299,29 +10488,12 @@ def build_backend(
             )
             if not isinstance(value, Mapping):
                 raise ValueError("objective prerequisite audit returned no object")
-            requirements = value.get("requirements")
-            gate_values = value.get("phase_gates")
-            unresolved = value.get("unresolved_requirements")
-            if not isinstance(requirements, list) or not isinstance(gate_values, list):
-                raise ValueError("objective prerequisite audit omitted requirements or phase_gates")
-            if not isinstance(unresolved, list):
-                raise ValueError("objective prerequisite audit omitted unresolved_requirements")
-            if unresolved:
-                reasons: list[str] = []
-                for item in unresolved:
-                    if not isinstance(item, Mapping):
-                        raise ValueError("objective prerequisite audit returned invalid blockers")
-                    quote = str(item.get("source_quote") or "").strip()
-                    reason = str(item.get("reason") or "").strip()
-                    if not quote or quote not in objective or not reason:
-                        raise ValueError(
-                            "objective prerequisite blocker lacks exact operator provenance"
-                        )
-                    reasons.append(f"{quote!r}: {reason}")
-                raise ValueError(
-                    "reviewed adapter cannot express explicit objective prerequisite(s): "
-                    + "; ".join(reasons)
-                )
+            gate_values = _compile_objective_phase_gate_audit(
+                objective,
+                adapter_projection,
+                existing_payload,
+                value,
+            )
             try:
                 audited = tuple(objective_phase_gate_from_mapping(item) for item in gate_values)
             except (KeyError, TypeError, ValueError) as error:
@@ -10331,25 +10503,6 @@ def build_backend(
             gate_ids = [gate.id for gate in audited]
             if len(gate_ids) != len(set(gate_ids)):
                 raise ValueError("objective prerequisite audit returned duplicate gate ids")
-            requirement_gate_ids: list[str] = []
-            for item in requirements:
-                if not isinstance(item, Mapping):
-                    raise ValueError("objective prerequisite audit returned invalid requirements")
-                quote = str(item.get("source_quote") or "").strip()
-                gate_id = str(item.get("gate_id") or "").strip()
-                if not quote or quote not in objective:
-                    raise ValueError(
-                        "objective prerequisite audit requirement lacks exact operator provenance"
-                    )
-                if gate_id not in gate_ids:
-                    raise ValueError(
-                        "objective prerequisite audit requirement references an unknown gate"
-                    )
-                requirement_gate_ids.append(gate_id)
-            if set(requirement_gate_ids) != set(gate_ids):
-                raise ValueError(
-                    "objective prerequisite audit did not map every gate to operator text"
-                )
             existing_by_id = {gate.id: gate for gate in proposed_gates}
             audited_by_id = {gate.id: gate for gate in audited}
             missing_existing = set(existing_by_id) - set(audited_by_id)

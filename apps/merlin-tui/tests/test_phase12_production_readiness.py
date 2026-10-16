@@ -89,6 +89,7 @@ from merlin_tui.bootstrap import (
     CleanupDiscoveryRequiredError,
     _adapter_transport_effect_identity,
     _compile_current_reviewed_adapter_state,
+    _compile_objective_phase_gate_audit,
     _has_durable_handoff,
     _hydrate_handoff_adapter,
     _persisted_reviewed_api_adapter,
@@ -111,11 +112,111 @@ class _NoPrerequisiteAuditProvider:
     async def stream(self, request):
         yield TextDelta(
             text=(
-                '{"requirements":[],"phase_gates":[],'
+                '{"requirements":[],"gate_proposals":[],'
                 '"unresolved_requirements":[]}'
             )
         )
         yield ModelCompleted()
+
+
+def test_objective_phase_gate_audit_compiles_semantics_into_valid_structure() -> None:
+    objective = "Authenticate with Test Wallet. Learn the rules and play normally first."
+    gates = _compile_objective_phase_gate_audit(
+        objective,
+        {
+            "api_steps": [
+                {"step_id": "read-state", "interaction": False},
+                {"step_id": "play-turn", "interaction": True},
+            ],
+            "state_observations": [
+                {"name": "authenticated"},
+                {"name": "turns_completed"},
+            ],
+        },
+        (),
+        {
+            "requirements": [
+                {
+                    "source_quote": "Authenticate with Test Wallet",
+                    "gate_key": "authenticated-session",
+                },
+                {
+                    "source_quote": "play normally first",
+                    "gate_key": "normal-play-baseline",
+                },
+            ],
+            "gate_proposals": [
+                {
+                    "key": "authenticated-session",
+                    "objective": "Verify the reviewed Test Wallet session",
+                    "actions": [{"step_id": "read-state"}],
+                    "success_predicate": {
+                        "observation_name": "authenticated",
+                        "operator": "equals",
+                        "expected_values": [True],
+                    },
+                },
+                {
+                    "key": "normal-play-baseline",
+                    "objective": "Complete one normal-play turn",
+                    "actions": [
+                        {"step_id": "play-turn", "input_text": "Play a normal turn"}
+                    ],
+                    "success_predicate": {
+                        "observation_name": "turns_completed",
+                        "operator": "increases",
+                        "expected_values": [],
+                    },
+                },
+            ],
+            "unresolved_requirements": [],
+        },
+    )
+
+    assert [gate["id"] for gate in gates] == [
+        "phase-gate/authenticated-session",
+        "phase-gate/normal-play-baseline",
+    ]
+    assert [gate["ordinal"] for gate in gates] == [0, 1]
+    assert gates[0]["actions"] == [
+        {
+            "id": "action-1",
+            "step_id": "read-state",
+            "input_text": "Verify the reviewed Test Wallet session",
+        }
+    ]
+    assert gates[1]["budget"] == {"max_attempts": 2, "max_target_calls": 2}
+    assert gates[1]["retain_success"] == "recipe"
+
+
+def test_objective_phase_gate_audit_rejects_unreviewed_adapter_bindings() -> None:
+    with pytest.raises(ValueError, match="unknown adapter step"):
+        _compile_objective_phase_gate_audit(
+            "Play normally first.",
+            {
+                "api_steps": [{"step_id": "play-turn"}],
+                "state_observations": [{"name": "turns_completed"}],
+            },
+            (),
+            {
+                "requirements": [
+                    {"source_quote": "Play normally first", "gate_key": "baseline"}
+                ],
+                "gate_proposals": [
+                    {
+                        "key": "baseline",
+                        "objective": "Complete a normal turn",
+                        "actions": [{"step_id": "invented-step"}],
+                        "success_predicate": {
+                            "observation_name": "turns_completed",
+                            "operator": "increases",
+                            "expected_values": [],
+                        },
+                    }
+                ],
+                "unresolved_requirements": [],
+            },
+        )
 
 
 def test_current_reviewed_adapter_state_compiles_genuinely_unsealed_legacy_input() -> None:
