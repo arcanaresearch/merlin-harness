@@ -282,6 +282,25 @@ def test_compiler_preserves_actual_campaign_attempt_clause() -> None:
     )
 
 
+def test_compiler_preserves_explicit_method_list_rewritten_with_test() -> None:
+    source = (
+        "Test prompt injection, role spoofing, judge manipulation, and game-logic exploits "
+        "that attempt to force wins, bypass character progression, or bypass session limits."
+    )
+
+    contract = compile_objective_contract(source)
+
+    assert len(contract.objectives) == 1
+    selector = contract.objectives[0].selectors[0]
+    assert selector.dimension == "method"
+    assert selector.values == (
+        "prompt injection",
+        "role spoofing",
+        "judge manipulation",
+        "game-logic exploits",
+    )
+
+
 def test_compiler_preserves_attempted_method_list() -> None:
     source = (
         "Attempted prompt injection, role spoofing, judge manipulation, and game-logic exploits."

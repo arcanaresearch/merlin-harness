@@ -285,9 +285,10 @@ _ALL_AVAILABLE_PATTERN = re.compile(
 )
 _EXPLICIT_LIST_PATTERN = re.compile(
     r"(?:^|(?<=[.!?\n]))[ \t]*(?:then[ \t]+)?"
-    r"(?:try|attempt|attempted|exercise|assess)[ \t]+"
+    r"(?:try|test|attempt|attempted|exercise|assess)[ \t]+"
     r"(?P<items>[^.!?\n]{1,300}?)"
-    r"(?=[ \t]+to[ \t]+[A-Za-z]|[.!?\n]|$)",
+    r"(?=[ \t]+(?:to|that[ \t]+(?:attempts?|tries|seeks?)[ \t]+to)"
+    r"[ \t]+[A-Za-z]|[.!?\n]|$)",
     re.IGNORECASE,
 )
 _EXPLICIT_LIST_ITEM = re.compile(
