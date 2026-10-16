@@ -100,6 +100,7 @@ from merlin_agents.campaign_service import (
     _mark_reproduction_uncertain,
     _merge_typed_worker_hypotheses,
     _normalize_adapter_evaluation_metadata,
+    _objective_contract_with_phase_gates,
     _objective_phase_gate_result,
     _objective_progress_from_journal,
     _outcomes_are_defensive_only,
@@ -8611,6 +8612,68 @@ async def _objective_authority_service(objective: str = "Cover Tier 1 through Ti
     store.rows[manifest.id]["status"] = "executing"
     service = CampaignService(store, object(), preparation)  # type: ignore[arg-type]
     return service, store, manifest
+
+
+async def test_phase_gates_share_the_required_objective_contract_and_progress() -> None:
+    objective = "Authenticate with Test Wallet, then play normally before Tier 1 through Tier 4."
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+    auth = replace(
+        _objective_gate(),
+        id="authenticate-test-wallet",
+        ordinal=0,
+        objective="Authenticate with Test Wallet",
+    )
+    baseline = replace(
+        _objective_gate(),
+        id="normal-play-baseline",
+        ordinal=1,
+        objective="Establish normal-play baseline",
+    )
+    gates = (auth, baseline)
+    contract = _objective_contract_with_phase_gates(
+        compile_objective_contract(objective),
+        gates,
+    )
+    manifest = manifest_with_objective_contract(
+        manifest_with_objective_phase_gates(prepared.manifest, gates),
+        contract,
+    )
+
+    progress = _objective_progress_from_journal(
+        manifest,
+        (
+            {
+                "wave": 1,
+                "payload": {
+                    "kind": "objective_phase_gate_settled",
+                    "gate_id": auth.id,
+                    "status": "succeeded",
+                    "evidence_refs": ["target-call:auth"],
+                },
+            },
+            {
+                "wave": 2,
+                "payload": {
+                    "kind": "objective_phase_gate_settled",
+                    "gate_id": baseline.id,
+                    "status": "blocked",
+                    "blocker": "normal-play predicate was not observed",
+                },
+            },
+        ),
+    )
+
+    assert [item.objective.description for item in progress[:3]] == [
+        "Authenticate with Test Wallet",
+        "Establish normal-play baseline",
+        "Cover every tier from 1 through 4",
+    ]
+    assert [item.status.value for item in progress[:3]] == [
+        "satisfied_by_campaign",
+        "blocked",
+        "unmet",
+    ]
+    assert progress[1].status_reason == "normal-play predicate was not observed"
 
 
 async def test_sealed_objectives_project_durable_progress_and_block_false_completion() -> None:

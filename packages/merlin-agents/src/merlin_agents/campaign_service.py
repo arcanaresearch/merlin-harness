@@ -24,6 +24,7 @@ from merlin_contracts import (
     AgentTask,
     CampaignEndReason,
     CampaignLifecycle,
+    CampaignObjective,
     CampaignObjectiveContract,
     CampaignObservation,
     CampaignOutcomeProjection,
@@ -32,7 +33,10 @@ from merlin_contracts import (
     EvidenceWitness,
     InfrastructureFailureCategory,
     ModelJsonError,
+    ObjectiveKind,
     ObjectiveProgress,
+    ObjectiveProvenance,
+    ObjectiveProvenanceKind,
     ObjectiveSelectorBinding,
     ObjectiveSelectorBindingSource,
     ObjectiveSelectorBindingSourceKind,
@@ -40,6 +44,7 @@ from merlin_contracts import (
     ObjectiveSelectorQuantifier,
     ObjectiveSelectorResolution,
     ObjectiveStatus,
+    ObjectiveTemporalSemantics,
     ProviderFailureKind,
     StateEnumerationReceipt,
     SwarmRequest,
@@ -791,6 +796,64 @@ def _objective_progress_from_journal(
             ),
         )
 
+    # Objective phase gates are reviewed, ordered campaign requirements. Project
+    # their durable journal state into the same checklist as coverage objectives
+    # so operators do not need to reconcile two contracts.
+    gate_by_objective_id = {
+        _phase_gate_objective_id(gate): gate for gate in manifest.objective_phase_gates
+    }
+    for objective_id, gate in gate_by_objective_id.items():
+        objective = objectives.get(objective_id)
+        if objective is None or objective_id in latest:
+            continue
+        gate_event: Mapping[str, object] | None = None
+        event_wave = 0
+        for entry in lead:
+            payload = entry.get("payload") if isinstance(entry, Mapping) else None
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("gate_id") == gate.id
+                and payload.get("kind")
+                in {
+                    "objective_phase_gate_started",
+                    "objective_phase_gate_settled",
+                    "objective_phase_gate_waived",
+                }
+            ):
+                gate_event = payload
+                event_wave = int(entry.get("wave") or 0)
+        if gate_event is None:
+            continue
+        gate_status = str(gate_event.get("status") or "pending")
+        status = {
+            "succeeded": ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+            "waived": ObjectiveStatus.WAIVED,
+            "blocked": ObjectiveStatus.BLOCKED,
+            "pending": ObjectiveStatus.ACTIVE,
+            "retryable": ObjectiveStatus.ACTIVE,
+        }.get(gate_status, ObjectiveStatus.INDETERMINATE)
+        raw_refs = gate_event.get("evidence_refs")
+        evidence_refs = tuple(
+            str(item)
+            for item in raw_refs or ()
+            if isinstance(item, str) and item.strip()
+        )
+        if status in {
+            ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+            ObjectiveStatus.BLOCKED,
+            ObjectiveStatus.WAIVED,
+        } and not evidence_refs:
+            evidence_refs = (
+                f"lead:{manifest.id}:wave:{event_wave}:objective-phase-gate:{gate.id}",
+            )
+        reason = gate_event.get("blocker") or gate_event.get("reason")
+        latest[objective_id] = ObjectiveProgress(
+            objective=objective,
+            status=status,
+            evidence_refs=evidence_refs,
+            status_reason=str(reason) if reason is not None else None,
+        )
+
     def normalized_dimension(value: object) -> str:
         normalized = str(value or "").strip().casefold().replace("-", "_")
         if normalized.endswith("ies") and len(normalized) > 3:
@@ -1083,6 +1146,42 @@ def _objective_progress_from_journal(
     return tuple(
         latest.get(objective.id, ObjectiveProgress(objective=objective))
         for objective in contract.objectives
+    )
+
+
+def _phase_gate_objective_id(gate: ObjectivePhaseGate) -> str:
+    return f"phase-gate/{gate.id}"
+
+
+def _objective_contract_with_phase_gates(
+    contract: CampaignObjectiveContract,
+    gates: tuple[ObjectivePhaseGate, ...],
+) -> CampaignObjectiveContract:
+    """Expose reviewed prerequisite gates in the durable objective checklist."""
+
+    if not gates:
+        return contract
+    gate_objectives: list[CampaignObjective] = []
+    previous_id: str | None = None
+    for gate in gates:
+        objective_id = _phase_gate_objective_id(gate)
+        gate_objectives.append(
+            CampaignObjective(
+                id=objective_id,
+                description=gate.objective,
+                kind=ObjectiveKind.TRANSITION,
+                temporal_semantics=ObjectiveTemporalSemantics.TRANSITION,
+                provenance=ObjectiveProvenance(
+                    kind=ObjectiveProvenanceKind.MODEL_PROPOSAL,
+                    source_ref=f"reviewed:objective-phase-gate:{gate.id}",
+                ),
+                required=True,
+                depends_on=(() if previous_id is None else (previous_id,)),
+            )
+        )
+        previous_id = objective_id
+    return contract.model_copy(
+        update={"objectives": (*gate_objectives, *contract.objectives)}
     )
 
 
@@ -3638,10 +3737,13 @@ class CampaignService:
             prepared = await self._preparation_factory(
                 session_id, objective, profile, adapter, **composition_kwargs
             )
-        # Operator requirements are authority, not model guidance. Compile the
-        # common target-neutral selectors deterministically and seal both the
-        # exact source text and typed clauses into the reviewed manifest.
-        objective_contract = compile_objective_contract(prepared.manifest.objective)
+        # Seal the exact operator text and its target-neutral selectors. Reviewed
+        # prerequisite gates are also required objectives; expose them through the
+        # same contract so approval, status, completion, and reports share one list.
+        objective_contract = _objective_contract_with_phase_gates(
+            compile_objective_contract(prepared.manifest.objective),
+            objective_phase_gates,
+        )
         if objective_phase_gates:
             prepared = replace(
                 prepared,
@@ -18907,10 +19009,14 @@ class AssessmentPrepareTool:
                     "phase_gates": {
                         "type": "array",
                         "description": (
-                            "Optional operator-reviewed ordered prerequisites. Each gate must "
-                            "contain an exact target action recipe and a typed predicate over a "
-                            "reviewed target state observation. Never derive gates from objective "
-                            "prose."
+                            "Operator-reviewed ordered prerequisites that must finish before "
+                            "attack execution. When the operator explicitly requires a setup or "
+                            "baseline action (for example named authentication or normal play "
+                            "first), include one gate per requirement whenever the reviewed "
+                            "adapter supplies an exact action step and target-state predicate. "
+                            "Use only explicit operator requirements and derive step IDs and "
+                            "predicates from reviewed adapter evidence; never invent them from a "
+                            "URL or target catalogue."
                         ),
                         "items": {
                             "type": "object",
