@@ -3526,6 +3526,43 @@ async def test_cleanup_discovery_batch_later_prepare_success_clears_hold() -> No
 
 
 @pytest.mark.asyncio
+async def test_required_tool_batch_admits_only_receipt_authorized_successor() -> None:
+    class BatchTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="compiled",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="prepared")
+
+    tools = BatchTools()
+    kernel = Kernel(Provider(), Store(), tools, Settings())
+    session_id = await kernel.start()
+
+    next_tool, _, _, prepare_succeeded, _ = await kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(
+                call_id="compile",
+                name="browser_compile_api_handoff",
+                arguments={},
+            ),
+            ToolCall(call_id="prepare", name="assessment_prepare", arguments={}),
+        ],
+        required_tool_name="browser_compile_api_handoff",
+    )
+
+    assert tools.calls == ["browser_compile_api_handoff", "assessment_prepare"]
+    assert next_tool == "assessment_prepare"
+    assert prepare_succeeded is True
+
+
+@pytest.mark.asyncio
 async def test_cleanup_discovery_detects_non_consecutive_semantic_plateau() -> None:
     class CycleTools(Tools):
         def __init__(self):

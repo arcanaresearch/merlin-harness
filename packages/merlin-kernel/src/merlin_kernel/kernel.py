@@ -1814,6 +1814,7 @@ class Kernel:
         if not events:
             return None, None, None, None, recon_recall_completed
         preferred_next_tool: str | None = None
+        admitted_tool_name = required_tool_name
         automatic_continuation: dict[str, object] | None = None
         last_known_continuation: dict[str, object] | None = None
         automatic_progress_fingerprint: str | None = None
@@ -1867,7 +1868,7 @@ class Kernel:
                 and not duplicate_owned_cleanup
             )
             tool_admitted = cleanup_admitted and (
-                required_tool_name is None or event.name == required_tool_name
+                admitted_tool_name is None or event.name == admitted_tool_name
             ) and (
                 not recon_recall_completed
                 or _tool_admitted_after_recon_recall(event.name)
@@ -1957,6 +1958,7 @@ class Kernel:
             next_tool = result.metadata.get("preferred_next_tool")
             if not result.is_error and isinstance(next_tool, str):
                 preferred_next_tool = next_tool
+                admitted_tool_name = next_tool
             if event.name == _RECON_RECALL_TOOL and not result.is_error:
                 recon_recall_completed = True
             if continuation is not None:
