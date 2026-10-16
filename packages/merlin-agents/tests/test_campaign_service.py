@@ -554,6 +554,57 @@ def test_objective_phase_gate_accepts_clean_target_predicate_without_attack_corr
     assert settled["last_transition"] == transition
 
 
+def test_objective_phase_gate_accepts_reviewed_identity_observation_for_presence() -> None:
+    gate = ObjectivePhaseGate(
+        id="auth-wallet-session-gate",
+        ordinal=0,
+        objective="Verify the authenticated wallet session",
+        actions=(
+            ObjectiveGateAction(
+                id="auth/action",
+                step_id="observed-session-setup",
+                input_text="Verify the authenticated wallet session",
+            ),
+        ),
+        success_predicate=ObjectiveGatePredicate(
+            observation_name="character",
+            operator=ObjectiveGateOperator.PRESENT,
+        ),
+        budget=ObjectiveGateBudget(max_attempts=2, max_target_calls=2),
+    )
+    task = AgentTask(id="gate-task", objective="gate", status="completed")
+    evidence = _objective_gate_evidence(task.id)
+    receipt = evidence[task.id]["target_evidence_receipts"]["target-call:1"]
+    receipt["attempt_disposition"] = "uncertain"
+    receipt["target_state_transition"] = {
+        "schema": "merlin.target-state-transition.v2",
+        "authority": "target",
+        "identity_match": True,
+        "outcome": "unclear",
+        "observations": [],
+        "validation_errors": [],
+        "quarantined_observations": [],
+        "disposition_rule": "no_valid_corroborated_observation",
+    }
+    receipt["state_observations"] = [
+        {
+            "name": "character",
+            "role": "state_identity",
+            "phase": "result",
+            "authority": "target",
+            "trust_class": "target_reported",
+            "selected_value": "gertie",
+            "validation_errors": [],
+        }
+    ]
+
+    settled = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert settled["status"] == "succeeded"
+    assert settled["attempt_disposition"] == "valid"
+    assert settled["last_transition"] == receipt["target_state_transition"]
+
+
 async def test_objective_phase_gate_controller_retries_in_order_before_frontier() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     gates = (_objective_gate("baseline", 0), _objective_gate("progression", 1))

@@ -23230,19 +23230,55 @@ def _objective_phase_gate_result(
         None,
     )
     predicate_transition = evaluated_transition
+    if evaluated_transition is not None and observation is None:
+        reviewed_state_observation = next(
+            (
+                item
+                for receipt in reversed(gate_receipts)
+                for item in reversed(tuple(receipt.get("state_observations") or ()))
+                if isinstance(receipt.get("state_observations"), Sequence)
+                and not isinstance(receipt.get("state_observations"), (str, bytes))
+                and isinstance(item, Mapping)
+                and item.get("name") == gate.success_predicate.observation_name
+                and item.get("phase") == "result"
+                and item.get("authority") == "target"
+                and item.get("trust_class") == "target_reported"
+                and not item.get("validation_errors")
+                and "selected_value" in item
+            ),
+            None,
+        )
+        if reviewed_state_observation is not None:
+            observation = {
+                "name": reviewed_state_observation["name"],
+                "role": reviewed_state_observation.get("role"),
+                "status": "observed",
+                "after_value": reviewed_state_observation["selected_value"],
+                "trust_class": "target_reported",
+                "validation_errors": (),
+            }
+            predicate_transition = {
+                **evaluated_transition,
+                "observations": (*evaluated_transition.get("observations", ()), observation),
+                "quarantined_observations": tuple(
+                    name
+                    for name in evaluated_transition.get("quarantined_observations", ())
+                    if name != gate.success_predicate.observation_name
+                ),
+            }
     if (
-        evaluated_transition is not None
+        predicate_transition is not None
         and observation is not None
         and observation.get("trust_class") == "target_reported"
         and not observation.get("validation_errors")
-        and evaluated_transition.get("disposition_rule")
+        and predicate_transition.get("disposition_rule")
         == "no_valid_corroborated_observation"
     ):
         predicate_transition = {
-            **evaluated_transition,
+            **predicate_transition,
             "quarantined_observations": tuple(
                 name
-                for name in evaluated_transition.get("quarantined_observations", ())
+                for name in predicate_transition.get("quarantined_observations", ())
                 if name != gate.success_predicate.observation_name
             ),
         }
@@ -23253,10 +23289,10 @@ def _objective_phase_gate_result(
     )
     reviewed_predicate_satisfied = (
         predicate_result is True
-        and evaluated_transition is not None
-        and evaluated_transition.get("authority") == "target"
-        and evaluated_transition.get("identity_match") is True
-        and not evaluated_transition.get("validation_errors")
+        and predicate_transition is not None
+        and predicate_transition.get("authority") == "target"
+        and predicate_transition.get("identity_match") is True
+        and not predicate_transition.get("validation_errors")
         and observation is not None
         and not observation.get("validation_errors")
     )
