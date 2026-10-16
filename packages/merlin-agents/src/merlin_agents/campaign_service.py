@@ -1885,6 +1885,10 @@ PreparationCleanup = Callable[[str], Awaitable[None]]
 ReviewedAdapterResolver = Callable[[str, Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
 ReconObservationReader = Callable[[str, str, str], Awaitable[Sequence[Mapping[str, object]]]]
 AutomationRunner = Callable[[CampaignManifest, LeadAutomationRequest], Awaitable[AutomationOutcome]]
+ObjectivePhaseGateReviewRunner = Callable[
+    [str, Mapping[str, Any], tuple[ObjectivePhaseGate, ...]],
+    Awaitable[tuple[ObjectivePhaseGate, ...]],
+]
 
 
 class CampaignService:
@@ -1925,6 +1929,7 @@ class CampaignService:
         state_scope_store: Any | None = None,
         task_review_runner: IncrementalTaskReviewRunner | None = None,
         review_merge_runner: IncrementalReviewMergeRunner | None = None,
+        objective_phase_gate_review_runner: ObjectivePhaseGateReviewRunner | None = None,
     ) -> None:
         if stalled_after_seconds <= 0:
             raise ValueError("campaign stall interval must be positive")
@@ -1981,6 +1986,7 @@ class CampaignService:
         self._state_scope_store = state_scope_store
         self._task_review_runner = task_review_runner
         self._review_merge_runner = review_merge_runner
+        self._objective_phase_gate_review_runner = objective_phase_gate_review_runner
         # Judgments are advisory and cached per evidence digest so repeated
         # status() projections never re-run a model call for the same evidence.
         self._judgment_cache: dict[str, RefusalJudgment | None] = {}
@@ -3736,6 +3742,13 @@ class CampaignService:
         else:
             prepared = await self._preparation_factory(
                 session_id, objective, profile, adapter, **composition_kwargs
+            )
+        if self._objective_phase_gate_review_runner is not None:
+            reviewed_adapter = _reviewed_adapter_value(prepared.manifest) or {}
+            objective_phase_gates = await self._objective_phase_gate_review_runner(
+                prepared.manifest.objective,
+                reviewed_adapter,
+                objective_phase_gates,
             )
         # Seal the exact operator text and its target-neutral selectors. Reviewed
         # prerequisite gates are also required objectives; expose them through the

@@ -9631,6 +9631,47 @@ async def test_prepare_review_execute_binds_digest_before_workers_start() -> Non
     assert store.events == ["prepared", "admitted", "bound", "started"]
 
 
+async def test_prepare_semantic_audit_adds_missing_explicit_phase_gate() -> None:
+    store = Store()
+    agents = Agents(store)
+    proposed = _objective_gate("authenticate", 0)
+    captured: list[tuple[str, tuple[ObjectivePhaseGate, ...]]] = []
+
+    async def audit(objective, adapter, gates):
+        assert isinstance(adapter, Mapping)
+        captured.append((objective, gates))
+        return (
+            gates[0],
+            _objective_gate("normal-play", 1),
+        )
+
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        agents,
+        preparation,
+        objective_phase_gate_review_runner=audit,
+    )
+    objective = "Authenticate with Test Wallet. Learn the rules and play normally first."
+
+    await service.prepare(
+        "session-1",
+        objective,
+        CampaignProfile.RECOMMENDED,
+        objective_phase_gates=(proposed,),
+    )
+
+    assert captured == [(objective, (proposed,))]
+    persisted = store.rows["campaign-1"]["manifest"]["manifest"]
+    assert [gate["id"] for gate in persisted["objective_phase_gates"]] == [
+        "authenticate",
+        "normal-play",
+    ]
+    assert [item["id"] for item in persisted["objective_contract"]["objectives"][:2]] == [
+        "phase-gate/authenticate",
+        "phase-gate/normal-play",
+    ]
+
+
 async def test_execute_rejects_a_reviewed_adapter_that_became_stale_before_approval() -> None:
     store = Store()
     agents = Agents(store)

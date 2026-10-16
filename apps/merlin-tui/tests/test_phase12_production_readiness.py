@@ -104,6 +104,20 @@ class _NoTools:
         return ()
 
 
+class _NoPrerequisiteAuditProvider:
+    def __init__(self, config) -> None:
+        self.config = config
+
+    async def stream(self, request):
+        yield TextDelta(
+            text=(
+                '{"requirements":[],"phase_gates":[],'
+                '"unresolved_requirements":[]}'
+            )
+        )
+        yield ModelCompleted()
+
+
 def test_current_reviewed_adapter_state_compiles_genuinely_unsealed_legacy_input() -> None:
     compiled = _compile_current_reviewed_adapter_state(
         {
@@ -606,6 +620,9 @@ async def test_two_physical_recon_sessions_cleanup_and_prepare_only_the_selected
             classmethod(lambda cls: ConfigPaths(tmp_path / "config-two-physical-sessions")),
         )
         monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
+        monkeypatch.setattr(
+            "merlin_providers.OpenAICompatibleProvider", _NoPrerequisiteAuditProvider
+        )
         backend = build_backend(tmp_path / "workspace-two-physical-sessions")
         _admit_synthetic_live_handoff(backend)
         try:
@@ -2053,6 +2070,9 @@ async def test_assessment_prepare_canonicalizes_legacy_handoff_before_persistenc
             classmethod(lambda cls: ConfigPaths(tmp_path / "config")),
         )
         monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
+        monkeypatch.setattr(
+            "merlin_providers.OpenAICompatibleProvider", _NoPrerequisiteAuditProvider
+        )
         backend = build_backend(tmp_path / "workspace")
         _admit_synthetic_live_handoff(backend)
         try:
