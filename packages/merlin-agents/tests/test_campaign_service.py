@@ -3371,6 +3371,52 @@ async def test_recovery_starts_next_frontier_batch_after_settlement_crash_window
     ]
 
 
+async def test_recovery_does_not_start_frontier_after_blocked_objective_gate() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    gate = _objective_gate()
+    manifest = manifest_with_objective_phase_gates(prepared.manifest, (gate,))
+    events = []
+
+    class FrontierStore:
+        def list_lead(self, _campaign_id):
+            return [
+                {
+                    "wave": 1,
+                    "payload": {
+                        "kind": "objective_phase_gate_settled",
+                        "gate_id": gate.id,
+                        "status": "blocked",
+                        "blocker": "authoritative prerequisite evidence is unavailable",
+                    },
+                }
+            ]
+
+        def pause(self, campaign_id):
+            events.append(("pause", campaign_id))
+
+        def claim_frontier_transition(self, *_args):
+            raise AssertionError("blocked prerequisites must prevent a frontier claim")
+
+    class RecoveryService(CampaignService):
+        async def _claim_execution_frontier_context(self, *_args, **_kwargs):
+            raise AssertionError("blocked prerequisites must prevent frontier selection")
+
+        async def _start_wave(self, *_args, **_kwargs):
+            raise AssertionError("blocked prerequisites must prevent frontier execution")
+
+    service = RecoveryService(FrontierStore(), object(), None)  # type: ignore[arg-type]
+
+    successor = await service._recover_settled_frontier_successor(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        prepared.assignment_context,
+        ({"wave": 1},),
+    )
+
+    assert successor is None
+    assert events == [("pause", manifest.id)]
+
+
 async def test_recovery_successor_uses_one_transition_fence_for_claim_and_start() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     observed = []

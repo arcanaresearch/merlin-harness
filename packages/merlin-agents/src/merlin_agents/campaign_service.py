@@ -16033,6 +16033,23 @@ class CampaignService:
     ) -> tuple[Any, int] | None:
         """Claim and start one post-settlement successor under one DB fence."""
 
+        candidate_wave = max(int(item["wave"]) for item in waves) + 1
+        gates_ready, last_gate_wave = await self._run_objective_phase_gates(
+            campaign_id,
+            manifest,
+            context,
+            first_wave=candidate_wave,
+        )
+        if not gates_ready:
+            pause_campaign = getattr(self._store, "pause", None)
+            if callable(pause_campaign):
+                try:
+                    await asyncio.to_thread(pause_campaign, campaign_id)
+                except ValueError:
+                    pass
+            return None
+        candidate_wave = max(candidate_wave, last_gate_wave + 1)
+
         async with self._frontier_transition(campaign_id, required=True) as transition_lease:
             if transition_lease is None:
                 return None
@@ -16048,7 +16065,6 @@ class CampaignService:
                 return None
             if int(counts.get("queued", 0)) <= 0:
                 return None
-            candidate_wave = max(int(item["wave"]) for item in waves) + 1
             batch_context, frontier_batch = await self._claim_execution_frontier_context(
                 campaign_id,
                 manifest,
