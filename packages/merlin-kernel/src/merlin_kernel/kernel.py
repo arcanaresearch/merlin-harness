@@ -81,6 +81,7 @@ _PROVIDER_OWNED_TRANSPORT_RETRIES = frozenset(
     }
 )
 _AUTOMATIC_RECON_MARKER = "[merlin-automatic-recon]"
+_RECON_RECALL_TOOL = "browser_recall_reconnaissance"
 _OWNED_SESSION_CLEANUP_TOOL = "browser_end_owned_session"
 _READ_ONLY_LIFECYCLE_DISCOVERY_TOOLS = (
     "browser_snapshot",
@@ -111,6 +112,13 @@ _SENSITIVE_SHELL_OPTION = re.compile(
     r"(?i)--?(?:api[-_]?key|access[-_]?key|password|passwd|secret|token|"
     r"authorization|cookie|credential|private[-_]?key)"
 )
+
+
+def _tool_admitted_after_recon_recall(name: str) -> bool:
+    """Keep post-recall reconnaissance on attributable target evidence surfaces."""
+    return name == "assessment_prepare" or (
+        name.startswith("browser_") and name != _RECON_RECALL_TOOL
+    )
 
 
 def _safe_shell_invocation(
@@ -826,6 +834,7 @@ class Kernel:
         automatic_progress_seen: set[str] = set()
         automatic_progress_key: str | None = None
         automatic_recon_stalled = False
+        recon_recall_completed = False
         automatic_state_restored = False
         owned_cleanup_failed = False
         owned_cleanup_evidence_failed = False
@@ -958,6 +967,25 @@ class Kernel:
                 available_tools = tuple(
                     spec for spec in described_tools if spec.name != _OWNED_SESSION_CLEANUP_TOOL
                 )
+                if recon_recall_completed:
+                    available_tools = tuple(
+                        spec
+                        for spec in available_tools
+                        if _tool_admitted_after_recon_recall(spec.name)
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role="system",
+                            content=(
+                                "Durable reconnaissance recall is complete. The Campaign Lead "
+                                "must judge the recalled scope and evidence semantically. Continue "
+                                "only with attributable browser/network observations and the "
+                                "campaign preparation tool. Workspace reads and shell commands are "
+                                "withheld because exposed application source is not target-state "
+                                "evidence. Do not call browser_recall_reconnaissance again."
+                            ),
+                        )
+                    )
                 if automatic_recon_continuation is not None:
                     continuation_tools = automatic_recon_continuation.get("allowed_tools", [])
                     continuation_source = (
@@ -1069,6 +1097,7 @@ class Kernel:
                     nonlocal preferred_next_tool_name
                     nonlocal preferred_tool_follow_through_failures
                     nonlocal preferred_tool_invoked_dynamically
+                    nonlocal recon_recall_completed
                     await self._store.append_message(
                         session_id,
                         ChatMessage(
@@ -1124,6 +1153,10 @@ class Kernel:
                     )
                     tool_admitted = (
                         (call.name in _advertised_tool_names or dynamically_admitted_transition)
+                        and (
+                            not recon_recall_completed
+                            or _tool_admitted_after_recon_recall(call.name)
+                        )
                         and (
                             call.name != _OWNED_SESSION_CLEANUP_TOOL
                             or (
@@ -1212,6 +1245,8 @@ class Kernel:
                     if not result.is_error and isinstance(next_tool, str):
                         preferred_next_tool_name = next_tool
                         preferred_tool_follow_through_failures = 0
+                    if call.name == _RECON_RECALL_TOOL and not result.is_error:
+                        recon_recall_completed = True
                     if is_required_owned_cleanup and not duplicate_owned_cleanup:
                         owned_cleanup_failed = (
                             result.is_error or next_tool != "browser_compile_api_handoff"
@@ -1457,6 +1492,7 @@ class Kernel:
                         tool_continuation,
                         tool_progress_fingerprint,
                         prepare_succeeded,
+                        recon_recall_completed,
                     ) = await self._invoke_tools(
                         session_id,
                         tool_calls,
@@ -1470,6 +1506,7 @@ class Kernel:
                         advertised_tool_names=advertised_tool_names,
                         automatic_recon_continuation=automatic_recon_continuation,
                         required_tool_name=request_preferred_tool_name,
+                        recon_recall_completed=recon_recall_completed,
                     )
                     preferred_tool_invoked = request_preferred_tool_name is not None and any(
                         call.name == request_preferred_tool_name for call in tool_calls
@@ -1766,9 +1803,10 @@ class Kernel:
         advertised_tool_names: frozenset[str] | None = None,
         automatic_recon_continuation: Mapping[str, object] | None = None,
         required_tool_name: str | None = None,
-    ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None]:
+        recon_recall_completed: bool = False,
+    ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool]:
         if not events:
-            return None, None, None, None
+            return None, None, None, None, recon_recall_completed
         preferred_next_tool: str | None = None
         automatic_continuation: dict[str, object] | None = None
         last_known_continuation: dict[str, object] | None = None
@@ -1824,6 +1862,9 @@ class Kernel:
             )
             tool_admitted = cleanup_admitted and (
                 required_tool_name is None or event.name == required_tool_name
+            ) and (
+                not recon_recall_completed
+                or _tool_admitted_after_recon_recall(event.name)
             )
             try:
                 if not tool_admitted:
@@ -1910,6 +1951,8 @@ class Kernel:
             next_tool = result.metadata.get("preferred_next_tool")
             if not result.is_error and isinstance(next_tool, str):
                 preferred_next_tool = next_tool
+            if event.name == _RECON_RECALL_TOOL and not result.is_error:
+                recon_recall_completed = True
             if continuation is not None:
                 automatic_continuation = continuation
                 last_known_continuation = continuation
@@ -1932,6 +1975,7 @@ class Kernel:
             automatic_continuation,
             automatic_progress_fingerprint,
             prepare_succeeded,
+            recon_recall_completed,
         )
 
     async def _save_assistant(

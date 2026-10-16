@@ -275,6 +275,127 @@ class Tools:
 
 
 @pytest.mark.asyncio
+async def test_recon_recall_withholds_workspace_and_shell_tools_from_later_requests() -> None:
+    class ReconTools(Tools):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "browser_recall_reconnaissance",
+                    "browser_open_tab",
+                    "browser_network_events",
+                    "browser_compile_api_handoff",
+                    "assessment_prepare",
+                    "read_file",
+                    "shell_command",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(content="ok")
+
+    class ReconProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            names = {item["function"]["name"] for item in request.tools}
+            if len(self.requests) == 1:
+                assert {"read_file", "shell_command"} <= names
+                yield ToolCall(
+                    call_id="recall",
+                    name="browser_recall_reconnaissance",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            assert names == {
+                "browser_open_tab",
+                "browser_network_events",
+                "browser_compile_api_handoff",
+                "assessment_prepare",
+            }
+            if len(self.requests) == 2:
+                # A provider may retain an earlier schema. Admission still rejects it.
+                yield ToolCall(call_id="source-crawl", name="shell_command", arguments={})
+                yield ToolCall(call_id="open", name="browser_open_tab", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Reconnaissance remains bounded.")
+            yield ModelCompleted()
+
+    tools = ReconTools()
+    provider = ReconProvider()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("reuse prior reconnaissance")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == ["browser_recall_reconnaissance", "browser_open_tab"]
+    assert len(provider.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_dynamic_recon_recall_blocks_source_crawl_in_same_provider_stream() -> None:
+    class ReconTools(Tools):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "browser_recall_reconnaissance",
+                    "browser_open_tab",
+                    "assessment_prepare",
+                    "shell_command",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(content="ok")
+
+    class DynamicReconProvider:
+        async def stream_with_tools(self, request, handler):
+            assert "shell_command" in {
+                item["function"]["name"] for item in request.tools
+            }
+            recalled = await handler(
+                ToolCall(
+                    call_id="recall",
+                    name="browser_recall_reconnaissance",
+                    arguments={},
+                )
+            )
+            assert recalled.success is True
+            blocked = await handler(
+                ToolCall(call_id="source-crawl", name="shell_command", arguments={})
+            )
+            assert blocked.success is False
+            assert "not admitted" in blocked.content
+            opened = await handler(
+                ToolCall(call_id="open", name="browser_open_tab", arguments={})
+            )
+            assert opened.success is True
+            yield TextDelta(text="Reconnaissance remains bounded.")
+            yield ModelCompleted()
+
+    tools = ReconTools()
+    kernel = Kernel(DynamicReconProvider(), Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("reuse prior reconnaissance")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == ["browser_recall_reconnaissance", "browser_open_tab"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("dynamic", [False, True])
 async def test_large_prepared_review_survives_real_broker_text_bound(dynamic) -> None:
     from merlin_tools import ToolBroker
@@ -3323,7 +3444,7 @@ async def test_cleanup_discovery_batch_later_prepare_success_clears_hold() -> No
 
     kernel = Kernel(Provider(), Store(), BatchTools(), Settings())
     session_id = await kernel.start()
-    _, continuation, _, prepare_succeeded = await kernel._invoke_tools(  # noqa: SLF001
+    _, continuation, _, prepare_succeeded, _ = await kernel._invoke_tools(  # noqa: SLF001
         session_id,
         [
             ToolCall(call_id="held", name="assessment_prepare", arguments={"held": True}),
