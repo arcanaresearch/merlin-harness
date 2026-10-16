@@ -1503,7 +1503,7 @@ class KernelBackend:
     async def campaign_status(self, campaign_id: str) -> Mapping[str, object]:
         if self._campaigns is None:
             raise RuntimeError("campaign support is not configured")
-        await self._current_session_campaign(campaign_id)
+        await self._campaign_by_id(campaign_id)
         return await self._campaigns.status(campaign_id)
 
     async def execute_campaign(
@@ -1595,8 +1595,21 @@ class KernelBackend:
     async def resume_campaign(self, campaign_id: str) -> object:
         if self._campaigns is None or self.kernel.session_id is None:
             raise RuntimeError("campaign support is not configured")
-        await self._current_session_campaign(campaign_id)
+        row = await self._campaign_by_id(campaign_id)
+        owning_session_id = str(row["session_id"])
+        if owning_session_id != self.kernel.session_id:
+            if self.kernel.turn_active:
+                await self.kernel.interrupt()
+            await self.kernel.start(owning_session_id)
         return await self._campaigns.resume(campaign_id)
+
+    async def _campaign_by_id(self, campaign_id: str) -> Mapping[str, object]:
+        if self._campaigns is None:
+            raise RuntimeError("campaign support is not configured")
+        for row in await self._campaigns.list_all():
+            if str(row["campaign_id"]) == campaign_id:
+                return row
+        raise ValueError(f"campaign does not exist: {campaign_id}")
 
     async def _current_session_campaign(self, campaign_id: str) -> Mapping[str, object]:
         if self._campaigns is None or self.kernel.session_id is None:

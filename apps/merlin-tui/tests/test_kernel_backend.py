@@ -49,6 +49,10 @@ class FakeKernel:
     async def interrupt(self) -> bool:
         return True
 
+    async def start(self, session_id: str | None = None) -> str:
+        self.session_id = session_id or self.session_id
+        return self.session_id
+
 
 @pytest.mark.asyncio
 async def test_close_is_idempotent_and_closes_all_resources_after_failure() -> None:
@@ -345,14 +349,14 @@ async def test_explicit_campaign_resume_rejects_a_different_session() -> None:
 
     backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match="different session"):
-        await backend.resume_campaign("campaign/other")
+    await backend.resume_campaign("campaign/other")
 
-    assert resumed == []
+    assert backend.kernel.session_id == "session-2"
+    assert resumed == ["campaign/other"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ("campaign_status", "pause_campaign"))
+@pytest.mark.parametrize("operation", ("pause_campaign",))
 async def test_campaign_operations_reject_a_different_session(operation: str) -> None:
     calls: list[str] = []
 
@@ -378,6 +382,32 @@ async def test_campaign_operations_reject_a_different_session(operation: str) ->
         await getattr(backend, operation)("campaign/foreign")
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_campaign_status_reads_a_different_session_without_switching() -> None:
+    calls: list[str] = []
+
+    class Campaigns:
+        async def list_all(self):
+            return (
+                {
+                    "campaign_id": "campaign/foreign",
+                    "session_id": "session-2",
+                },
+            )
+
+        async def status(self, campaign_id: str):
+            calls.append(campaign_id)
+            return {"campaign_id": campaign_id, "status": "paused"}
+
+    backend = KernelBackend(FakeKernel([]), campaigns=Campaigns())  # type: ignore[arg-type]
+
+    status = await backend.campaign_status("campaign/foreign")
+
+    assert backend.kernel.session_id == "session-1"
+    assert status == {"campaign_id": "campaign/foreign", "status": "paused"}
+    assert calls == ["campaign/foreign"]
 
 
 def app_event(type_: str, **payload: object) -> AppEvent:
