@@ -10220,6 +10220,11 @@ def build_backend(
                     "execution_mode",
                     "endpoint",
                     "url",
+                    "origin",
+                    "api_transport",
+                    "authentication",
+                    "credential_handle",
+                    "observed_evidence",
                     "api_steps",
                     "browser_steps",
                     "interaction_contract",
@@ -10239,10 +10244,21 @@ def build_backend(
                         role="system",
                         content=(
                             "You are the independent semantic auditor for a campaign objective "
-                            "contract. Identify every explicit ordered setup or baseline "
-                            "requirement that must happen before adversarial attacks, including "
-                            "named authentication and normal play. Do not treat suggested attack "
-                            "methods as prerequisites. Return one JSON object only with keys "
+                            "contract. Identify only explicit ordered setup or normal-play "
+                            "requirements whose state must be verified immediately before "
+                            "adversarial attacks. A phase gate is bounded executable or verifiable "
+                            "pre-attack work; cumulative tier/character coverage, reporting, "
+                            "blocker handling, desired attack outcomes, and suggested attack "
+                            "methods are campaign objectives or guidance, never phase gates. "
+                            "Opening the target, named authentication, and signing may already "
+                            "have happened during reviewed reconnaissance. When the adapter shows "
+                            "that authenticated state, use an existing setup/state-read step and "
+                            "authoritative state observation to create a verification gate; do "
+                            "not require a second browser navigation, wallet connection, or "
+                            "signature. Multiple exact source requirements may map to that one "
+                            "verification gate. A request to play normally first remains a "
+                            "separate baseline gate using the reviewed interaction step. Return "
+                            "one JSON object only with keys "
                             "requirements, phase_gates, and unresolved_requirements. "
                             "requirements is an array of {source_quote, gate_id}; source_quote "
                             "must be an exact non-empty substring of the operator objective. "
@@ -10251,8 +10267,10 @@ def build_backend(
                             "content, though you may reorder ordinals to match the objective. Add "
                             "a missing gate only from reviewed adapter step IDs and authoritative "
                             "state observations. unresolved_requirements is an array of "
-                            "{source_quote, reason} for an explicit prerequisite the adapter "
-                            "cannot express. Never silently omit an explicit prerequisite. Gate "
+                            "{source_quote, reason} only when a true pre-attack prerequisite has "
+                            "neither reviewed evidence nor an adapter action that can verify or "
+                            "perform it. Never put cumulative coverage or reporting work in that "
+                            "array. Never silently omit a true prerequisite. Gate "
                             "operators are equals, one_of, at_least, at_most, increases, "
                             "decreases, or terminal_success; retention is recipe or checkpoint; "
                             "retry reasons are infrastructure_failure, ambiguous_transition, or "
