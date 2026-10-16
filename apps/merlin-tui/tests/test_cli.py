@@ -1397,6 +1397,93 @@ def test_campaign_approve_rejects_prepared_objective_drift(monkeypatch) -> None:
     assert client.execute_calls == []
 
 
+@pytest.mark.asyncio
+async def test_campaign_approve_repairs_streamed_objective_drift_without_new_recon(
+    monkeypatch,
+) -> None:
+    operator_objective = (
+        "Try prompt injection and role spoofing against https://target.test exactly as suggested."
+    )
+    drifted_objective = (
+        "Attempt prompt injection and role spoofing against https://target.test as requirements."
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.approved = False
+            self.cancel_calls: list[str] = []
+            self.execute_calls: list[tuple[str, str]] = []
+
+        async def list_campaigns(self):
+            return ()
+
+        async def campaign_status(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "status": "executing" if self.approved else "prepared",
+                "manifest_digest": (
+                    "sha256:exact" if campaign_id == "campaign/exact" else "sha256:drifted"
+                ),
+                "budget": {"limits": {}},
+                "specialist_composition": "opinionated",
+            }
+
+        async def cancel_campaign(self, campaign_id="*"):
+            self.cancel_calls.append(campaign_id)
+            return 1
+
+        async def execute_campaign(self, campaign_id, digest):
+            self.execute_calls.append((campaign_id, digest))
+            self.approved = True
+            return {"campaign_id": campaign_id, "status": "executing"}
+
+        async def close(self):
+            return None
+
+    client = Client()
+
+    async def build_client(*, confirmer=None):
+        assert confirmer is None
+        return client
+
+    prompts: list[str] = []
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        if prompt == "/new":
+            return None
+        prompts.append(prompt)
+        campaign_id = "campaign/drifted" if len(prompts) == 1 else "campaign/exact"
+        prepared_objective = drifted_objective if len(prompts) == 1 else operator_objective
+        digest = "sha256:drifted" if len(prompts) == 1 else "sha256:exact"
+        return {
+            "campaign_id": campaign_id,
+            "manifest_digest": digest,
+            "objective": prepared_objective,
+            "profile": "recommended",
+            "review": {
+                "budget": {
+                    "turns": None,
+                    "tokens": None,
+                    "seconds": None,
+                    "cost_usd": None,
+                }
+            },
+        }
+
+    monkeypatch.setattr("merlin_tui.cli._client", build_client)
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    from merlin_tui.cli import _submit_campaign
+
+    await _submit_campaign(["--approve", operator_objective])
+
+    assert client.cancel_calls == ["campaign/drifted"]
+    assert client.execute_calls == [("campaign/exact", "sha256:exact")]
+    assert len(prompts) == 2
+    assert "do not repeat reconnaissance" in prompts[1]
+    assert f"operator_objective_json={operator_objective!r}" not in prompts[1]
+    assert operator_objective in prompts[1]
+
+
 def test_campaign_approve_accepts_verbatim_objective_with_target_anchor(monkeypatch) -> None:
     operator_objective = "Assess https://target.test for prompt injection"
     client = _install_durable_campaign(

@@ -930,12 +930,38 @@ async def _submit_campaign(arguments: list[str]) -> None:
     preparation_note: str | None = None
     campaign_poll: asyncio.Task[object] | None = None
     campaign_poll_error: BaseException | None = None
+    objective_repair_needed: tuple[str, str] | None = None
     try:
         # The preparing model occasionally ends its turn asking for confirmation
         # instead of calling assessment_prepare even though --approve was given.
         # Retry once with an explicit nudge before refusing approval.
-        for preparation_attempt in range(2):
-            if preparation_attempt:
+        for preparation_attempt in range(3):
+            if objective_repair_needed is not None:
+                preparation_prompt = (
+                    "The previous prepared campaign was cancelled because its objective changed "
+                    "the operator's wording and therefore changed the sealed requirements. Reuse "
+                    "the already-sealed reconnaissance handoff from this session; do not repeat "
+                    "reconnaissance. Call assessment_prepare exactly once now. Set its objective "
+                    "argument to the exact JSON string below, byte-for-byte, without adding a "
+                    "Target line or changing verbs, punctuation, or quotes:\n"
+                    f"operator_objective_json={json.dumps(objective, ensure_ascii=False)}\n"
+                    f"Use campaign_profile={profile!r}"
+                    + (
+                        f" and specialist_composition={composition!r}"
+                        if composition != "opinionated"
+                        else ""
+                    )
+                    + (
+                        ". Keep the exact previously selected budget: "
+                        + ", ".join(
+                            f"max_{name}={value}" for name, value in sorted(limits.items())
+                        )
+                        if limits
+                        else ". Keep all provider/model budget limits unset"
+                    )
+                    + ". Do not ask for confirmation."
+                )
+            elif preparation_attempt:
                 preparation_prompt = (
                     "The previous turn ended without calling assessment_prepare. "
                     "Approval is already given; call assessment_prepare exactly once "
@@ -1012,15 +1038,13 @@ async def _submit_campaign(arguments: list[str]) -> None:
                         if not _prepared_objective_preserves_operator_scope(
                             objective, streamed_objective
                         ):
-                            await campaign_client.cancel_campaign(
-                                str(streamed_review["campaign_id"])
-                            )
-                            raise SystemExit(
-                                "prepared campaign objective drifted from the operator objective; "
-                                "refusing approval and cancelling the drifted campaign.\n"
-                                f"operator objective: {objective!r}\n"
-                                f"prepared objective: {streamed_objective!r}"
-                            )
+                            drifted_id = str(streamed_review["campaign_id"])
+                            await campaign_client.cancel_campaign(drifted_id)
+                            existing_campaign_ids.add(drifted_id)
+                            objective_repair_needed = (drifted_id, streamed_objective)
+                            streamed_review = None
+                            break
+                        objective_repair_needed = None
                         status_task = asyncio.create_task(
                             campaign_client.campaign_status(str(streamed_review["campaign_id"]))
                         )
@@ -1090,12 +1114,11 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     ):
                         if isinstance(campaign_id, str) and campaign_id:
                             await campaign_client.cancel_campaign(campaign_id)
-                        raise SystemExit(
-                            "prepared campaign objective drifted from the operator objective; "
-                            "refusing approval and cancelling the drifted campaign.\n"
-                            f"operator objective: {objective!r}\n"
-                            f"prepared objective: {candidate_objective!r}"
-                        )
+                            existing_campaign_ids.add(campaign_id)
+                            objective_repair_needed = (campaign_id, candidate_objective)
+                        await _bounded_task_teardown(preparation)
+                        break
+                    objective_repair_needed = None
                     list_digest = candidate.get("manifest_digest")
                     if not isinstance(campaign_id, str) or not isinstance(list_digest, str):
                         raise SystemExit(
@@ -1142,6 +1165,10 @@ async def _submit_campaign(arguments: list[str]) -> None:
                 preparation_note = str(streamed_review["preparation_note"])
             if durable_review is not None:
                 break
+            if objective_repair_needed is not None:
+                continue
+            if preparation_attempt >= 1:
+                break
             if campaign_poll is not None and not campaign_poll.done():
                 await _bounded_task_teardown(campaign_poll)
                 campaign_poll = None
@@ -1157,6 +1184,14 @@ async def _submit_campaign(arguments: list[str]) -> None:
         if durable_review is None:
             await _bounded_stream_teardown(campaign_client.close())
     if durable_review is None:
+        if objective_repair_needed is not None:
+            drifted_id, drifted_objective = objective_repair_needed
+            raise SystemExit(
+                "prepared campaign objective drifted from the operator objective after repair "
+                f"attempts; refusing approval. Last cancelled campaign: {drifted_id}.\n"
+                f"operator objective: {objective!r}\n"
+                f"prepared objective: {drifted_objective!r}"
+            )
         note = ""
         if isinstance(streamed_review, dict):
             tail = streamed_review.get("preparation_note")
