@@ -1139,7 +1139,10 @@ class LocalControlClient:
             if getattr(self, "_reconnecting", False) or reader is not self._lease_reader:
                 continue
             if not line:
-                raise ConnectionError("The Merlin session disconnected")
+                raise ConnectionError(
+                    "The Merlin session disconnected. Run ./merlin and choose "
+                    "\"Resume last session\" to reconnect."
+                )
             if json.loads(line).get("type") != "foreground_close":
                 raise RuntimeError("Unexpected foreground session notification")
             return

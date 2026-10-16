@@ -2347,6 +2347,17 @@ async def test_restart_foreground_waits_for_lease_eof_and_backend_cleanup(monkey
 
 
 @pytest.mark.asyncio
+async def test_foreground_disconnect_explains_how_to_resume() -> None:
+    client = LocalControlClient(socket_path=Path("/tmp/merlin-disconnect-test.sock"))
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    client._lease_reader = reader
+
+    with pytest.raises(ConnectionError, match="Run ./merlin.*Resume last session"):
+        await client.wait_for_foreground_close()
+
+
+@pytest.mark.asyncio
 async def test_restart_idle_daemon_cleans_resources_before_start(monkeypatch) -> None:
     from uuid import uuid4
 
