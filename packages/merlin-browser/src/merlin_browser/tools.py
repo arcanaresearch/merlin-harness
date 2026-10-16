@@ -8562,6 +8562,110 @@ def _scope_values_match(left: str | None, right: str | None) -> bool:
     return left_tokens <= right_tokens or right_tokens <= left_tokens
 
 
+def _recon_adapter_blueprint(value: str | None) -> dict[str, object] | None:
+    """Project a prior adapter into non-executable evidence for Lead review.
+
+    Partial recon matches are intentionally not executable reuse.  The Lead still
+    needs enough evidence to decide whether two model-authored scope descriptions
+    refer to the same target behavior, without receiving an old request body,
+    headers, cookies, or captured values that could be replayed accidentally.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+
+    blueprint: dict[str, object] = {}
+    for key in (
+        "interface",
+        "endpoint",
+        "api_transport",
+        "execution_mode",
+        "available_execution_modes",
+    ):
+        candidate = parsed.get(key)
+        if isinstance(candidate, (str, list, tuple)):
+            blueprint[key] = list(candidate) if isinstance(candidate, tuple) else candidate
+
+    projected_steps: list[dict[str, object]] = []
+    raw_steps = parsed.get("api_steps")
+    if isinstance(raw_steps, (list, tuple)):
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, Mapping):
+                continue
+            step: dict[str, object] = {}
+            for key in (
+                "step_id",
+                "method",
+                "endpoint",
+                "interaction",
+                "cleanup",
+                "response_selector",
+            ):
+                candidate = raw_step.get(key)
+                if isinstance(candidate, (str, bool)):
+                    step[key] = candidate
+            captures = raw_step.get("captures")
+            if isinstance(captures, Mapping):
+                step["capture_names"] = sorted(str(name) for name in captures)
+            if step:
+                projected_steps.append(step)
+    if projected_steps:
+        blueprint["api_steps"] = projected_steps
+
+    state_capabilities = parsed.get("state_capabilities")
+    if isinstance(state_capabilities, Mapping):
+        observations: list[dict[str, object]] = []
+        raw_observations = state_capabilities.get("observations")
+        if isinstance(raw_observations, (list, tuple)):
+            for raw_observation in raw_observations:
+                if not isinstance(raw_observation, Mapping):
+                    continue
+                observation: dict[str, object] = {}
+                for key in ("name", "role", "value_type", "trust_class"):
+                    candidate = raw_observation.get(key)
+                    if isinstance(candidate, str):
+                        observation[key] = candidate
+                for selector_name in ("baseline_selector", "result_selector"):
+                    selector = raw_observation.get(selector_name)
+                    if not isinstance(selector, Mapping):
+                        continue
+                    pointer = selector.get("pointer")
+                    step_id = selector.get("step_id")
+                    if isinstance(pointer, str) and isinstance(step_id, str):
+                        observation[selector_name] = {
+                            "pointer": pointer,
+                            "step_id": step_id,
+                        }
+                if observation:
+                    observations.append(observation)
+        if observations:
+            blueprint["state_observations"] = observations
+
+    constraints: list[dict[str, object]] = []
+    raw_constraints = parsed.get("request_constraints")
+    if isinstance(raw_constraints, (list, tuple)):
+        for raw_constraint in raw_constraints:
+            if not isinstance(raw_constraint, Mapping):
+                continue
+            constraint = {
+                key: raw_constraint[key]
+                for key in ("kind", "path", "maximum", "unit", "step_id")
+                if isinstance(raw_constraint.get(key), (str, int, float))
+                and not isinstance(raw_constraint.get(key), bool)
+            }
+            if constraint:
+                constraints.append(constraint)
+    if constraints:
+        blueprint["request_constraints"] = constraints
+
+    return blueprint or None
+
+
 class ReconRecallTool:
     """Find evidence-backed reconnaissance that can be safely reused or narrowed."""
 
@@ -8595,10 +8699,13 @@ class ReconRecallTool:
             name=self.name,
             description=(
                 "Before full reconnaissance, find durable evidence for this target. Exact scenario "
-                "matches default to a lightweight validation probe. Shared-site matches reuse site "
-                "facts but require bot-specific reconnaissance. Omit authentication_context when "
-                "it has not been observed; never guess it. An authentication mismatch may return "
-                "only authentication-neutral site facts. Tenant mismatches are never returned. "
+                "matches default to a lightweight validation probe. Shared-target matches may "
+                "include a sanitized, non-executable historical adapter blueprint for the Lead to "
+                "compare semantically with the requested scope before choosing lightweight "
+                "validation or narrower bot-specific reconnaissance. Omit authentication_context "
+                "when it has not been observed; never guess it. An authentication mismatch may "
+                "return only authentication-neutral site facts and a blueprint without request "
+                "values. Tenant mismatches are never returned. "
                 "This lookup is synchronous: its returned result is "
                 "final, no callback will arrive, and it must not be repeated while waiting. Follow "
                 "the returned next_action immediately."
@@ -8671,6 +8778,9 @@ class ReconRecallTool:
                 "shared_site_facts": site_facts,
                 "authentication_reusable": authentication_matches,
             }
+            adapter_blueprint = _recon_adapter_blueprint(
+                handoff.adapter or handoff.reusable_adapter
+            )
             differing = sorted(
                 key
                 for key in (
@@ -8699,17 +8809,33 @@ class ReconRecallTool:
                     }
                 )
             else:
+                partial_default_action = (
+                    "semantic_scope_review"
+                    if adapter_blueprint is not None
+                    else "bot_specific_reconnaissance"
+                )
                 partial.append(
                     {
                         **shared,
                         "match": "shared_site",
                         "different_dimensions": differing,
-                        "default_action": "bot_specific_reconnaissance",
+                        "candidate_reuse_status": "semantic_review_required",
+                        **(
+                            {"candidate_adapter_blueprint": adapter_blueprint}
+                            if adapter_blueprint is not None
+                            else {}
+                        ),
+                        "default_action": partial_default_action,
                     }
                 )
+        semantic_review_available = any(
+            item.get("default_action") == "semantic_scope_review" for item in partial
+        )
         default_action = (
             "lightweight_validation"
             if exact
+            else "semantic_scope_review"
+            if semantic_review_available
             else "bot_specific_reconnaissance"
             if partial
             else "full_reconnaissance"
@@ -8717,6 +8843,13 @@ class ReconRecallTool:
         next_action = (
             "Run one lightweight validation probe against the exact match."
             if exact
+            else (
+                "Have the Campaign Lead compare requested_scope with the candidate's recorded "
+                "recon_scope and adapter blueprint. If the Lead judges them semantically relevant, "
+                "validate only the listed endpoints and state selectors in the current session, "
+                "then compile a new handoff. Otherwise begin narrower bot-specific reconnaissance."
+            )
+            if semantic_review_available
             else "Reuse only shared site facts and begin bot-specific reconnaissance."
             if partial
             else "Call browser_open_tab now and begin full reconnaissance."
@@ -8762,6 +8895,7 @@ class ReconRecallTool:
             "target_id": session.bounds.target_id,
             "recall_status": "complete",
             "callback_pending": False,
+            "requested_scope": desired,
             "exact_matches": projected_exact,
             "partial_matches": projected_partial,
             "match_projection": {
@@ -8776,6 +8910,7 @@ class ReconRecallTool:
             ),
             "operator_options": [
                 "reuse_after_lightweight_validation",
+                "semantic_scope_review",
                 "bot_specific_reconnaissance",
                 "full_reconnaissance",
             ],

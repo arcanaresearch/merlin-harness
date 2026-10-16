@@ -7535,7 +7535,47 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
                 "url": f"{origin}/api/message",
                 "request_evidence_ref": "evidence:req",
                 "response_evidence_ref": "evidence:res",
-                "adapter": '{"interface":"http_api"}',
+                "adapter": json.dumps(
+                    {
+                        "interface": "http_api",
+                        "endpoint": f"{origin}/api/message",
+                        "api_steps": [
+                            {
+                                "step_id": "message",
+                                "method": "POST",
+                                "endpoint": f"{origin}/api/message",
+                                "interaction": True,
+                                "cleanup": False,
+                                "request_template": {
+                                    "message": "{{input}}",
+                                    "credential": "do-not-project",
+                                },
+                                "response_selector": "/reply",
+                                "captures": {"session_id": "/sessionId"},
+                            }
+                        ],
+                        "state_capabilities": {
+                            "observations": [
+                                {
+                                    "name": "tier",
+                                    "role": "progress_ordinal",
+                                    "value_type": "integer",
+                                    "trust_class": "target_reported",
+                                    "baseline_selector": {
+                                        "pointer": "/tier",
+                                        "step_id": "message",
+                                    },
+                                    "result_selector": {
+                                        "pointer": "/tier",
+                                        "step_id": "message",
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 "reusable_adapter": '{"interface":"http_api"}',
                 "reusable_site_facts": (
                     '{"authentication_flow":"signed-in cookie",'
@@ -7579,12 +7619,45 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
                     "agent_or_bot": "sales-bot",
                 },
             )
-            assert different_bot.metadata["default_action"] == "bot_specific_reconnaissance"
+            assert different_bot.metadata["default_action"] == "semantic_scope_review"
             assert different_bot.metadata["exact_matches"] == []
-            assert different_bot.metadata["partial_matches"][0]["different_dimensions"] == [
+            partial = different_bot.metadata["partial_matches"][0]
+            assert partial["different_dimensions"] == [
                 "agent_or_bot",
                 "surface",
             ]
+            assert partial["candidate_reuse_status"] == "semantic_review_required"
+            assert partial["candidate_adapter_blueprint"] == {
+                "api_steps": [
+                    {
+                        "capture_names": ["session_id"],
+                        "cleanup": False,
+                        "endpoint": f"{origin}/api/message",
+                        "interaction": True,
+                        "method": "POST",
+                        "response_selector": "/reply",
+                        "step_id": "message",
+                    }
+                ],
+                "endpoint": f"{origin}/api/message",
+                "interface": "http_api",
+                "state_observations": [
+                    {
+                        "baseline_selector": {"pointer": "/tier", "step_id": "message"},
+                        "name": "tier",
+                        "result_selector": {"pointer": "/tier", "step_id": "message"},
+                        "role": "progress_ordinal",
+                        "trust_class": "target_reported",
+                        "value_type": "integer",
+                    }
+                ],
+            }
+            assert "do-not-project" not in different_bot.content
+            assert different_bot.metadata["requested_scope"] == {
+                **dict(bot_a.recon_scope),
+                "surface": "sales-chat",
+                "agent_or_bot": "sales-bot",
+            }
             assert (
                 "signed-in cookie"
                 in different_bot.metadata["partial_matches"][0]["shared_site_facts"]
@@ -7615,7 +7688,7 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
                     "agent_or_bot": "sales-bot",
                 },
             )
-            assert unknown_auth.metadata["default_action"] == "bot_specific_reconnaissance"
+            assert unknown_auth.metadata["default_action"] == "semantic_scope_review"
             assert unknown_auth.metadata["partial_matches"][0]["authentication_reusable"] is False
 
 
@@ -7688,11 +7761,14 @@ async def test_recon_recall_does_not_reuse_legacy_passive_session_adapter() -> N
             result = await recall.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), scope)
 
             assert result.metadata["exact_matches"] == []
-            assert result.metadata["default_action"] == "bot_specific_reconnaissance"
+            assert result.metadata["default_action"] == "semantic_scope_review"
             assert [item["handoff_id"] for item in result.metadata["partial_matches"]] == [
                 "handoff:passive-session"
             ]
             assert "reusable_adapter" not in result.metadata["partial_matches"][0]
+            assert result.metadata["partial_matches"][0]["candidate_reuse_status"] == (
+                "semantic_review_required"
+            )
 
 
 @pytest.mark.asyncio
