@@ -326,6 +326,29 @@ def test_compiler_preserves_exact_requirements_with_open_world_completion_gate()
     )
 
 
+def test_compiler_seals_enumerated_range_and_stops_method_list_before_in_order_to() -> None:
+    source = (
+        "Play normally across all four tiers (Tier 1, Tier 2, Tier 3, Tier 4), "
+        "including every available character in each tier. Then attempt prompt injection, "
+        "role spoofing, judge manipulation, and game-logic exploits in order to force wins."
+    )
+
+    contract = compile_objective_contract(source)
+
+    assert len(contract.objectives) == 3
+    tier = contract.objectives[0].selectors[0]
+    assert tier.dimension == "tier"
+    assert tier.values == ("1", "2", "3", "4")
+    character = contract.objectives[1].selectors[0]
+    assert character.scope_values == ("1", "2", "3", "4")
+    assert contract.objectives[2].selectors[0].values == (
+        "prompt injection",
+        "role spoofing",
+        "judge manipulation",
+        "game-logic exploits",
+    )
+
+
 def test_all_available_requirement_cannot_be_satisfied_before_denominator_binding() -> None:
     contract = compile_objective_contract("Test every available character in each tier.")
     objective = contract.objectives[0]

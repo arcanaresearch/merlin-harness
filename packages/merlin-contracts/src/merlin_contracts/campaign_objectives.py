@@ -271,6 +271,12 @@ _RANGE_PATTERN = re.compile(
     r"(?:through|to|[-–])\s*(?:(?P=label)\s+)?(?P<end>\d+)\b",
     re.IGNORECASE,
 )
+_ENUMERATED_RANGE_PATTERN = re.compile(
+    r"\b(?P<label>[A-Za-z][A-Za-z0-9_-]*)\s+(?P<start>\d+)"
+    r"(?P<middle>(?:\s*,\s*(?P=label)\s+\d+)+)"
+    r"\s*,?\s*(?:and\s+)?(?P=label)\s+(?P<end>\d+)\b",
+    re.IGNORECASE,
+)
 _ALL_AVAILABLE_PATTERN = re.compile(
     r"\b(?P<quantifier>every(?:\s+available)?|all\s+available)\s+"
     r"(?P<dimension>[A-Za-z][A-Za-z0-9_-]*)"
@@ -321,9 +327,17 @@ def compile_objective_contract(
     ranges: dict[str, tuple[str, ...]] = {}
     occupied: list[tuple[int, int]] = []
 
-    for match in _RANGE_PATTERN.finditer(text):
+    range_matches = [*_RANGE_PATTERN.finditer(text), *_ENUMERATED_RANGE_PATTERN.finditer(text)]
+    for match in sorted(range_matches, key=lambda item: item.start()):
         start = int(match.group("start"))
         end = int(match.group("end"))
+        if match.re is _ENUMERATED_RANGE_PATTERN:
+            observed = (start, *map(int, re.findall(r"\d+", match.group("middle"))), end)
+            expected = tuple(range(start, end + 1))
+            if observed != expected:
+                raise ObjectiveContractAmbiguity(
+                    f"enumerated range {match.group(0)!r} is not contiguous"
+                )
         if end < start:
             raise ObjectiveContractAmbiguity(
                 f"descending range {match.group(0)!r} is ambiguous; state the required order"
@@ -397,6 +411,7 @@ def compile_objective_contract(
 
     for match in _EXPLICIT_LIST_PATTERN.finditer(text):
         raw_items = match.group("items").strip()
+        raw_items = re.sub(r"[ \t]+in[ \t]+order$", "", raw_items, flags=re.IGNORECASE)
         # Require an explicit final conjunction. Comma-separated lists retain the
         # serial-comma guard; two-item lists must contain exactly one conjunction.
         # This excludes ordinary workflow prose such as "Assess the app,
