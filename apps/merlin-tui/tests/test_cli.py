@@ -38,6 +38,8 @@ def _install_durable_campaign(
             self.approved = False
             self.execute_calls: list[tuple[object, object]] = []
             self.cancel_calls: list[object] = []
+            self.release_calls = 0
+            self.close_calls = 0
 
         async def list_campaigns(self):
             self.list_calls += 1
@@ -83,6 +85,11 @@ def _install_durable_campaign(
             }
 
         async def close(self):
+            self.close_calls += 1
+            return None
+
+        async def release_foreground_lease(self):
+            self.release_calls += 1
             return None
 
     client = Client()
@@ -956,6 +963,8 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
     # Execution starts through the deterministic daemon RPC, not a model turn.
     assert client.build_calls == 1
     assert client.execute_calls == [("campaign/one", "sha256:reviewed")]
+    assert client.release_calls == 1
+    assert client.close_calls == 0
     assert not any(str(prompt).startswith("Approve and execute") for prompt, *_ in calls)
 
 

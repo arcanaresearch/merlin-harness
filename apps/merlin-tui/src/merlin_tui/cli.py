@@ -1261,6 +1261,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
         if campaign_poll_error is not None:
             note += "; durable campaign polling also failed"
         raise SystemExit("campaign was not durably prepared; refusing approval" + note)
+    campaign_active = False
     try:
         if (
             streamed_review is not None
@@ -1286,9 +1287,12 @@ async def _submit_campaign(arguments: list[str]) -> None:
         # attached to the preparation daemon so the reviewed session identity is
         # preserved through the execute RPC.
         try:
-            await campaign_client.execute_campaign(campaign_id, digest)
+            execution = _plain(await campaign_client.execute_campaign(campaign_id, digest))
         except RuntimeError as error:
             raise SystemExit(f"campaign {campaign_id} execution was rejected: {error}") from None
+        campaign_active = (
+            isinstance(execution, dict) and execution.get("status") == "executing"
+        )
         final = _plain(await campaign_client.campaign_status(campaign_id))
         if not isinstance(final, dict) or final.get("status") == "prepared":
             raise SystemExit(
@@ -1296,10 +1300,20 @@ async def _submit_campaign(arguments: list[str]) -> None:
                 "no wave was compiled and the campaign will never start on its own; "
                 "re-run merlin campaign submit or cancel the campaign"
             )
+        campaign_active = final.get("status") == "executing"
         print(f"Campaign started: {campaign_id}")
         print(f"Monitor: merlin campaign status {campaign_id}")
     finally:
-        await _bounded_stream_teardown(campaign_client.close())
+        if campaign_active:
+            # Submission is finished, but the daemon now owns live campaign work.
+            # Releasing the foreground lease arms the daemon's campaign-aware idle
+            # watcher; closing an owning client here would bypass that watcher and
+            # tear down the campaign immediately after printing "Campaign started".
+            release = getattr(campaign_client, "release_foreground_lease", None)
+            if callable(release):
+                await _bounded_stream_teardown(release())
+        else:
+            await _bounded_stream_teardown(campaign_client.close())
 
 
 def _validate_campaign_review(
