@@ -533,6 +533,27 @@ def test_objective_phase_gate_requires_reviewed_identity_and_predicate() -> None
     assert failed_predicate["status"] == "blocked"
 
 
+def test_objective_phase_gate_accepts_clean_target_predicate_without_attack_corroboration() -> None:
+    gate = _objective_gate(max_attempts=1)
+    task = AgentTask(id="gate-task", objective="gate", status="completed")
+    evidence = _objective_gate_evidence(task.id)
+    receipt = evidence[task.id]["target_evidence_receipts"]["target-call:1"]
+    receipt["attempt_disposition"] = "uncertain"
+    receipt["outcome_authority"] = "none"
+    receipt["target_authoritative_outcome"] = "unclear"
+    transition = receipt["target_state_transition"]
+    transition["outcome"] = "unclear"
+    transition["disposition_rule"] = "no_valid_corroborated_observation"
+    transition["quarantined_observations"] = ["stage"]
+    transition["observations"][0]["trust_class"] = "target_reported"
+
+    settled = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert settled["status"] == "succeeded"
+    assert settled["attempt_disposition"] == "valid"
+    assert settled["last_transition"] == transition
+
+
 async def test_objective_phase_gate_controller_retries_in_order_before_frontier() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     gates = (_objective_gate("baseline", 0), _objective_gate("progression", 1))

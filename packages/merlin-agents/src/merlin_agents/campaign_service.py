@@ -23155,26 +23155,8 @@ def _objective_phase_gate_result(
     else:
         canonical = _canonical_committed_attempt_outcome(committed)
         disposition = str(canonical["attempt_disposition"])
-    if disposition != "valid":
-        retry_reason = (
-            ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE
-            if disposition == "infrastructure_failed"
-            else ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION
-        )
-        return {
-            "status": "retryable" if retry_reason in gate.retry_on else "blocked",
-            "attempt_disposition": disposition,
-            "target_calls": len(target_calls),
-            "last_transition": None,
-            "blocker": f"objective prerequisite attempt was {disposition}",
-        }
     transitions = _objective_gate_transitions(committed)
     evaluated_transition = transitions[-1] if transitions else None
-    predicate_result = (
-        None
-        if evaluated_transition is None
-        else evaluate_objective_gate_predicate(asdict(gate), evaluated_transition)
-    )
     observation = next(
         (
             item
@@ -23188,6 +23170,63 @@ def _objective_phase_gate_result(
         ),
         None,
     )
+    predicate_transition = evaluated_transition
+    if (
+        evaluated_transition is not None
+        and observation is not None
+        and observation.get("trust_class") == "target_reported"
+        and not observation.get("validation_errors")
+        and evaluated_transition.get("disposition_rule")
+        == "no_valid_corroborated_observation"
+    ):
+        predicate_transition = {
+            **evaluated_transition,
+            "quarantined_observations": tuple(
+                name
+                for name in evaluated_transition.get("quarantined_observations", ())
+                if name != gate.success_predicate.observation_name
+            ),
+        }
+    predicate_result = (
+        None
+        if predicate_transition is None
+        else evaluate_objective_gate_predicate(asdict(gate), predicate_transition)
+    )
+    reviewed_predicate_satisfied = (
+        predicate_result is True
+        and evaluated_transition is not None
+        and evaluated_transition.get("authority") == "target"
+        and evaluated_transition.get("identity_match") is True
+        and not evaluated_transition.get("validation_errors")
+        and observation is not None
+        and not observation.get("validation_errors")
+    )
+    if reviewed_predicate_satisfied:
+        return {
+            "status": "succeeded",
+            "attempt_disposition": "valid",
+            "target_calls": len(target_calls),
+            "last_transition": dict(evaluated_transition),
+            "blocker": None,
+            "evidence_refs": tuple(
+                str(value)
+                for value in (committed.get("reference"), committed.get("digest"), *target_calls)
+                if isinstance(value, str) and value
+            ),
+        }
+    if disposition != "valid":
+        retry_reason = (
+            ObjectiveGateRetryReason.INFRASTRUCTURE_FAILURE
+            if disposition == "infrastructure_failed"
+            else ObjectiveGateRetryReason.AMBIGUOUS_TRANSITION
+        )
+        return {
+            "status": "retryable" if retry_reason in gate.retry_on else "blocked",
+            "attempt_disposition": disposition,
+            "target_calls": len(target_calls),
+            "last_transition": None,
+            "blocker": f"objective prerequisite attempt was {disposition}",
+        }
     last_transition = dict(transitions[-1]) if transitions else None
     if predicate_result is True:
         status, blocker = "succeeded", None
