@@ -3825,20 +3825,24 @@ def _compile_objective_phase_gate_audit(
 
     observation_names: set[str] = set()
 
-    def collect_observation_names(value: object) -> None:
-        if isinstance(value, Mapping):
+    def collect_declared_observations(value: object) -> None:
+        if not isinstance(value, (list, tuple)):
+            return
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
             for field in ("name", "observation_name"):
-                name = str(value.get(field) or "").strip()
+                name = str(item.get(field) or "").strip()
                 if name:
                     observation_names.add(name)
-            for child in value.values():
-                collect_observation_names(child)
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                collect_observation_names(child)
 
-    collect_observation_names(reviewed_adapter.get("state_observations"))
-    collect_observation_names(reviewed_adapter.get("state_capabilities"))
+    # Only executable state-observation declarations can back a runtime gate.
+    # Identity selectors describe how receipts are joined; they are not emitted
+    # as transition observations and therefore cannot satisfy a predicate.
+    collect_declared_observations(reviewed_adapter.get("state_observations"))
+    state_capabilities = reviewed_adapter.get("state_capabilities")
+    if isinstance(state_capabilities, Mapping):
+        collect_declared_observations(state_capabilities.get("observations"))
 
     existing_by_key: dict[str, dict[str, object]] = {}
     for gate in proposed_gates:
@@ -10480,8 +10484,11 @@ def build_backend(
                             "array. Never silently omit a true prerequisite. Predicate "
                             "operators are present, equals, one_of, at_least, at_most, "
                             "increases, decreases, or terminal_success. Use present with an "
-                            "empty expected_values array when a non-empty authoritative identity "
-                            "or authentication observation proves the prerequisite; never compare "
+                            "empty expected_values array when a non-empty executable state "
+                            "observation proves the prerequisite. Identity selectors and capture "
+                            "names are receipt metadata, not state observations; never select them "
+                            "unless the adapter also declares them in state_observations or "
+                            "state_capabilities.observations. Never compare "
                             "an identifier to an empty string."
                         ),
                     ),

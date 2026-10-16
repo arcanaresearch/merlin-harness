@@ -294,6 +294,49 @@ def test_objective_phase_gate_audit_accepts_present_and_rejects_blank_identity()
         _compile_objective_phase_gate_audit(objective, adapter, (), audit)
 
 
+def test_objective_phase_gate_audit_rejects_identity_selector_as_observation() -> None:
+    objective = "Authenticate with Test Wallet."
+    adapter = {
+        "api_steps": [{"step_id": "read-state", "interaction": False}],
+        "state_capabilities": {
+            "identity": {
+                "name": "run_id",
+                "result_selector": {
+                    "step_id": "read-state",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/id",
+                },
+            },
+            "observations": [{"name": "run_status"}],
+        },
+    }
+    audit = {
+        "requirements": [
+            {"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}
+        ],
+        "gate_proposals": [
+            {
+                "key": "auth",
+                "objective": "Verify the authenticated run",
+                "actions": [{"step_id": "read-state"}],
+                "success_predicate": {
+                    "observation_name": "run_id",
+                    "operator": "present",
+                    "expected_values": [],
+                },
+            }
+        ],
+        "unresolved_requirements": [],
+    }
+
+    with pytest.raises(ValueError, match="unknown authoritative observation 'run_id'"):
+        _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+
+    audit["gate_proposals"][0]["success_predicate"]["observation_name"] = "run_status"
+    gates = _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+    assert gates[0]["success_predicate"]["observation_name"] == "run_status"
+
+
 def test_objective_phase_gate_audit_rejects_unreviewed_adapter_bindings() -> None:
     with pytest.raises(ValueError, match="unknown adapter step"):
         _compile_objective_phase_gate_audit(
