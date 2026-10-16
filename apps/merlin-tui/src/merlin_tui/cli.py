@@ -834,12 +834,25 @@ def _prepared_objective_preserves_operator_scope(operator: str, prepared: str) -
     if operator_normalized in prepared_normalized:
         return True
 
+    # ``campaign submit`` is itself the Merlin invocation, so providers may
+    # reasonably omit the leading product command while preserving the actual
+    # assessment objective.  Admit only this exact wrapper removal, and only
+    # through the same-origin anchored path below.  The remaining operator text
+    # still has to survive unchanged apart from typography, whitespace, and case.
+    operator_variants = [operator_normalized]
+    invocation_prefix = "use merlin to "
+    if operator_normalized.casefold().startswith(invocation_prefix):
+        operator_variants.append(operator_normalized[len(invocation_prefix) :])
+
     lines = [line.strip() for line in prepared.splitlines() if line.strip()]
     target_lines = [line for line in lines if line.casefold().startswith("target:")]
     semantic_lines = [line for line in lines if line not in target_lines]
     if not target_lines or not semantic_lines:
         return False
-    if any(normalized(line) not in operator_normalized for line in semantic_lines):
+    if not any(
+        all(normalized(line).casefold() in variant.casefold() for line in semantic_lines)
+        for variant in operator_variants
+    ):
         return False
 
     operator_origins = {

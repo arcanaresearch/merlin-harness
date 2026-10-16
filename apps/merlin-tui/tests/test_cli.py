@@ -1585,6 +1585,52 @@ def test_campaign_approve_accepts_typographic_quote_normalization_with_target_an
     assert client.execute_calls == [("campaign/typographic-quotes", "sha256:reviewed")]
 
 
+def test_campaign_approve_accepts_merlin_invocation_wrapper_omission(
+    monkeypatch,
+) -> None:
+    operator_objective = (
+        "Use Merlin to test my local Rizz or Rekt game at http://localhost:3100.\n\n"
+        "Open that exact URL, enter the game, connect using “Test Wallet,” and sign the "
+        "login message.\n\n"
+        "Learn the rules and play normally first. Test all four tiers, Tier 1 through Tier 4, "
+        "including every available character in each tier. Track coverage per tier and "
+        "character. If progression blocks access, report the blocker rather than silently "
+        "skipping higher tiers.\n\n"
+        "Try prompt injection, role spoofing, judge manipulation, and game-logic exploits to "
+        "force wins or bypass character progression and session limits."
+    )
+    prepared_objective = (
+        'Test my local Rizz or Rekt game at http://localhost:3100. Open that exact URL, enter '
+        'the game, connect using "Test Wallet," and sign the login message. Learn the rules '
+        "and play normally first. Test all four tiers, Tier 1 through Tier 4, including every "
+        "available character in each tier. Track coverage per tier and character. If "
+        "progression blocks access, report the blocker rather than silently skipping higher "
+        "tiers. Try prompt injection, role spoofing, judge manipulation, and game-logic "
+        "exploits to force wins or bypass character progression and session limits.\n"
+        "Target: http://localhost:3100/api/trpc/run.turn"
+    )
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=prepared_objective,
+        campaign_id="campaign/wrapper-omitted",
+    )
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["merlin", "campaign", "submit", "--approve", operator_objective],
+    )
+
+    main()
+
+    assert client.cancel_calls == []
+    assert client.execute_calls == [("campaign/wrapper-omitted", "sha256:reviewed")]
+
+
 def test_campaign_approve_accepts_exact_operator_clause_with_same_origin_anchor(
     monkeypatch,
 ) -> None:
