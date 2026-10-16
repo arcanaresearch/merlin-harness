@@ -8849,10 +8849,17 @@ class ReconRecallTool:
             "Run one lightweight validation probe against the exact match."
             if exact
             else (
-                "Have the Campaign Lead compare requested_scope with the candidate's recorded "
-                "recon_scope and adapter blueprint. If the Lead judges them semantically relevant, "
-                "validate only the listed endpoints and state selectors in the current session, "
-                "then compile a new handoff. Otherwise begin narrower bot-specific reconnaissance."
+                "The Campaign Lead must compare requested_scope with the candidate's recorded "
+                "recon_scope and adapter blueprint and make the semantic reuse decision. If the "
+                "Lead judges them relevant, open only the requested target entry surface, satisfy "
+                "the requested authentication flow, and perform at most one harmless UI exchange "
+                "needed to capture fresh requests and responses for the blueprint's listed "
+                "endpoints. Inspect only those endpoint exchanges and their target-authored state "
+                "fields, then compile a superseding current-session handoff. Learn missing state "
+                "observations from those fresh endpoint responses. Do not probe robots.txt, "
+                "sitemap.xml, guessed routes, application source files, or unrelated endpoints. "
+                "If the Lead judges the candidate irrelevant, record the material scope mismatch "
+                "and begin narrower bot-specific reconnaissance."
             )
             if semantic_review_available
             else "Reuse only shared site facts and begin bot-specific reconnaissance."

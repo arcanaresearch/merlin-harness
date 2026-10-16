@@ -7620,6 +7620,11 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
                 },
             )
             assert different_bot.metadata["default_action"] == "semantic_scope_review"
+            assert "Campaign Lead must compare requested_scope" in different_bot.metadata[
+                "next_action"
+            ]
+            assert "at most one harmless UI exchange" in different_bot.metadata["next_action"]
+            assert "Do not probe robots.txt" in different_bot.metadata["next_action"]
             assert different_bot.metadata["exact_matches"] == []
             partial = different_bot.metadata["partial_matches"][0]
             assert partial["different_dimensions"] == [
