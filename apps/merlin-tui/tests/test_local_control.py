@@ -948,6 +948,47 @@ async def test_foreground_lease_disconnect_keeps_active_campaign_daemon_alive(
 
 
 @pytest.mark.asyncio
+async def test_foreground_lease_disconnect_rechecks_transient_idle_campaign(
+    monkeypatch,
+) -> None:
+    class CampaignBackend(Backend):
+        def __init__(self) -> None:
+            self.checks = 0
+
+        async def has_active_background_work(self) -> bool:
+            self.checks += 1
+            return self.checks > 1
+
+    monkeypatch.setattr("merlin_tui.local_control._IDLE_SHUTDOWN_CONFIRM_SECONDS", 0.02)
+    backend = CampaignBackend()
+    socket_path = Path(f"/tmp/merlin-transient-idle-campaign-{os.getpid()}.sock")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    task = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    client = LocalControlClient(socket_path=socket_path)
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await client.acquire_foreground_lease()
+        await client.release_foreground_lease()
+        for _ in range(100):
+            if backend.checks >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert backend.checks >= 2
+        assert not task.done()
+        assert await asyncio.to_thread(socket_path.exists)
+        await client.shutdown()
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_foreground_lease_heartbeat_keeps_daemon_alive(monkeypatch) -> None:
     from uuid import uuid4
 

@@ -284,6 +284,56 @@ def test_physical_state_history_and_target_execution_fence_cross_scopes(tmp_path
                 assert competing.release_target_execution(takeover, "invocation:takeover")
 
 
+def test_physical_state_claim_adopts_owner_without_live_execution_lease(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-stale-physical-owner")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            first_campaign = "campaign/stale-physical-owner"
+            second_campaign = "campaign/physical-owner-successor"
+            _prepare_campaign(connection, first_campaign)
+            _prepare_campaign(connection, second_campaign)
+            sessions = CampaignApiSessionRepository(connection)
+            sessions.create(
+                first_campaign,
+                "target-1",
+                "sha256:adapter",
+                session_scope_id="assignment:first",
+            )
+            sessions.create(
+                second_campaign,
+                "target-1",
+                "sha256:adapter",
+                session_scope_id="assignment:second",
+            )
+
+            first_claim = sessions.claim_physical_state(
+                first_campaign,
+                "sha256:physical-run-a",
+                target_id="target-1",
+                session_scope_id="assignment:first",
+            )
+            assert first_claim.session.remote_session_id == "sha256:physical-run-a"
+
+            successor = sessions.claim_physical_state(
+                second_campaign,
+                "sha256:physical-run-a",
+                target_id="target-1",
+                session_scope_id="assignment:second",
+            )
+
+            assert successor.previously_observed
+            assert successor.prior_session_scope_ids == ("assignment:first",)
+            assert successor.session.remote_session_id == "sha256:physical-run-a"
+            prior = sessions.load(
+                first_campaign,
+                target_id="target-1",
+                session_scope_id="assignment:first",
+            )
+            assert prior is not None
+            assert prior.remote_session_id is None
+            assert prior.physical_state_identity == "sha256:physical-run-a"
+
+
 def test_scoped_api_session_state_survives_postgres_restart(tmp_path: Path) -> None:
     data_dir = tmp_path / "postgres-scoped-restart"
     campaign_id = "campaign/scoped-restart"

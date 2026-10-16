@@ -521,6 +521,29 @@ class CampaignApiSessionRepository(StateScopeRepository):
                          AND state = 'ambiguous'""",
                     (target_id, identity),
                 )
+                # A daemon or TUI can disappear after the target execution lease
+                # is released but before the session row drops its live identity.
+                # Preserve physical_state_identity as sequential alias history,
+                # while releasing only owners that provably have no live target
+                # execution. A genuinely active worker remains protected by its
+                # unexpired lease and will still trigger the unique-claim fence.
+                self.connection.execute(
+                    """UPDATE merlin_storage.campaign_api_sessions s
+                       SET remote_session_id = NULL, updated_at = now()
+                       WHERE s.target_id = %s AND s.remote_session_id = %s
+                         AND NOT (
+                             s.campaign_id = %s AND s.session_scope_id = %s
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM merlin_storage.target_execution_leases l
+                             WHERE l.target_id = s.target_id
+                               AND l.campaign_id = s.campaign_id
+                               AND l.session_scope_id = s.session_scope_id
+                               AND l.expires_at > now()
+                         )""",
+                    (target_id, identity, campaign_id, session_scope_id),
+                )
                 row = self.connection.execute(
                     """UPDATE merlin_storage.campaign_api_sessions
                        SET remote_session_id = %s, physical_state_identity = %s,

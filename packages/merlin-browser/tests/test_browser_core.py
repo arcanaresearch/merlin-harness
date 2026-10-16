@@ -7698,6 +7698,45 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
 
 
 @pytest.mark.asyncio
+async def test_recon_recall_restricts_navigation_to_requested_entry_surface() -> None:
+    class Recorder:
+        async def list_handoffs(self, _target_id, limit=20):
+            return ()
+
+        async def append_action(self, _action):
+            raise AssertionError("rejected navigation must not reach the target")
+
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            actions = browser_tools(lambda _: session, Recorder())
+            recall = next(
+                item
+                for item in actions
+                if item.describe().name == "browser_recall_reconnaissance"
+            )
+            opened = next(
+                item for item in actions if item.describe().name == "browser_open_tab"
+            )
+            context = ToolContext(session_id="s1", workspace_root="/tmp")
+
+            result = await recall.invoke(
+                context,
+                {"surface": origin, "agent_or_bot": "target"},
+            )
+            rejected = await opened.invoke(
+                context,
+                {"url": f"{origin}/src/lib/private.ts"},
+            )
+
+            assert result.metadata["preferred_next_tool"] == "browser_open_tab"
+            assert rejected.is_error is True
+            assert rejected.metadata["failure_code"] == "recon_entry_surface_required"
+            assert rejected.metadata["target_effect_attempted"] is False
+
+
+@pytest.mark.asyncio
 async def test_recon_recall_does_not_reuse_legacy_passive_session_adapter() -> None:
     class Recorder:
         def __init__(self, handoff):

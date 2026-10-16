@@ -396,7 +396,7 @@ class BrowserTool:
         failure_tracker: dict[tuple[str, ...], int] | None = None,
         network_seen: dict[tuple[str, ...], deque[str]] | None = None,
         state_scope_store: object | None = None,
-        recalled_recon: set[tuple[str, str]] | None = None,
+        recalled_recon: dict[tuple[str, str], str] | None = None,
     ) -> None:
         if name not in _SPECS:
             raise ValueError(f"unknown browser tool: {name}")
@@ -476,6 +476,33 @@ class BrowserTool:
                         "target_call_budget_charge": 0,
                     },
                 )
+        recalled_surface = (
+            self._recalled_recon.get(recall_key)
+            if self._recalled_recon is not None
+            else None
+        )
+        requested_url = _string(arguments.get("url"))
+        if (
+            kind in {"open_tab", "navigate"}
+            and recalled_surface is not None
+            and requested_url is not None
+            and requested_url.rstrip("/") != recalled_surface.rstrip("/")
+        ):
+            return ToolResult(
+                content=(
+                    "durable reconnaissance recall restricts navigation to the requested "
+                    "target entry surface; reuse recalled site facts and inspect only fresh "
+                    "target-authored state/network evidence from that surface"
+                ),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "recon_entry_surface_required",
+                    "requested_surface": recalled_surface,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                },
+            )
         action_value = _string(arguments.get("url", arguments.get("value")))
         evidence_refs = ["browser-action:sha256:" + uuid4().hex + uuid4().hex]
         if kind == "fill" and arguments.get("connection_probe") is True:
@@ -8676,7 +8703,7 @@ class ReconRecallTool:
         self,
         resolver: BrowserSessionResolver,
         recorder: BrowserRecorder,
-        recalled_recon: set[tuple[str, str]] | None = None,
+        recalled_recon: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self._resolver = resolver
         self._recorder = recorder
@@ -8732,7 +8759,11 @@ class ReconRecallTool:
         partial: list[dict[str, object]] = []
         handoffs = await self._recorder.list_handoffs(session.bounds.target_id)
         if self._recalled_recon is not None:
-            self._recalled_recon.add((context.session_id, session.bounds.target_id))
+            recalled_surface = desired["surface"]
+            if urlsplit(recalled_surface).scheme.casefold() in {"http", "https"}:
+                self._recalled_recon[(context.session_id, session.bounds.target_id)] = (
+                    recalled_surface
+                )
         compatible_tenants = {
             tuple(sorted(_scope_tokens(str(handoff.recon_scope["tenant"]))))
             for handoff in handoffs
@@ -8934,7 +8965,10 @@ class ReconRecallTool:
                 "session's handoff directly to assessment_prepare."
             ),
         }
-        return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
+        return ToolResult(
+            content=json.dumps(result, sort_keys=True),
+            metadata={**result, "preferred_next_tool": "browser_open_tab"},
+        )
 
 
 def _authentication_neutral_site_facts(value: str | None) -> str | None:
@@ -8990,7 +9024,7 @@ def browser_tools(
 ]:
     failures: dict[tuple[str, ...], int] = {}
     network_seen: dict[tuple[str, ...], deque[str]] = {}
-    recalled_recon: set[tuple[str, str]] | None = set() if recorder is not None else None
+    recalled_recon: dict[tuple[str, str], str] | None = {} if recorder is not None else None
     actions: tuple[
         BrowserTool
         | BrowserOwnedSessionCleanupTool

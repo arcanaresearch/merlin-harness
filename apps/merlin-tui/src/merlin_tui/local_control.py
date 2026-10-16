@@ -78,6 +78,7 @@ _SNAPSHOT_METHODS = frozenset(
 _BATCHABLE_STREAM_KINDS = frozenset({"status", "content", "thinking"})
 _STARTER_EXIT_GRACE_SECONDS = 0.5
 _RECOVERY_WATCHDOG_SECONDS = 5.0
+_IDLE_SHUTDOWN_CONFIRM_SECONDS = 0.25
 _FOREGROUND_HEARTBEAT_SECONDS = 1.0
 _FOREGROUND_LEASE_TIMEOUT_SECONDS = 5.0
 _FOREGROUND_ATTACH_GRACE_SECONDS = 10.0
@@ -556,6 +557,7 @@ async def serve(
         if grace_seconds:
             await asyncio.sleep(grace_seconds)
         activity_reader = getattr(backend, "has_active_background_work", None)
+        inactive_observations = 0
         while foreground_lease_id is None and not shutdown.is_set():
             try:
                 active = bool(await activity_reader()) if callable(activity_reader) else False
@@ -563,12 +565,23 @@ async def serve(
                 # Losing the daemon would pause and invalidate live target contexts.
                 # Preserve possible work and retry the authoritative activity check.
                 active = True
-            if not active:
+            if active:
+                inactive_observations = 0
+            else:
+                inactive_observations += 1
+            if inactive_observations >= 2:
                 clean_shutdown = True
                 shutdown.set()
                 return
             try:
-                await asyncio.wait_for(shutdown.wait(), timeout=_RECOVERY_WATCHDOG_SECONDS)
+                await asyncio.wait_for(
+                    shutdown.wait(),
+                    timeout=(
+                        _IDLE_SHUTDOWN_CONFIRM_SECONDS
+                        if inactive_observations
+                        else _RECOVERY_WATCHDOG_SECONDS
+                    ),
+                )
             except TimeoutError:
                 pass
 
