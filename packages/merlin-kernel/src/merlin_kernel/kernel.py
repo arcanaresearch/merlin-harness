@@ -1053,6 +1053,9 @@ class Kernel:
                 async def handle_dynamic_tool(
                     call: ToolCall,
                     _advertised_tool_names: frozenset[str] = advertised_tool_names,
+                    _described_tool_names: frozenset[str] = frozenset(
+                        spec.name for spec in described_tools
+                    ),
                     _request_preferred_tool_name: str | None = request_preferred_tool_name,
                 ) -> DynamicToolOutput:
                     nonlocal automatic_no_progress_key
@@ -1101,7 +1104,14 @@ class Kernel:
                         is_required_owned_cleanup
                         and owned_cleanup_key in owned_cleanup_attempted_keys
                     )
-                    if call.name == _request_preferred_tool_name and not duplicate_owned_cleanup:
+                    current_preferred_tool_name = preferred_next_tool_name
+                    is_preferred_tool_call = call.name == current_preferred_tool_name
+                    dynamically_admitted_transition = (
+                        is_preferred_tool_call
+                        and call.name != _request_preferred_tool_name
+                        and call.name in _described_tool_names
+                    )
+                    if is_preferred_tool_call and not duplicate_owned_cleanup:
                         # Invocation discharges the obligation even when the tool returns a
                         # typed error. Tool integrity failures are evidence, not provider prose.
                         preferred_next_tool_name = None
@@ -1113,7 +1123,7 @@ class Kernel:
                         call_id=call.call_id,
                     )
                     tool_admitted = (
-                        call.name in _advertised_tool_names
+                        (call.name in _advertised_tool_names or dynamically_admitted_transition)
                         and (
                             call.name != _OWNED_SESSION_CLEANUP_TOOL
                             or (

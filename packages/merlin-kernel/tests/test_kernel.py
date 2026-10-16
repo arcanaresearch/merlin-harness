@@ -2301,6 +2301,68 @@ async def test_dynamic_preferred_tool_invocation_discharges_obligation() -> None
 
 
 @pytest.mark.asyncio
+async def test_dynamic_provider_can_follow_trusted_tool_transition_in_same_request() -> None:
+    class DynamicTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="compile", description="Compile", input_schema={}),
+                ToolSpec(name="assessment_prepare", description="Prepare", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "compile":
+                return ToolResult(
+                    content="compiled",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="prepared")
+
+    class DynamicProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            compiled = await handler(
+                ToolCall(call_id="compile", name="compile", arguments={})
+            )
+            assert compiled.success is True
+            prepared = await handler(
+                ToolCall(
+                    call_id="prepare",
+                    name="assessment_prepare",
+                    arguments={},
+                )
+            )
+            assert prepared.success is True
+            yield TextDelta(text="Prepared.")
+            yield ModelCompleted()
+
+    provider = DynamicProvider()
+    tools = DynamicTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("prepare")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 1
+    assert tools.calls == ["compile", "assessment_prepare"]
+    assert not any(
+        message.role == "tool" and "not admitted" in message.content
+        for message in store.messages[kernel.session_id]
+    )
+
+
+@pytest.mark.asyncio
 async def test_repeated_preferred_tool_refusal_is_typed_retryable_failure() -> None:
     class PreferredTools(Tools):
         def describe(self):
