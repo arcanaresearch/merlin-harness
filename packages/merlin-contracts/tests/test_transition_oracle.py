@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from merlin_contracts import build_state_observation, evaluate_state_transition
+from merlin_contracts import (
+    build_state_observation,
+    evaluate_objective_gate_predicate,
+    evaluate_state_transition,
+)
 
 
 def _observed(
@@ -93,3 +97,33 @@ def test_missing_observation_value_is_canonical_but_non_authoritative() -> None:
     assert transition["outcome"] == "unclear"
     assert "score:baseline:invalid_digest" in transition["validation_errors"]
     assert transition["quarantined_observations"] == ["score"]
+
+
+def test_objective_gate_present_requires_a_nonempty_authoritative_result() -> None:
+    transition = {
+        "schema": "merlin.target-state-transition.v2",
+        "authority": "target",
+        "identity_match": True,
+        "conflict": False,
+        "validation_errors": [],
+        "quarantined_observations": [],
+        "observations": [
+            {
+                "name": "run_id",
+                "before_value": "run-1",
+                "after_value": "run-1",
+                "validation_errors": [],
+            }
+        ],
+    }
+    gate = {
+        "success_predicate": {
+            "observation_name": "run_id",
+            "operator": "present",
+            "expected_values": [],
+        }
+    }
+
+    assert evaluate_objective_gate_predicate(gate, transition) is True
+    transition["observations"][0]["after_value"] = ""
+    assert evaluate_objective_gate_predicate(gate, transition) is False

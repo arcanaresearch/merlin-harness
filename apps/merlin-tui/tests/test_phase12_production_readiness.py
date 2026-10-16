@@ -253,6 +253,47 @@ def test_objective_phase_gate_audit_can_narrow_an_overbroad_existing_gate() -> N
     assert gates[0]["budget"] == {"max_attempts": 2, "max_target_calls": 2}
 
 
+def test_objective_phase_gate_audit_accepts_present_and_rejects_blank_identity() -> None:
+    objective = "Authenticate with Test Wallet."
+    adapter = {
+        "api_steps": [{"step_id": "read-state", "interaction": False}],
+        "state_observations": [{"name": "run_id", "role": "state_identity"}],
+    }
+    audit = {
+        "requirements": [
+            {"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}
+        ],
+        "gate_proposals": [
+            {
+                "key": "auth",
+                "objective": "Verify the authenticated run identity",
+                "actions": [{"step_id": "read-state"}],
+                "success_predicate": {
+                    "observation_name": "run_id",
+                    "operator": "present",
+                    "expected_values": [],
+                },
+            }
+        ],
+        "unresolved_requirements": [],
+    }
+
+    gates = _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+    assert gates[0]["success_predicate"] == {
+        "observation_name": "run_id",
+        "operator": "present",
+        "expected_values": [],
+    }
+
+    audit["gate_proposals"][0]["success_predicate"] = {
+        "observation_name": "run_id",
+        "operator": "equals",
+        "expected_values": [""],
+    }
+    with pytest.raises(ValueError, match="cannot use blank expected values"):
+        _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+
+
 def test_objective_phase_gate_audit_rejects_unreviewed_adapter_bindings() -> None:
     with pytest.raises(ValueError, match="unknown adapter step"):
         _compile_objective_phase_gate_audit(

@@ -51,6 +51,8 @@ def evaluate_objective_gate_predicate(
         return None
     before = observation.get("before_value")
     after = observation.get("after_value")
+    if operator == "present":
+        return after is not None and (not isinstance(after, str) or bool(after.strip()))
     if operator == "terminal_success":
         return observation.get("status") == "success"
     if operator in {"increases", "decreases"}:

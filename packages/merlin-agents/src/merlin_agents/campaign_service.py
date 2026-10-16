@@ -19067,6 +19067,7 @@ class AssessmentPrepareTool:
                                         },
                                         "operator": {
                                             "enum": [
+                                                "present",
                                                 "equals",
                                                 "one_of",
                                                 "at_least",

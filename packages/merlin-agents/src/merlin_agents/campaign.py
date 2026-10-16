@@ -58,6 +58,7 @@ class CampaignProfile(StrEnum):
 
 
 class ObjectiveGateOperator(StrEnum):
+    PRESENT = "present"
     EQUALS = "equals"
     ONE_OF = "one_of"
     AT_LEAST = "at_least"

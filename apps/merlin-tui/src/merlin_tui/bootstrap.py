@@ -3848,6 +3848,7 @@ def _compile_objective_phase_gate_audit(
         existing_by_key[gate_id] = dict(gate)
 
     operators = {
+        "present",
         "equals",
         "one_of",
         "at_least",
@@ -3905,6 +3906,13 @@ def _compile_objective_phase_gate_audit(
         expected_values = predicate.get("expected_values", [])
         if not isinstance(expected_values, list):
             raise ValueError("objective prerequisite expected_values must be an array")
+        if operator in {"equals", "one_of"} and any(
+            isinstance(item, str) and not item.strip() for item in expected_values
+        ):
+            raise ValueError(
+                "objective prerequisite equality predicates cannot use blank expected values; "
+                "use present to verify a non-empty authoritative observation"
+            )
 
         slug = "-".join(
             part
@@ -10470,8 +10478,11 @@ def build_backend(
                             "neither reviewed evidence nor an adapter action that can verify or "
                             "perform it. Never put cumulative coverage or reporting work in that "
                             "array. Never silently omit a true prerequisite. Predicate "
-                            "operators are equals, one_of, at_least, at_most, increases, "
-                            "decreases, or terminal_success."
+                            "operators are present, equals, one_of, at_least, at_most, "
+                            "increases, decreases, or terminal_success. Use present with an "
+                            "empty expected_values array when a non-empty authoritative identity "
+                            "or authentication observation proves the prerequisite; never compare "
+                            "an identifier to an empty string."
                         ),
                     ),
                     ChatMessage(
