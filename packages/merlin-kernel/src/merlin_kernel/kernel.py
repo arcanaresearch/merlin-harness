@@ -1154,6 +1154,9 @@ class Kernel:
                     tool_admitted = (
                         (call.name in _advertised_tool_names or dynamically_admitted_transition)
                         and (
+                            current_preferred_tool_name is None or is_preferred_tool_call
+                        )
+                        and (
                             not recon_recall_completed
                             or _tool_admitted_after_recon_recall(call.name)
                         )
@@ -1242,7 +1245,7 @@ class Kernel:
                     if call.name == "request_user_input" and not result.is_error:
                         raise _AwaitingUserInput
                     next_tool = result.metadata.get("preferred_next_tool")
-                    if not result.is_error and isinstance(next_tool, str):
+                    if isinstance(next_tool, str):
                         preferred_next_tool_name = next_tool
                         preferred_tool_follow_through_failures = 0
                     if call.name == _RECON_RECALL_TOOL and not result.is_error:

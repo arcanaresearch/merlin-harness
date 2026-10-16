@@ -2683,6 +2683,71 @@ async def test_preferred_tool_integrity_rejection_remains_real_tool_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_dynamic_preferred_tool_rejects_stale_advertised_tool_in_same_request() -> None:
+    class DynamicTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="observe", description="Observe", input_schema={}),
+                ToolSpec(name="compile", description="Compile", input_schema={}),
+                ToolSpec(name="unrelated", description="Unrelated", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    is_error=True,
+                    metadata={"preferred_next_tool": "compile"},
+                )
+            return ToolResult(content="done")
+
+    class DynamicProvider:
+        def __init__(self):
+            self.requests = []
+            self.unrelated_result = None
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                observed = await handler(
+                    ToolCall(call_id="observe", name="observe", arguments={})
+                )
+                assert observed.success is False
+                self.unrelated_result = await handler(
+                    ToolCall(call_id="unrelated", name="unrelated", arguments={})
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            compiled = await handler(
+                ToolCall(call_id="compile", name="compile", arguments={})
+            )
+            assert compiled.success is True
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = DynamicTools()
+    provider = DynamicProvider()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("repair")
+    await kernel.wait_for_turn()
+
+    assert provider.unrelated_result == DynamicToolOutput(
+        content="unrelated failed: tool is not admitted for this provider request",
+        success=False,
+    )
+    assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["compile"]
+    assert tools.calls == ["observe", "compile"]
+
+
+@pytest.mark.asyncio
 async def test_cleanup_discovery_continues_recon_without_operator_prompt() -> None:
     class ReconTools(Tools):
         def __init__(self):
