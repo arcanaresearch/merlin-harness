@@ -3982,7 +3982,7 @@ async def test_api_handoff_keeps_full_response_when_evaluator_hints_are_stale() 
 
 
 @pytest.mark.asyncio
-async def test_api_handoff_keeps_recompile_available_for_invalid_state_selector() -> None:
+async def test_api_handoff_keeps_invalid_state_selector_advisory() -> None:
     class Session:
         context_id = "browser-context"
         bounds = SimpleNamespace(target_id="target")
@@ -4040,7 +4040,7 @@ async def test_api_handoff_keeps_recompile_available_for_invalid_state_selector(
         for item in adapter["evaluation_uncertainties"]
     )
     assert result.metadata["state_observation_repair_available"] is True
-    assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
+    assert result.metadata["preferred_next_tool"] == "assessment_prepare"
     assert "no pre-interaction baseline was selected" in result.metadata[
         "state_observation_repair"
     ]

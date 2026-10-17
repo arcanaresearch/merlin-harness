@@ -5001,8 +5001,6 @@ class CompiledApiReconHandoffTool:
             if isinstance(cleanup_discovery, Mapping)
             and cleanup_discovery.get("status") == "required_before_target_execution"
             and cleanup_discovery.get("session_ownership") == "owned"
-            else "browser_compile_api_handoff"
-            if state_observation_repair_available
             else "assessment_prepare"
         )
         return ToolResult(
