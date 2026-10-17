@@ -559,8 +559,14 @@ async def serve(
         activity_reader = getattr(backend, "has_active_background_work", None)
         inactive_observations = 0
         while foreground_lease_id is None and not shutdown.is_set():
+            active_stream = any(
+                state.task is not None and not state.task.done()
+                for state in streams.values()
+            )
             try:
-                active = bool(await activity_reader()) if callable(activity_reader) else False
+                active = active_stream or (
+                    bool(await activity_reader()) if callable(activity_reader) else False
+                )
             except Exception:
                 # Losing the daemon would pause and invalidate live target contexts.
                 # Preserve possible work and retry the authoritative activity check.

@@ -1016,6 +1016,72 @@ async def test_foreground_lease_heartbeat_keeps_daemon_alive(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_active_stream_keeps_daemon_alive_after_foreground_lease_expires(
+    monkeypatch,
+) -> None:
+    from uuid import uuid4
+
+    class StreamingBackend(Backend):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def stream(self, prompt):
+            del prompt
+            self.started.set()
+            await self.release.wait()
+            yield StreamEvent("content", "finished")
+
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr("merlin_tui.local_control._FOREGROUND_LEASE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("merlin_tui.local_control._IDLE_SHUTDOWN_CONFIRM_SECONDS", 0.02)
+    monkeypatch.setattr("merlin_tui.local_control._RECOVERY_WATCHDOG_SECONDS", 0.02)
+    backend = StreamingBackend()
+    socket_path = Path(f"/tmp/merlin-active-stream-{uuid4().hex[:12]}.sock")
+    daemon = asyncio.create_task(serve(socket_path, backend_factory=lambda **_: backend))
+    client = LocalControlClient(socket_path=socket_path)
+    stream_task: asyncio.Task[list[StreamEvent]] | None = None
+
+    async def collect_stream() -> list[StreamEvent]:
+        return [event async for event in client.stream("prepare")]
+
+    try:
+        for _ in range(100):
+            if await asyncio.to_thread(socket_path.exists):
+                break
+            await asyncio.sleep(0.01)
+        await client.acquire_foreground_lease()
+        stream_task = asyncio.create_task(collect_stream())
+        await asyncio.wait_for(backend.started.wait(), timeout=1)
+        assert client._lease_heartbeat is not None
+        client._lease_heartbeat.cancel()
+        await asyncio.gather(client._lease_heartbeat, return_exceptions=True)
+        client._lease_heartbeat = None
+
+        await asyncio.sleep(0.15)
+        assert not daemon.done()
+        assert not backend.closed
+
+        backend.release.set()
+        assert [event.text for event in await asyncio.wait_for(stream_task, timeout=1)] == [
+            "finished"
+        ]
+        await asyncio.wait_for(daemon, timeout=1)
+        assert backend.closed
+    finally:
+        backend.release.set()
+        await client.release_foreground_lease()
+        if stream_task is not None and not stream_task.done():
+            stream_task.cancel()
+        if not daemon.done():
+            daemon.cancel()
+        await asyncio.gather(
+            *(task for task in (stream_task, daemon) if task is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_legacy_idle_daemon_is_replaced_before_foreground_attach(
     monkeypatch,
 ) -> None:
