@@ -605,6 +605,68 @@ def test_objective_phase_gate_accepts_reviewed_identity_observation_for_presence
     assert settled["last_transition"] == receipt["target_state_transition"]
 
 
+def test_objective_phase_gate_accepts_presence_from_same_identity_receipt_without_transition(
+) -> None:
+    gate = ObjectivePhaseGate(
+        id="auth-wallet-session-gate",
+        ordinal=0,
+        objective="Verify the authenticated wallet session",
+        actions=(
+            ObjectiveGateAction(
+                id="auth/action",
+                step_id="observed-session-setup",
+                input_text="Verify the authenticated wallet session",
+            ),
+        ),
+        success_predicate=ObjectiveGatePredicate(
+            observation_name="character",
+            operator=ObjectiveGateOperator.PRESENT,
+        ),
+        budget=ObjectiveGateBudget(max_attempts=2, max_target_calls=2),
+    )
+    task = AgentTask(id="gate-task", objective="gate", status="completed")
+    evidence = _objective_gate_evidence(task.id)
+    receipt = evidence[task.id]["target_evidence_receipts"]["target-call:1"]
+    receipt["attempt_disposition"] = "uncertain"
+    del receipt["target_state_transition"]
+    receipt["state_observations"] = [
+        {
+            "name": "physical_state_identity",
+            "phase": "baseline",
+            "authority": "target",
+            "selected_digest": "sha256:run-one",
+            "validation_errors": [],
+        },
+        {
+            "name": "physical_state_identity",
+            "phase": "result",
+            "authority": "target",
+            "selected_digest": "sha256:run-one",
+            "validation_errors": [],
+        },
+        {
+            "name": "character",
+            "role": "custom",
+            "phase": "result",
+            "authority": "target",
+            "trust_class": "target_reported",
+            "selected_value": "gertie",
+            "validation_errors": [],
+        },
+    ]
+
+    settled = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert settled["status"] == "succeeded"
+    assert settled["attempt_disposition"] == "valid"
+    assert settled["last_transition"]["identity_match"] is True
+
+    receipt["state_observations"][1]["selected_digest"] = "sha256:run-two"
+    ambiguous = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert ambiguous["status"] == "retryable"
+
+
 async def test_objective_phase_gate_controller_retries_in_order_before_frontier() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     gates = (_objective_gate("baseline", 0), _objective_gate("progression", 1))

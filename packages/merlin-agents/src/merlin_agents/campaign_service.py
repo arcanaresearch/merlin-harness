@@ -23421,10 +23421,54 @@ def _objective_gate_transitions(
         transitions.append(direct)
     receipts = committed.get("target_evidence_receipts")
     for _, receipt in _mapping_items(receipts):
-        if isinstance(receipt, Mapping) and isinstance(
-            transition := receipt.get("target_state_transition"), Mapping
-        ):
+        if not isinstance(receipt, Mapping):
+            continue
+        if isinstance(transition := receipt.get("target_state_transition"), Mapping):
             transitions.append(transition)
+            continue
+        observations = receipt.get("state_observations")
+        if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
+            continue
+        reviewed = tuple(item for item in observations if isinstance(item, Mapping))
+        baseline_identity = next(
+            (
+                item
+                for item in reviewed
+                if item.get("name") == "physical_state_identity"
+                and item.get("phase") == "baseline"
+                and item.get("authority") == "target"
+                and not item.get("validation_errors")
+                and isinstance(item.get("selected_digest"), str)
+            ),
+            None,
+        )
+        result_identity = next(
+            (
+                item
+                for item in reviewed
+                if item.get("name") == "physical_state_identity"
+                and item.get("phase") == "result"
+                and item.get("authority") == "target"
+                and not item.get("validation_errors")
+                and isinstance(item.get("selected_digest"), str)
+            ),
+            None,
+        )
+        if baseline_identity is None or result_identity is None:
+            continue
+        identity_match = baseline_identity["selected_digest"] == result_identity["selected_digest"]
+        transitions.append(
+            {
+                "schema": "merlin.target-state-transition.v2",
+                "authority": "target",
+                "identity_match": identity_match,
+                "outcome": "unchanged",
+                "observations": (),
+                "validation_errors": (),
+                "quarantined_observations": (),
+                "disposition_rule": "no_valid_corroborated_observation",
+            }
+        )
     return tuple(transitions)
 
 
