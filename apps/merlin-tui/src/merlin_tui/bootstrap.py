@@ -3831,6 +3831,12 @@ def _compile_objective_phase_gate_audit(
         for item in value:
             if not isinstance(item, Mapping):
                 continue
+            if item.get("role") == "state_identity":
+                # Runtime seals identity selectors as opaque physical-state
+                # receipts and deliberately omits their raw values from target
+                # transition observations. They can prove attribution, but they
+                # cannot be evaluated as a phase-gate predicate.
+                continue
             for field in ("name", "observation_name"):
                 name = str(item.get(field) or "").strip()
                 if name:

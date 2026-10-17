@@ -253,11 +253,14 @@ def test_objective_phase_gate_audit_can_narrow_an_overbroad_existing_gate() -> N
     assert gates[0]["budget"] == {"max_attempts": 2, "max_target_calls": 2}
 
 
-def test_objective_phase_gate_audit_accepts_present_and_rejects_blank_identity() -> None:
+def test_objective_phase_gate_audit_rejects_identity_role_and_blank_values() -> None:
     objective = "Authenticate with Test Wallet."
     adapter = {
         "api_steps": [{"step_id": "read-state", "interaction": False}],
-        "state_observations": [{"name": "run_id", "role": "state_identity"}],
+        "state_observations": [
+            {"name": "run_id", "role": "state_identity"},
+            {"name": "run_status", "role": "terminal_status"},
+        ],
     }
     audit = {
         "requirements": [
@@ -278,15 +281,19 @@ def test_objective_phase_gate_audit_accepts_present_and_rejects_blank_identity()
         "unresolved_requirements": [],
     }
 
+    with pytest.raises(ValueError, match="unknown authoritative observation 'run_id'"):
+        _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+
+    audit["gate_proposals"][0]["success_predicate"]["observation_name"] = "run_status"
     gates = _compile_objective_phase_gate_audit(objective, adapter, (), audit)
     assert gates[0]["success_predicate"] == {
-        "observation_name": "run_id",
+        "observation_name": "run_status",
         "operator": "present",
         "expected_values": [],
     }
 
     audit["gate_proposals"][0]["success_predicate"] = {
-        "observation_name": "run_id",
+        "observation_name": "run_status",
         "operator": "equals",
         "expected_values": [""],
     }
