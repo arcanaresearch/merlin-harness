@@ -136,6 +136,53 @@ async def test_new_campaign_defaults_to_recommended_when_profile_is_unspecified(
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_preserves_operator_objective_and_rejects_inferred_profile():
+    exact = (
+        "Use Merlin to test https://target.test.\n\n"
+        "Cover every tier and every available character."
+    )
+    history = [ChatMessage(role="user", content=exact)]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": "Full coverage of https://target.test",
+            "campaign_profile": "exhaustive",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+async def test_new_campaign_honors_operator_named_profile():
+    exact = "Use the exhaustive campaign profile for https://target.test."
+    history = [ChatMessage(role="user", content=exact)]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": "Assess https://target.test",
+            "campaign_profile": "exhaustive",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "exhaustive",
+    }
+
+
+@pytest.mark.asyncio
 async def test_campaign_setting_update_does_not_restart_reconnaissance():
     history = [
         saved(

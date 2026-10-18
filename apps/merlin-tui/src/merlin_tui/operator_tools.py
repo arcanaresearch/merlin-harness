@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import shlex
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -14,6 +15,7 @@ from merlin_contracts import ChatMessage, ToolContext, ToolResult, ToolSpec
 MessageLoader = Callable[[str], Awaitable[Sequence[ChatMessage]]]
 PROFILES = ("quickscan", "recommended", "exhaustive", "exploration")
 MODES = ("api", "browser", "hybrid")
+_URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 READ_OPERATIONS = (
     "get_runtime_status",
     "list_campaigns",
@@ -97,6 +99,51 @@ def _latest_prepared_campaign(messages: Sequence[ChatMessage]) -> tuple[str, str
     return None
 
 
+def _operator_campaign_request(
+    messages: Sequence[ChatMessage], proposed_objective: object
+) -> str | None:
+    """Recover the exact operator request that contains the proposed target.
+
+    The foreground model may summarize the request before calling
+    ``campaign_configure``.  Target URLs give us a precise provenance join back to
+    the operator-authored message without treating later model prose as authority.
+    """
+
+    proposed = str(proposed_objective or "").strip()
+    target_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(proposed)}
+    if not target_urls:
+        return None
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        content = message.content.strip()
+        if content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
+            continue
+        authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
+        if target_urls & authored_urls:
+            return content
+    return None
+
+
+def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> str | None:
+    """Return a profile only when operator-authored text explicitly selects it."""
+
+    values = [objective]
+    values.extend(message.content for message in messages if message.role == "user")
+    for value in reversed(values):
+        normalized = " ".join(value.lower().split())
+        for profile in PROFILES:
+            if re.search(
+                rf"\b{re.escape(profile)}\b\s+(?:campaign\s+)?profile\b"
+                rf"|\bcampaign\s+profile\b[^.\n]{{0,40}}\b{re.escape(profile)}\b",
+                normalized,
+            ):
+                return profile
+        if normalized in PROFILES:
+            return normalized
+    return None
+
+
 class CampaignConfigureTool:
     effect = "workspace_write"
 
@@ -141,10 +188,11 @@ class CampaignConfigureTool:
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
         try:
             _foreground(context)
+            messages = await self._load(context.session_id)
             settings = (
                 {}
                 if arguments.get("new_campaign") is True
-                else _settings(await self._load(context.session_id))
+                else _settings(messages)
             )
             allowed = set(self.describe().input_schema["properties"])
             if set(arguments) - allowed:
@@ -174,7 +222,16 @@ class CampaignConfigureTool:
             if arguments.get("new_campaign") is True and not settings.get("objective"):
                 raise ValueError("a new campaign requires its exact objective and target")
             if arguments.get("new_campaign") is True:
-                settings.setdefault("campaign_profile", "recommended")
+                operator_objective = _operator_campaign_request(
+                    messages, settings.get("objective")
+                )
+                if operator_objective is not None:
+                    settings["objective"] = operator_objective
+                    settings["campaign_profile"] = (
+                        _operator_named_profile(messages, operator_objective) or "recommended"
+                    )
+                else:
+                    settings.setdefault("campaign_profile", "recommended")
             profile = settings.get("campaign_profile")
             if profile and self._preflight is not None:
                 ready, report = await self._preflight(profile)
