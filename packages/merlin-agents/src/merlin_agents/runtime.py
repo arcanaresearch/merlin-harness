@@ -2385,9 +2385,7 @@ class WorkerRuntime:
                 return
             if (
                 result.is_error
-                and self._target_attempt_disposition(
-                    result.metadata, is_error=result.is_error
-                )
+                and self._target_attempt_disposition(result.metadata, is_error=result.is_error)
                 == "protocol_invalid"
             ):
                 reason = result.metadata.get("disposition_reason")
@@ -3506,9 +3504,7 @@ class WorkerRuntime:
                                 expected_target_sequence=handoff.expected_target_sequence,
                                 target_effects_blocked=handoff.target_effects_blocked,
                                 effect_attempt_lineage=handoff.effect_attempt_lineage,
-                                state_action_kind=(
-                                    "reconnaissance" if probe_worker else None
-                                ),
+                                state_action_kind=("reconnaissance" if probe_worker else None),
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -4357,9 +4353,7 @@ class WorkerRuntime:
                                 expected_target_sequence=handoff.expected_target_sequence,
                                 target_effects_blocked=handoff.target_effects_blocked,
                                 effect_attempt_lineage=handoff.effect_attempt_lineage,
-                                state_action_kind=(
-                                    "reconnaissance" if probe_worker else None
-                                ),
+                                state_action_kind=("reconnaissance" if probe_worker else None),
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -5399,9 +5393,7 @@ class WorkerRuntime:
                                     expected_target_sequence=handoff.expected_target_sequence,
                                     target_effects_blocked=handoff.target_effects_blocked,
                                     effect_attempt_lineage=handoff.effect_attempt_lineage,
-                                    state_action_kind=(
-                                        "reconnaissance" if probe_worker else None
-                                    ),
+                                    state_action_kind=("reconnaissance" if probe_worker else None),
                                     transform_bindings=handoff.assignment.transform_bindings,
                                     planned_language=handoff.assignment.planned_language,
                                     requested_language=handoff.assignment.requested_language,
@@ -6316,7 +6308,10 @@ class WorkerRuntime:
                     checkpoint=checkpoint_payload(),
                     target_session_id=target_session_id,
                 )
-            arguments = _controller_tool_arguments(target_tool, {"input": input_text})
+            arguments = _controller_tool_arguments(
+                target_tool,
+                {"input": input_text, "step_id": step_id},
+            )
             call = ToolCall(call_id=call_id, name=target_tool, arguments=arguments)
             try:
                 async with asyncio.timeout(remaining_seconds):
@@ -6409,6 +6404,7 @@ class WorkerRuntime:
                     error=f"sealed objective phase gate action {action_id!r} failed",
                     error_code="objective_phase_gate_action_failed",
                     retry_class="fresh_worker",
+                    infrastructure_failure_category=(self._target_adapter_failure_category(result)),
                     checkpoint=checkpoint_payload(),
                     target_session_id=target_session_id,
                 )

@@ -3792,9 +3792,7 @@ def _compile_objective_phase_gate_audit(
     proposals = audit.get("gate_proposals")
     unresolved = audit.get("unresolved_requirements")
     if not isinstance(requirements, list) or not isinstance(proposals, list):
-        raise ValueError(
-            "objective prerequisite audit omitted requirements or gate_proposals"
-        )
+        raise ValueError("objective prerequisite audit omitted requirements or gate_proposals")
     if not isinstance(unresolved, list):
         raise ValueError("objective prerequisite audit omitted unresolved_requirements")
     if unresolved:
@@ -3975,8 +3973,7 @@ def _compile_objective_phase_gate_audit(
     if mapped_ids != all_ids:
         raise ValueError("objective prerequisite audit did not map every gate to operator text")
     return tuple(
-        {**compiled_by_key[key], "ordinal": ordinal}
-        for ordinal, key in enumerate(ordered_keys)
+        {**compiled_by_key[key], "ordinal": ordinal} for ordinal, key in enumerate(ordered_keys)
     )
 
 
@@ -5713,9 +5710,7 @@ def build_backend(
                     # below when computing the request's fair share. Dividing
                     # in both places can make a valid Lead prompt larger than
                     # its reservation even though the campaign has capacity.
-                    cost_token_capacity = math.floor(
-                        float(max_cost_usd) / cost_rate
-                    )
+                    cost_token_capacity = math.floor(float(max_cost_usd) / cost_rate)
                     max_tokens = (
                         cost_token_capacity
                         if max_tokens is None
@@ -6538,9 +6533,7 @@ def build_backend(
                 raise ValueError("incremental task review batch returned the wrong review count")
             batch_usage = merge_usage_records(usage_records)
             reviews: list[IncrementalTaskReview] = []
-            for index, ((task, context), row) in enumerate(
-                zip(requests, review_rows, strict=True)
-            ):
+            for index, ((task, context), row) in enumerate(zip(requests, review_rows, strict=True)):
                 if not isinstance(row, Mapping):
                     raise ValueError("incremental task review batch row is not an object")
                 task_id = str(getattr(task, "id", ""))
@@ -9709,9 +9702,7 @@ def build_backend(
                 except ValueError:
                     canonical_target = manifest.target.endpoint
             try:
-                target_progress = await campaigns.target_progress(
-                    campaign_id, manifest.target.id
-                )
+                target_progress = await campaigns.target_progress(campaign_id, manifest.target.id)
             except Exception:
                 # Reporting remains available when optional target-state projection fails.
                 target_progress = {}
@@ -9731,16 +9722,10 @@ def build_backend(
                     "objective": manifest.objective,
                     **(
                         {
-                            "objective_contract": dict(
-                                completion_document["objective_contract"]
-                            ),
-                            "campaign_outcome": dict(
-                                completion_document["campaign_outcome"]
-                            ),
+                            "objective_contract": dict(completion_document["objective_contract"]),
+                            "campaign_outcome": dict(completion_document["campaign_outcome"]),
                         }
-                        if isinstance(
-                            completion_document.get("objective_contract"), Mapping
-                        )
+                        if isinstance(completion_document.get("objective_contract"), Mapping)
                         and isinstance(completion_document.get("campaign_outcome"), Mapping)
                         else {}
                     ),
@@ -10460,7 +10445,10 @@ def build_backend(
                             "that authenticated state, use an existing setup/state-read step and "
                             "authoritative state observation to create a verification gate; do "
                             "not require a second browser navigation, wallet connection, or "
-                            "signature. Multiple exact source requirements may map to that one "
+                            "signature. For this verification gate, select a non-interaction "
+                            "setup/state-read step; never select a chat/message interaction merely "
+                            "to observe state that the read step already returns. Multiple exact "
+                            "source requirements may map to that one "
                             "verification gate. A request to play normally first remains a "
                             "separate baseline gate using exactly one bounded ordinary target "
                             "interaction. That baseline gate must not advance tiers, cover "
@@ -10492,9 +10480,9 @@ def build_backend(
                             "increases, decreases, or terminal_success. Use present with an "
                             "empty expected_values array when a non-empty executable state "
                             "observation proves the prerequisite. Identity selectors and capture "
-                            "names are receipt metadata, not state observations; never select them "
-                            "unless the adapter also declares them in state_observations or "
-                            "state_capabilities.observations. Never compare "
+                            "names are receipt metadata, not predicate observations; never select "
+                            "an observation whose role is state_identity, even when it appears in "
+                            "state_observations or state_capabilities.observations. Never compare "
                             "an identifier to an empty string."
                         ),
                     ),

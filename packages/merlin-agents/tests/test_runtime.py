@@ -506,8 +506,8 @@ async def test_objective_phase_gate_executes_sealed_actions_without_provider_inf
     assert result.status == "completed"
     assert provider.requests == []
     assert tools.arguments == [
-        {"input": "hello exactly"},
-        {"input": "continue exactly"},
+        {"input": "hello exactly", "step_id": "message"},
+        {"input": "continue exactly", "step_id": "message"},
     ]
     assert result.structured == {
         "gate_id": "baseline",
@@ -518,6 +518,52 @@ async def test_objective_phase_gate_executes_sealed_actions_without_provider_inf
         "blocker": None,
     }
     assert len(result.checkpoint["target_evidence"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_objective_phase_gate_preserves_delivery_failure_for_fresh_retry() -> None:
+    base = reviewed_handoff(interface="http_api", tools=("target_request",))
+    gate = {
+        "id": "auth",
+        "actions": [{"id": "read", "step_id": "read-state", "input_text": "verify"}],
+    }
+    assignment = replace(
+        base.assignment,
+        id="campaign/00000000-0000-0000-0000-000000000001/objective-gate/0-auth",
+        strategy_id="objective-phase-gate/v1",
+        strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
+        max_target_exchanges=1,
+    )
+    assert base.worker_context is not None
+    reviewed = replace(
+        base,
+        assignment=assignment,
+        worker_context=replace(base.worker_context, assignment_id=assignment.id),
+    )
+
+    class RejectedGateTools(Tools):
+        def __init__(self) -> None:
+            super().__init__(effect="target_network")
+
+        def describe(self):
+            return (ToolSpec(name="target_request", description="Target", input_schema={}),)
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="conflict",
+                is_error=True,
+                metadata={
+                    "target_delivery_rejected": True,
+                    "infrastructure_failure_category": "delivery_failure",
+                },
+            )
+
+    result = await WorkerRuntime(Provider([]), RejectedGateTools()).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "objective_phase_gate_action_failed"
+    assert result.retry_class == "fresh_worker"
+    assert result.infrastructure_failure_category == "delivery_failure"
 
 
 @pytest.mark.asyncio
@@ -2110,8 +2156,7 @@ async def test_direct_strategy_repairs_protocol_invalid_target_input() -> None:
     assert result.checkpoint is not None
     assert result.checkpoint["effect_observed"] is True
     assert any(
-        item["source"] == "runtime.request_constraints"
-        for item in result.evaluation_uncertainties
+        item["source"] == "runtime.request_constraints" for item in result.evaluation_uncertainties
     )
 
 

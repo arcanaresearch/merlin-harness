@@ -387,6 +387,14 @@ class ReviewedApiTargetTool:
                 "type": "object",
                 "properties": {
                     "input": {"type": "string", "minLength": 1},
+                    "step_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Execute the named reviewed adapter step. Used by sealed objective "
+                            "phase gates; omitted calls retain the ordinary interaction path."
+                        ),
+                    },
                     "strategy_plan": {
                         "type": "object",
                         "properties": {
@@ -416,6 +424,11 @@ class ReviewedApiTargetTool:
         text = arguments.get("input")
         if not isinstance(text, str) or not text.strip():
             return ToolResult(content="input must be a non-empty string", is_error=True)
+        requested_step_id = arguments.get("step_id")
+        if requested_step_id is not None and (
+            not isinstance(requested_step_id, str) or not requested_step_id.strip()
+        ):
+            return ToolResult(content="step_id must be a non-empty string", is_error=True)
         if context.campaign_id is None or context.target_id is None:
             return ToolResult(
                 content="target_request requires campaign target context", is_error=True
@@ -441,6 +454,16 @@ class ReviewedApiTargetTool:
         identity_failure = _context_adapter_identity_failure(context, adapter)
         if identity_failure is not None:
             return resolved(identity_failure)
+        if requested_step_id is not None and requested_step_id not in {
+            step.id for step in adapter.steps if not step.cleanup
+        }:
+            return resolved(
+                ToolResult(
+                    content=f"reviewed adapter step {requested_step_id!r} is unavailable",
+                    is_error=True,
+                    metadata={"infrastructure_failure_category": "configuration"},
+                )
+            )
 
         legacy_failure = await self._reconcile_legacy_sessions(
             context.campaign_id,
@@ -489,6 +512,7 @@ class ReviewedApiTargetTool:
                         await self._invoke_locked(
                             context,
                             text,
+                            requested_step_id,
                             pointer_miss_retries,
                             session_scope_id,
                             adapter,
@@ -823,6 +847,7 @@ class ReviewedApiTargetTool:
         self,
         context: ToolContext,
         text: str,
+        requested_step_id: str | None,
         pointer_miss_retries: int,
         session_scope_id: str,
         adapter: _ApiAdapter,
@@ -914,6 +939,7 @@ class ReviewedApiTargetTool:
                 result = await self._invoke_under_execution_lease(
                     context,
                     text,
+                    requested_step_id,
                     pointer_miss_retries,
                     session_scope_id,
                     adapter,
@@ -1084,6 +1110,7 @@ class ReviewedApiTargetTool:
         self,
         context: ToolContext,
         text: str,
+        requested_step_id: str | None,
         pointer_miss_retries: int,
         session_scope_id: str,
         adapter: _ApiAdapter,
@@ -1141,8 +1168,18 @@ class ReviewedApiTargetTool:
             )
             if item.kind.value in {"provision_fresh_state", "restore_checkpoint", "clone_state"}
         }
+        selected_step = next(
+            (step for step in adapter.steps if step.id == requested_step_id),
+            None,
+        )
+        setup_observed: list[object] = []
         for step in adapter.steps:
-            if step.cleanup or step.interaction or step.id in completed:
+            if (
+                step.cleanup
+                or step.interaction
+                or step.id in completed
+                and step.id != requested_step_id
+            ):
                 continue
             if (
                 context.objective_phase_checkpoint_intent is None
@@ -1158,7 +1195,7 @@ class ReviewedApiTargetTool:
                 and context.objective_phase_checkpoint_intent == "restore"
             ):
                 continue
-            _, variables, exchange = await self._execute(
+            item, variables, exchange = await self._execute(
                 context.campaign_id,
                 adapter,
                 step,
@@ -1180,6 +1217,8 @@ class ReviewedApiTargetTool:
                     state_scope_lease.checkpoint_restore_secret,
                 )
             exchanges.append(exchange)
+            if selected_step is not None and step.id == selected_step.id:
+                setup_observed.append(item)
             if 200 <= int(exchange["status_code"]) <= 299 and checkpoint is not None:
                 if (
                     context.objective_phase_checkpoint_intent == "capture"
@@ -1290,11 +1329,19 @@ class ReviewedApiTargetTool:
                         ),
                     )
                 )
+            if (
+                selected_step is not None
+                and not selected_step.interaction
+                and step.id == selected_step.id
+            ):
+                break
         observed: list[object] = []
         session_terminal = False
         session_restart_used = False
         for step in adapter.steps:
             if not step.interaction:
+                continue
+            if selected_step is not None and step.id != selected_step.id:
                 continue
             repeat_index = 0
             while repeat_index < step.repeat:
@@ -1450,8 +1497,14 @@ class ReviewedApiTargetTool:
                 repeat_index += 1
             if session_terminal:
                 break
+        if selected_step is not None and not selected_step.interaction:
+            observed.extend(setup_observed)
         if not observed:
-            raise ValueError("reviewed API adapter has no interaction step")
+            raise ValueError(
+                "reviewed API adapter did not execute the requested step"
+                if requested_step_id is not None
+                else "reviewed API adapter has no interaction step"
+            )
         if state_scope_lease.pending_checkpoint_secret is not None:
             if _objective_checkpoint_gate_succeeded(
                 context,
@@ -2544,9 +2597,7 @@ class ReviewedApiTargetTool:
         )
         evaluation_uncertainties = list(step.evaluation_uncertainties)
         response_state_observations = _state_observations(adapter, step, response_json, variables)
-        response_state_enumerations = _state_enumerations(
-            adapter, step, response_json, variables
-        )
+        response_state_enumerations = _state_enumerations(adapter, step, response_json, variables)
         freshness_observations = _freshness_observations(adapter, step, response_json, variables)
         freshness_unproven = any(item.get("matched") is not True for item in freshness_observations)
         if step.expected_status is not None and status_code != step.expected_status:

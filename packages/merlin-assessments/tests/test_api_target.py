@@ -121,6 +121,42 @@ def _adapter() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_reviewed_api_tool_executes_selected_setup_step_without_interaction(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "verified-session"})
+        raise AssertionError("selected setup verification must not execute the interaction step")
+
+    campaign_id = "campaign/selected-setup-step"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"input": "verify state", "step_id": "start"},
+                )
+
+    assert result.is_error is False
+    assert json.loads(result.content) == "[target-identity-redacted]"
+    assert calls == ["/api/scanner/start"]
+    assert result.metadata["limit_interaction_count"] == 0
+    assert result.metadata["current_target_exchanges"][0]["id"] == "start"
+
+
+@pytest.mark.asyncio
 async def test_reviewed_api_tool_executes_normalized_compiled_steps_and_emits_identity(
     tmp_path: Path,
 ) -> None:
@@ -4274,12 +4310,15 @@ def test_reviewed_api_state_enumeration_reaches_target_metadata() -> None:
     assert metadata["state_enumerations"] == enumerations
     assert enumerations[0]["members_by_scope"] == {"*": ["en", "ms"]}
     assert enumerations[0]["complete"] is True
-    assert _state_enumerations(
-        adapter,
-        SimpleNamespace(id="unreviewed-later-step"),
-        {"available_languages": ["forged"]},
-        {},
-    ) == []
+    assert (
+        _state_enumerations(
+            adapter,
+            SimpleNamespace(id="unreviewed-later-step"),
+            {"available_languages": ["forged"]},
+            {},
+        )
+        == []
+    )
 
 
 def test_reviewed_api_state_enumeration_rejects_shape_drift() -> None:
@@ -4301,12 +4340,15 @@ def test_reviewed_api_state_enumeration_rejects_shape_drift() -> None:
         target_id="target-1",
     )
 
-    assert _state_enumerations(
-        adapter,
-        SimpleNamespace(id="message"),
-        {"available_languages": "en"},
-        {},
-    ) == []
+    assert (
+        _state_enumerations(
+            adapter,
+            SimpleNamespace(id="message"),
+            {"available_languages": "en"},
+            {},
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
