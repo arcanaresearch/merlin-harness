@@ -813,56 +813,22 @@ async def _output_stream(
 
 
 def _prepared_objective_preserves_operator_scope(operator: str, prepared: str) -> bool:
-    """Accept verbatim scope or an exact operator clause plus a same-origin target anchor."""
-
-    typography = str.maketrans(
-        {
-            "\N{LEFT SINGLE QUOTATION MARK}": "'",
-            "\N{RIGHT SINGLE QUOTATION MARK}": "'",
-            "\N{SINGLE LOW-9 QUOTATION MARK}": "'",
-            "\N{LEFT DOUBLE QUOTATION MARK}": '"',
-            "\N{RIGHT DOUBLE QUOTATION MARK}": '"',
-            "\N{DOUBLE LOW-9 QUOTATION MARK}": '"',
-        }
-    )
-
-    def normalized(value: str) -> str:
-        return " ".join(value.translate(typography).split())
-
-    operator_normalized = normalized(operator)
-    prepared_normalized = normalized(prepared)
-    if operator_normalized in prepared_normalized:
-        return True
-
-    # ``campaign submit`` is itself the Merlin invocation, so providers may
-    # reasonably omit the leading product command while preserving the actual
-    # assessment objective.  Admit only this exact wrapper removal, and only
-    # through the same-origin anchored path below.  The remaining operator text
-    # still has to survive unchanged apart from typography, whitespace, and case.
-    operator_variants = [operator_normalized]
-    invocation_prefix = "use merlin to "
-    if operator_normalized.casefold().startswith(invocation_prefix):
-        operator_variants.append(operator_normalized[len(invocation_prefix) :])
-
-    lines = [line.strip() for line in prepared.splitlines() if line.strip()]
-    target_lines = [line for line in lines if line.casefold().startswith("target:")]
-    semantic_lines = [line for line in lines if line not in target_lines]
-    if not target_lines or not semantic_lines:
-        return False
-    if not any(
-        all(normalized(line).casefold() in variant.casefold() for line in semantic_lines)
-        for variant in operator_variants
-    ):
-        return False
+    """Keep prepared target URLs inside the operator-authorized origins."""
 
     operator_origins = {
         (parsed.scheme.casefold(), parsed.netloc.casefold())
         for token in operator.replace("(", " ").replace(")", " ").split()
         if (parsed := urlsplit(token.rstrip(".,:;"))).scheme in {"http", "https"} and parsed.netloc
     }
-    for line in target_lines:
-        parsed = urlsplit(line.split(":", 1)[1].strip())
-        if (parsed.scheme.casefold(), parsed.netloc.casefold()) not in operator_origins:
+    prepared_origins = {
+        (parsed.scheme.casefold(), parsed.netloc.casefold())
+        for token in prepared.replace("(", " ").replace(")", " ").split()
+        if (parsed := urlsplit(token.rstrip(".,:;"))).scheme in {"http", "https"} and parsed.netloc
+    }
+    if operator_origins and not prepared_origins:
+        return False
+    for origin in prepared_origins:
+        if origin not in operator_origins:
             return False
     return True
 

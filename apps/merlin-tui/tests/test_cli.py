@@ -1419,15 +1419,11 @@ async def test_bounded_task_teardown_propagates_caller_cancellation() -> None:
     await asyncio.gather(child, return_exceptions=True)
 
 
-def test_campaign_approve_rejects_prepared_objective_drift(monkeypatch) -> None:
-    """Run31: the model paraphrased the operator objective when calling
-    assessment_prepare, and the drift was only caught downstream by the
-    driver's scope guard. Submit must refuse approval loudly and cancel the
-    drifted campaign instead of executing it."""
+def test_campaign_approve_rejects_prepared_foreign_target_origin(monkeypatch) -> None:
     client = _install_durable_campaign(
         monkeypatch,
         objective="Determine whether FareCare can be manipulated into granting a "
-        "retroactive bereavement refund for completing travel that policy forbids.",
+        "retroactive bereavement refund at https://foreign.test.",
         campaign_id="campaign/drifted",
     )
 
@@ -1444,7 +1440,7 @@ def test_campaign_approve_rejects_prepared_objective_drift(monkeypatch) -> None:
             "submit",
             "--approve",
             "Determine whether FareCare can be manipulated into granting a retroactive "
-            "bereavement refund for completed travel that policy forbids.",
+            "bereavement refund at https://target.test.",
         ],
     )
 
@@ -1455,8 +1451,41 @@ def test_campaign_approve_rejects_prepared_objective_drift(monkeypatch) -> None:
     assert client.execute_calls == []
 
 
+def test_campaign_approve_accepts_same_origin_paraphrase(monkeypatch) -> None:
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=(
+            "Test the local game at http://localhost:3100 and play one ordinary turn.\n"
+            "Target: http://localhost:3100/api/trpc/run.turn"
+        ),
+        campaign_id="campaign/paraphrased",
+    )
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merlin",
+            "campaign",
+            "submit",
+            "--approve",
+            "Use Merlin to assess http://localhost:3100. Learn the rules and establish a "
+            "normal-play baseline.",
+        ],
+    )
+
+    main()
+
+    assert client.cancel_calls == []
+    assert client.execute_calls == [("campaign/paraphrased", "sha256:reviewed")]
+
+
 @pytest.mark.asyncio
-async def test_campaign_approve_repairs_streamed_objective_drift_without_new_recon(
+async def test_campaign_approve_accepts_streamed_same_origin_paraphrase_without_retry(
     monkeypatch,
 ) -> None:
     operator_objective = (
@@ -1534,12 +1563,9 @@ async def test_campaign_approve_repairs_streamed_objective_drift_without_new_rec
 
     await _submit_campaign(["--approve", operator_objective])
 
-    assert client.cancel_calls == ["campaign/drifted"]
-    assert client.execute_calls == [("campaign/exact", "sha256:exact")]
-    assert len(prompts) == 2
-    assert "do not repeat reconnaissance" in prompts[1]
-    assert f"operator_objective_json={operator_objective!r}" not in prompts[1]
-    assert operator_objective in prompts[1]
+    assert client.cancel_calls == []
+    assert client.execute_calls == [("campaign/drifted", "sha256:drifted")]
+    assert len(prompts) == 1
 
 
 def test_campaign_approve_accepts_verbatim_objective_with_target_anchor(monkeypatch) -> None:
