@@ -1955,6 +1955,77 @@ async def test_repeated_malformed_tool_calls_switch_to_simpler_recovery_strategy
 
 
 @pytest.mark.asyncio
+async def test_repeated_malformed_preferred_tool_remains_advertised() -> None:
+    class PreferredTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="observe", description="Observe", input_schema={}),
+                ToolSpec(name="assessment_prepare", description="Prepare", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="ready",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="prepared")
+
+    class RecoveringProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="observe", name="observe", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) < 4:
+                yield ModelError(
+                    message="malformed",
+                    code="malformed_tool_call",
+                    retryable=True,
+                    tool_name="assessment_prepare",
+                )
+                return
+            if len(self.requests) == 4:
+                yield ToolCall(
+                    call_id="prepare",
+                    name="assessment_prepare",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Prepared")
+            yield ModelCompleted()
+
+    provider = RecoveringProvider()
+    tools = PreferredTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings(), max_provider_retries=3)
+    await kernel.start()
+    await kernel.submit("prepare")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 5
+    assert all(
+        [tool["function"]["name"] for tool in request.tools]
+        == ["assessment_prepare"]
+        for request in provider.requests[1:4]
+    )
+    assert all(
+        request.required_tool_name == "assessment_prepare"
+        for request in provider.requests[1:4]
+    )
+    assert tools.calls == ["observe", "assessment_prepare"]
+
+
+@pytest.mark.asyncio
 async def test_persistent_malformed_tool_calls_never_remove_the_tool_schema() -> None:
     class AvailableTools(Tools):
         def describe(self):

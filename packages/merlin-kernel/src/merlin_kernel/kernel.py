@@ -963,6 +963,7 @@ class Kernel:
                     spec
                     for spec in self._tools.describe()
                     if spec.name not in blocked_recovery_tools
+                    or spec.name == request_preferred_tool_name
                 )
                 available_tools = tuple(
                     spec for spec in described_tools if spec.name != _OWNED_SESSION_CLEANUP_TOOL
