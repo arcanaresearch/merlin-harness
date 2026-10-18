@@ -125,6 +125,40 @@ async def test_reviewed_api_tool_executes_selected_setup_step_without_interactio
     tmp_path: Path,
 ) -> None:
     adapter = _adapter()
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/sessionId",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/sessionId",
+            },
+            "evidence_refs": ["exchange/session"],
+        },
+        "observations": [
+            {
+                "name": "session_id",
+                "role": "custom",
+                "baseline_selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "result_selector": {
+                    "step_id": "message",
+                    "evaluation_root": "response_body",
+                    "pointer": "/sessionId",
+                },
+                "value_type": "string",
+                "trust_class": "target_reported",
+            }
+        ],
+        "maximum_parallel_states": 1,
+    }
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -145,7 +179,19 @@ async def test_reviewed_api_tool_executes_selected_setup_step_without_interactio
                     {"target-token": "opaque-secret"},
                     client=client,
                 ).invoke(
-                    _sealed_context(campaign_id, adapter),
+                    _sealed_context(campaign_id, adapter).model_copy(
+                        update={
+                            "objective_phase_gate_id": "auth-session",
+                            "objective_phase_gate_contract": {
+                                "id": "auth-session",
+                                "success_predicate": {
+                                    "observation_name": "session_id",
+                                    "operator": "present",
+                                    "expected_values": [],
+                                },
+                            },
+                        }
+                    ),
                     {"input": "verify state", "step_id": "start"},
                 )
 
@@ -154,6 +200,22 @@ async def test_reviewed_api_tool_executes_selected_setup_step_without_interactio
     assert calls == ["/api/scanner/start"]
     assert result.metadata["limit_interaction_count"] == 0
     assert result.metadata["current_target_exchanges"][0]["id"] == "start"
+    observations = result.metadata["state_observations"]
+    assert {
+        (item["name"], item["phase"])
+        for item in observations
+    } == {
+        ("physical_state_identity", "baseline"),
+        ("physical_state_identity", "result"),
+        ("session_id", "baseline"),
+        ("session_id", "result"),
+    }
+    transition = result.metadata["target_state_transition"]
+    session_observation = next(
+        item for item in transition["observations"] if item["name"] == "session_id"
+    )
+    assert session_observation["status"] == "unchanged"
+    assert session_observation["validation_errors"] == []
 
 
 @pytest.mark.asyncio
