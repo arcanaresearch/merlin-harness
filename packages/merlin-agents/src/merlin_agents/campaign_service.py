@@ -1702,6 +1702,60 @@ def _incremental_review_result(value: str | None) -> Mapping[str, object]:
     }
 
 
+def _incremental_objective_contract_projection(
+    value: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Keep review semantics while omitting repeated catalogue denominators."""
+
+    projected = dict(value)
+    raw_objectives = value.get("objectives")
+    if not isinstance(raw_objectives, Sequence) or isinstance(raw_objectives, (str, bytes)):
+        return projected
+    objectives: list[Mapping[str, object]] = []
+    for raw_objective in raw_objectives:
+        if not isinstance(raw_objective, Mapping):
+            continue
+        objective = dict(raw_objective)
+        raw_selectors = raw_objective.get("selectors")
+        selectors: list[Mapping[str, object]] = []
+        if isinstance(raw_selectors, Sequence) and not isinstance(raw_selectors, (str, bytes)):
+            for raw_selector in raw_selectors:
+                if not isinstance(raw_selector, Mapping):
+                    continue
+                selector = dict(raw_selector)
+                raw_bindings = raw_selector.get("bindings")
+                bindings: list[Mapping[str, object]] = []
+                if isinstance(raw_bindings, Sequence) and not isinstance(
+                    raw_bindings, (str, bytes)
+                ):
+                    for raw_binding in raw_bindings:
+                        if not isinstance(raw_binding, Mapping):
+                            continue
+                        candidate_ids = raw_binding.get("candidate_ids")
+                        candidate_count = (
+                            len(candidate_ids)
+                            if isinstance(candidate_ids, Sequence)
+                            and not isinstance(candidate_ids, (str, bytes))
+                            else 0
+                        )
+                        bindings.append(
+                            {
+                                key: _json_value(raw_binding[key])
+                                for key in ("selector_value", "status", "reason")
+                                if key in raw_binding
+                            }
+                            | {"candidate_count": candidate_count}
+                        )
+                selector["bindings"] = tuple(bindings)
+                selector.pop("binding_source", None)
+                selectors.append(selector)
+        objective["selectors"] = tuple(selectors)
+        objective.pop("provenance", None)
+        objectives.append(objective)
+    projected["objectives"] = tuple(objectives)
+    return cast(Mapping[str, object], _json_value(projected))
+
+
 def _incremental_review_fallback(
     reviews: tuple[IncrementalTaskReview, ...],
 ) -> LeadAssessment:
@@ -10441,6 +10495,13 @@ class CampaignService:
         evidence = await self._source_evidence(schedule_id, (task,))
         task_evidence = evidence.get(task.id, {})
         evidence_digest = _incremental_review_evidence_digest(task, task_evidence)
+        lead_loader = getattr(self._store, "list_lead", None)
+        lead = (
+            tuple(await asyncio.to_thread(lead_loader, campaign_id))
+            if callable(lead_loader)
+            else ()
+        )
+        objective_progress = _objective_progress_from_journal(manifest, lead)
         target_progress: Mapping[str, object] = {}
         try:
             target_progress = await self.target_progress(campaign_id, manifest.target.id)
@@ -10468,7 +10529,7 @@ class CampaignService:
         )
         shortlist_loader = getattr(self._store, "list_frontier_shortlist", None)
         shortlist = (
-            tuple(await asyncio.to_thread(shortlist_loader, campaign_id, 32))
+            tuple(await asyncio.to_thread(shortlist_loader, campaign_id, 12))
             if callable(shortlist_loader)
             else ()
         )
@@ -10485,7 +10546,12 @@ class CampaignService:
             "evidence_digest": evidence_digest,
             "evidence_delta": _json_value(task_evidence),
             "campaign_objective": manifest.objective,
-            "objective_contract": _json_value(manifest.objective_contract or {}),
+            "objective_contract": _incremental_objective_contract_projection(
+                manifest.objective_contract or {}
+            ),
+            "objective_progress": tuple(
+                item.model_dump(mode="json") for item in objective_progress
+            ),
             "target_state": _json_value(target_progress),
             "nearby_technique_history": nearby_history,
             "campaign_summary": {

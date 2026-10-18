@@ -93,6 +93,7 @@ from merlin_agents.campaign_service import (
     _hypothesis_task_observation,
     _hypothesis_task_outcome,
     _inapplicable_evidence_is_trusted,
+    _incremental_objective_contract_projection,
     _initial_capability_probe_plan,
     _json_value,
     _latest_saturation_decision_state,
@@ -15928,6 +15929,7 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
         assert context["evidence_digest"].startswith("sha256:")
         assert "campaign_summary" in context
         assert "target_state" in context
+        assert "objective_progress" in context
         assert "nearby_technique_history" in context
         return IncrementalTaskReview(
             task_id=task.id,
@@ -16015,6 +16017,47 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
     assert applied_priorities == [{"candidate-b": 0.95}]
     assert any(event.get("kind") == "incremental_task_review_completed" for event in events)
     assert any(event.get("kind") == "incremental_review_merge_completed" for event in events)
+
+
+def test_incremental_objective_projection_keeps_binding_state_without_candidate_ids() -> None:
+    projected = _incremental_objective_contract_projection(
+        {
+            "schema_version": "merlin.campaign-objective-contract.v1",
+            "objectives": [
+                {
+                    "id": "operator/methods",
+                    "description": "Exercise requested attack classes",
+                    "provenance": {"kind": "operator", "source_ref": "request"},
+                    "selectors": [
+                        {
+                            "dimension": "method",
+                            "quantifier": "all_listed",
+                            "binding_source": {"kind": "reviewed_catalogue"},
+                            "bindings": [
+                                {
+                                    "selector_value": "prompt injection",
+                                    "candidate_ids": [f"candidate-{index}" for index in range(69)],
+                                    "status": "bound",
+                                    "reason": None,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    objective = projected["objectives"][0]
+    binding = objective["selectors"][0]["bindings"][0]
+    assert "provenance" not in objective
+    assert "binding_source" not in objective["selectors"][0]
+    assert binding == {
+        "selector_value": "prompt injection",
+        "status": "bound",
+        "reason": None,
+        "candidate_count": 69,
+    }
 
 
 async def test_monitor_skips_final_review_for_completed_frontier_schedule() -> None:
