@@ -23282,6 +23282,19 @@ def _objective_phase_gate_result(
                 if name != gate.success_predicate.observation_name
             ),
         }
+    if predicate_transition is not None and observation is not None:
+        observation_name = gate.success_predicate.observation_name
+        predicate_transition = {
+            **predicate_transition,
+            "validation_errors": tuple(
+                error
+                for error in predicate_transition.get("validation_errors", ())
+                if not isinstance(error, str)
+                or ":" not in error
+                or error.startswith(f"{observation_name}:")
+                or error.startswith("physical_state_identity:")
+            ),
+        }
     predicate_result = (
         None
         if predicate_transition is None

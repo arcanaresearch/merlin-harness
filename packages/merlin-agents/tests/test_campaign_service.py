@@ -545,6 +545,7 @@ def test_objective_phase_gate_accepts_clean_target_predicate_without_attack_corr
     transition["outcome"] = "unclear"
     transition["disposition_rule"] = "no_valid_corroborated_observation"
     transition["quarantined_observations"] = ["stage"]
+    transition["validation_errors"] = ["score:monotonicity_violation"]
     transition["observations"][0]["trust_class"] = "target_reported"
 
     settled = _objective_phase_gate_result(gate, (task,), evidence)
