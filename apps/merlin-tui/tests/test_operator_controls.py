@@ -115,6 +115,7 @@ async def test_settings_revision_preserves_unspecified_fields_and_new_scan_reset
         "objective": "L2",
         "campaign_profile": "quickscan",
     }
+    assert new.metadata["preferred_next_tool"] == "browser_recall_reconnaissance"
 
 
 @pytest.mark.asyncio
@@ -131,6 +132,29 @@ async def test_new_campaign_defaults_to_recommended_when_profile_is_unspecified(
         "objective": "Assess https://target.test",
         "campaign_profile": "recommended",
     }
+    assert result.metadata["preferred_next_tool"] == "browser_recall_reconnaissance"
+
+
+@pytest.mark.asyncio
+async def test_campaign_setting_update_does_not_restart_reconnaissance():
+    history = [
+        saved(
+            "campaign_configure",
+            {
+                "status": "configured",
+                "settings": {
+                    "campaign_profile": "recommended",
+                    "objective": "existing target",
+                },
+            },
+        )
+    ]
+    tool = CampaignConfigureTool(AsyncMock(side_effect=lambda _: tuple(history)))
+
+    result = await tool.invoke(context(), {"campaign_profile": "exploration"})
+
+    assert not result.is_error
+    assert "preferred_next_tool" not in result.metadata
 
 
 @pytest.mark.asyncio

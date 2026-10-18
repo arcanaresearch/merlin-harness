@@ -191,7 +191,10 @@ class CampaignConfigureTool:
                 "revision": context.call_id,
                 "requires_review": True,
             }
-            return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
+            metadata = dict(result)
+            if arguments.get("new_campaign") is True:
+                metadata["preferred_next_tool"] = "browser_recall_reconnaissance"
+            return ToolResult(content=json.dumps(result, sort_keys=True), metadata=metadata)
         except (ValueError, TypeError) as error:
             return ToolResult(
                 content=json.dumps({"status": "not_configured", "error": str(error)}), is_error=True
