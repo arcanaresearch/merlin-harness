@@ -1487,6 +1487,7 @@ class DurableAgentService:
         request_hashes: dict[str, str] = {}
         content_hashes: dict[str, str] = {}
         target_delivery_receipts: dict[str, Mapping[str, object]] = {}
+        durably_acknowledged_receipt_ids: set[str] = set()
         probe_effect_calls: dict[str, str] = {}
         if isinstance(messages, list):
             for message in messages:
@@ -1625,6 +1626,7 @@ class DurableAgentService:
                 != receipt.get("metadata_sha256")
             ):
                 continue
+            durably_acknowledged_receipt_ids.add(str(call_id))
             try:
                 target_call_documents[str(call_id)] = json.loads(content)
             except json.JSONDecodeError:
@@ -1636,6 +1638,10 @@ class DurableAgentService:
             call_id: receipt
             for call_id, receipt in target_evidence_receipts.items()
             if call_id in target_call_ids
+            and (
+                receipt.get("acknowledged") is True
+                or call_id in durably_acknowledged_receipt_ids
+            )
         }
         completed_target_call_ids = target_call_ids & completed_call_ids
         if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("target_evidence"), list):
@@ -7152,7 +7158,7 @@ def _validated_target_evidence_receipts(
             or not isinstance(item.get("content_bytes"), int)
             or isinstance(item.get("content_bytes"), bool)
             or int(item["content_bytes"]) < 0
-            or item.get("acknowledged") is not True
+            or item.get("acknowledged") not in {True, False}
             or item.get("is_error") is not False
             or not all(
                 isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes

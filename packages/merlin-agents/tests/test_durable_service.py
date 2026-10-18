@@ -1906,7 +1906,10 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
         "content_bytes": len(content.encode()),
         "metadata_sha256": WorkerRuntime._json_fingerprint(metadata),  # noqa: SLF001
         "is_error": False,
-        "acknowledged": True,
+        # Read-only objective-gate observations do not increment the interaction
+        # count, so their checkpoint receipt is provisional until the durable
+        # tool effect proves acknowledgement.
+        "acknowledged": False,
     }
     receipt = {
         **receipt_body,
@@ -1947,20 +1950,30 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
         }
     }
     service = DurableAgentService(Provider(), EvidenceTools(), store)
+    task = AgentTask(
+        id=task_id,
+        objective="recon",
+        status="completed",
+        result='{"applicable_techniques":[]}',
+    )
 
     evidence = await service.committed_task_result_evidence(
         "schedule-1",
-        AgentTask(
-            id=task_id,
-            objective="recon",
-            status="completed",
-            result='{"applicable_techniques":[]}',
-        ),
+        task,
     )
 
     assert evidence is not None
     assert evidence["target_call_documents"] == {"call-compacted": {"reply": "objective reached"}}
     assert evidence["target_delivery_receipts"] == {"call-compacted": delivery}
+
+    unmatched = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-1",
+        task,
+        store.results["schedule-1"][f"worker:{task_id}"],
+    )
+    assert unmatched is not None
+    assert unmatched["target_call_ids"] == ()
+    assert unmatched["target_evidence_receipts"] == {}
 
 
 async def test_replacement_result_inherits_authenticated_ancestor_evidence_after_restart() -> None:
