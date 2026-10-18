@@ -92,6 +92,7 @@ from .campaign import (
     CampaignManifest,
     CampaignProfile,
     ContextDocument,
+    ObjectiveGateOperator,
     ObjectiveGateRetryReason,
     ObjectivePhaseGate,
     ReviewedTargetAdapter,
@@ -23486,6 +23487,28 @@ def _objective_phase_gate_result(
     else:
         canonical = _canonical_committed_attempt_outcome(committed)
         disposition = str(canonical["attempt_disposition"])
+    if (
+        gate.success_predicate.observation_name == "target_exchange_completed"
+        and gate.success_predicate.operator is ObjectiveGateOperator.PRESENT
+        and disposition == "valid"
+        and gate_receipts
+    ):
+        return {
+            "status": "succeeded",
+            "attempt_disposition": "valid",
+            "target_calls": len(target_calls),
+            "last_transition": None,
+            "blocker": None,
+            "evidence_refs": tuple(
+                str(value)
+                for value in (
+                    committed.get("reference"),
+                    committed.get("digest"),
+                    *target_calls,
+                )
+                if isinstance(value, str) and value
+            ),
+        }
     transitions = _objective_gate_transitions(committed)
     evaluated_transition = transitions[-1] if transitions else None
     observation = next(

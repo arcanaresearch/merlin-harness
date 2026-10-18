@@ -301,6 +301,74 @@ def test_objective_phase_gate_audit_rejects_identity_role_and_blank_values() -> 
         _compile_objective_phase_gate_audit(objective, adapter, (), audit)
 
 
+def test_objective_phase_gate_audit_allows_reviewed_interaction_receipt() -> None:
+    objective = "Play normally first."
+    adapter = {
+        "api_steps": [
+            {
+                "step_id": "play-turn",
+                "interaction": True,
+                "method": "POST",
+            }
+        ],
+    }
+    audit = {
+        "requirements": [
+            {"source_quote": "Play normally first", "gate_key": "normal-play"}
+        ],
+        "gate_proposals": [
+            {
+                "key": "normal-play",
+                "objective": "Complete one ordinary turn before attacks",
+                "actions": [{"step_id": "play-turn", "input_text": "Hello"}],
+                "success_predicate": {
+                    "observation_name": "target_exchange_completed",
+                    "operator": "present",
+                    "expected_values": [],
+                },
+            }
+        ],
+        "unresolved_requirements": [],
+    }
+
+    gates = _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+
+    assert gates[0]["success_predicate"] == {
+        "observation_name": "target_exchange_completed",
+        "operator": "present",
+        "expected_values": [],
+    }
+
+
+def test_objective_phase_gate_audit_rejects_receipt_for_read_only_step() -> None:
+    objective = "Verify setup."
+    adapter = {
+        "api_steps": [{"step_id": "read-state", "interaction": False, "method": "GET"}],
+    }
+    audit = {
+        "requirements": [{"source_quote": "Verify setup", "gate_key": "setup"}],
+        "gate_proposals": [
+            {
+                "key": "setup",
+                "objective": "Verify setup",
+                "actions": [{"step_id": "read-state"}],
+                "success_predicate": {
+                    "observation_name": "target_exchange_completed",
+                    "operator": "present",
+                    "expected_values": [],
+                },
+            }
+        ],
+        "unresolved_requirements": [],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="unknown authoritative observation 'target_exchange_completed'",
+    ):
+        _compile_objective_phase_gate_audit(objective, adapter, (), audit)
+
+
 def test_objective_phase_gate_audit_rejects_identity_selector_as_observation() -> None:
     objective = "Authenticate with Test Wallet."
     adapter = {

@@ -3810,8 +3810,8 @@ def _compile_objective_phase_gate_audit(
             + "; ".join(reasons)
         )
 
-    step_ids = {
-        str(step.get("step_id") or "").strip()
+    steps_by_id = {
+        str(step.get("step_id") or "").strip(): step
         for collection_name in ("api_steps", "browser_steps")
         for step in (
             reviewed_adapter.get(collection_name)
@@ -3820,6 +3820,7 @@ def _compile_objective_phase_gate_audit(
         )
         if isinstance(step, Mapping) and str(step.get("step_id") or "").strip()
     }
+    step_ids = set(steps_by_id)
 
     observation_names: set[str] = set()
 
@@ -3902,10 +3903,21 @@ def _compile_objective_phase_gate_audit(
 
         observation_name = str(predicate.get("observation_name") or "").strip()
         operator = str(predicate.get("operator") or "").strip()
-        if observation_name not in observation_names:
+        receipt_predicate = observation_name == "target_exchange_completed"
+        selected_interaction = any(
+            steps_by_id[action["step_id"]].get("interaction") is True
+            for action in compiled_actions
+        )
+        if observation_name not in observation_names and not (
+            receipt_predicate and selected_interaction
+        ):
             raise ValueError(
                 "objective prerequisite audit selected unknown authoritative observation "
                 f"{observation_name!r}"
+            )
+        if receipt_predicate and operator != "present":
+            raise ValueError(
+                "target_exchange_completed requires the present predicate operator"
             )
         if operator not in operators:
             raise ValueError(
@@ -10425,12 +10437,47 @@ def build_backend(
                 if key in reviewed_adapter
             }
             existing_payload = [asdict(gate) for gate in proposed_gates]
+            executable_steps = [
+                {
+                    "step_id": str(step.get("step_id") or ""),
+                    "interaction": step.get("interaction") is True,
+                    "method": step.get("method"),
+                    "endpoint": step.get("endpoint"),
+                }
+                for collection_name in ("api_steps", "browser_steps")
+                for step in (
+                    adapter_projection.get(collection_name)
+                    if isinstance(adapter_projection.get(collection_name), list)
+                    else ()
+                )
+                if isinstance(step, Mapping) and step.get("step_id")
+            ]
+            predicate_observations = sorted(
+                {
+                    str(item.get(field) or "")
+                    for field in ("name", "observation_name")
+                    for collection in (
+                        adapter_projection.get("state_observations"),
+                        (
+                            adapter_projection.get("state_capabilities", {}).get(
+                                "observations"
+                            )
+                            if isinstance(
+                                adapter_projection.get("state_capabilities"), Mapping
+                            )
+                            else None
+                        ),
+                    )
+                    for item in (collection if isinstance(collection, list) else ())
+                    if isinstance(item, Mapping)
+                    and item.get("role") != "state_identity"
+                    and item.get(field)
+                }
+            )
+            if any(step["interaction"] for step in executable_steps):
+                predicate_observations.append("target_exchange_completed")
             lead_model = config.provider_role_models.get("lead", model)
-            value = await _request_structured_json(
-                provider=provider,
-                capability_registry=capability_registry,
-                selected_model=lead_model,
-                messages=(
+            audit_messages = [
                     ChatMessage(
                         role="system",
                         content=(
@@ -10485,6 +10532,12 @@ def build_backend(
                             "an observation whose role is state_identity, even when it appears in "
                             "state_observations or state_capabilities.observations. Never compare "
                             "an identifier to an empty string."
+                            " The user message supplies an explicit phase_gate_choices object. "
+                            "Select step_id and observation_name values only from those arrays. "
+                            "target_exchange_completed means that the selected interaction "
+                            "produced a committed target-bound receipt with a valid delivery "
+                            "disposition; use it with operator present only for a bounded "
+                            "normal-play interaction when no executable state observation exists."
                         ),
                     ),
                     ChatMessage(
@@ -10494,24 +10547,76 @@ def build_backend(
                                 "operator_objective": objective,
                                 "proposed_phase_gates": existing_payload,
                                 "reviewed_adapter": adapter_projection,
+                                "phase_gate_choices": {
+                                    "steps": executable_steps,
+                                    "observations": predicate_observations,
+                                },
                             },
                             sort_keys=True,
                             ensure_ascii=False,
                             default=str,
                         ),
                     ),
-                ),
-                expected_container="object",
-                max_attempts=config.provider_runtime.worker_retry_attempts,
-            )
-            if not isinstance(value, Mapping):
-                raise ValueError("objective prerequisite audit returned no object")
-            gate_values = _compile_objective_phase_gate_audit(
-                objective,
-                adapter_projection,
-                existing_payload,
-                value,
-            )
+            ]
+            gate_values: tuple[dict[str, object], ...] | None = None
+            last_audit_error: ValueError | None = None
+            for semantic_attempt in range(
+                max(1, config.provider_runtime.worker_retry_attempts)
+            ):
+                value = await _request_structured_json(
+                    provider=provider,
+                    capability_registry=capability_registry,
+                    selected_model=lead_model,
+                    messages=tuple(audit_messages),
+                    expected_container="object",
+                    max_attempts=config.provider_runtime.worker_retry_attempts,
+                )
+                if not isinstance(value, Mapping):
+                    last_audit_error = ValueError(
+                        "objective prerequisite audit returned no object"
+                    )
+                else:
+                    try:
+                        gate_values = _compile_objective_phase_gate_audit(
+                            objective,
+                            adapter_projection,
+                            existing_payload,
+                            value,
+                        )
+                    except ValueError as error:
+                        last_audit_error = error
+                    else:
+                        break
+                if semantic_attempt + 1 < max(
+                    1, config.provider_runtime.worker_retry_attempts
+                ):
+                    audit_messages.extend(
+                        (
+                            ChatMessage(
+                                role="assistant",
+                                content=json.dumps(
+                                    value,
+                                    sort_keys=True,
+                                    ensure_ascii=False,
+                                    default=str,
+                                ),
+                            ),
+                            ChatMessage(
+                                role="user",
+                                content=(
+                                    "Your previous audit could not be compiled: "
+                                    f"{last_audit_error}. Correct only that contract error. "
+                                    "Use phase_gate_choices exactly. "
+                                    "target_exchange_completed may accompany only a step where "
+                                    "interaction is true. Return the complete corrected audit "
+                                    "object."
+                                ),
+                            ),
+                        )
+                    )
+            if gate_values is None:
+                assert last_audit_error is not None
+                raise last_audit_error
             try:
                 audited = tuple(objective_phase_gate_from_mapping(item) for item in gate_values)
             except (KeyError, TypeError, ValueError) as error:

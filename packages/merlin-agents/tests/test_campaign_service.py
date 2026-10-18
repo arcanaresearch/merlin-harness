@@ -535,6 +535,31 @@ def test_objective_phase_gate_requires_reviewed_identity_and_predicate() -> None
     assert failed_predicate["status"] == "blocked"
 
 
+def test_objective_phase_gate_accepts_valid_committed_interaction_receipt() -> None:
+    gate = replace(
+        _objective_gate(max_attempts=1),
+        success_predicate=ObjectiveGatePredicate(
+            observation_name="target_exchange_completed",
+            operator=ObjectiveGateOperator.PRESENT,
+        ),
+    )
+    task = AgentTask(id="gate-task", objective="gate", status="completed")
+    evidence = _objective_gate_evidence(task.id)
+
+    settled = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert settled["status"] == "succeeded"
+    assert settled["attempt_disposition"] == "valid"
+    assert settled["target_calls"] == 1
+
+    evidence[task.id]["target_evidence_receipts"]["target-call:1"][
+        "attempt_disposition"
+    ] = "infrastructure_failed"
+    failed = _objective_phase_gate_result(gate, (task,), evidence)
+
+    assert failed["status"] == "retryable"
+
+
 def test_objective_phase_gate_accepts_clean_target_predicate_without_attack_corroboration() -> None:
     gate = _objective_gate(max_attempts=1)
     task = AgentTask(id="gate-task", objective="gate", status="completed")
