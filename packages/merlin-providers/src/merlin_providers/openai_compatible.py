@@ -698,6 +698,15 @@ class OpenAICompatibleProvider:
                 tools,
                 partial=emitted,
                 finish_reason=finish,
+                allowed_tool_names=(
+                    frozenset(
+                        str(item.get("function", {}).get("name", ""))
+                        for item in request.tools
+                    )
+                    if request.tools
+                    else None
+                ),
+                required_tool_name=request.required_tool_name,
             ):
                 for event in terminal_events:
                     yield event
@@ -898,6 +907,8 @@ class OpenAICompatibleProvider:
         *,
         partial: bool = False,
         finish_reason: str | None = None,
+        allowed_tool_names: frozenset[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> ModelError | None:
         completed: list[tuple[str, str, dict[str, object]]] = []
         for slot, item in tools.items():
@@ -985,6 +996,24 @@ class OpenAICompatibleProvider:
             completed.append((call_id, str(item["name"]), arguments))
         seen_ids: dict[str, tuple[str, dict[str, object]]] = {}
         for call_id, name, arguments in completed:
+            admitted = allowed_tool_names is None or name in allowed_tool_names
+            required = required_tool_name is None or name == required_tool_name
+            if not admitted or not required:
+                expected = required_tool_name or "an advertised tool"
+                events.append(
+                    ModelError(
+                        message=(
+                            "provider returned an unadmitted native tool call; "
+                            f"expected {expected}"
+                        ),
+                        code="malformed_tool_call",
+                        retryable=True,
+                        partial=partial,
+                        tool_name=required_tool_name,
+                        failure_kind=ProviderFailureKind.FORMATTING,
+                    )
+                )
+                return events[-1]
             prior = seen_ids.get(call_id)
             if prior is not None:
                 classification = "conflicting" if prior != (name, arguments) else "duplicate"

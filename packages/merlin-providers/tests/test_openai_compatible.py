@@ -1273,6 +1273,54 @@ def test_malformed_streamed_tool_calls_fail_closed(tool_call: str) -> None:
         assert "[1]" not in events[0].message
 
 
+def test_unadmitted_native_tool_call_fails_before_reaching_kernel() -> None:
+    stream = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1",'
+        '"function":{"name":"browser_compile_api_handoff","arguments":"{}"}}]},'
+        '"finish_reason":"tool_calls"}]}\n'
+        "data: [DONE]\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=stream)
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://models.example/v1",
+                    "",
+                    "deepseek-v4-pro",
+                    max_attempts=1,
+                ),
+                client=client,
+            )
+            request = ChatRequest(
+                model="deepseek-v4-pro",
+                messages=[],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "assessment_prepare",
+                            "description": "Prepare",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                required_tool_name="assessment_prepare",
+            )
+            return [event async for event in provider.stream(request)]
+
+    events = asyncio.run(run())
+    assert len(events) == 1
+    assert isinstance(events[0], ModelError)
+    assert events[0].code == "malformed_tool_call"
+    assert events[0].tool_name == "assessment_prepare"
+    assert "browser_compile_api_handoff" not in events[0].message
+    assert not any(isinstance(event, ToolCall) for event in events)
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [

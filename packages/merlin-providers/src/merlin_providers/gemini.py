@@ -279,6 +279,8 @@ class GeminiProvider(OpenAICompatibleProvider):
         *,
         partial: bool = False,
         finish_reason: str | None = None,
+        allowed_tool_names: frozenset[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> ModelError | None:
         if self._pending_usage is not None:
             events.append(self._pending_usage)
@@ -288,6 +290,8 @@ class GeminiProvider(OpenAICompatibleProvider):
             tools,
             partial=partial,
             finish_reason=finish_reason,
+            allowed_tool_names=allowed_tool_names,
+            required_tool_name=required_tool_name,
         )
 
 
