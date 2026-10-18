@@ -8819,6 +8819,47 @@ async def _objective_authority_service(objective: str = "Cover Tier 1 through Ti
     return service, store, manifest
 
 
+async def test_objective_navigation_runs_before_attack_for_unmet_coverage() -> None:
+    objective = "Cover Tier 1 through Tier 4"
+    _, store, manifest = await _objective_authority_service(objective)
+    prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
+
+    class NavigationService(CampaignService):
+        def __init__(self):
+            super().__init__(store, object(), preparation)  # type: ignore[arg-type]
+            self.compiled = None
+
+        async def _run_wave(self, _campaign_id, _manifest, wave, kind, compiled):
+            self.compiled = (wave, kind, compiled)
+            return ()
+
+        async def _source_evidence(self, _schedule_id, _tasks):
+            return {}
+
+        async def _record_worker_objective_selector_resolutions(self, *_args):
+            return None
+
+    service = NavigationService()
+    last_wave = await service._run_objective_navigation(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        prepared.assignment_context,
+        wave=2,
+    )
+
+    assert last_wave == 3
+    assert service.compiled is not None
+    wave, kind, compiled = service.compiled
+    assert (wave, kind) == (3, "objective_prerequisite")
+    assert len(compiled.assignments) == 1
+    assert compiled.assignments[0].strategy_id == "objective-navigation/v1"
+    assert compiled.assignments[0].technique_ids == ()
+    assert [entry["payload"]["kind"] for entry in store.lead] == [
+        "objective_navigation_started",
+        "objective_navigation_settled",
+    ]
+
+
 async def test_phase_gates_share_the_required_objective_contract_and_progress() -> None:
     objective = "Authenticate with Test Wallet, then play normally before Tier 1 through Tier 4."
     prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)

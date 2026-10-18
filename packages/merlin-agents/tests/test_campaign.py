@@ -53,6 +53,7 @@ from merlin_agents.campaign import (
     _recon_output_schema,
     compile_baseline_agenda,
     compile_execution_agenda,
+    compile_objective_navigation_campaign,
     enumerate_language_candidate_references,
     language_frontier_spec,
     materialize_language_technique,
@@ -1716,6 +1717,43 @@ def test_objective_contract_is_digest_bound_round_trips_and_survives_resealing()
         manifest_with_objective_phase_gates(prepared, (objective_gate(),)).objective_contract
         == prepared.objective_contract
     )
+
+
+def test_objective_navigation_is_isolated_from_attack_coverage() -> None:
+    base = manifest()
+    contract = compile_objective_contract(
+        "Cover stage 1 through stage 4 and every available persona in each stage."
+    )
+    prepared = manifest_with_objective_contract(base, contract)
+    context = AssignmentContext(
+        target_profile_id=prepared.target.id,
+        techniques=(),
+        tool_ids=prepared.tool_ids,
+        skill_ids=(),
+        provider_id=prepared.provider_id,
+        authority_ids=prepared.authority_ids,
+        budget=prepared.budget,
+        input_schema="merlin.worker-input/v1",
+        output_schema="merlin.worker-result/v1",
+    )
+
+    compiled = compile_objective_navigation_campaign(
+        prepared,
+        context,
+        contract.objectives,
+    )
+
+    assert len(compiled.assignments) == 1
+    assignment = compiled.assignments[0]
+    assert assignment.strategy_id == "objective-navigation/v1"
+    assert assignment.profile_id == "recon"
+    assert assignment.technique_ids == ()
+    assert "Do not execute, select, score, or claim any attack technique" in (
+        assignment.objective
+    )
+    assert {item.id for item in contract.objectives} <= {
+        item["id"] for item in json.loads(assignment.objective.split("Sealed objectives:\n", 1)[1])
+    }
 
 
 def test_bounded_regeneration_is_digest_bound_round_trips_and_is_optional() -> None:

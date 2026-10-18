@@ -102,6 +102,7 @@ from .campaign import (
     compile_attack_campaign,
     compile_execution_agenda,
     compile_initial_campaign,
+    compile_objective_navigation_campaign,
     compile_prerequisite_campaign,
     compile_recon_campaign,
     compile_target_brief,
@@ -4894,7 +4895,13 @@ class CampaignService:
                 )
                 if not gates_ready:
                     return
-                attack_wave = last_gate_wave + 1
+                last_navigation_wave = await self._run_objective_navigation(
+                    campaign_id,
+                    manifest,
+                    context,
+                    wave=last_gate_wave,
+                )
+                attack_wave = last_navigation_wave + 1
                 attack_context, frontier_batch = await self._claim_execution_frontier_context(
                     campaign_id,
                     manifest,
@@ -5033,7 +5040,13 @@ class CampaignService:
                 )
                 if not gates_ready:
                     return
-                attack_wave = last_gate_wave + 1
+                last_navigation_wave = await self._run_objective_navigation(
+                    campaign_id,
+                    manifest,
+                    context,
+                    wave=last_gate_wave,
+                )
+                attack_wave = last_navigation_wave + 1
                 # Advertised/observed capabilities are evidence, not attack
                 # admission. Unknown surfaces remain eligible for safe probing.
                 attack_context, frontier_batch = await self._claim_execution_frontier_context(
@@ -12901,6 +12914,88 @@ class CampaignService:
                     await asyncio.to_thread(pause_campaign, campaign_id)
                 return False, wave
         return True, wave
+
+    async def _run_objective_navigation(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        *,
+        wave: int,
+    ) -> int:
+        """Advance unmet sealed state coverage before claiming attack work."""
+
+        if manifest.objective_contract is None:
+            return wave
+        list_lead = getattr(self._store, "list_lead", None)
+        if not callable(list_lead):
+            return wave
+        lead = await asyncio.to_thread(list_lead, campaign_id)
+        pending = tuple(
+            progress.objective
+            for progress in _objective_progress_from_journal(manifest, lead)
+            if progress.objective.required
+            and progress.objective.kind is ObjectiveKind.COVERAGE
+            and all(selector.dimension != "method" for selector in progress.objective.selectors)
+            and progress.status
+            not in {
+                ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+                ObjectiveStatus.PREEXISTING,
+                ObjectiveStatus.WAIVED,
+            }
+        )
+        if not pending:
+            return wave
+        navigation_wave = wave + 1
+        compiled = compile_objective_navigation_campaign(manifest, context, pending)
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            navigation_wave,
+            {
+                "kind": "objective_navigation_started",
+                "objective_ids": tuple(item.id for item in pending),
+                "frontier_claimed": False,
+            },
+        )
+        tasks = await self._run_wave(
+            campaign_id,
+            manifest,
+            navigation_wave,
+            "objective_prerequisite",
+            compiled,
+        )
+        schedule_id = self._campaign_wave_schedule_id(campaign_id, navigation_wave)
+        evidence = await self._source_evidence(schedule_id, tasks)
+        await self._record_worker_objective_selector_resolutions(
+            campaign_id,
+            manifest,
+            navigation_wave,
+            tasks,
+            evidence,
+        )
+        updated_lead = await asyncio.to_thread(self._store.list_lead, campaign_id)
+        progress = _objective_progress_from_journal(manifest, updated_lead)
+        relevant = {
+            item.objective.id: item
+            for item in progress
+            if item.objective.id in {objective.id for objective in pending}
+        }
+        await asyncio.to_thread(
+            self._store.append_lead,
+            campaign_id,
+            navigation_wave,
+            {
+                "kind": "objective_navigation_settled",
+                "objective_progress": tuple(
+                    relevant[objective.id].model_dump(mode="json")
+                    for objective in pending
+                    if objective.id in relevant
+                ),
+                "frontier_claimed": False,
+            },
+        )
+        return navigation_wave
 
     async def _settle_objective_phase_gate(
         self,

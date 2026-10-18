@@ -12,6 +12,7 @@ from enum import StrEnum
 from typing import Any
 
 from merlin_contracts import (
+    CampaignObjective,
     CampaignObjectiveContract,
     CapabilityGrant,
     executable_adapter_digest,
@@ -1800,6 +1801,120 @@ def compile_prerequisite_campaign(
             compile_worker_context(manifest, assignment, profile, capability_grant=grant)
         )
     return CampaignCompilation(tuple(assignments), tuple(worker_contexts))
+
+
+def compile_objective_navigation_campaign(
+    manifest: CampaignManifest,
+    context: AssignmentContext,
+    objectives: tuple[CampaignObjective, ...],
+) -> CampaignCompilation:
+    """Compile one isolated worker that advances sealed target-state objectives.
+
+    Navigation is deliberately separate from attack selection. The worker may use
+    the reviewed target adapter to reach and exercise required states, but it owns
+    no attack technique and therefore cannot consume or retire attack coverage.
+    """
+
+    if not objectives:
+        return CampaignCompilation((), ())
+    profile = next(item for item in CORE_WORKER_PROFILES if item.id == "recon")
+    grant = profile_grant(profile.id, target_scope=context.target_profile_id)
+    projected_tools = _profile_projection(
+        manifest.tool_ids,
+        profile.id,
+        target_interface=manifest.target.interface,
+        api_credential=manifest.target.credential_handle is not None,
+    )
+    if not {"target_request", "target_chat", "browser_chat_exchange"}.intersection(
+        projected_tools
+    ):
+        raise ValueError("objective navigation requires a projected target interaction tool")
+    objective_contract = tuple(
+        objective.model_dump(mode="json") for objective in objectives
+    )
+    objective_digest = hashlib.sha256(
+        json.dumps(objective_contract, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    compiled_adapter = _reviewed_compiled_adapter(manifest)
+    assignment = WorkerAssignment(
+        id=f"{manifest.id}/objective-navigation/{objective_digest[:16]}",
+        objective=(
+            "Advance the target through the following sealed campaign objectives before "
+            "adversarial attack execution. Use the reviewed target adapter and normal target "
+            "semantics. Preserve attributable before/after receipts for every state transition. "
+            "Do not execute, select, score, or claim any attack technique. If an objective is "
+            "inaccessible, return the concrete blocker and its evidence instead of silently "
+            "skipping it. Continue until every listed objective is evidenced or a concrete "
+            "blocker is established.\n\nSealed objectives:\n"
+            + json.dumps(objective_contract, sort_keys=True, separators=(",", ":"))
+        ),
+        profile_id=profile.id,
+        target_profile_id=context.target_profile_id,
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=projected_tools,
+        skill_ids=(),
+        provider_id=context.provider_id,
+        authority_ids=context.authority_ids,
+        budget=context.budget,
+        input_schema=context.input_schema,
+        output_schema=json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "objective_updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "objective_id": {"type": "string"},
+                                "status": {
+                                    "enum": ["satisfied", "active", "blocked"]
+                                },
+                                "evidence_refs": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "blocker": {"type": ["string", "null"]},
+                            },
+                            "required": [
+                                "objective_id",
+                                "status",
+                                "evidence_refs",
+                                "blocker",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["objective_updates"],
+                "additionalProperties": False,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        provider_model=context.model_for(profile.id) or manifest.provider_model,
+        provider_capabilities=context.capabilities_for(profile.id),
+        target_session_capacity=manifest.target.browser_concurrency,
+        grant_id=grant.id,
+        strategy_id="objective-navigation/v1",
+        strategy_contract=(
+            ("objective_navigation_digest", objective_digest),
+            ("objective_navigation_manifest_digest", manifest.digest),
+            *(
+                (
+                    ("compiled_adapter", compiled_adapter[0]),
+                    ("compiled_adapter_digest", compiled_adapter[1]),
+                )
+                if compiled_adapter is not None
+                else (("compiled_adapter_compatibility", "legacy_absent"),)
+            ),
+        ),
+    )
+    return CampaignCompilation(
+        (assignment,),
+        (compile_worker_context(manifest, assignment, profile, capability_grant=grant),),
+    )
 
 
 def compile_initial_campaign(
