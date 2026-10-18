@@ -13046,8 +13046,8 @@ class CampaignService:
         schedule_id = self._campaign_wave_schedule_id(campaign_id, navigation_wave)
         evidence = await self._source_evidence(schedule_id, tasks)
         await self._record_worker_objective_selector_resolutions(
-            campaign_id,
             manifest,
+            campaign_id,
             navigation_wave,
             tasks,
             evidence,

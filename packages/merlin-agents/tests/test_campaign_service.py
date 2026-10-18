@@ -8829,6 +8829,7 @@ async def test_objective_navigation_runs_before_attack_for_unmet_coverage() -> N
         def __init__(self):
             super().__init__(store, object(), preparation)  # type: ignore[arg-type]
             self.compiled = None
+            self.selector_resolution_args = None
 
         async def _run_wave(self, _campaign_id, _manifest, wave, kind, compiled):
             self.compiled = (wave, kind, compiled)
@@ -8837,7 +8838,21 @@ async def test_objective_navigation_runs_before_attack_for_unmet_coverage() -> N
         async def _source_evidence(self, _schedule_id, _tasks):
             return {}
 
-        async def _record_worker_objective_selector_resolutions(self, *_args):
+        async def _record_worker_objective_selector_resolutions(
+            self,
+            selected_manifest,
+            campaign_id,
+            wave,
+            tasks,
+            evidence,
+        ):
+            self.selector_resolution_args = (
+                selected_manifest,
+                campaign_id,
+                wave,
+                tasks,
+                evidence,
+            )
             return None
 
     service = NavigationService()
@@ -8855,6 +8870,13 @@ async def test_objective_navigation_runs_before_attack_for_unmet_coverage() -> N
     assert len(compiled.assignments) == 1
     assert compiled.assignments[0].strategy_id == "objective-navigation/v1"
     assert compiled.assignments[0].technique_ids == ()
+    assert service.selector_resolution_args == (
+        manifest,
+        manifest.id,
+        3,
+        (),
+        {},
+    )
     assert [entry["payload"]["kind"] for entry in store.lead] == [
         "objective_navigation_started",
         "objective_navigation_settled",
