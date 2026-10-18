@@ -1498,36 +1498,35 @@ class ReviewedApiTargetTool:
             if session_terminal:
                 break
         if selected_step is not None and not selected_step.interaction:
-            if context.objective_phase_gate_contract is not None:
-                for exchange in exchanges:
-                    if exchange.get("id") != selected_step.id:
+            for exchange in exchanges:
+                if exchange.get("id") != selected_step.id:
+                    continue
+                observations = _mapping_list(exchange.get("state_observations"))
+                result_names = {
+                    str(item.get("name"))
+                    for item in observations
+                    if item.get("phase") == "result"
+                }
+                projected_results: list[dict[str, object]] = []
+                for observation in observations:
+                    if (
+                        observation.get("phase") != "baseline"
+                        or str(observation.get("name")) in result_names
+                    ):
                         continue
-                    observations = _mapping_list(exchange.get("state_observations"))
-                    result_names = {
-                        str(item.get("name"))
-                        for item in observations
-                        if item.get("phase") == "result"
-                    }
-                    projected_results: list[dict[str, object]] = []
-                    for observation in observations:
-                        if (
-                            observation.get("phase") != "baseline"
-                            or str(observation.get("name")) in result_names
-                        ):
-                            continue
-                        projected = {**observation, "phase": "result"}
-                        projected.pop("observation_digest", None)
-                        projected_results.append(
-                            {
-                                **projected,
-                                "observation_digest": _digest_json(projected),
-                            }
-                        )
-                    if projected_results:
-                        exchange["state_observations"] = [
-                            *observations,
-                            *projected_results,
-                        ]
+                    projected = {**observation, "phase": "result"}
+                    projected.pop("observation_digest", None)
+                    projected_results.append(
+                        {
+                            **projected,
+                            "observation_digest": _digest_json(projected),
+                        }
+                    )
+                if projected_results:
+                    exchange["state_observations"] = [
+                        *observations,
+                        *projected_results,
+                    ]
             observed.extend(setup_observed)
         if not observed:
             raise ValueError(
