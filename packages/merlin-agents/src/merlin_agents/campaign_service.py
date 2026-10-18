@@ -19580,15 +19580,22 @@ class AssessmentPrepareTool:
         assert isinstance(adapter, Mapping)
         observability_error = _validate_objective_state_observability(objective, adapter)
         if observability_error is not None:
-            return ToolResult(
-                content=observability_error,
-                is_error=True,
-                metadata={
+            adapter = dict(adapter)
+            uncertainties = [
+                dict(item)
+                for item in adapter.get("evaluation_uncertainties", [])
+                if isinstance(item, Mapping)
+            ]
+            uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "assessment_prepare.objective_state_observability",
+                    "reason": observability_error,
+                    "confidence": "low",
                     "retryable": True,
-                    "preferred_next_tool": "browser_compile_api_handoff",
-                    "failure_code": "objective_state_observability_missing",
-                },
+                }
             )
+            adapter["evaluation_uncertainties"] = uncertainties
         # The objective is scope evidence: anchor it to the reviewed target URL so a
         # model-authored objective can never silently drop the target identity.
         target_anchor = str(adapter.get("url") or adapter.get("endpoint") or "").strip()
@@ -19963,13 +19970,13 @@ def _adapter_target_authority(endpoint: str) -> str:
 def _validate_objective_state_observability(
     objective: str, adapter: Mapping[str, Any]
 ) -> str | None:
-    """Require reviewed state bindings for typed state-coverage selectors.
+    """Describe missing reviewed bindings for typed state-coverage selectors.
 
     The objective compiler preserves only explicit operator selectors. This check
     does not infer target semantics: it requires the reconnaissance reviewer to
     bind each non-method selector to an executable observation with the exact same
-    target-neutral name. Missing bindings return a repairable preparation error;
-    they never suppress, retire, or score an attack candidate.
+    target-neutral name. Missing bindings remain explicit evaluation uncertainty;
+    they never block admission, suppress, retire, or score an attack candidate.
     """
 
     contract = compile_objective_contract(objective)
@@ -20002,9 +20009,9 @@ def _validate_objective_state_observability(
     return (
         "the sealed objective contract requires executable target-state observations named "
         f"{', '.join(missing)}, but the reviewed adapter provides: {available}. "
-        "Recompile the same reconnaissance handoff with exact captured baseline/result "
-        "selectors for those objective dimensions, then retry assessment_prepare. The "
-        "campaign was not prepared and no attack candidate was suppressed."
+        "Continue execution while collecting exact captured baseline/result selectors for "
+        "those objective dimensions. Keep the affected objectives unmet or blocked until "
+        "authoritative observations exist; do not infer completion."
     )
 
 

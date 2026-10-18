@@ -12602,13 +12602,12 @@ async def test_prepare_tool_passes_structured_objective_phase_gates() -> None:
     assert captured[0][0].success_predicate.expected_values == ("ready",)
 
 
-async def test_prepare_tool_rejects_state_coverage_without_executable_observations() -> None:
-    prepared = False
+async def test_prepare_tool_preserves_missing_state_coverage_as_uncertainty() -> None:
+    captured: list[Mapping[str, object]] = []
 
     class Service:
-        async def prepare(self, *_args, **_kwargs):
-            nonlocal prepared
-            prepared = True
+        async def prepare(self, _session_id, _objective, _profile, adapter, **_kwargs):
+            captured.append(adapter)
             return {"campaign_id": "campaign-1"}
 
     result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
@@ -12640,11 +12639,15 @@ async def test_prepare_tool_rejects_state_coverage_without_executable_observatio
         },
     )
 
-    assert result.is_error is True
-    assert prepared is False
-    assert "observations named character, tier" in result.content
-    assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
-    assert result.metadata["retryable"] is True
+    assert result.is_error is False
+    assert len(captured) == 1
+    uncertainties = captured[0]["evaluation_uncertainties"]
+    assert isinstance(uncertainties, list)
+    assert any(
+        item["source"] == "assessment_prepare.objective_state_observability"
+        and "observations named character, tier" in item["reason"]
+        for item in uncertainties
+    )
 
 
 async def test_prepare_tool_accepts_state_coverage_with_reviewed_observations() -> None:
