@@ -2404,7 +2404,12 @@ def compile_crescendo_agenda(
                     metadata_uncertainties.append("a transformed technique cell was requested")
                 contract = replace(
                     contract,
-                    semantic_technique_id=technique.resolved_semantic_id,
+                    # Runtime provenance is sealed to the exact executable
+                    # frontier cell.  Keep the assignment's semantic id for
+                    # aggregate coverage, but bind the controller contract to
+                    # the selected cell so transformed/language variants do
+                    # not fail before their first target action.
+                    semantic_technique_id=technique.id,
                     reviewed_adapter_digest=reviewed_adapter_digest,
                     language=technique.language,
                 )
@@ -2600,7 +2605,7 @@ def compile_goat_agenda(
                     metadata_uncertainties.append("a transformed technique cell was requested")
                 contract = replace(
                     contract,
-                    semantic_technique_id=technique.resolved_semantic_id,
+                    semantic_technique_id=technique.id,
                     goal_digest=_digest(technique.objective),
                     reviewed_adapter_digest=adapter_digest,
                     attacker_route_digest=route_digest,
@@ -2847,7 +2852,7 @@ def compile_hydra_select_agenda(
                     metadata_uncertainties.append("a transformed technique cell was requested")
                 contract = replace(
                     contract,
-                    semantic_technique_id=technique.resolved_semantic_id,
+                    semantic_technique_id=technique.id,
                     goal_digest=_digest(technique.objective),
                     reviewed_adapter_digest=adapter_digest,
                     attacker_route_digest=route_digest,

@@ -24,6 +24,17 @@ def exchange(text, nonce, session, *, status=200):
     }
 
 
+def test_api_handoff_description_requires_progression_stable_state_identity():
+    tool = CompiledApiReconHandoffTool(lambda _: None, SimpleNamespace())
+
+    description = tool.describe().description
+
+    assert "stable across target-owned progression and phase transitions" in description
+    assert "aggregate run, conversation, or game identifier" in description
+    assert "rotating turn, tier, round, or sub-session identifier" in description
+    assert "omit state_identity and preserve the uncertainty" in description
+
+
 def test_inference_uses_changed_values_not_target_or_field_names():
     session_id = str(uuid4())
     first = exchange("first", str(uuid4()), session_id)

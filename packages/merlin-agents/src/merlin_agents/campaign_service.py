@@ -3235,10 +3235,24 @@ class CampaignService:
                     if not authoritative_outcomes.get(technique_id):
                         authoritative_outcomes.setdefault(technique_id, set()).add(outcome)
         dispositions = {}
+        infrastructure_candidate_ids: set[str] = set()
         for candidate in candidates:
             if not isinstance(candidate, Mapping) or not candidate.get("id"):
                 continue
             candidate_id = str(candidate["id"])
+            candidate_attempts = tuple(
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("task_id") in task_ids
+                and attempt.get("technique_id") == candidate_id
+            )
+            if candidate_attempts and all(
+                str(attempt.get("disposition") or "").casefold()
+                == "infrastructure_failed"
+                for attempt in candidate_attempts
+            ):
+                infrastructure_candidate_ids.add(candidate_id)
             outcomes = authoritative_outcomes.get(candidate_id, set())
             clear_outcomes = outcomes & {"confirmed", "refuted"}
             terminal = len(clear_outcomes) == 1
@@ -3285,7 +3299,67 @@ class CampaignService:
             ),
             "retryable_claims_below_cap": sum(generation < 3 for generation in retry_generations),
             "retry_exhausted_candidates": sum(generation >= 3 for generation in retry_generations),
+            **(
+                {"infrastructure_only_batch": 1}
+                if candidates_by_id
+                and infrastructure_candidate_ids == set(candidates_by_id)
+                else {}
+            ),
         }
+
+    async def _pause_repeated_frontier_infrastructure(
+        self,
+        campaign_id: str,
+        wave: int,
+        frontier_counts: Mapping[str, int] | None,
+    ) -> bool:
+        """Pause after repeated infrastructure-only batches without retiring coverage."""
+
+        append_lead = getattr(self._store, "append_lead", None)
+        list_lead = getattr(self._store, "list_lead", None)
+        if not (callable(append_lead) and callable(list_lead)) or frontier_counts is None:
+            return False
+        infrastructure_only = bool(frontier_counts.get("infrastructure_only_batch", 0))
+        await asyncio.to_thread(
+            append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": (
+                    _FRONTIER_INFRASTRUCTURE_CIRCUIT_FAILURE_KIND
+                    if infrastructure_only
+                    else _FRONTIER_INFRASTRUCTURE_CIRCUIT_SUCCESS_KIND
+                ),
+                "state": "retryable" if infrastructure_only else "healthy",
+                "queued": frontier_counts.get("queued", 0),
+            },
+        )
+        if not infrastructure_only:
+            return False
+        journal = await asyncio.to_thread(list_lead, campaign_id)
+        consecutive = _consecutive_frontier_infrastructure_failures(journal)
+        if consecutive < _FRONTIER_INFRASTRUCTURE_CIRCUIT_THRESHOLD:
+            return False
+        await asyncio.to_thread(
+            append_lead,
+            campaign_id,
+            wave,
+            {
+                "kind": "frontier_infrastructure_circuit_open",
+                "state": "paused",
+                "consecutive_failures": consecutive,
+                "queued": frontier_counts.get("queued", 0),
+                "reason": (
+                    "consecutive frontier batches produced only infrastructure failures; "
+                    "all unresolved candidates remain durably queued"
+                ),
+                "retryable": True,
+            },
+        )
+        pause_campaign = getattr(self._store, "pause", None)
+        if callable(pause_campaign):
+            await asyncio.to_thread(pause_campaign, campaign_id)
+        return True
 
     async def _frontier_batch_for_schedule(
         self, campaign_id: str, schedule_id: str
@@ -5326,6 +5400,10 @@ class CampaignService:
                 await self._apply_incremental_review_priorities(
                     campaign_id, initial_wave, live_assessment
                 )
+                if await self._pause_repeated_frontier_infrastructure(
+                    campaign_id, initial_wave, frontier_counts
+                ):
+                    return
                 frontier_retry_available = bool(
                     frontier_counts is not None
                     and (
@@ -20908,6 +20986,32 @@ def _consecutive_lead_replan_failures(journal: object) -> int:
             consecutive += 1
             continue
         if entry.get("decision_id") or kind in _LEAD_REPLAN_CIRCUIT_SUCCESS_KINDS:
+            break
+    return consecutive
+
+
+_FRONTIER_INFRASTRUCTURE_CIRCUIT_THRESHOLD = 3
+_FRONTIER_INFRASTRUCTURE_CIRCUIT_FAILURE_KIND = "frontier_infrastructure_only_batch"
+_FRONTIER_INFRASTRUCTURE_CIRCUIT_SUCCESS_KIND = "frontier_infrastructure_healthy_batch"
+
+
+def _consecutive_frontier_infrastructure_failures(journal: object) -> int:
+    """Count trailing infrastructure-only frontier batches across unrelated journal noise."""
+
+    if not isinstance(journal, (tuple, list)):
+        return 0
+    consecutive = 0
+    for entry in reversed(journal):
+        if not isinstance(entry, Mapping):
+            continue
+        payload = entry.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = entry
+        kind = payload.get("kind")
+        if kind == _FRONTIER_INFRASTRUCTURE_CIRCUIT_FAILURE_KIND:
+            consecutive += 1
+            continue
+        if kind == _FRONTIER_INFRASTRUCTURE_CIRCUIT_SUCCESS_KIND:
             break
     return consecutive
 

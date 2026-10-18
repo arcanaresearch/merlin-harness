@@ -3465,6 +3465,8 @@ def test_adaptive_compilers_repair_advisory_metadata_without_downgrading(
 
     repaired = dict(assignment.strategy_contract)
     assert assignment.strategy_id == strategy_id
+    assert assignment.semantic_technique_id == technique.resolved_semantic_id
+    assert repaired["semantic_technique_id"] == technique.id
     assert repaired["reviewed_adapter_digest"] == adapter_digest
     assert repaired["language"] == "lzh"
     assert "EVALUATION UNCERTAIN" in assignment.objective

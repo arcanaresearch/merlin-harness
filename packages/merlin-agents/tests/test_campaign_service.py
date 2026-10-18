@@ -83,6 +83,7 @@ from merlin_agents.campaign_service import (
     _committed_attempt_authority,
     _compile_capability_probe_recon,
     _completion_arm_record,
+    _consecutive_frontier_infrastructure_failures,
     _conservative_semantic_outcome,
     _coverage_extension_stop_reason,
     _crescendo_lesson_evidence,
@@ -23340,6 +23341,7 @@ async def test_frontier_settlement_requeues_infrastructure_failures_without_reti
                     "task_id": "task/failed",
                     "technique_id": "cell/failed",
                     "state": "inconclusive",
+                    "disposition": "infrastructure_failed",
                     "strategy_state": {},
                 },
             )
@@ -23373,6 +23375,111 @@ async def test_frontier_settlement_requeues_infrastructure_failures_without_reti
         "retryable_claims_below_cap": 1,
         "retry_exhausted_candidates": 0,
     }
+
+
+async def test_frontier_settlement_marks_infrastructure_only_batch():
+    class FrontierStore(Store):
+        def load_active_frontier_batch(self, _campaign_id):
+            return {
+                "id": "batch-1",
+                "schedule_id": "schedule-1",
+                "candidates": ({"id": "cell/failed", "claim_generation": 1},),
+            }
+
+        def settle_frontier_batch(self, _campaign_id, _batch_id, _dispositions):
+            return {"queued": 1, "terminal": 0, "total": 1}
+
+    class OutcomeAgents:
+        async def technique_attempts(self, _schedule_id):
+            return (
+                {
+                    "task_id": "task/failed",
+                    "technique_id": "cell/failed",
+                    "state": "blocked",
+                    "disposition": "infrastructure_failed",
+                    "strategy_state": {},
+                },
+            )
+
+    service = CampaignService(FrontierStore(), OutcomeAgents(), None)  # type: ignore[arg-type]
+    counts = await service._settle_execution_frontier_batch(  # noqa: SLF001
+        "campaign-1",
+        SimpleNamespace(id="schedule-1"),
+        (
+            AgentTask(
+                id="task/failed",
+                objective="failed",
+                status="failed",
+                technique_ids=("cell/failed",),
+            ),
+        ),
+    )
+
+    assert counts is not None
+    assert counts["infrastructure_only_batch"] == 1
+
+
+async def test_frontier_infrastructure_circuit_pauses_after_three_consecutive_batches():
+    class CircuitStore:
+        def __init__(self) -> None:
+            self.lead = []
+            self.paused = []
+
+        def append_lead(self, campaign_id, wave, payload):
+            self.lead.append({"campaign_id": campaign_id, "wave": wave, "payload": payload})
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def pause(self, campaign_id):
+            self.paused.append(campaign_id)
+
+    store = CircuitStore()
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+    counts = {"queued": 12, "infrastructure_only_batch": 1}
+
+    assert not await service._pause_repeated_frontier_infrastructure(  # noqa: SLF001
+        "campaign-1", 4, counts
+    )
+    store.append_lead("campaign-1", 4, {"kind": "unrelated_diagnostic"})
+    assert not await service._pause_repeated_frontier_infrastructure(  # noqa: SLF001
+        "campaign-1", 5, counts
+    )
+    assert await service._pause_repeated_frontier_infrastructure(  # noqa: SLF001
+        "campaign-1", 6, counts
+    )
+
+    assert store.paused == ["campaign-1"]
+    assert _consecutive_frontier_infrastructure_failures(store.lead) == 3
+    opened = [
+        item["payload"]
+        for item in store.lead
+        if item["payload"].get("kind") == "frontier_infrastructure_circuit_open"
+    ]
+    assert opened == [
+        {
+            "kind": "frontier_infrastructure_circuit_open",
+            "state": "paused",
+            "consecutive_failures": 3,
+            "queued": 12,
+            "reason": (
+                "consecutive frontier batches produced only infrastructure failures; "
+                "all unresolved candidates remain durably queued"
+            ),
+            "retryable": True,
+        }
+    ]
+
+
+def test_frontier_infrastructure_circuit_resets_after_healthy_batch():
+    journal = [
+        {"payload": {"kind": "frontier_infrastructure_only_batch"}},
+        {"payload": {"kind": "frontier_infrastructure_healthy_batch"}},
+        {"payload": {"kind": "unrelated_diagnostic"}},
+        {"payload": {"kind": "frontier_infrastructure_only_batch"}},
+    ]
+
+    assert _consecutive_frontier_infrastructure_failures(journal) == 1
 
 
 @pytest.mark.parametrize(
