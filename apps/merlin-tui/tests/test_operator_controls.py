@@ -118,6 +118,22 @@ async def test_settings_revision_preserves_unspecified_fields_and_new_scan_reset
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_defaults_to_recommended_when_profile_is_unspecified():
+    tool = CampaignConfigureTool(AsyncMock(return_value=()))
+
+    result = await tool.invoke(
+        context(),
+        {"new_campaign": True, "objective": "Assess https://target.test"},
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": "Assess https://target.test",
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
 async def test_no_recon_when_route_preflight_fails_and_worker_cannot_configure():
     delegate = AsyncMock(return_value=(False, "worker route missing"))
     tool = CampaignConfigureTool(AsyncMock(return_value=()), delegate)

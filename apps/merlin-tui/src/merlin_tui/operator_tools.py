@@ -114,6 +114,8 @@ class CampaignConfigureTool:
                 "exploration; "
                 "quick, recommended, exhaustive, and exploration are distinct profiles. Set "
                 "new_campaign=true for a new scan with its exact target/scenario and objective. "
+                "When the operator does not name a profile, omit campaign_profile and Merlin "
+                "will use Recommended. "
                 "For profile, composition, execution-mode, or budget changes, update only the "
                 "requested fields; omitted fields retain the selection. Null clears an optional "
                 "setting. For a new campaign, omit execution_mode unless the operator explicitly "
@@ -171,11 +173,8 @@ class CampaignConfigureTool:
                 settings[key] = value
             if arguments.get("new_campaign") is True and not settings.get("objective"):
                 raise ValueError("a new campaign requires its exact objective and target")
-            if arguments.get("new_campaign") is True and not settings.get("campaign_profile"):
-                raise ValueError(
-                    "a new campaign requires its requested campaign_profile; "
-                    "ask the operator if the desired effort is unclear"
-                )
+            if arguments.get("new_campaign") is True:
+                settings.setdefault("campaign_profile", "recommended")
             profile = settings.get("campaign_profile")
             if profile and self._preflight is not None:
                 ready, report = await self._preflight(profile)
