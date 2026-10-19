@@ -485,6 +485,7 @@ class BrowserTool:
         if (
             kind in {"open_tab", "navigate"}
             and recalled_surface is not None
+            and urlsplit(recalled_surface).scheme.casefold() in {"http", "https"}
             and requested_url is not None
             and requested_url.rstrip("/") != recalled_surface.rstrip("/")
         ):
@@ -8800,10 +8801,7 @@ class ReconRecallTool:
         handoffs = await self._recorder.list_handoffs(session.bounds.target_id)
         if self._recalled_recon is not None:
             recalled_surface = desired["surface"]
-            if urlsplit(recalled_surface).scheme.casefold() in {"http", "https"}:
-                self._recalled_recon[(context.session_id, session.bounds.target_id)] = (
-                    recalled_surface
-                )
+            self._recalled_recon[(context.session_id, session.bounds.target_id)] = recalled_surface
         compatible_tenants = {
             tuple(sorted(_scope_tokens(str(handoff.recon_scope["tenant"]))))
             for handoff in handoffs
