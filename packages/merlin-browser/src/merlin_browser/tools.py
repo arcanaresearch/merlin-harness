@@ -487,13 +487,20 @@ class BrowserTool:
             and recalled_surface is not None
             and urlsplit(recalled_surface).scheme.casefold() in {"http", "https"}
             and requested_url is not None
-            and requested_url.rstrip("/") != recalled_surface.rstrip("/")
+            and (
+                urlsplit(requested_url).scheme.casefold(),
+                urlsplit(requested_url).netloc.casefold(),
+            )
+            != (
+                urlsplit(recalled_surface).scheme.casefold(),
+                urlsplit(recalled_surface).netloc.casefold(),
+            )
         ):
             return ToolResult(
                 content=(
                     "durable reconnaissance recall restricts navigation to the requested "
-                    "target entry surface; reuse recalled site facts and inspect only fresh "
-                    "target-authored state/network evidence from that surface"
+                    "target origin; reuse recalled site facts and inspect only fresh "
+                    "target-authored state/network evidence from that origin"
                 ),
                 is_error=True,
                 metadata={
