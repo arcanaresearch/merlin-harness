@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
@@ -13,6 +14,8 @@ from merlin_browser import (
     BrowserObservation,
 )
 from psycopg.types.json import Jsonb
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class BrowserRepository:
@@ -247,7 +250,23 @@ class BrowserRepository:
                 LIMIT %s""",
             (target_id, limit),
         ).fetchall()
-        return tuple(ApiReconHandoff.model_validate(row["document"]) for row in rows)
+        handoffs: list[ApiReconHandoff] = []
+        for row in rows:
+            try:
+                handoffs.append(ApiReconHandoff.model_validate(row["document"]))
+            except ValueError as error:
+                # Historical handoffs can outlive stricter schema revisions. A
+                # malformed cache entry must not prevent fresh reconnaissance or
+                # hide other valid handoffs for the same target.
+                document = row.get("document") if isinstance(row, Mapping) else None
+                handoff_id = document.get("id") if isinstance(document, Mapping) else None
+                _LOGGER.warning(
+                    "ignoring invalid reconnaissance handoff %s for target %s: %s",
+                    handoff_id or "<unknown>",
+                    target_id,
+                    error,
+                )
+        return tuple(handoffs)
 
     def verify_handoff_evidence(
         self, handoff_id: str, target_id: str, evidence_refs: Sequence[str]

@@ -231,6 +231,15 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
             assert recalled[0].reusable_site_facts == handoff.reusable_site_facts
 
             connection.execute(
+                """UPDATE merlin_storage.browser_recon_handoffs
+                      SET document = document - 'adapter' - 'dom_fallback_reason'
+                    WHERE handoff_id = %s""",
+                (handoff.id,),
+            )
+            connection.commit()
+            assert asyncio.run(store.list_handoffs(handoff.target_id)) == ()
+
+            connection.execute(
                 "DELETE FROM merlin_storage.browser_evidence WHERE evidence_ref = %s",
                 (handoff.response_evidence_ref,),
             )
