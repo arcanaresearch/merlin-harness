@@ -8101,15 +8101,22 @@ def _resolve_reviewed_scalar_pointer(
     )
     if not normalized_name:
         return None
-    matches = tuple(
-        (path, value)
-        for path, value in _json_scalar_paths(response)
-        if "".join(
+    state_prefixes = ("session", "run", "turn", "current", "target")
+
+    def matches_observation_name(path: str) -> bool:
+        leaf_name = "".join(
             character
             for character in path.rsplit("/", 1)[-1].casefold()
             if character.isalnum()
         )
-        == normalized_name
+        if leaf_name == normalized_name:
+            return True
+        return any(normalized_name == prefix + leaf_name for prefix in state_prefixes)
+
+    matches = tuple(
+        (path, value)
+        for path, value in _json_scalar_paths(response)
+        if matches_observation_name(path)
     )
     return matches[0] if len(matches) == 1 else None
 

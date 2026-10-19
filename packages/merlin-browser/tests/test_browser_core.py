@@ -4137,7 +4137,7 @@ async def test_api_handoff_infers_omitted_identity_from_shared_read_only_state()
         "response_selector": "/turn/reply",
         "state_observations": [
             {
-                "name": "score",
+                "name": "session_score",
                 "role": "score",
                 "baseline_selector": {
                     "pointer": "/turn/score",
@@ -4186,10 +4186,12 @@ async def test_api_handoff_infers_omitted_identity_from_shared_read_only_state()
     assert capabilities["identity"]["result_selector"]["pointer"] == "/run/runId"
     assert {item["name"] for item in capabilities["observations"]} == {
         "run_id",
-        "score",
+        "session_score",
         "turns_left",
     }
-    score = next(item for item in capabilities["observations"] if item["name"] == "score")
+    score = next(
+        item for item in capabilities["observations"] if item["name"] == "session_score"
+    )
     assert score["baseline_selector"]["pointer"] == "/session/score"
     assert score["result_selector"]["pointer"] == "/turn/score"
 
