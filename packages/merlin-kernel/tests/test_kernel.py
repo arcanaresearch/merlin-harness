@@ -2823,6 +2823,66 @@ async def test_dynamic_preferred_tool_rejects_stale_advertised_tool_in_same_requ
 
 
 @pytest.mark.asyncio
+async def test_dynamic_handoff_compile_allows_one_final_read_only_observation() -> None:
+    class DynamicTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "observe",
+                    "browser_snapshot",
+                    "browser_compile_api_handoff",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name in {"observe", "browser_snapshot"}:
+                return ToolResult(
+                    content="fresh exchange evidence",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            return ToolResult(content="compiled")
+
+    class DynamicProvider:
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            observed = await handler(ToolCall(call_id="observe", name="observe", arguments={}))
+            assert observed.success is True
+            snapshot = await handler(
+                ToolCall(call_id="snapshot", name="browser_snapshot", arguments={})
+            )
+            assert snapshot.success is True
+            repeated = await handler(
+                ToolCall(call_id="snapshot-again", name="browser_snapshot", arguments={})
+            )
+            assert repeated.success is False
+            compiled = await handler(
+                ToolCall(
+                    call_id="compile",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+            )
+            assert compiled.success is True
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = DynamicTools()
+    kernel = Kernel(DynamicProvider(), Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("compile recalled reconnaissance")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == ["observe", "browser_snapshot", "browser_compile_api_handoff"]
+
+
+@pytest.mark.asyncio
 async def test_dynamic_cleanup_compile_admits_prepare_in_same_request() -> None:
     class DynamicTools(Tools):
         def __init__(self):

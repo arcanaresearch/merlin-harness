@@ -828,6 +828,7 @@ class Kernel:
         repair_messages: list[ChatMessage] = []
         follow_through_recoveries = 0
         preferred_tool_follow_through_failures = 0
+        preferred_transition_observation_used = False
         automatic_recon_continuation: dict[str, object] | None = None
         automatic_no_progress_key: str | None = None
         automatic_progress_fingerprint: str | None = None
@@ -1100,6 +1101,7 @@ class Kernel:
                     nonlocal owned_cleanup_completed
                     nonlocal preferred_next_tool_name
                     nonlocal preferred_tool_follow_through_failures
+                    nonlocal preferred_transition_observation_used
                     nonlocal preferred_tool_invoked_dynamically
                     nonlocal recon_recall_completed
                     await self._store.append_message(
@@ -1144,11 +1146,18 @@ class Kernel:
                         and call.name != _request_preferred_tool_name
                         and call.name in _described_tool_names
                     )
+                    bounded_preferred_observation = (
+                        current_preferred_tool_name == "browser_compile_api_handoff"
+                        and not preferred_transition_observation_used
+                        and call.name in {"browser_snapshot", "browser_network_events"}
+                        and call.name in _described_tool_names
+                    )
                     if is_preferred_tool_call and not duplicate_owned_cleanup:
                         # Invocation discharges the obligation even when the tool returns a
                         # typed error. Tool integrity failures are evidence, not provider prose.
                         preferred_next_tool_name = None
                         preferred_tool_follow_through_failures = 0
+                        preferred_transition_observation_used = False
                         preferred_tool_invoked_dynamically = True
                     context = ToolContext(
                         session_id=session_id,
@@ -1156,9 +1165,15 @@ class Kernel:
                         call_id=call.call_id,
                     )
                     tool_admitted = (
-                        (call.name in _advertised_tool_names or dynamically_admitted_transition)
+                        (
+                            call.name in _advertised_tool_names
+                            or dynamically_admitted_transition
+                            or bounded_preferred_observation
+                        )
                         and (
-                            current_preferred_tool_name is None or is_preferred_tool_call
+                            current_preferred_tool_name is None
+                            or is_preferred_tool_call
+                            or bounded_preferred_observation
                         )
                         and (
                             not recon_recall_completed
@@ -1175,6 +1190,8 @@ class Kernel:
                     )
                     if is_required_owned_cleanup and not duplicate_owned_cleanup:
                         owned_cleanup_attempted_keys.add(owned_cleanup_key)
+                    if bounded_preferred_observation:
+                        preferred_transition_observation_used = True
                     try:
                         if not tool_admitted:
                             raise PermissionError("tool is not admitted for this provider request")
@@ -1250,6 +1267,8 @@ class Kernel:
                         raise _AwaitingUserInput
                     next_tool = result.metadata.get("preferred_next_tool")
                     if isinstance(next_tool, str):
+                        if next_tool != current_preferred_tool_name:
+                            preferred_transition_observation_used = False
                         preferred_next_tool_name = next_tool
                         preferred_tool_follow_through_failures = 0
                     elif (
