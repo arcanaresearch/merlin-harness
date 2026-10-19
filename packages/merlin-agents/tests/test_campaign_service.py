@@ -18576,6 +18576,176 @@ async def test_worker_terminal_prose_does_not_close_or_rewrite_frontier() -> Non
     assert store.directives
 
 
+async def test_committed_target_terminal_state_closes_nonrenewable_frontier() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    adapter = {
+        "interface": "http_api",
+        "endpoint": "https://target.test/run.turn",
+        "api_steps": [_text_message_step()],
+        "state_capabilities": {
+            "schema_version": "merlin.state-capabilities.v1",
+            "observations": [],
+        },
+    }
+    manifest = replace(
+        prepared.manifest,
+        catalogue=(
+            *prepared.manifest.catalogue,
+            ContextDocument.create(
+                "target:reviewed-interaction-contract",
+                "Reviewed API adapter.\n" + json.dumps(adapter, sort_keys=True),
+            ),
+        ),
+    )
+    task = AgentTask(id="worker/one", objective="probe", status="completed")
+    terminal_observation = {
+        "schema": "merlin.target-state-observation.v1",
+        "authority": "target",
+        "name": "run_status",
+        "role": "terminal_status",
+        "phase": "result",
+        "selected_value": "lost",
+        "failure_values": ["lost"],
+        "trust_class": "target_reported",
+    }
+    evidence = {
+        task.id: {
+            "target_evidence_receipts": {
+                "call/one": {
+                    "attempt_disposition": "valid",
+                    "target_state_transition": {
+                        "authority": "target",
+                        "identity_match": True,
+                        "validation_errors": [],
+                    },
+                    "state_observations": [terminal_observation],
+                }
+            }
+        }
+    }
+
+    assert CampaignService._terminal_single_session_observed(  # noqa: SLF001
+        manifest, (task,), evidence
+    )
+
+
+async def test_terminal_state_does_not_close_frontier_with_fresh_state_affordance() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    adapter = {
+        "interface": "http_api",
+        "endpoint": "https://target.test/run.turn",
+        "api_steps": [_text_message_step()],
+        "state_capabilities": {
+            "schema_version": "merlin.state-capabilities.v1",
+            "observations": [],
+            "affordances": [{"kind": "provision_fresh_state"}],
+        },
+    }
+    manifest = replace(
+        prepared.manifest,
+        catalogue=(
+            *prepared.manifest.catalogue,
+            ContextDocument.create(
+                "target:reviewed-interaction-contract",
+                "Reviewed API adapter.\n" + json.dumps(adapter, sort_keys=True),
+            ),
+        ),
+    )
+    task = AgentTask(id="worker/one", objective="probe", status="completed")
+    evidence = {
+        task.id: {
+            "target_evidence_receipts": {
+                "call/one": {
+                    "attempt_disposition": "valid",
+                    "terminal_response_observation": {"matched": True},
+                }
+            }
+        }
+    }
+
+    assert not CampaignService._terminal_single_session_observed(  # noqa: SLF001
+        manifest, (task,), evidence
+    )
+
+
+async def test_assessment_uses_committed_terminal_receipt_to_stop_followups() -> None:
+    class Store:
+        def list_waves(self, _campaign_id):
+            return ({"wave": 3, "schedule_id": "schedule-3"},)
+
+        def append_lead(self, *_args):
+            return None
+
+    task = AgentTask(id="worker/one", objective="probe", status="completed")
+    terminal_observation = {
+        "schema": "merlin.target-state-observation.v1",
+        "authority": "target",
+        "name": "run_status",
+        "role": "terminal_status",
+        "phase": "result",
+        "selected_value": "lost",
+        "failure_values": ["lost"],
+        "trust_class": "target_reported",
+    }
+    evidence = {
+        task.id: {
+            "target_evidence_receipts": {
+                "call/one": {
+                    "attempt_disposition": "valid",
+                    "target_state_transition": {
+                        "authority": "target",
+                        "identity_match": True,
+                        "validation_errors": [],
+                    },
+                    "state_observations": [terminal_observation],
+                }
+            }
+        }
+    }
+
+    class Agents:
+        async def completion_projection(self, schedule_id):
+            assert schedule_id
+            return {"evidence": evidence}
+
+    async def lead(*_args):
+        return LeadAssessment(
+            "continue",
+            False,
+            followups=(LeadFollowUp("next", "keep attacking", ("worker/one",)),),
+        )
+
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    adapter = {
+        "interface": "http_api",
+        "endpoint": "https://target.test/run.turn",
+        "api_steps": [_text_message_step()],
+        "state_capabilities": {
+            "schema_version": "merlin.state-capabilities.v1",
+            "observations": [],
+        },
+    }
+    manifest = replace(
+        prepared.manifest,
+        catalogue=(
+            *prepared.manifest.catalogue,
+            ContextDocument.create(
+                "target:reviewed-interaction-contract",
+                "Reviewed API adapter.\n" + json.dumps(adapter, sort_keys=True),
+            ),
+        ),
+    )
+    service = CampaignService(Store(), Agents(), preparation, lead)  # type: ignore[arg-type]
+
+    assessment = await service._assess_and_journal(  # noqa: SLF001
+        "campaign-1", manifest, 3, (task,)
+    )
+
+    assert assessment.coverage_complete is True
+    assert assessment.followups == ()
+    assert "target frontier is closed" in assessment.summary
+
+
 async def test_campaign_lead_retries_malformed_decisions() -> None:
     calls = 0
 

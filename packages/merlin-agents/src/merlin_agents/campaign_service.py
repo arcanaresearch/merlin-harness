@@ -9675,7 +9675,11 @@ class CampaignService:
         wave: int,
         tasks: tuple[AgentTask, ...],
     ) -> LeadAssessment:
-        terminal_single_session = self._terminal_single_session_observed(manifest, tasks)
+        schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+        source_evidence = await self._source_evidence(schedule_id, tasks)
+        terminal_single_session = self._terminal_single_session_observed(
+            manifest, tasks, source_evidence
+        )
         # In-flight visibility: a provider-backed Lead can stream for many minutes while
         # usage and task projections stay silent. Journal the start so operators can tell
         # "Lead mid-assessment" apart from a stalled campaign.
@@ -9752,12 +9756,80 @@ class CampaignService:
 
     @staticmethod
     def _terminal_single_session_observed(
-        manifest: CampaignManifest, tasks: tuple[AgentTask, ...]
+        manifest: CampaignManifest,
+        tasks: tuple[AgentTask, ...],
+        source_evidence: Mapping[str, Mapping[str, object]] | None = None,
     ) -> bool:
-        del manifest, tasks
-        # Worker prose may quote terminal markers or speculate about turn limits.
-        # Until a target-owned lifecycle receipt is wired here, fail closed and
-        # let the receipt reducer cap rather than claim saturation.
+        """Close an exhausted single-session frontier from committed target receipts only."""
+
+        if not source_evidence:
+            return False
+        try:
+            adapter = _reviewed_adapter_value(manifest)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        capabilities = adapter.get("state_capabilities") if adapter is not None else None
+        affordances = capabilities.get("affordances") if isinstance(capabilities, Mapping) else ()
+        renewable = {
+            "provision_fresh_state",
+            "reset_state",
+            "clone_state",
+            "restore_checkpoint",
+        }
+        if isinstance(affordances, Sequence) and not isinstance(affordances, (str, bytes)):
+            if any(
+                isinstance(item, Mapping) and item.get("kind") in renewable
+                for item in affordances
+            ):
+                return False
+
+        committed_ids = {task.id for task in tasks if task.status in _COMMITTED_TASK_STATUSES}
+        for task_id, committed in source_evidence.items():
+            if task_id not in committed_ids or not isinstance(committed, Mapping):
+                continue
+            for _, receipt in _mapping_items(committed.get("target_evidence_receipts")):
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("attempt_disposition") != "valid"
+                ):
+                    continue
+                terminal = receipt.get("terminal_response_observation")
+                if isinstance(terminal, Mapping) and terminal.get("matched") is True:
+                    return True
+                transition = receipt.get("target_state_transition")
+                if isinstance(transition, Mapping) and (
+                    transition.get("authority") != "target"
+                    or transition.get("identity_match") is not True
+                    or transition.get("validation_errors")
+                ):
+                    continue
+                observations = receipt.get("state_observations")
+                if not isinstance(observations, Sequence) or isinstance(
+                    observations, (str, bytes)
+                ):
+                    continue
+                for observation in observations:
+                    if (
+                        not isinstance(observation, Mapping)
+                        or observation.get("schema") != "merlin.target-state-observation.v1"
+                        or observation.get("authority") != "target"
+                        or observation.get("role") != "terminal_status"
+                        or observation.get("phase") != "result"
+                        or observation.get("trust_class") != "target_reported"
+                        or observation.get("validation_errors")
+                        or "selected_value" not in observation
+                    ):
+                        continue
+                    terminal_values = (
+                        *tuple(observation.get("success_values") or ()),
+                        *tuple(observation.get("failure_values") or ()),
+                    )
+                    selected = observation["selected_value"]
+                    if any(
+                        type(selected) is type(value) and selected == value
+                        for value in terminal_values
+                    ):
+                        return True
         return False
 
     async def _seal_completion_receipt(
