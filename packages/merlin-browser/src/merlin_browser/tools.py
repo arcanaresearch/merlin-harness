@@ -5691,13 +5691,50 @@ class CompiledApiReconHandoffTool:
         if physical_session_id is not None:
             request_sourced_session_values.intersection_update({physical_session_id})
 
+        reviewed_state_observations: list[Mapping[str, object]] = []
+        for raw_observation in arguments.get("state_observations", []):
+            if not isinstance(raw_observation, Mapping):
+                continue
+            baseline_selector = raw_observation.get("baseline_selector")
+            result_selector = raw_observation.get("result_selector")
+            if (
+                isinstance(baseline_selector, Mapping)
+                and isinstance(result_selector, Mapping)
+                and baseline_selector.get("step_id") == "observed-message-exchange"
+                and result_selector.get("step_id") == "observed-message-exchange"
+            ):
+                observation_name = str(raw_observation.get("name") or "")
+                baseline_pointer = baseline_selector.get("pointer")
+                matching_baselines = [
+                    candidate
+                    for candidate in exchanges[:event_index]
+                    if str(candidate.get("method") or "").upper() in {"GET", "HEAD"}
+                    and type(candidate.get("status")) is int
+                    and 200 <= int(candidate["status"])
+                    and _resolve_reviewed_scalar_pointer(
+                        candidate.get("response_json"),
+                        baseline_pointer,
+                        observation_name,
+                    )
+                    is not None
+                ]
+                if len(matching_baselines) == 1:
+                    raw_observation = {
+                        **raw_observation,
+                        "baseline_selector": {
+                            **baseline_selector,
+                            "step_id": "observed-session-setup",
+                        },
+                    }
+            reviewed_state_observations.append(raw_observation)
+
         # Cookie-authenticated APIs often keep physical state out of the request
         # body.  In that lifecycle, an exact reviewed state-identity declaration
         # can bind a passive GET snapshot to the interaction response without
         # treating the cookie itself as target state or inventing field semantics.
         passive_identity_baselines: list[tuple[Mapping[str, object], str, str]] = []
         if not request_sourced_session_values:
-            for raw_observation in arguments.get("state_observations", []):
+            for raw_observation in reviewed_state_observations:
                 if (
                     not isinstance(raw_observation, Mapping)
                     or raw_observation.get("role") != "state_identity"
@@ -6531,7 +6568,7 @@ class CompiledApiReconHandoffTool:
             ),
             "observed-cleanup-exchange": (cleanup_event, cleanup_evidence),
         }
-        for raw_observation in arguments.get("state_observations", []):
+        for raw_observation in reviewed_state_observations:
             if not isinstance(raw_observation, Mapping):
                 continue
             observation_name = str(raw_observation.get("name") or "")

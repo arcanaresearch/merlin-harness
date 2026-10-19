@@ -2311,7 +2311,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
                 "role": "state_identity",
                 "baseline_selector": {
                     "pointer": "/json/run/runId",
-                    "step_id": "observed-session-setup",
+                    "step_id": "observed-message-exchange",
                     "evaluation_root": "response_body",
                 },
                 "result_selector": {
@@ -2326,7 +2326,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
                 "role": "progress_ordinal",
                 "baseline_selector": {
                     "pointer": "/json/run/tier",
-                    "step_id": "observed-session-setup",
+                    "step_id": "observed-message-exchange",
                     "evaluation_root": "response_body",
                 },
                 "result_selector": {
