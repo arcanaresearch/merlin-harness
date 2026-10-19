@@ -1149,7 +1149,12 @@ class Kernel:
                     bounded_preferred_observation = (
                         current_preferred_tool_name == "browser_compile_api_handoff"
                         and not preferred_transition_observation_used
-                        and call.name in {"browser_snapshot", "browser_network_events"}
+                        and call.name
+                        in {
+                            "browser_snapshot",
+                            "browser_network_events",
+                            "browser_wait_for_text",
+                        }
                         and call.name in _described_tool_names
                     )
                     if is_preferred_tool_call and not duplicate_owned_cleanup:

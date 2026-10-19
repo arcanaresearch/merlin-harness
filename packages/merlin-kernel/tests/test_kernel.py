@@ -2833,7 +2833,7 @@ async def test_dynamic_handoff_compile_allows_one_final_read_only_observation() 
                 ToolSpec(name=name, description=name, input_schema={})
                 for name in (
                     "observe",
-                    "browser_snapshot",
+                    "browser_wait_for_text",
                     "browser_compile_api_handoff",
                 )
             )
@@ -2856,11 +2856,11 @@ async def test_dynamic_handoff_compile_allows_one_final_read_only_observation() 
             observed = await handler(ToolCall(call_id="observe", name="observe", arguments={}))
             assert observed.success is True
             snapshot = await handler(
-                ToolCall(call_id="snapshot", name="browser_snapshot", arguments={})
+                ToolCall(call_id="wait", name="browser_wait_for_text", arguments={})
             )
             assert snapshot.success is True
             repeated = await handler(
-                ToolCall(call_id="snapshot-again", name="browser_snapshot", arguments={})
+                ToolCall(call_id="wait-again", name="browser_wait_for_text", arguments={})
             )
             assert repeated.success is False
             compiled = await handler(
@@ -2879,7 +2879,7 @@ async def test_dynamic_handoff_compile_allows_one_final_read_only_observation() 
     await kernel.submit("compile recalled reconnaissance")
     await kernel.wait_for_turn()
 
-    assert tools.calls == ["observe", "browser_snapshot", "browser_compile_api_handoff"]
+    assert tools.calls == ["observe", "browser_wait_for_text", "browser_compile_api_handoff"]
 
 
 @pytest.mark.asyncio
