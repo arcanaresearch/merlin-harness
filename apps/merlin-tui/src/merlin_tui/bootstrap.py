@@ -10652,14 +10652,6 @@ def build_backend(
             gate_ids = [gate.id for gate in audited]
             if len(gate_ids) != len(set(gate_ids)):
                 raise ValueError("objective prerequisite audit returned duplicate gate ids")
-            existing_by_id = {gate.id: gate for gate in proposed_gates}
-            audited_by_id = {gate.id: gate for gate in audited}
-            missing_existing = set(existing_by_id) - set(audited_by_id)
-            if missing_existing:
-                raise ValueError(
-                    "objective prerequisite audit dropped proposed gate(s): "
-                    + ", ".join(sorted(missing_existing))
-                )
             return tuple(replace(gate, ordinal=index) for index, gate in enumerate(audited))
 
         campaigns = CampaignService(
