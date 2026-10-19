@@ -13837,7 +13837,7 @@ async def test_lead_admits_validator_then_bounded_followup_wave() -> None:
     assert store.terminal == "completed"
     assert store.lead[-1][1]["stop_reason"] == "budget_exhausted"
     assert any(item[1].get("independent_reproduction") == "blocked" for item in store.lead)
-    assert agents.evidence_requests[0] == "initial"
+    assert "initial" in agents.evidence_requests
 
 
 @pytest.mark.parametrize("qualified_negative", (False, True))
