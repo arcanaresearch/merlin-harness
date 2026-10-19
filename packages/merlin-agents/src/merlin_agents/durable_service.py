@@ -5903,6 +5903,12 @@ class DurableAgentService:
                     # fresh worker, not a full stall budget of provider latency.
                     failure_kind_stall_limits={
                         RetryFailureKind.RESULT_SCHEMA_INVALID.value: 1,
+                        # Once the shared adapter circuit has opened, one
+                        # stalled half-open replacement is enough to test
+                        # recovery. Further identical workers cannot reach the
+                        # target and only repeat provider work until the wave's
+                        # generic stall budget expires.
+                        RetryFailureKind.TARGET_ADAPTER_UNHEALTHY.value: 1,
                     },
                 ),
             )

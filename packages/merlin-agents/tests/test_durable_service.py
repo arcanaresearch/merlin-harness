@@ -385,6 +385,12 @@ def test_worker_graph_fail_fast_rules_for_target_effect_and_schema_failures() ->
         retry.retry_policy.failure_kind_stall_limits[RetryFailureKind.RESULT_SCHEMA_INVALID.value]
         == 1
     )
+    assert (
+        retry.retry_policy.failure_kind_stall_limits[
+            RetryFailureKind.TARGET_ADAPTER_UNHEALTHY.value
+        ]
+        == 1
+    )
     assert RetryFailureKind.TRANSPORT_TRANSIENT.value in retry.retry_policy.failure_kinds
     assert (
         RetryFailureKind.TRANSPORT_TRANSIENT.value
