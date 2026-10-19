@@ -2683,6 +2683,7 @@ class ReviewedApiTargetTool:
                 )
             )
         if not 200 <= status_code <= 299:
+            application_rejection = status_code == 409
             discovered_constraints = _structured_constraint_rejection_observations(
                 adapter,
                 step,
@@ -2725,9 +2726,14 @@ class ReviewedApiTargetTool:
                     "outcome": (
                         "request_constraint_violation"
                         if protocol_invalid
-                        else "target_delivery_rejected"
+                        else (
+                            "target_application_rejected"
+                            if application_rejection
+                            else "target_delivery_rejected"
+                        )
                     ),
-                    "target_delivery_rejected": not protocol_invalid,
+                    "target_delivery_rejected": not protocol_invalid and not application_rejection,
+                    "target_application_rejected": application_rejection,
                     **(
                         {
                             "resource_blocks": {
@@ -2739,10 +2745,26 @@ class ReviewedApiTargetTool:
                         else {}
                     ),
                     "session_health": "unknown",
-                    "retryable": True,
+                    "retryable": not application_rejection,
+                    **(
+                        {
+                            "exact_replay_retryable": False,
+                            "attempt_disposition": "uncertain",
+                            "disposition_reason": (
+                                "the target acknowledged the request and rejected it because "
+                                "of application state; semantic review must decide the next "
+                                "lifecycle action"
+                            ),
+                            "no_target_effect": True,
+                        }
+                        if application_rejection
+                        else {}
+                    ),
                     **(
                         {"attempt_disposition": "protocol_invalid"}
                         if protocol_invalid
+                        else {}
+                        if application_rejection
                         else {
                             "infrastructure_failure_category": (
                                 InfrastructureFailureCategory.DELIVERY_FAILURE.value
@@ -5526,15 +5548,23 @@ def _target_delivery_rejected_result(
         if exchange.get("cleanup") is not True
     )
     protocol_invalid = current.get("attempt_disposition") == "protocol_invalid"
+    application_rejection = current.get("target_application_rejected") is True
     return ToolResult(
         content=(
             f"reviewed target delivery returned HTTP {status_code}; the structured response "
             "proved a request constraint violation"
             if protocol_invalid
-            else f"reviewed target delivery returned HTTP {status_code}; the response was "
-            "preserved as retryable infrastructure telemetry, not capability evidence"
+            else (
+                f"reviewed target delivery returned HTTP {status_code}; the target "
+                "acknowledged and rejected the request because of application state. "
+                "The response is preserved for semantic lifecycle review and exact replay "
+                "is disabled"
+                if application_rejection
+                else f"reviewed target delivery returned HTTP {status_code}; the response was "
+                "preserved as retryable infrastructure telemetry, not capability evidence"
+            )
         ),
-        is_error=True,
+        is_error=not application_rejection,
         metadata={
             "campaign_id": state.campaign_id,
             "target_profile_id": adapter.target_id,
@@ -5543,11 +5573,18 @@ def _target_delivery_rejected_result(
             "target_session_generation": state.generation,
             "session_scope_id": state.session_scope_id,
             "failure_code": (
-                "request_constraint_violation" if protocol_invalid else "target_delivery_rejected"
+                "request_constraint_violation"
+                if protocol_invalid
+                else (
+                    "target_application_rejected"
+                    if application_rejection
+                    else "target_delivery_rejected"
+                )
             ),
-            "target_delivery_rejected": not protocol_invalid,
+            "target_delivery_rejected": not protocol_invalid and not application_rejection,
+            "target_application_rejected": application_rejection,
             "session_health": "unknown",
-            "retryable": True,
+            "retryable": not application_rejection,
             **(
                 {
                     "attempt_disposition": "protocol_invalid",
@@ -5558,6 +5595,17 @@ def _target_delivery_rejected_result(
                     "no_target_effect": True,
                 }
                 if protocol_invalid
+                else {
+                    "attempt_disposition": "uncertain",
+                    "disposition_reason": (
+                        "the target acknowledged the request and rejected it because of "
+                        "application state; semantic review must decide the next lifecycle "
+                        "action"
+                    ),
+                    "exact_replay_retryable": False,
+                    "no_target_effect": True,
+                }
+                if application_rejection
                 else {
                     "infrastructure_failure_category": (
                         InfrastructureFailureCategory.DELIVERY_FAILURE.value

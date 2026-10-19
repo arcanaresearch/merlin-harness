@@ -2074,11 +2074,15 @@ async def test_reviewed_api_tool_preserves_applied_terminal_response_on_http_4xx
                     client=client,
                 ).invoke(_context(campaign_id), {"input": "terminal probe"})
 
-    assert result.is_error is True
-    assert result.metadata["failure_code"] == "target_delivery_rejected"
+    assert result.is_error is False
+    assert result.metadata["failure_code"] == "target_application_rejected"
+    assert result.metadata["target_application_rejected"] is True
+    assert result.metadata["retryable"] is False
+    assert result.metadata["exact_replay_retryable"] is False
+    assert "infrastructure_failure_category" not in result.metadata
     interaction = result.metadata["current_target_exchanges"][-1]
     assert interaction["status_code"] == 409
-    assert interaction["outcome"] == "target_delivery_rejected"
+    assert interaction["outcome"] == "target_application_rejected"
     assert interaction["response_body_summary"]["fields"] == ["gameStatus", "reply"]
 
 
@@ -2621,8 +2625,13 @@ async def test_reviewed_api_tool_preserves_interaction_on_expected_status_mismat
                     client=client,
                 ).invoke(_context(campaign_id), {"input": "probe"})
 
-    assert result.is_error is True
-    assert result.metadata["failure_code"] == "target_delivery_rejected"
+    assert result.is_error is False
+    assert result.metadata["failure_code"] == "target_application_rejected"
+    assert result.metadata["target_application_rejected"] is True
+    assert result.metadata["retryable"] is False
+    assert result.metadata["exact_replay_retryable"] is False
+    assert result.metadata["attempt_disposition"] == "uncertain"
+    assert "infrastructure_failure_category" not in result.metadata
     assert result.metadata["acknowledged_capability_evidence"] is False
     assert result.metadata["limit_interaction_count"] == 1
     assert result.metadata["target_call_budget_charge"] == 2
@@ -2631,7 +2640,7 @@ async def test_reviewed_api_tool_preserves_interaction_on_expected_status_mismat
     assert exchange["status_code"] == 409
     assert exchange["expected_status"] == 200
     assert exchange["response_body_summary"]["fields"] == ["reason", "reply"]
-    assert exchange["outcome"] == "target_delivery_rejected"
+    assert exchange["outcome"] == "target_application_rejected"
 
 
 @pytest.mark.asyncio
@@ -3648,8 +3657,10 @@ async def test_generated_request_values_survive_retry_rejection_and_tool_restart
                 )
 
     assert not first.is_error and not third.is_error
-    assert rejected.is_error and rejected.metadata["target_profile_id"] == "target-refund"
-    assert rejected.metadata["infrastructure_failure_category"] == "delivery_failure"
+    assert not rejected.is_error and rejected.metadata["target_profile_id"] == "target-refund"
+    assert rejected.metadata["failure_code"] == "target_application_rejected"
+    assert rejected.metadata["retryable"] is False
+    assert "infrastructure_failure_category" not in rejected.metadata
     assert len(seen) == 4
     assert seen[0] == seen[1]  # Same logical message, same ID on transport retry.
     assert len({item["envelope"]["opaque"] for item in seen}) == 3
