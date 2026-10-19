@@ -804,7 +804,11 @@ class BrowserSession:
 
     def api_exchange_events(self) -> tuple[dict[str, object], ...]:
         """Return bounded, redacted JSON request/response events for adapter compilation."""
-        return tuple(dict(item) for item in self._network_events if "request_json" in item)
+        return tuple(
+            dict(item)
+            for item in self._network_events
+            if "request_json" in item or "response_json" in item
+        )
 
     async def _install_bounds(self) -> None:
         await self.context.route("**/*", self._route_request)

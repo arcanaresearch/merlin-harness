@@ -1336,16 +1336,11 @@ class StateScopeRepository:
                     (campaign_id,),
                 ).fetchone()
                 cleanup = self.connection.execute(
-                    """SELECT count(*) AS count FROM (
-                           SELECT 1 FROM merlin_storage.campaign_api_sessions
-                           WHERE campaign_id = %s AND state <> 'cleaned'
-                             AND cleanup_disposition IS NULL
-                           UNION ALL
-                           SELECT 1 FROM merlin_storage.state_scopes
+                    """SELECT count(*) AS count
+                       FROM merlin_storage.state_scopes
                            WHERE campaign_id = %s
-                             AND cleanup_disposition IN ('pending', 'failed')
-                       ) AS obligations""",
-                    (campaign_id, campaign_id),
+                         AND cleanup_disposition IN ('pending', 'failed')""",
+                    (campaign_id,),
                 ).fetchone()
                 leases = self.connection.execute(
                     """SELECT count(*) AS count

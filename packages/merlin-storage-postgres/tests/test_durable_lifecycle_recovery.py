@@ -21,6 +21,7 @@ from merlin_contracts.state_scope import (
     StateScopeEvidence,
 )
 from merlin_storage_postgres import (
+    CampaignApiSessionRepository,
     CampaignStore,
     Database,
     DatabaseConfig,
@@ -95,6 +96,31 @@ def _reconcile(repository: StateScopeRepository, claimant_id: str):
 
 def _campaign_recovery(report, campaign_id: str):
     return next(item for item in report["campaigns"] if item["campaign_id"] == campaign_id)
+
+
+def test_active_api_session_is_not_an_unfinished_cleanup_obligation(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            _campaigns, campaign_id = _prepare_campaign(connection, "active-api-session")
+            sessions = CampaignApiSessionRepository(connection)
+            sessions.create(
+                campaign_id,
+                "target.example",
+                "sha256:adapter",
+                session_scope_id="session/main",
+            )
+
+            recovery = _campaign_recovery(
+                _reconcile(sessions, "daemon/recovery"),
+                campaign_id,
+            )
+
+            assert recovery["decision"] == "resume"
+            assert recovery["cleanup_obligations"] == 0
+            assert recovery["status"] == "prepared"
 
 
 def test_restart_settles_acknowledged_effect_once_after_lease_takeover(

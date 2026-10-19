@@ -55,6 +55,37 @@ from merlin_storage_postgres import (
 from merlin_tools import ToolBroker
 
 
+def test_api_exchange_events_include_read_only_json_state_baselines() -> None:
+    session = object.__new__(BrowserSession)
+    session._network_events = [  # noqa: SLF001
+        {
+            "method": "GET",
+            "url": "https://target.test/api/state",
+            "status": 200,
+            "response_json": {"run": {"tier": 2, "score": 73}},
+        },
+        {
+            "method": "GET",
+            "url": "https://target.test/app.js",
+            "status": 200,
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "request_json": {"text": "hello"},
+            "response_json": {"turn": {"score": 81}},
+        },
+    ]
+
+    events = session.api_exchange_events()
+
+    assert [event["url"] for event in events] == [
+        "https://target.test/api/state",
+        "https://target.test/api/turn",
+    ]
+
+
 def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
     session = SimpleNamespace(
         context_id="browser-context",
