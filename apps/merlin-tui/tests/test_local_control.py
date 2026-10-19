@@ -927,9 +927,10 @@ async def test_foreground_lease_disconnect_keeps_active_campaign_daemon_alive(
                 break
             await asyncio.sleep(0.01)
 
-        client = LocalControlClient(socket_path=socket_path)
+        client = LocalControlClient(socket_path=socket_path, owns_daemon=True)
         await client.acquire_foreground_lease()
         await client.release_foreground_lease()
+        await client.close()
         await asyncio.wait_for(backend.checked.wait(), timeout=1)
         await asyncio.sleep(0.05)
 

@@ -1188,6 +1188,10 @@ class LocalControlClient:
         writer = await self._drop_foreground_lease()
         if writer is not None:
             await _close_writer(writer)
+            # From this point the daemon's campaign-aware idle watcher owns its
+            # lifetime.  A later client close must not bypass that watcher and
+            # pause durable work that is still active.
+            self._owns_daemon = False
 
     async def replace_foreground(self, *, restart: bool = False) -> None:
         """Ask the existing window to quit, then wait for owned-resource cleanup."""
