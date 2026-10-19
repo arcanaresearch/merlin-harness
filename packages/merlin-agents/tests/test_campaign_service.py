@@ -58,6 +58,7 @@ from merlin_agents.campaign import (
     enumerate_language_candidate_references,
     manifest_with_bounded_regeneration,
     manifest_with_objective_contract,
+    resolve_declared_effect,
 )
 from merlin_agents.campaign_service import (
     QUICKSCAN_FOLLOWUP_WAVE_LIMIT,
@@ -1127,6 +1128,35 @@ def test_schedule_grants_bind_one_reviewed_target() -> None:
                 assignment("worker-2", "target-2"),
             )
         )
+
+
+def test_schedule_grants_restore_exact_dynamic_successor_grant() -> None:
+    assignment = WorkerAssignment(
+        id="worker-1",
+        objective="Inspect the reviewed target",
+        profile_id="injection",
+        target_profile_id="target-1",
+        technique_ids=("technique-1",),
+        guidance_ids=(),
+        tool_ids=("knowledge_search",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("authority",),
+        budget=AssignmentBudget(128, 1024, 60),
+        input_schema="{}",
+        output_schema="{}",
+        grant_id="dynamic-grant:abc123",
+        strategy_contract=(
+            ("capability_grant_effects", '["workspace_read"]'),
+            ("capability_grant_evidence", "approved request-1"),
+        ),
+    )
+
+    grants = _schedule_grant_universe((assignment,))
+
+    assert grants["dynamic-grant:abc123"].effect_classes == frozenset({"workspace_read"})
+    assert grants["dynamic-grant:abc123"].evidence == "approved request-1"
+    assert grants["dynamic-grant:abc123"].target_scope == "target-1"
 
 
 def test_adapted_agent_message_transport_withholds_surface_credit() -> None:
@@ -12050,6 +12080,65 @@ async def test_failed_source_followup_creates_attributable_escalated_assignment(
     assert assignment.target_session_capacity == 2
 
 
+async def test_lead_capability_expansion_seals_exact_successor_grant() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    manifest = CampaignManifest.create(
+        id=prepared.manifest.id,
+        session_id=prepared.manifest.session_id,
+        objective=prepared.manifest.objective,
+        profile=prepared.manifest.profile,
+        target=prepared.manifest.target,
+        provider_id=prepared.manifest.provider_id,
+        provider_model=prepared.manifest.provider_model,
+        provider_effort=prepared.manifest.provider_effort,
+        authority_ids=prepared.manifest.authority_ids,
+        catalogue=prepared.manifest.catalogue,
+        skill_documents=prepared.manifest.skill_documents,
+        tool_ids=(*prepared.manifest.tool_ids, "knowledge_search"),
+        budget=prepared.manifest.budget,
+    )
+    context = replace(
+        prepared.assignment_context,
+        tool_ids=tuple(
+            dict.fromkeys((*prepared.assignment_context.tool_ids, "knowledge_search"))
+        ),
+    )
+    owner = _active_dynamic_specialist(
+        prepared,
+        "dynamic-injection",
+        (context.techniques[0].id,),
+        context=context,
+    )
+
+    compiled = CampaignService._followup_compilation(  # noqa: SLF001
+        manifest,
+        context,
+        2,
+        (
+            LeadFollowUp(
+                owner.assignment.profile_id,
+                "Use the reviewed knowledge index for the successor experiment",
+                ("source-task",),
+                capability_request_ids=("worker-message:request-1",),
+                expanded_tool_ids=("knowledge_search",),
+            ),
+        ),
+        dynamic_specialists=(owner,),
+    )
+
+    assignment = compiled.assignments[0]
+    assert "knowledge_search" in assignment.tool_ids
+    assert assignment.grant_id is not None
+    assert assignment.grant_id.startswith("dynamic-grant:")
+    grants = _schedule_grant_universe((assignment,))
+    grant = grants[assignment.grant_id]
+    assert grant.effect_classes == frozenset(
+        resolve_declared_effect(tool_id) for tool_id in assignment.tool_ids
+    )
+    assert grant.evidence == "approved Lead capability requests: worker-message:request-1"
+    assert compiled.worker_contexts[0].tool_ids == assignment.tool_ids
+
+
 @pytest.mark.parametrize("strategy_id", ("crescendo", "goat", "hydra-select"))
 async def test_ordinary_followup_excludes_adaptive_cells_from_mixed_profile(
     strategy_id: str,
@@ -17861,6 +17950,47 @@ async def test_broadcast_to_peers_stays_opt_in_without_a_named_recipient() -> No
         "worker:campaign/campaign-1/peer-b",
     )
     assert len(agents.deliveries) == 2
+
+
+async def test_worker_can_request_next_wave_tools_only_from_sealed_campaign() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    expanded_manifest = replace(
+        prepared.manifest,
+        tool_ids=("target_chat", "knowledge_search"),
+    )
+
+    class CapabilityStore(_NamedShareStore):
+        def get(self, campaign_id):
+            return {
+                "id": campaign_id,
+                "session_id": "session-1",
+                "status": "executing",
+                "manifest": {"manifest": _json_value(asdict(expanded_manifest))},
+            }
+
+    store = CapabilityStore()
+    service = CampaignService(store, _NamedShareAgents(), preparation)  # type: ignore[arg-type]
+
+    result = await service.share_worker_message(
+        _share_context(),
+        "lead",
+        "The next experiment needs the campaign knowledge index.",
+        kind="capability_request",
+        requested_tool_ids=("knowledge_search",),
+    )
+
+    assert result["requested_tool_ids"] == ("knowledge_search",)
+    recorded = next(iter(store.messages.values()))
+    assert json.loads(recorded["content"])["requested_tool_ids"] == ["knowledge_search"]
+
+    with pytest.raises(PermissionError, match="sealed campaign tool universe"):
+        await service.share_worker_message(
+            _share_context().model_copy(update={"call_id": "call-2"}),
+            "lead",
+            "I also want an unrelated shell.",
+            kind="capability_request",
+            requested_tool_ids=("shell_exec",),
+        )
 
 
 async def test_named_peer_must_be_an_active_sibling() -> None:

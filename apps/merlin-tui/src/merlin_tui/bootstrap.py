@@ -3922,8 +3922,7 @@ def _compile_objective_phase_gate_audit(
         operator = str(predicate.get("operator") or "").strip()
         receipt_predicate = observation_name == "target_exchange_completed"
         selected_interaction = any(
-            steps_by_id[action["step_id"]].get("interaction") is True
-            for action in compiled_actions
+            steps_by_id[action["step_id"]].get("interaction") is True for action in compiled_actions
         )
         if observation_name not in observation_names and not (
             receipt_predicate and selected_interaction
@@ -3933,9 +3932,7 @@ def _compile_objective_phase_gate_audit(
                 f"{observation_name!r}"
             )
         if receipt_predicate and operator != "present":
-            raise ValueError(
-                "target_exchange_completed requires the present predicate operator"
-            )
+            raise ValueError("target_exchange_completed requires the present predicate operator")
         if operator not in operators:
             raise ValueError(
                 f"objective prerequisite audit selected unknown predicate operator {operator!r}"
@@ -3998,9 +3995,7 @@ def _compile_objective_phase_gate_audit(
         if key not in ordered_keys:
             ordered_keys.append(key)
 
-    all_ids = {
-        final_id_by_key[key] for key in compiled_by_key if key not in rejected_keys
-    }
+    all_ids = {final_id_by_key[key] for key in compiled_by_key if key not in rejected_keys}
     if mapped_ids != all_ids:
         raise ValueError("objective prerequisite audit did not map every gate to operator text")
     return tuple(
@@ -5466,7 +5461,13 @@ def build_backend(
                     "operator instruction, never to declare coverage complete. For ordinary "
                     "guidance use worker actions or followups as appropriate. "
                     "optional plan_update, and optional automation_requests. Each followup has "
-                    "profile_id, objective, and source_task_ids. A genuinely new, "
+                    "profile_id, objective, and source_task_ids. When a worker coordination "
+                    "task carries kind=capability_request, you may approve some or all of its "
+                    "requested_tool_ids for the next wave by adding capability_request_ids and "
+                    "expanded_tool_ids to a followup. Copy the worker-message id and tool names "
+                    "exactly. This is a tactical expansion within the sealed target, authority, "
+                    "provider, and campaign tool universe; it never changes those ceilings and "
+                    "never mutates a running worker. A genuinely new, "
                     "target-derived hypothesis must also include hypothesis with "
                     "surface, assertion, oracle, and novelty_basis. Do not create a "
                     "hypothesis without a concrete target surface and falsifiable test "
@@ -6045,7 +6046,17 @@ def build_backend(
                         )
                 return (
                     LeadFollowUp(
-                        profile_id, objective, source_task_ids, hypothesis, specialist=specialist
+                        profile_id,
+                        objective,
+                        source_task_ids,
+                        hypothesis,
+                        specialist=specialist,
+                        capability_request_ids=tuple(
+                            str(request_id) for request_id in item.get("capability_request_ids", ())
+                        ),
+                        expanded_tool_ids=tuple(
+                            str(tool_id) for tool_id in item.get("expanded_tool_ids", ())
+                        ),
                     ),
                     None,
                 )
@@ -10478,12 +10489,8 @@ def build_backend(
                     for collection in (
                         adapter_projection.get("state_observations"),
                         (
-                            adapter_projection.get("state_capabilities", {}).get(
-                                "observations"
-                            )
-                            if isinstance(
-                                adapter_projection.get("state_capabilities"), Mapping
-                            )
+                            adapter_projection.get("state_capabilities", {}).get("observations")
+                            if isinstance(adapter_projection.get("state_capabilities"), Mapping)
                             else None
                         ),
                     )
@@ -10497,98 +10504,96 @@ def build_backend(
                 predicate_observations.append("target_exchange_completed")
             lead_model = config.provider_role_models.get("lead", model)
             audit_messages = [
-                    ChatMessage(
-                        role="system",
-                        content=(
-                            "You are the independent semantic auditor for a campaign objective "
-                            "contract. Identify only explicit ordered setup or normal-play "
-                            "requirements whose state must be verified immediately before "
-                            "adversarial attacks. A phase gate is bounded executable or verifiable "
-                            "pre-attack work; cumulative tier/character coverage, reporting, "
-                            "blocker handling, desired attack outcomes, and suggested attack "
-                            "methods are campaign objectives or guidance, never phase gates. "
-                            "Opening the target, named authentication, and signing may already "
-                            "have happened during the current reviewed reconnaissance. When the "
-                            "reviewed adapter and evidence explicitly establish that the named "
-                            "authentication/signing or ordinary baseline interaction already "
-                            "occurred in this same live context, that prerequisite is preexisting: "
-                            "do not schedule it again. Explicitly reject any corresponding "
-                            "existing "
-                            "proposed gate in rejected_gates with a reason stating that current "
-                            "reviewed reconnaissance already satisfied it. Do not add satisfied "
-                            "prerequisites to requirements. Only an unmet authentication "
-                            "prerequisite may use a non-interaction setup/state-read verification "
-                            "step; never select a chat/message interaction merely to observe state "
-                            "that the read step already returns. An unmet request to play normally "
-                            "first requires a separate baseline gate using exactly one bounded "
-                            "ordinary target interaction. That baseline gate must not advance "
-                            "tiers, cover "
-                            "characters, repeat play, or perform reporting; those remain "
-                            "cumulative campaign objectives. Audit existing proposed gates as "
-                            "critically as missing gates. When an existing gate is over-broad or "
-                            "does not express the exact prerequisite, replace it by emitting a "
-                            "gate_proposals entry whose key is that existing gate id. When an "
-                            "existing proposed gate is not an explicit pre-attack prerequisite "
-                            "at all, list it in rejected_gates as {key, reason}; only existing "
-                            "gate IDs may be rejected. Return one JSON object only with keys "
-                            "requirements, gate_proposals, rejected_gates, and "
-                            "unresolved_requirements. requirements is an ordered array of "
-                            "{source_quote, gate_key}; source_quote "
-                            "must be an exact non-empty substring of the operator objective. "
-                            "gate_key is either an existing proposed gate id or the key of one "
-                            "gate_proposals entry. gate_proposals contains missing gates and any "
-                            "semantically corrected replacement for an existing gate, "
-                            "each as {key, objective, actions, success_predicate}. Each action has "
-                            "only {step_id, input_text}; input_text may be omitted for a "
-                            "state-read step. Each success_predicate has "
-                            "{observation_name, operator, "
-                            "expected_values}. Select only reviewed adapter step IDs and "
-                            "authoritative state observation names. Do not emit ids, ordinals, "
-                            "budgets, retry policies, retention, or existing gates; the compiler "
-                            "owns those structural fields. unresolved_requirements is an array of "
-                            "{source_quote, reason} only when a true pre-attack prerequisite has "
-                            "neither reviewed evidence nor an adapter action that can verify or "
-                            "perform it. Never put cumulative coverage or reporting work in that "
-                            "array. Never silently omit a true prerequisite. Predicate "
-                            "operators are present, equals, one_of, at_least, at_most, "
-                            "increases, decreases, or terminal_success. Use present with an "
-                            "empty expected_values array when a non-empty executable state "
-                            "observation proves the prerequisite. Identity selectors and capture "
-                            "names are receipt metadata, not predicate observations; never select "
-                            "an observation whose role is state_identity, even when it appears in "
-                            "state_observations or state_capabilities.observations. Never compare "
-                            "an identifier to an empty string."
-                            " The user message supplies an explicit phase_gate_choices object. "
-                            "Select step_id and observation_name values only from those arrays. "
-                            "target_exchange_completed means that the selected interaction "
-                            "produced a committed target-bound receipt with a valid delivery "
-                            "disposition; use it with operator present only for a bounded "
-                            "normal-play interaction when no executable state observation exists."
-                        ),
+                ChatMessage(
+                    role="system",
+                    content=(
+                        "You are the independent semantic auditor for a campaign objective "
+                        "contract. Identify only explicit ordered setup or normal-play "
+                        "requirements whose state must be verified immediately before "
+                        "adversarial attacks. A phase gate is bounded executable or verifiable "
+                        "pre-attack work; cumulative tier/character coverage, reporting, "
+                        "blocker handling, desired attack outcomes, and suggested attack "
+                        "methods are campaign objectives or guidance, never phase gates. "
+                        "Opening the target, named authentication, and signing may already "
+                        "have happened during the current reviewed reconnaissance. When the "
+                        "reviewed adapter and evidence explicitly establish that the named "
+                        "authentication/signing or ordinary baseline interaction already "
+                        "occurred in this same live context, that prerequisite is preexisting: "
+                        "do not schedule it again. Explicitly reject any corresponding "
+                        "existing "
+                        "proposed gate in rejected_gates with a reason stating that current "
+                        "reviewed reconnaissance already satisfied it. Do not add satisfied "
+                        "prerequisites to requirements. Only an unmet authentication "
+                        "prerequisite may use a non-interaction setup/state-read verification "
+                        "step; never select a chat/message interaction merely to observe state "
+                        "that the read step already returns. An unmet request to play normally "
+                        "first requires a separate baseline gate using exactly one bounded "
+                        "ordinary target interaction. That baseline gate must not advance "
+                        "tiers, cover "
+                        "characters, repeat play, or perform reporting; those remain "
+                        "cumulative campaign objectives. Audit existing proposed gates as "
+                        "critically as missing gates. When an existing gate is over-broad or "
+                        "does not express the exact prerequisite, replace it by emitting a "
+                        "gate_proposals entry whose key is that existing gate id. When an "
+                        "existing proposed gate is not an explicit pre-attack prerequisite "
+                        "at all, list it in rejected_gates as {key, reason}; only existing "
+                        "gate IDs may be rejected. Return one JSON object only with keys "
+                        "requirements, gate_proposals, rejected_gates, and "
+                        "unresolved_requirements. requirements is an ordered array of "
+                        "{source_quote, gate_key}; source_quote "
+                        "must be an exact non-empty substring of the operator objective. "
+                        "gate_key is either an existing proposed gate id or the key of one "
+                        "gate_proposals entry. gate_proposals contains missing gates and any "
+                        "semantically corrected replacement for an existing gate, "
+                        "each as {key, objective, actions, success_predicate}. Each action has "
+                        "only {step_id, input_text}; input_text may be omitted for a "
+                        "state-read step. Each success_predicate has "
+                        "{observation_name, operator, "
+                        "expected_values}. Select only reviewed adapter step IDs and "
+                        "authoritative state observation names. Do not emit ids, ordinals, "
+                        "budgets, retry policies, retention, or existing gates; the compiler "
+                        "owns those structural fields. unresolved_requirements is an array of "
+                        "{source_quote, reason} only when a true pre-attack prerequisite has "
+                        "neither reviewed evidence nor an adapter action that can verify or "
+                        "perform it. Never put cumulative coverage or reporting work in that "
+                        "array. Never silently omit a true prerequisite. Predicate "
+                        "operators are present, equals, one_of, at_least, at_most, "
+                        "increases, decreases, or terminal_success. Use present with an "
+                        "empty expected_values array when a non-empty executable state "
+                        "observation proves the prerequisite. Identity selectors and capture "
+                        "names are receipt metadata, not predicate observations; never select "
+                        "an observation whose role is state_identity, even when it appears in "
+                        "state_observations or state_capabilities.observations. Never compare "
+                        "an identifier to an empty string."
+                        " The user message supplies an explicit phase_gate_choices object. "
+                        "Select step_id and observation_name values only from those arrays. "
+                        "target_exchange_completed means that the selected interaction "
+                        "produced a committed target-bound receipt with a valid delivery "
+                        "disposition; use it with operator present only for a bounded "
+                        "normal-play interaction when no executable state observation exists."
                     ),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(
-                            {
-                                "operator_objective": objective,
-                                "proposed_phase_gates": existing_payload,
-                                "reviewed_adapter": adapter_projection,
-                                "phase_gate_choices": {
-                                    "steps": executable_steps,
-                                    "observations": predicate_observations,
-                                },
+                ),
+                ChatMessage(
+                    role="user",
+                    content=json.dumps(
+                        {
+                            "operator_objective": objective,
+                            "proposed_phase_gates": existing_payload,
+                            "reviewed_adapter": adapter_projection,
+                            "phase_gate_choices": {
+                                "steps": executable_steps,
+                                "observations": predicate_observations,
                             },
-                            sort_keys=True,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
+                        },
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
                     ),
+                ),
             ]
             gate_values: tuple[dict[str, object], ...] | None = None
             last_audit_error: ValueError | None = None
-            for semantic_attempt in range(
-                max(1, config.provider_runtime.worker_retry_attempts)
-            ):
+            for semantic_attempt in range(max(1, config.provider_runtime.worker_retry_attempts)):
                 value = await _request_structured_json(
                     provider=provider,
                     capability_registry=capability_registry,
@@ -10598,9 +10603,7 @@ def build_backend(
                     max_attempts=config.provider_runtime.worker_retry_attempts,
                 )
                 if not isinstance(value, Mapping):
-                    last_audit_error = ValueError(
-                        "objective prerequisite audit returned no object"
-                    )
+                    last_audit_error = ValueError("objective prerequisite audit returned no object")
                 else:
                     try:
                         gate_values = _compile_objective_phase_gate_audit(
@@ -10613,9 +10616,7 @@ def build_backend(
                         last_audit_error = error
                     else:
                         break
-                if semantic_attempt + 1 < max(
-                    1, config.provider_runtime.worker_retry_attempts
-                ):
+                if semantic_attempt + 1 < max(1, config.provider_runtime.worker_retry_attempts):
                     audit_messages.extend(
                         (
                             ChatMessage(

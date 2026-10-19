@@ -1,3 +1,4 @@
+import json
 from dataclasses import FrozenInstanceError, asdict, replace
 
 import pytest
@@ -631,14 +632,17 @@ def test_dynamic_specialist_grant_subset_rule() -> None:
     granted_parent = replace(parent, grant_id="grant-parent")
     parent_effects = frozenset({"target_read", "target_network", "workspace_read"})
 
-    # A proposal pinning a narrowing effect set is admitted and inherits the
-    # parent grant; a plain proposal inherits it too.
+    # A proposal pinning a narrowing effect set receives an exact durable
+    # successor grant; a plain proposal inherits the parent grant.
     record = compile_one(
         dynamic_proposal(grant_effects=frozenset({"target_read"})),
         parent=granted_parent,
         parent_grant_effects=parent_effects,
     )
-    assert record.assignment.grant_id == "grant-parent"
+    assert record.assignment.grant_id.startswith("dynamic-grant:")
+    assert json.loads(dict(record.assignment.strategy_contract)["capability_grant_effects"]) == [
+        "target_read"
+    ]
     inherited = compile_one(dynamic_proposal(), parent=granted_parent)
     assert inherited.assignment.grant_id == "grant-parent"
 

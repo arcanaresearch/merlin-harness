@@ -120,6 +120,7 @@ from .campaign import (
     project_by_effects,
     reconcile_techniques_for_surfaces,
     remediation_output_schema,
+    resolve_declared_effect,
     reviewed_adapter_supports_multi_turn,
     scenario_fingerprint_for,
     select_profile_candidate_references,
@@ -488,6 +489,27 @@ def _schedule_grant_universe(
     for profile_id in sorted(profile_ids):
         grant = profile_grant(profile_id, target_scope=target_scope)
         grants[grant.id] = grant
+    for assignment in assignments:
+        if not (assignment.grant_id or "").startswith("dynamic-grant:"):
+            continue
+        contract = dict(assignment.strategy_contract)
+        try:
+            effects = json.loads(contract.get("capability_grant_effects", ""))
+        except (TypeError, ValueError):
+            effects = None
+        if (
+            not isinstance(effects, list)
+            or not effects
+            or not all(isinstance(effect, str) and effect.strip() for effect in effects)
+        ):
+            raise ValueError("dynamic assignment is missing its sealed capability grant")
+        grant = CapabilityGrant(
+            id=str(assignment.grant_id),
+            effect_classes=frozenset(effects),
+            target_scope=target_scope,
+            evidence=contract.get("capability_grant_evidence") or None,
+        )
+        grants[grant.id] = grant
     grants[OFFLINE_AUTOMATION_GRANT.id] = OFFLINE_AUTOMATION_GRANT
     return grants
 
@@ -679,9 +701,7 @@ def _bind_method_objectives(
                     )
                 )
             selectors.append(
-                selector.model_copy(
-                    update={"bindings": tuple(bindings), "binding_source": source}
-                )
+                selector.model_copy(update={"bindings": tuple(bindings), "binding_source": source})
             )
         objectives.append(objective.model_copy(update={"selectors": tuple(selectors)}))
     return CampaignObjectiveContract.model_validate(
@@ -749,8 +769,7 @@ def _objective_progress_from_journal(
         prior_bindings = {item.selector_value: item for item in selector.bindings}
         proposed_bindings = {item.selector_value: item for item in resolved_selector.bindings}
         if any(
-            not set(prior.candidate_ids)
-            <= set(proposed_bindings.get(value, prior).candidate_ids)
+            not set(prior.candidate_ids) <= set(proposed_bindings.get(value, prior).candidate_ids)
             for value, prior in prior_bindings.items()
             if prior.status is ObjectiveSelectorBindingStatus.BOUND
         ):
@@ -761,9 +780,7 @@ def _objective_progress_from_journal(
         selectors[index] = resolved_selector
         objectives[objective_id] = objective.model_copy(update={"selectors": tuple(selectors)})
     contract = contract.model_copy(
-        update={
-            "objectives": tuple(objectives[item.id] for item in contract.objectives)
-        }
+        update={"objectives": tuple(objectives[item.id] for item in contract.objectives)}
     )
     latest: dict[str, ObjectiveProgress] = {}
     target_attributions: list[Mapping[str, object]] = []
@@ -792,9 +809,7 @@ def _objective_progress_from_journal(
             status=ObjectiveStatus(str(payload.get("status") or "unmet")),
             evidence_refs=tuple(str(item) for item in evidence),
             status_reason=(
-                str(payload["status_reason"])
-                if payload.get("status_reason") is not None
-                else None
+                str(payload["status_reason"]) if payload.get("status_reason") is not None else None
             ),
         )
 
@@ -836,15 +851,17 @@ def _objective_progress_from_journal(
         }.get(gate_status, ObjectiveStatus.INDETERMINATE)
         raw_refs = gate_event.get("evidence_refs")
         evidence_refs = tuple(
-            str(item)
-            for item in raw_refs or ()
-            if isinstance(item, str) and item.strip()
+            str(item) for item in raw_refs or () if isinstance(item, str) and item.strip()
         )
-        if status in {
-            ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
-            ObjectiveStatus.BLOCKED,
-            ObjectiveStatus.WAIVED,
-        } and not evidence_refs:
+        if (
+            status
+            in {
+                ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+                ObjectiveStatus.BLOCKED,
+                ObjectiveStatus.WAIVED,
+            }
+            and not evidence_refs
+        ):
             evidence_refs = (
                 f"lead:{manifest.id}:wave:{event_wave}:objective-phase-gate:{gate.id}",
             )
@@ -872,9 +889,7 @@ def _objective_progress_from_journal(
     attempted_candidates: dict[str, set[str]] = {}
     semantic_id_by_candidate: dict[str, str] = {}
     if assignment_context is not None:
-        technique_by_id = {
-            technique.id: technique for technique in assignment_context.techniques
-        }
+        technique_by_id = {technique.id: technique for technique in assignment_context.techniques}
         semantic_id_by_candidate.update(
             {
                 technique.id: technique.resolved_semantic_id
@@ -899,11 +914,7 @@ def _objective_progress_from_journal(
             if not isinstance(task, Mapping):
                 continue
             evidence = task.get("evidence_references")
-            refs = {
-                str(item)
-                for item in evidence or ()
-                if isinstance(item, str) and item.strip()
-            }
+            refs = {str(item) for item in evidence or () if isinstance(item, str) and item.strip()}
             if not refs:
                 continue
             for technique_id, outcome in _mapping_items(task.get("technique_outcomes")):
@@ -941,9 +952,7 @@ def _objective_progress_from_journal(
             preexisting_refs: set[str] = set()
             for attribution in target_attributions:
                 reference = str(attribution.get("attribution_id") or "").strip()
-                counts_as_campaign_progress = (
-                    attribution.get("counts_as_campaign_progress") is True
-                )
+                counts_as_campaign_progress = attribution.get("counts_as_campaign_progress") is True
                 is_preexisting = attribution.get("provenance") == "preexisting"
                 if not reference or (not counts_as_campaign_progress and not is_preexisting):
                     continue
@@ -987,8 +996,7 @@ def _objective_progress_from_journal(
             complete = all(
                 all(
                     candidate in attempted_candidates
-                    or candidate.casefold()
-                    in observed_by_scope.get(scope.casefold(), set())
+                    or candidate.casefold() in observed_by_scope.get(scope.casefold(), set())
                     for candidate in bindings[scope].candidate_ids
                 )
                 for scope in selector.expected_binding_values()
@@ -1000,9 +1008,7 @@ def _objective_progress_from_journal(
                 for ref in attempted_candidates.get(candidate, ())
             }
             attribution_refs = campaign_refs | preexisting_refs | attempt_refs
-            empty_denominator = all(
-                not item.candidate_ids for item in bindings.values()
-            )
+            empty_denominator = all(not item.candidate_ids for item in bindings.values())
             if complete and (attribution_refs or empty_denominator):
                 latest[objective.id] = ObjectiveProgress(
                     objective=objective,
@@ -1044,7 +1050,8 @@ def _objective_progress_from_journal(
                     status=ObjectiveStatus.BLOCKED,
                     evidence_refs=binding_evidence,
                     status_reason=(
-                        "no reviewed candidate binding for: " + ", ".join(unresolved)
+                        "no reviewed candidate binding for: "
+                        + ", ".join(unresolved)
                         + "; target-derived discovery is required"
                     ),
                 )
@@ -1091,9 +1098,7 @@ def _objective_progress_from_journal(
             reference = str(attribution.get("attribution_id") or "").strip()
             if not reference:
                 continue
-            counts_as_campaign_progress = (
-                attribution.get("counts_as_campaign_progress") is True
-            )
+            counts_as_campaign_progress = attribution.get("counts_as_campaign_progress") is True
             is_preexisting = attribution.get("provenance") == "preexisting"
             # Untrusted observations cannot contribute denominator values.  In
             # particular, one trusted receipt must not bless values learned from
@@ -1182,9 +1187,7 @@ def _objective_contract_with_phase_gates(
             )
         )
         previous_id = objective_id
-    return contract.model_copy(
-        update={"objectives": (*gate_objectives, *contract.objectives)}
-    )
+    return contract.model_copy(update={"objectives": (*gate_objectives, *contract.objectives)})
 
 
 def _objective_outcome(
@@ -1439,6 +1442,20 @@ class LeadFollowUp:
     specialist: DynamicSpecialistProposal | None = None
     arm: Mapping[str, object] | None = None
     evaluation_uncertainties: tuple[Mapping[str, object], ...] = ()
+    capability_request_ids: tuple[str, ...] = ()
+    expanded_tool_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if bool(self.capability_request_ids) != bool(self.expanded_tool_ids):
+            raise ValueError("followup capability expansion requires both request ids and tool ids")
+        if any(
+            not value.strip() for value in (*self.capability_request_ids, *self.expanded_tool_ids)
+        ):
+            raise ValueError("followup capability expansion fields must not be blank")
+        object.__setattr__(
+            self, "capability_request_ids", tuple(dict.fromkeys(self.capability_request_ids))
+        )
+        object.__setattr__(self, "expanded_tool_ids", tuple(dict.fromkeys(self.expanded_tool_ids)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -3051,9 +3068,7 @@ class CampaignService:
                         projection_value,
                         expected_candidate_id=candidate_id_for_identity(identity_value),
                     )
-                    identity_technique_id = str(
-                        identity_value.get("technique_id") or ""
-                    ).strip()
+                    identity_technique_id = str(identity_value.get("technique_id") or "").strip()
                     if not isinstance(technique_id, str) or identity_technique_id != technique_id:
                         raise ValueError(
                             "frontier settlement projection conflicts with attempted candidate"
@@ -3249,8 +3264,7 @@ class CampaignService:
                 and attempt.get("technique_id") == candidate_id
             )
             if candidate_attempts and all(
-                str(attempt.get("disposition") or "").casefold()
-                == "infrastructure_failed"
+                str(attempt.get("disposition") or "").casefold() == "infrastructure_failed"
                 for attempt in candidate_attempts
             ):
                 infrastructure_candidate_ids.add(candidate_id)
@@ -3302,8 +3316,7 @@ class CampaignService:
             "retry_exhausted_candidates": sum(generation >= 3 for generation in retry_generations),
             **(
                 {"infrastructure_only_batch": 1}
-                if candidates_by_id
-                and infrastructure_candidate_ids == set(candidates_by_id)
+                if candidates_by_id and infrastructure_candidate_ids == set(candidates_by_id)
                 else {}
             ),
         }
@@ -5252,9 +5265,7 @@ class CampaignService:
                 live_assessment = (
                     None
                     if terminal_frontier_batch
-                    and (
-                        self._task_review_runner is None or self._review_merge_runner is None
-                    )
+                    and (self._task_review_runner is None or self._review_merge_runner is None)
                     else await self._monitor_live(campaign_id, manifest, initial_wave, live)
                 )
             # Monitoring can span the entire worker run.  The projection loaded
@@ -6690,9 +6701,7 @@ class CampaignService:
                             "skipped": sum(task.status == "cancelled" for task in tasks),
                         },
                     )
-            terminalized = await self._finish_campaign(
-                campaign_id, "cancelled", "operator_stopped"
-            )
+            terminalized = await self._finish_campaign(campaign_id, "cancelled", "operator_stopped")
             if terminalized is not False:
                 await self._generate_report(campaign_id, manifest, wave, "operator_stopped")
         except asyncio.CancelledError:
@@ -7592,14 +7601,20 @@ class CampaignService:
             # Restart-idempotent replay: an already-admitted identity is reused
             # verbatim, never compiled twice or counted against the caps again.
             assignments.append(record.assignment)
+            effective_grant = profile_grant("adversarial-explorer", target_scope=manifest.target.id)
+            if proposal.grant_effects is not None:
+                effective_grant = CapabilityGrant(
+                    id=str(record.assignment.grant_id),
+                    effect_classes=proposal.grant_effects,
+                    target_scope=manifest.target.id,
+                    evidence=proposal.evidence_expectation,
+                )
             worker_contexts.append(
                 compile_worker_context(
                     manifest,
                     record.assignment,
                     record.profile,
-                    capability_grant=profile_grant(
-                        "adversarial-explorer", target_scope=manifest.target.id
-                    ),
+                    capability_grant=effective_grant,
                 )
             )
         return CampaignCompilation(tuple(assignments), tuple(worker_contexts))
@@ -9778,8 +9793,7 @@ class CampaignService:
         }
         if isinstance(affordances, Sequence) and not isinstance(affordances, (str, bytes)):
             if any(
-                isinstance(item, Mapping) and item.get("kind") in renewable
-                for item in affordances
+                isinstance(item, Mapping) and item.get("kind") in renewable for item in affordances
             ):
                 return False
 
@@ -9804,9 +9818,7 @@ class CampaignService:
                 ):
                     continue
                 observations = receipt.get("state_observations")
-                if not isinstance(observations, Sequence) or isinstance(
-                    observations, (str, bytes)
-                ):
+                if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
                     continue
                 for observation in observations:
                     if (
@@ -9877,9 +9889,7 @@ class CampaignService:
         if isinstance(objective_contract_value, Mapping):
             contract = CampaignObjectiveContract.model_validate(objective_contract_value)
             progress_value = normalized_document.get("objective_progress")
-            if not isinstance(progress_value, Sequence) or isinstance(
-                progress_value, (str, bytes)
-            ):
+            if not isinstance(progress_value, Sequence) or isinstance(progress_value, (str, bytes)):
                 raise RuntimeError("sealed objective contract requires objective progress")
             objective_progress = tuple(
                 ObjectiveProgress.model_validate(item) for item in progress_value
@@ -9898,9 +9908,7 @@ class CampaignService:
             digest = (
                 "sha256:"
                 + hashlib.sha256(
-                    json.dumps(
-                        normalized_document, sort_keys=True, separators=(",", ":")
-                    ).encode()
+                    json.dumps(normalized_document, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
             )
         saturation = document.get("saturation")
@@ -9911,14 +9919,10 @@ class CampaignService:
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         wave = int(waves[-1]["wave"]) if waves else 0
         receipt_kind = (
-            "campaign_incomplete_checkpoint"
-            if resumable_incomplete
-            else "campaign_completion"
+            "campaign_incomplete_checkpoint" if resumable_incomplete else "campaign_completion"
         )
         decision_namespace = (
-            "campaign-incomplete-checkpoint"
-            if resumable_incomplete
-            else "campaign-completion"
+            "campaign-incomplete-checkpoint" if resumable_incomplete else "campaign-completion"
         )
         receipt = {
             "kind": receipt_kind,
@@ -11281,12 +11285,8 @@ class CampaignService:
                             "kind": str(item.get("kind") or "discovery"),
                             "source_task_id": str(item.get("source_task_id") or ""),
                             "related_task_id": str(item.get("related_task_id") or ""),
-                            "requested_profile_id": str(
-                                item.get("requested_profile_id") or ""
-                            ),
-                            "message": _incremental_review_result(
-                                str(item.get("content") or "")
-                            ),
+                            "requested_profile_id": str(item.get("requested_profile_id") or ""),
+                            "message": _incremental_review_result(str(item.get("content") or "")),
                         }
                         for item in pending_worker_messages
                         if isinstance(item, Mapping)
@@ -11906,8 +11906,7 @@ class CampaignService:
                             item
                             for item in objective.selectors
                             if item.dimension == enumeration.name
-                            and item.quantifier
-                            is ObjectiveSelectorQuantifier.ALL_AVAILABLE
+                            and item.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE
                         )
                         for selector in selectors:
                             if selector.scope_dimension != enumeration.scope_dimension:
@@ -11925,9 +11924,7 @@ class CampaignService:
                                 kind=ObjectiveSelectorBindingSourceKind.REVIEWED_ADAPTER,
                                 source_ref=f"target-call:{call_id}",
                                 evidence_refs=tuple(
-                                    dict.fromkeys(
-                                        (str(call_id), *enumeration.evidence_refs)
-                                    )
+                                    dict.fromkeys((str(call_id), *enumeration.evidence_refs))
                                 ),
                             )
                             try:
@@ -11943,8 +11940,7 @@ class CampaignService:
                                 "objective_id": objective.id,
                                 "selector_dimension": selector.dimension,
                                 "bindings": tuple(
-                                    item.model_dump(mode="json")
-                                    for item in resolved.bindings
+                                    item.model_dump(mode="json") for item in resolved.bindings
                                 ),
                                 "source": source.model_dump(mode="json"),
                                 "source_task_id": task.id,
@@ -11958,9 +11954,7 @@ class CampaignService:
                             )
                             if identity in existing_payloads:
                                 continue
-                            await asyncio.to_thread(
-                                append_lead, campaign_id, wave, payload
-                            )
+                            await asyncio.to_thread(append_lead, campaign_id, wave, payload)
                             existing_payloads.add(identity)
                             latest_bindings[key] = {
                                 scope: frozenset(members)
@@ -11991,9 +11985,7 @@ class CampaignService:
         contract = CampaignObjectiveContract.model_validate(manifest.objective_contract)
         objectives = {item.id: item for item in contract.objectives}
         catalogue_ids = {str(item.id) for item in manifest.catalogue}
-        catalogue_ids.update(
-            technique_id for task in tasks for technique_id in task.technique_ids
-        )
+        catalogue_ids.update(technique_id for task in tasks for technique_id in task.technique_ids)
         existing = (
             await asyncio.to_thread(self._store.list_lead, campaign_id)
             if callable(getattr(self._store, "list_lead", None))
@@ -12051,9 +12043,7 @@ class CampaignService:
             # only target-call receipts authenticate what is actually
             # available or which reviewed candidate the target supports.
             trusted_refs = {
-                str(value)
-                for value in target_call_ids
-                if isinstance(value, str) and value.strip()
+                str(value) for value in target_call_ids if isinstance(value, str) and value.strip()
             }
             source_ref = str(committed.get("reference") or "").strip()
             if not trusted_refs or not source_ref:
@@ -12142,8 +12132,7 @@ class CampaignService:
                     continue
                 previous = latest_bindings.get((objective_id, dimension), {})
                 if any(
-                    not set(previous.get(value, ())) <= set(supplied[value])
-                    for value in expected
+                    not set(previous.get(value, ())) <= set(supplied[value]) for value in expected
                 ):
                     continue
                 ordered_values = (
@@ -12187,16 +12176,13 @@ class CampaignService:
                     "source": source.model_dump(mode="json"),
                     "source_task_id": task.id,
                 }
-                identity = json.dumps(
-                    payload, sort_keys=True, separators=(",", ":"), default=str
-                )
+                identity = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
                 if identity in existing_payloads:
                     continue
                 await asyncio.to_thread(append_lead, campaign_id, wave, payload)
                 existing_payloads.add(identity)
                 latest_bindings[(objective_id, dimension)] = {
-                    value: frozenset(candidate_ids)
-                    for value, candidate_ids in supplied.items()
+                    value: frozenset(candidate_ids) for value, candidate_ids in supplied.items()
                 }
 
     async def _record_browser_recon_observations(self, manifest: CampaignManifest) -> None:
@@ -14205,6 +14191,26 @@ class CampaignService:
             )
             if not technique_ids:
                 continue
+            expansion_grant = delegated_grant or profile_grant(
+                parent.profile_id, target_scope=manifest.target.id
+            )
+            expansion_ceiling = set(
+                project_by_effects(
+                    manifest.tool_ids,
+                    expansion_grant,
+                    target_interface=manifest.target.interface,
+                    api_credential=manifest.target.credential_handle is not None,
+                )
+            )
+            unauthorized_expansion = sorted(set(followup.expanded_tool_ids) - expansion_ceiling)
+            if unauthorized_expansion:
+                raise ValueError(
+                    "Lead capability expansion exceeds the sealed target/profile grant: "
+                    + ", ".join(unauthorized_expansion)
+                )
+            expanded_tool_ids = tuple(
+                dict.fromkeys((*parent.tool_ids, *followup.expanded_tool_ids))
+            )
             candidate_identities = _compiled_candidate_identities(
                 followup,
                 technique_ids,
@@ -14289,7 +14295,7 @@ class CampaignService:
                 ),
             }
             assignment = (
-                replace(parent, **common)
+                replace(parent, tool_ids=expanded_tool_ids, **common)
                 if repair_ids
                 else WorkerAssignment(
                     id=f"{manifest.id}/wave-{wave}/{followup.profile_id}-{index}",
@@ -14365,7 +14371,7 @@ class CampaignService:
                     target_profile_id=parent.target_profile_id,
                     technique_ids=technique_ids,
                     guidance_ids=parent.guidance_ids,
-                    tool_ids=parent.tool_ids,
+                    tool_ids=expanded_tool_ids,
                     skill_ids=parent.skill_ids,
                     provider_id=parent.provider_id,
                     authority_ids=parent.authority_ids,
@@ -14547,13 +14553,57 @@ class CampaignService:
                 if not freeform_ids:
                     continue
                 assignment = replace(assignment, technique_ids=freeform_ids)
+            effective_assignment_grant = delegated_grant
+            if followup.capability_request_ids:
+                effects = frozenset(
+                    resolve_declared_effect(tool_id) for tool_id in assignment.tool_ids
+                )
+                if "unknown" in effects or not effects:
+                    raise ValueError(
+                        "Lead capability expansion contains a tool without a declared effect"
+                    )
+                grant_body = json.dumps(sorted(effects), separators=(",", ":"))
+                grant_id = (
+                    "dynamic-grant:"
+                    + hashlib.sha256(
+                        (
+                            manifest.id
+                            + "\n"
+                            + assignment.id
+                            + "\n"
+                            + grant_body
+                        ).encode()
+                    ).hexdigest()[:24]
+                )
+                evidence = "approved Lead capability requests: " + ", ".join(
+                    followup.capability_request_ids
+                )
+                assignment = replace(
+                    assignment,
+                    grant_id=grant_id,
+                    strategy_contract=tuple(
+                        sorted(
+                            {
+                                **dict(assignment.strategy_contract),
+                                "capability_grant_effects": grant_body,
+                                "capability_grant_evidence": evidence,
+                            }.items()
+                        )
+                    ),
+                )
+                effective_assignment_grant = CapabilityGrant(
+                    id=grant_id,
+                    effect_classes=effects,
+                    target_scope=manifest.target.id,
+                    evidence=evidence,
+                )
             assignments.append(assignment)
             worker_contexts.append(
                 compile_worker_context(
                     manifest,
                     assignment,
                     parent_profile,
-                    capability_grant=delegated_grant,
+                    capability_grant=effective_assignment_grant,
                 )
             )
         return CampaignCompilation(tuple(assignments), tuple(worker_contexts))
@@ -14757,6 +14807,7 @@ class CampaignService:
                 if pending_loader is not None
                 else []
             )
+
         def coordination_projection(
             rows: Sequence[Mapping[str, object]],
         ) -> tuple[AgentTask, ...]:
@@ -14790,13 +14841,10 @@ class CampaignService:
                 if callable(pending_loader)
                 else []
             )
-            coordination_by_id = {
-                str(row["id"]): row for row in (*pending, *newly_pending)
-            }
-            refreshed_coordination = coordination_projection(
-                tuple(coordination_by_id.values())
-            )
+            coordination_by_id = {str(row["id"]): row for row in (*pending, *newly_pending)}
+            refreshed_coordination = coordination_projection(tuple(coordination_by_id.values()))
             return (*tasks, *refreshed_controls, *refreshed_coordination)
+
         renewal: asyncio.Task[None] | None = None
         if claim_id is not None:
             renewal = asyncio.create_task(
@@ -14821,14 +14869,21 @@ class CampaignService:
             attempt_usage: dict[str, object] | None = None
             try:
                 runner_parameters = inspect.signature(self._lead_runner).parameters.values()
-                accepts_refresh = any(
-                    parameter.kind is inspect.Parameter.VAR_POSITIONAL
-                    for parameter in runner_parameters
-                ) or sum(
-                    parameter.kind
-                    in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
-                    for parameter in runner_parameters
-                ) >= 5
+                accepts_refresh = (
+                    any(
+                        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                        for parameter in runner_parameters
+                    )
+                    or sum(
+                        parameter.kind
+                        in {
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        }
+                        for parameter in runner_parameters
+                    )
+                    >= 5
+                )
                 runner_tasks = (*tasks, *model_control_tasks, *coordination_tasks)
                 if accepts_refresh:
                     assessment = await self._lead_runner(
@@ -14855,6 +14910,49 @@ class CampaignService:
                 # decision still consumed provider tokens that must journal.
                 attempt_usage = dict(assessment.usage)
                 task_ids = {task.id for task in tasks}
+                capability_requests: dict[str, tuple[str, frozenset[str]]] = {}
+                for row in pending:
+                    if row.get("kind") != "capability_request":
+                        continue
+                    try:
+                        request = json.loads(str(row.get("content") or ""))
+                    except (TypeError, ValueError):
+                        continue
+                    raw_tools = (
+                        request.get("requested_tool_ids") if isinstance(request, Mapping) else None
+                    )
+                    if not isinstance(raw_tools, Sequence) or isinstance(raw_tools, (str, bytes)):
+                        continue
+                    capability_requests[str(row["id"])] = (
+                        str(row["source_task_id"]),
+                        frozenset(str(item) for item in raw_tools),
+                    )
+                for followup in assessment.followups:
+                    if not followup.capability_request_ids:
+                        continue
+                    requested_tools: set[str] = set()
+                    request_sources: set[str] = set()
+                    for request_id in followup.capability_request_ids:
+                        request = capability_requests.get(request_id)
+                        if request is None:
+                            raise ValueError(
+                                "Lead capability expansion cites an unknown or already-consumed "
+                                f"worker request: {request_id}"
+                            )
+                        source_task_id, tool_ids = request
+                        request_sources.add(source_task_id)
+                        requested_tools.update(tool_ids)
+                    if not request_sources <= set(followup.source_task_ids):
+                        raise ValueError(
+                            "Lead capability expansion must cite each requesting worker as a "
+                            "followup source task"
+                        )
+                    unrequested = sorted(set(followup.expanded_tool_ids) - requested_tools)
+                    if unrequested:
+                        raise ValueError(
+                            "Lead capability expansion grants tools the worker did not request: "
+                            + ", ".join(unrequested)
+                        )
                 # Control-plane/coordination tasks are read-only Lead projections the
                 # autonomous Lead legitimately receives and may cite as evidence sources
                 # (e.g. the specialist_composition_get projection). They are legal for the
@@ -16074,17 +16172,29 @@ class CampaignService:
         kind: str = "discovery",
         related_task_id: str | None = None,
         requested_profile_id: str | None = None,
+        requested_tool_ids: tuple[str, ...] = (),
         recipient_task_id: str | None = None,
     ) -> Mapping[str, object]:
         """Persist attributable worker coordination and optionally fan it out to live peers."""
         if destination not in {"lead", "peers", "lead_and_peers"}:
             raise ValueError("destination must be lead, peers, or lead_and_peers")
-        if kind not in {"discovery", "blocker", "decline", "reroute_request"}:
+        if kind not in {
+            "discovery",
+            "blocker",
+            "decline",
+            "reroute_request",
+            "capability_request",
+        }:
             raise ValueError("worker message kind is not supported")
-        if kind in {"decline", "reroute_request"} and destination == "peers":
+        if kind in {"decline", "reroute_request", "capability_request"} and destination == "peers":
             raise ValueError(f"{kind} messages must be delivered to the Campaign Lead")
         if kind == "reroute_request" and not (requested_profile_id or "").strip():
             raise ValueError("reroute_request requires requested_profile_id")
+        requested_tool_ids = tuple(dict.fromkeys(requested_tool_ids))
+        if kind == "capability_request" and not requested_tool_ids:
+            raise ValueError("capability_request requires requested_tool_ids")
+        if kind != "capability_request" and requested_tool_ids:
+            raise ValueError("requested_tool_ids are only valid for capability_request")
         if recipient_task_id is not None and destination == "lead":
             raise ValueError("a named peer recipient requires a peer destination")
         content = message.strip()
@@ -16097,6 +16207,18 @@ class CampaignService:
             raise PermissionError("worker does not belong to the requested campaign session")
         if row["status"] != "executing":
             raise ValueError("worker coordination requires an executing campaign")
+        if requested_tool_ids:
+            envelope = row.get("manifest", {})
+            manifest_value = (
+                envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else {}
+            )
+            manifest = _manifest(manifest_value)
+            unsealed_tools = sorted(set(requested_tool_ids) - set(manifest.tool_ids))
+            if unsealed_tools:
+                raise PermissionError(
+                    "capability request exceeds the sealed campaign tool universe: "
+                    + ", ".join(unsealed_tools)
+                )
         waves = await asyncio.to_thread(self._store.list_waves, context.campaign_id)
         if not waves:
             raise ValueError("campaign has no durable worker wave")
@@ -16136,6 +16258,7 @@ class CampaignService:
                 "message": content,
                 "related_task_id": related_task_id,
                 "requested_profile_id": requested_profile_id,
+                "requested_tool_ids": requested_tool_ids,
                 "recipient_task_id": recipient_task_id,
             },
             sort_keys=True,
@@ -16152,7 +16275,7 @@ class CampaignService:
                 "wave": int(latest["wave"]),
                 "source_task_id": context.agent_id,
                 "destination": destination,
-                "content": content,
+                "content": content_body if kind == "capability_request" else content,
                 "content_digest": content_digest,
                 "kind": kind,
                 "related_task_id": related_task_id,
@@ -16194,6 +16317,7 @@ class CampaignService:
             "destination": destination,
             "peer_recipients": recipients,
             "lead_pending": destination in {"lead", "lead_and_peers"},
+            "requested_tool_ids": requested_tool_ids,
         }
 
     async def list_schedule_directives(self, schedule_id: str) -> Mapping[str, tuple[str, ...]]:
@@ -19190,6 +19314,9 @@ class CampaignShareTool:
                 "workers, or both. Use this for recovered target mechanics, blockers, and novel "
                 "hypotheses that materially change other workers' plans. Messages are durable, "
                 "deduplicated by tool-call identity, and remain inside the current campaign. "
+                "Use kind=capability_request with requested_tool_ids when a later wave needs "
+                "additional tools already sealed into this campaign; the Lead may approve a "
+                "narrow next-wave expansion, never mutate the running worker or widen authority. "
                 "Address a single active sibling by passing recipient_task_id; omitting it with a "
                 "peer destination broadcasts to every active sibling."
             ),
@@ -19197,10 +19324,24 @@ class CampaignShareTool:
                 "type": "object",
                 "properties": {
                     "destination": {"enum": ["lead", "peers", "lead_and_peers"]},
-                    "kind": {"enum": ["discovery", "blocker", "decline", "reroute_request"]},
+                    "kind": {
+                        "enum": [
+                            "discovery",
+                            "blocker",
+                            "decline",
+                            "reroute_request",
+                            "capability_request",
+                        ]
+                    },
                     "message": {"type": "string", "minLength": 1, "maxLength": 4096},
                     "related_task_id": {"type": "string", "minLength": 1},
                     "requested_profile_id": {"type": "string", "minLength": 1},
+                    "requested_tool_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
                     "recipient_task_id": {"type": "string", "minLength": 1},
                 },
                 "required": ["destination", "kind", "message"],
@@ -19224,6 +19365,9 @@ class CampaignShareTool:
                     str(arguments["requested_profile_id"])
                     if arguments.get("requested_profile_id") is not None
                     else None
+                ),
+                requested_tool_ids=tuple(
+                    str(item) for item in arguments.get("requested_tool_ids", ())
                 ),
                 recipient_task_id=(
                     str(arguments["recipient_task_id"])
@@ -23647,8 +23791,7 @@ def _objective_phase_gate_result(
         and observation is not None
         and observation.get("trust_class") == "target_reported"
         and not observation.get("validation_errors")
-        and predicate_transition.get("disposition_rule")
-        == "no_valid_corroborated_observation"
+        and predicate_transition.get("disposition_rule") == "no_valid_corroborated_observation"
     ):
         predicate_transition = {
             **predicate_transition,
@@ -23906,9 +24049,7 @@ def _authoritative_progress_changes(value: object) -> tuple[Mapping[str, object]
         and item.get("name") not in quarantined
         and item.get("status") in {"success", "progress"}
         and not item.get("validation_errors")
-        and (
-            ("scope_dimension" in item) == ("scope_value" in item)
-        )
+        and (("scope_dimension" in item) == ("scope_value" in item))
     )
 
 
@@ -23926,9 +24067,7 @@ def _target_state_source_kind(task: AgentTask) -> str:
         item.startswith("objective-phase-gate/") for item in technique_ids
     ):
         return "objective_prerequisite"
-    if "/validation/" in task.id or any(
-        item.startswith("validation/") for item in technique_ids
-    ):
+    if "/validation/" in task.id or any(item.startswith("validation/") for item in technique_ids):
         return "validation"
     return "candidate"
 
@@ -24685,6 +24824,10 @@ def _dynamic_specialist_proposal(
         if capabilities is None:
             return None
         narrowing["required_capabilities"] = capabilities
+        grant_effects = _str_tuple("grant_effects") if "grant_effects" in proposal else None
+        if "grant_effects" in proposal and grant_effects is None:
+            return None
+        narrowing["grant_effects"] = None if grant_effects is None else frozenset(grant_effects)
         ttl = proposal.get("ttl_waves", 1)
         if isinstance(ttl, bool) or not isinstance(ttl, int):
             return None

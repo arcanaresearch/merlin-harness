@@ -926,9 +926,8 @@ def compile_dynamic_specialist(
     ``parent_grant_effects`` is the parent grant's resolved effect-class set
     (resolved by the caller from the schedule's grant registry). A proposal
     pinning ``grant_effects`` is admitted only when that set narrows the
-    parent's; the compiled specialist inherits the parent's ``grant_id``
-    either way, and a parent without a grant keeps the name-narrowing
-    behavior unchanged.
+    parent's. The narrowed grant is sealed into the successor assignment so
+    schedule persistence can reconstruct the exact grant after restart.
     """
     limits = policy or DynamicSpecialistPolicy()
     if proposal.campaign_id != graph_id:
@@ -978,6 +977,23 @@ def compile_dynamic_specialist(
     if not set(proposal.required_capabilities) <= set(capabilities):
         raise ValueError("dynamic specialist requires capabilities its route does not expose")
     input_cost, output_cost = context.pricing_for_model(selected_model)
+    narrowed_grant_id = parent.grant_id
+    strategy_contract = parent.strategy_contract
+    if proposal.grant_effects is not None:
+        grant_body = json.dumps(sorted(proposal.grant_effects), separators=(",", ":"))
+        narrowed_grant_id = (
+            "dynamic-grant:"
+            + digest_text(f"{graph_id}\n{digest}\n{grant_body}").removeprefix("sha256:")[:24]
+        )
+        strategy_contract = tuple(
+            sorted(
+                {
+                    **dict(parent.strategy_contract),
+                    "capability_grant_effects": grant_body,
+                    "capability_grant_evidence": proposal.evidence_expectation,
+                }.items()
+            )
+        )
     candidate = WorkerAssignment(
         id=f"{proposal.campaign_id}/wave-{wave}/{profile.id}",
         objective=(
@@ -1019,7 +1035,8 @@ def compile_dynamic_specialist(
             selected_model
         ),
         target_session_capacity=parent.target_session_capacity,
-        grant_id=parent.grant_id,
+        grant_id=narrowed_grant_id,
+        strategy_contract=strategy_contract,
     )
     # Reuse the reviewed temporary-specialist narrowing for every invariant
     # except the model route, which is relaxed only after the campaign-admitted
