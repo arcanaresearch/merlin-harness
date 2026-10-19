@@ -369,6 +369,42 @@ def test_objective_phase_gate_audit_rejects_receipt_for_read_only_step() -> None
         _compile_objective_phase_gate_audit(objective, adapter, (), audit)
 
 
+def test_objective_phase_gate_audit_can_explicitly_reject_overbroad_proposal() -> None:
+    objective = "Play normally first."
+    adapter = {
+        "api_steps": [{"step_id": "play-turn", "interaction": True}],
+    }
+    proposed = (
+        {
+            "id": "attack-methods",
+            "ordinal": 0,
+            "objective": "Run every suggested attack method",
+            "actions": [
+                {"id": "action-1", "step_id": "play-turn", "input_text": "attack"}
+            ],
+            "success_predicate": {
+                "observation_name": "target_exchange_completed",
+                "operator": "present",
+                "expected_values": [],
+            },
+            "budget": {"max_attempts": 2, "max_target_calls": 2},
+        },
+    )
+    audit = {
+        "requirements": [],
+        "gate_proposals": [],
+        "rejected_gates": [
+            {
+                "key": "attack-methods",
+                "reason": "Suggested attack methods are campaign guidance, not prerequisites.",
+            }
+        ],
+        "unresolved_requirements": [],
+    }
+
+    assert _compile_objective_phase_gate_audit(objective, adapter, proposed, audit) == ()
+
+
 def test_objective_phase_gate_audit_rejects_identity_selector_as_observation() -> None:
     objective = "Authenticate with Test Wallet."
     adapter = {

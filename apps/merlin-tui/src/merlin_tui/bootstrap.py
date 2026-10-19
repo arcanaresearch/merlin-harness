@@ -3790,9 +3790,12 @@ def _compile_objective_phase_gate_audit(
 
     requirements = audit.get("requirements")
     proposals = audit.get("gate_proposals")
+    rejected = audit.get("rejected_gates", [])
     unresolved = audit.get("unresolved_requirements")
     if not isinstance(requirements, list) or not isinstance(proposals, list):
         raise ValueError("objective prerequisite audit omitted requirements or gate_proposals")
+    if not isinstance(rejected, list):
+        raise ValueError("objective prerequisite audit returned invalid rejected_gates")
     if not isinstance(unresolved, list):
         raise ValueError("objective prerequisite audit omitted unresolved_requirements")
     if unresolved:
@@ -3856,6 +3859,16 @@ def _compile_objective_phase_gate_audit(
             raise ValueError("proposed objective phase gates require unique ids")
         existing_by_key[gate_id] = dict(gate)
 
+    rejected_keys: set[str] = set()
+    for item in rejected:
+        if not isinstance(item, Mapping):
+            raise ValueError("objective prerequisite audit returned invalid rejected gate")
+        key = str(item.get("key") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if key not in existing_by_key or not reason:
+            raise ValueError("objective prerequisite audit rejected an unknown gate")
+        rejected_keys.add(key)
+
     operators = {
         "present",
         "equals",
@@ -3873,6 +3886,10 @@ def _compile_objective_phase_gate_audit(
         if not isinstance(proposal, Mapping):
             raise ValueError("objective prerequisite audit returned an invalid gate proposal")
         key = str(proposal.get("key") or "").strip()
+        if key in rejected_keys:
+            raise ValueError(
+                "objective prerequisite audit both rejected and replaced the same gate"
+            )
         gate_objective = str(proposal.get("objective") or "").strip()
         actions = proposal.get("actions")
         predicate = proposal.get("success_predicate")
@@ -3981,7 +3998,9 @@ def _compile_objective_phase_gate_audit(
         if key not in ordered_keys:
             ordered_keys.append(key)
 
-    all_ids = {final_id_by_key[key] for key in compiled_by_key}
+    all_ids = {
+        final_id_by_key[key] for key in compiled_by_key if key not in rejected_keys
+    }
     if mapped_ids != all_ids:
         raise ValueError("objective prerequisite audit did not map every gate to operator text")
     return tuple(
@@ -10504,8 +10523,11 @@ def build_backend(
                             "cumulative campaign objectives. Audit existing proposed gates as "
                             "critically as missing gates. When an existing gate is over-broad or "
                             "does not express the exact prerequisite, replace it by emitting a "
-                            "gate_proposals entry whose key is that existing gate id. Return "
-                            "one JSON object only with keys requirements, gate_proposals, and "
+                            "gate_proposals entry whose key is that existing gate id. When an "
+                            "existing proposed gate is not an explicit pre-attack prerequisite "
+                            "at all, list it in rejected_gates as {key, reason}; only existing "
+                            "gate IDs may be rejected. Return one JSON object only with keys "
+                            "requirements, gate_proposals, rejected_gates, and "
                             "unresolved_requirements. requirements is an ordered array of "
                             "{source_quote, gate_key}; source_quote "
                             "must be an exact non-empty substring of the operator objective. "
