@@ -3871,6 +3871,107 @@ async def test_reviewed_state_contract_emits_attributable_authoritative_transiti
     assert interaction_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_reused_assignment_reobserves_passive_state_baseline(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    steps = adapter["api_steps"]
+    assert isinstance(steps, list)
+    start = steps[0]
+    assert isinstance(start, dict)
+    start.update(
+        {
+            "method": "GET",
+            "request_template": {},
+            "response_selector": "/run/id",
+            "captures": {"session_id": "/run/id"},
+            "idempotency_key": None,
+        }
+    )
+    adapter["state_capabilities"] = {
+        "identity": {
+            "baseline_selector": {
+                "step_id": "start",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+            "result_selector": {
+                "step_id": "message",
+                "evaluation_root": "response_body",
+                "pointer": "/run/id",
+            },
+        },
+        "observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "step_id": "start",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "result_selector": {
+                    "step_id": "message",
+                    "evaluation_root": "response_body",
+                    "pointer": "/run/score",
+                },
+                "preferred_direction": "increase",
+                "value_type": "integer",
+                "trust_class": "host_observed",
+            }
+        ],
+        "maximum_parallel_states": 1,
+    }
+    interaction_calls = 0
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal interaction_calls
+        step = request.url.path.rsplit("/", 1)[-1]
+        calls.append(step)
+        if step == "start":
+            return httpx.Response(
+                200,
+                json={"run": {"id": "physical-run", "score": 10 + interaction_calls * 10}},
+            )
+        interaction_calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "reply": "advanced",
+                "run": {"id": "physical-run", "score": 10 + interaction_calls * 10},
+            },
+        )
+
+    campaign_id = "campaign/passive-baseline-reobservation"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    checkpoint_vault=CredentialCheckpointVault(
+                        ConfigPaths(tmp_path / "passive-baseline-credentials")
+                    ),
+                    client=client,
+                )
+                context = _sealed_context(campaign_id, adapter)
+                first = await tool.invoke(context, {"input": "first"})
+                second = await tool.invoke(context, {"input": "second"})
+
+    assert first.metadata["state_identity_match"] is True, first.metadata[
+        "target_state_transition"
+    ]
+    assert second.metadata["state_identity_match"] is True
+    assert second.metadata["target_state_transition"]["observations"][0]["before_value"] == 20
+    assert second.metadata["target_state_transition"]["observations"][0]["after_value"] == 30
+    assert calls == ["start", "message", "start", "message"]
+
+
 def test_target_parallel_capacity_enforces_caps_and_reset_is_not_concurrent_isolation() -> None:
     capped = _adapter()
     capped["state_capabilities"] = {"maximum_parallel_states": 3}

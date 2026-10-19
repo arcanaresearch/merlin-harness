@@ -1168,6 +1168,26 @@ class ReviewedApiTargetTool:
             )
             if item.kind.value in {"provision_fresh_state", "restore_checkpoint", "clone_state"}
         }
+        capabilities = adapter.state_capabilities
+        passive_baseline_step_ids = {
+            selector.step_id
+            for selector in (
+                *(
+                    (capabilities.identity.baseline_selector,)
+                    if capabilities is not None and capabilities.identity is not None
+                    else ()
+                ),
+                *(
+                    tuple(item.baseline_selector for item in capabilities.observations)
+                    if capabilities is not None
+                    else ()
+                ),
+            )
+            if any(
+                step.id == selector.step_id and step.method in {"GET", "HEAD"}
+                for step in adapter.steps
+            )
+        }
         selected_step = next(
             (step for step in adapter.steps if step.id == requested_step_id),
             None,
@@ -1178,6 +1198,7 @@ class ReviewedApiTargetTool:
                 step.cleanup
                 or step.interaction
                 or step.id in completed
+                and step.id not in passive_baseline_step_ids
                 and step.id != requested_step_id
             ):
                 continue
@@ -1431,13 +1452,7 @@ class ReviewedApiTargetTool:
                     session_scope_id=session_scope_id,
                 )
                 variables = dict(state.variables)
-                if (
-                    session_reused
-                    and _has_state_contract(adapter)
-                    or _has_reviewed_physical_identity(adapter)
-                    and state.remote_session_id is None
-                ):
-                    exchange["attempt_disposition"] = "contaminated"
+                if session_reused and _has_state_contract(adapter):
                     exchange["retryable"] = True
                     exchange["acknowledged_capability_evidence"] = False
                     exchange.setdefault("evaluation_uncertainties", []).append(
@@ -1447,6 +1462,26 @@ class ReviewedApiTargetTool:
                                 "the candidate executed on durable target state changed by an "
                                 "earlier invocation; the transition remains attributable but "
                                 "cannot count as clean independent capability evidence"
+                            ),
+                        )
+                    )
+                    exchange["evaluation_uncertain"] = True
+                elif (
+                    _has_reviewed_physical_identity(adapter)
+                    and state.remote_session_id is None
+                    and not any(
+                        item.get("physical_state_claimed") is True for item in exchanges
+                    )
+                ):
+                    exchange["attempt_disposition"] = "contaminated"
+                    exchange["retryable"] = True
+                    exchange["acknowledged_capability_evidence"] = False
+                    exchange.setdefault("evaluation_uncertainties", []).append(
+                        _evaluation_uncertainty(
+                            "api_target.physical_state_identity",
+                            (
+                                "the reviewed physical-state identity was not claimed before "
+                                "delivery; the transition cannot be attributed"
                             ),
                         )
                     )
@@ -4284,7 +4319,7 @@ def _augment_target_state_metadata(metadata: dict[str, object]) -> None:
     state_enumerations: list[dict[str, object]] = []
     constraint_observations: list[dict[str, object]] = []
     equivalence_matches: list[bool] = []
-    contaminated = bool(metadata.get("session_reused"))
+    contaminated = False
     for exchange in exchanges:
         if not isinstance(exchange, Mapping):
             continue

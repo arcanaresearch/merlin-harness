@@ -9148,6 +9148,9 @@ async def test_attack_wave_target_transitions_advance_sealed_range_objective_onc
                 "quarantined_observations": (),
             },
         }
+    # Sequential stateful execution is not independent attack evidence, but an
+    # identity-proven target transition still advances the separate objective ledger.
+    receipts["attack-call-2"]["attempt_disposition"] = "contaminated"
     evidence = {
         task.id: {
             "digest": "sha256:" + "a" * 64,

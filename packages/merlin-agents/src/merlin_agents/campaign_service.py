@@ -11653,7 +11653,11 @@ class CampaignService:
                     continue
                 transition = receipt.get("target_state_transition")
                 changes = _authoritative_progress_changes(transition)
-                if not changes or receipt.get("attempt_disposition") != "valid":
+                if (
+                    not changes
+                    or not isinstance(transition, Mapping)
+                    or transition.get("identity_match") is not True
+                ):
                     continue
                 transition_digest = (
                     "sha256:"
