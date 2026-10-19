@@ -930,9 +930,15 @@ class BrowserTool:
         }
         if network_delta_metadata is not None:
             metadata["network_delta"] = network_delta_metadata
-        if kind == "network_events" and any(
-            _probe_linked_api_exchange(event) for event in session.api_exchange_events()
-        ):
+        exchange_loader = getattr(session, "api_exchange_events", None)
+        api_exchanges = exchange_loader() if callable(exchange_loader) else ()
+        probe_exchange_ready = any(
+            _probe_linked_api_exchange(event) for event in api_exchanges
+        )
+        recalled_recon_active = (
+            self._recalled_recon is not None and recall_key in self._recalled_recon
+        )
+        if probe_exchange_ready and (kind == "network_events" or recalled_recon_active):
             metadata["preferred_next_tool"] = "browser_compile_api_handoff"
             content += (
                 "\nStructured API request/response evidence is now sufficient to attempt "

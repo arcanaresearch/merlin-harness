@@ -7054,7 +7054,13 @@ async def test_browser_fill_records_non_sensitive_input_verbatim() -> None:
             send = next(item for item in snapshot.elements if item.name == "Send")
             recorder = Recorder()
             context = ToolContext(session_id="s1", workspace_root="/tmp")
-            result = await BrowserTool("browser_fill", lambda _: session, recorder).invoke(
+            recalled_recon = {(context.session_id, session.bounds.target_id): origin}
+            result = await BrowserTool(
+                "browser_fill",
+                lambda _: session,
+                recorder,
+                recalled_recon=recalled_recon,
+            ).invoke(
                 context,
                 {
                     "tab_ref": tab,
@@ -7064,21 +7070,33 @@ async def test_browser_fill_records_non_sensitive_input_verbatim() -> None:
                     "step": 2,
                 },
             )
-            submitted = await BrowserTool("browser_click", lambda _: session, recorder).invoke(
-                context,
-                {"tab_ref": tab, "element_ref": send.ref, "step": 3},
-            )
+            submitted = await BrowserTool(
+                "browser_click",
+                lambda _: session,
+                recorder,
+                recalled_recon=recalled_recon,
+            ).invoke(context, {"tab_ref": tab, "element_ref": send.ref, "step": 3})
             for _ in range(20):
                 if session.api_exchange_events():
                     break
                 await asyncio.sleep(0.05)
+            bounded = await BrowserTool(
+                "browser_snapshot",
+                lambda _: session,
+                recorder,
+                recalled_recon=recalled_recon,
+            ).invoke(context, {"tab_ref": tab, "step": 4})
             event = session.api_exchange_events()[-1]
             network = await BrowserTool(
-                "browser_network_events", lambda _: session, recorder
+                "browser_network_events",
+                lambda _: session,
+                recorder,
+                recalled_recon=recalled_recon,
             ).invoke(context, {"tab_ref": tab})
 
     assert result.is_error is False
     assert submitted.is_error is False
+    assert bounded.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
     assert network.is_error is False
     assert network.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
     recorded = recorder.actions[0]
