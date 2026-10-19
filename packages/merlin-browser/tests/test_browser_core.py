@@ -4082,6 +4082,104 @@ async def test_api_handoff_keeps_invalid_state_selector_advisory() -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_handoff_retains_state_when_monotonic_hint_is_contradicted() -> None:
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = owner()
+
+        def api_exchange_events(self):
+            return (
+                {
+                    "method": "GET",
+                    "url": "https://target.test/api/state",
+                    "status": 200,
+                    "request_json": {},
+                    "response_json": {"runId": "run-1", "score": 90},
+                },
+                {
+                    "method": "POST",
+                    "url": "https://target.test/api/message",
+                    "status": 200,
+                    "request_json": {"message": "harmless probe"},
+                    "response_json": {
+                        "runId": "run-1",
+                        "reply": "observed response",
+                        "score": 80,
+                    },
+                },
+            )
+
+    class Recorder:
+        handoff = None
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    arguments = _compile_arguments()
+    arguments["state_observations"] = [
+        {
+            "name": "run_id",
+            "role": "state_identity",
+            "baseline_selector": {
+                "step_id": "observed-session-setup",
+                "evaluation_root": "response_body",
+                "pointer": "/runId",
+            },
+            "result_selector": {
+                "step_id": "observed-message-exchange",
+                "evaluation_root": "response_body",
+                "pointer": "/runId",
+            },
+            "value_type": "string",
+        },
+        {
+            "name": "score",
+            "role": "score",
+            "baseline_selector": {
+                "step_id": "observed-session-setup",
+                "evaluation_root": "response_body",
+                "pointer": "/score",
+            },
+            "result_selector": {
+                "step_id": "observed-message-exchange",
+                "evaluation_root": "response_body",
+                "pointer": "/score",
+            },
+            "preferred_direction": "increase",
+            "monotonicity": "nondecreasing",
+            "value_type": "integer",
+            "minimum_value": 0,
+            "maximum_value": 100,
+        }
+    ]
+    recorder = Recorder()
+    tool = next(
+        item
+        for item in browser_tools(lambda _: Session(), recorder)
+        if item.describe().name == "browser_compile_api_handoff"
+    )
+
+    result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    adapter = json.loads(recorder.handoff.adapter)
+    score = next(
+        item
+        for item in adapter["state_capabilities"]["observations"]
+        if item["name"] == "score"
+    )
+    assert score["name"] == "score"
+    assert "monotonicity" not in score
+    assert any(
+        item["source"] == "browser_compile_api_handoff.state_observations"
+        and "remains executable" in item["reason"]
+        for item in adapter["evaluation_uncertainties"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_handoff_infers_omitted_identity_from_shared_read_only_state() -> None:
     captured = (
         {

@@ -6810,11 +6810,11 @@ class CompiledApiReconHandoffTool:
                 evaluation_uncertainties.append(
                     _evaluation_uncertainty(
                         "browser_compile_api_handoff.state_observations",
-                        "A state observation contradicted its reviewed monotonic rule and was "
-                        "not made executable.",
+                        "A state observation contradicted its reviewed monotonic rule; the "
+                        "observation remains executable without that unverified rule.",
                     )
                 )
-                continue
+                monotonicity = None
             observation = {
                 "name": str(raw_observation["name"]),
                 "role": str(raw_observation["role"]),
@@ -6834,7 +6834,13 @@ class CompiledApiReconHandoffTool:
                 "monotonicity",
             ):
                 if optional_key in raw_observation:
-                    value = raw_observation[optional_key]
+                    value = (
+                        monotonicity
+                        if optional_key == "monotonicity"
+                        else raw_observation[optional_key]
+                    )
+                    if value is None:
+                        continue
                     observation[optional_key] = list(value) if isinstance(value, list) else value
             state_observations.append(observation)
             observation_values_by_name[str(observation["name"])] = observed_values
