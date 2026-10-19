@@ -251,6 +251,7 @@ class CampaignConfigureTool:
             metadata = dict(result)
             if arguments.get("new_campaign") is True:
                 metadata["preferred_next_tool"] = "browser_recall_reconnaissance"
+                metadata["preferred_next_tool_mode"] = "after_one_admitted_action"
             return ToolResult(content=json.dumps(result, sort_keys=True), metadata=metadata)
         except (ValueError, TypeError) as error:
             return ToolResult(

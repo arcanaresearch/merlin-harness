@@ -824,6 +824,7 @@ class Kernel:
         recovery_tool_name: str | None = None
         recovery_reasoning: Literal["enabled", "disabled"] | None = None
         preferred_next_tool_name: str | None = None
+        preferred_next_tool_mode = "strict"
         blocked_recovery_tools: set[str] = set()
         repair_messages: list[ChatMessage] = []
         follow_through_recoveries = 0
@@ -913,6 +914,13 @@ class Kernel:
                 request_recovery_reasoning = recovery_reasoning
                 recovery_reasoning = None
                 request_preferred_tool_name = preferred_next_tool_name
+                request_preferred_tool_is_strict = (
+                    request_preferred_tool_name is not None
+                    and (
+                        preferred_next_tool_mode != "after_one_admitted_action"
+                        or preferred_tool_follow_through_failures > 0
+                    )
+                )
                 request_repair_messages = repair_messages
                 repair_messages = []
                 if self._permissions is not None and not await self._permissions.authorize_provider(
@@ -1031,10 +1039,11 @@ class Kernel:
                     available_tools = tuple(
                         spec for spec in available_tools if spec.name == request_recovery_tool_name
                     )
-                elif request_preferred_tool_name is not None:
+                elif request_preferred_tool_is_strict:
                     available_tools = tuple(
                         spec for spec in available_tools if spec.name == request_preferred_tool_name
                     )
+                if request_preferred_tool_name is not None:
                     if available_tools:
                         messages.append(
                             ChatMessage(
@@ -1071,7 +1080,12 @@ class Kernel:
                     ),
                     tools=tool_schemas,
                     required_tool_name=(
-                        request_recovery_tool_name or request_preferred_tool_name
+                        request_recovery_tool_name
+                        or (
+                            request_preferred_tool_name
+                            if request_preferred_tool_is_strict
+                            else None
+                        )
                     ),
                     reasoning=request_recovery_reasoning,
                     max_output_tokens=output_token_limit,
@@ -1100,6 +1114,7 @@ class Kernel:
                     nonlocal owned_cleanup_evidence_failed
                     nonlocal owned_cleanup_completed
                     nonlocal preferred_next_tool_name
+                    nonlocal preferred_next_tool_mode
                     nonlocal preferred_tool_follow_through_failures
                     nonlocal preferred_transition_observation_used
                     nonlocal preferred_tool_invoked_dynamically
@@ -1275,6 +1290,9 @@ class Kernel:
                         if next_tool != current_preferred_tool_name:
                             preferred_transition_observation_used = False
                         preferred_next_tool_name = next_tool
+                        preferred_next_tool_mode = str(
+                            result.metadata.get("preferred_next_tool_mode") or "strict"
+                        )
                         preferred_tool_follow_through_failures = 0
                     elif (
                         not result.is_error
@@ -1282,6 +1300,7 @@ class Kernel:
                         and call.name == "browser_compile_api_handoff"
                     ):
                         preferred_next_tool_name = "assessment_prepare"
+                        preferred_next_tool_mode = "strict"
                         preferred_tool_follow_through_failures = 0
                     if call.name == _RECON_RECALL_TOOL and not result.is_error:
                         recon_recall_completed = True
@@ -1531,6 +1550,7 @@ class Kernel:
                         tool_progress_fingerprint,
                         prepare_succeeded,
                         recon_recall_completed,
+                        next_preferred_tool_mode,
                     ) = await self._invoke_tools(
                         session_id,
                         tool_calls,
@@ -1543,7 +1563,11 @@ class Kernel:
                         ),
                         advertised_tool_names=advertised_tool_names,
                         automatic_recon_continuation=automatic_recon_continuation,
-                        required_tool_name=request_preferred_tool_name,
+                        required_tool_name=(
+                            request_preferred_tool_name
+                            if request_preferred_tool_is_strict
+                            else None
+                        ),
                         recon_recall_completed=recon_recall_completed,
                     )
                     preferred_tool_invoked = request_preferred_tool_name is not None and any(
@@ -1551,11 +1575,13 @@ class Kernel:
                     )
                     if preferred_tool_invoked:
                         preferred_next_tool_name = next_preferred_tool_name
+                        preferred_next_tool_mode = next_preferred_tool_mode
                         preferred_tool_follow_through_failures = 0
                     elif (
                         request_preferred_tool_name is None and next_preferred_tool_name is not None
                     ):
                         preferred_next_tool_name = next_preferred_tool_name
+                        preferred_next_tool_mode = next_preferred_tool_mode
                         preferred_tool_follow_through_failures = 0
                     if request_preferred_tool_name is not None and not preferred_tool_invoked:
                         disposition = await handle_preferred_tool_miss(request_preferred_tool_name)
@@ -1613,6 +1639,7 @@ class Kernel:
                                 )
                                 return
                             preferred_next_tool_name = _OWNED_SESSION_CLEANUP_TOOL
+                            preferred_next_tool_mode = "strict"
                             preferred_tool_follow_through_failures = 0
                     elif automatic_recon_continuation is not None and prepare_succeeded is True:
                         automatic_recon_continuation = None
@@ -1842,10 +1869,11 @@ class Kernel:
         automatic_recon_continuation: Mapping[str, object] | None = None,
         required_tool_name: str | None = None,
         recon_recall_completed: bool = False,
-    ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool]:
+    ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
         if not events:
-            return None, None, None, None, recon_recall_completed
+            return None, None, None, None, recon_recall_completed, "strict"
         preferred_next_tool: str | None = None
+        preferred_next_tool_mode = "strict"
         admitted_tool_name = required_tool_name
         automatic_continuation: dict[str, object] | None = None
         last_known_continuation: dict[str, object] | None = None
@@ -1990,6 +2018,9 @@ class Kernel:
             next_tool = result.metadata.get("preferred_next_tool")
             if not result.is_error and isinstance(next_tool, str):
                 preferred_next_tool = next_tool
+                preferred_next_tool_mode = str(
+                    result.metadata.get("preferred_next_tool_mode") or "strict"
+                )
                 admitted_tool_name = next_tool
             if event.name == _RECON_RECALL_TOOL and not result.is_error:
                 recon_recall_completed = True
@@ -2016,6 +2047,7 @@ class Kernel:
             automatic_progress_fingerprint,
             prepare_succeeded,
             recon_recall_completed,
+            preferred_next_tool_mode,
         )
 
     async def _save_assistant(

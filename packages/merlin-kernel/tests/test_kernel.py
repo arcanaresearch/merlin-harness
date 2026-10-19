@@ -2302,6 +2302,87 @@ async def test_successful_tool_can_constrain_exactly_the_next_tool_request() -> 
 
 
 @pytest.mark.asyncio
+async def test_browser_compile_preference_allows_one_final_observation() -> None:
+    class HandoffTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="browser_snapshot", description="Observe", input_schema={}),
+                ToolSpec(name="browser_wait_for_text", description="Wait", input_schema={}),
+                ToolSpec(
+                    name="browser_compile_api_handoff",
+                    description="Compile",
+                    input_schema={},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_snapshot":
+                return ToolResult(
+                    content="nearly ready",
+                    metadata={
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "after_one_admitted_action",
+                    },
+                )
+            return ToolResult(content="done")
+
+    class Provider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number == 1:
+                yield ToolCall(
+                    call_id="observe", name="browser_snapshot", arguments={}
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 2:
+                yield ToolCall(
+                    call_id="wait", name="browser_wait_for_text", arguments={}
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 3:
+                yield ToolCall(
+                    call_id="compile", name="browser_compile_api_handoff", arguments={}
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="compiled")
+            yield ModelCompleted()
+
+    provider = Provider()
+    tools = HandoffTools()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("recon")
+    await kernel.wait_for_turn()
+
+    assert [tool["function"]["name"] for tool in provider.requests[1].tools] == [
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_compile_api_handoff",
+    ]
+    assert provider.requests[1].required_tool_name is None
+    assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
+        "browser_compile_api_handoff"
+    ]
+    assert provider.requests[2].required_tool_name == "browser_compile_api_handoff"
+    assert tools.calls == [
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_compile_api_handoff",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_preferred_tool_refusal_is_uncertain_then_cooperates() -> None:
     class FollowThroughTools(Tools):
         def __init__(self):
@@ -3710,7 +3791,7 @@ async def test_cleanup_discovery_batch_later_prepare_success_clears_hold() -> No
 
     kernel = Kernel(Provider(), Store(), BatchTools(), Settings())
     session_id = await kernel.start()
-    _, continuation, _, prepare_succeeded, _ = await kernel._invoke_tools(  # noqa: SLF001
+    _, continuation, _, prepare_succeeded, _, _ = await kernel._invoke_tools(  # noqa: SLF001
         session_id,
         [
             ToolCall(call_id="held", name="assessment_prepare", arguments={"held": True}),
@@ -3741,7 +3822,7 @@ async def test_required_tool_batch_admits_only_receipt_authorized_successor() ->
     kernel = Kernel(Provider(), Store(), tools, Settings())
     session_id = await kernel.start()
 
-    next_tool, _, _, prepare_succeeded, _ = await kernel._invoke_tools(  # noqa: SLF001
+    next_tool, _, _, prepare_succeeded, _, _ = await kernel._invoke_tools(  # noqa: SLF001
         session_id,
         [
             ToolCall(

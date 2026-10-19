@@ -940,6 +940,7 @@ class BrowserTool:
         )
         if probe_exchange_ready and (kind == "network_events" or recalled_recon_active):
             metadata["preferred_next_tool"] = "browser_compile_api_handoff"
+            metadata["preferred_next_tool_mode"] = "after_one_admitted_action"
             content += (
                 "\nStructured API request/response evidence is now sufficient to attempt "
                 "browser_compile_api_handoff; compile whenever the exchange evidence is "
