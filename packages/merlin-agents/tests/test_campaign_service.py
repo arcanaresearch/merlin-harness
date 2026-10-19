@@ -760,7 +760,7 @@ async def test_objective_phase_gate_controller_retries_in_order_before_frontier(
     assert all(payload.get("frontier_claimed") is False for payload in gate_events)
 
 
-async def test_ambiguous_objective_gate_exhaustion_pauses_without_frontier_claim() -> None:
+async def test_ambiguous_objective_gate_exhaustion_continues_with_uncertainty() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     manifest = manifest_with_objective_phase_gates(
         prepared.manifest,
@@ -804,10 +804,11 @@ async def test_ambiguous_objective_gate_exhaustion_pauses_without_frontier_claim
         first_wave=1,
     )
 
-    assert ready is False
+    assert ready is True
     assert last_wave == 1
-    assert store.paused is True
-    assert store.lead[-1]["status"] == "blocked"
+    assert store.paused is False
+    assert store.lead[-1]["status"] == "continued_with_uncertainty"
+    assert "continuing the authorized frontier" in store.lead[-1]["blocker"]
     assert store.lead[-1]["frontier_claimed"] is False
 
 

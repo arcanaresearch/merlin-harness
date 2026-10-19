@@ -12826,7 +12826,10 @@ class CampaignService:
         wave = first_wave - 1
         for gate in manifest.objective_phase_gates:
             prior = tuple(event for event in gate_events if event.get("gate_id") == gate.id)
-            if any(event.get("status") == "succeeded" for event in prior):
+            if any(
+                event.get("status") in {"succeeded", "continued_with_uncertainty"}
+                for event in prior
+            ):
                 continue
             if gate.id in waived:
                 if not gate.operator_waivable:
@@ -12959,9 +12962,10 @@ class CampaignService:
                     )
                 )
                 if settled["status"] == "retryable" and exhausted:
-                    settled["status"] = "blocked"
+                    settled["status"] = "continued_with_uncertainty"
                     settled["blocker"] = (
-                        f"{settled.get('blocker')}; reviewed prerequisite retry budget exhausted"
+                        f"{settled.get('blocker')}; reviewed prerequisite retry budget exhausted; "
+                        "continuing the authorized frontier with recorded uncertainty"
                     )
                 await asyncio.to_thread(
                     self._store.append_lead,
@@ -12979,7 +12983,7 @@ class CampaignService:
                         "frontier_claimed": False,
                     },
                 )
-                if settled["status"] == "succeeded":
+                if settled["status"] in {"succeeded", "continued_with_uncertainty"}:
                     gate_succeeded = True
                     break
                 if settled["status"] == "blocked":
