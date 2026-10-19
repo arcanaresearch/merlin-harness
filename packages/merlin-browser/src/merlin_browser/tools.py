@@ -4900,6 +4900,52 @@ class CompiledApiReconHandoffTool:
         if isinstance(derived, ToolResult):
             return derived
         adapter = derived.adapter
+        requested_state_observations = [
+            item
+            for item in arguments.get("state_observations", ())
+            if isinstance(item, Mapping)
+        ]
+        state_capabilities = adapter.get("state_capabilities")
+        executable_state_observations = [
+            item
+            for item in (
+                state_capabilities.get("observations", ())
+                if isinstance(state_capabilities, Mapping)
+                else ()
+            )
+            if isinstance(item, Mapping)
+        ]
+        state_observation_failures = [
+            str(item.get("reason") or "").strip()
+            for item in adapter.get("evaluation_uncertainties", ())
+            if isinstance(item, Mapping)
+            and item.get("source") == "browser_compile_api_handoff.state_observations"
+            and str(item.get("reason") or "").strip()
+        ]
+        if (
+            requested_state_observations
+            and not executable_state_observations
+            and state_observation_failures
+        ):
+            return ToolResult(
+                content=(
+                    "none of the requested target-state observations could be compiled. "
+                    "Capture a current-session read-only baseline response, then call "
+                    "browser_compile_api_handoff again with baseline selectors bound to "
+                    "observed-session-setup. Do not prepare the state-less adapter. "
+                    + " ".join(state_observation_failures)
+                ),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "state_observation_baseline_required",
+                    "retryable": True,
+                    "preferred_next_tool": "browser_network_events",
+                    "state_observation_repair_available": True,
+                    "state_observation_repair": " ".join(state_observation_failures),
+                    "state_observation_failures": state_observation_failures,
+                },
+            )
         method, url = derived.method, derived.url
         success_witness = derived.success_witness
         request_evidence_ref = derived.request_evidence_ref
@@ -5001,13 +5047,6 @@ class CompiledApiReconHandoffTool:
             and item.get("source") == "browser_compile_api_handoff.state_observations"
             for item in adapter.get("evaluation_uncertainties", ())
         )
-        state_observation_failures = [
-            str(item.get("reason") or "").strip()
-            for item in adapter.get("evaluation_uncertainties", ())
-            if isinstance(item, Mapping)
-            and item.get("source") == "browser_compile_api_handoff.state_observations"
-            and str(item.get("reason") or "").strip()
-        ]
         preferred_next_tool = (
             "browser_end_owned_session"
             if isinstance(cleanup_discovery, Mapping)

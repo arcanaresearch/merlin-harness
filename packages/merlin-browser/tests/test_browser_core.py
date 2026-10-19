@@ -4013,7 +4013,7 @@ async def test_api_handoff_keeps_full_response_when_evaluator_hints_are_stale() 
 
 
 @pytest.mark.asyncio
-async def test_api_handoff_keeps_invalid_state_selector_advisory() -> None:
+async def test_api_handoff_requires_baseline_when_all_state_selectors_are_invalid() -> None:
     class Session:
         context_id = "browser-context"
         bounds = SimpleNamespace(target_id="target")
@@ -4063,15 +4063,12 @@ async def test_api_handoff_keeps_invalid_state_selector_advisory() -> None:
 
     result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
 
-    assert result.is_error is False
-    assert recorder.handoff is not None
-    adapter = json.loads(recorder.handoff.adapter)
-    assert any(
-        item["source"] == "browser_compile_api_handoff.state_observations"
-        for item in adapter["evaluation_uncertainties"]
-    )
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "state_observation_baseline_required"
+    assert result.metadata["retryable"] is True
+    assert recorder.handoff is None
     assert result.metadata["state_observation_repair_available"] is True
-    assert result.metadata["preferred_next_tool"] == "assessment_prepare"
+    assert result.metadata["preferred_next_tool"] == "browser_network_events"
     assert "no pre-interaction baseline was selected" in result.metadata[
         "state_observation_repair"
     ]
