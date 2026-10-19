@@ -5729,6 +5729,87 @@ class CompiledApiReconHandoffTool:
                     }
             reviewed_state_observations.append(raw_observation)
 
+        # A model may describe progress fields while omitting the bookkeeping
+        # state_identity observation that binds a passive state read to the
+        # interaction response. Recover that identity only from an exact shared
+        # ID-valued scalar in captured target responses. This keeps the binding
+        # evidence-derived and lets the reviewed progress selectors use the
+        # authoritative read-only baseline already present in the browser trace.
+        if (
+            not request_sourced_session_values
+            and not any(
+                item.get("role") == "state_identity"
+                for item in reviewed_state_observations
+            )
+        ):
+            result_identity_scalars = [
+                (pointer, value)
+                for pointer, value in _string_scalar_paths(event.get("response_json"))
+                if pointer.rsplit("/", 1)[-1].casefold().endswith("id") and value
+            ]
+            inferred_identity_matches: list[
+                tuple[int, Mapping[str, object], str, str, str]
+            ] = []
+            for candidate_index, candidate in enumerate(exchanges[:event_index]):
+                if (
+                    str(candidate.get("method") or "").upper() not in {"GET", "HEAD"}
+                    or type(candidate.get("status")) is not int
+                    or not 200 <= int(candidate["status"]) <= 299
+                ):
+                    continue
+                for baseline_pointer, baseline_value in _string_scalar_paths(
+                    candidate.get("response_json")
+                ):
+                    if not baseline_pointer.rsplit("/", 1)[-1].casefold().endswith("id"):
+                        continue
+                    for result_pointer, result_value in result_identity_scalars:
+                        if (
+                            baseline_value == result_value
+                            and _capture_name_compatible(
+                                baseline_pointer,
+                                result_pointer,
+                            )
+                        ):
+                            inferred_identity_matches.append(
+                                (
+                                    candidate_index,
+                                    candidate,
+                                    baseline_pointer,
+                                    result_pointer,
+                                    result_value,
+                                )
+                            )
+            if inferred_identity_matches:
+                _, _, baseline_pointer, result_pointer, _ = max(
+                    inferred_identity_matches,
+                    key=lambda match: (
+                        match[0],
+                        match[3].rsplit("/", 1)[-1].casefold() == "runid",
+                        match[3].rsplit("/", 1)[-1].casefold() == "sessionid",
+                    ),
+                )
+                identity_leaf = result_pointer.rsplit("/", 1)[-1]
+                identity_name = re.sub(r"(?<!^)(?=[A-Z])", "_", identity_leaf).casefold()
+                identity_name = re.sub(r"[^a-z0-9_]+", "_", identity_name).strip("_")
+                reviewed_state_observations.insert(
+                    0,
+                    {
+                        "name": identity_name,
+                        "role": "state_identity",
+                        "baseline_selector": {
+                            "pointer": baseline_pointer,
+                            "step_id": "observed-session-setup",
+                            "evaluation_root": "response_body",
+                        },
+                        "result_selector": {
+                            "pointer": result_pointer,
+                            "step_id": "observed-message-exchange",
+                            "evaluation_root": "response_body",
+                        },
+                        "value_type": "string",
+                    },
+                )
+
         # Cookie-authenticated APIs often keep physical state out of the request
         # body.  In that lifecycle, an exact reviewed state-identity declaration
         # can bind a passive GET snapshot to the interaction response without

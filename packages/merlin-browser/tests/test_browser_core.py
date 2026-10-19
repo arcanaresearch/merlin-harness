@@ -4082,6 +4082,119 @@ async def test_api_handoff_keeps_invalid_state_selector_advisory() -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_handoff_infers_omitted_identity_from_shared_read_only_state() -> None:
+    captured = (
+        {
+            "method": "GET",
+            "url": "https://target.test/api/state",
+            "status": 200,
+            "response_json": {
+                "run": {"runId": "run-1", "tier": 1},
+                "session": {"score": 85, "turnsLeft": 30},
+            },
+        },
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "request_json": {"text": "harmless probe"},
+            "response_json": {
+                "run": {"runId": "run-1", "tier": 1},
+                "turn": {"score": 77, "turnsLeft": 29, "reply": "hello"},
+            },
+        },
+    )
+
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = owner()
+
+        def api_exchange_events(self):
+            return captured
+
+    class Recorder:
+        handoff = None
+
+        async def reviewed_native_input_receipt(self, context_id, _event, input_pointer):
+            return {
+                "context_id": context_id,
+                "target_id": "target",
+                "input_pointer": input_pointer,
+                "evidence_ref": "native-request:sha256:" + "f" * 64,
+            }
+
+        async def record_evidence(self, *_args):
+            return None
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    arguments = {
+        **_compile_arguments(),
+        "url": "https://target.test/api/turn",
+        "input_pointer": "/text",
+        "response_selector": "/turn/reply",
+        "state_observations": [
+            {
+                "name": "score",
+                "role": "score",
+                "baseline_selector": {
+                    "pointer": "/turn/score",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/turn/score",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "value_type": "integer",
+                "preferred_direction": "increase",
+            },
+            {
+                "name": "turns_left",
+                "role": "budget_remaining",
+                "baseline_selector": {
+                    "pointer": "/turn/turnsLeft",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "result_selector": {
+                    "pointer": "/turn/turnsLeft",
+                    "step_id": "observed-message-exchange",
+                    "evaluation_root": "response_body",
+                },
+                "value_type": "integer",
+                "preferred_direction": "decrease",
+            },
+        ],
+    }
+    recorder = Recorder()
+    tool = next(
+        item
+        for item in browser_tools(lambda _: Session(), recorder)
+        if item.describe().name == "browser_compile_api_handoff"
+    )
+
+    result = await tool.invoke(ToolContext(session_id="s1", workspace_root="/tmp"), arguments)
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    adapter = json.loads(recorder.handoff.adapter)
+    capabilities = adapter["state_capabilities"]
+    assert capabilities["identity"]["result_selector"]["pointer"] == "/run/runId"
+    assert {item["name"] for item in capabilities["observations"]} == {
+        "run_id",
+        "score",
+        "turns_left",
+    }
+    score = next(item for item in capabilities["observations"] if item["name"] == "score")
+    assert score["baseline_selector"]["pointer"] == "/session/score"
+    assert score["result_selector"]["pointer"] == "/turn/score"
+
+
+@pytest.mark.asyncio
 async def test_api_handoff_replays_compiled_adapter_against_fresh_session_state() -> None:
     captured = (
         {
