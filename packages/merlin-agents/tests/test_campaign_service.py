@@ -25019,6 +25019,7 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
         (item["provenance"], item["counts_as_campaign_progress"])
         for item in attributions
     } == {("campaign", True), ("preexisting", False)}
+    assert {item["changes"][0]["role"] for item in attributions} == {"custom"}
     assert not hasattr(store, "arm_observations")
 
 

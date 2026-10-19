@@ -8241,77 +8241,66 @@ def _reviewed_recon_observations(
             or not isinstance(result_selector, Mapping)
         ):
             continue
-        baseline_matches = tuple(
-            (event, resolved)
-            for event in candidates
-            if (
-                resolved := observed_value(event, baseline_selector.get("pointer"), name)
-            )
-            is not None
-        )
-        result_matches = tuple(
-            (event, resolved)
-            for event in candidates
-            if (resolved := observed_value(event, result_selector.get("pointer"), name))
-            is not None
-        )
-        if not baseline_matches or not result_matches:
-            continue
-        baseline_event, (baseline_pointer, baseline_value) = baseline_matches[0]
         success_values = declaration.get("success_values")
-        successful_results = tuple(
-            match
-            for match in result_matches
-            if isinstance(success_values, list)
-            and any(
-                type(match[1][1]) is type(expected) and match[1][1] == expected
+        direction = declaration.get("preferred_direction")
+        if direction is None:
+            direction = {
+                "nondecreasing": "increase",
+                "nonincreasing": "decrease",
+            }.get(declaration.get("monotonicity"))
+        # Preserve every adjacent authoritative transition witnessed during
+        # reconnaissance.  Collapsing a 1 -> 2 -> 3 -> 4 progression into only
+        # 1 -> 4 loses the intermediate coverage members and makes the campaign
+        # repeat already-completed baseline work.
+        for baseline_event, result_event in zip(candidates, candidates[1:], strict=False):
+            baseline = observed_value(
+                baseline_event, baseline_selector.get("pointer"), name
+            )
+            result = observed_value(result_event, result_selector.get("pointer"), name)
+            if baseline is None or result is None:
+                continue
+            baseline_pointer, baseline_value = baseline
+            result_pointer, result_value = result
+            if type(baseline_value) is not type(result_value):
+                continue
+            succeeded = isinstance(success_values, list) and any(
+                type(result_value) is type(expected) and result_value == expected
                 for expected in success_values
             )
-        )
-        result_event, (result_pointer, result_value) = (
-            successful_results[-1] if successful_results else result_matches[-1]
-        )
-        if baseline_event is result_event or type(baseline_value) is not type(result_value):
-            continue
-        succeeded = isinstance(success_values, list) and any(
-            type(result_value) is type(expected) and result_value == expected
-            for expected in success_values
-        )
-        direction = declaration.get("preferred_direction")
-        progressed = (
-            type(baseline_value) in {int, float}
-            and type(result_value) in {int, float}
-            and (
-                (direction == "increase" and result_value > baseline_value)
-                or (direction == "decrease" and result_value < baseline_value)
+            progressed = (
+                type(baseline_value) in {int, float}
+                and type(result_value) in {int, float}
+                and (
+                    (direction == "increase" and result_value > baseline_value)
+                    or (direction == "decrease" and result_value < baseline_value)
+                )
             )
-        )
-        if not succeeded and not progressed:
-            continue
-        evidence_refs: list[str] = []
-        for event in (baseline_event, result_event):
-            for part in ("request", "response"):
-                reference, payload = _captured_api_evidence(session, event, part)
-                evidence[reference] = payload
-                evidence_refs.append(reference)
-        core = {
-            "schema": "merlin.browser.recon-observation.v1",
-            "name": name,
-            "role": str(declaration.get("role") or "custom"),
-            "baseline": baseline_value,
-            "result": result_value,
-            "baseline_pointer": baseline_pointer,
-            "result_pointer": result_pointer,
-            "outcome": "observed" if succeeded else "partial",
-            "success_value_matched": succeeded,
-            "result_observed_at": str(
-                result_event.get("observed_at")
-                or result_event.get("_observation_observed_at")
-                or ""
-            ),
-            "evidence_refs": list(dict.fromkeys(evidence_refs)),
-        }
-        receipts.append({**core, "digest": _digest_json(core)})
+            if not succeeded and not progressed:
+                continue
+            evidence_refs: list[str] = []
+            for event in (baseline_event, result_event):
+                for part in ("request", "response"):
+                    reference, payload = _captured_api_evidence(session, event, part)
+                    evidence[reference] = payload
+                    evidence_refs.append(reference)
+            core = {
+                "schema": "merlin.browser.recon-observation.v1",
+                "name": name,
+                "role": str(declaration.get("role") or "custom"),
+                "baseline": baseline_value,
+                "result": result_value,
+                "baseline_pointer": baseline_pointer,
+                "result_pointer": result_pointer,
+                "outcome": "observed" if succeeded else "partial",
+                "success_value_matched": succeeded,
+                "result_observed_at": str(
+                    result_event.get("observed_at")
+                    or result_event.get("_observation_observed_at")
+                    or ""
+                ),
+                "evidence_refs": list(dict.fromkeys(evidence_refs)),
+            }
+            receipts.append({**core, "digest": _digest_json(core)})
     return tuple(receipts), tuple(evidence.items())
 
 

@@ -147,6 +147,47 @@ def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
     assert len(evidence) == 4
 
 
+def test_reviewed_recon_observation_preserves_each_progress_transition() -> None:
+    session = SimpleNamespace(
+        context_id="browser-context",
+        bounds=SimpleNamespace(target_id="target"),
+    )
+    exchanges = tuple(
+        {
+            "method": "POST",
+            "url": "https://target.test/api/turn",
+            "status": 200,
+            "observed_at": f"2026-10-13T18:3{tier}:24+00:00",
+            "request_json": {"message": f"tier {tier}"},
+            "response_json": {"result": {"turn": {"tier": tier}}},
+        }
+        for tier in range(1, 5)
+    )
+
+    observations, _evidence = _reviewed_recon_observations(
+        session,
+        [
+            {
+                "name": "tier",
+                "role": "progress_ordinal",
+                "monotonicity": "nondecreasing",
+                "baseline_selector": {"pointer": "/result/turn/tier"},
+                "result_selector": {"pointer": "/result/turn/tier"},
+            }
+        ],
+        exchanges,
+        method="POST",
+        url="https://target.test/api/turn",
+    )
+
+    assert [(item["baseline"], item["result"]) for item in observations] == [
+        (1, 2),
+        (2, 3),
+        (3, 4),
+    ]
+    assert all(item["role"] == "progress_ordinal" for item in observations)
+
+
 class _NativeRequestFixtureRecorder:
     """Give legacy compiler fixtures an explicit typed native-request receipt."""
 

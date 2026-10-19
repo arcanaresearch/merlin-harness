@@ -12291,6 +12291,7 @@ class CampaignService:
                         "changes": (
                             {
                                 "name": name,
+                                "role": str(receipt.get("role") or "custom"),
                                 "status": str(receipt.get("outcome") or "partial"),
                                 "before_value": baseline,
                                 "after_value": result,
