@@ -4478,8 +4478,13 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                 )
                 attempts[stage] = (lease.id, call_id)
             assert target_session_ids == [
-                f"api:{campaign_id}:{target_id}:scope:{node_id}:generation:1"
-                for node_id in node_ids
+                (
+                    f"api:{campaign_id}:{target_id}:scope:{node_id}"
+                    f"/attempt/{attempts[stage][0]}:generation:1"
+                )
+                for stage, node_id in zip(
+                    ("control", "direct", "replay"), node_ids, strict=True
+                )
             ]
             assert len(set(target_session_ids)) == 3
             gate = scheduler.baseline_gate(schedule_id)
@@ -4762,10 +4767,15 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                         checkpoint={"completed": [node_id]},
                         target_session_id=emitted_session_id,
                     )
-                assert forged_session_ids == [
-                    f"api:campaign/foreign:{target_id}:scope:{node_id}:generation:1"
-                    for node_id in forged_nodes
-                ]
+                assert all(
+                    session_id.startswith(
+                        f"api:campaign/foreign:{target_id}:scope:{node_id}/attempt/"
+                    )
+                    and session_id.endswith(":generation:1")
+                    for session_id, node_id in zip(
+                        forged_session_ids, forged_nodes, strict=True
+                    )
+                )
                 assert len(set(forged_session_ids)) == 3
                 forged_gate = forged_scheduler.baseline_gate(forged_schedule)
                 assert forged_gate["positive"] == ()

@@ -1665,6 +1665,60 @@ async def test_unknown_cleanup_requirement_survives_restart_without_blocking_com
 
 
 @pytest.mark.asyncio
+async def test_retry_uses_fresh_scope_after_unknown_cleanup_quarantines_prior_attempt(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    adapter["api_steps"] = adapter["api_steps"][:-1]  # type: ignore[index]
+    adapter["cleanup_lifecycle"] = {"status": "not_established", "evidence_refs": []}
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if request.url.path.endswith("/start"):
+            starts += 1
+            return httpx.Response(200, json={"sessionId": f"session-{starts}"})
+        return httpx.Response(200, json={"reply": "observed"})
+
+    campaign_id = "campaign/api-cleanup-unknown-retry"
+    assignment_id = f"{campaign_id}/injection"
+    first_context = _context(campaign_id).model_copy(update={"attempt_id": "attempt-1"})
+    retry_context = _context(campaign_id).model_copy(update={"attempt_id": "attempt-2"})
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                first = await tool.invoke(first_context, {"input": "first"})
+                await tool.cleanup_assignment(assignment_id)
+                retry = await tool.invoke(retry_context, {"input": "retry"})
+                await tool.cleanup_assignment(assignment_id)
+
+            first_state = sessions.load(
+                campaign_id,
+                target_id="target-refund",
+                session_scope_id=f"{assignment_id}/attempt/attempt-1",
+            )
+            retry_state = sessions.load(
+                campaign_id,
+                target_id="target-refund",
+                session_scope_id=f"{assignment_id}/attempt/attempt-2",
+            )
+
+    assert first.is_error is False and retry.is_error is False
+    assert starts == 2
+    assert first_state is not None and first_state.state == "ambiguous"
+    assert retry_state is not None and retry_state.state == "ambiguous"
+    assert first_state.target_session_id != retry_state.target_session_id
+
+
+@pytest.mark.asyncio
 async def test_reviewed_api_tool_retries_no_response_transport_timeout(
     tmp_path: Path,
 ) -> None:

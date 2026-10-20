@@ -437,7 +437,10 @@ class ReviewedApiTargetTool:
             return ToolResult(
                 content="target_request requires a stable assignment scope", is_error=True
             )
-        session_scope_id = _reviewed_session_scope_id(context.agent_id)
+        session_scope_id = _reviewed_session_scope_id(
+            context.agent_id,
+            attempt_id=context.attempt_id,
+        )
         try:
             adapter = self._adapter(context.campaign_id, context.target_id)
         except ValueError as error:
@@ -2372,17 +2375,29 @@ class ReviewedApiTargetTool:
                 campaign_id,
                 include_cleaned=False,
             )
+            attempt_scope_prefix = f"{assignment_scope_id}/attempt/"
             for state in states:
                 if state.session_scope_id in {
                     LEGACY_API_SESSION_SCOPE_ID,
                     assignment_id,
                     assignment_scope_id,
-                }:
-                    await self._cleanup_locked(
-                        campaign_id,
-                        state.target_id,
-                        state.session_scope_id,
+                } or state.session_scope_id.startswith(attempt_scope_prefix):
+                    state_lock = self._locks.setdefault(
+                        (campaign_id, state.session_scope_id), asyncio.Lock()
                     )
+                    if state_lock in {legacy_lock, assignment_lock}:
+                        await self._cleanup_locked(
+                            campaign_id,
+                            state.target_id,
+                            state.session_scope_id,
+                        )
+                    else:
+                        async with state_lock:
+                            await self._cleanup_locked(
+                                campaign_id,
+                                state.target_id,
+                                state.session_scope_id,
+                            )
 
         async with legacy_lock:
             if assignment_lock is legacy_lock:
@@ -5138,9 +5153,11 @@ def _campaign_id(assignment_id: str) -> str | None:
     return "/".join(parts[:2]) if len(parts) >= 2 else None
 
 
-def _reviewed_session_scope_id(assignment_id: str) -> str:
-    """Keep each logical assignment in an independent target-session scope."""
-    return assignment_id
+def _reviewed_session_scope_id(assignment_id: str, *, attempt_id: str | None = None) -> str:
+    """Keep each execution attempt in an independent target-session scope."""
+    if attempt_id is None:
+        return assignment_id
+    return f"{assignment_id}/attempt/{attempt_id}"
 
 
 def _session_expired_signal(raw: Mapping[str, object]) -> _SessionExpiredSignal | None:
