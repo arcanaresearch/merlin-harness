@@ -874,15 +874,22 @@ class Kernel:
                 )
                 if preferred_tool_follow_through_failures < self._max_provider_retries:
                     preferred_tool_follow_through_failures += 1
+                    bounded_preference = preferred_next_tool_mode == "after_one_admitted_action"
                     repair_messages = [
                         ChatMessage(
                             role="system",
                             content=(
-                                "The previous provider response did not invoke the required "
+                                "The previous provider response did not invoke the preferred "
                                 f"`{tool_name}` tool. Durable tool evidence takes precedence "
                                 "over prose, refusal, speculation, or an alternate tool call. "
-                                "Call that exact tool now; its schema is the only tool schema "
-                                "provided. Do not repeat or reinterpret the refusal."
+                                "Call that exact tool now. "
+                                + (
+                                    "Other admitted tools remain available for a necessary final "
+                                    "observation, but do not repeat optional reconnaissance."
+                                    if bounded_preference
+                                    else "Its schema is the only tool schema provided."
+                                )
+                                + " Do not repeat or reinterpret the refusal."
                             ),
                         )
                     ]
@@ -916,10 +923,7 @@ class Kernel:
                 request_preferred_tool_name = preferred_next_tool_name
                 request_preferred_tool_is_strict = (
                     request_preferred_tool_name is not None
-                    and (
-                        preferred_next_tool_mode != "after_one_admitted_action"
-                        or preferred_tool_follow_through_failures > 0
-                    )
+                    and preferred_next_tool_mode != "after_one_admitted_action"
                 )
                 request_repair_messages = repair_messages
                 repair_messages = []

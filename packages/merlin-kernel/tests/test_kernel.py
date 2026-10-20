@@ -2372,9 +2372,11 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
     ]
     assert provider.requests[1].required_tool_name is None
     assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
-        "browser_compile_api_handoff"
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_compile_api_handoff",
     ]
-    assert provider.requests[2].required_tool_name == "browser_compile_api_handoff"
+    assert provider.requests[2].required_tool_name is None
     assert tools.calls == [
         "browser_snapshot",
         "browser_wait_for_text",
