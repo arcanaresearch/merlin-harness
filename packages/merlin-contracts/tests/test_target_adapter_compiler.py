@@ -581,7 +581,7 @@ def test_observation_baseline_must_precede_its_interaction_result() -> None:
     assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
 
 
-def test_authoritative_observations_require_reviewed_physical_identity() -> None:
+def test_observations_without_physical_identity_remain_available_as_telemetry() -> None:
     raw = _http_adapter()
     raw["state_capabilities"] = {
         "observations": [
@@ -603,8 +603,11 @@ def test_authoritative_observations_require_reviewed_physical_identity() -> None
         ]
     }
 
-    with pytest.raises(AdapterCompileError, match="require reviewed physical-state identity"):
-        compile_target_adapter(raw)
+    compiled = compile_target_adapter(raw).executable
+
+    assert compiled.state_capabilities is not None
+    assert compiled.state_capabilities.identity is None
+    assert tuple(item.name for item in compiled.state_capabilities.observations) == ("score",)
 
 
 def test_absent_capabilities_preserve_legacy_compiled_digest_shape() -> None:

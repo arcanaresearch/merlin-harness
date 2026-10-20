@@ -23770,6 +23770,56 @@ async def test_frontier_settlement_marks_infrastructure_only_batch():
     assert counts["infrastructure_only_batch"] == 1
 
 
+async def test_frontier_settlement_does_not_mark_target_evidence_as_infrastructure_only():
+    class FrontierStore(Store):
+        def load_active_frontier_batch(self, _campaign_id):
+            return {
+                "id": "batch-1",
+                "schedule_id": "schedule-1",
+                "candidates": ({"id": "cell/failed", "claim_generation": 1},),
+            }
+
+        def settle_frontier_batch(self, _campaign_id, _batch_id, _dispositions):
+            return {"queued": 1, "terminal": 0, "total": 1}
+
+    class OutcomeAgents:
+        async def technique_attempts(self, _schedule_id):
+            return (
+                {
+                    "task_id": "task/failed",
+                    "technique_id": "cell/failed",
+                    "state": "blocked",
+                    "disposition": "infrastructure_failed",
+                    "strategy_state": {},
+                },
+            )
+
+    service = CampaignService(FrontierStore(), OutcomeAgents(), None)  # type: ignore[arg-type]
+    counts = await service._settle_execution_frontier_batch(  # noqa: SLF001
+        "campaign-1",
+        SimpleNamespace(id="schedule-1"),
+        (
+            AgentTask(
+                id="task/failed",
+                objective="failed",
+                status="failed",
+                technique_ids=("cell/failed",),
+            ),
+        ),
+        evidence={
+            "task/failed": {
+                "target_call_ids": ("target-call-1",),
+                "target_evidence_receipts": {
+                    "target-call-1": {"status_code": 200},
+                },
+            }
+        },
+    )
+
+    assert counts is not None
+    assert "infrastructure_only_batch" not in counts
+
+
 async def test_frontier_infrastructure_circuit_pauses_after_three_consecutive_batches():
     class CircuitStore:
         def __init__(self) -> None:

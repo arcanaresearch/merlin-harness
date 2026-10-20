@@ -377,12 +377,6 @@ def _validate_capability_step_ids(
                 "state_capabilities.supported_modalities",
                 "supported modality must reference an existing interaction request value",
             )
-    if capabilities.observations and capabilities.identity is None:
-        raise AdapterCompileError(
-            AdapterCompileFailureKind.CONTRACT_VALIDATION,
-            "state_capabilities.observations",
-            "authoritative state observations require reviewed physical-state identity",
-        )
     invalid_enumeration_steps = sorted(
         declaration.selector.step_id
         for declaration in capabilities.enumerations

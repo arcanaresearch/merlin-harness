@@ -3014,6 +3014,7 @@ class CampaignService:
         live: Any,
         tasks: tuple[AgentTask, ...],
         *,
+        evidence: Mapping[str, Mapping[str, object]] | None = None,
         manifest: CampaignManifest | None = None,
         transition_lease: _FrontierTransitionLease | None = None,
     ) -> Mapping[str, int] | None:
@@ -3252,6 +3253,19 @@ class CampaignService:
                         authoritative_outcomes.setdefault(technique_id, set()).add(outcome)
         dispositions = {}
         infrastructure_candidate_ids: set[str] = set()
+        target_evidence_task_ids = {
+            task_id
+            for task_id, committed in (evidence or {}).items()
+            if tuple(
+                value
+                for value in committed.get("target_call_ids", ())
+                if isinstance(value, str) and value
+            )
+            or any(
+                isinstance(receipt, Mapping)
+                for _, receipt in _mapping_items(committed.get("target_evidence_receipts"))
+            )
+        }
         for candidate in candidates:
             if not isinstance(candidate, Mapping) or not candidate.get("id"):
                 continue
@@ -3263,9 +3277,19 @@ class CampaignService:
                 and attempt.get("task_id") in task_ids
                 and attempt.get("technique_id") == candidate_id
             )
-            if candidate_attempts and all(
-                str(attempt.get("disposition") or "").casefold() == "infrastructure_failed"
+            candidate_task_ids = {
+                str(attempt.get("task_id"))
                 for attempt in candidate_attempts
+                if attempt.get("task_id")
+            }
+            if (
+                candidate_attempts
+                and candidate_task_ids.isdisjoint(target_evidence_task_ids)
+                and all(
+                    str(attempt.get("disposition") or "").casefold()
+                    == "infrastructure_failed"
+                    for attempt in candidate_attempts
+                )
             ):
                 infrastructure_candidate_ids.add(candidate_id)
             outcomes = authoritative_outcomes.get(candidate_id, set())
@@ -5402,6 +5426,7 @@ class CampaignService:
                     campaign_id,
                     live,
                     tasks,
+                    evidence=frontier_evidence,
                     manifest=manifest,
                     transition_lease=transition_lease,
                 )
@@ -17004,10 +17029,12 @@ class CampaignService:
                             summary,
                             transition_lease,
                         )
+                    recovery_evidence = await self._source_evidence(schedule_id, tasks)
                     await self._settle_execution_frontier_batch(
                         campaign_id,
                         _TerminalFrontierSchedule(schedule_id),
                         tasks,
+                        evidence=recovery_evidence,
                         manifest=manifest,
                         transition_lease=transition_lease,
                     )
