@@ -277,8 +277,22 @@ async def test_execute_reused_recon_admits_autonomous_composition_before_attack(
     service = CampaignService(store, agents, _preparation)  # type: ignore[arg-type]
     lead_sources: list[tuple[AgentTask, ...]] = []
 
-    async def compose_before_submit(_campaign_id, _manifest, _wave, source_tasks):
+    async def compose_before_submit(
+        _campaign_id,
+        _manifest,
+        _wave,
+        source_tasks,
+        *,
+        source_evidence_override=None,
+    ):
         assert not agents.submissions
+        assert source_evidence_override == {
+            "recon-result:reused": {
+                "digest": result_digest,
+                "reference": "recon-result:reused",
+                "source": "reused_reconnaissance",
+            }
+        }
         lead_sources.append(source_tasks)
         proposal = DynamicSpecialistProposal(
             campaign_id=prepared.manifest.id,
@@ -355,7 +369,7 @@ async def test_autonomous_composition_is_admitted_before_initial_attack_once(
     )
     lead_calls = 0
 
-    async def assess_once(*_args):
+    async def assess_once(*_args, **_kwargs):
         nonlocal lead_calls
         lead_calls += 1
         proposal = DynamicSpecialistProposal(

@@ -7909,7 +7909,17 @@ class CampaignService:
         ):
             try:
                 assessment = await self._assess_and_journal(
-                    campaign_id, manifest, wave, recon_tasks
+                    campaign_id,
+                    manifest,
+                    wave,
+                    recon_tasks,
+                    source_evidence_override=(
+                        {
+                            recon_source_task.id: dict(committed_recon_evidence),
+                        }
+                        if committed_recon_evidence is not None
+                        else {}
+                    ),
                 )
             except CampaignLeadDecisionError as error:
                 await asyncio.to_thread(
@@ -7931,6 +7941,8 @@ class CampaignService:
                         continue
                     body = asdict(followup.specialist)
                     body["model"] = body.pop("requested_model", None)
+                    if body.get("grant_effects") is None:
+                        body.pop("grant_effects", None)
                     proposals.append(body)
                 if proposals:
                     evidence_refs = tuple(
@@ -9714,9 +9726,15 @@ class CampaignService:
         manifest: CampaignManifest,
         wave: int,
         tasks: tuple[AgentTask, ...],
+        *,
+        source_evidence_override: Mapping[str, Mapping[str, object]] | None = None,
     ) -> LeadAssessment:
         schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
-        source_evidence = await self._source_evidence(schedule_id, tasks)
+        source_evidence = (
+            await self._source_evidence(schedule_id, tasks)
+            if source_evidence_override is None
+            else source_evidence_override
+        )
         terminal_single_session = self._terminal_single_session_observed(
             manifest, tasks, source_evidence
         )
