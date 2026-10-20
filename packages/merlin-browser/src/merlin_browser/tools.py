@@ -451,6 +451,7 @@ class BrowserTool:
             if self._recorder is not None
             else None
         )
+        reusable_handoff_count = 0
         if (
             kind == "open_tab"
             and callable(handoff_loader)
@@ -459,23 +460,7 @@ class BrowserTool:
         ):
             reusable_handoffs = await handoff_loader(session.bounds.target_id)
             if reusable_handoffs:
-                return ToolResult(
-                    content=(
-                        "durable reconnaissance exists for this target; call "
-                        "browser_recall_reconnaissance once before browser_open_tab so prior "
-                        "evidence can be reused or narrowed"
-                    ),
-                    is_error=True,
-                    metadata={
-                        "effect": self.effect,
-                        "failure_code": "recon_recall_required",
-                        "required_tool": "browser_recall_reconnaissance",
-                        "reusable_handoff_count": len(reusable_handoffs),
-                        "target": session.bounds.target_id,
-                        "target_effect_attempted": False,
-                        "target_call_budget_charge": 0,
-                    },
-                )
+                reusable_handoff_count = len(reusable_handoffs)
         recalled_surface = (
             self._recalled_recon.get(recall_key)
             if self._recalled_recon is not None
@@ -937,6 +922,14 @@ class BrowserTool:
         }
         if network_delta_metadata is not None:
             metadata["network_delta"] = network_delta_metadata
+        if reusable_handoff_count:
+            metadata["reusable_handoff_count"] = reusable_handoff_count
+            metadata["recon_recall_status"] = "available_not_loaded"
+            content += (
+                "\nDurable reconnaissance exists for this target but was not loaded before "
+                "opening the page. You may call browser_recall_reconnaissance to reuse or "
+                "narrow it; this advisory does not block fresh reconnaissance."
+            )
         exchange_loader = getattr(session, "api_exchange_events", None)
         api_exchanges = exchange_loader() if callable(exchange_loader) else ()
         probe_exchange_ready = any(

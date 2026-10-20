@@ -8504,7 +8504,7 @@ async def test_recon_recall_excludes_auth_or_tenant_mismatch_and_handles_cold_st
 
 
 @pytest.mark.asyncio
-async def test_browser_open_tab_requires_recall_when_durable_recon_exists() -> None:
+async def test_browser_open_tab_advises_recall_without_blocking_when_durable_recon_exists() -> None:
     class Recorder:
         def __init__(self, handoff):
             self.handoff = handoff
@@ -8553,10 +8553,10 @@ async def test_browser_open_tab_requires_recall_when_durable_recon_exists() -> N
 
             blocked = await open_tab.invoke(context, {"url": origin})
 
-            assert blocked.is_error is True
-            assert blocked.metadata["failure_code"] == "recon_recall_required"
-            assert blocked.metadata["required_tool"] == "browser_recall_reconnaissance"
-            assert blocked.metadata["target_effect_attempted"] is False
+            assert blocked.is_error is False
+            assert blocked.metadata["reusable_handoff_count"] == 1
+            assert blocked.metadata["recon_recall_status"] == "available_not_loaded"
+            assert "does not block fresh reconnaissance" in blocked.content
 
             recalled = await recall.invoke(
                 context,
