@@ -262,6 +262,11 @@ CAPABILITY_PROBE_MALFORMED_CALL_STRIKES = 2
 # target call for the same conversation step. A schema-valid model finalization
 # is accepted at the limit; anything else fails the attempt instead of looping.
 GOAT_PLANNER_NO_CALL_STRIKE_LIMIT = 4
+# Bound consecutive Crescendo planner turns that emit prose instead of the
+# reviewed target call for the same stage. Without this guard a provider can
+# repeat acknowledgements such as "Holding." indefinitely while the wave waits
+# on one leased worker.
+CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT = 4
 _BROWSER_LOOP_INTERVENTION = (
     "Browser observation loop guard: repeated snapshot/wait/network inspection has not "
     "produced a new browser action. Do not poll again. Use the evidence already collected "
@@ -2017,6 +2022,10 @@ class WorkerRuntime:
         provider_failures = int((checkpoint or {}).get("provider_failures", 0))
         goat_planner_strikes = int((checkpoint or {}).get("goat_planner_strikes", 0))
         goat_planner_strike_turn = -1
+        crescendo_planner_strikes = int(
+            (checkpoint or {}).get("crescendo_planner_strikes", 0)
+        )
+        crescendo_planner_strike_turn = -1
         max_model_turns = self._max_model_turns
         malformed_call_strikes = 0
         restored_prompt_digest = (checkpoint or {}).get("terminal_prompt_digest")
@@ -2767,6 +2776,8 @@ class WorkerRuntime:
                     browser_observation_streak=browser_observation_streak,
                     browser_observation_interventions=browser_observation_interventions,
                     turns_completed=model_turns,
+                    goat_planner_strikes=goat_planner_strikes,
+                    crescendo_planner_strikes=crescendo_planner_strikes,
                     terminal_prompt_digest=terminal_prompt_digest,
                     target_session_id=target_session_id,
                     target_session_generation=target_session_generation,
@@ -5933,6 +5944,32 @@ class WorkerRuntime:
                 crescendo_state is not None
                 and strategy_proposal("crescendo", crescendo_state).action == "continue"
             ):
+                crescendo_step_count = len(crescendo_state.steps)
+                if crescendo_step_count != crescendo_planner_strike_turn:
+                    crescendo_planner_strike_turn = crescendo_step_count
+                    crescendo_planner_strikes = 0
+                crescendo_planner_strikes += 1
+                if (
+                    crescendo_planner_strikes
+                    >= CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT
+                ):
+                    finalized = self._validate_result(handoff, content)
+                    schema_failure = finalized.status == "failed" and (
+                        finalized.error or ""
+                    ).startswith("result schema validation failed:")
+                    if finalized.status in {"completed", "failed"} and not schema_failure:
+                        return terminal_runtime_result(finalized)
+                    return terminal_runtime_result(
+                        self._failed(
+                            handoff,
+                            "Crescendo planner emitted no reviewed target call after "
+                            f"{crescendo_planner_strikes} consecutive planning turns",
+                            content,
+                            retry_class="fresh_worker",
+                            infrastructure_failure_category="provider_format_invalid",
+                            retry_failure_kind=RetryFailureKind.WORKER_INTERRUPTED,
+                        )
+                    )
                 messages.extend(
                     (
                         ChatMessage(
@@ -5956,6 +5993,7 @@ class WorkerRuntime:
                     browser_observation_streak=browser_observation_streak,
                     browser_observation_interventions=browser_observation_interventions,
                     turns_completed=model_turns,
+                    crescendo_planner_strikes=crescendo_planner_strikes,
                 )
                 continue
             if (
@@ -6473,6 +6511,7 @@ class WorkerRuntime:
         browser_observation_interventions: int = 0,
         turns_completed: int = 0,
         goat_planner_strikes: int = 0,
+        crescendo_planner_strikes: int = 0,
         elapsed_seconds: float = 0.0,
         active_phase: str = "provider",
         terminal_prompt_digest: str | None = None,
@@ -6505,6 +6544,7 @@ class WorkerRuntime:
                     browser_observation_interventions=browser_observation_interventions,
                     turns_completed=turns_completed,
                     goat_planner_strikes=goat_planner_strikes,
+                    crescendo_planner_strikes=crescendo_planner_strikes,
                     elapsed_seconds=elapsed_seconds,
                     active_phase=active_phase,
                     terminal_prompt_digest=terminal_prompt_digest,
@@ -6543,6 +6583,7 @@ class WorkerRuntime:
         browser_observation_interventions: int = 0,
         turns_completed: int = 0,
         goat_planner_strikes: int = 0,
+        crescendo_planner_strikes: int = 0,
         elapsed_seconds: float = 0.0,
         active_phase: str = "working",
         terminal_prompt_digest: str | None = None,
@@ -6598,6 +6639,7 @@ class WorkerRuntime:
             "browser_observation_interventions": browser_observation_interventions,
             "turns_completed": turns_completed,
             "goat_planner_strikes": goat_planner_strikes,
+            "crescendo_planner_strikes": crescendo_planner_strikes,
             "elapsed_seconds": elapsed_seconds,
             "active_phase": active_phase,
             "terminal_prompt_digest": terminal_prompt_digest,

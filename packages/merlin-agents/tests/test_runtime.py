@@ -45,6 +45,7 @@ from merlin_agents.goat import (
 from merlin_agents.hydra_select import HydraSelectState
 from merlin_agents.runtime import (
     CAPABILITY_PROBE_MALFORMED_CALL_STRIKES,
+    CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT,
     GOAT_PLANNER_NO_CALL_STRIKE_LIMIT,
     _controller_target_tool,
     _goat_contract,
@@ -7986,6 +7987,41 @@ async def test_crescendo_truncation_stays_in_active_strategy_protocol() -> None:
     assert result.status == "completed", result.error
     assert provider.requests[1].tools
     assert tools.calls == ["browser_chat_exchange"]
+
+
+async def test_crescendo_prose_only_planner_loop_is_bounded_and_checkpointed() -> None:
+    provider = Provider(
+        [
+            [TextDelta(text="Holding."), ModelCompleted(finish_reason="stop")]
+            for _ in range(CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT)
+        ]
+    )
+    tools = BrowserGoatTargetTools()
+    checkpoints: list[Mapping[str, object]] = []
+
+    async def save(checkpoint, _consumed_ids):
+        checkpoints.append(checkpoint)
+
+    result = await WorkerRuntime(provider, tools, checkpoint_writer=save).run(
+        browser_crescendo_handoff()
+    )
+
+    assert result.status == "failed"
+    assert result.error == (
+        "Crescendo planner emitted no reviewed target call after "
+        f"{CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT} consecutive planning turns"
+    )
+    assert result.retry_class == "fresh_worker"
+    assert tools.calls == []
+    assert len(provider.requests) == CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT
+    assert any(
+        checkpoint["crescendo_planner_strikes"]
+        == CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT - 1
+        for checkpoint in checkpoints
+    )
+    assert result.checkpoint["crescendo_planner_strikes"] == (
+        CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT
+    )
 
 
 async def test_hydra_select_browser_run_executes_daemon_selection_via_browser_exchange() -> None:
