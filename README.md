@@ -84,9 +84,12 @@ To produce the standalone macOS bundle, run:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.0-darwin-arm64
+cd target/releases/merlin-0.2.1-darwin-arm64
 ./merlin
 ```
+
+To increment the workspace version and build the corresponding release in one command, use
+`make release-patch`, `make release-minor`, or `make release-major`.
 
 The bundle includes its own Python, PostgreSQL, and browser runtimes. Its first launch installs
 Merlin for the current user and opens the same guided setup when needed.
