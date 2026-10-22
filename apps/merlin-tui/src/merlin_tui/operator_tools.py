@@ -111,8 +111,6 @@ def _operator_campaign_request(
 
     proposed = str(proposed_objective or "").strip()
     target_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(proposed)}
-    if not target_urls:
-        return None
     for message in reversed(messages):
         if message.role != "user":
             continue
@@ -120,7 +118,7 @@ def _operator_campaign_request(
         if content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
         authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
-        if target_urls & authored_urls:
+        if (target_urls & authored_urls) or (not target_urls and len(authored_urls) == 1):
             return content
     return None
 

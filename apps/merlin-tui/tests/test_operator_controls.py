@@ -163,6 +163,28 @@ async def test_new_campaign_preserves_operator_objective_and_rejects_inferred_pr
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_restores_operator_url_when_model_omits_it():
+    exact = "Run a redpen scan on https://break-room.ai, Bank L1"
+    history = [ChatMessage(role="user", content=exact)]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": "Assess Bank L1",
+            "campaign_profile": "exploration",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
 async def test_new_campaign_honors_operator_named_profile():
     exact = "Use the exhaustive campaign profile for https://target.test."
     history = [ChatMessage(role="user", content=exact)]

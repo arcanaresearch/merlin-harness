@@ -60,6 +60,25 @@ class TargetStore:
         return self.targets.get(target_id)
 
 
+@pytest.mark.asyncio
+async def test_targets_add_accepts_and_selects_a_single_url():
+    store = TargetStore()
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=store,
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.test/v1", "", "test"),
+        target_factory=SimpleNamespace(),
+    )
+
+    added = await service.add_target(("https://break-room.ai",))
+
+    assert added["base_url"] == "https://break-room.ai/"
+    assert added["model"] == "web-chat"
+    assert added["selected"] is True
+    assert service.selected_target_id == added["id"]
+
+
 async def test_http_objective_prepares_campaign_and_operates_local_browser():
     requests = []
 

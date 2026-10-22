@@ -212,8 +212,15 @@ class AssessmentService:
         return [run.model_dump(mode="json") for run in await self._store.list_runs(session_id)]
 
     async def add_target(self, arguments: Sequence[str]) -> Mapping[str, Any]:
+        if len(arguments) == 1:
+            profile = _target_from_objective(arguments[0])
+            if profile is None:
+                raise ValueError("usage: /targets add URL | ID TITLE BASE_URL MODEL")
+            saved = await self._store.save_target(profile)
+            self._selected_target_id = saved.id
+            return saved.model_dump(mode="json") | {"selected": True}
         if len(arguments) != 4:
-            raise ValueError("usage: /targets add ID TITLE BASE_URL MODEL")
+            raise ValueError("usage: /targets add URL | ID TITLE BASE_URL MODEL")
         profile = TargetProfile(
             id=arguments[0], title=arguments[1], base_url=arguments[2], model=arguments[3]
         )
