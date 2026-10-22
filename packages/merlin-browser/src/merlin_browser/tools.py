@@ -467,7 +467,7 @@ class BrowserTool:
             else None
         )
         requested_url = _string(arguments.get("url"))
-        if (
+        recalled_surface_mismatch = (
             kind in {"open_tab", "navigate"}
             and recalled_surface is not None
             and urlsplit(recalled_surface).scheme.casefold() in {"http", "https"}
@@ -480,22 +480,7 @@ class BrowserTool:
                 urlsplit(recalled_surface).scheme.casefold(),
                 urlsplit(recalled_surface).netloc.casefold(),
             )
-        ):
-            return ToolResult(
-                content=(
-                    "durable reconnaissance recall restricts navigation to the requested "
-                    "target origin; reuse recalled site facts and inspect only fresh "
-                    "target-authored state/network evidence from that origin"
-                ),
-                is_error=True,
-                metadata={
-                    "effect": self.effect,
-                    "failure_code": "recon_entry_surface_required",
-                    "requested_surface": recalled_surface,
-                    "target_effect_attempted": False,
-                    "target_call_budget_charge": 0,
-                },
-            )
+        )
         action_value = _string(arguments.get("url", arguments.get("value")))
         evidence_refs = ["browser-action:sha256:" + uuid4().hex + uuid4().hex]
         if kind == "fill" and arguments.get("connection_probe") is True:
@@ -929,6 +914,14 @@ class BrowserTool:
                 "\nDurable reconnaissance exists for this target but was not loaded before "
                 "opening the page. You may call browser_recall_reconnaissance to reuse or "
                 "narrow it; this advisory does not block fresh reconnaissance."
+            )
+        if recalled_surface_mismatch:
+            metadata["recalled_surface"] = recalled_surface
+            metadata["recon_recall_status"] = "surface_mismatch_advisory"
+            content += (
+                "\nThe recalled entry surface differs from this navigation, but the requested "
+                "URL passed the target's authoritative origin bounds. Treat the mismatch as "
+                "advisory evidence and continue with fresh target-authored observations."
             )
         exchange_loader = getattr(session, "api_exchange_events", None)
         api_exchanges = exchange_loader() if callable(exchange_loader) else ()

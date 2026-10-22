@@ -8045,6 +8045,51 @@ async def test_recon_recall_allows_requested_path_on_recalled_origin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recon_recall_surface_mismatch_is_advisory_within_target_bounds() -> None:
+    class Recorder:
+        async def list_handoffs(self, _target_id, limit=20):
+            return ()
+
+        async def append_action(self, _action):
+            return None
+
+        async def record_evidence(self, *_args):
+            return None
+
+        async def append_observation(self, _observation):
+            return None
+
+        async def save_metadata(self, _metadata):
+            return None
+
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            actions = browser_tools(lambda _: session, Recorder())
+            recall = next(
+                item
+                for item in actions
+                if item.describe().name == "browser_recall_reconnaissance"
+            )
+            opened = next(
+                item for item in actions if item.describe().name == "browser_open_tab"
+            )
+            context = ToolContext(session_id="s1", workspace_root="/tmp")
+
+            await recall.invoke(
+                context,
+                {"surface": "https://stale.example/the-bank/chat", "agent_or_bot": "bank-l1"},
+            )
+            result = await opened.invoke(context, {"url": f"{origin}/the-bank/chat"})
+
+            assert result.is_error is False
+            assert result.metadata["recon_recall_status"] == "surface_mismatch_advisory"
+            assert result.metadata["recalled_surface"] == "https://stale.example/the-bank/chat"
+            assert "passed the target's authoritative origin bounds" in result.content
+
+
+@pytest.mark.asyncio
 async def test_recon_recall_does_not_reuse_legacy_passive_session_adapter() -> None:
     class Recorder:
         def __init__(self, handoff):
