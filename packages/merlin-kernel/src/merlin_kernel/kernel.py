@@ -855,6 +855,7 @@ class Kernel:
 
             async def handle_preferred_tool_miss(tool_name: str) -> str:
                 nonlocal preferred_tool_follow_through_failures
+                nonlocal preferred_next_tool_name
                 nonlocal repair_messages
                 await self._emit(
                     self._event(
@@ -894,6 +895,10 @@ class Kernel:
                         )
                     ]
                     return "retry"
+                if preferred_next_tool_mode == "after_one_admitted_action":
+                    preferred_next_tool_name = None
+                    preferred_tool_follow_through_failures = 0
+                    return "released"
                 await self._emit(
                     self._event(
                         "error",
@@ -1593,6 +1598,10 @@ class Kernel:
                             assistant = ""
                             reasoning = ""
                             continue
+                        if disposition == "released":
+                            assistant = ""
+                            reasoning = ""
+                            continue
                         return
                     if (
                         request_preferred_tool_name == _OWNED_SESSION_CLEANUP_TOOL
@@ -1691,6 +1700,10 @@ class Kernel:
                     ):
                         disposition = await handle_preferred_tool_miss(request_preferred_tool_name)
                         if disposition == "retry":
+                            assistant = ""
+                            reasoning = ""
+                            continue
+                        if disposition == "released":
                             assistant = ""
                             reasoning = ""
                             continue
