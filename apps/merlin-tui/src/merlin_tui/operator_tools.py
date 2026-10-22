@@ -126,6 +126,28 @@ def _operator_campaign_request(
 def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> str | None:
     """Return a profile only when operator-authored text explicitly selects it."""
 
+    for message in reversed(messages):
+        if message.role != "user" or not message.content.startswith(
+            "MERLIN_USER_INPUT_RESPONSE\n"
+        ):
+            continue
+        try:
+            response = json.loads(message.content.split("\n", 1)[1])
+        except (ValueError, TypeError, IndexError):
+            continue
+        answers = response.get("answers", {}) if isinstance(response, Mapping) else {}
+        if not isinstance(answers, Mapping):
+            continue
+        for answer_id, answer in answers.items():
+            if "profile" not in str(answer_id).casefold() or not isinstance(answer, Mapping):
+                continue
+            option_ids = answer.get("option_ids", ())
+            if not isinstance(option_ids, Sequence) or isinstance(option_ids, (str, bytes)):
+                continue
+            selected = [str(value).casefold() for value in option_ids if str(value) in PROFILES]
+            if len(selected) == 1:
+                return selected[0]
+
     values = [objective]
     values.extend(message.content for message in messages if message.role == "user")
     for value in reversed(values):

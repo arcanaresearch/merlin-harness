@@ -207,6 +207,41 @@ async def test_new_campaign_honors_operator_named_profile():
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_honors_structured_operator_profile_selection():
+    exact = "Run a redpen scan on https://break-room.ai, the bank L1"
+    response = {
+        "request_id": "profile-choice",
+        "answers": {
+            "profile": {"option_ids": ["exploration"], "text": ""},
+            "composition": {"option_ids": ["autonomous"], "text": ""},
+        },
+    }
+    history = [
+        ChatMessage(role="user", content=exact),
+        ChatMessage(
+            role="user",
+            content="MERLIN_USER_INPUT_RESPONSE\n" + json.dumps(response),
+        ),
+    ]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": "Assess Bank L1",
+            "campaign_profile": "exploration",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "exploration",
+    }
+
+
+@pytest.mark.asyncio
 async def test_campaign_setting_update_does_not_restart_reconnaissance():
     history = [
         saved(
