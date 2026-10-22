@@ -1,6 +1,6 @@
 [project]
 name = "merlin-assessments"
-version = "0.2.3"
+version = "0.2.4"
 description = "Bounded AI-target assessment orchestration for Merlin"
 requires-python = ">=3.13"
 dependencies = [
