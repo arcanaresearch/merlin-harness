@@ -185,6 +185,7 @@ class CampaignView:
     stop_reason: str = ""
     target_progress: Mapping[str, object] | None = None
     review_progress: Mapping[str, object] | None = None
+    saturation_decision: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

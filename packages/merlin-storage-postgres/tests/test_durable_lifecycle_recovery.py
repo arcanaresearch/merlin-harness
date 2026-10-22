@@ -123,6 +123,88 @@ def test_active_api_session_is_not_an_unfinished_cleanup_obligation(
             assert recovery["status"] == "prepared"
 
 
+def test_restart_releases_target_execution_lease_for_terminal_scheduler_attempt(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-orphaned-target-lease")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaigns, campaign_id = _prepare_campaign(connection, "orphaned-target-lease")
+            campaign = campaigns.get(campaign_id)
+            assert campaign is not None
+            schedule_id = uuid5(NAMESPACE_URL, "orphaned-target-lease/schedule")
+            attempt_id = uuid5(NAMESPACE_URL, "orphaned-target-lease/attempt")
+            node_id = f"worker:{campaign_id}/adversarial-explorer/candidate"
+            session_scope_id = f"{node_id.removeprefix('worker:')}/attempt/{attempt_id}"
+            connection.execute(
+                """INSERT INTO merlin_storage.scheduler_schedules
+                       (id, session_id, graph, graph_digest, checkpoint,
+                        checkpoint_digest, last_event_digest, status)
+                   VALUES (%s, %s, '{}'::jsonb, %s, '{}'::jsonb,
+                           %s, %s, 'paused')""",
+                (
+                    schedule_id,
+                    campaign["session_id"],
+                    "1" * 64,
+                    "2" * 64,
+                    "3" * 64,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO merlin_storage.scheduler_nodes
+                       (schedule_id, node_id, state, lease_generation, attempts_started)
+                   VALUES (%s, %s, 'ready', 1, 1)""",
+                (schedule_id, node_id),
+            )
+            connection.execute(
+                """INSERT INTO merlin_storage.scheduler_attempts
+                       (id, schedule_id, node_id, generation, owner, state,
+                        lease_expires_at, heartbeat_at, completed_at, error)
+                   VALUES (%s, %s, %s, 1, %s, 'expired',
+                           now() - interval '1 second', now() - interval '1 second',
+                           now(), 'clean pause: operator-campaign-pause')""",
+                (attempt_id, schedule_id, node_id, node_id.removeprefix("worker:")),
+            )
+            sessions = CampaignApiSessionRepository(connection)
+            sessions.create(
+                campaign_id,
+                "target.example",
+                "sha256:adapter",
+                session_scope_id=session_scope_id,
+            )
+            claim_id = sessions.claim_target_execution(
+                campaign_id,
+                target_id="target.example",
+                session_scope_id=session_scope_id,
+                claimant_id="target-execution:interrupted",
+                lease_seconds=480,
+            )
+            assert claim_id is not None
+            envelope = _scope(campaign_id, "orphaned-target-lease").model_copy(
+                update={"attempt_id": session_scope_id}
+            )
+            sessions.create_state_scope(campaign_id, "target.example", envelope)
+            state_claim_id = sessions.claim_state_scope_lease(
+                envelope.scope_id,
+                target_authority="target.example",
+                principal_key="anonymous",
+                equivalence_key="conservative-shared-state",
+                claimant_id="target-execution:interrupted",
+                lease_seconds=480,
+            )
+            assert state_claim_id is not None
+
+            report = _reconcile(sessions, "daemon/restarted")
+
+            assert report["expired_global_leases"] == 2
+            assert not sessions.validate_target_execution(
+                claim_id, "target-execution:interrupted"
+            )
+            assert not sessions.validate_state_scope_lease(
+                state_claim_id, "target-execution:interrupted"
+            )
+
+
 def test_restart_settles_acknowledged_effect_once_after_lease_takeover(
     tmp_path: Path,
 ) -> None:

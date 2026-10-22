@@ -4121,6 +4121,8 @@ class MerlinApp(App[None]):
         self._pending_profile_answer = ""
         self._pending_campaign_review: tuple[str, str] | None = None
         self._active_saturation_request: str | None = None
+        self._handled_saturation_requests: set[tuple[str, str]] = set()
+        self._saturation_poll_lock = asyncio.Lock()
         self._known_report_revisions: set[tuple[str, str]] | None = None
         self._pending_report_notifications: dict[tuple[str, str], ReportView] = {}
         self._announced_terminal_campaigns: set[tuple[str, str]] = set()
@@ -5531,26 +5533,36 @@ class MerlinApp(App[None]):
             )
 
     async def _poll_saturation_decisions(self) -> None:
-        if self._unmounting or self._active_saturation_request is not None:
+        if (
+            self._unmounting
+            or self._active_saturation_request is not None
+            or self._saturation_poll_lock.locked()
+        ):
             return
-        try:
-            campaigns = _campaigns_for_session(
-                await self.backend.list_campaigns(), self._active_session_id
-            )
-            for campaign in campaigns:
-                if campaign.status != "executing":
-                    continue
-                status = await self.backend.campaign_status(campaign.id)
-                if not isinstance(status, Mapping):
-                    continue
-                decision = status.get("saturation_decision")
-                if isinstance(decision, Mapping) and decision.get("state") == "awaiting_operator":
-                    self._offer_saturation_choice(campaign.id, status, decision)
+        async with self._saturation_poll_lock:
+            try:
+                campaigns = _campaigns_for_session(
+                    await self.backend.list_campaigns(), self._active_session_id
+                )
+                for campaign in campaigns:
+                    if campaign.status != "executing":
+                        continue
+                    decision = campaign.saturation_decision
+                    if not (
+                        isinstance(decision, Mapping)
+                        and decision.get("state") == "awaiting_operator"
+                    ):
+                        continue
+                    self._offer_saturation_choice(
+                        campaign.id,
+                        {"status": campaign.status, "saturation": {}},
+                        decision,
+                    )
                     return
-        except Exception:
-            # Status remains available through /campaign status; transient reconnects
-            # must not create transcript noise or duplicate prompts.
-            return
+            except Exception:
+                # Status remains available through /campaign status; transient reconnects
+                # must not create transcript noise or duplicate prompts.
+                return
 
     async def _poll_completed_reports(self) -> None:
         """Present each newly completed durable report exactly once."""
@@ -5662,6 +5674,22 @@ class MerlinApp(App[None]):
             session_campaigns = _campaigns_for_session(campaigns, self._active_session_id)
             self._last_swarm_campaigns = (self._active_session_id, session_campaigns)
             self._update_target_progress(session_campaigns)
+            for campaign in session_campaigns:
+                decision = campaign.saturation_decision
+                if campaign.status == "executing" and (
+                    isinstance(decision, Mapping)
+                    and decision.get("state") == "awaiting_operator"
+                ):
+                    # The live refresh already owns an authoritative lightweight
+                    # campaign snapshot. Surface its pending checkpoint here as
+                    # well as in the independent decision poll so a slow or
+                    # interrupted poll cannot strand an executing campaign.
+                    self._offer_saturation_choice(
+                        campaign.id,
+                        {"status": campaign.status, "saturation": {}},
+                        decision,
+                    )
+                    break
             active_campaigns = tuple(
                 campaign
                 for campaign in _current_campaigns(session_campaigns)
@@ -5846,13 +5874,18 @@ class MerlinApp(App[None]):
         decision: Mapping[str, object],
     ) -> None:
         request_id = str(decision.get("request_id", ""))
-        if not request_id or self._active_saturation_request is not None:
+        request_key = (campaign_id, request_id)
+        if (
+            not request_id
+            or request_key in self._handled_saturation_requests
+            or self._active_saturation_request is not None
+        ):
             return
         self._active_saturation_request = request_id
         incomplete = decision.get("purpose") == "coverage_extension"
         self.push_screen(
             ChoiceScreen(
-                _render_saturation_choice_summary(campaign_id, status),
+                _render_saturation_choice_summary(campaign_id, status, request_id=request_id),
                 (
                     (
                         "Stop with incomplete coverage and generate report"
@@ -5872,22 +5905,33 @@ class MerlinApp(App[None]):
         )
 
     def _saturation_choice(self, campaign_id: str, choice: str | None) -> None:
-        self._active_saturation_request = None
+        request_id = self._active_saturation_request
         if choice in {
             "Stop and generate report",
             "Stop with incomplete coverage and generate report",
         }:
-            self._spawn(self._decide_campaign_saturation(campaign_id, "stop"))
+            self._spawn(
+                self._decide_campaign_saturation(
+                    campaign_id, "stop", request_id=request_id
+                )
+            )
         elif choice in {
             "Continue exhaustive assessment",
             "Replan missing coverage and continue",
         }:
-            self._spawn(self._decide_campaign_saturation(campaign_id, "continue"))
+            self._spawn(
+                self._decide_campaign_saturation(
+                    campaign_id, "continue", request_id=request_id
+                )
+            )
         elif choice == "Continue with a limit…":
+            self._active_saturation_request = None
             composer = self.query_one("#composer", Composer)
             composer.text = f"/campaign saturation {campaign_id} limit "
             composer.focus()
             self.notify("Enter the maximum number of additional waves, then press Enter")
+        else:
+            self._active_saturation_request = None
 
     async def _decide_campaign_saturation(
         self,
@@ -5895,9 +5939,12 @@ class MerlinApp(App[None]):
         decision: str,
         *,
         additional_waves: int | None = None,
+        request_id: str | None = None,
     ) -> None:
         try:
             await self.backend.decide_campaign_saturation(campaign_id, decision, additional_waves)
+            if request_id:
+                self._handled_saturation_requests.add((campaign_id, request_id))
             self.query_one("#transcript", RichLog).write(
                 f"[green]✓ Exhaustive campaign decision recorded: {decision}[/]"
             )
@@ -5905,6 +5952,8 @@ class MerlinApp(App[None]):
             self.query_one("#transcript", RichLog).write(
                 _transcript_text("✕ Campaign decision failed: ", exc, "bold red")
             )
+        finally:
+            self._active_saturation_request = None
 
     async def _cancel_campaign(self, campaign_id: str) -> None:
         try:
@@ -6508,6 +6557,10 @@ class MerlinApp(App[None]):
                 qualifiers.append(f"Target: {_permission_single_line(scope.target)}")
             if scope.operation_group:
                 qualifiers.append(f"Scope: {_permission_single_line(scope.operation_group)}")
+            self.query_one("#permission-title", Static).update(
+                f"Effect: {request.effect.value} · "
+                f"Tool: {_permission_single_line(scope.tool_name)} · Permission required"
+            )
             self.query_one("#permission-scope", Static).update(
                 f"Effect: {request.effect.value} · "
                 f"Tool: {_permission_single_line(scope.tool_name)}\n"
@@ -7494,6 +7547,11 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
         title = "Scan complete"
     rendered = Text()
     rendered.append(f"{title} — {_short_activity(campaign.objective, 100)}\n", style="bold cyan")
+    if report is not None:
+        # Keep the durable completion signal in the always-visible inline
+        # summary. Transcript notifications can be obscured by a concurrently
+        # opened report screen even though the export is already available.
+        rendered.append("Campaign report ready\n", style="bold green")
     rendered.append(f"Campaign: {campaign.id}\n", style="dim")
     if report is None:
         state = _campaign_display_status(campaign.status)
@@ -8472,26 +8530,62 @@ def _render_campaign_status(status: object) -> str:
     return "\n".join(lines)
 
 
-def _render_saturation_choice_summary(campaign_id: str, status: Mapping[str, object]) -> str:
+def _render_saturation_choice_summary(
+    campaign_id: str,
+    status: Mapping[str, object],
+    *,
+    request_id: str = "",
+) -> str:
     """Keep the operator decision and every choice visible in a small terminal."""
     saturation = status.get("saturation")
     if not isinstance(saturation, Mapping):
         saturation = {}
+    attempted = saturation.get("attempted_techniques")
+    admitted = saturation.get("admitted_techniques")
+    technique_summary = (
+        "Techniques: "
+        f"{attempted}/{admitted} attempted · "
+        f"{saturation.get('untested_techniques', 0)} untested · "
+        f"{saturation.get('catalogue_cells_unclear', 0)} inconclusive"
+        if isinstance(attempted, int) and isinstance(admitted, int)
+        else "Remaining coverage: "
+        f"{saturation.get('untested_techniques', 0)} untested techniques · "
+        f"{len(saturation.get('catalogue_unresolved_cell_ids', ()))} inconclusive cells"
+    )
     return "\n".join(
         (
             "Campaign needs an operator decision",
             f"{campaign_id} · {status.get('status', 'unknown')}",
-            "Techniques: "
-            f"{saturation.get('attempted_techniques', 0)}/"
-            f"{saturation.get('admitted_techniques', 0)} attempted · "
-            f"{saturation.get('untested_techniques', 0)} untested · "
-            f"{saturation.get('catalogue_cells_unclear', 0)} inconclusive",
+            f"Decision checkpoint: {request_id}",
+            technique_summary,
             "Exploratory hypotheses: "
             f"{saturation.get('hypothesis_cells_attempted', 0)}/"
             f"{saturation.get('hypothesis_cells_required', 0)} attempted",
             f"Full details: /campaign status {campaign_id}",
         )
     )
+
+
+def _pending_saturation_decision(
+    lead_rows: tuple[Mapping[str, object], ...],
+) -> Mapping[str, object] | None:
+    """Return the newest unresolved operator decision from the compact Lead journal."""
+    decided: set[str] = set()
+    for row in reversed(lead_rows):
+        payload = row.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            continue
+        if payload.get("kind") == "saturation_decision":
+            decided.add(request_id)
+        elif (
+            payload.get("kind") == "saturation_decision_required"
+            and request_id not in decided
+        ):
+            return payload
+    return None
 
 
 def _format_duration(value: object) -> str:

@@ -9281,6 +9281,15 @@ def build_backend(
                 for witness in finding.witnesses
             )
             exchanges = []
+            exchange_id_counts: dict[str, int] = {}
+
+            def report_exchange_id(effect_call_id: str, row_id: object) -> str:
+                """Keep repeated exchanges from one effect distinct and stable."""
+                base = f"{effect_call_id}:{row_id}"
+                occurrence = exchange_id_counts.get(base, 0)
+                exchange_id_counts[base] = occurrence + 1
+                return base if occurrence == 0 else f"{base}:{occurrence}"
+
             goat_effect_ids = {
                 str(step.get("effect_id"))
                 for receipt in goat_receipts
@@ -9307,7 +9316,7 @@ def build_backend(
                             request = strategy_plan.get("response")
                     exchange = {
                         **dict(row),
-                        "id": f"{effect.call_id}:{row.get('id', ordinal)}",
+                        "id": report_exchange_id(effect.call_id, row.get("id", ordinal)),
                         "request": request,
                         "request_at": row.get("request_at")
                         or (effect.created_at.isoformat() if effect.created_at else None),
@@ -9341,7 +9350,7 @@ def build_backend(
                         continue
                     exchange = {
                         **dict(row),
-                        "id": f"{effect.call_id}:{row.get('id', ordinal)}",
+                        "id": report_exchange_id(effect.call_id, row.get("id", ordinal)),
                         "request_at": row.get("request_at")
                         or (effect.created_at.isoformat() if effect.created_at else None),
                         "response_at": row.get("response_at")
@@ -10018,6 +10027,7 @@ def build_backend(
         async def resolve_reviewed_adapter(
             session_id: str, adapter: Mapping[str, Any]
         ) -> Mapping[str, Any]:
+            revalidated_after_restart = False
             if not _has_durable_handoff(adapter):
                 candidate = _compile_current_reviewed_adapter_state(adapter)
                 handoff_id = str(adapter.get("recon_handoff_id") or "inline:reviewed-adapter")
@@ -10027,10 +10037,15 @@ def build_backend(
                 if handoff is None:
                     raise ValueError("reviewed reconnaissance handoff is unavailable")
                 if not _handoff_context_is_current(browser, handoff):
-                    raise ValueError(
-                        "the reviewed browser context restarted after this reconnaissance "
-                        "handoff was sealed; authenticate again and compile a new handoff"
+                    revalidated_after_restart = await _revalidate_handoff_cross_session(
+                        browser, session_id, handoff
                     )
+                    if not revalidated_after_restart:
+                        raise ValueError(
+                            "the reviewed browser context restarted after this reconnaissance "
+                            "handoff was sealed and its setup exchange could not be revalidated; "
+                            "authenticate again and compile a new handoff"
+                        )
                 if str(handoff.owner.session_id) != session_id:
                     if not await _revalidate_handoff_cross_session(browser, session_id, handoff):
                         raise ValueError(
@@ -10058,6 +10073,24 @@ def build_backend(
                     compiled_adapter=handoff.compiled_adapter,
                     compiled_digest=handoff.compiled_adapter_digest,
                 )
+            if revalidated_after_restart:
+                uncertainties = [
+                    dict(item)
+                    for item in candidate.get("evaluation_uncertainties", [])
+                    if isinstance(item, Mapping)
+                ]
+                uncertainties.append(
+                    {
+                        "kind": "handoff_revalidated_after_browser_restart",
+                        "reason": (
+                            "The isolated browser context restarted; Merlin replayed only the "
+                            "sealed non-interaction setup exchange in the current context and "
+                            "verified its expected status and captures before resuming."
+                        ),
+                        "confidence": 0.9,
+                    }
+                )
+                candidate["evaluation_uncertainties"] = uncertainties
             cleanup_discovery = _stateful_api_cleanup_discovery(candidate)
             if cleanup_discovery is not None:
                 # Advisory only: unproven session ownership or incomplete cleanup
@@ -10995,7 +11028,10 @@ def _require_terminal_report_status(
         CampaignTerminalReason.FRONTIER_EXHAUSTED.value: {"completed"},
         CampaignTerminalReason.BUDGET_EXHAUSTED.value: {"completed"},
         CampaignTerminalReason.TARGET_TERMINAL.value: {"completed"},
-        CampaignTerminalReason.OPERATOR_STOPPED.value: {"cancelled"},
+        # A coverage-boundary Stop closes a successfully reviewed campaign,
+        # while an explicit mid-run cancel uses the same terminal reason with
+        # cancelled lifecycle status. Both are canonical operator decisions.
+        CampaignTerminalReason.OPERATOR_STOPPED.value: {"completed", "cancelled"},
         CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value: {"failed"},
     }
     if status not in expected_statuses.get(stop_reason, set()):

@@ -468,6 +468,9 @@ async def test_pending_saturation_status_offers_numbered_keyboard_choices(
         assert "Campaign needs an operator decision" in str(
             app.screen.query_one("#dialog Label").render()
         )
+        assert "Decision checkpoint: request-1" in str(
+            app.screen.query_one("#dialog Label").render()
+        )
         assert all(
             button.region.bottom <= app.screen.size.height
             for button in app.screen.query("#dialog Button")
@@ -480,6 +483,173 @@ async def test_pending_saturation_status_offers_numbered_keyboard_choices(
             )
 
     assert backend.decisions == expected
+
+
+@pytest.mark.asyncio
+async def test_saturation_poller_uses_lightweight_campaign_projection() -> None:
+    class SaturatedBackend(DemoBackend):
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/pending",
+                    "session-demo",
+                    "Pending coverage decision",
+                    "recommended",
+                    "executing",
+                    "sha256:reviewed",
+                    saturation_decision={
+                        "state": "awaiting_operator",
+                        "request_id": "coverage-extension-1",
+                        "purpose": "coverage_extension",
+                    },
+                ),
+            )
+
+        async def campaign_status(self, campaign_id: str) -> object:
+            raise AssertionError("the saturation poller must not load full campaign status")
+
+        async def get_campaign_lead_log(self, campaign_id: str, limit: int = 100):
+            raise AssertionError("the saturation poller must not load the full Lead journal")
+
+    app = MerlinApp(SaturatedBackend())
+    async with app.run_test() as pilot:
+        await app._poll_saturation_decisions()  # noqa: SLF001
+        await pilot.pause()
+        assert "Campaign needs an operator decision" in str(
+            app.screen.query_one("#dialog Label").render()
+        )
+
+
+@pytest.mark.asyncio
+async def test_saturation_poller_does_not_reoffer_acknowledged_stale_request() -> None:
+    class StaleProjectionBackend(DemoBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decisions: list[tuple[str, str, int | None]] = []
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/pending",
+                    "session-demo",
+                    "Pending coverage decision",
+                    "recommended",
+                    "executing",
+                    "sha256:reviewed",
+                    saturation_decision={
+                        "state": "awaiting_operator",
+                        "request_id": "coverage-extension-1",
+                        "purpose": "coverage_extension",
+                    },
+                ),
+            )
+
+        async def decide_campaign_saturation(
+            self, campaign_id: str, decision: str, additional_waves: int | None = None
+        ) -> object:
+            self.decisions.append((campaign_id, decision, additional_waves))
+            return {"decision": decision}
+
+    backend = StaleProjectionBackend()
+    app = MerlinApp(backend)
+    async with app.run_test() as pilot:
+        await app._poll_saturation_decisions()  # noqa: SLF001
+        await pilot.pause()
+        await pilot.press("2")
+        await pilot.pause()
+        await app._poll_saturation_decisions()  # noqa: SLF001
+        await pilot.pause()
+        assert (  # noqa: SLF001
+            "campaign/pending",
+            "coverage-extension-1",
+        ) in app._handled_saturation_requests
+        assert app.screen is app.screen_stack[0]
+
+    assert backend.decisions == [("campaign/pending", "continue", None)]
+
+
+@pytest.mark.asyncio
+async def test_saturation_poller_reoffers_same_request_id_for_another_campaign() -> None:
+    class RepeatedRequestBackend(DemoBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.campaign_id = "campaign/one"
+            self.decisions: list[tuple[str, str, int | None]] = []
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    self.campaign_id,
+                    "session-demo",
+                    "Pending coverage decision",
+                    "recommended",
+                    "executing",
+                    "sha256:reviewed",
+                    saturation_decision={
+                        "state": "awaiting_operator",
+                        "request_id": "shared-request",
+                        "purpose": "coverage_extension",
+                    },
+                ),
+            )
+
+        async def decide_campaign_saturation(
+            self, campaign_id: str, decision: str, additional_waves: int | None = None
+        ) -> object:
+            self.decisions.append((campaign_id, decision, additional_waves))
+            return {"decision": decision}
+
+    backend = RepeatedRequestBackend()
+    app = MerlinApp(backend)
+    async with app.run_test() as pilot:
+        await app._poll_saturation_decisions()  # noqa: SLF001
+        await pilot.pause()
+        await pilot.press("2")
+        await pilot.pause()
+        backend.campaign_id = "campaign/two"
+        await app._poll_saturation_decisions()  # noqa: SLF001
+        await pilot.pause()
+        assert app.screen is not app.screen_stack[0]
+        await pilot.press("2")
+        await pilot.pause()
+
+    assert backend.decisions == [
+        ("campaign/one", "continue", None),
+        ("campaign/two", "continue", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_swarm_refresh_surfaces_pending_saturation_when_decision_poll_is_unavailable() -> None:
+    class SaturatedBackend(DemoBackend):
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/pending",
+                    "session-demo",
+                    "Pending coverage decision",
+                    "recommended",
+                    "executing",
+                    "sha256:reviewed",
+                    saturation_decision={
+                        "state": "awaiting_operator",
+                        "request_id": "coverage-extension-wave-96",
+                        "purpose": "coverage_extension",
+                    },
+                ),
+            )
+
+    class SwarmOnlyApp(MerlinApp):
+        async def _poll_saturation_decisions(self) -> None:
+            return
+
+    app = SwarmOnlyApp(SaturatedBackend())
+    async with app.run_test() as pilot:
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+        dialog = str(app.screen.query_one("#dialog Label").render())
+        assert "Campaign needs an operator decision" in dialog
+        assert "Decision checkpoint: coverage-extension-wave-96" in dialog
 
 
 @pytest.mark.asyncio
@@ -5326,6 +5496,7 @@ async def test_failed_campaign_replaces_running_swarm_even_when_worker_refresh_f
         text = "".join(line.text for line in live.lines)
         assert "Working" not in text
         assert "Scan failed — partial results retained" in text
+        assert "Campaign report ready" in text
         assert "Infrastructure retries exhausted" in text
         assert "/saved/assessment.html" in text
         assert not live.animating

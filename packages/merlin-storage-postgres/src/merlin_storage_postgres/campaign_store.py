@@ -1208,6 +1208,13 @@ class CampaignStore:
         counts = {state: 0 for state in ("dormant", "queued", "claimed", "scheduled", "terminal")}
         counts.update({str(row["state"]): int(row["count"]) for row in rows})
         counts["total"] = sum(counts.values())
+        eligible = self.connection.execute(
+            """SELECT count(*) AS count
+               FROM merlin_storage.campaign_frontier_candidates
+               WHERE campaign_id = %s AND state = 'queued' AND claim_generation < 3""",
+            (campaign_id,),
+        ).fetchone()
+        counts["retryable_below_cap"] = 0 if eligible is None else int(eligible["count"])
         return counts
 
     def load_active_frontier_batch(self, campaign_id: str) -> dict[str, Any] | None:
@@ -2941,7 +2948,7 @@ class CampaignStore:
             row = self.connection.execute(
                 """UPDATE merlin_storage.campaign_dynamic_specialists
                    SET state = 'retired', retired_wave = %s, retirement_reason = %s,
-                       record = %s, updated_at = now()
+                       record = record || %s, updated_at = now()
                    WHERE id = %s AND campaign_id = %s AND state = 'active'
                    RETURNING *""",
                 (

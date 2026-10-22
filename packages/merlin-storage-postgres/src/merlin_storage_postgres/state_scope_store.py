@@ -1283,11 +1283,35 @@ class StateScopeRepository:
                        WHERE expires_at <= now() RETURNING 1
                    ) SELECT count(*) AS count FROM expired"""
             ).fetchone()
+            orphaned_state = self.connection.execute(
+                """WITH orphaned AS (
+                       DELETE FROM merlin_storage.state_scope_leases AS lease
+                       USING merlin_storage.state_scopes AS scope,
+                             merlin_storage.scheduler_attempts AS attempt
+                       WHERE lease.scope_id = scope.id
+                         AND scope.attempt_id =
+                           regexp_replace(attempt.node_id, '^worker:', '')
+                           || '/attempt/' || attempt.id::text
+                         AND attempt.state <> 'running'
+                       RETURNING 1
+                   ) SELECT count(*) AS count FROM orphaned"""
+            ).fetchone()
             expired_target = self.connection.execute(
                 """WITH expired AS (
                        DELETE FROM merlin_storage.target_execution_leases
                        WHERE expires_at <= now() RETURNING 1
                    ) SELECT count(*) AS count FROM expired"""
+            ).fetchone()
+            orphaned_target = self.connection.execute(
+                """WITH orphaned AS (
+                       DELETE FROM merlin_storage.target_execution_leases AS lease
+                       USING merlin_storage.scheduler_attempts AS attempt
+                       WHERE lease.session_scope_id =
+                           regexp_replace(attempt.node_id, '^worker:', '')
+                           || '/attempt/' || attempt.id::text
+                         AND attempt.state <> 'running'
+                       RETURNING 1
+                   ) SELECT count(*) AS count FROM orphaned"""
             ).fetchone()
             due = self.connection.execute(
                 """SELECT target_authority, principal_key, resource_kind, window_key
@@ -1629,7 +1653,9 @@ class StateScopeRepository:
                     "value"
                 ],
                 "expired_global_leases": int(expired_state["count"] or 0)
-                + int(expired_target["count"] or 0),
+                + int(orphaned_state["count"] or 0)
+                + int(expired_target["count"] or 0)
+                + int(orphaned_target["count"] or 0),
                 "due_quota_wakes": due_wakes,
                 "campaigns": results,
             }

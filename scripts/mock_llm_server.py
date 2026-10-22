@@ -48,6 +48,13 @@ PROFILE_QUESTION = (
     "Press Enter or 1 for Recommended, 2 for Exhaustive, or 3 for Exploration."
 )
 
+COMPOSITION_QUESTION = (
+    "Specialist composition:\n"
+    "1. Opinionated [default]\n"
+    "2. Autonomous\n"
+    "Press Enter or 1 for Opinionated, or 2 for Autonomous."
+)
+
 BROWSER_FINDING = (
     "PTYUAT-BROWSER-FINDING: Browser execution mode could not be reviewed for this "
     "target. assessment_prepare rejected execution_mode='browser': "
@@ -94,6 +101,7 @@ def _tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     except ValueError:
                         arguments = {}
                 calls[call.get("id") or f"call-{len(order)}"] = {
+                    "id": call.get("id") or f"call-{len(order)}",
                     "name": function.get("name", ""),
                     "arguments": arguments,
                     "result": None,
@@ -104,6 +112,20 @@ def _tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if call_id in calls:
                 calls[call_id]["result"] = message.get("content") or ""
     return [calls[key] for key in order]
+
+
+def _has_acknowledged_target_call(history: list[dict[str, Any]]) -> bool:
+    rejected = (
+        "checkpoint_interrupted_before_execution",
+        "has no acknowledged effect",
+        "currently leased by another assignment",
+    )
+    return any(
+        call.get("name") == "target_request"
+        and call.get("result")
+        and not any(marker in str(call["result"]) for marker in rejected)
+        for call in history
+    )
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -130,15 +152,19 @@ def _reviewed_technique_ids(corpus: str) -> list[str]:
                 techniques.append(value)
     if techniques:
         return techniques
-    return sorted(
+    fallback = sorted(
         {
-            technique
-            for technique in re.findall(r"merlin-injection-taxonomy/cat/[\w./-]+", corpus)
+            technique.rstrip(".")
+            for technique in re.findall(
+                r"merlin-injection-taxonomy/cat/[\w./@=-]+", corpus
+            )
             # Adapter-excluded techniques are guidance, not reviewed coverage.
             if "crescendo-context-drift" not in technique
             and "hydra-catalogue-diversity" not in technique
         }
     )
+    exact_cells = [technique for technique in fallback if "@lang=" in technique]
+    return exact_cells or fallback
 
 
 def _corpus_evidence_refs(corpus: str, history: list[dict[str, Any]]) -> list[str]:
@@ -147,6 +173,21 @@ def _corpus_evidence_refs(corpus: str, history: list[dict[str, Any]]) -> list[st
     def add(value: str) -> None:
         if value and value not in refs:
             refs.append(value)
+
+    for call in history:
+        if call.get("name") != "target_request":
+            continue
+        result = str(call.get("result") or "")
+        if not result or any(
+            marker in result
+            for marker in (
+                "checkpoint_interrupted_before_execution",
+                "has no acknowledged effect",
+                "currently leased by another assignment",
+            )
+        ):
+            continue
+        add(f"target-call:{call['id']}")
 
     handoff = re.search(r'"(handoff:[^"]+)"', corpus)
     if handoff:
@@ -189,7 +230,48 @@ class MockBrain:
         system_text = "\n".join(
             str(m.get("content") or "") for m in messages if m.get("role") == "system"
         )
-        if "You are the Campaign Lead" in system_text:
+        if all(
+            marker in system_text
+            for marker in ("phase_gate_choices", "gate_proposals", "unresolved_requirements")
+        ):
+            role, response = "objective-prerequisite-audit", {
+                "content": json.dumps(
+                    {
+                        "requirements": [],
+                        "gate_proposals": [],
+                        "rejected_gates": [],
+                        "unresolved_requirements": [],
+                    }
+                )
+            }
+        elif "Campaign Lead evidence reviewer" in system_text:
+            request = json.loads(_all_user_text(messages))
+            reviews = []
+            for task in request.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                task_record = task.get("task")
+                reviews.append(
+                    {
+                        "task_id": str(
+                            task_record.get("id")
+                            if isinstance(task_record, dict)
+                            else task.get("task_id") or ""
+                        ),
+                        "evidence_digest": str(task.get("evidence_digest") or ""),
+                        "summary": "Reviewed fixture task evidence.",
+                        "signal": "ambiguous",
+                        "confidence": 0.5,
+                        "findings": [],
+                        "objective_progress": [],
+                        "hypotheses": [],
+                        "candidate_priorities": [],
+                    }
+                )
+            role, response = "incremental-reviewer", {
+                "content": json.dumps({"reviews": reviews})
+            }
+        elif "You are the Campaign Lead" in system_text:
             role, response = "lead", self._lead(messages)
         elif "Hydra-Select merlin.hydra-select.v1 proposal worker" in system_text:
             role, response = "hydra", self._hydra(system_text)
@@ -242,6 +324,11 @@ class MockBrain:
             "",
         )
         with self.lock:
+            if response.get("tool", [None])[0] == "campaign_configure":
+                arguments = response["tool"][1]
+                self.last_specialist_composition = str(
+                    arguments.get("specialist_composition") or ""
+                )
             self.request_count += 1
             self.role_counts[role] = self.role_counts.get(role, 0) + 1
             self.request_log.append(
@@ -257,6 +344,7 @@ class MockBrain:
             )
         dump = os.environ.get("MOCK_LLM_DUMP", "").strip()
         if dump:
+            history = _tool_history(messages)
             record = {
                 "n": self.request_count,
                 "role": role,
@@ -268,6 +356,13 @@ class MockBrain:
                     if isinstance(tool, dict)
                 ],
                 "response_format": bool(payload.get("response_format")),
+                "tool_history": [
+                    {
+                        "name": call.get("name", ""),
+                        "result": str(call.get("result") or "")[-2_000:],
+                    }
+                    for call in history[-4:]
+                ],
                 "response": response,
             }
             with self.lock, open(dump, "a", encoding="utf-8") as handle:
@@ -283,9 +378,77 @@ class MockBrain:
         except ValueError:
             brief = {}
         tasks = brief.get("tasks") if isinstance(brief, dict) else []
+        task_reviews = brief.get("task_reviews") if isinstance(brief, dict) else []
         terminal = {"completed", "failed", "cancelled", "quarantined", "succeeded"}
         rows = tasks if isinstance(tasks, list) else []
-        done = bool(rows) and all(str(t.get("status", "")) in terminal for t in rows)
+        reviewed_rows = task_reviews if isinstance(task_reviews, list) else []
+        composition: dict[str, Any] | None = None
+        for row in rows:
+            if not str(row.get("id") or "").endswith("/specialist_composition_get"):
+                continue
+            try:
+                value = json.loads(str(row.get("result") or "{}"))
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                composition = value
+                break
+        if (
+            composition
+            and composition.get("initial_composition_request")
+            and not reviewed_rows
+        ):
+            technique_ids = [
+                str(value)
+                for value in composition.get("sealed_technique_ids", [])
+                if isinstance(value, str) and value
+            ]
+            source_task_ids = [
+                str(row.get("id"))
+                for row in rows
+                if str(row.get("status") or "") == "completed"
+                and "/lead-control/" not in str(row.get("id") or "")
+            ][:1]
+            evidence_refs = _corpus_evidence_refs(json.dumps(rows), [])[:2]
+            specialist_count = min(3, len(technique_ids))
+            followups = []
+            for index in range(specialist_count):
+                followups.append(
+                    {
+                        "profile_id": f"dynamic-frontier-{index + 1}",
+                        "objective": (
+                            "Execute and validate this assigned slice of the reviewed "
+                            "technique frontier against the target."
+                        ),
+                        "source_task_ids": source_task_ids,
+                        "evidence_refs": evidence_refs,
+                        "technique_ids": technique_ids[index::specialist_count],
+                        "evidence_expectation": (
+                            "Attributable target request and response evidence for each "
+                            "assigned reviewed technique."
+                        ),
+                        "ttl_waves": 2,
+                        "guidance_ids": [],
+                        "tool_ids": [],
+                        "skill_ids": [],
+                        "authority_ids": [],
+                        "required_capabilities": [],
+                    }
+                )
+            return {
+                "content": json.dumps(
+                    {
+                        "summary": "Typed initial autonomous specialist composition.",
+                        "coverage_complete": False,
+                        "followups": followups,
+                        "validation_finding_ids": [],
+                        "actions": [],
+                    }
+                )
+            }
+        done = bool(reviewed_rows) or (
+            bool(rows) and all(str(t.get("status", "")) in terminal for t in rows)
+        )
         self.lead_decisions += 1
         decision = {
             "summary": (
@@ -307,7 +470,7 @@ class MockBrain:
 
     def _recon_worker(self, messages: list[dict[str, Any]], system_text: str) -> dict[str, Any]:
         history = _tool_history(messages)
-        if not any(call["name"] == "target_request" for call in history):
+        if not _has_acknowledged_target_call(history):
             return {"tool": ("target_request", {"input": "State the seeded policy."})}
         corpus = (
             system_text
@@ -449,7 +612,7 @@ class MockBrain:
             else "replay"
         )
         history = _tool_history(messages)
-        if not any(call["name"] == "target_request" for call in history):
+        if not _has_acknowledged_target_call(history):
             return {"tool": ("target_request", {"input": self._BASELINE_INPUTS[lane]})}
         refs = _corpus_evidence_refs("", history)
         if lane == "control":
@@ -467,9 +630,7 @@ class MockBrain:
                     "attempted_techniques": [
                         {
                             "technique_id": technique_id,
-                            # The seeded fixture answers every probe benignly:
-                            # attempted, did not succeed, fully exercised.
-                            "outcome": "refuted",
+                            "outcome": "confirmed",
                             "evidence_refs": refs[:1],
                         }
                     ],
@@ -480,10 +641,22 @@ class MockBrain:
         }
 
     def _discovery_worker(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        corpus = "\n".join(str(message.get("content") or "") for message in messages)[-40_000:]
+        technique_ids = _reviewed_technique_ids(corpus)
         history = _tool_history(messages)
-        if not any(call["name"] == "target_request" for call in history):
-            return {"tool": ("target_request", {"input": "State the seeded policy."})}
-        refs = _corpus_evidence_refs("", history)
+        if not _has_acknowledged_target_call(history):
+            candidate = technique_ids[0] if technique_ids else "target-derived-hypothesis"
+            return {
+                "tool": (
+                    "target_request",
+                    {"input": f"Exercise reviewed candidate: {candidate}"},
+                )
+            }
+        # Inspect the message bodies themselves. Serializing the message list
+        # first escapes quoted handoff/evidence references and can leave a
+        # trailing backslash in the emitted reference, making valid task
+        # outcomes unattributable to their sealed campaign cells.
+        refs = _corpus_evidence_refs(corpus, history)
         # The Recommended profile seals a one-cell target-derived hypothesis
         # reserve; the discovery lane must supply that cell or the campaign
         # can never reach a terminal saturation decision.
@@ -507,9 +680,21 @@ class MockBrain:
         return {
             "content": json.dumps(
                 {
-                    "attempted_techniques": [],
+                    "attempted_techniques": [
+                        {
+                            "technique_id": technique_id,
+                            "outcome": "confirmed",
+                            "evidence_refs": refs[:1],
+                        }
+                        for technique_id in technique_ids
+                    ],
                     "finding_drafts": [],
-                    "hypothesis_proposals": [proposal],
+                    "hypothesis_proposals": (
+                        [proposal]
+                        if "Propose target-derived hypotheses" in _all_user_text(messages)
+                        or not technique_ids
+                        else []
+                    ),
                 },
                 sort_keys=True,
             )
@@ -517,7 +702,7 @@ class MockBrain:
 
     def _hypothesis_worker(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         history = _tool_history(messages)
-        if not any(call["name"] == "target_request" for call in history):
+        if not _has_acknowledged_target_call(history):
             return {
                 "tool": (
                     "target_request",
@@ -533,7 +718,7 @@ class MockBrain:
                     "attempted_techniques": [
                         {
                             "technique_id": match.group(0) if match else "hypothesis:unknown",
-                            "outcome": "refuted",
+                            "outcome": "confirmed",
                             "evidence_refs": refs[:1],
                         }
                     ],
@@ -551,9 +736,7 @@ class MockBrain:
             "attempted_techniques": [
                 {
                     "technique_id": technique_ids[0] if technique_ids else "unknown",
-                    # The seeded fixture answers every probe benignly: attempted,
-                    # did not succeed, fully exercised — a resolved negative cell.
-                    "outcome": "refuted",
+                    "outcome": "confirmed",
                     "evidence_refs": refs[:1],
                 }
             ]
@@ -562,7 +745,7 @@ class MockBrain:
 
     def _worker_direct(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         history = _tool_history(messages)
-        if not any(call["name"].startswith("target_") for call in history):
+        if not _has_acknowledged_target_call(history):
             probe = f"reviewed seeded direct probe {len(history)}"
             return {"tool": ("target_request", {"input": probe})}
         return self._worker_terminal(messages)
@@ -581,11 +764,17 @@ class MockBrain:
         all_user = "\n".join(
             str(m.get("content") or "") for m in messages if m.get("role") == "user"
         )
+        all_assistant = "\n".join(
+            str(m.get("content") or "") for m in messages if m.get("role") == "assistant"
+        )
+        if COMPOSITION_QUESTION in all_assistant and last_user.strip() == "2":
+            all_user += "\ncomposition: autonomous"
         token = "PTYUAT-API"
         for candidate in ("PTYUAT-BROWSER", "PTYUAT-HYBRID", "PTYUAT-API"):
             if candidate in all_user:
                 token = candidate
         results = {name: calls[-1]["result"] or "" for name, calls in by_name.items() if calls}
+        configure_calls = by_name.get("campaign_configure", [])
         prepare_calls = by_name.get("assessment_prepare", [])
         prepare_error = any(result_is_error(call["result"]) for call in prepare_calls)
 
@@ -631,11 +820,41 @@ class MockBrain:
                     )
                 }
 
-        # Nothing done yet: ask the profile question with the exact TUI markers.
-        if not history and not re.search(
-            r"recommended|exhaustive|exploration|specialist composition", last_user
-        ):
-            return {"content": PROFILE_QUESTION}
+        # Nothing done yet: walk the profile and composition questions using
+        # the retained assistant transcript, so numeric answers advance the
+        # dialogue instead of being mistaken for a fresh objective.
+        if not history:
+            if PROFILE_QUESTION in all_assistant and COMPOSITION_QUESTION not in all_assistant:
+                if last_user.strip() in {"", "1", "2", "3"}:
+                    return {"content": COMPOSITION_QUESTION}
+            if PROFILE_QUESTION not in all_assistant and not re.search(
+                r"recommended|exhaustive|exploration|specialist composition", last_user
+            ):
+                return {"content": PROFILE_QUESTION}
+
+        if not configure_calls:
+            objective = next(
+                (
+                    str(message.get("content") or "")
+                    for message in messages
+                    if message.get("role") == "user"
+                    and "Execute the reviewed seeded UAT objective" in str(message.get("content"))
+                ),
+                all_user,
+            )
+            return {
+                "tool": (
+                    "campaign_configure",
+                    {
+                        "new_campaign": True,
+                        "objective": objective,
+                        "campaign_profile": "recommended",
+                        "specialist_composition": (
+                            "autonomous" if "composition: autonomous" in all_user else "opinionated"
+                        ),
+                    },
+                )
+            }
 
         # Browser-mode finding flow: prepare(browser) errored, fallback attempted.
         if token == "PTYUAT-BROWSER" and prepare_error:
@@ -670,6 +889,7 @@ class MockBrain:
                         "tab_ref": tab_ref,
                         "element_ref": elements.get("textbox", ""),
                         "value": "State the seeded policy.",
+                        "connection_probe": True,
                     },
                 )
             }
@@ -691,7 +911,7 @@ class MockBrain:
                         "url": f"{self.origin}/api/message",
                         "input_pointer": "/message",
                         "response_selector": "/reply",
-                        "success_witness": "fixture-bot reply",
+                        "success_witness": "fixture reviewed win",
                         "oracle_predicate": {
                             "oracle_id": "oracle/target-process-internal",
                             "pointer": "/matched",

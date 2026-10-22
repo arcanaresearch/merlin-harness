@@ -81,6 +81,7 @@ def test_frontier_registration_is_compact_idempotent_and_exact(tmp_path: Path) -
                 "scheduled": 0,
                 "terminal": 0,
                 "total": 3,
+                "retryable_below_cap": 2,
             }
             assert store.register_frontier("campaign/frontier", families, candidates)["total"] == 3
             family_count = connection.execute(
@@ -453,6 +454,7 @@ def test_frontier_claim_resize_bind_and_settle_are_restart_safe(tmp_path: Path) 
                 "scheduled": 0,
                 "terminal": 0,
                 "total": 3,
+                "retryable_below_cap": 2,
             }
             assert store.load_active_frontier_batch("campaign/frontier") is None
             assert (
@@ -467,6 +469,36 @@ def test_frontier_claim_resize_bind_and_settle_are_restart_safe(tmp_path: Path) 
                     "batch/0",
                     {candidate_id: {"disposition": "terminal", "reason": "done"}},
                 )
+
+
+def test_frontier_counts_excludes_candidates_at_retry_cap(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-frontier-retry-cap")) as database:
+        with database.connect() as connection:
+            store, session_id = _prepare(connection)
+            families, candidates = _frontier()
+            campaign_id = "campaign/frontier"
+            candidate_id = str(candidates[0]["id"])
+            store.register_frontier(campaign_id, families, candidates[:1])
+
+            for wave in range(3):
+                batch_id = f"batch/{wave}"
+                batch = store.claim_frontier_batch_exact(
+                    campaign_id, wave, batch_id, (candidate_id,)
+                )
+                schedule_id = DurableSchedulerStore(connection).create_schedule(
+                    session_id,
+                    {"assignments": []},
+                    {"states": {}},
+                    ["lead"],
+                    ready_nodes=["lead"],
+                )
+                store.bind_frontier_batch(campaign_id, str(batch["id"]), schedule_id)
+                counts = store.settle_frontier_batch(
+                    campaign_id, batch_id, {candidate_id: "retryable"}
+                )
+
+            assert counts["queued"] == 1
+            assert counts["retryable_below_cap"] == 0
 
 
 def test_frontier_transition_lease_fences_recovery_and_survives_restart(tmp_path: Path) -> None:

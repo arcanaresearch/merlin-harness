@@ -3565,6 +3565,7 @@ def _one_oracle_observation(
         matched = any(_typed_equal(selected, expected) for expected in predicate.match_values)
         selected_digest = _digest_json(selected)
     binding = {
+        "authority": "target",
         "adapter_digest": adapter.digest,
         "compiled_adapter_digest": adapter.compiled_digest,
         "step_id": step.id,
@@ -4462,7 +4463,21 @@ def _attempt_disposition(metadata: Mapping[str, object], *, is_error: bool) -> s
     if is_error or metadata.get("infrastructure_failure_category") is not None:
         return "infrastructure_failed"
     if metadata.get("evaluation_uncertain") is True:
-        return "uncertain"
+        uncertainties = _uncertainty_records(metadata.get("evaluation_uncertainties", ()))
+        # Compiler advisories deliberately preserve review hints outside the
+        # executable adapter identity. They must remain visible to validators,
+        # but cannot turn an otherwise attributable target exchange into a
+        # retryable uncertain attempt. Operational uncertainty records do not
+        # carry ``advisory_kind`` and continue to classify the attempt as
+        # uncertain.
+        operational = [
+            item
+            for item in uncertainties
+            if "advisory_kind" not in item
+            and item.get("source") != "reviewed_adapter_resolver.cleanup_discovery"
+        ]
+        if not uncertainties or operational:
+            return "uncertain"
     return "valid"
 
 

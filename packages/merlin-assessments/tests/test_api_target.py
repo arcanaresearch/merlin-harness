@@ -20,6 +20,7 @@ from merlin_agents.specialists import (
 )
 from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
 from merlin_assessments.api_target import (
+    _attempt_disposition,
     _augment_target_state_metadata,
     _infrastructure_failure_category,
     _ResponsePointerMissing,
@@ -118,6 +119,40 @@ def _adapter() -> dict[str, object]:
             },
         ],
     }
+
+
+def test_adapter_advisories_do_not_make_attributable_attempt_uncertain() -> None:
+    metadata = {
+        "evaluation_uncertain": True,
+        "evaluation_uncertainties": [
+            {
+                "kind": "evaluation_uncertain",
+                "advisory_kind": "evaluation_hint",
+                "source": "target_adapter_compiler.api_steps[1].success_witness",
+                "reason": "Evaluation metadata is retained for validator judgment.",
+            },
+            {
+                "kind": "evaluation_uncertain",
+                "source": "reviewed_adapter_resolver.cleanup_discovery",
+                "reason": "Cleanup ownership is unknown; destructive cleanup stays skipped.",
+            },
+        ],
+        "current_target_exchanges": [
+            {
+                "interaction": True,
+                "status_code": 200,
+                "oracle_observations": [
+                    {
+                        "purpose": "objective",
+                        "authority": "target",
+                        "matched": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert _attempt_disposition(metadata, is_error=False) == "valid"
 
 
 @pytest.mark.asyncio
@@ -2648,6 +2683,7 @@ async def test_reviewed_api_tool_emits_daemon_derived_typed_oracle_observation(
     exchange = result.metadata["target_exchanges"][-1]
     assert isinstance(exchange["latency_ms"], int) and exchange["latency_ms"] >= 0
     observation = exchange["oracle_observation"]
+    assert observation["authority"] == "target"
     assert observation["matched"] is True
     assert observation["selected_digest"].startswith("sha256:")
     assert observation["binding_digest"].startswith("sha256:")

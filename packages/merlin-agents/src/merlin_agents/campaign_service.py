@@ -480,8 +480,13 @@ def _schedule_grant_universe(
     too. Consumers read it back via ``graph.get("grants", {})``.
     """
     target_ids = {assignment.target_profile_id for assignment in assignments}
+    if not target_ids:
+        raise ValueError("schedule capability universe requires at least one assignment")
     if len(target_ids) != 1:
-        raise ValueError("one schedule capability universe must bind exactly one reviewed target")
+        raise ValueError(
+            "one schedule capability universe must bind exactly one reviewed target; got "
+            + ", ".join(sorted(target_ids))
+        )
     target_scope = next(iter(target_ids))
     profile_ids = set(CORE_PROFILES_BY_ID)
     profile_ids.update(assignment.profile_id for assignment in assignments)
@@ -4631,9 +4636,7 @@ class CampaignService:
                 preflight_estimate,
                 approve_over_budget=approve_over_budget,
             )
-        if _specialist_composition(manifest) == "opinionated" and not callable(
-            getattr(self._store, "claim_frontier_batch", None)
-        ):
+        if _specialist_composition(manifest) == "opinionated":
             await self._admit_wave0_specialist_composition(campaign_id, manifest, context)
         fingerprint = scenario_fingerprint_for(manifest.target, manifest.catalogue)
         latest_loader = getattr(self._store, "latest_recon_result", None)
@@ -5245,6 +5248,7 @@ class CampaignService:
             seen = await self._durable_followup_keys(campaign_id)
             candidate_scenario = scenario_fingerprint_for(manifest.target, manifest.catalogue)
             hypothesis_cap_capped = False
+            frontier_retry_cap_reached = False
             if (
                 not wave_running
                 and manifest.profile is not CampaignProfile.EXPLORATION
@@ -5443,11 +5447,13 @@ class CampaignService:
                     return
                 frontier_retry_available = bool(
                     frontier_counts is not None
-                    and (
-                        int(frontier_counts.get("retryable_claims_below_cap", 0)) > 0
-                        or int(frontier_counts.get("queued", 0))
-                        > int(frontier_counts.get("retry_exhausted_candidates", 0))
+                    and int(
+                        frontier_counts.get(
+                            "retryable_below_cap",
+                            frontier_counts.get("retryable_claims_below_cap", 0),
+                        )
                     )
+                    > 0
                 )
                 quickscan_frontier_limit_reached = bool(
                     manifest.profile is CampaignProfile.QUICKSCAN
@@ -5526,26 +5532,22 @@ class CampaignService:
                             "retryable": True,
                         },
                     )
-                    pause_campaign = getattr(self._store, "pause", None)
-                    if callable(pause_campaign):
-                        await asyncio.to_thread(pause_campaign, campaign_id)
-                        await asyncio.to_thread(
-                            self._store.append_lead,
-                            campaign_id,
-                            initial_wave,
-                            {
-                                "kind": "frontier_retry_cap_paused",
-                                "state": "paused",
-                                "queued": frontier_counts.get("queued", 0),
-                                "reason": (
-                                    "per-candidate infrastructure retry cap reached; "
-                                    "unresolved candidates remain durably queued for "
-                                    "operator continuation"
-                                ),
-                                "retryable": True,
-                            },
-                        )
-                        return
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        initial_wave,
+                        {
+                            "kind": "frontier_retry_cap_reached",
+                            "state": "awaiting_coverage_decision",
+                            "queued": frontier_counts.get("queued", 0),
+                            "reason": (
+                                "per-candidate retry cap reached; unresolved candidates "
+                                "remain queued for the coverage-extension decision"
+                            ),
+                            "retryable": True,
+                        },
+                    )
+                    frontier_retry_cap_reached = True
                 if continue_frontier:
                     candidate_wave = initial_wave + 1
                     batch_context, frontier_batch = await self._claim_execution_frontier_context(
@@ -5953,7 +5955,7 @@ class CampaignService:
             autonomous_adaptive = _specialist_composition(manifest) == "autonomous"
             recon_task: AgentTask | None = None
             recon_evidence: Mapping[str, object] | None = None
-            while not budget_capped and (
+            while not budget_capped and not frontier_retry_cap_reached and (
                 autonomous_adaptive
                 or assessment.followups
                 or manifest.profile in {CampaignProfile.RECOMMENDED, CampaignProfile.EXPLORATION}
@@ -6414,6 +6416,12 @@ class CampaignService:
             canonical_completion = isinstance(completion_evidence, Mapping) and isinstance(
                 completion_evidence.get("completion_frontier"), (tuple, list)
             )
+            if canonical_completion and int(completion_evidence.get("attempted_techniques", 0)) > 0:
+                # Canonical target-backed attempts supersede a stale failure
+                # flag from an earlier operational wave. Actual supervision
+                # exceptions and a campaign with no attempted technique still
+                # retain the failure path below.
+                campaign_failed = False
             progress_snapshot = _progress_snapshot_from_status(completion_status)
             progress_decision = assess_campaign_progress(None, progress_snapshot)
             hypothesis_cap_capped = isinstance(completion_evidence, Mapping) and bool(
@@ -6454,6 +6462,37 @@ class CampaignService:
                 campaign_failed = False
                 stop_reason = "coverage_incomplete"
             coverage_extensions = 0
+            coverage_frontier_signature = _coverage_frontier_signature(completion_evidence)
+            unchanged_coverage_extensions = 0
+            lead_loader = getattr(self._store, "list_lead", None)
+            prior_lead = (
+                await asyncio.to_thread(lead_loader, campaign_id)
+                if callable(lead_loader)
+                else ()
+            )
+            operator_approved_coverage = _operator_authorized_coverage_continuation(prior_lead)
+            (
+                operator_coverage_extensions,
+                operator_coverage_request_id,
+            ) = _operator_coverage_extension_usage(prior_lead)
+            if operator_approved_coverage and operator_coverage_extensions >= 3:
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "coverage_continuation_authorization_expired",
+                        "purpose": "coverage_extension",
+                        "request_id": operator_coverage_request_id,
+                        "reason": (
+                            "the authorized three-wave repair microbatch completed before "
+                            "durable supervision resumed"
+                        ),
+                        "operator_coverage_extensions": operator_coverage_extensions,
+                    },
+                )
+                operator_approved_coverage = False
+                operator_coverage_extensions = 0
             while stop_reason == "coverage_incomplete" or (
                 manifest.profile is CampaignProfile.EXHAUSTIVE and stop_reason == "saturated"
             ):
@@ -6481,6 +6520,12 @@ class CampaignService:
                         or coverage_extensions < self._max_coverage_extensions
                         else "stop"
                     )
+                elif purpose == "coverage_extension" and operator_approved_coverage:
+                    # "Continue" authorizes the outstanding mandatory coverage
+                    # plan, not one tiny repair wave. Keep applying that policy
+                    # until saturation, a budget boundary, or a blocker changes
+                    # the campaign state materially.
+                    auto_decision = "continue"
                 decision = await self._await_saturation_decision(
                     campaign_id,
                     wave,
@@ -6496,6 +6541,14 @@ class CampaignService:
                             saturation=saturation if isinstance(saturation, Mapping) else {},
                         )
                     break
+                if (
+                    purpose == "coverage_extension"
+                    and decision.get("decision") == "continue"
+                    and decision.get("automatic") is False
+                ):
+                    if auto_decision is None:
+                        operator_coverage_extensions = 0
+                    operator_approved_coverage = True
                 if auto_decision == "continue":
                     coverage_extensions += 1
                 previous_wave = wave
@@ -6516,6 +6569,12 @@ class CampaignService:
                     admitted_hypotheses,
                     source_schedule_id=source_schedule_id,
                 )
+                if wave != previous_wave and any(task.status == "completed" for task in tasks):
+                    # A materialized, target-backed repair wave recovered the
+                    # earlier operational failure. Preserve failed task history,
+                    # but do not let its stale campaign-wide flag override the
+                    # later coverage decision and completion seal.
+                    campaign_failed = False
                 if wave != previous_wave:
                     source_schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
                 admitted_hypotheses.update(continued_hypotheses)
@@ -6555,6 +6614,53 @@ class CampaignService:
                     )
                     progress_decision = assess_campaign_progress(None, current_progress)
                 progress_snapshot = current_progress
+                current_frontier_signature = _coverage_frontier_signature(continuation_evidence)
+                if purpose == "coverage_extension" and operator_approved_coverage:
+                    operator_coverage_extensions += 1
+                if (
+                    current_frontier_signature is not None
+                    and current_frontier_signature == coverage_frontier_signature
+                ):
+                    unchanged_coverage_extensions += 1
+                else:
+                    unchanged_coverage_extensions = 0
+                coverage_frontier_signature = current_frontier_signature
+                if (
+                    purpose == "coverage_extension"
+                    and operator_approved_coverage
+                    and (
+                        progress_decision.semantic_plateau
+                        or unchanged_coverage_extensions >= 3
+                        or operator_coverage_extensions >= 3
+                    )
+                ):
+                    # One operator Continue authorizes the current repair plan
+                    # while it is producing semantic progress.  It is not an
+                    # unlimited licence to replay an unchanged ambiguous
+                    # frontier.  Expire the standing policy at a target-backed
+                    # plateau so the next loop exposes a fresh operator choice.
+                    operator_approved_coverage = False
+                    await asyncio.to_thread(
+                        self._store.append_lead,
+                        campaign_id,
+                        wave,
+                        {
+                            "kind": "coverage_continuation_authorization_expired",
+                            "purpose": purpose,
+                            "request_id": decision.get("request_id"),
+                            "reason": (
+                                "the authorized three-wave repair microbatch completed, the "
+                                "reviewed coverage frontier remained unchanged, or new target "
+                                "calls produced no durable evidence, frontier resolution, or "
+                                "semantic state change"
+                            ),
+                            "progress_action": progress_decision.action.value,
+                            "unchanged_coverage_extensions": unchanged_coverage_extensions,
+                            "operator_coverage_extensions": operator_coverage_extensions,
+                        },
+                    )
+                    unchanged_coverage_extensions = 0
+                    operator_coverage_extensions = 0
                 if not continuation_canonical:
                     continuation_has_failures = any(
                         task.status in {"failed", "quarantined", "cancelled"} for task in tasks
@@ -7434,7 +7540,10 @@ class CampaignService:
         # and therefore cannot silently permit the specialist to execute.
         recorder = getattr(self._store, "record_dynamic_specialist", None)
         if recorder is not None:
-            await asyncio.to_thread(recorder, record.projection())
+            durable_record = record.projection()
+            if creation is not None:
+                durable_record = {**durable_record, "creation": dict(creation)}
+            await asyncio.to_thread(recorder, durable_record)
         await asyncio.to_thread(
             self._store.append_lead,
             campaign_id,
@@ -8244,12 +8353,18 @@ class CampaignService:
                 if isinstance(item.get("payload"), Mapping)
                 and item["payload"].get("kind") == "saturation_decision_required"
             )
-            request_id = f"{purpose}/{evidence_digest.removeprefix('sha256:')}/{sequence + 1}"
+            request_id = (
+                f"{purpose}/{evidence_digest.removeprefix('sha256:')}/"
+                f"wave-{wave}/{sequence + 1}"
+            )
             payload = {
                 "kind": "saturation_decision_required",
                 "request_id": request_id,
                 "evidence_digest": evidence_digest,
                 "purpose": purpose,
+                # Keep automatic repair requests auditable without exposing
+                # their short-lived pending state as an operator prompt.
+                "automatic": auto_decision is not None,
             }
             if purpose == "coverage_extension" and saturation is not None:
                 raw_terminal_blocked = saturation.get("catalogue_terminal_blocked_cell_ids", ())
@@ -8315,6 +8430,8 @@ class CampaignService:
                 "request_id": request_id,
                 "evidence_digest": evidence_digest,
                 "decision": auto_decision,
+                "purpose": purpose,
+                "automatic": True,
             }
             commit = getattr(self._store, "commit_lead_decision", None)
             if commit is None:
@@ -8516,9 +8633,12 @@ class CampaignService:
                     (*compiled.assignments, *admitted_compilation.assignments),
                     (*compiled.worker_contexts, *admitted_compilation.worker_contexts),
                 )
-                if not compiled.assignments:
-                    # Every dynamic proposal failed closed; never submit an empty wave.
-                    break
+            if not compiled.assignments:
+                # Every ordinary and dynamic proposal was either already
+                # resolved or not routable.  The continuation has exhausted
+                # its runnable work; return to the coverage/completion reducer
+                # instead of submitting an invalid empty schedule.
+                break
             wave = candidate_wave
             tasks = await self._run_wave(
                 campaign_id, manifest, wave, "operator-continuation", compiled
@@ -8740,6 +8860,41 @@ class CampaignService:
         }
         exact_repairs: list[LeadFollowUp] = []
         exact_repair_keys: set[str] = set()
+        exact_missing = {
+            str(item) for item in gaps.get("untested_concrete_ids", ()) if str(item).strip()
+        }
+        if exact_missing and isinstance(gaps.get("completion_frontier"), (tuple, list)):
+            # A differential baseline keys its benign control within one
+            # schedule. Dispatch exactly one never-attempted cell per repair
+            # microbatch so several resource-exhaustion treatments sharing the
+            # same reviewed control cannot collide during reconciliation. The
+            # standing operator continuation policy advances the next exact
+            # cell after this one commits its authoritative attempt evidence.
+            technique_id = sorted(exact_missing)[0]
+            profile_id = next(
+                (
+                    candidate_profile
+                    for candidate_profile, owned_ids in ownership.items()
+                    if technique_id in owned_ids
+                ),
+                None,
+            )
+            if profile_id not in routable_profiles:
+                profile_id = (
+                    "adversarial-explorer"
+                    if "adversarial-explorer" in routable_profiles
+                    else next(iter(sorted(routable_profiles)), None)
+                )
+            if profile_id is not None:
+                return (
+                    LeadFollowUp(
+                        profile_id,
+                        "Retry mandatory coverage cells: "
+                        + json.dumps([technique_id], separators=(",", ":"))
+                        + f"#exact-untested:{technique_id}",
+                        (),
+                    ),
+                )
         frontier_rows = tuple(
             item
             for item in gaps.get("completion_frontier", ())
@@ -8845,9 +9000,6 @@ class CampaignService:
             return tuple(exact_repairs)
         missing = {
             str(item) for item in gaps.get("untested_technique_ids", ()) if str(item).strip()
-        }
-        exact_missing = {
-            str(item) for item in gaps.get("untested_concrete_ids", ()) if str(item).strip()
         }
         missing.update(
             str(item)
@@ -9243,9 +9395,28 @@ class CampaignService:
                         "candidate_identity": identity.projection(),
                     }
                     catalogue_arm = True
-            hypothesis_observation = _hypothesis_task_observation(
-                campaign_id, task, contract, committed
-            )
+            try:
+                hypothesis_observation = _hypothesis_task_observation(
+                    campaign_id, task, contract, committed
+                )
+            except ValueError as exc:
+                # A receipt/settlement identity conflict invalidates this
+                # derived lifecycle projection, not the already committed
+                # target attempt or the rest of campaign finalization. Keep
+                # strict validation and make the uncertainty durable.
+                await asyncio.to_thread(
+                    self._store.append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "candidate_outcome_unrecorded",
+                        "task_id": task.id,
+                        "reason": str(exc),
+                        "evaluation_uncertain": True,
+                        "retryable": True,
+                    },
+                )
+                continue
             if (
                 not catalogue_arm
                 and hypothesis_observation is not None
@@ -13335,7 +13506,17 @@ class CampaignService:
             and inherited_transition[0] == campaign_id
         ):
             transition_lease = inherited_transition[1]
-        assignments = compiled.assignments
+        # A campaign may reuse reconnaissance, capability probes, or dynamic
+        # specialists compiled before the reviewed target adapter was resealed.
+        # Those parents retain useful technique history, but their historical
+        # target id must never leak into a new wave beside the current manifest
+        # target.  Rebind at the final scheduling boundary so every compilation
+        # path (direct, adaptive, validation, and operator continuation) shares
+        # one authoritative target scope.
+        assignments = tuple(
+            replace(assignment, target_profile_id=manifest.target.id)
+            for assignment in compiled.assignments
+        )
         if kind in {"initial", "frontier", "followup", "validation"}:
             assignments = await self._bind_objective_phase_checkpoint_restores(
                 campaign_id, manifest, assignments
@@ -14213,12 +14394,43 @@ class CampaignService:
                     requested = ()
                 if isinstance(requested, list):
                     repair_ids = {str(item) for item in requested}
+            repair_techniques = list(context.techniques)
+            known_repair_ids = {item.id for item in repair_techniques}
+            if repair_ids and context.language_frontier is not None:
+                base_by_id = {item.id: item for item in context.techniques}
+                for repair_id in sorted(repair_ids.difference(known_repair_ids)):
+                    family_id = repair_id.split("@lang=", 1)[0].split("@variant=", 1)[0]
+                    base = base_by_id.get(family_id)
+                    if base is None or "@lang=" not in repair_id or "@variant=" not in repair_id:
+                        continue
+                    language = repair_id.split("@lang=", 1)[1].split("@", 1)[0]
+                    variant = repair_id.split("@variant=", 1)[1].split("@", 1)[0]
+                    try:
+                        repair_techniques.append(
+                            materialize_language_technique(
+                                base,
+                                context.language_frontier,
+                                LanguageCandidateReference(
+                                    id=repair_id,
+                                    family_id=family_id,
+                                    ordinal=0,
+                                    requested_language=language,
+                                    variant_id=variant,
+                                ),
+                            )
+                        )
+                    except ValueError:
+                        # A malformed or out-of-policy concrete id remains
+                        # uncompiled; deterministic interpretation cannot widen
+                        # the sealed language/variant frontier.
+                        continue
+            repair_context = replace(context, techniques=tuple(repair_techniques))
             arm_technique_id = (
                 str(followup.arm.get("technique_id") or "")
                 if isinstance(followup.arm, Mapping)
                 else ""
             )
-            known_technique_ids = {item.id for item in context.techniques}
+            known_technique_ids = {item.id for item in repair_context.techniques}
             technique_ids = (
                 (followup.hypothesis.id,)
                 if followup.hypothesis is not None
@@ -14226,7 +14438,7 @@ class CampaignService:
                 if arm_technique_id in known_technique_ids
                 else tuple(
                     item.id
-                    for item in context.techniques
+                    for item in repair_context.techniques
                     if (item.id in repair_ids or item.resolved_semantic_id in repair_ids)
                 )
                 if repair_ids
@@ -14258,7 +14470,7 @@ class CampaignService:
                 followup,
                 technique_ids,
                 manifest=manifest,
-                context=context,
+                context=repair_context,
             )
             candidate_projections = tuple(
                 identity.projection() for identity in candidate_identities
@@ -14274,7 +14486,7 @@ class CampaignService:
             concrete_technique = next(
                 (
                     item
-                    for item in context.techniques
+                    for item in repair_context.techniques
                     if item.id == (arm_technique_id or technique_ids[0])
                 ),
                 None,
@@ -14316,6 +14528,12 @@ class CampaignService:
             common = {
                 "id": f"{manifest.id}/wave-{wave}/{followup.profile_id}-{index}",
                 "objective": compiled_objective,
+                # Follow-up parents can come from capability probes or reused
+                # dynamic specialists whose historical target_profile_id is not
+                # the reviewed campaign target.  Every executable continuation
+                # is rebound to the manifest target before the schedule grant
+                # universe is sealed.
+                "target_profile_id": manifest.target.id,
                 "technique_ids": technique_ids,
                 "provider_model": selected_model,
                 "provider_capabilities": context.capabilities_for_model(selected_model),
@@ -14411,7 +14629,7 @@ class CampaignService:
                         )
                     ),
                     profile_id=parent.profile_id,
-                    target_profile_id=parent.target_profile_id,
+                    target_profile_id=manifest.target.id,
                     technique_ids=technique_ids,
                     guidance_ids=parent.guidance_ids,
                     tool_ids=expanded_tool_ids,
@@ -14455,7 +14673,7 @@ class CampaignService:
                 # trusted. Route repair cells through the same receipt-bound
                 # execution agenda the initial wave uses (minus the discovery lane,
                 # which would strip the catalogue techniques being repaired).
-                agenda_context = context
+                agenda_context = repair_context
                 if arm_technique_id and isinstance(followup.arm, Mapping):
                     requested_controller = str(followup.arm.get("controller_id") or "").strip()
                     requested_contract = followup.arm.get("strategy_contract")
@@ -17579,6 +17797,16 @@ class CampaignService:
                     if not ledger_rows and isinstance(committed, Mapping) and trusted_refs
                     else {}
                 )
+                # Some bounded workers execute several assigned catalogue
+                # cells under one committed target attempt while the attempt
+                # ledger carries only the settlement's primary cell. Preserve
+                # every exact, assigned, evidence-referenced worker outcome in
+                # completion evidence, using ledger authority whenever both
+                # sources name the same cell.
+                for technique_id, outcome in _attempted_technique_outcomes(
+                    task.result or "", task.technique_ids
+                ).items():
+                    outcomes.setdefault(technique_id, outcome)
                 task_outcomes_by_id[task.id] = outcomes
                 # Receipt-native clear negatives: an observed attempt whose sealed
                 # target responses are all deterministic refusals is a refuted cell,
@@ -17709,8 +17937,10 @@ class CampaignService:
         status_techniques = assignment_context.techniques
         technique_by_id = {item.id: item for item in status_techniques}
         language_references = (
-            enumerate_language_candidate_references(
-                status_techniques, assignment_context.language_frontier
+            select_profile_candidate_references(
+                status_techniques,
+                assignment_context.language_frontier,
+                manifest.profile,
             )
             if assignment_context.language_frontier is not None
             else ()
@@ -18046,6 +18276,41 @@ class CampaignService:
             if payload.get("kind") == "dynamic_specialist_admitted"
             and isinstance(payload.get("record"), Mapping)
         }
+        dynamic_admission_ids = set(dynamic_creation_by_id)
+        dynamic_lister = getattr(self._store, "list_dynamic_specialists", None)
+        if callable(dynamic_lister):
+            durable_dynamic_rows = await asyncio.to_thread(dynamic_lister, campaign_id)
+            durable_admission_events = tuple(
+                {
+                    "kind": "dynamic_specialist_admitted",
+                    "record": {
+                        key: value
+                        for key, value in durable_record.items()
+                        if key != "creation"
+                    },
+                    "creation": dict(creation),
+                }
+                for row in durable_dynamic_rows
+                if isinstance(row, Mapping)
+                and isinstance(
+                    durable_record := (
+                        row.get("record")
+                        if isinstance(row.get("record"), Mapping)
+                        else row
+                    ),
+                    Mapping,
+                )
+                and isinstance(creation := durable_record.get("creation"), Mapping)
+                and str(durable_record.get("id") or "") not in dynamic_admission_ids
+            )
+            if durable_admission_events:
+                dynamic_events = (*durable_admission_events, *dynamic_events)
+                dynamic_creation_by_id.update(
+                    {
+                        str(event["record"]["id"]): event["creation"]
+                        for event in durable_admission_events
+                    }
+                )
         frontier_document = tuple(
             {
                 "key": item.key,
@@ -18084,7 +18349,7 @@ class CampaignService:
         saturation_document = asdict(saturation) | {
             "ready": saturation.ready and completion_frontier.may_complete,
             "execution_complete": (
-                saturation.execution_complete and completion_frontier.may_complete
+                saturation.execution_complete
             ),
             "frontier_exhausted": completion_frontier.may_complete,
             "completion_frontier": projected_frontier_document,
@@ -18118,6 +18383,12 @@ class CampaignService:
             ):
                 field_values = cast(Sequence[object], saturation_document.get(field_name, ()))
                 _bounded_sequence_field(saturation_document, field_name, field_values)
+                if field_name == "catalogue_cell_owners":
+                    # Ownership is executable acceptance evidence: callers
+                    # must be able to compare every admitted cell with its
+                    # terminal attempt. Retain projection metadata without
+                    # replacing the authoritative row set with its UI sample.
+                    saturation_document[field_name] = field_values
 
         frontier_snapshot: dict[str, object] | None = None
         frontier_live_projection: dict[str, object] | None = None
@@ -18163,6 +18434,70 @@ class CampaignService:
             for task in wave["tasks"]
             for technique_id in task["technique_outcomes"]
         }
+        raw_completion_cells = tuple(
+            sorted(
+                (
+                    (
+                        str(task["id"]),
+                        str(technique_id),
+                        str(outcome),
+                        *(
+                            (dict(task["partial_signals"][technique_id]),)
+                            if outcome == "partial"
+                            and isinstance(task.get("partial_signals"), Mapping)
+                            and isinstance(task["partial_signals"].get(technique_id), Mapping)
+                            else ()
+                        ),
+                    )
+                    for wave in projected_waves
+                    for task in wave["tasks"]
+                    for technique_id, outcome in task["technique_outcomes"].items()
+                ),
+                key=lambda cell: tuple(str(part) for part in cell[:3]),
+            )
+        )
+        first_cell_by_technique: dict[str, tuple[object, ...]] = {}
+        for cell in raw_completion_cells:
+            technique_id = str(cell[1])
+            incumbent = first_cell_by_technique.get(technique_id)
+            if incumbent is None or (
+                str(incumbent[2]) not in {"confirmed", "refuted", "unclear"}
+                and str(cell[2]) in {"confirmed", "refuted", "unclear"}
+            ):
+                first_cell_by_technique[technique_id] = cell
+        # Use the same bounded owner projection exposed in the saturation
+        # document. Independently taking the first completion cells can select
+        # a different 32-row sample and hide terminal evidence for admitted
+        # owners even though the canonical snapshots agree.
+        owner_cell_ids = tuple(
+            str(value[0])
+            for value in saturation_document.get("catalogue_cell_owners", ())
+            if isinstance(value, (tuple, list)) and value
+        )
+        owner_cells = tuple(
+            first_cell_by_technique[cell_id]
+            for cell_id in owner_cell_ids
+            if cell_id in first_cell_by_technique
+        )
+        owner_cell_set = set(owner_cell_ids)
+        completion_cells = owner_cells + tuple(
+            cell
+            for technique_id, cell in first_cell_by_technique.items()
+            if technique_id not in owner_cell_set
+            and (
+                not language_references
+                or not technique_id.startswith("merlin-injection-taxonomy/")
+            )
+        ) + tuple(
+            cell
+            for cell in raw_completion_cells
+            if cell is not first_cell_by_technique[str(cell[1])]
+            and (
+                not language_references
+                or str(cell[1]) in owner_cell_set
+                or not str(cell[1]).startswith("merlin-injection-taxonomy/")
+            )
+        )
         completion_document = {
             "schema": (
                 "merlin.campaign-completion.v2"
@@ -18236,28 +18571,11 @@ class CampaignService:
                 }
                 for technique_id in saturation.untested_concrete_ids
             ),
-            "cells": tuple(
-                sorted(
-                    (
-                        (
-                            str(task["id"]),
-                            str(technique_id),
-                            str(outcome),
-                            *(
-                                (dict(task["partial_signals"][technique_id]),)
-                                if outcome == "partial"
-                                and isinstance(task.get("partial_signals"), Mapping)
-                                and isinstance(task["partial_signals"].get(technique_id), Mapping)
-                                else ()
-                            ),
-                        )
-                        for wave in projected_waves
-                        for task in wave["tasks"]
-                        for technique_id, outcome in task["technique_outcomes"].items()
-                    ),
-                    key=lambda cell: tuple(str(part) for part in cell[:3]),
-                )
-            ),
+            # Preserve full attempt history in the projection digest while
+            # placing one row per distinct technique before retry duplicates.
+            # The bounded operator-facing sample can then prove breadth instead
+            # of being crowded out by repeated attempts at early-sorted cells.
+            "cells": completion_cells,
             "waves": tuple(
                 (
                     int(wave["wave"]),
@@ -18333,11 +18651,18 @@ class CampaignService:
             completion_document["frontier_projection"] = frontier_live_projection
         if frontier_snapshot is not None or frontier_live_projection is not None:
             for field_name in ("limitations", "unsearched_frontier", "cells"):
+                field_values = cast(Sequence[object], completion_document[field_name])
                 _bounded_sequence_field(
                     completion_document,
                     field_name,
-                    cast(Sequence[object], completion_document[field_name]),
+                    field_values,
                 )
+                if field_name == "cells":
+                    # Completion cells are the counterpart to the admitted
+                    # owner rows above. Keep their full evidence while the
+                    # adjacent projection still supplies count/digest/omitted
+                    # metadata for compact renderers.
+                    completion_document[field_name] = field_values
         completion_digest = (
             "sha256:"
             + hashlib.sha256(
@@ -18464,6 +18789,8 @@ class CampaignService:
             "request_id": state["request_id"],
             "evidence_digest": status["completion_digest"],
             "decision": decision,
+            "purpose": purpose,
+            "automatic": False,
         }
         if additional_waves is not None:
             payload["additional_waves"] = additional_waves
@@ -18541,6 +18868,48 @@ class CampaignService:
         cleanup_unresolved: tuple[str, ...] = (),
         adaptive_unresolved: tuple[str, ...] = (),
     ) -> SaturationEvidence | None:
+        def task_technique_outcomes(task: Mapping[str, object]) -> tuple[tuple[object, object], ...]:
+            projected = list(_mapping_items(task.get("technique_outcomes")))
+            projected_ids = {str(technique_id) for technique_id, _outcome in projected}
+            technique_ids = task.get("technique_ids")
+            assigned_ids = {
+                str(technique_id)
+                for technique_id in technique_ids
+            } if isinstance(technique_ids, (tuple, list, set)) else set()
+            result = task.get("result")
+            if isinstance(result, str):
+                for technique_id, outcome in _attempted_technique_outcomes(
+                    result, tuple(sorted(assigned_ids))
+                ).items():
+                    if technique_id not in projected_ids:
+                        projected.append((technique_id, outcome))
+                        projected_ids.add(technique_id)
+                return tuple(projected)
+            attempted = result.get("attempted_techniques") if isinstance(result, Mapping) else ()
+            if isinstance(attempted, (tuple, list)):
+                for item in attempted:
+                    if not isinstance(item, Mapping):
+                        continue
+                    technique_id = str(item.get("technique_id") or "")
+                    evidence_refs = item.get("evidence_refs")
+                    if (
+                        not technique_id
+                        or technique_id not in assigned_ids
+                        or technique_id in projected_ids
+                        or not isinstance(evidence_refs, (tuple, list))
+                        or not any(str(reference).strip() for reference in evidence_refs)
+                    ):
+                        continue
+                    outcome = str(item.get("outcome") or "unclear").casefold()
+                    projected.append(
+                        (
+                            technique_id,
+                            outcome if outcome in {"confirmed", "refuted", "unclear"} else "unclear",
+                        )
+                    )
+                    projected_ids.add(technique_id)
+            return tuple(projected)
+
         terminal_wave_ids = {
             int(wave["wave"])
             for wave in waves
@@ -18548,7 +18917,7 @@ class CampaignService:
             and wave.get("status") == "completed"
             and wave.get("kind") in {"initial", "followup", "operator-continuation"}
             and any(
-                isinstance(task, Mapping) and bool(task.get("technique_outcomes"))
+                isinstance(task, Mapping) and bool(task_technique_outcomes(task))
                 for task in wave.get("tasks", ())
             )
         }
@@ -18573,14 +18942,14 @@ class CampaignService:
             for task in tasks
             if isinstance(task, Mapping)
             and task.get("status") in {"completed", "failed", "quarantined", "cancelled"}
-            for technique_id, outcome in _mapping_items(task.get("technique_outcomes"))
+            for technique_id, outcome in task_technique_outcomes(task)
             if str(technique_id).startswith("hypothesis:")
         }
         hypothesis_owners = {
             str(technique_id): str(task.get("id", "unknown"))
             for task in tasks
             if isinstance(task, Mapping)
-            for technique_id, _outcome in _mapping_items(task.get("technique_outcomes"))
+            for technique_id, _outcome in task_technique_outcomes(task)
             if str(technique_id).startswith("hypothesis:")
         }
         admitted_identity: dict[str, tuple[str, str]] = (
@@ -18607,7 +18976,7 @@ class CampaignService:
                 "cancelled",
             }:
                 continue
-            for technique_id, outcome in _mapping_items(task.get("technique_outcomes")):
+            for technique_id, outcome in task_technique_outcomes(task):
                 concrete_id = str(technique_id)
                 identity = admitted_identity.get(concrete_id)
                 if identity is None:
@@ -18753,6 +19122,27 @@ class CampaignService:
         latest = waves[-1]
         lead_loader = getattr(self._store, "list_lead", None)
         lead = await asyncio.to_thread(lead_loader, campaign_id) if callable(lead_loader) else ()
+        saturation_decision = _latest_saturation_decision_state(list(lead))
+        pending_saturation_decision = (
+            {
+                key: saturation_decision[key]
+                for key in ("state", "request_id", "evidence_digest", "purpose")
+                if key in saturation_decision
+            }
+            if saturation_decision.get("state") == "awaiting_operator"
+            and saturation_decision.get("automatic") is not True
+            else None
+        )
+        if pending_saturation_decision is not None:
+            return {
+                "wave_number": len(waves),
+                "wave_kind": str(latest["kind"]),
+                "wave_status": str(latest["status"]),
+                "lead_activity": "waiting for operator coverage decision",
+                "target_progress": {},
+                "review_progress": {},
+                "saturation_decision": pending_saturation_decision,
+            }
         review_events = [
             item["payload"]
             for item in lead
@@ -18918,6 +19308,7 @@ class CampaignService:
             ),
             "target_progress": target_progress,
             "review_progress": review_progress,
+            "saturation_decision": pending_saturation_decision,
         }
 
     async def console_context(self, session_id: str) -> str | None:
@@ -19316,7 +19707,68 @@ class CampaignService:
             )
             return {"campaign_id": campaign_id, "status": "executing"}
         latest = paused[-1]
-        live = await self._agents.resume_schedule(str(latest["schedule_id"]))
+        status_loader = getattr(self._agents, "schedule_status", None)
+        schedule_status = (
+            await status_loader(str(latest["schedule_id"]))
+            if callable(status_loader)
+            else None
+        )
+        if schedule_status in {"completed", "failed", "cancelled"}:
+            # The scheduler can terminalize after CampaignStore.pause() marks
+            # the wave paused but before the operator's resume reaches it.
+            # Restore the campaign/wave envelope, then let normal durable
+            # recovery reconcile the scheduler receipts at the Lead boundary.
+            await asyncio.to_thread(self._store.resume, campaign_id)
+            await self._stop_supervisor(campaign_id)
+            if await self.recover() < 1:
+                raise RuntimeError(
+                    "terminal paused scheduler continuation could not reclaim campaign ownership"
+                )
+            await asyncio.to_thread(
+                self._store.append_lead,
+                campaign_id,
+                int(latest["wave"]),
+                {
+                    "state": "executing",
+                    "reason": "operator-terminal-paused-scheduler-continuation",
+                    "schedule_id": str(latest["schedule_id"]),
+                    "schedule_status": schedule_status,
+                },
+            )
+            return {"campaign_id": campaign_id, "status": "executing"}
+        try:
+            live = await self._agents.resume_schedule(str(latest["schedule_id"]))
+        except ValueError as error:
+            # Close the check/use race above: the scheduler may terminalize
+            # after reporting paused but before resume_schedule acquires it.
+            schedule_status = (
+                await status_loader(str(latest["schedule_id"]))
+                if callable(status_loader)
+                else None
+            )
+            if (
+                "unknown or not paused" not in str(error)
+                or schedule_status not in {"completed", "failed", "cancelled"}
+            ):
+                raise
+            await asyncio.to_thread(self._store.resume, campaign_id)
+            await self._stop_supervisor(campaign_id)
+            if await self.recover() < 1:
+                raise RuntimeError(
+                    "terminal paused scheduler continuation could not reclaim campaign ownership"
+                ) from error
+            await asyncio.to_thread(
+                self._store.append_lead,
+                campaign_id,
+                int(latest["wave"]),
+                {
+                    "state": "executing",
+                    "reason": "operator-terminal-paused-scheduler-continuation",
+                    "schedule_id": str(latest["schedule_id"]),
+                    "schedule_status": schedule_status,
+                },
+            )
+            return {"campaign_id": campaign_id, "status": "executing"}
         try:
             await asyncio.to_thread(self._store.resume, campaign_id)
         except Exception:
@@ -22474,11 +22926,12 @@ def _exact_candidate_outcome(
     """Resolve one exact variant only from attributable authoritative evidence."""
     committed_refs = _committed_candidate_evidence_refs(committed)
     for value in attempts:
-        if not isinstance(value, Mapping) or value.get("task_id") != task_id:
+        row = _object_projection(value)
+        if row.get("task_id") != task_id:
             continue
-        if str(value.get("state") or "") not in {"confirmed", "refuted"}:
+        if str(row.get("state") or "") not in {"confirmed", "refuted"}:
             continue
-        strategy_state = value.get("strategy_state")
+        strategy_state = row.get("strategy_state")
         if not isinstance(strategy_state, Mapping):
             continue
         projection = _candidate_identity_from_projection(strategy_state.get("candidate_identity"))
@@ -22488,13 +22941,13 @@ def _exact_candidate_outcome(
         if not isinstance(authority, Mapping):
             continue
         authority_kind = str(authority.get("kind") or "").casefold()
-        state = str(value["state"])
+        state = str(row["state"])
         if (
             authority_kind not in {"target", "validator"}
             or str(authority.get("outcome") or "").casefold() != state
         ):
             continue
-        evidence_refs = value.get("evidence_refs")
+        evidence_refs = row.get("evidence_refs")
         attributable_refs = (
             {str(item) for item in evidence_refs if isinstance(item, str) and item.strip()}
             if isinstance(evidence_refs, (tuple, list, set, frozenset))
@@ -25977,6 +26430,7 @@ def _latest_saturation_decision_state(
     request_id: str | None = None
     evidence_digest: str | None = None
     purpose = "saturation"
+    automatic = False
     coverage_gaps: Mapping[str, object] | None = None
     decision: Mapping[str, object] | None = None
     for event in lead:
@@ -25992,6 +26446,7 @@ def _latest_saturation_decision_state(
                 else None
             )
             purpose = str(payload.get("purpose", "saturation"))
+            automatic = payload.get("automatic") is True
             coverage_gaps = (
                 dict(payload["coverage_gaps"])
                 if isinstance(payload.get("coverage_gaps"), Mapping)
@@ -26012,6 +26467,21 @@ def _latest_saturation_decision_state(
                     "conflicting": current,
                 }
             decision = current
+        elif (
+            kind == "coverage_continuation_authorization_expired"
+            and request_id is not None
+            and payload.get("request_id") == request_id
+        ):
+            # The evidence digest may remain identical while repeated target
+            # calls leave the same ambiguous frontier.  Invalidate the old
+            # checkpoint identity so _await_saturation_decision journals a new
+            # sequence-numbered request instead of replaying its prior Continue.
+            request_id = None
+            evidence_digest = None
+            purpose = "saturation"
+            automatic = False
+            coverage_gaps = None
+            decision = None
     if request_id is None:
         return {"state": "not_requested"}
     if decision is None:
@@ -26023,12 +26493,95 @@ def _latest_saturation_decision_state(
         if purpose != "saturation":
             pending["purpose"] = purpose
             pending["coverage_gaps"] = coverage_gaps
+        if automatic:
+            pending["automatic"] = True
         return pending
     decided: dict[str, object] = {"state": "decided", **decision}
     if purpose != "saturation":
         decided["purpose"] = purpose
         decided["coverage_gaps"] = coverage_gaps
     return decided
+
+
+def _operator_authorized_coverage_continuation(
+    lead: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return the durable operator policy for mandatory coverage repair.
+
+    A manual ``continue`` remains active across daemon supervision re-entry.
+    Automatic decisions merely apply that policy and therefore cannot erase
+    it. A later manual ``stop`` or bounded ``limit`` revokes the open-ended
+    authorization.
+    """
+    request_purpose: dict[str, str] = {}
+    authorized = False
+    for event in lead:
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str):
+            continue
+        if payload.get("kind") == "saturation_decision_required":
+            request_purpose[request_id] = str(payload.get("purpose", "saturation"))
+            continue
+        if payload.get("kind") == "coverage_continuation_authorization_expired":
+            authorized = False
+            continue
+        if payload.get("kind") != "saturation_decision":
+            continue
+        purpose = str(payload.get("purpose") or request_purpose.get(request_id, "saturation"))
+        if purpose != "coverage_extension" or payload.get("automatic") is not False:
+            continue
+        decision = str(payload.get("decision", ""))
+        if decision == "continue":
+            authorized = True
+        elif decision in {"stop", "limit"}:
+            authorized = False
+    return authorized
+
+
+def _operator_coverage_extension_usage(
+    lead: Sequence[Mapping[str, Any]],
+) -> tuple[int, str | None]:
+    """Rebuild the current operator-authorized repair microbatch from durable events."""
+
+    request_purpose: dict[str, str] = {}
+    count = 0
+    latest_request_id: str | None = None
+    for event in lead:
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str):
+            continue
+        kind = payload.get("kind")
+        if kind == "saturation_decision_required":
+            request_purpose[request_id] = str(payload.get("purpose", "saturation"))
+            continue
+        if kind == "coverage_continuation_authorization_expired":
+            count = 0
+            latest_request_id = None
+            continue
+        if kind != "saturation_decision":
+            continue
+        purpose = str(payload.get("purpose") or request_purpose.get(request_id, "saturation"))
+        if purpose != "coverage_extension":
+            continue
+        decision = str(payload.get("decision", ""))
+        if payload.get("automatic") is False:
+            if decision == "continue":
+                count = 1
+                latest_request_id = request_id
+            elif decision in {"stop", "limit"}:
+                count = 0
+                latest_request_id = None
+            continue
+        if decision == "continue" and count:
+            count += 1
+            latest_request_id = request_id
+    return count, latest_request_id
 
 
 def _sealed_applicable_technique_ids(

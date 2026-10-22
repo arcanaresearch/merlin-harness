@@ -31,7 +31,7 @@ from merlin_agents import (
     ReviewedTargetAdapter,
 )
 from merlin_agents.campaign_service import _arm_task_observation, _hypothesis_task_observation
-from merlin_contracts import AgentTask
+from merlin_contracts import AgentTask, project_candidate_outcome
 
 _GENERATED_OBJECTIVE = (
     "Probe cross-tenant isolation between two provisioned identities on the reviewed target."
@@ -773,3 +773,88 @@ async def test_missing_hypothesis_record_does_not_fail_arm_outcome_recording() -
     assert payload["kind"] == "hypothesis_outcome_unrecorded"
     assert payload["hypothesis"] == "hypothesis:missing"
     assert payload["evaluation_uncertain"] is True
+
+
+async def test_conflicting_candidate_projection_does_not_abort_outcome_recording() -> None:
+    arm = {
+        "id": "arm:conflicting-projection",
+        "target_id": "target-1",
+        "scenario_fingerprint": "scenario-1",
+        "surface_id": "chat",
+        "technique_id": "technique-1",
+        "controller_id": "direct",
+        "mutation_id": "baseline",
+        "actual_language": "en",
+        "state_id": "fresh",
+    }
+    contract = json.dumps(
+        {
+            "id": "hypothesis:conflicting-projection",
+            "arm": arm,
+            "candidate_identity": {
+                "campaign_id": "campaign-1",
+                "target_id": "target-1",
+                "target_generation": "generation-1",
+                "scenario_fingerprint": "scenario-1",
+                "technique_id": "hypothesis:conflicting-projection",
+                "controller_id": "direct",
+                "payload_family": "baseline",
+                "requested_language": "en",
+                "mutation_id": "baseline",
+            },
+        }
+    )
+    task = AgentTask(
+        id="arm-worker",
+        objective=f"Run. Sealed hypothesis contract: {contract}",
+        status="completed",
+        result="{}",
+        technique_ids=("hypothesis:conflicting-projection",),
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.journal = []
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.journal.append((wave, payload))
+
+    class ArmStore:
+        def record_arm_observation(self, _observation):
+            raise AssertionError("invalid projection must not produce an arm observation")
+
+    store = Store()
+    service = CampaignService(store, object(), object(), arm_store=ArmStore())  # type: ignore[arg-type]
+    evidence = {
+        task.id: {
+            "attempt_id": "attempt:one",
+            "reference": "receipt:one",
+            "target_call_ids": ("call:one",),
+            "target_evidence_receipts": {
+                "call:one": {
+                    "candidate_outcome_projection": project_candidate_outcome(
+                        candidate_id="sha256:" + "f" * 64,
+                        attempt_disposition="valid",
+                        outcome_authority="target",
+                        outcome="confirmed",
+                        evidence_digest="a" * 64,
+                    )
+                }
+            },
+        }
+    }
+
+    await service._record_arm_outcomes("campaign-1", (task,), evidence, wave=4)  # noqa: SLF001
+
+    assert store.journal == [
+        (
+            4,
+            {
+                "kind": "candidate_outcome_unrecorded",
+                "task_id": "arm-worker",
+                "reason": "candidate outcome projection candidate id conflicts with settlement",
+                "evaluation_uncertain": True,
+                "retryable": True,
+            },
+        )
+    ]

@@ -106,6 +106,8 @@ from merlin_agents.campaign_service import (
     _objective_contract_with_phase_gates,
     _objective_phase_gate_result,
     _objective_progress_from_journal,
+    _operator_authorized_coverage_continuation,
+    _operator_coverage_extension_usage,
     _outcomes_are_defensive_only,
     _progress_snapshot_from_status,
     _receipt_refusal_negatives,
@@ -5708,6 +5710,58 @@ def test_saturation_decision_state_pairs_only_the_latest_request() -> None:
     }
 
 
+def test_automatic_coverage_request_is_not_an_operator_prompt() -> None:
+    state = _latest_saturation_decision_state(
+        [
+            {
+                "payload": {
+                    "kind": "saturation_decision_required",
+                    "request_id": "coverage/automatic",
+                    "evidence_digest": "sha256:frontier",
+                    "purpose": "coverage_extension",
+                    "automatic": True,
+                    "coverage_gaps": {"untested_techniques": 3},
+                }
+            }
+        ]
+    )
+
+    assert state["state"] == "awaiting_operator"
+    assert state["automatic"] is True
+
+
+def test_expired_coverage_authorization_invalidates_prior_checkpoint_identity() -> None:
+    events = [
+        {
+            "payload": {
+                "kind": "saturation_decision_required",
+                "request_id": "coverage/one",
+                "evidence_digest": "sha256:unchanged",
+                "purpose": "coverage_extension",
+            }
+        },
+        {
+            "payload": {
+                "kind": "saturation_decision",
+                "request_id": "coverage/one",
+                "evidence_digest": "sha256:unchanged",
+                "decision": "continue",
+                "purpose": "coverage_extension",
+                "automatic": False,
+            }
+        },
+        {
+            "payload": {
+                "kind": "coverage_continuation_authorization_expired",
+                "request_id": "coverage/one",
+                "purpose": "coverage_extension",
+            }
+        },
+    ]
+
+    assert _latest_saturation_decision_state(events) == {"state": "not_requested"}
+
+
 async def test_operator_saturation_decision_is_journaled_against_pending_request() -> None:
     class DecisionStore:
         def __init__(self) -> None:
@@ -5752,6 +5806,8 @@ async def test_operator_saturation_decision_is_journaled_against_pending_request
             "request_id": "request-1",
             "evidence_digest": "sha256:completion",
             "decision": "limit",
+            "purpose": "saturation",
+            "automatic": False,
             "additional_waves": 3,
         },
     )
@@ -5794,6 +5850,87 @@ async def test_operator_can_extend_incomplete_required_coverage() -> None:
     assert result["decision"] == "continue"
     assert store.payload is not None
     assert store.payload[2]["request_id"] == "coverage/request-1"
+    assert store.payload[2]["purpose"] == "coverage_extension"
+    assert store.payload[2]["automatic"] is False
+
+
+def test_operator_coverage_continue_policy_survives_automatic_repair_decisions() -> None:
+    events = [
+        {
+            "payload": {
+                "kind": "saturation_decision_required",
+                "request_id": "coverage/one",
+                "purpose": "coverage_extension",
+            }
+        },
+        {
+            "payload": {
+                "kind": "saturation_decision",
+                "request_id": "coverage/one",
+                "decision": "continue",
+                "purpose": "coverage_extension",
+                "automatic": False,
+            }
+        },
+        {
+            "payload": {
+                "kind": "saturation_decision_required",
+                "request_id": "coverage/two",
+                "purpose": "coverage_extension",
+            }
+        },
+        {
+            "payload": {
+                "kind": "saturation_decision",
+                "request_id": "coverage/two",
+                "decision": "continue",
+                "purpose": "coverage_extension",
+                "automatic": True,
+            }
+        },
+    ]
+
+    assert _operator_authorized_coverage_continuation(events) is True
+    assert _operator_coverage_extension_usage(events) == (2, "coverage/two")
+
+    events.append(
+        {
+            "payload": {
+                "kind": "coverage_continuation_authorization_expired",
+                "request_id": "coverage/two",
+                "purpose": "coverage_extension",
+                "reason": "target-backed semantic plateau",
+            }
+        }
+    )
+    assert _operator_authorized_coverage_continuation(events) is False
+    assert _operator_coverage_extension_usage(events) == (0, None)
+
+    events.append(
+        {
+            "payload": {
+                "kind": "saturation_decision",
+                "request_id": "coverage/three",
+                "decision": "continue",
+                "purpose": "coverage_extension",
+                "automatic": False,
+            }
+        }
+    )
+    assert _operator_authorized_coverage_continuation(events) is True
+
+    events.append(
+        {
+            "payload": {
+                "kind": "saturation_decision",
+                "request_id": "coverage/three",
+                "decision": "stop",
+                "purpose": "coverage_extension",
+                "automatic": False,
+            }
+        }
+    )
+    assert _operator_authorized_coverage_continuation(events) is False
 
 
 async def test_operator_continuation_does_not_wait_forever_for_campaign_lead() -> None:
@@ -6187,6 +6324,230 @@ async def test_quickscan_stops_at_first_coverage_extension_gate() -> None:
     )
 
 
+async def test_operator_continue_authorizes_subsequent_coverage_repair_waves() -> None:
+    """One explicit Continue covers the outstanding mandatory coverage plan.
+
+    The operator must not be interrupted after every single repair wave while
+    the campaign is still making progress toward the same coverage objective.
+    """
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+    class Store:
+        def __init__(self) -> None:
+            self.lead = []
+            self.terminal = None
+
+        def get(self, campaign_id):
+            return {"id": campaign_id, "session_id": "session-1", "status": "executing"}
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def list_waves(self, _campaign_id):
+            return []
+
+        def finish_wave(self, *_args):
+            return None
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.lead.append({"wave": wave, "payload": dict(payload)})
+
+        def finish(self, _campaign_id, status, *, stop_reason=None):
+            self.terminal = (status, stop_reason)
+
+    class Agents:
+        async def list_schedule_tasks(self, _schedule_id):
+            return (AgentTask(id="worker", objective="probe", status="completed", result="{}"),)
+
+    continuations = 0
+    offered_auto_decisions: list[str | None] = []
+
+    class Service(CampaignService):
+        async def status(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "completion_digest": f"sha256:incomplete-{continuations}",
+                "saturation": {
+                    "ready": False,
+                    "execution_complete": False,
+                    "untested_techniques": max(1, 3 - continuations),
+                },
+            }
+
+        async def _await_saturation_decision(self, *args, auto_decision=None, **kwargs):
+            offered_auto_decisions.append(auto_decision)
+            return {
+                "decision": "continue",
+                    "automatic": False,
+                "request_id": f"coverage-{len(offered_auto_decisions)}",
+                "coverage_gaps": {"untested_techniques": max(1, 3 - continuations)},
+            }
+
+        async def _run_saturation_continuation(
+            self, campaign_id, manifest, context, wave, tasks, decision, *args, **kwargs
+        ):
+            nonlocal continuations
+            continuations += 1
+            repaired = (
+                AgentTask(
+                    id=f"repair-{continuations}",
+                    objective="repair coverage",
+                    status="completed",
+                    result="{}",
+                ),
+            )
+            return wave + 1, repaired, LeadAssessment("coverage advanced", False), set()
+
+        async def _campaign_budget_capped(self, *_args):
+            return continuations >= 2
+
+    async def lead(*_args):
+        return LeadAssessment("coverage incomplete", False)
+
+    store = Store()
+    service = Service(store, Agents(), preparation, lead)  # type: ignore[arg-type]
+    await service._supervise(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        SimpleNamespace(id="initial", execution=None),
+    )
+
+    assert continuations == 2
+    assert offered_auto_decisions == [None, "continue"]
+    assert store.terminal == ("completed", "budget_exhausted")
+
+
+async def test_operator_continue_expires_after_three_repair_waves() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+    class Store:
+        def __init__(self) -> None:
+            self.lead = []
+            self.terminal = None
+
+        def get(self, campaign_id):
+            return {"id": campaign_id, "session_id": "session-1", "status": "executing"}
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def list_waves(self, _campaign_id):
+            return []
+
+        def finish_wave(self, *_args):
+            return None
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.lead.append({"wave": wave, "payload": dict(payload)})
+
+        def finish(self, _campaign_id, status, *, stop_reason=None):
+            self.terminal = (status, stop_reason)
+
+    class Agents:
+        async def list_schedule_tasks(self, _schedule_id):
+            return (AgentTask(id="worker", objective="probe", status="completed", result="{}"),)
+
+    continuations = 0
+    offered_auto_decisions: list[str | None] = []
+
+    class Service(CampaignService):
+        async def status(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "completion_digest": f"sha256:incomplete-{continuations}",
+                "completion_document": {
+                    "receipts": (
+                        {
+                            "target_call_ids": tuple(
+                                f"target-call-{index}" for index in range(continuations)
+                            )
+                        },
+                    ),
+                    "findings": (),
+                },
+                "saturation": {
+                    "ready": False,
+                    "execution_complete": False,
+                    "completion_frontier": (
+                        {
+                            "kind": "candidate",
+                            "state": "runnable",
+                            "key": ("candidate", "technique/unclear"),
+                            "identity": {"technique_id": "technique/unclear"},
+                        },
+                    ),
+                    "catalogue_unresolved_cell_ids": (
+                        f"technique/unclear-{continuations}",
+                    ),
+                    "frontier_runnable": 1,
+                    "frontier_exhausted": False,
+                    "total_tasks": continuations + 1,
+                    "terminal_tasks": continuations + 1,
+                },
+            }
+
+        async def _await_saturation_decision(self, *args, auto_decision=None, **kwargs):
+            offered_auto_decisions.append(auto_decision)
+            return {
+                "decision": (
+                    "stop"
+                    if auto_decision is None and len(offered_auto_decisions) > 1
+                    else "continue"
+                ),
+                    "automatic": auto_decision is not None,
+                "request_id": f"coverage-{len(offered_auto_decisions)}",
+                "coverage_gaps": {
+                    "catalogue_unresolved_cell_ids": (
+                        f"technique/unclear-{continuations}",
+                    )
+                },
+            }
+
+        async def _run_saturation_continuation(
+            self, campaign_id, manifest, context, wave, tasks, decision, *args, **kwargs
+        ):
+            nonlocal continuations
+            continuations += 1
+            repaired = (
+                AgentTask(
+                    id=f"repair-{continuations}",
+                    objective="retry unclear coverage",
+                    status="completed",
+                    result="{}",
+                ),
+            )
+            return wave + 1, repaired, LeadAssessment("frontier unchanged", False), set()
+
+        async def _campaign_budget_capped(self, *_args):
+            return False
+
+    async def lead(*_args):
+        return LeadAssessment("coverage incomplete", False)
+
+    store = Store()
+    service = Service(  # type: ignore[arg-type]
+        store,
+        Agents(),
+        preparation,
+        lead,
+    )
+    await service._supervise(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        SimpleNamespace(id="initial", execution=None),
+    )
+
+    assert continuations == 3, (offered_auto_decisions, store.terminal, store.lead)
+    assert offered_auto_decisions == [None, "continue", "continue", None]
+    assert store.terminal == ("completed", "operator_stopped")
+    assert any(
+        item["payload"].get("kind") == "coverage_continuation_authorization_expired"
+        for item in store.lead
+    )
+
+
 async def test_fully_executed_inconclusive_graph_completes_with_limitations() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
 
@@ -6318,6 +6679,49 @@ async def test_coverage_extension_materializes_exact_untested_semantic_cells() -
     )
     assert unresolved_followups
     assert any(technique.resolved_semantic_id in item.objective for item in unresolved_followups)
+
+
+async def test_coverage_extension_materializes_unprojected_exact_cells() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.EXHAUSTIVE)
+    visible = prepared.assignment_context.techniques[0]
+    omitted_id = f"{visible.id}@lang=en@variant=native"
+    context = replace(
+        prepared.assignment_context,
+        techniques=(visible,),
+        language_frontier=LanguageFrontierSpec("en", ("en",), False),
+    )
+
+    followups = CampaignService._coverage_repair_followups(  # noqa: SLF001
+        prepared.manifest,
+        context,
+        {
+            "coverage_gaps": {
+                "untested_concrete_ids": (omitted_id,),
+                "completion_frontier": (
+                    {
+                        "kind": "candidate",
+                        "state": "unresolved",
+                        "identity": {
+                            "technique_id": visible.id,
+                            "controller_id": visible.strategy_id,
+                            "requested_language": visible.language,
+                            "mutation_id": visible.transform_id,
+                        },
+                    },
+                ),
+            }
+        },
+    )
+
+    assert omitted_id in followups[0].objective
+    assert len(followups) == 1
+    compilation = CampaignService._followup_compilation(  # noqa: SLF001
+        prepared.manifest,
+        context,
+        2,
+        followups,
+    )
+    assert any(omitted_id in assignment.technique_ids for assignment in compilation.assignments)
 
 
 async def test_unattended_continue_carries_gaps_into_coverage_repair() -> None:
@@ -7398,8 +7802,48 @@ async def test_changed_frontier_supersedes_stale_saturation_request_once() -> No
         "sha256:old",
         "sha256:new",
     ]
+    assert requests[-1]["request_id"] == "saturation/new/wave-4/2"
     waiting.cancel()
     await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def test_compacted_saturation_journal_keeps_later_wave_request_identity_unique() -> None:
+    class CompactDecisionJournal:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def list_lead(self, _campaign_id):
+            return list(self.events)
+
+        def commit_lead_decision(self, _campaign_id, wave, _decision_id, payload, _mailbox):
+            self.events = [{"wave": wave, "payload": dict(payload)}]
+
+    store = CompactDecisionJournal()
+    service = CampaignService(store, object(), preparation)  # type: ignore[arg-type]
+
+    first = asyncio.create_task(  # noqa: SLF001
+        service._await_saturation_decision("campaign-1", 87, "sha256:first")
+    )
+    await asyncio.sleep(0.02)
+    first_request = store.events[-1]["payload"]
+    assert isinstance(first_request, dict)
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+
+    # Simulate retention compaction before the next checkpoint. The local
+    # sequence restarts, so the wave must keep the request identity distinct.
+    store.events = []
+    second = asyncio.create_task(  # noqa: SLF001
+        service._await_saturation_decision("campaign-1", 90, "sha256:second")
+    )
+    await asyncio.sleep(0.02)
+    second_request = store.events[-1]["payload"]
+    assert isinstance(second_request, dict)
+    assert first_request["request_id"] == "saturation/first/wave-87/1"
+    assert second_request["request_id"] == "saturation/second/wave-90/1"
+    assert first_request["request_id"] != second_request["request_id"]
+    second.cancel()
+    await asyncio.gather(second, return_exceptions=True)
 
 
 async def test_completion_receipt_rejects_not_ready_saturation_and_conflicting_replay() -> None:
@@ -7882,6 +8326,61 @@ async def test_saturation_counts_exact_attempts_not_all_cells_owned_by_worker() 
     assert evidence.catalogue_cells_refuted == 1
     assert evidence.catalogue_cells_unsearched == 53
     assert evidence.ready is False
+
+
+async def test_saturation_counts_evidence_backed_direct_attempt_results() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.EXHAUSTIVE)
+    service = CampaignService(SimpleNamespace(), SimpleNamespace(), preparation)  # type: ignore[arg-type]
+    lead = [
+        {"payload": {"coverage_complete": True, "validation_finding_ids": []}}
+        for _ in range(3)
+    ]
+
+    evidence = service._project_saturation_evidence(  # noqa: SLF001
+        prepared.manifest,
+        lead,
+        [
+            {
+                "wave": wave_id,
+                "kind": "followup",
+                "status": "completed",
+                "tasks": (
+                    {
+                        "id": "direct-attempt",
+                        "status": "completed",
+                        "technique_ids": ("assigned",),
+                        "technique_outcomes": {},
+                        "result": json.dumps(
+                            {
+                                "attempted_techniques": [
+                                    {
+                                        "technique_id": "assigned",
+                                        "outcome": "refuted",
+                                        "evidence_refs": [f"target-call:{wave_id}"],
+                                    },
+                                    {
+                                        "technique_id": "not-assigned",
+                                        "outcome": "confirmed",
+                                        "evidence_refs": [f"target-call:injected:{wave_id}"],
+                                    },
+                                ]
+                            }
+                        ),
+                    },
+                ),
+            }
+            for wave_id in range(3)
+        ],
+        admitted_technique_ids={"assigned", "not-assigned"},
+        awaiting_validation=0,
+    )
+
+    assert evidence is not None
+    assert evidence.attempted_techniques == 1
+    assert evidence.catalogue_cells_refuted == 1
+    assert evidence.catalogue_cells_confirmed == 0
+    assert evidence.untested_technique_ids == ("not-assigned",)
+    assert evidence.no_new_findings_waves == 3
 
 
 async def test_multilingual_saturation_groups_transforms_but_retains_language_frontier() -> None:
@@ -17147,6 +17646,135 @@ async def test_campaign_resume_reconciles_running_wave_with_terminal_scheduler()
     }
 
 
+async def test_campaign_resume_reconciles_paused_wave_with_terminal_scheduler() -> None:
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.row = None
+            self.journal = []
+            self.wave_status = "paused"
+
+        def prepare(self, campaign_id, session_id, manifest, digest):
+            self.row = {
+                "id": campaign_id,
+                "session_id": session_id,
+                "manifest": manifest,
+                "manifest_digest": digest,
+                "status": "prepared",
+            }
+            return self.row
+
+        def get(self, _campaign_id):
+            return self.row
+
+        def list_waves(self, _campaign_id):
+            return [{"wave": 5, "status": self.wave_status, "schedule_id": "schedule-5"}]
+
+        def resume(self, _campaign_id):
+            self.row["status"] = "executing"
+            self.wave_status = "running"
+            return self.row
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            self.journal.append(payload)
+
+    class RecoveryAgents:
+        async def schedule_status(self, schedule_id):
+            assert schedule_id == "schedule-5"
+            return "completed"
+
+        async def resume_schedule(self, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("a terminal paused scheduler must enter reconciliation")
+
+    class RecoveryService(CampaignService):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.recovery_calls = 0
+
+        async def recover(self, *, resume_execution=True):
+            assert resume_execution is True
+            self.recovery_calls += 1
+            return 1
+
+    store = RecoveryStore()
+    service = RecoveryService(store, RecoveryAgents(), preparation)  # type: ignore[arg-type]
+    review = await service.prepare("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    campaign_id = str(review["campaign_id"])
+    store.row["status"] = "paused"
+
+    assert await service.resume(campaign_id) == {
+        "campaign_id": campaign_id,
+        "status": "executing",
+    }
+    assert store.row["status"] == "executing"
+    assert store.wave_status == "running"
+    assert service.recovery_calls == 1
+    assert store.journal[-1] == {
+        "state": "executing",
+        "reason": "operator-terminal-paused-scheduler-continuation",
+        "schedule_id": "schedule-5",
+        "schedule_status": "completed",
+    }
+
+
+async def test_campaign_resume_rechecks_scheduler_that_terminalizes_during_resume() -> None:
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.row = None
+            self.journal = []
+
+        def prepare(self, campaign_id, session_id, manifest, digest):
+            self.row = {
+                "id": campaign_id,
+                "session_id": session_id,
+                "manifest": manifest,
+                "manifest_digest": digest,
+                "status": "prepared",
+            }
+            return self.row
+
+        def get(self, _campaign_id):
+            return self.row
+
+        def list_waves(self, _campaign_id):
+            return [{"wave": 5, "status": "paused", "schedule_id": "schedule-5"}]
+
+        def resume(self, _campaign_id):
+            self.row["status"] = "executing"
+            return self.row
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            self.journal.append(payload)
+
+    class RecoveryAgents:
+        def __init__(self) -> None:
+            self.statuses = iter(("paused", "completed"))
+
+        async def schedule_status(self, _schedule_id):
+            return next(self.statuses)
+
+        async def resume_schedule(self, _schedule_id):
+            raise ValueError("schedule is unknown or not paused")
+
+    class RecoveryService(CampaignService):
+        async def recover(self, *, resume_execution=True):
+            assert resume_execution is True
+            return 1
+
+    store = RecoveryStore()
+    service = RecoveryService(store, RecoveryAgents(), preparation)  # type: ignore[arg-type]
+    review = await service.prepare("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    campaign_id = str(review["campaign_id"])
+    store.row["status"] = "paused"
+
+    assert await service.resume(campaign_id) == {
+        "campaign_id": campaign_id,
+        "status": "executing",
+    }
+    assert store.journal[-1]["reason"] == (
+        "operator-terminal-paused-scheduler-continuation"
+    )
+
+
 async def test_campaign_resume_retries_failed_incomplete_coverage_from_latest_wave() -> None:
     class RetryStore:
         def __init__(self) -> None:
@@ -23615,19 +24243,22 @@ async def test_lazy_frontier_status_and_receipt_projection_stay_bounded_at_12765
     assert "frontier_snapshot" not in document
     assert "reference" not in snapshot
     assert snapshot["sealed"] is False
-    assert snapshot["total_count"] == 12_765
-    assert snapshot["counts"]["outcomes"]["unattempted"] == 12_765
+    # Recommended completion tracks one reviewed representative per family.
+    # The full 69 x 47 x 4 lazy portfolio remains durable for later adaptive
+    # admission; it is not silently promoted into mandatory completion work.
+    assert snapshot["total_count"] == 69
+    assert snapshot["counts"]["outcomes"]["unattempted"] == 69
     assert len(snapshot["sample"]) == 32
     assert [item["position"] for item in snapshot["sample"]] == list(range(32))
-    assert document["unsearched_frontier_projection"]["count"] == 12_765
+    assert document["unsearched_frontier_projection"]["count"] == 69
     assert len(document["unsearched_frontier"]) == 32
-    assert projected["saturation"]["completion_frontier_projection"]["count"] == 12_765
+    assert projected["saturation"]["completion_frontier_projection"]["count"] == 69
     assert len(projected["saturation"]["completion_frontier"]) == 32
     assert len(json.dumps(_json_value(document))) < 250_000
 
     sealed = await service.status(prepared.manifest.id, seal_frontier_snapshot=True)
     assert len(recorded_snapshots) == 1
-    assert len(recorded_snapshots[0][2]) == 12_765
+    assert len(recorded_snapshots[0][2]) == 69
     assert sealed["completion_document"]["schema"] == "merlin.campaign-completion.v2"
     assert sealed["completion_document"]["frontier_snapshot"]["reference"].startswith(
         f"merlin-frontier-snapshot:{prepared.manifest.id}:"

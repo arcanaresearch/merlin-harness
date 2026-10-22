@@ -107,13 +107,15 @@ def test_reviewed_adapter_multi_turn_support_accepts_evidence_bound_plural_oracl
 
 
 def _fallback_technique_ids(context: AssignmentContext) -> set[str]:
-    """Technique ids the structural explorer lane owns under template routing."""
+    """Direct technique ids retained by the structural explorer lane."""
 
     template = template_by_id("merlin-core-specialists", 1)
     return {
         item.id
         for item in context.techniques
-        if route_specialty_tags(item.tags, template) == "adversarial-explorer"
+        if item.execution_role == "direct"
+        or item.strategy_id in {"crescendo", "goat", "hydra-select"}
+        or route_specialty_tags(item.tags, template) == "adversarial-explorer"
     }
 
 

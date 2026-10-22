@@ -99,7 +99,6 @@ class ExecuteStore:
     def list_lead(self, _campaign_id):
         return [{"wave": wave, "payload": payload} for wave, payload in self.lead]
 
-
 class ReconAgents:
     def __init__(self) -> None:
         self.submissions = []
@@ -121,7 +120,13 @@ class ReconAgents:
 
 async def test_execute_admits_wave0_template_specialists_exactly_once() -> None:
     prepared = _preparation("session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED)
-    store = ExecuteStore(prepared)
+
+    class FrontierExecuteStore(ExecuteStore):
+        def claim_frontier_batch(self, *_args, **_kwargs):
+            """Model the PostgreSQL frontier capability used by packaged campaigns."""
+            return ()
+
+    store = FrontierExecuteStore(prepared)
     agents = ReconAgents()
     service = CampaignService(store, agents, _preparation)  # type: ignore[arg-type]
 

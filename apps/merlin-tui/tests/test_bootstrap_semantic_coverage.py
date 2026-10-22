@@ -432,6 +432,29 @@ def test_report_publication_requires_current_terminal_campaign_authority() -> No
         cleanup_status="completed",
         report_state="complete",
     )
+    _require_terminal_report_authority(
+        "campaign/example",
+        "operator_stopped",
+        {
+            **authority,
+            "stop_reason": "operator_stopped",
+        },
+        completion_digest=completion_digest,
+        cleanup_status="completed",
+        report_state="complete",
+    )
+    _require_terminal_report_authority(
+        "campaign/example",
+        "operator_stopped",
+        {
+            **authority,
+            "status": "cancelled",
+            "stop_reason": "operator_stopped",
+        },
+        completion_digest=completion_digest,
+        cleanup_status="completed",
+        report_state="complete",
+    )
 
     with pytest.raises(RuntimeError, match="not terminal"):
         _require_terminal_report_authority(

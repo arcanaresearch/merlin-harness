@@ -107,6 +107,49 @@ async def test_wave_progress_omits_completed_review() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wave_progress_projects_pending_saturation_decision_without_coverage_payload() -> None:
+    class Store:
+        def list_waves(self, _campaign_id):
+            return [
+                {
+                    "wave": 86,
+                    "kind": "frontier",
+                    "status": "completed",
+                    "schedule_id": "schedule-86",
+                    "target_id": "target-1",
+                }
+            ]
+
+        def list_lead(self, _campaign_id):
+            return [
+                {
+                    "payload": {
+                        "kind": "saturation_decision_required",
+                        "request_id": "coverage-extension-1",
+                        "evidence_digest": "sha256:evidence",
+                        "purpose": "coverage_extension",
+                        "coverage_gaps": {"completion_frontier": tuple(range(10_000))},
+                    }
+                }
+            ]
+
+    class Agents:
+        async def target_progress(self, _campaign_id, _target_id):
+            return {}
+
+    service = CampaignService(Store(), Agents(), None)  # type: ignore[arg-type]
+
+    decision = (await service.wave_progress("campaign-1"))["saturation_decision"]
+
+    assert decision == {
+        "state": "awaiting_operator",
+        "request_id": "coverage-extension-1",
+        "evidence_digest": "sha256:evidence",
+        "purpose": "coverage_extension",
+    }
+
+
+@pytest.mark.asyncio
 async def test_wave_progress_projects_parallel_task_reviews() -> None:
     class Store:
         def list_waves(self, _campaign_id):

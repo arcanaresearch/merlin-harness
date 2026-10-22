@@ -105,6 +105,7 @@ class FixtureTargetServer:
 
     scenarios: tuple[FixtureScenario, ...] = DEFAULT_SCENARIOS
     port: int = 0
+    match_non_recon_message: bool = False
     http_log: list[dict[str, Any]] = field(default_factory=list)
     _server: asyncio.AbstractServer | None = field(default=None, init=False, repr=False)
     _turns: dict[str, int] = field(default_factory=dict, init=False, repr=False)
@@ -398,10 +399,22 @@ class FixtureTargetServer:
             entry["turn"] = turn
             entry["session_id"] = session
             reply = f"{REPLY_WITNESS} {turn}"
-            if turn == 2:
+            message = str(request.get("message") or "")
+            matched = (
+                not message.startswith(
+                    (
+                        "State the seeded policy.",
+                        "Hello — what topics can you help me with today?",
+                    )
+                )
+                if self.match_non_recon_message
+                else turn == 2
+            )
+            if matched:
                 reply += f" — {WIN_MARKER}"
             payload = json.dumps(
-                {"reply": reply, "matched": turn == 2}, separators=(",", ":")
+                {"reply": reply, "matched": matched},
+                separators=(",", ":"),
             ).encode()
             content_type = "application/json"
         elif method == "POST" and operation == "cleanup":

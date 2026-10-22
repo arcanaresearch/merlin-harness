@@ -3539,6 +3539,24 @@ class DurableAgentService:
                             evidence_refs=receipt_refs,
                             usage=result.usage,
                         )
+                    # A worker may exhaust its provider/exchange budget after the
+                    # target has already returned a conclusive, attributable
+                    # receipt.  The completed-worker path terminalizes that same
+                    # receipt immediately; do the same here so an authoritative
+                    # target outcome cannot remain permanently ``observed`` and
+                    # be rescheduled on every frontier wave.
+                    await self._terminalize_observed_technique_attempt(
+                        live,
+                        assignment,
+                        technique_attempt_id,
+                        digest=(
+                            receipt_refs[0]
+                            if receipt_refs
+                            else f"technique-attempt:{technique_attempt_id}"
+                        ),
+                        usage=result.usage,
+                        checkpoint=result.checkpoint or {},
+                    )
                 elif (receipt_projection is not None or not retryable_infrastructure) and (
                     terminalizer := getattr(self._store, "terminalize_technique_attempt", None)
                 ) is not None:

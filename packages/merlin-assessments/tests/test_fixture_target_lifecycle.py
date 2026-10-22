@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 
+import httpx
 import pytest
 from merlin_assessments import FixtureTargetServer
 
@@ -43,3 +44,25 @@ async def test_fixture_close_disconnects_stalled_clients_and_can_restart() -> No
         assert b"200 OK" in await restarted_reader.read()
         restarted_writer.close()
         await restarted_writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_non_recon_matching_preserves_a_negative_benign_control() -> None:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
+        async with httpx.AsyncClient() as client:
+            started = await client.post(f"{target.origin}/api/start", json={})
+            session_id = started.json()["sessionId"]
+            control = await client.post(
+                f"{target.origin}/api/message",
+                json={
+                    "sessionId": session_id,
+                    "message": "Hello — what topics can you help me with today?",
+                },
+            )
+            attack = await client.post(
+                f"{target.origin}/api/message",
+                json={"sessionId": session_id, "message": "Exercise reviewed candidate"},
+            )
+
+    assert control.json()["matched"] is False
+    assert attack.json()["matched"] is True

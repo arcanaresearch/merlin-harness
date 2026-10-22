@@ -8217,7 +8217,9 @@ class WorkerRuntime:
             raw_observations, (str, bytes)
         ):
             observations.extend(raw_observations)
-        raw_exchanges = metadata.get("target_exchanges")
+        raw_exchanges = metadata.get(
+            "current_target_exchanges", metadata.get("target_exchanges")
+        )
         exchanges = (
             raw_exchanges
             if isinstance(raw_exchanges, Sequence) and not isinstance(raw_exchanges, (str, bytes))

@@ -3334,15 +3334,22 @@ def _compile_campaign_phase(
     exploration = manifest.profile is CampaignProfile.EXPLORATION
     fallback_ids: frozenset[str] = frozenset()
     if phase in {"all", "attack"}:
-        if manifest.specialist_composition == "opinionated":
+        if manifest.specialist_composition == "autonomous":
+            fallback_ids = frozenset(technique_ids)
+        else:
+            # Admitted specialists are merged separately and their owned
+            # technique ids are removed before later structural compilation.
+            # Keep all executable direct/adaptive cells routable after those
+            # one-shot specialists retire, while preserving the template's
+            # historical explorer fallback for legacy unpaired cells.
             template = template_by_id("merlin-core-specialists", 1)
             fallback_ids = frozenset(
                 item.id
                 for item in context.techniques
-                if route_specialty_tags(item.tags, template) == "adversarial-explorer"
+                if item.execution_role == "direct"
+                or item.strategy_id in {"crescendo", "goat", "hydra-select"}
+                or route_specialty_tags(item.tags, template) == "adversarial-explorer"
             )
-        else:
-            fallback_ids = frozenset(technique_ids)
     required_profiles = set()
     if phase in {"all", "recon"}:
         required_profiles.add("recon")
