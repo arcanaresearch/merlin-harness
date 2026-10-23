@@ -12,7 +12,9 @@ from merlin_tui.app import (
     COMMANDS,
     CampaignScreen,
     Composer,
+    EndpointScreen,
     EndpointSetup,
+    JevSetupScreen,
     LibraryScreen,
     LiveTranscript,
     MerlinApp,
@@ -1691,6 +1693,32 @@ async def test_form_drawers_expose_semantic_names_and_restore_keyboard_focus(
         await pilot.press("escape")
         await pilot.pause()
         assert composer.has_focus
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "screen",
+    (
+        EndpointScreen(),
+        SetupScreen("openai", base_url="https://example.test", model="test-model"),
+        JevSetupScreen(token_configured=True),
+        ModelScreen(judgments_jev_token_configured=True),
+        RemoteMcpScreen(),
+    ),
+)
+async def test_form_drawers_submit_with_ctrl_enter_from_any_control(screen) -> None:
+    results = []
+    app = MerlinApp(DemoBackend())
+    async with app.run_test() as pilot:
+        app.push_screen(screen, results.append)
+        await pilot.pause()
+        if isinstance(screen, EndpointScreen):
+            screen.query_one("#endpoint-model", Input).value = "test-model"
+            screen.query_one("#endpoint-base-url", Input).value = "https://example.test"
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+
+    assert len(results) == 1
 
 
 @pytest.mark.asyncio

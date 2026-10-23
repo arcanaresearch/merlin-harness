@@ -5,13 +5,17 @@ from rich.console import RenderableType
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, RadioButton, RadioSet, Static
 
 
 class UserInputScreen(ModalScreen[str | None]):
-    BINDINGS = [("escape", "dismiss_question", "Answer in chat")]
+    BINDINGS = [
+        Binding("ctrl+enter", "submit_answers", "Continue", priority=True),
+        Binding("escape", "dismiss_question", "Answer in chat", priority=True),
+    ]
     DEFAULT_CSS = """
     UserInputScreen { align: center middle; background: $background 70%; }
     #operator-question { width: 90; max-width: 94%; height: auto; max-height: 90%;
@@ -22,6 +26,7 @@ class UserInputScreen(ModalScreen[str | None]):
     #operator-question Input { margin-top: 1; }
     #operator-question Button { margin-top: 1; }
     #question-context { height: auto; margin-bottom: 1; }
+    #question-help { color: $text-muted; height: auto; margin-top: 1; }
     #question-error { color: $error; height: auto; }
     """
 
@@ -59,12 +64,26 @@ class UserInputScreen(ModalScreen[str | None]):
                             )
                 if question.allow_free_text:
                     yield Input(placeholder="Your answer or additional context", id=f"text-{index}")
+            yield Static(
+                "Tab/Shift+Tab move · arrows choose · Space toggles · "
+                "Enter activates · Ctrl+Enter continues · Esc answers in chat",
+                id="question-help",
+                markup=False,
+            )
             yield Static("", id="question-error")
             yield Button("Continue", variant="primary", id="question-continue")
             yield Button("Answer in chat", id="question-close")
 
+    def on_mount(self) -> None:
+        controls = list(self.query("RadioSet, Checkbox, Input, Button"))
+        if controls:
+            controls[0].focus()
+
     @on(Button.Pressed, "#question-continue")
     def submit_answers(self) -> None:
+        self.action_submit_answers()
+
+    def action_submit_answers(self) -> None:
         answers = {}
         for index, question in enumerate(self.request.questions):
             ids = [

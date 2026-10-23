@@ -187,6 +187,49 @@ async def test_terminal_question_selection_and_free_text():
 
 
 @pytest.mark.asyncio
+async def test_terminal_question_is_fully_keyboard_controllable():
+    request = InputRequest(request_id="question-keyboard", questions=QUESTIONS)
+    result = []
+
+    class QuestionApp(App):
+        def on_mount(self):
+            self.push_screen(UserInputScreen(request), result.append)
+
+    app = QuestionApp()
+    async with app.run_test(size=(120, 45)) as pilot:
+        await pilot.pause()
+        assert app.screen.query_one("#options-0").has_focus
+        await pilot.press("down", "space")
+        await pilot.press("tab")
+        assert app.screen.query_one("#text-0", Input).has_focus
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+
+    response = InputResponse.model_validate_json(result[0][len(ANSWER_PREFIX) :])
+    assert response.answers["auth"].option_ids == ["google"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_question_continue_button_activates_with_enter():
+    request = InputRequest(request_id="question-enter", questions=QUESTIONS)
+    result = []
+
+    class QuestionApp(App):
+        def on_mount(self):
+            self.push_screen(UserInputScreen(request), result.append)
+
+    app = QuestionApp()
+    async with app.run_test(size=(120, 45)) as pilot:
+        await pilot.pause()
+        await pilot.press("tab", "tab")
+        assert app.screen.query_one("#question-continue").has_focus
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
 async def test_backend_resume_and_answer_resolve_the_same_durable_question():
     import asyncio
 

@@ -576,7 +576,10 @@ class EndpointSetup:
 
 class EndpointScreen(ModalScreen[EndpointSetup | None]):
     DEFAULT_CSS = ChoiceScreen.DEFAULT_CSS.replace("ChoiceScreen", "EndpointScreen")
-    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+    BINDINGS = [
+        Binding("ctrl+enter", "save", "Save", show=False, priority=True),
+        Binding("escape", "cancel", "Close", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -619,10 +622,16 @@ class EndpointScreen(ModalScreen[EndpointSetup | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_save(self) -> None:
+        self.query_one("#save", Button).press()
+
 
 class SetupScreen(ModalScreen[ProviderSetup | None]):
     DEFAULT_CSS = ChoiceScreen.DEFAULT_CSS.replace("ChoiceScreen", "SetupScreen")
-    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+    BINDINGS = [
+        Binding("ctrl+enter", "save", "Save", show=False, priority=True),
+        Binding("escape", "cancel", "Close", show=False),
+    ]
 
     def __init__(
         self, route: Any, base_url: str = "", model: str = "", effort: str = "default"
@@ -748,6 +757,9 @@ class SetupScreen(ModalScreen[ProviderSetup | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_save(self) -> None:
+        self.query_one("#save", Button).press()
+
 
 _JEV_ENABLE_LABEL = "Yes — set up Jev"
 _JEV_SKIP_LABEL = "No — keep off (default)"
@@ -760,7 +772,10 @@ class JevSetup:
 
 class JevSetupScreen(ModalScreen[JevSetup | None]):
     DEFAULT_CSS = ChoiceScreen.DEFAULT_CSS.replace("ChoiceScreen", "JevSetupScreen")
-    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+    BINDINGS = [
+        Binding("ctrl+enter", "save", "Save", show=False, priority=True),
+        Binding("escape", "cancel", "Close", show=False),
+    ]
 
     def __init__(self, token_configured: bool = False) -> None:
         super().__init__()
@@ -798,6 +813,9 @@ class JevSetupScreen(ModalScreen[JevSetup | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_save(self) -> None:
+        self.query_one("#save", Button).press()
+
 
 @dataclass(frozen=True, slots=True)
 class ModelSetup:
@@ -818,7 +836,10 @@ class ModelSetup:
 
 class ModelScreen(ModalScreen[ModelSetup | None]):
     DEFAULT_CSS = ChoiceScreen.DEFAULT_CSS.replace("ChoiceScreen", "ModelScreen")
-    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+    BINDINGS = [
+        Binding("ctrl+enter", "save", "Save", show=False, priority=True),
+        Binding("escape", "cancel", "Close", show=False),
+    ]
     _CUSTOM_MODEL = "__custom_model__"
 
     def __init__(
@@ -1175,6 +1196,9 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_save(self) -> None:
+        self.query_one("#save", Button).press()
+
 
 async def _configured_model_screen(current: str) -> ModelScreen:
     """Build the routing dialog from live catalogues plus persisted model IDs."""
@@ -1288,7 +1312,10 @@ class RemoteMcpSetup:
 
 class RemoteMcpScreen(ModalScreen[RemoteMcpSetup | None]):
     DEFAULT_CSS = ChoiceScreen.DEFAULT_CSS.replace("ChoiceScreen", "RemoteMcpScreen")
-    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+    BINDINGS = [
+        Binding("ctrl+enter", "save", "Save", show=False, priority=True),
+        Binding("escape", "cancel", "Close", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -1329,6 +1356,9 @@ class RemoteMcpScreen(ModalScreen[RemoteMcpSetup | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def action_save(self) -> None:
+        self.query_one("#mcp-remote-save", Button).press()
 
 
 class SelectableDrawerText(TextArea):
