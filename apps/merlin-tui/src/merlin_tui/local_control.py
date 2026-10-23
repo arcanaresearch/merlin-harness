@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
@@ -550,6 +551,49 @@ async def serve(
     foreground_channel: _Channel | None = None
     foreground_accepts_close = False
     unclaimed_shutdown: asyncio.Task[None] | None = None
+    shutdown_record: dict[str, Any] | None = None
+
+    async def shutdown_state() -> dict[str, object]:
+        """Capture best-effort durable state before owned resources are closed."""
+        snapshot: dict[str, object] = {}
+        for name in ("list_campaigns", "list_active_schedules"):
+            reader = getattr(backend, name, None)
+            if not callable(reader):
+                continue
+            try:
+                snapshot[name] = _json(await reader())
+            except Exception as error:
+                snapshot[f"{name}_error"] = (
+                    f"{type(error).__module__}.{type(error).__qualname__}: {error}"
+                )
+        return snapshot
+
+    async def request_shutdown(
+        reason: str,
+        *,
+        clean: bool,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        """Attribute every orderly daemon shutdown before teardown begins."""
+        nonlocal clean_shutdown, shutdown_record
+        if shutdown.is_set():
+            return
+        clean_shutdown = clean
+        shutdown_record = {
+            "event": "merlin_daemon_shutdown_requested",
+            "reason": reason,
+            "clean": clean,
+            "occurred_at": time.time(),
+            "foreground_lease_id": foreground_lease_id,
+            "details": dict(details or {}),
+            "state": await shutdown_state(),
+            "caller_stack": traceback.format_stack()[:-1],
+        }
+        logging.getLogger(__name__).warning(
+            "MERLIN_DAEMON_SHUTDOWN %s",
+            json.dumps(shutdown_record, separators=(",", ":"), default=str),
+        )
+        shutdown.set()
 
     async def stop_if_daemon_remains_unclaimed(*, grace_seconds: float) -> None:
         """Retire an unclaimed daemon after its durable background work settles."""
@@ -558,26 +602,49 @@ async def serve(
             await asyncio.sleep(grace_seconds)
         activity_reader = getattr(backend, "has_active_background_work", None)
         inactive_observations = 0
+        observations: list[dict[str, object]] = []
         while foreground_lease_id is None and not shutdown.is_set():
             active_stream = any(
                 state.task is not None and not state.task.done()
                 for state in streams.values()
             )
             try:
-                active = active_stream or (
+                background_active = (
                     bool(await activity_reader()) if callable(activity_reader) else False
                 )
-            except Exception:
+                active = active_stream or background_active
+                activity_error = None
+            except Exception as error:
                 # Losing the daemon would pause and invalidate live target contexts.
                 # Preserve possible work and retry the authoritative activity check.
                 active = True
+                background_active = None
+                activity_error = (
+                    f"{type(error).__module__}.{type(error).__qualname__}: {error}"
+                )
+            observations.append(
+                {
+                    "observed_at": time.time(),
+                    "active_stream": active_stream,
+                    "background_active": background_active,
+                    "activity_error": activity_error,
+                    "active": active,
+                }
+            )
             if active:
                 inactive_observations = 0
             else:
                 inactive_observations += 1
             if inactive_observations >= 2:
-                clean_shutdown = True
-                shutdown.set()
+                await request_shutdown(
+                    "idle_watchdog",
+                    clean=True,
+                    details={
+                        "grace_seconds": grace_seconds,
+                        "inactive_observations": inactive_observations,
+                        "observations": observations[-10:],
+                    },
+                )
                 return
             try:
                 await asyncio.wait_for(
@@ -776,9 +843,12 @@ async def serve(
                 requested_lease = request.get("lease_id")
                 if foreground_lease_id is not None and requested_lease != foreground_lease_id:
                     raise PermissionError("clean shutdown is reserved for the foreground owner")
-                clean_shutdown = True
                 await channel.send({"type": "result", "value": "stopping"})
-                shutdown.set()
+                await request_shutdown(
+                    "explicit_request",
+                    clean=True,
+                    details={"method": method, "requested_lease_id": requested_lease},
+                )
                 return
             if method == "close_foreground":
                 if foreground_channel is not None:
@@ -819,6 +889,8 @@ async def serve(
                         "heartbeat_seconds": _FOREGROUND_HEARTBEAT_SECONDS,
                     }
                 )
+                lease_end_reason = "foreground_eof"
+                last_heartbeat_at = time.monotonic()
                 try:
                     # EOF handles normal and abrupt exits. Heartbeats also detect a
                     # suspended frontend, which otherwise keeps its Unix socket open
@@ -829,13 +901,31 @@ async def serve(
                                 deadline_seconds=_FOREGROUND_LEASE_TIMEOUT_SECONDS
                             )
                         except TimeoutError:
+                            lease_end_reason = "heartbeat_timeout"
                             break
                         if (
                             heartbeat.get("method") != "foreground_heartbeat"
                             or heartbeat.get("lease_id") != lease_id
                         ):
+                            lease_end_reason = "invalid_heartbeat"
                             raise ValueError("invalid foreground lease heartbeat")
+                        last_heartbeat_at = time.monotonic()
                 finally:
+                    logging.getLogger(__name__).warning(
+                        "MERLIN_FOREGROUND_LEASE_RELEASED %s",
+                        json.dumps(
+                            {
+                                "event": "merlin_foreground_lease_released",
+                                "reason": lease_end_reason,
+                                "lease_id": lease_id,
+                                "seconds_since_heartbeat": max(
+                                    0.0, time.monotonic() - last_heartbeat_at
+                                ),
+                                "timeout_seconds": _FOREGROUND_LEASE_TIMEOUT_SECONDS,
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
                     if foreground_lease_id == lease_id:
                         foreground_lease_id = None
                         foreground_channel = None
@@ -902,9 +992,27 @@ async def serve(
         recovery_watcher = asyncio.create_task(
             watch_campaign_ownership(), name="local-control:campaign-recovery-watchdog"
         )
+    exit_error: BaseException | None = None
     try:
         async with server:
             await shutdown.wait()
+    except BaseException as error:
+        exit_error = error
+        if shutdown_record is None:
+            shutdown_record = {
+                "event": "merlin_daemon_shutdown_requested",
+                "reason": "fatal_exception",
+                "clean": False,
+                "occurred_at": time.time(),
+                "error": f"{type(error).__module__}.{type(error).__qualname__}: {error}",
+                "traceback": traceback.format_exc(),
+                "state": await shutdown_state(),
+            }
+            logging.getLogger(__name__).exception(
+                "MERLIN_DAEMON_SHUTDOWN %s",
+                json.dumps(shutdown_record, separators=(",", ":"), default=str),
+            )
+        raise
     finally:
         if unclaimed_shutdown is not None:
             unclaimed_shutdown.cancel()
@@ -938,6 +1046,28 @@ async def serve(
         except BaseException as error:
             cleanup_error = error
         finally:
+            final_record = {
+                "event": "merlin_daemon_shutdown_finished",
+                "reason": (shutdown_record or {}).get("reason", "unknown"),
+                "clean": clean_shutdown,
+                "exit_error": (
+                    None
+                    if exit_error is None
+                    else f"{type(exit_error).__module__}.{type(exit_error).__qualname__}: {exit_error}"
+                ),
+                "cleanup_error": (
+                    None
+                    if cleanup_error is None
+                    else (
+                        f"{type(cleanup_error).__module__}."
+                        f"{type(cleanup_error).__qualname__}: {cleanup_error}"
+                    )
+                ),
+            }
+            logging.getLogger(__name__).warning(
+                "MERLIN_DAEMON_SHUTDOWN_FINISHED %s",
+                json.dumps(final_record, separators=(",", ":"), default=str),
+            )
             await asyncio.to_thread(socket_path.unlink, missing_ok=True)
             if hold_lock_until_process_exit:
                 # asyncio.run() waits for default-executor work only after this
