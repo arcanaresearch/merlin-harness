@@ -1132,7 +1132,7 @@ async def test_background_recovery_renews_campaign_ownership_but_recovers_agents
 
     assert calls == [
         ("lifecycle", None),
-        ("campaigns", False),
+        ("campaigns", True),
         ("agents", False),
         ("lifecycle", None),
         ("campaigns", True),
@@ -2174,7 +2174,7 @@ async def test_campaign_inventory_projects_durable_wave_without_full_status():
 
 
 @pytest.mark.asyncio
-async def test_startup_and_new_session_do_not_resume_saved_work() -> None:
+async def test_startup_and_new_session_keep_authorized_campaign_work_running() -> None:
     calls = []
 
     class StartupKernel(FakeKernel):
@@ -2191,10 +2191,7 @@ async def test_startup_and_new_session_do_not_resume_saved_work() -> None:
 
         async def recover(self, *, resume_execution=True):
             calls.append(("campaigns", resume_execution))
-            if not resume_execution:
-                self.status = "paused"
-            elif self.status == "executing":
-                raise AssertionError("old campaign resumed without operator selection")
+            assert resume_execution
 
     class Agents:
         async def recover(self, *, resume_execution=True):
@@ -2209,13 +2206,13 @@ async def test_startup_and_new_session_do_not_resume_saved_work() -> None:
     campaigns = Campaigns()
     backend = KernelBackend(kernel, campaigns=campaigns, agents=Agents())
     await backend.recover_background()
-    assert campaigns.status == "paused"
+    assert campaigns.status == "executing"
     await backend.list_schedules()
     assert [event async for event in backend.stream("/new")] == []
     await backend.recover_background()
     assert kernel.session_id == "new-session"
-    assert campaigns.status == "paused"
-    assert calls == [("campaigns", False), ("agents", False), ("campaigns", True)]
+    assert campaigns.status == "executing"
+    assert calls == [("campaigns", True), ("agents", False), ("campaigns", True)]
 
 
 async def test_conversation_history_is_paged_sanitized_and_session_bound():

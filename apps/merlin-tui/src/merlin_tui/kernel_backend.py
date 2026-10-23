@@ -1474,13 +1474,15 @@ class KernelBackend:
     async def recover_background(self) -> None:
         if self.kernel.session_id is None:
             await self.kernel.start()
-        # The first pass pauses persisted target work before reopening any
-        # schedules. Explicit session/campaign resume restores execution. Later
-        # watchdog passes still repair supervisors started in this daemon.
+        # Executing campaigns already carry durable operator authorization.
+        # Reattach them when the daemon is replaced so a read-only client or a
+        # transient daemon restart cannot silently turn active work into a pause.
+        # Campaigns explicitly paused by an operator are absent from
+        # ``list_executing`` and remain paused.
         if self._campaigns is not None:
             if self._lifecycle_recovery is not None:
                 await self._lifecycle_recovery.reconcile()
-            await self._campaigns.recover(resume_execution=self._campaigns_recovered)
+            await self._campaigns.recover(resume_execution=True)
         self._campaigns_recovered = True
         if not self._agents_recovered:
             if self._agent_store is not None:
