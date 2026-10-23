@@ -3341,10 +3341,12 @@ class BrowserScreen(OverviewScreen):
         self,
         contexts: tuple[BrowserContextView, ...],
         takeover: Callable[[str], Awaitable[BrowserContextView]],
+        resume: Callable[[str], Awaitable[BrowserContextView]],
     ) -> None:
         super().__init__("Browser contexts", _render_browser_contexts(contexts))
         self.contexts = contexts
         self.takeover = takeover
+        self.resume = resume
 
     def compose(self) -> ComposeResult:
         with Vertical(id="overview"):
@@ -3352,14 +3354,22 @@ class BrowserScreen(OverviewScreen):
             yield SelectableDrawerText(self.content, id="overview-content")
             for index, context in enumerate(self.contexts):
                 if context.owner != "operator":
-                    yield Button(f"Take over {context.id}", id=f"browser-takeover-{index}")
+                    label = (
+                        f"Resume and take over {context.id}"
+                        if context.state == "restart_required"
+                        else f"Take over {context.id}"
+                    )
+                    yield Button(label, id=f"browser-takeover-{index}")
             yield Button("Close", id="overview-close")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id and event.button.id.startswith("browser-takeover-"):
             event.stop()
             index = int(event.button.id.removeprefix("browser-takeover-"))
-            updated = await self.takeover(self.contexts[index].id)
+            context = self.contexts[index]
+            if context.state == "restart_required":
+                context = await self.resume(context.id)
+            updated = await self.takeover(context.id)
             self.contexts = tuple(
                 updated if item.id == updated.id else item for item in self.contexts
             )
@@ -6073,7 +6083,18 @@ class MerlinApp(App[None]):
     async def _show_browser(self) -> None:
         try:
             contexts = await self.backend.list_browser_contexts()
-            self.push_screen(BrowserScreen(contexts, self.backend.takeover_browser_context))
+            resume = getattr(
+                self.backend,
+                "resume_browser_context",
+                self.backend.takeover_browser_context,
+            )
+            self.push_screen(
+                BrowserScreen(
+                    contexts,
+                    self.backend.takeover_browser_context,
+                    resume,
+                )
+            )
         except Exception as exc:
             self.query_one("#transcript", RichLog).write(
                 _transcript_text("✕ Browser failed: ", exc, "bold red")
