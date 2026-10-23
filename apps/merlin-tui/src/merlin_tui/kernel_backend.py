@@ -9,7 +9,7 @@ from typing import Any
 from merlin_agents.swarm_snapshot import SwarmSnapshot
 from merlin_config import Config
 from merlin_contracts import AppEvent
-from merlin_contracts.user_input import ANSWER_PREFIX, InputResponse, pending_input
+from merlin_contracts.user_input import ANSWER_PREFIX, InputRequest, InputResponse, pending_input
 from merlin_kernel import Kernel
 from merlin_readiness import ResourceCloser
 from merlin_readiness import sanitize as sanitize_readiness
@@ -176,6 +176,7 @@ class KernelBackend:
         self._operator_controls = operator_controls
         self._pending_campaign_objective: str | None = None
         self._pending_route_preflight: tuple[str, str, str] | None = None
+        self._pending_user_input: InputRequest | None = None
         self._config_reload_status: Mapping[str, object] = {
             "applied": (),
             "restart_required": (),
@@ -227,9 +228,12 @@ class KernelBackend:
             await self.interrupt()
             yield StreamEvent(kind="status", text="Foreground interruption acknowledged.")
             return
-        pending = None
+        durable_pending = None
         if hasattr(self.kernel, "_store") and self.kernel.session_id:
-            pending = pending_input(await self.kernel._store.load_messages(self.kernel.session_id))
+            durable_pending = pending_input(
+                await self.kernel._store.load_messages(self.kernel.session_id)
+            )
+        pending = durable_pending or self._pending_user_input
         if prompt.startswith(ANSWER_PREFIX):
             if pending is None:
                 raise ValueError("This question is no longer pending; refresh before answering")
@@ -239,6 +243,7 @@ class KernelBackend:
         if prompt.strip() == "/new":
             self._pending_campaign_objective = None
             self._pending_route_preflight = None
+            self._pending_user_input = None
             if self._settings is not None:
                 self._settings.reset_runtime_model()
         elif self._pending_route_preflight is not None:
@@ -338,6 +343,7 @@ class KernelBackend:
             await self.kernel.wait_for_turn()
         await self.kernel.submit(prompt)
         if pending is not None and not prompt.startswith("/"):
+            self._pending_user_input = None
             yield StreamEvent("user_input_resolved", pending.request_id)
         if campaign_selection:
             self._pending_campaign_objective = None
@@ -360,6 +366,8 @@ class KernelBackend:
                     preparation_failed |= event.payload.get("state") == "failed"
             if rendered is not None and rendered.kind == "campaign_review":
                 review_seen = True
+            if rendered is not None and rendered.kind == "user_input":
+                self._pending_user_input = InputRequest.model_validate_json(rendered.text)
             if event.type == "report" and event.payload.get("state") == "completed":
                 self._remember_report(event)
             if rendered is not None:
@@ -439,6 +447,7 @@ class KernelBackend:
         if prompt.strip().startswith("/resume ") and hasattr(self.kernel, "_store"):
             pending = pending_input(await self.kernel._store.load_messages(self.kernel.session_id))
             if pending is not None:
+                self._pending_user_input = pending
                 yield StreamEvent("user_input", pending.model_dump_json())
 
     async def _saved_campaign_review(

@@ -281,6 +281,66 @@ async def test_backend_resume_and_answer_resolve_the_same_durable_question():
 
 
 @pytest.mark.asyncio
+async def test_backend_accepts_the_exact_question_it_displayed_when_durable_order_lags():
+    import asyncio
+
+    request = InputRequest(request_id="displayed-question", questions=QUESTIONS)
+    messages = []
+    events = [
+        SimpleNamespace(
+            type="tool",
+            payload={
+                "name": "request_user_input",
+                "state": "completed",
+                "text": json.dumps(
+                    {"status": "awaiting_input", "request": request.model_dump()}
+                ),
+            },
+        )
+    ]
+    submissions = []
+
+    async def load(_):
+        return messages
+
+    class Kernel:
+        session_id = "s1"
+        turn_active = False
+        _store = SimpleNamespace(load_messages=load)
+
+        async def submit(self, prompt):
+            submissions.append(prompt)
+
+        async def next_event(self):
+            if events:
+                return events.pop(0)
+            await asyncio.sleep(1)
+
+    backend = KernelBackend(Kernel())
+    first = [event async for event in backend.stream("show the form")]
+    displayed = InputRequest.model_validate_json(
+        next(event.text for event in first if event.kind == "user_input")
+    )
+    answer = answer_prompt(
+        displayed,
+        InputResponse(
+            request_id=displayed.request_id,
+            answers={"auth": {"option_ids": ["existing"]}},
+        ),
+    )
+    resolved = [event async for event in backend.stream(answer)]
+
+    assert any(
+        event.kind == "user_input_resolved" and event.text == displayed.request_id
+        for event in resolved
+    )
+    assert submissions == ["show the form", answer]
+    with pytest.raises(ValueError, match="no longer pending"):
+        _ = [event async for event in backend.stream(answer)]
+    assert submissions == ["show the form", answer]
+
+
+@pytest.mark.asyncio
 async def test_terminal_app_opens_structured_question_and_continues():
     from merlin_tui.app import MerlinApp
     from merlin_tui.backend import DemoBackend, StreamEvent
