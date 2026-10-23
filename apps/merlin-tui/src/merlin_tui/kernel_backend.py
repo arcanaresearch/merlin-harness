@@ -342,6 +342,7 @@ class KernelBackend:
         if campaign_selection:
             self._pending_campaign_objective = None
             self._pending_route_preflight = None
+        review_recovery_requested = False
         preparation_failed = False
         review_seen = False
         while True:
@@ -351,8 +352,12 @@ class KernelBackend:
             except TimeoutError:
                 break
             rendered = event_to_stream(event)
-            if event.type == "tool" and event.payload.get("name") == "assessment_prepare":
-                preparation_failed |= event.payload.get("state") == "failed"
+            if event.type == "tool":
+                tool_name = event.payload.get("name")
+                if tool_name in {"assessment_prepare", "assessment_execute"}:
+                    review_recovery_requested = True
+                if tool_name == "assessment_prepare":
+                    preparation_failed |= event.payload.get("state") == "failed"
             if rendered is not None and rendered.kind == "campaign_review":
                 review_seen = True
             if event.type == "report" and event.payload.get("state") == "completed":
@@ -360,21 +365,24 @@ class KernelBackend:
             if rendered is not None:
                 yield rendered
             await asyncio.sleep(0)
-        if preparation_failed and not review_seen:
-            # A cancelled to_thread save may commit after the tool deadline.
-            # Recover only a sealed review in this session; never infer approval
-            # from the model's prose or execute the prepared campaign here.
+        if review_recovery_requested and not review_seen:
+            # The model-facing preparation receipt intentionally omits the full
+            # review, and some provider event paths do not retain the tool
+            # metadata that normally carries it. Recover only a sealed review in
+            # this session; never infer approval from prose or execute here.
             for campaign in await self.list_campaigns():
                 if campaign.status != "prepared" or campaign.session_id != self.kernel.session_id:
                     continue
                 review = await self._saved_campaign_review(campaign.id, campaign.manifest_digest)
                 if review is not None:
-                    yield StreamEvent(
-                        "status",
-                        "Preparation timed out, but its saved review was recovered. "
-                        "Execution has not started; review and approve below.",
-                    )
+                    if preparation_failed:
+                        yield StreamEvent(
+                            "status",
+                            "Preparation timed out, but its saved review was recovered. "
+                            "Execution has not started; review and approve below.",
+                        )
                     yield StreamEvent("campaign_review", json.dumps(review))
+                    break
         values = prompt.strip().split(maxsplit=1)
         if (
             len(values) == 2
