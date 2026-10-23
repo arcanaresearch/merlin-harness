@@ -821,7 +821,7 @@ wheels = [
 
 [[package]]
 name = "merlin-agents"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-agents" }
 dependencies = [
     { name = "jsonschema" },
@@ -840,7 +840,7 @@ requires-dist = [
 
 [[package]]
 name = "merlin-assessments"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-assessments" }
 dependencies = [
     { name = "httpx" },
@@ -873,7 +873,7 @@ dev = [
 
 [[package]]
 name = "merlin-browser"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-browser" }
 dependencies = [
     { name = "merlin-contracts" },
@@ -890,12 +890,12 @@ requires-dist = [
 
 [[package]]
 name = "merlin-config"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-config" }
 
 [[package]]
 name = "merlin-contracts"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-contracts" }
 dependencies = [
     { name = "pydantic" },
@@ -914,7 +914,7 @@ dev = [{ name = "pytest", specifier = ">=8.3,<9" }]
 
 [[package]]
 name = "merlin-findings"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-findings" }
 dependencies = [
     { name = "merlin-contracts" },
@@ -939,7 +939,7 @@ dev = [
 
 [[package]]
 name = "merlin-harness"
-version = "0.2.6"
+version = "0.2.7"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -960,7 +960,7 @@ dev = [
 
 [[package]]
 name = "merlin-kernel"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-kernel" }
 dependencies = [
     { name = "merlin-contracts" },
@@ -971,7 +971,7 @@ requires-dist = [{ name = "merlin-contracts", editable = "packages/merlin-contra
 
 [[package]]
 name = "merlin-mcp"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-mcp" }
 dependencies = [
     { name = "httpx2" },
@@ -986,7 +986,7 @@ requires-dist = [
 
 [[package]]
 name = "merlin-memory"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-memory" }
 dependencies = [
     { name = "merlin-agents" },
@@ -1013,7 +1013,7 @@ dev = [
 
 [[package]]
 name = "merlin-packs"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-packs" }
 dependencies = [
     { name = "cryptography" },
@@ -1028,12 +1028,12 @@ requires-dist = [
 
 [[package]]
 name = "merlin-permissions"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-permissions" }
 
 [[package]]
 name = "merlin-promotion"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-promotion" }
 dependencies = [
     { name = "httpx" },
@@ -1064,7 +1064,7 @@ dev = [
 
 [[package]]
 name = "merlin-providers"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-providers" }
 dependencies = [
     { name = "httpx" },
@@ -1091,7 +1091,7 @@ dev = [
 
 [[package]]
 name = "merlin-readiness"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-readiness" }
 
 [package.dev-dependencies]
@@ -1110,7 +1110,7 @@ dev = [
 
 [[package]]
 name = "merlin-skills"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-skills" }
 dependencies = [
     { name = "pyyaml" },
@@ -1121,7 +1121,7 @@ requires-dist = [{ name = "pyyaml", specifier = ">=6,<7" }]
 
 [[package]]
 name = "merlin-storage-postgres"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-storage-postgres" }
 dependencies = [
     { name = "merlin-agents" },
@@ -1156,7 +1156,7 @@ dev = [{ name = "pytest", specifier = ">=8.3" }]
 
 [[package]]
 name = "merlin-tools"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "packages/merlin-tools" }
 dependencies = [
     { name = "jsonschema" },
@@ -1175,7 +1175,7 @@ requires-dist = [
 
 [[package]]
 name = "merlin-tui"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "apps/merlin-tui" }
 dependencies = [
     { name = "merlin-agents" },
@@ -1236,7 +1236,7 @@ dev = [
 
 [[package]]
 name = "merlin-web"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "apps/merlin-web" }
 dependencies = [
     { name = "aiohttp" },

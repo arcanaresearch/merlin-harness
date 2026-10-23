@@ -3379,7 +3379,9 @@ class BrowserScreen(OverviewScreen):
             event.button.disabled = True
             event.button.label = "Operator owns context"
             return
-        self.dismiss(None)
+        if event.button.id == "overview-close":
+            event.stop()
+            self.dismiss(None)
 
 
 class FindingsScreen(OverviewScreen):

@@ -1,6 +1,6 @@
 [project]
 name = "merlin-agents"
-version = "0.2.6"
+version = "0.2.7"
 description = "Bounded lead and worker agent orchestration for Merlin"
 requires-python = ">=3.13"
 dependencies = [
