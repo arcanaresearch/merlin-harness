@@ -3363,6 +3363,7 @@ class BrowserScreen(OverviewScreen):
             yield Button("Close", id="overview-close")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.prevent_default()
         if event.button.id and event.button.id.startswith("browser-takeover-"):
             event.stop()
             index = int(event.button.id.removeprefix("browser-takeover-"))

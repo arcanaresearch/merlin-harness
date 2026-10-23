@@ -3,7 +3,8 @@ set -eu
 
 repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=$($repository/.venv/bin/python -c \
-  'from importlib.metadata import version; print(version("merlin-tui"))')
+  'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' \
+  "$repository/pyproject.toml")
 release_name="merlin-${version}-darwin-arm64"
 archive="$repository/target/releases/$release_name.tar.gz"
 smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/merlin-release-smoke.XXXXXX")

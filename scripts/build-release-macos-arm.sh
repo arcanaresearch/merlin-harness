@@ -3,7 +3,8 @@ set -eu
 
 repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=$($repository/.venv/bin/python -c \
-  'from importlib.metadata import version; print(version("merlin-tui"))')
+  'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' \
+  "$repository/pyproject.toml")
 release_name="merlin-${version}-darwin-arm64"
 release_channel=${MERLIN_RELEASE_CHANNEL:-stable}
 target="$repository/target"
@@ -23,6 +24,9 @@ if [ "$(sw_vers -productVersion | cut -d. -f1)" != "14" ]; then
   exit 1
 fi
 
+# PyInstaller copies distribution metadata from the workspace environment.
+# Keep it aligned with the manifests so a version bump cannot freeze stale metadata.
+uv sync --all-packages
 "$repository/scripts/build-wheelhouse-macos-arm.sh"
 rm -rf -- "$build" "$release_root"
 mkdir -p -- "$build" "$release_root/payload" "$target/releases"
