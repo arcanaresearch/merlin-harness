@@ -4279,6 +4279,12 @@ def build_backend(
         scheduler_store = DurableSchedulerStore(agent_connection)
         campaign_connection = database.connect()
         campaign_store = CampaignStore(campaign_connection)
+        from merlin_storage_postgres.campaign_recovery_store import CampaignRecoveryRepository
+        from merlin_storage_postgres.campaign_transition_store import CampaignTransitionRepository
+
+        lifecycle_transitions = CampaignTransitionRepository(
+            campaign_connection, DurableSchedulerStore(campaign_connection)
+        )
         lifecycle_recovery = DurableLifecycleRecovery(
             StateScopeRepository(campaign_connection),
             claimant_id=f"merlin-tui:{os.getpid()}",
@@ -10715,6 +10721,9 @@ def build_backend(
             campaign_store,
             agents,
             prepare_campaign,
+            lifecycle_transitions=lifecycle_transitions,
+            lifecycle_recovery=lifecycle_recovery,
+            recovery_repository=CampaignRecoveryRepository(campaign_connection),
             lead_runner=run_campaign_lead,
             report_runner=create_campaign_report,
             interaction_lesson_runner=publish_interaction_lesson,

@@ -1107,17 +1107,20 @@ async def test_backend_agents_use_one_snapshot_read_without_recovery_or_schedule
 @pytest.mark.asyncio
 async def test_background_recovery_renews_campaign_ownership_but_recovers_agents_once() -> None:
     calls = []
+    report = object()
 
     class LifecycleRecovery:
         async def reconcile(self):
             calls.append(("lifecycle", None))
+            return report
 
     class RecoverableAgents:
         async def recover(self, *, resume_execution=True):
             calls.append(("agents", resume_execution))
 
     class RecoverableCampaigns:
-        async def recover(self, *, resume_execution=True):
+        async def recover(self, *, resume_execution=True, lifecycle_report=None):
+            assert lifecycle_report is report
             calls.append(("campaigns", resume_execution))
 
     backend = KernelBackend(  # type: ignore[arg-type]

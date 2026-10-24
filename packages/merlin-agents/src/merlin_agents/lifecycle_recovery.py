@@ -61,6 +61,7 @@ class CampaignLifecycleDecision:
     recovery_state_digest: str
     recovery_decision_digest: str
     target_call_count: int
+    recovery_fence_digest: str | None = None
 
     @property
     def resumable(self) -> bool:
@@ -220,6 +221,11 @@ def _campaign_decision(value: object) -> CampaignLifecycleDecision:
             value.get("recovery_decision_digest"), "recovery_decision_digest"
         ),
         target_call_count=_count(value.get("target_call_count"), "target_call_count"),
+        recovery_fence_digest=(
+            None
+            if value.get("recovery_fence_digest") is None
+            else _qualified_digest(value["recovery_fence_digest"], "recovery_fence_digest")
+        ),
     )
 
 

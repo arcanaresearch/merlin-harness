@@ -180,6 +180,11 @@ from .exploration import (
 from .jev import JevClient
 from .judgments import RefusalJudge, RefusalJudgment, RefusalVerdict
 from .language_execution import record_language_execution
+from .lifecycle_recovery import (
+    CampaignLifecycleDecision,
+    DurableLifecycleRecovery,
+    LifecycleRecoveryReport,
+)
 from .preflight import (
     LEAD_HISTORY_KIND,
     WORKER_HISTORY_KIND,
@@ -2016,6 +2021,9 @@ class CampaignService:
         task_review_runner: IncrementalTaskReviewRunner | None = None,
         review_merge_runner: IncrementalReviewMergeRunner | None = None,
         objective_phase_gate_review_runner: ObjectivePhaseGateReviewRunner | None = None,
+        lifecycle_transitions: Any | None = None,
+        lifecycle_recovery: DurableLifecycleRecovery | None = None,
+        recovery_repository: Any | None = None,
     ) -> None:
         if stalled_after_seconds <= 0:
             raise ValueError("campaign stall interval must be positive")
@@ -2040,6 +2048,9 @@ class CampaignService:
         if arm_trial_min_attempts < 1:
             raise ValueError("arm trial minimum attempts must be positive")
         self._store = store
+        self._lifecycle_transitions = lifecycle_transitions
+        self._lifecycle_recovery = lifecycle_recovery
+        self._recovery_repository = recovery_repository
         self._agents = agents
         self._preparation_factory = preparation_factory
         self._lead_runner = lead_runner
@@ -10196,6 +10207,15 @@ class CampaignService:
             await asyncio.to_thread(self._store.pause, campaign_id)
             return False
         await self._retire_campaign_terminal_dynamic_specialists(campaign_id)
+        if self._lifecycle_transitions is not None:
+            await asyncio.to_thread(
+                self._lifecycle_transitions.terminal,
+                campaign_id,
+                status=status,
+                reason=reason,
+                command_id=str(uuid4()),
+            )
+            return True
         finish = self._store.finish
         if "stop_reason" in inspect.signature(finish).parameters:
             await asyncio.to_thread(finish, campaign_id, status, stop_reason=reason)
@@ -16804,7 +16824,7 @@ class CampaignService:
     ) -> tuple[Any, int] | None:
         """Claim and start one post-settlement successor under one DB fence."""
 
-        candidate_wave = max(int(item["wave"]) for item in waves) + 1
+        candidate_wave = max((int(item["wave"]) for item in waves), default=-1) + 1
         gates_ready, last_gate_wave = await self._run_objective_phase_gates(
             campaign_id,
             manifest,
@@ -16885,18 +16905,151 @@ class CampaignService:
                         manifest, batch_context, compiled
                     )
 
-    async def recover(self, *, resume_execution: bool = True) -> int:
+    async def recover(
+        self, *, resume_execution: bool = True,
+        lifecycle_report: LifecycleRecoveryReport | None = None,
+    ) -> int:
         async with self._ownership_condition:
             await self._ownership_condition.wait_for(
                 lambda: self._execution_startups == 0 and not self._recovery_active
             )
             self._recovery_active = True
         try:
+            if self._recovery_repository is not None:
+                if lifecycle_report is None:
+                    if self._lifecycle_recovery is None:
+                        raise RuntimeError("production recovery requires a fenced lifecycle report")
+                    lifecycle_report = await self._lifecycle_recovery.reconcile()
+                return await self._apply_lifecycle_report(lifecycle_report, resume_execution)
             return await self._recover_owned(resume_execution=resume_execution)
         finally:
             async with self._ownership_condition:
                 self._recovery_active = False
                 self._ownership_condition.notify_all()
+
+    async def _apply_lifecycle_report(
+        self, report: LifecycleRecoveryReport, resume_execution: bool
+    ) -> int:
+        recovered = 0
+        for decision in report.campaigns:
+            supervisor = self._supervisors.get(decision.campaign_id)
+            if supervisor is not None and not supervisor.done():
+                continue
+            claim_id = await asyncio.to_thread(
+                self._recovery_repository.claim,
+                decision.campaign_id,
+                state_digest=decision.recovery_state_digest,
+                decision_digest=decision.recovery_decision_digest,
+                fence_digest=decision.recovery_fence_digest,
+                claimant_id=f"campaign-service:{id(self)}",
+            )
+            if claim_id is None:
+                continue
+            owner = asyncio.current_task()
+
+            async def renew_claim(
+                campaign_id: str, token: str, claim_owner: asyncio.Task[Any] | None
+            ) -> None:
+                while True:
+                    await asyncio.sleep(10)
+                    renewed = await asyncio.to_thread(
+                        self._recovery_repository.renew, campaign_id, claim_id=token
+                    )
+                    if not renewed:
+                        if claim_owner is not None:
+                            claim_owner.cancel()
+                        return
+
+            heartbeat = asyncio.create_task(renew_claim(decision.campaign_id, claim_id, owner))
+            try:
+                if decision.recovery_action not in {
+                    "pause_lifecycle",
+                    "paused",
+                    "await_approval",
+                    "idle",
+                    "pause_inconsistent",
+                }:
+                    recovered += await self._recover_recorded_action(decision, resume_execution)
+                elif decision.recovery_action == "pause_inconsistent":
+                    await asyncio.to_thread(self._store.pause, decision.campaign_id)
+                await asyncio.to_thread(
+                    self._recovery_repository.apply, decision.campaign_id, claim_id=claim_id
+                )
+            except Exception as error:
+                await asyncio.to_thread(
+                    self._recovery_repository.apply,
+                    decision.campaign_id,
+                    claim_id=claim_id,
+                    error=str(error),
+                )
+                raise
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+        return recovered
+
+    async def _recover_recorded_action(
+        self, decision: CampaignLifecycleDecision, resume_execution: bool
+    ) -> int:
+        """Dispatch the claimed plan; never independently classify production recovery."""
+        campaign_id = decision.campaign_id
+        if not resume_execution:
+            await self._pause_recovered_campaign(campaign_id)
+            return 1
+        row = await asyncio.to_thread(self._store.get, campaign_id)
+        envelope = row["manifest"]
+        manifest = _manifest(envelope["manifest"])
+        context = _assignment_context(envelope["assignment_context"])
+        waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+        action = decision.recovery_action
+        batch = await asyncio.to_thread(self._store.load_active_frontier_batch, campaign_id)
+        if action == "claim_successor":
+            successor = await self._recover_settled_frontier_successor(
+                campaign_id, manifest, context, waves
+            )
+            if successor is None:
+                raise RuntimeError("claimed recovery could not install successor")
+            live, wave = successor
+            wave_running = True
+        elif action in {
+            "persist_successor_schedule",
+            "bind_successor_schedule",
+            "persist_wave_binding",
+            "resume_active",
+        } and isinstance(batch, Mapping):
+            live = await self._recover_active_frontier_fenced(
+                campaign_id, manifest, context, batch, waves
+            )
+            if live is None:
+                raise RuntimeError("claimed recovery could not restore active batch")
+            wave = int(batch["wave"])
+            wave_running = True
+        elif action in {"finalize_and_settle_terminal_batch", "settle_terminal_batch"}:
+            if not isinstance(batch, Mapping) or not batch.get("schedule_id"):
+                raise RuntimeError("recorded terminal batch is missing")
+            live = _TerminalFrontierSchedule(str(batch["schedule_id"]))
+            wave = int(batch["wave"])
+            wave_running = action == "finalize_and_settle_terminal_batch"
+        elif action in {"resume_active", "finalize_terminal_wave"}:
+            latest = waves[-1]
+            live = await self._agents.reopen(
+                str(latest["schedule_id"]), resume_execution=action == "resume_active"
+            )
+            wave = int(latest["wave"])
+            wave_running = True
+        else:
+            raise ValueError(f"unsupported recorded recovery action: {action}")
+        self._supervisors[campaign_id] = asyncio.create_task(
+            self._supervise(
+                campaign_id,
+                manifest,
+                context,
+                live,
+                initial_wave=wave,
+                wave_running=wave_running,
+            )
+        )
+        return 1
 
     async def _recover_owned(self, *, resume_execution: bool = True) -> int:
         # A process/database failure can terminalize the campaign row before
@@ -19470,12 +19623,26 @@ class CampaignService:
             raise KeyError("active campaign not found")
         for row in selected:
             identifier = str(row["id"])
+            if self._lifecycle_transitions is not None:
+                transition = await asyncio.to_thread(
+                    self._lifecycle_transitions.terminal,
+                    identifier,
+                    status="cancelled",
+                    reason="operator_stopped",
+                    command_id=str(uuid4()),
+                )
+                await self._stop_supervisor(identifier)
+                for schedule_id in transition.schedule_ids:
+                    await self._agents.stop_local_schedule(schedule_id)
+                    await self._agents.reopen(schedule_id)
             supervisor = self._supervisors.pop(identifier, None)
             if supervisor is not None:
                 supervisor.cancel()
                 await asyncio.gather(supervisor, return_exceptions=True)
             waves = await asyncio.to_thread(self._store.list_waves, identifier)
             for wave in waves:
+                if self._lifecycle_transitions is not None:
+                    break
                 if str(wave["status"]) not in {"running", "paused"}:
                     continue
                 try:
@@ -19496,7 +19663,11 @@ class CampaignService:
                     {"reason": "operator-campaign-cancel"},
                 )
             terminalized = True
-            if str(row["status"]) in {"prepared", "executing", "paused"}:
+            if self._lifecycle_transitions is None and str(row["status"]) in {
+                "prepared",
+                "executing",
+                "paused",
+            }:
                 terminalized = await self._finish_campaign(
                     identifier, "cancelled", "operator_stopped"
                 )
@@ -19600,10 +19771,25 @@ class CampaignService:
             },
         )
 
-    async def pause(self, campaign_id: str) -> Mapping[str, object]:
+    async def pause(
+        self, campaign_id: str, *, command_id: str | None = None
+    ) -> Mapping[str, object]:
         row = await asyncio.to_thread(self._store.get, campaign_id)
-        if row is None or str(row["status"]) != "executing":
+        if row is None or (
+            self._lifecycle_transitions is None and str(row["status"]) != "executing"
+        ):
             raise ValueError("campaign is unknown or not executing")
+        if self._lifecycle_transitions is not None:
+            transition = await asyncio.to_thread(
+                self._lifecycle_transitions.pause,
+                campaign_id,
+                cause="operator",
+                command_id=command_id or str(uuid4()),
+            )
+            await self._stop_supervisor(campaign_id)
+            for schedule_id in transition.schedule_ids:
+                await self._agents.stop_local_schedule(schedule_id)
+            return {"campaign_id": campaign_id, "status": "paused"}
         await self._stop_supervisor(campaign_id)
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         running = [wave for wave in waves if str(wave["status"]) == "running"]
@@ -19620,7 +19806,9 @@ class CampaignService:
         )
         return {"campaign_id": campaign_id, "status": "paused"}
 
-    async def resume(self, campaign_id: str) -> Mapping[str, object]:
+    async def resume(
+        self, campaign_id: str, *, command_id: str | None = None
+    ) -> Mapping[str, object]:
         row = await asyncio.to_thread(self._store.get, campaign_id)
         if row is None:
             raise ValueError("campaign is unknown")
@@ -19712,8 +19900,25 @@ class CampaignService:
                 },
             )
             return {"campaign_id": campaign_id, "status": "executing"}
-        if str(row["status"]) != "paused":
+        if self._lifecycle_transitions is None and str(row["status"]) != "paused":
             raise ValueError("campaign is unknown, not paused, or not retryable")
+        if self._lifecycle_transitions is not None:
+            envelope = row["manifest"]
+            manifest = _manifest(envelope["manifest"])
+            reviewed_adapter = _reviewed_adapter_value(manifest)
+            if isinstance(reviewed_adapter, Mapping):
+                await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
+            transition = await asyncio.to_thread(
+                self._lifecycle_transitions.resume,
+                campaign_id,
+                cause="operator",
+                command_id=command_id or str(uuid4()),
+            )
+            await self._stop_supervisor(campaign_id)
+            for schedule_id in transition.schedule_ids:
+                await self._agents.stop_local_schedule(schedule_id)
+            await self.recover()
+            return {"campaign_id": campaign_id, "status": "executing"}
         envelope = row["manifest"]
         manifest = _manifest(envelope["manifest"])
         reviewed_adapter = _reviewed_adapter_value(manifest)

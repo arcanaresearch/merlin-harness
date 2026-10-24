@@ -1498,8 +1498,10 @@ class KernelBackend:
         # ``list_executing`` and remain paused.
         if self._campaigns is not None:
             if self._lifecycle_recovery is not None:
-                await self._lifecycle_recovery.reconcile()
-            await self._campaigns.recover(resume_execution=True)
+                report = await self._lifecycle_recovery.reconcile()
+                await self._campaigns.recover(resume_execution=True, lifecycle_report=report)
+            else:
+                await self._campaigns.recover(resume_execution=True)
         self._campaigns_recovered = True
         if not self._agents_recovered:
             if self._agent_store is not None:

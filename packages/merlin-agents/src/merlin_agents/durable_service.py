@@ -2309,6 +2309,16 @@ class DurableAgentService:
                     live.scheduler.cancel(node.id, reason, tick)
             live.circuit_wake.set()
 
+    async def stop_local_schedule(self, schedule_id: str) -> None:
+        """Detach local execution after an external durable lifecycle commit."""
+        live = self._live.pop(schedule_id, None)
+        if live is not None:
+            if self._session_active.get(live.session_id) == schedule_id:
+                self._session_active.pop(live.session_id, None)
+            if live.execution is not None:
+                live.execution.cancel()
+                await asyncio.gather(live.execution, return_exceptions=True)
+
     async def pause_schedule(self, schedule_id: str, *, reason: str) -> None:
         # Fence durable claims first. If the process exits while local tasks are
         # unwinding, recovery will still observe a paused schedule and will not

@@ -1621,6 +1621,23 @@ class StateScopeRepository:
                     or str(persisted_recovery["decision_digest"]) != recovery_decision_digest
                 ):
                     raise ValueError("campaign recovery decision conflicts with durable state")
+                from .campaign_recovery_store import recovery_fence
+
+                fence_digest = recovery_fence(self.connection, campaign_id)
+                self.connection.execute(
+                    """UPDATE merlin_storage.campaign_recovery
+                       SET fence_digest = %s,
+                           application_state = 'planned', claim_id = NULL,
+                           claimant_id = NULL, claim_expires_at = NULL,
+                           applied_at = NULL, application_error = NULL
+                       WHERE campaign_id = %s AND state_digest = %s
+                         AND (application_state <> 'claimed' OR claim_expires_at <= now())""",
+                    (
+                        fence_digest,
+                        campaign_id,
+                        recovery_state_digest,
+                    ),
+                )
                 results.append(
                     {
                         "campaign_id": campaign_id,
@@ -1636,6 +1653,7 @@ class StateScopeRepository:
                         "recovery_action": recovery_action,
                         "scheduler_action": scheduler_action,
                         "recovery_state_digest": recovery_state_digest,
+                        "recovery_fence_digest": fence_digest,
                         "recovery_decision_digest": recovery_decision_digest,
                         "target_call_count": int(counts["target_call_count"] or 0),
                         "state_lanes_requiring_reobservation": int(

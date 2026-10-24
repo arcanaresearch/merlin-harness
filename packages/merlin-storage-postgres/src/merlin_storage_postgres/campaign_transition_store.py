@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 
 from .scheduler_store import DurableSchedulerStore
 
-CampaignTransitionKind = Literal["campaign_paused", "campaign_resumed"]
+CampaignTransitionKind = Literal["campaign_paused", "campaign_resumed", "campaign_terminal"]
 
 _PAUSE_CAUSES = frozenset(
     {
@@ -44,8 +44,7 @@ def _digest(value: object) -> str:
 class CampaignTransitionRepository:
     """Atomic campaign/wave/scheduler pause and resume transitions.
 
-    This repository is intentionally not wired into the runtime yet. It shares
-    the scheduler connection and its re-entrant operation lock so the existing
+    It shares the scheduler connection and its re-entrant operation lock so the existing
     scheduler transition remains the authority for attempt fencing, mailbox
     claims, and scheduler events inside one outer transaction.
     """
@@ -175,9 +174,6 @@ class CampaignTransitionRepository:
                    ORDER BY wave FOR UPDATE""",
                 (campaign_id, expected_wave_status),
             ).fetchall()
-            if not waves:
-                action = transition_type.removeprefix("campaign_")
-                raise ValueError(f"campaign has no {expected_wave_status} wave to {action}")
             schedule_ids = tuple(str(wave["schedule_id"]) for wave in waves)
             schedule_rows = self.connection.execute(
                 """SELECT id, status FROM merlin_storage.scheduler_schedules
@@ -186,13 +182,16 @@ class CampaignTransitionRepository:
             ).fetchall()
             statuses = {str(row["id"]): str(row["status"]) for row in schedule_rows}
             if set(statuses) != set(schedule_ids) or any(
-                status != expected_schedule_status for status in statuses.values()
+                status not in {expected_schedule_status, "completed", "failed", "cancelled"}
+                for status in statuses.values()
             ):
                 raise ValueError(
                     f"campaign schedules are not uniformly {expected_schedule_status}: {statuses}"
                 )
 
             for schedule_id in schedule_ids:
+                if statuses[schedule_id] != expected_schedule_status:
+                    continue
                 if transition_type == "campaign_paused":
                     self.scheduler.pause_schedule(schedule_id, reason=normalized_cause)
                 else:
@@ -229,6 +228,88 @@ class CampaignTransitionRepository:
                 schedule_ids,
                 int(updated["event_count"]),
                 str(updated["last_event_digest"]),
+            )
+
+    def terminal(
+        self, campaign_id: str, *, status: str, reason: str, command_id: str
+    ) -> CampaignTransition:
+        """Fence active schedulers and commit the terminal envelope atomically."""
+        from merlin_contracts.campaign_lifecycle import require_campaign_terminal_reason
+
+        from .campaign_store import CampaignStore
+
+        reason = require_campaign_terminal_reason(reason).value
+        if status not in {"completed", "failed", "cancelled"} or not command_id.strip():
+            raise ValueError("invalid terminal campaign transition")
+        request = {"status": status, "reason": reason}
+        with self._lock, self.connection.transaction():
+            campaign = self.connection.execute(
+                "SELECT * FROM merlin_storage.assessment_campaigns WHERE id = %s FOR UPDATE",
+                (campaign_id,),
+            ).fetchone()
+            if campaign is None:
+                raise KeyError(campaign_id)
+            existing = self.connection.execute(
+                """SELECT * FROM merlin_storage.campaign_events
+                   WHERE campaign_id = %s AND command_id = %s""",
+                (campaign_id, command_id),
+            ).fetchone()
+            if existing is not None:
+                return self._existing_transition(
+                    campaign_id, "campaign_terminal", "operator", command_id, request, existing
+                )
+            if campaign["status"] not in {"prepared", "executing", "paused"}:
+                raise ValueError("campaign is already terminal")
+            waves = self.connection.execute(
+                """SELECT wave, schedule_id, status FROM merlin_storage.campaign_waves
+                   WHERE campaign_id = %s
+                   ORDER BY wave FOR UPDATE""",
+                (campaign_id,),
+            ).fetchall()
+            for wave in waves:
+                schedule = self.scheduler.load_schedule(str(wave["schedule_id"]))
+                if schedule is None:
+                    raise ValueError("campaign wave has no scheduler")
+                if schedule["status"] in {"running", "paused"}:
+                    if status != "cancelled":
+                        raise ValueError("terminal campaign still has an active schedule")
+                    document = schedule["graph"]
+                    spec = document.get("admitted", {}).get("spec", {})
+                    cleanup = [
+                        str(node["id"])
+                        for node in spec.get("nodes", [])
+                        if node.get("kind") == "cleanup"
+                    ]
+                    self.scheduler.cancel_schedule(
+                        str(wave["schedule_id"]),
+                        reason=reason,
+                        cleanup_node_ids=cleanup,
+                        checkpoint=schedule["checkpoint"],
+                    )
+                if wave["status"] in {"running", "paused"} or schedule["status"] in {
+                    "running", "paused"
+                }:
+                    self.connection.execute(
+                        """UPDATE merlin_storage.campaign_waves SET status = %s, updated_at = now()
+                           WHERE campaign_id = %s AND wave = %s""",
+                        (
+                            "cancelled" if status == "cancelled" else schedule["status"],
+                            campaign_id,
+                            wave["wave"],
+                        ),
+                    )
+            if self._after_scheduler_transition is not None:
+                self._after_scheduler_transition("campaign_terminal")
+            CampaignStore(self.connection).finish(campaign_id, status, stop_reason=reason)
+            return self._append_event(
+                campaign_id,
+                "campaign_terminal",
+                "operator",
+                command_id,
+                request,
+                tuple(str(wave["schedule_id"]) for wave in waves),
+                int(campaign["event_count"]),
+                str(campaign["last_event_digest"]),
             )
 
     def _append_event(

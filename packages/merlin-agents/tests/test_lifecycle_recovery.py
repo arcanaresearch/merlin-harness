@@ -22,6 +22,120 @@ _RECOVERY_FIELDS = {
 }
 
 
+@pytest.mark.parametrize(
+    ("action", "batch_state", "schedule_status", "wave_status", "queued"),
+    [
+        ("resume_active", "scheduled", "running", "running", 0),
+        ("resume_active", None, "running", "running", 0),
+        ("persist_successor_schedule", "claimed", None, "completed", 0),
+        ("bind_successor_schedule", "claimed", "running", "completed", 0),
+        ("persist_wave_binding", "scheduled", "running", "completed", 0),
+        ("finalize_and_settle_terminal_batch", "scheduled", "completed", "running", 0),
+        ("settle_terminal_batch", "scheduled", "completed", "completed", 0),
+        ("finalize_terminal_wave", None, "completed", "running", 0),
+        ("claim_successor", None, "completed", "completed", 1),
+    ],
+)
+async def test_recorded_recovery_actions_match_legacy_boundaries(
+    monkeypatch, action, batch_state, schedule_status, wave_status, queued
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    import merlin_agents.campaign_service as module
+
+    calls = []
+    batch = None if batch_state is None else {
+        "id": "batch", "wave": 1, "state": batch_state,
+        "schedule_id": "schedule" if batch_state == "scheduled" else None,
+    }
+    wave = 0 if action in {
+        "persist_successor_schedule", "bind_successor_schedule", "persist_wave_binding"
+    } else 1
+    waves = [{"wave": wave, "status": wave_status, "schedule_id": "schedule"}]
+    live = SimpleNamespace(id="schedule", assignments=(), execution=None)
+
+    class Store:
+        def get(self, campaign_id):
+            return {"id": campaign_id, "manifest": {"manifest": {}, "assignment_context": {}}}
+
+        def list_executing(self):
+            return [self.get("campaign/test")]
+
+        def list_waves(self, campaign_id):
+            return waves
+
+        def load_active_frontier_batch(self, campaign_id):
+            return batch
+
+        def frontier_counts(self, campaign_id):
+            return {"queued": queued}
+
+    class Agents:
+        async def schedule_status(self, schedule_id):
+            return schedule_status
+
+        async def reopen(self, schedule_id, **kwargs):
+            return live
+
+    class Recovery:
+        def claim(self, campaign_id, **kwargs):
+            assert kwargs["state_digest"] == _RECOVERY_FIELDS["recovery_state_digest"]
+            assert kwargs["decision_digest"] == _RECOVERY_FIELDS["recovery_decision_digest"]
+            return "claim/test"
+
+        def apply(self, campaign_id, **kwargs):
+            assert kwargs == {"claim_id": "claim/test"}
+
+    monkeypatch.setattr(module, "_manifest", lambda value: object())
+    monkeypatch.setattr(module, "_assignment_context", lambda value: object())
+
+    async def prepare(*args):
+        raise AssertionError
+
+    service = module.CampaignService(Store(), Agents(), prepare)
+
+    async def restore(*args):
+        return live
+
+    async def successor(*args):
+        return live, 2
+
+    async def supervise(*args, **kwargs):
+        calls.append(
+            (args[0], args[3].id, kwargs["initial_wave"], kwargs.get("wave_running", True))
+        )
+
+    monkeypatch.setattr(service, "_recover_active_frontier_fenced", restore)
+    monkeypatch.setattr(service, "_recover_settled_frontier_successor", successor)
+    monkeypatch.setattr(service, "_supervise", supervise)
+    assert await service.recover() == 1
+    await asyncio.gather(*service._supervisors.values())
+    legacy = calls.pop()
+    service._supervisors.clear()
+    service._recovery_repository = Recovery()
+
+    async def forbidden(**kwargs):
+        raise AssertionError("production must not recompute legacy recovery")
+
+    monkeypatch.setattr(service, "_recover_owned", forbidden)
+    report = lifecycle_recovery_report({
+        "schema": LIFECYCLE_RECOVERY_SCHEMA, "reconciled_at": datetime.now(UTC),
+        "expired_global_leases": 0, "due_quota_wakes": 0,
+        "campaigns": [{
+            **_RECOVERY_FIELDS, "campaign_id": "campaign/test",
+            "execution_format": STATE_SCOPE_SCHEMA_VERSION, "status": "executing",
+            "decision": "resume", "wake_at": None, "open_state_scopes": 0,
+            "acknowledged_state_scopes": 0, "cleanup_obligations": 0,
+            "recovery_action": action, "scheduler_action": action,
+            "recovery_fence_digest": "sha256:" + "c" * 64,
+        }],
+    })
+    assert await service.recover(lifecycle_report=report) == 1
+    await asyncio.gather(*service._supervisors.values())
+    assert calls == [legacy]
+
+
 async def test_lifecycle_recovery_fences_global_state_before_campaign_resume() -> None:
     calls = []
     now = datetime.now(UTC)

@@ -15,7 +15,11 @@ from psycopg.errors import CheckViolation
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 93))
+    # 093 is reserved for automation_requests on the independently integrated
+    # outbox branch. Both this foundation checkout and the merged tree are valid.
+    versions = [migration.version for migration in migrations]
+    assert [version for version in versions if version != 93] == [*range(1, 93), 94]
+    assert next(item for item in migrations if item.version == 94).sql
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
