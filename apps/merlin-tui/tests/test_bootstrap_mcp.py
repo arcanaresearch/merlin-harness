@@ -17,6 +17,7 @@ from merlin_tui.bootstrap import (
     _browser_origin,
     _register_browser_tools,
     _resolve_mcp_credential,
+    _target_requires_persistent_browser,
     _terminalize_validator_supported_attempt,
     _validated_browser_authentication,
     _validator_exchange_witnesses,
@@ -191,6 +192,27 @@ def test_browser_origin_is_exact_and_rejects_non_http_targets() -> None:
     assert _browser_origin("https://target.test:8443/v1/chat") == "https://target.test:8443"
     with pytest.raises(ValueError, match="browser origin"):
         _browser_origin("file:///tmp/target")
+
+
+def test_target_browser_policy_is_primary_with_legacy_origin_compatibility() -> None:
+    arbitrary_origin = "https://arbitrary.example.test"
+
+    assert not _target_requires_persistent_browser(
+        {"browser_session_policy": "ephemeral"}, arbitrary_origin, frozenset()
+    )
+    assert _target_requires_persistent_browser(
+        {"browser_session_policy": "persistent"}, arbitrary_origin, frozenset()
+    )
+    assert _target_requires_persistent_browser(
+        {"browser_session_policy": "ephemeral"},
+        arbitrary_origin,
+        frozenset({arbitrary_origin}),
+    )
+
+    with pytest.raises(ValueError, match="unsupported target browser session policy"):
+        _target_requires_persistent_browser(
+            {"browser_session_policy": "shared"}, arbitrary_origin, frozenset()
+        )
 
 
 def test_only_verified_session_cardinality_becomes_a_target_limit() -> None:

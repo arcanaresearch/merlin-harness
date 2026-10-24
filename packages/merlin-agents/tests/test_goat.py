@@ -186,6 +186,77 @@ def test_goat_rejects_missing_or_drifted_objective_observation() -> None:
     assert "absent" in str(advanced.evaluation_uncertainties[0]["reason"])
 
 
+def test_goat_accepts_only_target_authority_for_current_signed_observations() -> None:
+    review = contract(turns=1)
+    binding = {
+        "authority": "target",
+        "adapter_digest": review.reviewed_adapter_digest,
+        "compiled_adapter_digest": digest("compiled-adapter"),
+        "step_id": "interaction",
+        "oracle_digest": review.terminal_oracle_digest,
+        "pointer": "/result",
+        "match_values": ["matched"],
+        "modality": "text",
+        "turn": "multi",
+        "language": "en",
+        "purpose": "objective",
+    }
+    body = {
+        "schema": "merlin.api-oracle-observation.v2",
+        **binding,
+        "binding_digest": digest(binding),
+        "matched": True,
+    }
+    signed_exchange = {
+        "id": 1,
+        "interaction": True,
+        "oracle_observations": [{**body, "observation_digest": digest(body)}],
+    }
+
+    accepted = GoatState.start(review, "attempt-1").advance(
+        review,
+        plan=plan(),
+        target_session_id="chat-1",
+        call_id="call-0",
+        tool_content="reply",
+        arguments_digest=digest({"message": "ask"}),
+        exchange=signed_exchange,
+    )
+    assert accepted.steps[0].objective_matched is True
+    assert accepted.evaluation_uncertainties == ()
+
+    for invalid_authority in (None, "model"):
+        invalid_binding = {
+            key: value
+            for key, value in binding.items()
+            if key != "authority" or invalid_authority is not None
+        }
+        if invalid_authority is not None:
+            invalid_binding["authority"] = invalid_authority
+        invalid_body = {
+            "schema": "merlin.api-oracle-observation.v2",
+            **invalid_binding,
+            "binding_digest": digest(invalid_binding),
+            "matched": True,
+        }
+        invalid_exchange = {
+            "id": 1,
+            "interaction": True,
+            "oracle_observations": [{**invalid_body, "observation_digest": digest(invalid_body)}],
+        }
+        rejected = GoatState.start(review, "attempt-1").advance(
+            review,
+            plan=plan(),
+            target_session_id="chat-1",
+            call_id="call-0",
+            tool_content="reply",
+            arguments_digest=digest({"message": "ask"}),
+            exchange=invalid_exchange,
+        )
+        assert rejected.steps[0].objective_matched is None
+        assert rejected.evaluation_uncertainties[0]["source"] == "goat.oracle"
+
+
 def test_goat_replacement_restores_exact_non_system_attacker_history() -> None:
     review = contract(turns=2)
     state = GoatState.start(review, "attempt-1").advance(

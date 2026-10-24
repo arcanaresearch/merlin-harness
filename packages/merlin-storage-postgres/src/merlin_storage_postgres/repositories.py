@@ -485,21 +485,29 @@ class TargetProfileRepository:
 
     def save(self, profile: TargetProfile) -> TargetProfile:
         row = self.connection.execute(
-            """INSERT INTO merlin_storage.target_profiles (id, title, base_url, model)
-               VALUES (%s, %s, %s, %s)
+            """INSERT INTO merlin_storage.target_profiles
+                   (id, title, base_url, model, browser_session_policy)
+               VALUES (%s, %s, %s, %s, %s)
                ON CONFLICT (id) DO UPDATE SET
                    title = EXCLUDED.title,
                    base_url = EXCLUDED.base_url,
-                   model = EXCLUDED.model
-               RETURNING id, title, base_url, model""",
-            (profile.id, profile.title, profile.base_url, profile.model),
+                   model = EXCLUDED.model,
+                   browser_session_policy = EXCLUDED.browser_session_policy
+               RETURNING id, title, base_url, model, browser_session_policy""",
+            (
+                profile.id,
+                profile.title,
+                profile.base_url,
+                profile.model,
+                profile.browser_session_policy,
+            ),
         ).fetchone()
         self.connection.commit()
         return _record(TargetProfile, row)
 
     def get(self, profile_id: str) -> TargetProfile | None:
         row = self.connection.execute(
-            """SELECT id, title, base_url, model
+            """SELECT id, title, base_url, model, browser_session_policy
                FROM merlin_storage.target_profiles WHERE id = %s""",
             (profile_id,),
         ).fetchone()
@@ -507,7 +515,7 @@ class TargetProfileRepository:
 
     def list(self) -> list[TargetProfile]:
         rows = self.connection.execute(
-            """SELECT id, title, base_url, model
+            """SELECT id, title, base_url, model, browser_session_policy
                FROM merlin_storage.target_profiles ORDER BY title, id"""
         ).fetchall()
         return [_record(TargetProfile, row) for row in rows]

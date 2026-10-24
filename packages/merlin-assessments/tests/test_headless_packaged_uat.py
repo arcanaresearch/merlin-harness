@@ -24,7 +24,7 @@ spec.loader.exec_module(driver)
 
 
 async def test_headless_api_mode_governs_execution_and_exports_report(tmp_path: Path) -> None:
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         evidence = await driver.run_api_lane(tmp_path / "api", target)
     assert evidence["execution_mode"] == "api"
     assert evidence["effect_tools"] == ["target_request"]
@@ -33,21 +33,22 @@ async def test_headless_api_mode_governs_execution_and_exports_report(tmp_path: 
 
 
 async def test_headless_api_lane_cancel_restart_compaction_replay(tmp_path: Path) -> None:
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         evidence = await driver.run_api_restart_lane(tmp_path / "api-restart", target)
     assert evidence["mailbox_replayed"] is True
     assert evidence["mailbox_deduped"] is True
-    assert evidence["attempts"] == ["expired", "completed"]
+    assert evidence["attempts"] == ["expired", "failed", "completed"]
+    assert evidence["session_conflict_fenced"] is True
     assert evidence["service_replaced"] is True
     assert evidence["checkpoint_reused"] is True
     assert evidence["provider_calls"] == evidence["provider_calls_after_interruption"] == 2
     assert evidence["message_count"] == 2
-    assert len(evidence["receipt_attempt_ids"]) == 2
+    assert len(evidence["receipt_attempt_ids"]) == 1
     assert evidence["gate_verdict"] == "ambiguous"
 
 
 async def test_headless_browser_mode_uses_compiled_browser_flow(tmp_path: Path) -> None:
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         evidence = await driver.run_browser_lane(tmp_path / "browser", target)
     assert evidence["execution_mode"] == "browser"
     assert evidence["effect_tools"] == ["browser_chat_exchange"]
@@ -69,7 +70,7 @@ async def test_headless_browser_mode_uses_compiled_browser_flow(tmp_path: Path) 
 async def test_headless_hybrid_mode_runs_api_with_read_only_browser_checkpoints(
     tmp_path: Path,
 ) -> None:
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         evidence = await driver.run_hybrid_lane(tmp_path / "hybrid", target)
     assert evidence["execution_mode"] == "hybrid"
     assert evidence["effect_tools"] == ["target_request"]
@@ -87,7 +88,7 @@ async def test_headless_hybrid_mode_runs_api_with_read_only_browser_checkpoints(
 async def test_headless_recon_reuse_revalidates_bot_session_oracle_evidence(
     tmp_path: Path,
 ) -> None:
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         evidence = await driver.run_recon_reuse_lane(tmp_path / "recon-reuse", target)
     scenarios = evidence["scenarios"]
     assert scenarios[0]["site_evidence_reused"] is True

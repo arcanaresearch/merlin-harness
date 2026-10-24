@@ -39,3 +39,5 @@ jobs:
           apps/merlin-tui/tests/test_release_contract.py
           apps/merlin-tui/tests/test_packaged_launcher.py
           apps/merlin-tui/tests/test_install_release_script.py
+      - name: Run critical runtime release gate
+        run: make critical-runtime-test

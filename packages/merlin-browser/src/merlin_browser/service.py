@@ -68,13 +68,18 @@ class BrowserService:
     async def for_tool(self, session_id: str) -> BrowserSession:
         if self._closed:
             raise BrowserBoundaryError("browser service is shutting down")
+        bounds = await self._targets(session_id)
         context_id = self._session_context.get(session_id)
         if context_id is not None and context_id in self._live:
             session = self._live[context_id]
             if session.owner.worker_id == "operator":
                 raise BrowserBoundaryError("browser context is under operator control")
+            if bounds.requires_persistent_profile and session.mode != "persistent":
+                raise BrowserBoundaryError(
+                    "target browser session policy requires a persistent context; "
+                    "the current isolated context cannot preserve durable authentication"
+                )
             return session
-        bounds = await self._targets(session_id)
         restartable = [
             item
             for item in await self._store.list_metadata(session_id)

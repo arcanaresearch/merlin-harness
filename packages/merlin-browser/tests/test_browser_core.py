@@ -10748,6 +10748,78 @@ async def test_closed_browser_service_cannot_spawn_new_processes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_service_rejects_isolated_context_after_policy_requires_persistence() -> None:
+    class MetadataStore:
+        async def save_metadata(self, _value):
+            return None
+
+        async def load_metadata(self, _context_id):
+            return None
+
+        async def list_metadata(self, _session_id):
+            return ()
+
+    require_persistence = False
+
+    async def targets(_session_id):
+        return BrowserBounds(
+            target_id="arbitrary-target",
+            allowed_origins={"https://arbitrary.example.test"},
+            requires_persistent_profile=require_persistence,
+        )
+
+    service = BrowserService(MetadataStore(), targets)
+    service._session_context["session"] = "isolated-context"
+    service._live["isolated-context"] = SimpleNamespace(
+        mode="isolated",
+        owner=SimpleNamespace(worker_id="agent:browser"),
+    )
+
+    assert await service.for_tool("session") is service._live["isolated-context"]
+    require_persistence = True
+    with pytest.raises(BrowserBoundaryError, match="requires a persistent context"):
+        await service.for_tool("session")
+
+
+@pytest.mark.asyncio
+async def test_api_handoff_rejects_persistent_policy_with_isolated_live_context() -> None:
+    class Session:
+        context_id = "isolated-context"
+        mode = "isolated"
+        bounds = BrowserBounds(
+            target_id="arbitrary-target",
+            allowed_origins={"https://arbitrary.example.test"},
+            requires_persistent_profile=True,
+        )
+        owner = owner()
+
+    class Recorder:
+        handoff = None
+
+        async def record_handoff(self, value):
+            self.handoff = value
+
+    recorder = Recorder()
+    result = await ApiReconHandoffTool(lambda _: Session(), recorder).invoke(
+        ToolContext(session_id="session", workspace_root="/tmp"),
+        {
+            "method": "POST",
+            "url": "https://arbitrary.example.test/api/message",
+            "request_evidence_ref": "evidence:req",
+            "response_evidence_ref": "evidence:res",
+            "adapter": {
+                "interface": "provider_chat",
+                "endpoint": "https://arbitrary.example.test/api/message",
+            },
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "persistent_browser_required"
+    assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
 async def test_browser_service_uses_configured_shared_profile_directly(tmp_path: Path) -> None:
     class MetadataStore:
         def __init__(self):

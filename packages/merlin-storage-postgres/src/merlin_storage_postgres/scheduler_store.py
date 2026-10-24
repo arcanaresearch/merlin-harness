@@ -318,7 +318,14 @@ def _valid_adaptive_observation(value: Mapping[str, object]) -> bool:
         "language",
         "purpose",
     )
+    authority = value.get("authority")
+    if authority is not None:
+        if authority != "target":
+            return False
+        binding_keys = (*binding_keys, "authority")
     if "compiled_adapter_digest" in value:
+        if authority != "target":
+            return False
         binding_keys = (*binding_keys, "compiled_adapter_digest")
     return bool(
         observation_digest == _adaptive_observation_digest(unsigned)

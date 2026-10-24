@@ -108,6 +108,8 @@ def _scheduler_recovery_action(
             )
         if schedule_status == "running" and wave_status in {"running", "paused"}:
             return "paused" if campaign_status == "paused" else "resume_active"
+        if schedule_status == "paused" and wave_status == "paused" and campaign_status == "paused":
+            return "paused"
         return "pause_inconsistent"
     if latest_wave is not None:
         schedule_status = str(latest_wave["schedule_status"])
@@ -118,6 +120,8 @@ def _scheduler_recovery_action(
             return "claim_successor" if queued else "idle"
         if schedule_status == "running" and wave_status in {"running", "paused"}:
             return "paused" if campaign_status == "paused" else "resume_active"
+        if schedule_status == "paused" and wave_status == "paused" and campaign_status == "paused":
+            return "paused"
         return "pause_inconsistent"
     if queued and campaign_status == "executing":
         return "claim_successor"

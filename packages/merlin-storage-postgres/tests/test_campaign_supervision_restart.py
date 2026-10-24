@@ -538,6 +538,26 @@ def test_campaign_supervision_claim_decision_and_directive_survive_pg0_restart(
                 claimant_id="lead/original",
             )
             assert first_decision["decision_id"] == "decision/reroute"
+            stored_redirect = store.list_unapplied_directives(campaign_id)[0]
+            assert stored_redirect["payload"]["objective"] == (
+                "Continue through the browser route."
+            )
+            with pytest.raises(ValueError, match="unsupported lead directive action"):
+                store.commit_lead_decision(
+                    campaign_id,
+                    1,
+                    "decision/invalid",
+                    {"reason": "invalid directive must roll back"},
+                    (
+                        {
+                            "action": "reroute",
+                            "source_node_id": "worker/source",
+                        },
+                    ),
+                )
+            assert all(
+                row["decision_id"] != "decision/invalid" for row in store.list_lead(campaign_id)
+            )
             with pytest.raises(ValueError, match="different payload"):
                 store.commit_lead_decision(
                     campaign_id,
@@ -724,9 +744,12 @@ async def test_campaign_service_reconciles_existing_mailbox_effect_after_pg0_res
                     },
                 ),
             )
-            campaigns.mark_directive_failed(
+            failed = campaigns.mark_directive_failed(
                 "decision/failed/0", "destination capability disappeared"
             )
+            assert failed["state"] == "retry_wait"
+            assert failed["attempt_count"] == 1
+            assert failed["failure_kind"] == "runtime"
             assert campaigns.list_unapplied_directives(campaign_id, 1)[0]["id"] == directive_id
 
     with Database(DatabaseConfig(data_dir=data_dir)) as restarted:
@@ -750,11 +773,41 @@ async def test_campaign_service_reconciles_existing_mailbox_effect_after_pg0_res
             planned = await service.list_schedule_directives(schedule_id)
             assert "[directive:planned] decision/redirect/0" in planned["campaign/source"][0]
             assert any(
-                "[directive:failed] decision/failed/0" in row
+                "[directive:retry_wait] decision/failed/0" in row
                 and "failure=destination capability disappeared" in row
                 for row in planned["campaign/source"]
             )
             assert await service.list_schedule_directives("unrelated-schedule") == {}
+            assert all(
+                row["id"] != "decision/failed/0"
+                for row in campaigns.list_unapplied_directives(campaign_id, 1)
+            )
+            connection.execute(
+                """UPDATE merlin_storage.campaign_lead_directives
+                   SET next_retry_at = now() - interval '1 second'
+                   WHERE id = %s""",
+                ("decision/failed/0",),
+            )
+            connection.commit()
+            assert any(
+                row["id"] == "decision/failed/0"
+                for row in campaigns.list_unapplied_directives(campaign_id, 1)
+            )
+            second_failure = campaigns.mark_directive_failed(
+                "decision/failed/0", "provider unavailable after restart"
+            )
+            assert second_failure["state"] == "retry_wait"
+            assert second_failure["attempt_count"] == 2
+            exhausted = campaigns.mark_directive_failed(
+                "decision/failed/0", "provider unavailable after final retry"
+            )
+            assert exhausted["state"] == "rejected"
+            assert exhausted["attempt_count"] == 3
+            assert exhausted["failure_kind"] == "retry_exhausted"
+            assert all(
+                row["id"] != "decision/failed/0"
+                for row in campaigns.list_unapplied_directives(campaign_id, 1)
+            )
             campaigns.mark_directive_applied(
                 "decision/failed/0", "operator-reconciled:test-fixture"
             )

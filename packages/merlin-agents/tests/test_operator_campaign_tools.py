@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 from merlin_agents.campaign_service import CampaignService
-from merlin_agents.operator_campaign_tools import CampaignMessageTool
+from merlin_agents.operator_campaign_tools import CampaignDrainTool, CampaignMessageTool
 from merlin_contracts import ToolContext
 
 
@@ -18,7 +18,7 @@ class GuidanceStore:
         return self.rows.get(campaign_id)
 
     def list_waves(self, campaign_id):
-        return [{"wave": self.wave}]
+        return [{"wave": self.wave, "schedule_id": "schedule-1"}]
 
     def commit_lead_decision(self, campaign_id, wave, decision_id, payload, directives):
         identity = (campaign_id, decision_id)
@@ -50,6 +50,59 @@ async def test_guidance_retry_survives_service_recreation_and_wave_transition():
     with pytest.raises(ValueError, match="conflicts"):
         await service(store).guide("session-1", "campaign-1", "different", request_id="call-1")
     assert len(store.journal) == 1
+
+
+async def test_direct_drain_is_durable_idempotent_and_does_not_consult_lead():
+    store = GuidanceStore()
+    drains = []
+
+    class Agents:
+        async def drain_schedule(self, schedule_id, *, reason):
+            assert list(store.journal.values()) == [
+                {
+                    "kind": "operator_drain_requested",
+                    "request_id": "call-1",
+                    "reason": "finish owned work",
+                }
+            ]
+            drains.append((schedule_id, reason))
+
+    instance = service(store)
+    instance._agents = Agents()
+    first = await instance.drain(
+        "session-1",
+        "campaign-1",
+        "finish owned work",
+        request_id="call-1",
+    )
+    retry = await instance.drain(
+        "session-1",
+        "campaign-1",
+        "finish owned work",
+        request_id="call-1",
+    )
+
+    assert retry == first
+    assert first["drain_status"] == "requested"
+    assert list(store.journal.values()) == [
+        {
+            "kind": "operator_drain_requested",
+            "request_id": "call-1",
+            "reason": "finish owned work",
+        }
+    ]
+    assert drains == [
+        ("schedule-1", "operator_stopped"),
+        ("schedule-1", "operator_stopped"),
+    ]
+    with pytest.raises(ValueError, match="conflicts"):
+        await instance.drain(
+            "session-1",
+            "campaign-1",
+            "different intent",
+            request_id="call-1",
+        )
+    assert len(drains) == 2
 
 
 @pytest.mark.parametrize(
@@ -84,6 +137,40 @@ async def test_tool_resolves_single_active_campaign_and_reports_only_queued():
     assert result.metadata["delivery_status"] == "queued"
     assert result.metadata["delivery"] == "next_lead_boundary"
     assert "read" not in result.metadata
+
+
+async def test_drain_tool_resolves_single_campaign_and_invokes_direct_command():
+    calls = []
+
+    async def list_campaigns(session_id):
+        assert session_id == "session-1"
+        return (
+            {"campaign_id": "campaign-1", "status": "executing"},
+            {"campaign_id": "prepared", "status": "prepared"},
+        )
+
+    async def drain(session_id, campaign_id, reason, *, request_id):
+        calls.append((session_id, campaign_id, reason, request_id))
+        return {
+            "campaign_id": campaign_id,
+            "schedule_id": "schedule-1",
+            "drain_status": "requested",
+        }
+
+    result = await CampaignDrainTool(SimpleNamespace(list=list_campaigns, drain=drain)).invoke(
+        context(), {}
+    )
+
+    assert not result.is_error
+    assert result.metadata["drain_status"] == "requested"
+    assert calls == [
+        (
+            "session-1",
+            "campaign-1",
+            "Operator requested current work to finish",
+            "call-1",
+        )
+    ]
 
 
 @pytest.mark.parametrize("count", [0, 2])

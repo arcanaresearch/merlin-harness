@@ -32,6 +32,47 @@ _FRONTIER_COMPLETION_OUTCOMES = (
     "unattempted",
 )
 
+_LEAD_DIRECTIVE_ACTIONS = frozenset({"redirect", "handoff", "cancel"})
+
+
+def _validated_lead_directive(directive: Mapping[str, object]) -> dict[str, object]:
+    """Validate and normalize a durable directive before committing its identity."""
+
+    payload = dict(directive)
+    action = str(payload.get("action") or "").strip()
+    if action not in _LEAD_DIRECTIVE_ACTIONS:
+        raise ValueError(f"unsupported lead directive action: {action or '<blank>'}")
+    source_node_id = str(payload.get("source_node_id") or "").strip()
+    if not source_node_id:
+        raise ValueError("lead directive source worker must not be blank")
+    payload["action"] = action
+    payload["source_node_id"] = source_node_id
+
+    destination = str(payload.get("destination_node_id") or "").strip()
+    if action == "handoff":
+        if not destination:
+            raise ValueError("handoff directive destination worker must not be blank")
+        if destination == source_node_id:
+            raise ValueError("handoff directive destination must differ from its source")
+        payload["destination_node_id"] = destination
+
+    objective = str(payload.get("objective") or payload.get("instruction") or "").strip()
+    if action in {"redirect", "handoff"}:
+        if not objective:
+            raise ValueError(f"{action} directive objective must not be blank")
+        payload["objective"] = objective
+
+    ttl_turns = payload.get("temporary_ttl_turns")
+    if ttl_turns is not None:
+        if action != "redirect":
+            raise ValueError("temporary directive TTL is only valid for redirect")
+        if not isinstance(ttl_turns, int) or isinstance(ttl_turns, bool) or not 1 <= ttl_turns <= 8:
+            raise ValueError("temporary directive TTL must be 1-8 worker turns")
+        if not str(payload.get("evidence_expectation") or "").strip():
+            raise ValueError("temporary directive must include an evidence expectation")
+
+    return payload
+
 
 def _serialize_connection_methods(cls: type[Any]) -> type[Any]:
     """Serialize complete operations performed through one psycopg connection."""
@@ -2553,7 +2594,7 @@ class CampaignStore:
             if journal["payload_digest"] != digest:
                 raise ValueError("lead decision identity conflicts with different payload")
             for ordinal, directive in enumerate(directives):
-                directive_payload = dict(directive)
+                directive_payload = _validated_lead_directive(directive)
                 directive_body = json.dumps(
                     directive_payload, sort_keys=True, separators=(",", ":")
                 )
@@ -2605,7 +2646,11 @@ class CampaignStore:
             dict(row)
             for row in self.connection.execute(
                 f"""SELECT * FROM merlin_storage.campaign_lead_directives
-                   WHERE campaign_id = %s AND state IN ('planned', 'failed')
+                   WHERE campaign_id = %s
+                     AND (
+                         state = 'planned'
+                         OR (state = 'retry_wait' AND next_retry_at <= now())
+                     )
                      {wave_clause}
                    ORDER BY created_at, id""",
                 params,
@@ -2642,6 +2687,7 @@ class CampaignStore:
             row = self.connection.execute(
                 """UPDATE merlin_storage.campaign_lead_directives
                    SET state = 'applied', effect_reference = %s, failure = NULL,
+                       failure_kind = NULL, next_retry_at = NULL,
                        applied_at = now(), updated_at = now()
                    WHERE id = %s RETURNING *""",
                 (effect_reference, directive_id),
@@ -2650,21 +2696,64 @@ class CampaignStore:
             raise KeyError(f"unknown lead directive: {directive_id}")
         return dict(row)
 
-    def mark_directive_failed(self, directive_id: str, failure: str) -> dict[str, Any]:
-        row = self.connection.execute(
-            """UPDATE merlin_storage.campaign_lead_directives
-               SET state = 'failed', failure = %s, updated_at = now()
-               WHERE id = %s AND state != 'applied' RETURNING *""",
-            (failure[:4096], directive_id),
-        ).fetchone()
-        if row is None:
+    def mark_directive_failed(
+        self,
+        directive_id: str,
+        failure: str,
+        *,
+        failure_kind: str = "runtime",
+        retryable: bool = True,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        if not failure.strip():
+            raise ValueError("directive failure must not be blank")
+        if max_attempts < 1:
+            raise ValueError("directive retry limit must be positive")
+        retryable_kinds = {"runtime", "transport"}
+        permanent_kinds = {"validation", "unknown_worker"}
+        allowed_kinds = retryable_kinds | permanent_kinds
+        if failure_kind not in allowed_kinds:
+            raise ValueError(f"unsupported directive failure kind: {failure_kind}")
+        if retryable and failure_kind not in retryable_kinds:
+            raise ValueError("permanent directive failure kind cannot be retried")
+        if not retryable and failure_kind not in permanent_kinds:
+            raise ValueError("retryable directive failure kind cannot be rejected directly")
+
+        with self.connection.transaction():
             current = self.connection.execute(
-                "SELECT * FROM merlin_storage.campaign_lead_directives WHERE id = %s",
+                "SELECT * FROM merlin_storage.campaign_lead_directives WHERE id = %s FOR UPDATE",
                 (directive_id,),
             ).fetchone()
             if current is None:
                 raise KeyError(f"unknown lead directive: {directive_id}")
-            return dict(current)
+            if current["state"] in {"applied", "rejected"}:
+                return dict(current)
+            attempt_count = int(current["attempt_count"]) + 1
+            should_retry = retryable and attempt_count < max_attempts
+            state = "retry_wait" if should_retry else "rejected"
+            stored_kind = failure_kind if should_retry or not retryable else "retry_exhausted"
+            retry_delay_seconds = min(300, 2 ** (attempt_count - 1))
+            row = self.connection.execute(
+                """UPDATE merlin_storage.campaign_lead_directives
+                   SET state = %s, attempt_count = %s, failure = %s,
+                       failure_kind = %s,
+                       next_retry_at = CASE
+                           WHEN %s THEN now() + (%s * interval '1 second')
+                           ELSE NULL
+                       END,
+                       updated_at = now()
+                   WHERE id = %s AND state != 'applied' RETURNING *""",
+                (
+                    state,
+                    attempt_count,
+                    failure[:4096],
+                    stored_kind,
+                    should_retry,
+                    retry_delay_seconds,
+                    directive_id,
+                ),
+            ).fetchone()
+        assert row is not None
         return dict(row)
 
     def list_pending_worker_messages(self, campaign_id: str) -> list[dict[str, Any]]:

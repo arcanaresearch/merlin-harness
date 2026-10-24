@@ -555,9 +555,9 @@ def test_objective_phase_gate_accepts_valid_committed_interaction_receipt() -> N
     assert settled["attempt_disposition"] == "valid"
     assert settled["target_calls"] == 1
 
-    evidence[task.id]["target_evidence_receipts"]["target-call:1"][
-        "attempt_disposition"
-    ] = "infrastructure_failed"
+    evidence[task.id]["target_evidence_receipts"]["target-call:1"]["attempt_disposition"] = (
+        "infrastructure_failed"
+    )
     failed = _objective_phase_gate_result(gate, (task,), evidence)
 
     assert failed["status"] == "retryable"
@@ -636,8 +636,9 @@ def test_objective_phase_gate_accepts_reviewed_identity_observation_for_presence
     assert settled["last_transition"] == receipt["target_state_transition"]
 
 
-def test_objective_phase_gate_accepts_presence_from_same_identity_receipt_without_transition(
-) -> None:
+def test_objective_phase_gate_accepts_presence_from_same_identity_receipt_without_transition() -> (
+    None
+):
     gate = ObjectivePhaseGate(
         id="auth-wallet-session-gate",
         ordinal=0,
@@ -755,9 +756,7 @@ async def test_objective_phase_gate_controller_retries_in_order_before_frontier(
     assert service.gate_ids == ["baseline", "baseline", "progression"]
     assert store.paused is False
     gate_events = [
-        payload
-        for payload in store.lead
-        if payload.get("kind") == "objective_phase_gate_settled"
+        payload for payload in store.lead if payload.get("kind") == "objective_phase_gate_settled"
     ]
     assert gate_events
     assert all(payload.get("frontier_claimed") is False for payload in gate_events)
@@ -3389,7 +3388,12 @@ async def test_recovery_quarantines_incompatible_worker_context_without_crashing
     assert events[1][3]["kind"] == "campaign_recovery_failed"
     assert events[1][3]["retryable"] is False
     assert events[2][0:4] == ("finish_wave", prepared.manifest.id, 1, "failed")
-    assert events[3] == ("finish", prepared.manifest.id, "failed", "failed")
+    assert events[3] == (
+        "finish",
+        prepared.manifest.id,
+        "failed",
+        CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value,
+    )
 
 
 async def test_recovery_releases_orphaned_provider_budget_before_reopening_workers() -> None:
@@ -4188,9 +4192,7 @@ async def test_live_terminal_frontier_without_successor_falls_back_to_lead_after
             prepared.manifest.id,
             prepared.manifest,
             prepared.assignment_context,
-            SimpleNamespace(
-                id="schedule-3", assignments=(), execution=execution
-            ),
+            SimpleNamespace(id="schedule-3", assignments=(), execution=execution),
             initial_wave=3,
             wave_running=False,
         )
@@ -6378,7 +6380,7 @@ async def test_operator_continue_authorizes_subsequent_coverage_repair_waves() -
             offered_auto_decisions.append(auto_decision)
             return {
                 "decision": "continue",
-                    "automatic": False,
+                "automatic": False,
                 "request_id": f"coverage-{len(offered_auto_decisions)}",
                 "coverage_gaps": {"untested_techniques": max(1, 3 - continuations)},
             }
@@ -6477,9 +6479,7 @@ async def test_operator_continue_expires_after_three_repair_waves() -> None:
                             "identity": {"technique_id": "technique/unclear"},
                         },
                     ),
-                    "catalogue_unresolved_cell_ids": (
-                        f"technique/unclear-{continuations}",
-                    ),
+                    "catalogue_unresolved_cell_ids": (f"technique/unclear-{continuations}",),
                     "frontier_runnable": 1,
                     "frontier_exhausted": False,
                     "total_tasks": continuations + 1,
@@ -6495,12 +6495,10 @@ async def test_operator_continue_expires_after_three_repair_waves() -> None:
                     if auto_decision is None and len(offered_auto_decisions) > 1
                     else "continue"
                 ),
-                    "automatic": auto_decision is not None,
+                "automatic": auto_decision is not None,
                 "request_id": f"coverage-{len(offered_auto_decisions)}",
                 "coverage_gaps": {
-                    "catalogue_unresolved_cell_ids": (
-                        f"technique/unclear-{continuations}",
-                    )
+                    "catalogue_unresolved_cell_ids": (f"technique/unclear-{continuations}",)
                 },
             }
 
@@ -8332,8 +8330,7 @@ async def test_saturation_counts_evidence_backed_direct_attempt_results() -> Non
     prepared = await preparation("session-1", "Assess", CampaignProfile.EXHAUSTIVE)
     service = CampaignService(SimpleNamespace(), SimpleNamespace(), preparation)  # type: ignore[arg-type]
     lead = [
-        {"payload": {"coverage_complete": True, "validation_finding_ids": []}}
-        for _ in range(3)
+        {"payload": {"coverage_complete": True, "validation_finding_ids": []}} for _ in range(3)
     ]
 
     evidence = service._project_saturation_evidence(  # noqa: SLF001
@@ -9530,12 +9527,8 @@ async def test_sealed_objectives_project_durable_progress_and_block_false_comple
     assert checkpoint["resumable"] is True
     assert checkpoint["campaign_status"] == "paused"
     assert "terminal_status" not in checkpoint
-    assert checkpoint["document"]["campaign_outcome"]["unresolved_objective_ids"] == [
-        objective_id
-    ]
-    assert not any(
-        item["payload"].get("kind") == "campaign_completion" for item in store.lead
-    )
+    assert checkpoint["document"]["campaign_outcome"]["unresolved_objective_ids"] == [objective_id]
+    assert not any(item["payload"].get("kind") == "campaign_completion" for item in store.lead)
 
 
 async def test_incomplete_objective_pause_failure_never_seals_terminal_receipt() -> None:
@@ -9561,9 +9554,7 @@ async def test_incomplete_objective_pause_failure_never_seals_terminal_receipt()
     )
     assert checkpoint["resumable"] is True
     assert checkpoint["stop_reason"] == "budget_exhausted"
-    assert not any(
-        item["payload"].get("kind") == "campaign_completion" for item in store.lead
-    )
+    assert not any(item["payload"].get("kind") == "campaign_completion" for item in store.lead)
 
     # Restart/finalization retry reuses the nonterminal checkpoint and converges
     # on a resumable campaign state without manufacturing completion authority.
@@ -9575,9 +9566,7 @@ async def test_incomplete_objective_pause_failure_never_seals_terminal_receipt()
     )
     assert terminalized is False
     assert store.rows[manifest.id]["status"] == "paused"
-    assert not any(
-        item["payload"].get("kind") == "campaign_completion" for item in store.lead
-    )
+    assert not any(item["payload"].get("kind") == "campaign_completion" for item in store.lead)
 
 
 async def test_satisfied_sealed_objectives_allow_completed_reseal() -> None:
@@ -9767,9 +9756,7 @@ async def test_untrusted_target_state_values_cannot_complete_range_objective() -
     assert progress["status"] == "active"
     assert progress["evidence_refs"] == ["target-state-attribution:trusted-3-4"]
     assert "2 of 4" in progress["status_reason"]
-    assert status["campaign_outcome"]["unresolved_objective_ids"] == [
-        progress["objective"]["id"]
-    ]
+    assert status["campaign_outcome"]["unresolved_objective_ids"] == [progress["objective"]["id"]]
 
 
 async def test_authoritative_attempt_receipts_dispose_explicit_method_list() -> None:
@@ -9799,9 +9786,7 @@ async def test_authoritative_attempt_receipts_dispose_explicit_method_list() -> 
         {
             "tasks": (
                 {
-                    "technique_outcomes": {
-                        technique.id: "refuted" for technique in techniques
-                    },
+                    "technique_outcomes": {technique.id: "refuted" for technique in techniques},
                     "evidence_references": tuple(
                         f"receipt:{index}" for index in range(len(techniques))
                     ),
@@ -9840,9 +9825,7 @@ async def test_expanded_candidate_disposes_bound_semantic_method_family() -> Non
     )
     manifest = manifest_with_objective_contract(
         prepared.manifest,
-        _bind_method_objectives(
-            compile_objective_contract(objective), (base, authority)
-        ),
+        _bind_method_objectives(compile_objective_contract(objective), (base, authority)),
     )
     frontier = LanguageFrontierSpec(
         default_language="en",
@@ -9856,9 +9839,7 @@ async def test_expanded_candidate_disposes_bound_semantic_method_family() -> Non
     )
     expanded_id = next(
         reference.id
-        for reference in enumerate_language_candidate_references(
-            context.techniques, frontier
-        )
+        for reference in enumerate_language_candidate_references(context.techniques, frontier)
         if reference.family_id == base_id
         and reference.requested_language == "ms"
         and reference.variant_id == "native"
@@ -9895,8 +9876,7 @@ async def test_expanded_candidate_disposes_bound_semantic_method_family() -> Non
 
 def test_actual_campaign_methods_are_not_hardcoded_to_unrelated_catalogue_ids() -> None:
     objective = (
-        "Then attempt prompt injection, role spoofing, judge manipulation, and "
-        "game-logic exploits"
+        "Then attempt prompt injection, role spoofing, judge manipulation, and game-logic exploits"
     )
     techniques = (
         AssignmentTechnique(
@@ -9977,17 +9957,19 @@ async def test_committed_discovery_resolution_binds_and_disposes_method_objectiv
         ),
     )
 
-    assert sum(
-        row["payload"].get("kind") == "campaign_objective_selector_resolution"
-        for row in store.lead
-    ) == 1
+    assert (
+        sum(
+            row["payload"].get("kind") == "campaign_objective_selector_resolution"
+            for row in store.lead
+        )
+        == 1
+    )
     assert progress[0].status.value == "satisfied_by_campaign"
 
 
 async def test_actual_campaign_method_clause_resolves_from_target_receipt_and_completes() -> None:
     objective = (
-        "Then attempt prompt injection, role spoofing, judge manipulation, and "
-        "game-logic exploits"
+        "Then attempt prompt injection, role spoofing, judge manipulation, and game-logic exploits"
     )
     prepared = await preparation("session-1", objective, CampaignProfile.RECOMMENDED)
     candidate_ids = (
@@ -10068,8 +10050,7 @@ async def test_actual_campaign_method_clause_resolves_from_target_receipt_and_co
                             candidate_id: "refuted" for candidate_id in candidate_ids
                         },
                         "evidence_references": tuple(
-                            f"target-call:attempt-{index}"
-                            for index in range(len(candidate_ids))
+                            f"target-call:attempt-{index}" for index in range(len(candidate_ids))
                         ),
                     },
                 )
@@ -10123,8 +10104,7 @@ async def test_forged_discovery_evidence_cannot_bind_selector() -> None:
     )
 
     assert not any(
-        row["payload"].get("kind") == "campaign_objective_selector_resolution"
-        for row in store.lead
+        row["payload"].get("kind") == "campaign_objective_selector_resolution" for row in store.lead
     )
 
 
@@ -10157,14 +10137,18 @@ async def test_discovery_resolution_cannot_shrink_bound_denominator() -> None:
             result=json.dumps({"objective_selector_resolutions": [proposal]}),
         )
         tasks = (
-            task,
-            AgentTask(
-                id=f"{manifest.id}/catalogue/alternate",
-                objective="Reviewed alternate",
-                status="completed",
-                technique_ids=("case:alternate",),
-            ),
-        ) if suffix == "cccc" else (task,)
+            (
+                task,
+                AgentTask(
+                    id=f"{manifest.id}/catalogue/alternate",
+                    objective="Reviewed alternate",
+                    status="completed",
+                    technique_ids=("case:alternate",),
+                ),
+            )
+            if suffix == "cccc"
+            else (task,)
+        )
         await service._record_target_state_attributions(  # noqa: SLF001
             manifest,
             manifest.id,
@@ -10230,8 +10214,7 @@ async def test_model_cannot_hallucinate_empty_all_available_denominator() -> Non
     )
 
     assert not any(
-        row["payload"].get("kind") == "campaign_objective_selector_resolution"
-        for row in store.lead
+        row["payload"].get("kind") == "campaign_objective_selector_resolution" for row in store.lead
     )
     assert _objective_progress_from_journal(manifest, store.lead)[0].status.value == "blocked"
 
@@ -10499,9 +10482,7 @@ async def test_prepare_does_not_double_prefix_compiled_phase_gate_objective_ids(
     )
 
     persisted = store.rows["campaign-1"]["manifest"]["manifest"]
-    assert persisted["objective_contract"]["objectives"][0]["id"] == (
-        "phase-gate/authenticate"
-    )
+    assert persisted["objective_contract"]["objectives"][0]["id"] == ("phase-gate/authenticate")
 
 
 async def test_execute_rejects_a_reviewed_adapter_that_became_stale_before_approval() -> None:
@@ -12352,9 +12333,7 @@ async def test_recovery_waits_for_execution_ownership_handoff(
     monkeypatch.setattr(service, "_execute_owned", execute_owned)
     monkeypatch.setattr(service, "_recover_owned", recover_owned)
 
-    executing = asyncio.create_task(
-        service.execute("session-1", "campaign-1", "sha256:reviewed")
-    )
+    executing = asyncio.create_task(service.execute("session-1", "campaign-1", "sha256:reviewed"))
     await startup_entered.wait()
     recovering = asyncio.create_task(service.recover())
     await asyncio.sleep(0)
@@ -12598,9 +12577,7 @@ async def test_lead_capability_expansion_seals_exact_successor_grant() -> None:
     )
     context = replace(
         prepared.assignment_context,
-        tool_ids=tuple(
-            dict.fromkeys((*prepared.assignment_context.tool_ids, "knowledge_search"))
-        ),
+        tool_ids=tuple(dict.fromkeys((*prepared.assignment_context.tool_ids, "knowledge_search"))),
     )
     owner = _active_dynamic_specialist(
         prepared,
@@ -16494,10 +16471,10 @@ async def test_monitor_skips_automatic_review_while_frontier_schedule_is_active(
     assert agents.polls >= 2
     assert result is None
     assert lead_calls == 0
-    assert sum(
-        event.get("kind") == "lead_assessment_deferred_frontier_transition"
-        for event in events
-    ) == 1
+    assert (
+        sum(event.get("kind") == "lead_assessment_deferred_frontier_transition" for event in events)
+        == 1
+    )
 
 
 async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim() -> None:
@@ -16647,8 +16624,7 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
                     "text": "The reviewed adapter rejected delivery with HTTP 409.",
                     "characters": 53,
                     "digest": (
-                        "sha256:"
-                        "f1f3e2b2bfa873c4caaa0ef10b340c8c82365ae9d574b6cd1e2b4bbf175f34bc"
+                        "sha256:f1f3e2b2bfa873c4caaa0ef10b340c8c82365ae9d574b6cd1e2b4bbf175f34bc"
                     ),
                     "truncated": False,
                 },
@@ -17770,9 +17746,7 @@ async def test_campaign_resume_rechecks_scheduler_that_terminalizes_during_resum
         "campaign_id": campaign_id,
         "status": "executing",
     }
-    assert store.journal[-1]["reason"] == (
-        "operator-terminal-paused-scheduler-continuation"
-    )
+    assert store.journal[-1]["reason"] == ("operator-terminal-paused-scheduler-continuation")
 
 
 async def test_campaign_resume_retries_failed_incomplete_coverage_from_latest_wave() -> None:
@@ -18175,6 +18149,7 @@ async def test_durable_cancel_replay_accepts_already_terminal_task_after_receipt
         def __init__(self) -> None:
             self.applied = False
             self.receipt_attempts = 0
+            self.failures = []
 
         def list_unapplied_directives(self, campaign_id, wave=None):
             return [] if self.applied else [directive]
@@ -18186,8 +18161,17 @@ async def test_durable_cancel_replay_accepts_already_terminal_task_after_receipt
             self.applied = True
             return {"id": directive_id, "state": "applied"}
 
-        def mark_directive_failed(self, directive_id, failure):
-            return {"id": directive_id, "state": "failed", "failure": failure}
+        def mark_directive_failed(
+            self,
+            directive_id,
+            failure,
+            *,
+            failure_kind="runtime",
+            retryable=True,
+            max_attempts=3,
+        ):
+            self.failures.append((failure_kind, retryable))
+            return {"id": directive_id, "state": "retry_wait", "failure": failure}
 
     class CancelAgents:
         def __init__(self) -> None:
@@ -18217,6 +18201,7 @@ async def test_durable_cancel_replay_accepts_already_terminal_task_after_receipt
 
     assert agents.effect_count == 1
     assert store.applied is True
+    assert store.failures == [("runtime", True)]
 
 
 async def test_campaign_lead_claims_typed_messages_and_commits_before_ack() -> None:
@@ -18326,9 +18311,12 @@ async def test_campaign_lead_refreshes_durable_prompt_inputs_after_inference() -
     assert any("Observation committed during review" in result for result in coordination_results)
 
 
-@pytest.mark.parametrize("receipt_exists, expected", [(True, "applied"), (False, "failed")])
+@pytest.mark.parametrize(
+    "receipt_exists, expected",
+    [(True, "applied"), (False, ("rejected", "validation", False))],
+)
 async def test_redirect_terminal_replay_requires_exact_mailbox_receipt(
-    receipt_exists: bool, expected: str
+    receipt_exists: bool, expected: object
 ) -> None:
     class DirectiveStore:
         state = None
@@ -18341,15 +18329,23 @@ async def test_redirect_terminal_replay_requires_exact_mailbox_receipt(
                     "action": "redirect",
                     "source_node_id": "campaign/worker",
                     "destination_node_id": None,
-                    "payload": {"objective": "continue safely"},
+                    "payload": {"instruction": "continue safely"},
                 }
             ]
 
         def mark_directive_applied(self, directive_id, effect_reference):
             self.state = "applied"
 
-        def mark_directive_failed(self, directive_id, failure):
-            self.state = "failed"
+        def mark_directive_failed(
+            self,
+            directive_id,
+            failure,
+            *,
+            failure_kind="runtime",
+            retryable=True,
+            max_attempts=3,
+        ):
+            self.state = ("rejected", failure_kind, retryable)
 
     class ReceiptAgents:
         async def message_agent_receipt_exists(self, *args, **kwargs):
@@ -20571,10 +20567,8 @@ def test_technique_attempt_ledger_grades_observed_engagement_as_partial() -> Non
     }
 
 
-def test_receipt_refusal_negatives_upgrade_observed_refusals() -> None:
-    """A partial cell whose sealed target responses are all deterministic
-    refusals grades as a clear negative; any non-refusal evidence keeps the
-    partial.  Worker prose is never consulted."""
+def test_receipt_refusal_negatives_preserve_partial_outcomes() -> None:
+    """Deterministic refusal text remains evidence, never retirement authority."""
     committed = {
         "target_call_documents": {
             "call/1": {
@@ -20587,7 +20581,9 @@ def test_receipt_refusal_negatives_upgrade_observed_refusals() -> None:
 
     upgrades = _receipt_refusal_negatives(("technique/a", "technique/b"), committed, outcomes)
 
-    assert upgrades == {"technique/a": "refuted"}
+    assert upgrades == {}
+    assert outcomes == {"technique/a": "partial", "technique/b": "confirmed"}
+    assert committed["target_call_documents"]["call/1"]["response"].startswith("I'm sorry")
 
     engaged = {
         "target_call_documents": {
@@ -23691,9 +23687,7 @@ async def test_restart_recovery_ignores_missing_stale_schedule() -> None:
             "state": "paused",
             "kind": "daemon_recovery_paused",
             "reason": "daemon replacement paused durable campaign execution",
-            "non_running_schedules": [
-                {"schedule_id": "missing-schedule", "status": "missing"}
-            ],
+            "non_running_schedules": [{"schedule_id": "missing-schedule", "status": "missing"}],
         }
     ]
 
@@ -23986,11 +23980,7 @@ async def test_language_catalogue_stays_durable_while_wave0_admits_first_bounded
     assert store.finished_waves[0][0:2] == (0, "completed")
     assert service.frontier_batch_id is not None
     assert service.attack is not None
-    claimed_ids = {
-        str(item["id"])
-        for item in store.candidates
-        if item["state"] == "queued"
-    }
+    claimed_ids = {str(item["id"]) for item in store.candidates if item["state"] == "queued"}
     submitted_ids = {
         technique_id
         for assignment in service.attack.assignments
@@ -24171,9 +24161,7 @@ async def test_profile_controls_concrete_frontier_admission(
     assert sum(item["state"] == "dormant" for item in candidates) == 12_765 - expected_candidates
     if profile is not CampaignProfile.EXHAUSTIVE:
         assert {
-            str(item["requested_language"])
-            for item in candidates
-            if item["state"] == "queued"
+            str(item["requested_language"]) for item in candidates if item["state"] == "queued"
         } == {languages[0]}
 
 
@@ -25141,9 +25129,9 @@ async def test_adaptive_frontier_claim_scores_before_selection_and_keeps_rest_qu
     second_id = second.techniques[0].id
     assert first_id != second_id
     assert store.claims == [(first_id,), (second_id,)]
-    assert set(store.queued) == {
-        technique.id for technique in techniques
-    }.difference({first_id, second_id})
+    assert set(store.queued) == {technique.id for technique in techniques}.difference(
+        {first_id, second_id}
+    )
     assert store.priorities["cell/1"] == 0.1
     assert store.priorities["cell/2"] == 0.9
 
@@ -25180,12 +25168,21 @@ def test_execution_diversity_fills_batch_across_families_and_states():
 
     selected = ordered[:3]
     assert len({item.semantic_id for item in selected}) == 3
-    assert len({state for item in selected for state in {
-        "family/a/first": {"state/one"},
-        "family/a/second": {"state/two"},
-        "family/b": {"state/one"},
-        "family/c": {"state/two"},
-    }[item.id]}) == 2
+    assert (
+        len(
+            {
+                state
+                for item in selected
+                for state in {
+                    "family/a/first": {"state/one"},
+                    "family/a/second": {"state/two"},
+                    "family/b": {"state/one"},
+                    "family/c": {"state/two"},
+                }[item.id]
+            }
+        )
+        == 2
+    )
     assert {item.id for item in ordered} == {item.id for item in candidates}
 
 
@@ -25799,8 +25796,7 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
 
     contract = ContextDocument.create(
         "target:reviewed-interaction-contract",
-        "Reviewed interaction contract\n"
-        + json.dumps({"recon_handoff_id": "handoff:browser"}),
+        "Reviewed interaction contract\n" + json.dumps({"recon_handoff_id": "handoff:browser"}),
     )
     manifest = SimpleNamespace(
         id="campaign-1",
@@ -25826,10 +25822,10 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
     assert observation.summary == "Browser reconnaissance observed score: 85 -> 100."
     attributions = [row["payload"] for row in store.lead]
     assert len(attributions) == 2
-    assert {
-        (item["provenance"], item["counts_as_campaign_progress"])
-        for item in attributions
-    } == {("campaign", True), ("preexisting", False)}
+    assert {(item["provenance"], item["counts_as_campaign_progress"]) for item in attributions} == {
+        ("campaign", True),
+        ("preexisting", False),
+    }
     assert {item["changes"][0]["role"] for item in attributions} == {"custom"}
     assert not hasattr(store, "arm_observations")
 
@@ -25878,9 +25874,7 @@ async def test_recon_restart_counts_same_campaign_once_and_excludes_prior_campai
         task.id: {
             "digest": "sha256:" + character * 64,
             "reference": f"merlin-result://{task.id}",
-            "inherited_target_call_ids": (
-                (f"call-{index}",) if task is not tasks[0] else ()
-            ),
+            "inherited_target_call_ids": ((f"call-{index}",) if task is not tasks[0] else ()),
             "target_evidence_receipts": {
                 f"call-{index}": {
                     "attempt_disposition": "valid",
@@ -25890,9 +25884,7 @@ async def test_recon_restart_counts_same_campaign_once_and_excludes_prior_campai
                 }
             },
         }
-        for index, (task, character) in enumerate(
-            zip(tasks, ("a", "b", "c"), strict=True), start=1
-        )
+        for index, (task, character) in enumerate(zip(tasks, ("a", "b", "c"), strict=True), start=1)
     }
 
     class Store:
@@ -25943,10 +25935,7 @@ async def test_recon_restart_counts_same_campaign_once_and_excludes_prior_campai
         "campaign_restart",
         "preexisting",
     }
-    assert {
-        (item["provenance"], item["counts_as_campaign_progress"])
-        for item in payloads
-    } == {
+    assert {(item["provenance"], item["counts_as_campaign_progress"]) for item in payloads} == {
         ("campaign", True),
         ("campaign_restart", True),
         ("preexisting", False),

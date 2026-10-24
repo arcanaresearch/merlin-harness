@@ -1675,6 +1675,22 @@ class ApiReconHandoffTool:
             )
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
+        if (
+            getattr(session.bounds, "requires_persistent_profile", False)
+            and getattr(session, "mode", None) != "persistent"
+        ):
+            return ToolResult(
+                content=(
+                    "cannot seal a durable reconnaissance handoff: the reviewed target "
+                    "requires a persistent browser session but the live context is isolated"
+                ),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "persistent_browser_required",
+                    "retryable": True,
+                },
+            )
         compilation_source = adapter_value or reusable_adapter_value
         assert compilation_source is not None
         try:

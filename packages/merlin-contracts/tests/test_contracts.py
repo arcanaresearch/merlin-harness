@@ -206,6 +206,28 @@ def test_target_profile_cannot_contain_secrets() -> None:
         )
 
 
+def test_target_profile_browser_session_policy_is_explicit_and_backward_compatible() -> None:
+    legacy = TargetProfile(
+        id="legacy-target",
+        title="Legacy target",
+        base_url="https://legacy.example.test/",
+        model="target-model",
+    )
+    persistent = legacy.model_copy(update={"browser_session_policy": "persistent"})
+
+    assert legacy.browser_session_policy == "ephemeral"
+    assert persistent.browser_session_policy == "persistent"
+
+    with pytest.raises(ValidationError):
+        TargetProfile(
+            id="invalid-target",
+            title="Invalid target",
+            base_url="https://invalid.example.test/",
+            model="target-model",
+            browser_session_policy="shared",  # type: ignore[arg-type]
+        )
+
+
 def test_pack_run_rejects_unknown_status() -> None:
     with pytest.raises(ValidationError):
         PackRun(

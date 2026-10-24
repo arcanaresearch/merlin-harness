@@ -577,7 +577,15 @@ class CampaignStore(Protocol):
     def mark_directive_applied(
         self, directive_id: str, effect_reference: str
     ) -> Mapping[str, Any]: ...
-    def mark_directive_failed(self, directive_id: str, failure: str) -> Mapping[str, Any]: ...
+    def mark_directive_failed(
+        self,
+        directive_id: str,
+        failure: str,
+        *,
+        failure_kind: str = "runtime",
+        retryable: bool = True,
+        max_attempts: int = 3,
+    ) -> Mapping[str, Any]: ...
     def acknowledge_worker_messages(self, message_ids: tuple[str, ...]) -> int: ...
     def record_lesson(self, lesson: Mapping[str, object]) -> None: ...
     def record_exploration_critic_decision(
@@ -3291,8 +3299,7 @@ class CampaignService:
                 candidate_attempts
                 and candidate_task_ids.isdisjoint(target_evidence_task_ids)
                 and all(
-                    str(attempt.get("disposition") or "").casefold()
-                    == "infrastructure_failed"
+                    str(attempt.get("disposition") or "").casefold() == "infrastructure_failed"
                     for attempt in candidate_attempts
                 )
             ):
@@ -5955,10 +5962,15 @@ class CampaignService:
             autonomous_adaptive = _specialist_composition(manifest) == "autonomous"
             recon_task: AgentTask | None = None
             recon_evidence: Mapping[str, object] | None = None
-            while not budget_capped and not frontier_retry_cap_reached and (
-                autonomous_adaptive
-                or assessment.followups
-                or manifest.profile in {CampaignProfile.RECOMMENDED, CampaignProfile.EXPLORATION}
+            while (
+                not budget_capped
+                and not frontier_retry_cap_reached
+                and (
+                    autonomous_adaptive
+                    or assessment.followups
+                    or manifest.profile
+                    in {CampaignProfile.RECOMMENDED, CampaignProfile.EXPLORATION}
+                )
             ):
                 if (
                     manifest.profile is CampaignProfile.QUICKSCAN
@@ -6466,9 +6478,7 @@ class CampaignService:
             unchanged_coverage_extensions = 0
             lead_loader = getattr(self._store, "list_lead", None)
             prior_lead = (
-                await asyncio.to_thread(lead_loader, campaign_id)
-                if callable(lead_loader)
-                else ()
+                await asyncio.to_thread(lead_loader, campaign_id) if callable(lead_loader) else ()
             )
             operator_approved_coverage = _operator_authorized_coverage_continuation(prior_lead)
             (
@@ -8354,8 +8364,7 @@ class CampaignService:
                 and item["payload"].get("kind") == "saturation_decision_required"
             )
             request_id = (
-                f"{purpose}/{evidence_digest.removeprefix('sha256:')}/"
-                f"wave-{wave}/{sequence + 1}"
+                f"{purpose}/{evidence_digest.removeprefix('sha256:')}/wave-{wave}/{sequence + 1}"
             )
             payload = {
                 "kind": "saturation_decision_required",
@@ -12936,6 +12945,32 @@ class CampaignService:
             ]
             return matches[0] if len(matches) == 1 else None
 
+        async def mark_failed(
+            directive_id: str,
+            error: Exception,
+            *,
+            failure_kind: str,
+            retryable: bool,
+        ) -> None:
+            try:
+                await asyncio.to_thread(
+                    self._store.mark_directive_failed,
+                    directive_id,
+                    str(error),
+                    failure_kind=failure_kind,
+                    retryable=retryable,
+                )
+            except TypeError as signature_error:
+                if "unexpected keyword argument" not in str(signature_error):
+                    raise
+                # Compatibility for older embedded stores while the durable
+                # directive lifecycle migration rolls out.
+                await asyncio.to_thread(
+                    self._store.mark_directive_failed,
+                    directive_id,
+                    str(error),
+                )
+
         for row in rows:
             directive_id = str(row["id"])
             payload = dict(row["payload"])
@@ -12946,7 +12981,9 @@ class CampaignService:
             destination_any = resolve(row.get("destination_node_id"), include_terminal=True)
             try:
                 if action == "redirect":
-                    objective = str(payload.get("objective") or "").strip()
+                    objective = str(
+                        payload.get("objective") or payload.get("instruction") or ""
+                    ).strip()
                     if not objective:
                         raise ValueError("redirect directive has no objective")
                     if source_any is None:
@@ -12995,7 +13032,12 @@ class CampaignService:
                         raise ValueError("handoff directive worker identity is unknown")
                     if destination_any.id == source_any.id:
                         raise ValueError("handoff directive has no distinct destination")
-                    objective = str(payload.get("objective") or payload.get("reason") or "").strip()
+                    objective = str(
+                        payload.get("objective")
+                        or payload.get("instruction")
+                        or payload.get("reason")
+                        or ""
+                    ).strip()
                     recipient = destination_any.agent_id or f"worker:{destination_any.id}"
                     message_id = str(uuid5(NAMESPACE_URL, f"lead-directive:{directive_id}"))
                     if destination is None:
@@ -13036,8 +13078,30 @@ class CampaignService:
                 await asyncio.to_thread(
                     self._store.mark_directive_applied, directive_id, effect_reference
                 )
-            except (KeyError, RuntimeError, ValueError) as error:
-                await asyncio.to_thread(self._store.mark_directive_failed, directive_id, str(error))
+            except (KeyError, ValueError) as error:
+                failure_kind = (
+                    "unknown_worker" if "worker" in str(error).casefold() else "validation"
+                )
+                await mark_failed(
+                    directive_id,
+                    error,
+                    failure_kind=failure_kind,
+                    retryable=False,
+                )
+            except (ConnectionError, OSError, TimeoutError) as error:
+                await mark_failed(
+                    directive_id,
+                    error,
+                    failure_kind="transport",
+                    retryable=True,
+                )
+            except RuntimeError as error:
+                await mark_failed(
+                    directive_id,
+                    error,
+                    failure_kind="runtime",
+                    retryable=True,
+                )
 
     async def _run_wave(
         self,
@@ -14827,13 +14891,7 @@ class CampaignService:
                 grant_id = (
                     "dynamic-grant:"
                     + hashlib.sha256(
-                        (
-                            manifest.id
-                            + "\n"
-                            + assignment.id
-                            + "\n"
-                            + grant_body
-                        ).encode()
+                        (manifest.id + "\n" + assignment.id + "\n" + grant_body).encode()
                     ).hexdigest()[:24]
                 )
                 evidence = "approved Lead capability requests: " + ", ".join(
@@ -17379,7 +17437,7 @@ class CampaignService:
             self._store.finish,
             campaign_id,
             "failed",
-            stop_reason="failed",
+            stop_reason=(CampaignTerminalReason.INFRASTRUCTURE_BLOCKED_AFTER_RETRY_POLICY.value),
         )
 
     async def _authoritative_strategy_outcomes(
@@ -18284,9 +18342,7 @@ class CampaignService:
                 {
                     "kind": "dynamic_specialist_admitted",
                     "record": {
-                        key: value
-                        for key, value in durable_record.items()
-                        if key != "creation"
+                        key: value for key, value in durable_record.items() if key != "creation"
                     },
                     "creation": dict(creation),
                 }
@@ -18294,9 +18350,7 @@ class CampaignService:
                 if isinstance(row, Mapping)
                 and isinstance(
                     durable_record := (
-                        row.get("record")
-                        if isinstance(row.get("record"), Mapping)
-                        else row
+                        row.get("record") if isinstance(row.get("record"), Mapping) else row
                     ),
                     Mapping,
                 )
@@ -18348,9 +18402,7 @@ class CampaignService:
             projected_frontier_document = frontier_document
         saturation_document = asdict(saturation) | {
             "ready": saturation.ready and completion_frontier.may_complete,
-            "execution_complete": (
-                saturation.execution_complete
-            ),
+            "execution_complete": (saturation.execution_complete),
             "frontier_exhausted": completion_frontier.may_complete,
             "completion_frontier": projected_frontier_document,
             "completion_frontier_projection": {
@@ -18480,22 +18532,26 @@ class CampaignService:
             if cell_id in first_cell_by_technique
         )
         owner_cell_set = set(owner_cell_ids)
-        completion_cells = owner_cells + tuple(
-            cell
-            for technique_id, cell in first_cell_by_technique.items()
-            if technique_id not in owner_cell_set
-            and (
-                not language_references
-                or not technique_id.startswith("merlin-injection-taxonomy/")
+        completion_cells = (
+            owner_cells
+            + tuple(
+                cell
+                for technique_id, cell in first_cell_by_technique.items()
+                if technique_id not in owner_cell_set
+                and (
+                    not language_references
+                    or not technique_id.startswith("merlin-injection-taxonomy/")
+                )
             )
-        ) + tuple(
-            cell
-            for cell in raw_completion_cells
-            if cell is not first_cell_by_technique[str(cell[1])]
-            and (
-                not language_references
-                or str(cell[1]) in owner_cell_set
-                or not str(cell[1]).startswith("merlin-injection-taxonomy/")
+            + tuple(
+                cell
+                for cell in raw_completion_cells
+                if cell is not first_cell_by_technique[str(cell[1])]
+                and (
+                    not language_references
+                    or str(cell[1]) in owner_cell_set
+                    or not str(cell[1]).startswith("merlin-injection-taxonomy/")
+                )
             )
         )
         completion_document = {
@@ -18854,6 +18910,59 @@ class CampaignService:
             )
         return {"campaign_id": campaign_id, **payload}
 
+    async def drain(
+        self,
+        session_id: str,
+        campaign_id: str,
+        reason: str,
+        *,
+        request_id: str,
+    ) -> Mapping[str, object]:
+        """Durably request completion of owned work without consulting Campaign Lead."""
+        normalized_reason = " ".join(reason.split())
+        if not normalized_reason:
+            raise ValueError("campaign drain reason cannot be empty")
+        if not request_id.strip():
+            raise ValueError("campaign drain requires a durable request identity")
+        row = await asyncio.to_thread(self._store.get, campaign_id)
+        if row is None or str(row["session_id"]) != session_id:
+            raise KeyError(f"unknown campaign {campaign_id!r} in this session")
+        if str(row["status"]) not in {"executing", "paused"}:
+            raise ValueError("campaign is not executing or paused")
+        waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+        if not waves:
+            raise ValueError("campaign has no executable wave to drain")
+        latest = waves[-1]
+        schedule_id = str(latest.get("schedule_id") or "")
+        if not schedule_id:
+            raise ValueError("campaign wave has no durable schedule to drain")
+        wave = int(latest["wave"])
+        decision_identity = f"{session_id}\0{campaign_id}\0{request_id}"
+        decision_id = (
+            "operator-drain:" + hashlib.sha256(decision_identity.encode()).hexdigest()[:24]
+        )
+        payload: dict[str, object] = {
+            "kind": "operator_drain_requested",
+            "request_id": request_id,
+            "reason": normalized_reason,
+        }
+        await asyncio.to_thread(
+            self._store.commit_lead_decision,
+            campaign_id,
+            wave,
+            decision_id,
+            payload,
+            (),
+        )
+        await self._agents.drain_schedule(schedule_id, reason="operator_stopped")
+        return {
+            "campaign_id": campaign_id,
+            "schedule_id": schedule_id,
+            "decision_id": decision_id,
+            "drain_status": "requested",
+            **payload,
+        }
+
     def _project_saturation_evidence(
         self,
         manifest: CampaignManifest,
@@ -18868,14 +18977,17 @@ class CampaignService:
         cleanup_unresolved: tuple[str, ...] = (),
         adaptive_unresolved: tuple[str, ...] = (),
     ) -> SaturationEvidence | None:
-        def task_technique_outcomes(task: Mapping[str, object]) -> tuple[tuple[object, object], ...]:
+        def task_technique_outcomes(
+            task: Mapping[str, object],
+        ) -> tuple[tuple[object, object], ...]:
             projected = list(_mapping_items(task.get("technique_outcomes")))
             projected_ids = {str(technique_id) for technique_id, _outcome in projected}
             technique_ids = task.get("technique_ids")
-            assigned_ids = {
-                str(technique_id)
-                for technique_id in technique_ids
-            } if isinstance(technique_ids, (tuple, list, set)) else set()
+            assigned_ids = (
+                {str(technique_id) for technique_id in technique_ids}
+                if isinstance(technique_ids, (tuple, list, set))
+                else set()
+            )
             result = task.get("result")
             if isinstance(result, str):
                 for technique_id, outcome in _attempted_technique_outcomes(
@@ -18904,7 +19016,9 @@ class CampaignService:
                     projected.append(
                         (
                             technique_id,
-                            outcome if outcome in {"confirmed", "refuted", "unclear"} else "unclear",
+                            outcome
+                            if outcome in {"confirmed", "refuted", "unclear"}
+                            else "unclear",
                         )
                     )
                     projected_ids.add(technique_id)
@@ -19709,9 +19823,7 @@ class CampaignService:
         latest = paused[-1]
         status_loader = getattr(self._agents, "schedule_status", None)
         schedule_status = (
-            await status_loader(str(latest["schedule_id"]))
-            if callable(status_loader)
-            else None
+            await status_loader(str(latest["schedule_id"])) if callable(status_loader) else None
         )
         if schedule_status in {"completed", "failed", "cancelled"}:
             # The scheduler can terminalize after CampaignStore.pause() marks
@@ -19742,14 +19854,13 @@ class CampaignService:
             # Close the check/use race above: the scheduler may terminalize
             # after reporting paused but before resume_schedule acquires it.
             schedule_status = (
-                await status_loader(str(latest["schedule_id"]))
-                if callable(status_loader)
-                else None
+                await status_loader(str(latest["schedule_id"])) if callable(status_loader) else None
             )
-            if (
-                "unknown or not paused" not in str(error)
-                or schedule_status not in {"completed", "failed", "cancelled"}
-            ):
+            if "unknown or not paused" not in str(error) or schedule_status not in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
                 raise
             await asyncio.to_thread(self._store.resume, campaign_id)
             await self._stop_supervisor(campaign_id)
@@ -26256,13 +26367,13 @@ def _receipt_refusal_negatives(
     committed: Mapping[str, object] | None,
     outcomes: Mapping[str, str],
 ) -> dict[str, str]:
-    """Upgrade observed-only partials to refuted from sealed refusal evidence.
+    """Preserve sealed refusal evidence without resolving portfolio outcomes.
 
-    Receipt-native rule: when every hash-verified target response document in
-    the committed evidence matches the deterministic refusal marker, the target
-    demonstrably refused the technique objective — grade ``refuted`` so the cell
-    counts as a clear negative and feeds skip-history.  Worker prose is never
-    consulted; any response without refusal evidence keeps the ``partial``.
+    Deterministic interpretation of target text is advisory: even when every
+    hash-verified response matches the refusal marker, it must not turn a
+    retryable ``partial`` into a terminal ``refuted`` cell. The committed target
+    call documents retain the refusal evidence for telemetry and later selective
+    validation.
     """
     if not isinstance(committed, Mapping):
         return {}
@@ -26276,11 +26387,7 @@ def _receipt_refusal_negatives(
     ]
     if not texts or not all(_REFUSAL_MARKER.search(text) for text in texts):
         return {}
-    return {
-        technique_id: "refuted"
-        for technique_id in technique_ids
-        if outcomes.get(technique_id) == "partial"
-    }
+    return {}
 
 
 def _cells_excluding_advisory_judgments(

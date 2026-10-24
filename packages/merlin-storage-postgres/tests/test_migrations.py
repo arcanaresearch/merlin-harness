@@ -15,7 +15,7 @@ from psycopg.errors import CheckViolation
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 88))
+    assert [migration.version for migration in migrations] == list(range(1, 93))
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -23,6 +23,14 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "'review'" in migrations[75].sql
     assert "'missing_target_effect'" in migrations[76].sql
     assert "'result_schema_invalid'" in migrations[76].sql
+    assert "browser_session_policy" in migrations[88].sql
+    assert "'ephemeral', 'persistent'" in migrations[88].sql
+    assert "CREATE TABLE merlin_storage.campaign_events" in migrations[89].sql
+    assert "campaign_events_append_only" in migrations[89].sql
+    assert "campaign_lead_directives_ready_idx" in migrations[90].sql
+    assert "'planned', 'retry_wait', 'rejected', 'applied'" in migrations[90].sql
+    assert "CREATE TABLE merlin_storage.daemon_runs" in migrations[91].sql
+    assert "daemon_runs_one_active_idx" in migrations[91].sql
     assert "CREATE TABLE merlin_storage.technique_history" in migrations[60].sql
     assert "'blocked_terminal'" in migrations[61].sql
     assert "ADD COLUMN language_id" in migrations[62].sql

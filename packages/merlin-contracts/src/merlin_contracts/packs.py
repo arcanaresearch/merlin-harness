@@ -60,6 +60,7 @@ class TargetProfile(PackContract):
     title: str
     base_url: str
     model: str
+    browser_session_policy: Literal["ephemeral", "persistent"] = "ephemeral"
 
 
 PackRunStatus = Literal["pending", "running", "completed", "failed", "interrupted"]

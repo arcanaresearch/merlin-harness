@@ -106,6 +106,33 @@ async def test_recovery_replays_committed_finish_decision_before_waiting():
 
 
 @pytest.mark.asyncio
+async def test_recovery_replays_direct_operator_drain_without_lead_decision():
+    journal = Journal()
+    journal.append_lead(
+        "campaign",
+        0,
+        {
+            "kind": "operator_drain_requested",
+            "request_id": "call-1",
+            "reason": "finish owned work",
+        },
+    )
+    drains = []
+
+    class Agents:
+        async def drain_schedule(self, schedule, *, reason):
+            drains.append((schedule, reason))
+
+    service = CampaignService(journal, Agents(), None, None)
+    restored = await service._restore_operator_drain("campaign", 0, SimpleNamespace(id="schedule"))
+
+    assert restored is True
+    assert drains == [("schedule", "operator_stopped")]
+    with pytest.raises(_OperatorDrainComplete):
+        await service._raise_if_operator_drained("campaign")
+
+
+@pytest.mark.asyncio
 async def test_consumed_guidance_is_not_delivered_again():
     journal = Journal()
     journal.append_lead("campaign", 0, {"kind": "operator_guidance", "guidance_id": "one"})

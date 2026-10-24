@@ -120,6 +120,7 @@ _SECURITY_LANGUAGE_FRONTIER = (
 _INTERNAL_NON_CAMPAIGN_TOOL_IDS = frozenset(
     {
         "browser_end_owned_session",
+        "campaign_drain",
         "campaign_message",
         "agent_message",
         "agent_list",
@@ -1405,6 +1406,24 @@ def _browser_origin(base_url: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("selected target has no valid browser origin")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _target_requires_persistent_browser(
+    target: Mapping[str, object],
+    origin: str,
+    legacy_persistent_origins: frozenset[str],
+) -> bool:
+    """Resolve the reviewed target policy with an explicit legacy-config fallback.
+
+    New targets carry their browser lifetime policy with the target profile. Existing
+    installations may still name persistent origins in configuration, so retain that
+    behavior until those profiles are migrated. No target hostname is built in.
+    """
+
+    policy = str(target.get("browser_session_policy") or "ephemeral")
+    if policy not in {"ephemeral", "persistent"}:
+        raise ValueError(f"unsupported target browser session policy: {policy}")
+    return policy == "persistent" or origin in legacy_persistent_origins
 
 
 def _verified_session_concurrency(value: object, observed_evidence: object = ()) -> int | None:
@@ -4841,7 +4860,9 @@ def build_backend(
             if selected is None:
                 raise ValueError("natural target resolution did not select a browser target")
             origin = _browser_origin(str(selected["base_url"]))
-            persistent = origin in persistent_origins
+            persistent = _target_requires_persistent_browser(
+                selected, origin, persistent_origins
+            )
             return BrowserBounds(
                 target_id=str(selected["id"]),
                 allowed_origins={origin},
@@ -7512,11 +7533,13 @@ def build_backend(
             reviewed_endpoint = str(reviewed_adapter["endpoint"])
             session_constraint = reviewed_adapter.get("session_constraint")
             credential_handle = reviewed_adapter.get("credential_handle")
-            browser_profile = (
-                "shared_persistent_authenticated"
-                if target_is_browser and _browser_origin(reviewed_endpoint) in persistent_origins
-                else None
-            )
+            browser_profile = None
+            if target_is_browser:
+                reviewed_origin = _browser_origin(reviewed_endpoint)
+                if _target_requires_persistent_browser(
+                    target, reviewed_origin, persistent_origins
+                ):
+                    browser_profile = "shared_persistent_authenticated"
             reviewed_concurrency = _verified_session_concurrency(
                 reviewed_adapter.get("session_cardinality"),
                 reviewed_adapter.get("observed_evidence"),
@@ -10750,9 +10773,10 @@ def build_backend(
 
         tool_broker.register(RequestUserInputTool())
         tool_broker.register(OperatorCommandTool(COMMANDS, COMMAND_HINTS))
-        from merlin_agents.operator_campaign_tools import CampaignMessageTool
+        from merlin_agents.operator_campaign_tools import CampaignDrainTool, CampaignMessageTool
         from merlin_agents.worker_operator_tools import AgentListTool, AgentMessageTool
 
+        tool_broker.register(CampaignDrainTool(campaigns))
         tool_broker.register(CampaignMessageTool(campaigns))
         tool_broker.register(AgentListTool(agents))
         tool_broker.register(AgentMessageTool(agents))

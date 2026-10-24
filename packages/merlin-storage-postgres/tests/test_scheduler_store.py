@@ -41,6 +41,52 @@ from merlin_tools import ToolBroker
 from psycopg.errors import ForeignKeyViolation
 
 
+def test_adaptive_observation_validates_current_target_authority_binding() -> None:
+    binding = {
+        "authority": "target",
+        "adapter_digest": "sha256:" + "a" * 64,
+        "compiled_adapter_digest": "sha256:" + "b" * 64,
+        "step_id": "interaction",
+        "oracle_digest": "sha256:" + "c" * 64,
+        "pointer": "/matched",
+        "match_values": [True],
+        "modality": "text",
+        "turn": "multi",
+        "language": "en",
+        "purpose": "objective",
+    }
+    observation = {
+        "schema": "merlin.api-oracle-observation.v2",
+        **binding,
+        "binding_digest": scheduler_store_module._adaptive_observation_digest(binding),
+        "selected_digest": "sha256:" + "d" * 64,
+        "matched": True,
+    }
+    observation["observation_digest"] = scheduler_store_module._adaptive_observation_digest(
+        observation
+    )
+
+    assert scheduler_store_module._valid_adaptive_observation(observation) is True
+
+    for invalid_authority in (None, "model"):
+        invalid_binding = {
+            key: value
+            for key, value in binding.items()
+            if key != "authority" or invalid_authority is not None
+        }
+        if invalid_authority is not None:
+            invalid_binding["authority"] = invalid_authority
+        invalid = {
+            "schema": "merlin.api-oracle-observation.v2",
+            **invalid_binding,
+            "binding_digest": scheduler_store_module._adaptive_observation_digest(invalid_binding),
+            "selected_digest": "sha256:" + "d" * 64,
+            "matched": True,
+        }
+        invalid["observation_digest"] = scheduler_store_module._adaptive_observation_digest(invalid)
+        assert scheduler_store_module._valid_adaptive_observation(invalid) is False
+
+
 @pytest.mark.parametrize("artifact", ("graph", "checkpoint"))
 def test_scheduler_rejects_oversized_artifact_before_opening_transaction(
     monkeypatch, artifact: str

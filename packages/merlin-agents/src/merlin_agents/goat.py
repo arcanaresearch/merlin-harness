@@ -449,7 +449,14 @@ def _valid_observation(value: Mapping[str, object]) -> bool:
         "language",
         "purpose",
     )
+    authority = value.get("authority")
+    if authority is not None:
+        if authority != "target":
+            return False
+        binding_keys = (*binding_keys, "authority")
     if "compiled_adapter_digest" in value:
+        if authority != "target":
+            return False
         binding_keys = (*binding_keys, "compiled_adapter_digest")
     return (
         value.get("schema") == "merlin.api-oracle-observation.v2"

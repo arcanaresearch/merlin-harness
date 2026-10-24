@@ -16,6 +16,7 @@ from .api_session_store import (
 from .automation_store import PostgresAutomationJournal
 from .browser_store import BrowserRepository, PostgresBrowserStore
 from .campaign_store import CampaignStore
+from .daemon_run_store import DaemonRun, DaemonRunRepository
 from .database import Database, DatabaseConfig, EmbeddedPostgres
 from .effect_store import PostgresToolEffectStore, ToolEffectRepository
 from .finding_store import (
@@ -75,6 +76,8 @@ __all__ = [
     "CampaignObservabilityRepository",
     "Database",
     "DatabaseConfig",
+    "DaemonRun",
+    "DaemonRunRepository",
     "DurableSchedulerStore",
     "EmbeddedPostgres",
     "EventRepository",

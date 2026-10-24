@@ -752,29 +752,31 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
                 assert staged.execution is None
                 reopened = await replacement.resume_schedule(schedule_id)
                 assert reopened.execution is not None
-                await asyncio.wait_for(reopened.execution, timeout=30)
+                await asyncio.wait_for(reopened.execution, timeout=45)
 
             worker_attempts = [
                 row
                 for row in scheduler.list_attempts(schedule_id)
                 if row["node_id"] == f"worker:{assignment.id}"
             ]
-            assert len(worker_attempts) == 2
+            assert len(worker_attempts) == 3
             assert worker_attempts[0]["state"] == "expired"
-            assert worker_attempts[1]["state"] == "completed"
+            assert worker_attempts[1]["state"] == "failed"
+            assert worker_attempts[1]["failure_kind"] == "worker_interrupted"
+            assert "conflicting target session identities" in str(worker_attempts[1]["error"])
+            assert worker_attempts[2]["state"] == "completed"
             assert provider.calls == baseline_calls, "restart must not regenerate provider turns"
-            assert len(target.invocations("start")) - baseline_starts == 1
-            assert len(target.invocations("cleanup")) - baseline_cleanups == 1
+            assert len(target.invocations("start")) - baseline_starts == 2
+            assert len(target.invocations("cleanup")) - baseline_cleanups == 2
             gate = scheduler.goat_gate(schedule_id)
             assert gate["ambiguous"] == (assignment.id,)
             receipt = gate["strategies"][assignment.id]
             assert receipt["evidence_verdict"] == "ambiguous"
             assert receipt["evaluation_uncertain"] is True
-            assert len(receipt["steps"]) == 2
+            assert len(receipt["steps"]) == 1
             assert receipt["steps"][-1]["objective_matched"] is True
             assert {str(step["scheduler_attempt_id"]) for step in receipt["steps"]} == {
                 first_attempt_id,
-                str(worker_attempts[1]["id"]),
             }
     return {
         "lane": "api-restart",
@@ -785,6 +787,10 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
         "message_count": len(target.invocations("message")) - baseline_messages,
         "gate_verdict": receipt["evidence_verdict"],
         "attempts": [row["state"] for row in worker_attempts],
+        "session_conflict_fenced": (
+            worker_attempts[1]["failure_kind"] == "worker_interrupted"
+            and "conflicting target session identities" in str(worker_attempts[1]["error"])
+        ),
         "receipt_attempt_ids": sorted(
             {str(step["scheduler_attempt_id"]) for step in receipt["steps"]}
         ),
@@ -1275,7 +1281,7 @@ LANE_RUNNERS = {
 async def _run(modes: Sequence[str], workdir: Path) -> dict[str, Any]:
     workdir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
     evidence: dict[str, Any] = {}
-    async with FixtureTargetServer() as target:
+    async with FixtureTargetServer(match_non_recon_message=True) as target:
         for mode in modes:
             lane_workdir = workdir / mode
             lane_workdir.mkdir(parents=True, exist_ok=True)

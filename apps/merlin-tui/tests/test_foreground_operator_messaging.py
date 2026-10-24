@@ -15,7 +15,7 @@ class ForwardingProvider:
     async def stream(self, request):
         self.requests.append(request)
         names = {tool["function"]["name"] for tool in request.tools}
-        assert {"campaign_message", "agent_message", "agent_list"} <= names
+        assert {"campaign_drain", "campaign_message", "agent_message", "agent_list"} <= names
         if len(self.requests) == 1:
             assert any(
                 message.role == "user" and "prioritize authentication" in message.content
@@ -96,6 +96,7 @@ async def test_production_foreground_routes_chat_to_durable_lead_guidance(tmp_pa
             assert service_replay["guidance_id"] == replay.metadata["guidance_id"]
             assert len(campaign_store.list_lead("campaign/forwarding")) == 1
             assert {
+                "campaign_drain",
                 "campaign_message",
                 "agent_message",
                 "agent_list",
