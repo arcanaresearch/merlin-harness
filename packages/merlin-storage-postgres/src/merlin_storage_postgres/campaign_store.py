@@ -2593,6 +2593,38 @@ class CampaignStore:
             assert journal is not None
             if journal["payload_digest"] != digest:
                 raise ValueError("lead decision identity conflicts with different payload")
+            for request in payload.get("automation_requests", ()):
+                request_payload = dict(request)
+                request_id = str(request_payload.get("request_id") or "")
+                if not request_id.strip():
+                    raise ValueError("automation request identity must not be blank")
+                request_body = json.dumps(
+                    request_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                request_digest = "sha256:" + sha256(request_body.encode()).hexdigest()
+                run_id = (
+                    "automation-run:" + sha256(f"{campaign_id}:{request_id}".encode()).hexdigest()
+                )
+                existing_request = self.connection.execute(
+                    """INSERT INTO merlin_storage.automation_requests
+                           (campaign_id, request_id, decision_id, wave, run_id,
+                            payload, payload_digest)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (campaign_id, request_id)
+                       DO UPDATE SET request_id = EXCLUDED.request_id
+                       RETURNING payload_digest""",
+                    (
+                        campaign_id,
+                        request_id,
+                        decision_id,
+                        wave,
+                        run_id,
+                        Jsonb(request_payload),
+                        request_digest,
+                    ),
+                ).fetchone()
+                if existing_request["payload_digest"] != request_digest:
+                    raise ValueError("automation request identity conflicts with different payload")
             for ordinal, directive in enumerate(directives):
                 directive_payload = _validated_lead_directive(directive)
                 directive_body = json.dumps(
@@ -2636,6 +2668,108 @@ class CampaignStore:
                 if len(acknowledged) != len(source_ids):
                     raise ValueError("lead worker-message claim became stale before commit")
         return dict(journal)
+
+    def claim_automation_request(
+        self, campaign_id: str, *, lease_seconds: int = 60
+    ) -> dict[str, Any] | None:
+        """Claim one due request, including abandoned leases, using a fresh CAS token."""
+        if lease_seconds < 1:
+            raise ValueError("automation lease must be positive")
+        row = self.connection.execute(
+            """WITH due AS (
+                   SELECT request_id FROM merlin_storage.automation_requests
+                   WHERE campaign_id = %s AND (
+                       state = 'planned'
+                       OR (state = 'retry_wait' AND next_retry_at <= now())
+                       OR (state IN ('claimed', 'running') AND lease_expires_at <= now())
+                   ) ORDER BY created_at, request_id LIMIT 1 FOR UPDATE SKIP LOCKED
+               ) UPDATE merlin_storage.automation_requests AS r
+                 SET state = CASE WHEN r.state = 'running' THEN 'running' ELSE 'claimed' END,
+                     claim_id = %s,
+                     lease_expires_at = now() + (%s * interval '1 second'),
+                     attempt_count = attempt_count + 1, next_retry_at = NULL,
+                     updated_at = now()
+                 FROM due WHERE r.campaign_id = %s AND r.request_id = due.request_id
+                 RETURNING r.*""",
+            (campaign_id, str(uuid4()), lease_seconds, campaign_id),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def renew_automation_request(
+        self, campaign_id: str, request_id: str, claim_id: str, *, lease_seconds: int = 60
+    ) -> bool:
+        if lease_seconds < 1:
+            raise ValueError("automation lease must be positive")
+        return (
+            self.connection.execute(
+                """UPDATE merlin_storage.automation_requests
+               SET lease_expires_at = now() + (%s * interval '1 second'), updated_at = now()
+               WHERE campaign_id = %s AND request_id = %s AND claim_id = %s
+                 AND state IN ('claimed', 'running') AND lease_expires_at > now()
+               RETURNING request_id""",
+                (lease_seconds, campaign_id, request_id, claim_id),
+            ).fetchone()
+            is not None
+        )
+
+    def start_automation_request(self, campaign_id: str, request_id: str, claim_id: str) -> bool:
+        return (
+            self.connection.execute(
+                """UPDATE merlin_storage.automation_requests
+               SET state = 'running', updated_at = now()
+               WHERE campaign_id = %s AND request_id = %s AND claim_id = %s
+                 AND state = 'claimed' AND lease_expires_at > now() RETURNING request_id""",
+                (campaign_id, request_id, claim_id),
+            ).fetchone()
+            is not None
+        )
+
+    def automation_run_outcome(self, run_id: str, request_id: str, owning_attempt_id: str):
+        from .automation_store import PostgresAutomationJournal
+
+        return PostgresAutomationJournal(self.connection).load_outcome(
+            run_id, request_id, owning_attempt_id
+        )
+
+    def settle_automation_request(
+        self,
+        campaign_id: str,
+        request_id: str,
+        claim_id: str,
+        outcome: Mapping[str, object],
+        *,
+        retryable: bool = False,
+    ) -> bool:
+        """Fence stale owners; commit terminal Lead visibility with the outbox receipt."""
+        with self.connection.transaction():
+            row = self.connection.execute(
+                """UPDATE merlin_storage.automation_requests
+                   SET state = CASE WHEN %s AND attempt_count < 3 THEN 'retry_wait'
+                                    WHEN %s THEN 'completed' ELSE 'rejected' END,
+                       next_retry_at = CASE WHEN %s AND attempt_count < 3
+                           THEN now() + (power(2, attempt_count) * interval '1 second') END,
+                       outcome = CASE WHEN %s AND attempt_count < 3 THEN NULL ELSE %s END,
+                       failure = %s, claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+                   WHERE campaign_id = %s AND request_id = %s AND claim_id = %s
+                     AND state IN ('claimed', 'running') AND lease_expires_at > now()
+                   RETURNING *""",
+                (
+                    retryable,
+                    outcome.get("state") == "completed",
+                    retryable,
+                    retryable,
+                    Jsonb(dict(outcome)),
+                    outcome.get("error"),
+                    campaign_id,
+                    request_id,
+                    claim_id,
+                ),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] in {"completed", "rejected"}:
+                self.append_lead(campaign_id, int(row["wave"]), dict(outcome))
+        return True
 
     def list_unapplied_directives(
         self, campaign_id: str, wave: int | None = None

@@ -328,6 +328,15 @@ an automation pipeline that separates three jobs:
 The sequence is tied to the campaign and target, cannot silently change origin, and must include
 cleanup when the request requires it.
 
+Lead automation requests commit to the PostgreSQL `automation_requests` outbox in the same
+transaction as their decision. Campaign startup recovery and supervision drain due requests using
+expiring claims and compare-and-set ownership. Failed dispatches without a persisted run retry up
+to three claims with backoff. Terminal outcomes and their Lead journal entries commit together.
+Before invoking the runner, recovery looks up the existing deterministic campaign/request run ID.
+Every persisted terminal run is reconstructed, including its evidence and failure, without repeating
+the flow. An interrupted run or an expired running lease without a run receipt is reported as
+ambiguous and is never automatically replayed: the former runner may have committed target effects.
+
 The foundation exists, but its current practice test mainly checks whether the operation arguments
 match their schemas. Planned improvements include running the flow against a controlled fake target,
 testing failure and cancellation paths, requiring real evidence rather than a generic call record,

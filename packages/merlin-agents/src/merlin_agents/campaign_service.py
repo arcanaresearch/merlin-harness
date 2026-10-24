@@ -4910,6 +4910,7 @@ class CampaignService:
         # that actually faulted, not the (possibly stale) entry wave.
         wave = initial_wave
         try:
+            await self._execute_automation_requests(manifest, ())
             live_assignments = tuple(getattr(live, "assignments", ()))
             if live_assignments and all(
                 assignment.strategy_id == "objective-phase-gate/v1"
@@ -11195,6 +11196,7 @@ class CampaignService:
         lead_decision_retry_at = 0.0
         frontier_review_deferred = False
         while not live.execution.done():
+            await self._execute_automation_requests(manifest, ())
             tasks = tuple(await self._agents.list_schedule_tasks(live.id))
             if incremental_review_enabled:
                 for task in tasks:
@@ -15536,6 +15538,11 @@ class CampaignService:
         requests: tuple[LeadAutomationRequest, ...],
     ) -> None:
         """Run each committed request once and expose its terminal outcome to the Lead."""
+        if callable(getattr(self._store, "claim_automation_request", None)):
+            from .automation_outbox import reconcile_automation_requests
+
+            await reconcile_automation_requests(self._store, manifest, self._automation_runner)
+            return
         if not requests:
             return
         rows = await asyncio.to_thread(self._store.list_lead, manifest.id)
@@ -16928,6 +16935,7 @@ class CampaignService:
             envelope = row["manifest"]
             manifest = _manifest(envelope["manifest"])
             context = _assignment_context(envelope["assignment_context"])
+            await self._execute_automation_requests(manifest, ())
             frontier_loader = getattr(self._store, "load_active_frontier_batch", None)
             active_frontier = (
                 await asyncio.to_thread(frontier_loader, campaign_id)

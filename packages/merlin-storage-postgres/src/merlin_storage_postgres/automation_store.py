@@ -7,10 +7,12 @@ from typing import Any
 
 from merlin_agents.automation import (
     ArtifactAdmission,
+    ArtifactEvent,
     ArtifactRun,
     AutomationArtifact,
     AutomationAudit,
     AutomationError,
+    AutomationOutcome,
     AutomationStep,
     RunState,
 )
@@ -22,6 +24,47 @@ class PostgresAutomationJournal:
 
     def __init__(self, connection: Any) -> None:
         self.connection = connection
+
+    def load_outcome(
+        self, run_id: str, request_id: str, owning_attempt_id: str
+    ) -> AutomationOutcome | None:
+        """Recover a deterministic run without re-authoring or repeating target effects."""
+        row = self.connection.execute(
+            """SELECT r.*, a.request_id FROM merlin_storage.automation_artifact_runs r
+               JOIN merlin_storage.automation_artifacts a ON a.digest = r.artifact_digest
+               WHERE r.run_id = %s""",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_id"] != request_id or str(row["owning_attempt_id"]) != owning_attempt_id:
+            raise AutomationError("persisted automation run belongs to another request or attempt")
+        run = ArtifactRun(
+            run_id=run_id,
+            artifact_digest=row["artifact_digest"],
+            owning_attempt_id=owning_attempt_id,
+            state=RunState(row["state"]),
+            events=tuple(
+                ArtifactEvent(**{**event, "evidence_refs": tuple(event.get("evidence_refs", ()))})
+                for event in row["events"]
+            ),
+            evidence_refs=tuple(row["evidence_refs"]),
+            error=row["error"],
+        )
+        incomplete = run.state is RunState.EXECUTING
+        return AutomationOutcome(
+            request_id=request_id,
+            owning_attempt_id=owning_attempt_id,
+            stage="execution",
+            state="ambiguous" if incomplete else run.state.value,
+            artifact_digest=run.artifact_digest,
+            run=run,
+            error=(
+                "interrupted automation run may have committed effects; replay refused"
+                if incomplete
+                else run.error
+            ),
+        )
 
     def admits(
         self,
