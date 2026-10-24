@@ -9350,6 +9350,42 @@ async def test_executor_retries_a_crashed_worker_instead_of_dying() -> None:
     }
 
 
+async def test_postgres_disk_full_crash_is_infrastructure_and_retryable() -> None:
+    from psycopg.errors import DiskFull
+
+    class DiskFullStore(FencingStore):
+        failed = False
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            if not self.failed:
+                self.failed = True
+                raise DiskFull("injected local PostgreSQL disk full")
+            return "sha256:partial"
+
+    class Service(DurableAgentService):
+        crashed = None
+
+        async def _crashed_worker_outcome(self, *args):
+            outcome = await super()._crashed_worker_outcome(*args)
+            self.crashed = outcome[2]
+            return outcome
+
+    store = DiskFullStore()
+    service = Service(Provider(), Tools(), store, model="test", lease_seconds=0.9)
+    live = await service.submit(
+        "session-disk-full",
+        _fencing_assignments("campaign/disk-full/worker"),
+        max_workers=1,
+    )
+    await asyncio.wait_for(live.execution, timeout=10)
+    assert service.crashed.infrastructure_failure_category == "storage_exhausted"
+    assert service._retry_failure_kind(service.crashed) == RetryFailureKind.WORKER_INTERRUPTED
+    assert store.nodes[live.id][f"worker:{live.assignments[0].id}"]["state"] == "completed"
+    event = next(payload for _, kind, payload in store.lifecycle_events if kind == "worker_crashed")
+    assert event["failure_class"] == "infrastructure"
+    assert event["infrastructure_failure_category"] == "storage_exhausted"
+
+
 async def test_live_driver_wait_holds_while_expired_attempt_has_retry_budget() -> None:
     """The verdict gate waits out recovery headroom after a lease lapses.
 

@@ -79,6 +79,10 @@ class DurableGrantResolver(Protocol):
 def _infrastructure_failure_category(
     error: BaseException,
 ) -> InfrastructureFailureCategory | None:
+    from merlin_contracts.storage_failures import storage_failure_category
+
+    if category := storage_failure_category(error):
+        return category
     typed = getattr(error, "infrastructure_failure_category", None)
     if isinstance(typed, InfrastructureFailureCategory):
         return typed
@@ -584,8 +588,10 @@ class ToolBroker:
                     )
                 )
             raise
-        except (OSError, TypeError, ValueError) as error:
+        except Exception as error:
             failure_category = _infrastructure_failure_category(error)
+            if not isinstance(error, (OSError, TypeError, ValueError)) and failure_category is None:
+                raise
             failure_metadata = (
                 {"infrastructure_failure_category": failure_category.value}
                 if failure_category is not None

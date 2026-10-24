@@ -9,6 +9,7 @@ from .attempts import AttemptDisposition
 
 
 class InfrastructureFailureCategory(StrEnum):
+    STORAGE_EXHAUSTED = "storage_exhausted"
     ADAPTER_TIMEOUT = "adapter_timeout"
     MISSING_RESPONSE_POINTER = "missing_response_pointer"
     DELIVERY_FAILURE = "delivery_failure"

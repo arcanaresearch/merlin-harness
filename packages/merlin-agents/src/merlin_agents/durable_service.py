@@ -43,6 +43,7 @@ from merlin_contracts import (
     project_target_progress,
     validate_candidate_outcome_projection,
 )
+from merlin_contracts.storage_failures import storage_failure_category
 
 from .campaign import ContextDocument, ReviewedTargetAdapter, WorkerContext
 from .completion_frontier import CompletionCandidateIdentity
@@ -1802,6 +1803,7 @@ class DurableAgentService:
                         "completed_at": attempt.get("completed_at"),
                     }
         return {
+            "status": str(schedule["status"]),
             "tasks": tuple(tasks),
             "evidence": evidence,
             "progress": tuple(progress),
@@ -3007,6 +3009,8 @@ class DurableAgentService:
             return RetryFailureKind.PROVIDER_TRANSIENT
         if category in {"delivery_failure", "transient_transport", "transport_failure"}:
             return RetryFailureKind.TRANSPORT_TRANSIENT
+        if category == "storage_exhausted":
+            return RetryFailureKind.WORKER_INTERRUPTED
         if category == "missing_target_effect":
             return RetryFailureKind.MISSING_TARGET_EFFECT
         if category in {
@@ -3744,12 +3748,15 @@ class DurableAgentService:
         spinning READY forever.
         """
         node_id = f"worker:{assignment.id}"
+        category = storage_failure_category(error)
         reason = f"worker crashed without committing an outcome: {type(error).__name__}: {error}"
         await self._journal_lifecycle(
             live.id,
             "worker_crashed",
             {
                 "node_id": node_id,
+                "failure_class": "infrastructure" if category else "unknown",
+                "infrastructure_failure_category": category.value if category else None,
                 "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
                 "error": str(error)[:500],
                 "traceback": "".join(
@@ -3789,6 +3796,7 @@ class DurableAgentService:
                 status="failed",
                 error=reason,
                 retry_class=RetryClass.FRESH_WORKER.value,
+                infrastructure_failure_category=category.value if category else None,
             ),
             None,
             (),

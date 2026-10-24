@@ -4027,6 +4027,7 @@ def build_backend(
     *,
     tool_confirmer: Callable[..., Awaitable[object]] | None = None,
     max_workers: int = 3,
+    daemon: bool = False,
 ) -> ChatBackend:
     from merlin_agents import (
         EXPLORATION_POLICY,
@@ -4186,6 +4187,7 @@ def build_backend(
         CampaignApiSessionRepository,
         CampaignObservabilityRepository,
         CampaignStore,
+        DaemonRunRepository,
         Database,
         DatabaseConfig,
         DurableSchedulerStore,
@@ -4271,9 +4273,12 @@ def build_backend(
     effect_connection = None
     report_connection = None
     automation_connection = None
+    daemon_connection = None
     try:
         connection = database.connect()
         MigrationRunner(connection).apply()
+        if daemon:
+            daemon_connection = database.connect()
         store = PostgresSessionStore(connection)
         agent_connection = database.connect()
         scheduler_store = DurableSchedulerStore(agent_connection)
@@ -10906,7 +10911,7 @@ def build_backend(
         backend = KernelBackend(
             kernel,
             (
-                database,
+                *(() if daemon else (database,)),
                 connection,
                 agent_connection,
                 finding_connection,
@@ -10940,6 +10945,11 @@ def build_backend(
         )
         tool_broker.register(OperatorRuntimeTool(backend, read_only=True))
         tool_broker.register(OperatorRuntimeTool(backend, read_only=False))
+        if daemon:
+            # The daemon owns these separately: record cleanup before closing
+            # the lifecycle connection and stopping embedded PostgreSQL.
+            backend.daemon_run_repository = DaemonRunRepository(daemon_connection)
+            backend.daemon_database = database
         return backend
     except Exception:
         if connection is not None:
@@ -10966,6 +10976,8 @@ def build_backend(
             report_connection.close()
         if automation_connection is not None:
             automation_connection.close()
+        if daemon_connection is not None:
+            daemon_connection.close()
         database.stop()
         raise
 

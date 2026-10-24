@@ -92,6 +92,19 @@ merlin_tui.cli:main
 The TUI is a client. The daemon owns the live backend, which lets a UI restart or reconnect without
 becoming the owner of durable campaign execution.
 
+Daemon startup records a process incarnation through `DaemonRunRepository.start`, which marks
+unfinished predecessors unclean. A dedicated PostgreSQL connection carries heartbeats, attributed
+stop requests (including SIGTERM/SIGINT), and cleanup completion. It closes after backend resources;
+embedded PostgreSQL stops afterward. Failed cleanup leaves an unfinished run for the next startup
+to reconcile.
+
+Local ENOSPC fences new mutating foreground commands until restart, while status/read-only access
+and existing durable background campaigns remain available. The socket returns an error with
+`code: "local_storage_exhausted"`, `failure_class: "infrastructure"`, and
+`infrastructure_failure_category: "storage_exhausted"`. The daemon stops retrying the failed local
+replay journal. PostgreSQL SQLSTATE `53100` is classified separately as infrastructure storage
+exhaustion; it does not establish negative attack-quality evidence.
+
 ## Package catalogue
 
 ### Control and orchestration

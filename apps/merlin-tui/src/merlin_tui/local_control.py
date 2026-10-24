@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import errno
 import fcntl
 import json
 import logging
@@ -93,6 +94,46 @@ _SNAPSHOT_METHODS = frozenset(
         "list_schedules",
     }
 )
+_READ_ONLY_METHODS = _SNAPSHOT_METHODS | frozenset(
+    {
+        "list_packs",
+        "list_targets",
+        "list_skills",
+        "list_mcp_servers",
+        "list_findings",
+        "list_reports",
+        "get_permission_mode",
+        "list_permission_rules",
+        "list_permission_history",
+        "list_promotion_candidates",
+        "list_promotion_history",
+        "list_memory_records",
+        "list_browser_contexts",
+        "list_logs",
+        "list_lessons",
+        "export_safe_config",
+    }
+)
+
+
+class LocalStorageExhaustedError(RuntimeError):
+    """Local replay durability failed; new foreground mutations are fenced."""
+
+    code = "local_storage_exhausted"
+
+    def __init__(self) -> None:
+        super().__init__("Local storage is exhausted; new foreground mutations are disabled")
+
+    def response(self) -> dict[str, object]:
+        return {
+            "type": "error",
+            "error": str(self),
+            "code": self.code,
+            "failure_class": "infrastructure",
+            "infrastructure_failure_category": "storage_exhausted",
+        }
+
+
 _BATCHABLE_STREAM_KINDS = frozenset({"status", "content", "thinking"})
 _STARTER_EXIT_GRACE_SECONDS = 0.5
 _RECOVERY_WATCHDOG_SECONDS = 5.0
@@ -100,6 +141,7 @@ _IDLE_SHUTDOWN_CONFIRM_SECONDS = 0.25
 _FOREGROUND_HEARTBEAT_SECONDS = 1.0
 _FOREGROUND_LEASE_TIMEOUT_SECONDS = 5.0
 _FOREGROUND_ATTACH_GRACE_SECONDS = 10.0
+_DAEMON_HEARTBEAT_SECONDS = 5.0
 _PROCESS_LIFETIME_LOCKS: list[BinaryIO] = []
 _ALLOWED = {
     "configure_provider",
@@ -546,571 +588,712 @@ async def serve(
             raise PermissionError("local-control directory is not owned by the current user")
         os.chmod(socket_path.parent, 0o700)
     daemon_lock = await asyncio.to_thread(_acquire_daemon_lock, socket_path)
-    if await asyncio.to_thread(socket_path.exists):
-        try:
-            reader, writer = await asyncio.open_unix_connection(
-                socket_path, limit=_MAX_FRAME_BYTES + 1
-            )
-            writer.close()
-            await writer.wait_closed()
-            raise RuntimeError("Merlin daemon is already running")
-        except (ConnectionError, OSError):
-            await asyncio.to_thread(socket_path.unlink, missing_ok=True)
-    factory = backend_factory or build_backend
-    backend = factory(tool_confirmer=daemon_tool_confirmer)
-    recover = getattr(backend, "recover_background", None)
-    if callable(recover):
-        await recover()
-
-    shutdown = asyncio.Event()
-    clean_shutdown = False
-    foreground_lease_id: str | None = None
-    foreground_channel: _Channel | None = None
-    foreground_accepts_close = False
-    unclaimed_shutdown: asyncio.Task[None] | None = None
-    shutdown_record: dict[str, Any] | None = None
-
-    async def shutdown_state() -> dict[str, object]:
-        """Capture best-effort durable state before owned resources are closed."""
-        snapshot: dict[str, object] = {}
-        for name in ("list_campaigns", "list_active_schedules"):
-            reader = getattr(backend, name, None)
-            if not callable(reader):
-                continue
-            try:
-                snapshot[name] = _json(await reader())
-            except Exception as error:
-                snapshot[f"{name}_error"] = (
-                    f"{type(error).__module__}.{type(error).__qualname__}: {error}"
-                )
-        return snapshot
-
-    async def request_shutdown(
-        reason: str,
-        *,
-        clean: bool,
-        details: Mapping[str, object] | None = None,
-    ) -> None:
-        """Attribute every orderly daemon shutdown before teardown begins."""
-        nonlocal clean_shutdown, shutdown_record
-        if shutdown.is_set():
-            return
-        clean_shutdown = clean
-        shutdown_record = {
-            "event": "merlin_daemon_shutdown_requested",
-            "reason": reason,
-            "clean": clean,
-            "occurred_at": time.time(),
-            "foreground_lease_id": foreground_lease_id,
-            "details": dict(details or {}),
-            "state": await shutdown_state(),
-            "caller_stack": traceback.format_stack()[:-1],
-        }
-        logging.getLogger(__name__).warning(
-            "MERLIN_DAEMON_SHUTDOWN %s",
-            json.dumps(shutdown_record, separators=(",", ":"), default=str),
-        )
-        shutdown.set()
-
-    async def stop_if_daemon_remains_unclaimed(*, grace_seconds: float) -> None:
-        """Retire an unclaimed daemon after its durable background work settles."""
-        nonlocal clean_shutdown
-        if grace_seconds:
-            await asyncio.sleep(grace_seconds)
-        activity_reader = getattr(backend, "has_active_background_work", None)
-        inactive_observations = 0
-        observations: list[dict[str, object]] = []
-        while foreground_lease_id is None and not shutdown.is_set():
-            active_stream = any(
-                state.task is not None and not state.task.done()
-                for state in streams.values()
-            )
-            try:
-                background_active = (
-                    bool(await activity_reader()) if callable(activity_reader) else False
-                )
-                active = active_stream or background_active
-                activity_error = None
-            except Exception as error:
-                # Losing the daemon would pause and invalidate live target contexts.
-                # Preserve possible work and retry the authoritative activity check.
-                active = True
-                background_active = None
-                activity_error = (
-                    f"{type(error).__module__}.{type(error).__qualname__}: {error}"
-                )
-            observations.append(
-                {
-                    "observed_at": time.time(),
-                    "active_stream": active_stream,
-                    "background_active": background_active,
-                    "activity_error": activity_error,
-                    "active": active,
-                }
-            )
-            if active:
-                inactive_observations = 0
-            else:
-                inactive_observations += 1
-            if inactive_observations >= 2:
-                await request_shutdown(
-                    "idle_watchdog",
-                    clean=True,
-                    details={
-                        "grace_seconds": grace_seconds,
-                        "inactive_observations": inactive_observations,
-                        "observations": observations[-10:],
-                    },
-                )
-                return
-            try:
-                await asyncio.wait_for(
-                    shutdown.wait(),
-                    timeout=(
-                        _IDLE_SHUTDOWN_CONFIRM_SECONDS
-                        if inactive_observations
-                        else _RECOVERY_WATCHDOG_SECONDS
-                    ),
-                )
-            except TimeoutError:
-                pass
-
-    async def arm_idle_shutdown(*, grace_seconds: float) -> None:
-        nonlocal unclaimed_shutdown
-        if unclaimed_shutdown is not None:
-            unclaimed_shutdown.cancel()
-            await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
-        unclaimed_shutdown = asyncio.create_task(
-            stop_if_daemon_remains_unclaimed(grace_seconds=grace_seconds),
-            name="local-control:foreground-idle-watchdog",
-        )
-
-    async def watch_configuration() -> None:
-        from merlin_config import ConfigPaths, load_config
-
-        path = ConfigPaths.default().config
-        try:
-            initial = await asyncio.to_thread(path.stat)
-            signature: tuple[int, int, int] | None = (
-                initial.st_ino,
-                initial.st_mtime_ns,
-                initial.st_size,
-            )
-        except FileNotFoundError:
-            signature = None
-        while not shutdown.is_set():
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=tuning.config_reload_poll_seconds)
-                continue
-            except TimeoutError:
-                pass
-            try:
-                stat = await asyncio.to_thread(path.stat)
-                observed = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
-            except FileNotFoundError:
-                observed = None
-            if observed == signature:
-                continue
-            signature = observed
-            try:
-                newer = await asyncio.to_thread(load_config)
-                await reload_configuration(newer)
-            except Exception as error:
-                # Atomic config writers will produce another signature when corrected.
-                # Keep serving with the last valid applied configuration meanwhile.
-                failed = getattr(backend, "configuration_reload_failed", None)
-                if callable(failed):
-                    failed(error)
-                continue
-
-    async def watch_campaign_ownership() -> None:
-        """Renew daemon ownership of durable campaigns after supervisor failure."""
-        if not callable(recover):
-            return
-        last_error: str | None = None
-        last_reported = 0.0
-        while not shutdown.is_set():
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=_RECOVERY_WATCHDOG_SECONDS)
-                continue
-            except TimeoutError:
-                pass
-            try:
-                await recover()
-            except Exception as error:
-                # Keep the watchdog alive across transient database teardown;
-                # durable state is retried on the next pass. Report a persistent
-                # failure once a minute instead of spamming every pass.
-                message = str(error)
-                now = time.monotonic()
-                if message != last_error or now - last_reported >= 60.0:
-                    print(f"campaign recovery watchdog: {error}", file=sys.stderr)
-                    last_reported = now
-                last_error = message
-            else:
-                last_error = None
-
-    reload_configuration = getattr(backend, "reload_configuration", None)
-    config_watcher: asyncio.Task[None] | None = None
-    recovery_watcher: asyncio.Task[None] | None = None
-    journal_path = socket_path.with_suffix(".journal.json")
-    completed, streams = await asyncio.to_thread(
-        _load_journal, journal_path, tuning.max_stream_events
-    )
-    journal_lock = asyncio.Lock()
-
-    async def persist_journal() -> None:
-        async with journal_lock:
-            # Snapshot event-loop-owned collections before handing them to a writer thread.
-            # Otherwise another client may add a request while json is iterating the dict.
-            completed_snapshot = dict(completed)
-            stream_snapshot = {
-                key: _StreamState(
-                    request_id=state.request_id,
-                    prompt=state.prompt,
-                    events=list(state.events),
-                    first_cursor=state.first_cursor,
-                    done=state.done,
-                    error=state.error,
-                )
-                for key, state in tuple(streams.items())
-            }
-            await asyncio.to_thread(
-                _write_journal,
-                journal_path,
-                completed_snapshot,
-                stream_snapshot,
-                tuning.max_stream_events,
-            )
-
-    async def produce_stream(state: _StreamState, channel: _Channel) -> None:
-        token = _active_channel.set(channel)
-        unpersisted = 0
-        try:
-            async for event in backend.stream(state.prompt):
-                encoded = _json(event)
-                session_id = getattr(getattr(backend, "kernel", None), "session_id", None)
-                if isinstance(session_id, str) and session_id:
-                    encoded.setdefault("session_id", session_id)
-                async with state.changed:
-                    state.events.append(encoded)
-                    state.changed.notify_all()
-                unpersisted += 1
-                if (
-                    unpersisted >= tuning.stream_journal_batch
-                    or encoded.get("kind") not in _BATCHABLE_STREAM_KINDS
-                ):
-                    await persist_journal()
-                    unpersisted = 0
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            state.error = str(error)[:1_000]
-        finally:
-            _active_channel.reset(token)
-            async with state.changed:
-                state.done = True
-                state.changed.notify_all()
-            await persist_journal()
-
-    async def send_stream(channel: _Channel, state: _StreamState, cursor: int) -> None:
-        if cursor < state.first_cursor - 1:
-            raise ValueError("local-control stream cursor is no longer available")
-        while True:
-            async with state.changed:
-                index = cursor - state.first_cursor + 1
-                if 0 <= index < len(state.events):
-                    value = state.events[index]
-                elif state.done:
-                    # Do not acknowledge terminal delivery until the replay
-                    # journal also records it.  An immediate daemon restart
-                    # must not turn a completed turn into an interrupted one.
-                    await persist_journal()
-                    if state.error:
-                        await channel.send({"type": "error", "error": state.error})
-                    else:
-                        await channel.send({"type": "end", "cursor": cursor})
-                    # Once terminal delivery succeeds, keep a tombstone at the
-                    # final cursor instead of every token delta. A reconnect at
-                    # that cursor can still receive `end`; an older cursor gets
-                    # an explicit replay-gap error and can never rerun the turn.
-                    state.first_cursor += len(state.events)
-                    state.events.clear()
-                    await persist_journal()
-                    return
-                else:
-                    await state.changed.wait()
-                    continue
-            cursor += 1
-            await channel.send(
-                {"type": "event", "cursor": cursor, "value": _wire_client_event(value)}
-            )
-
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal clean_shutdown
-        nonlocal foreground_lease_id, foreground_channel, foreground_accepts_close
-        nonlocal unclaimed_shutdown
-        channel = _Channel(reader, writer)
-        try:
-            if not _peer_is_owner(writer):
-                raise PermissionError("local-control peer is not the daemon owner")
-            request = await channel.receive(deadline_seconds=tuning.request_timeout_seconds)
-            method = request.get("method")
-            if method == "ping":
-                await channel.send(
-                    {"type": "result", "value": "pong", "protocol": PROTOCOL_VERSION}
-                )
-                return
-            if method in {"shutdown", "shutdown_clean"}:
-                requested_lease = request.get("lease_id")
-                if foreground_lease_id is not None and requested_lease != foreground_lease_id:
-                    raise PermissionError("clean shutdown is reserved for the foreground owner")
-                await channel.send({"type": "result", "value": "stopping"})
-                await request_shutdown(
-                    "explicit_request",
-                    clean=True,
-                    details={"method": method, "requested_lease_id": requested_lease},
-                )
-                return
-            if method == "close_foreground":
-                if foreground_channel is not None:
-                    if not foreground_accepts_close:
-                        raise RuntimeError(
-                            "The existing Merlin window needs an update. "
-                            "Close it with /quit once, then relaunch Merlin."
-                        )
-                    await foreground_channel.send({"type": "foreground_close"})
-                    await channel.send({"type": "result", "value": "closing"})
-                else:
-                    await channel.send({"type": "result", "value": "no_owner"})
-                return
-            if method == "arm_unclaimed_shutdown":
-                if foreground_lease_id is None:
-                    await arm_idle_shutdown(grace_seconds=_FOREGROUND_ATTACH_GRACE_SECONDS)
-                    value = "armed"
-                else:
-                    value = "claimed"
-                await channel.send({"type": "result", "value": value})
-                return
-            if method == "foreground_lease":
-                if foreground_lease_id is not None:
-                    raise RuntimeError("Merlin already has a foreground owner")
-                lease_id = str(uuid4())
-                foreground_lease_id = lease_id
-                foreground_channel = channel
-                foreground_accepts_close = request.get("close_notifications") is True
-                if unclaimed_shutdown is not None:
-                    unclaimed_shutdown.cancel()
-                    await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
-                    unclaimed_shutdown = None
-                await channel.send(
-                    {
-                        "type": "result",
-                        "value": "attached",
-                        "lease_id": lease_id,
-                        "heartbeat_seconds": _FOREGROUND_HEARTBEAT_SECONDS,
-                    }
-                )
-                lease_end_reason = "foreground_eof"
-                last_heartbeat_at = time.monotonic()
-                try:
-                    # EOF handles normal and abrupt exits. Heartbeats also detect a
-                    # suspended frontend, which otherwise keeps its Unix socket open
-                    # forever while the daemon continues serving stale code.
-                    while True:
-                        try:
-                            heartbeat = await channel.receive(
-                                deadline_seconds=_FOREGROUND_LEASE_TIMEOUT_SECONDS
-                            )
-                        except TimeoutError:
-                            lease_end_reason = "heartbeat_timeout"
-                            break
-                        if (
-                            heartbeat.get("method") != "foreground_heartbeat"
-                            or heartbeat.get("lease_id") != lease_id
-                        ):
-                            lease_end_reason = "invalid_heartbeat"
-                            raise ValueError("invalid foreground lease heartbeat")
-                        last_heartbeat_at = time.monotonic()
-                finally:
-                    logging.getLogger(__name__).warning(
-                        "MERLIN_FOREGROUND_LEASE_RELEASED %s",
-                        json.dumps(
-                            {
-                                "event": "merlin_foreground_lease_released",
-                                "reason": lease_end_reason,
-                                "lease_id": lease_id,
-                                "seconds_since_heartbeat": max(
-                                    0.0, time.monotonic() - last_heartbeat_at
-                                ),
-                                "timeout_seconds": _FOREGROUND_LEASE_TIMEOUT_SECONDS,
-                            },
-                            separators=(",", ":"),
-                        ),
-                    )
-                    if foreground_lease_id == lease_id:
-                        foreground_lease_id = None
-                        foreground_channel = None
-                        foreground_accepts_close = False
-                    if not shutdown.is_set():
-                        await arm_idle_shutdown(grace_seconds=0)
-                return
-            if method == "stream":
-                request_id = _request_id(request)
-                prompt = str(request.get("prompt", ""))
-                cursor = request.get("cursor", 0)
-                if not isinstance(cursor, int) or cursor < 0:
-                    raise ValueError("local-control cursor must be a non-negative integer")
-                state = streams.get(request_id)
-                if state is None:
-                    state = _StreamState(request_id, prompt)
-                    streams[request_id] = state
-                    state.task = asyncio.create_task(
-                        produce_stream(state, channel), name=f"local-control:{request_id}"
-                    )
-                elif state.prompt != prompt:
-                    raise ValueError("request_id was already used with a different prompt")
-                await send_stream(channel, state, cursor)
-                return
-            if method not in _ALLOWED:
-                raise ValueError("local-control method is not admitted")
-            request_id = _request_id(request)
-            if cached := completed.get(request_id):
-                await channel.send(cached)
-                return
-            function = getattr(backend, str(method))
-            value = await function(*request.get("args", ()), **request.get("kwargs", {}))
-            response = {"type": "result", "value": _json(value)}
-            if method in _SNAPSHOT_METHODS:
-                await channel.send(response)
-                return
-            completed[request_id] = response
-            if len(completed) > _MAX_CACHED_REQUESTS:
-                completed.pop(next(iter(completed)))
-            await persist_journal()
-            await channel.send(response)
-        except (BrokenPipeError, ConnectionError, asyncio.IncompleteReadError):
-            return
-        except ClientEventDecodeError as error:
-            await channel.send(
-                {
-                    "type": "error",
-                    "error": str(error),
-                    "code": error.code,
-                    "schema_version": error.schema_version,
-                }
-            )
-        except Exception as error:
-            logging.getLogger(__name__).exception("Local-control request failed")
-            try:
-                await channel.send({"type": "error", "error": str(error)})
-            except (BrokenPipeError, ConnectionError):
-                pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (BrokenPipeError, ConnectionError):
-                pass
-
-    server = await asyncio.start_unix_server(handle, socket_path, limit=_MAX_FRAME_BYTES + 1)
-    os.chmod(socket_path, 0o600)
-    if callable(reload_configuration):
-        config_watcher = asyncio.create_task(
-            watch_configuration(), name="local-control:config-watcher"
-        )
-    if callable(recover):
-        recovery_watcher = asyncio.create_task(
-            watch_campaign_ownership(), name="local-control:campaign-recovery-watchdog"
-        )
-    exit_error: BaseException | None = None
+    backend = None
+    run_store = None
+    shutdown_record = None
+    run_id = str(uuid4())
+    cleanup_started = False
+    run_started = False
+    owns_socket = False
     try:
-        async with server:
-            await shutdown.wait()
-    except BaseException as error:
-        exit_error = error
-        if shutdown_record is None:
+        if await asyncio.to_thread(socket_path.exists):
+            try:
+                reader, writer = await asyncio.open_unix_connection(
+                    socket_path, limit=_MAX_FRAME_BYTES + 1
+                )
+                writer.close()
+                await writer.wait_closed()
+                raise RuntimeError("Merlin daemon is already running")
+            except (ConnectionError, OSError):
+                await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+        backend = (
+            backend_factory(tool_confirmer=daemon_tool_confirmer)
+            if backend_factory is not None
+            else build_backend(tool_confirmer=daemon_tool_confirmer, daemon=True)
+        )
+        run_store = getattr(backend, "daemon_run_repository", None)
+        if run_store is not None:
+            await asyncio.to_thread(run_store.start, run_id, pid=os.getpid())
+            run_started = True
+        recover = getattr(backend, "recover_background", None)
+        if callable(recover):
+            await recover()
+
+        shutdown = asyncio.Event()
+        clean_shutdown = False
+        foreground_lease_id: str | None = None
+        foreground_channel: _Channel | None = None
+        foreground_accepts_close = False
+        unclaimed_shutdown: asyncio.Task[None] | None = None
+        shutdown_record: dict[str, Any] | None = None
+        stop_kind = "unknown"
+        storage_exhausted = False
+
+        async def shutdown_state() -> dict[str, object]:
+            """Capture best-effort durable state before owned resources are closed."""
+            snapshot: dict[str, object] = {}
+            for name in ("list_campaigns", "list_active_schedules"):
+                reader = getattr(backend, name, None)
+                if not callable(reader):
+                    continue
+                try:
+                    snapshot[name] = _json(await reader())
+                except Exception as error:
+                    snapshot[f"{name}_error"] = (
+                        f"{type(error).__module__}.{type(error).__qualname__}: {error}"
+                    )
+            return snapshot
+
+        async def request_shutdown(
+            reason: str,
+            *,
+            clean: bool,
+            details: Mapping[str, object] | None = None,
+        ) -> None:
+            """Attribute every orderly daemon shutdown before teardown begins."""
+            nonlocal clean_shutdown, shutdown_record, stop_kind
+            if shutdown_record is not None:
+                return
+            clean_shutdown = clean
+            stop_kind = (
+                "signal"
+                if reason in {"SIGTERM", "SIGINT"}
+                else ("clean" if clean else "fatal_exception")
+            )
             shutdown_record = {
                 "event": "merlin_daemon_shutdown_requested",
-                "reason": "fatal_exception",
-                "clean": False,
+                "reason": reason,
+                "clean": clean,
                 "occurred_at": time.time(),
-                "error": f"{type(error).__module__}.{type(error).__qualname__}: {error}",
-                "traceback": traceback.format_exc(),
-                "state": await shutdown_state(),
+                "foreground_lease_id": foreground_lease_id,
+                "details": dict(details or {}),
+                "caller_stack": traceback.format_stack()[:-1],
             }
-            logging.getLogger(__name__).exception(
+            shutdown_record["state"] = await shutdown_state()
+            if run_store is not None:
+                try:
+                    await asyncio.to_thread(
+                        run_store.request_stop,
+                        run_id,
+                        stop_kind=stop_kind,
+                        reason=reason,
+                        details=shutdown_record,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not persist daemon stop request")
+            logging.getLogger(__name__).warning(
                 "MERLIN_DAEMON_SHUTDOWN %s",
                 json.dumps(shutdown_record, separators=(",", ":"), default=str),
             )
+            shutdown.set()
+
+        async def heartbeat_run() -> None:
+            while not shutdown.is_set():
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=_DAEMON_HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    if run_store is not None:
+                        try:
+                            await asyncio.to_thread(run_store.heartbeat, run_id)
+                        except Exception:
+                            logging.getLogger(__name__).exception("Daemon heartbeat failed")
+
+        async def stop_if_daemon_remains_unclaimed(*, grace_seconds: float) -> None:
+            """Retire an unclaimed daemon after its durable background work settles."""
+            nonlocal clean_shutdown
+            if grace_seconds:
+                await asyncio.sleep(grace_seconds)
+            activity_reader = getattr(backend, "has_active_background_work", None)
+            inactive_observations = 0
+            observations: list[dict[str, object]] = []
+            while foreground_lease_id is None and not shutdown.is_set():
+                active_stream = any(
+                    state.task is not None and not state.task.done() for state in streams.values()
+                )
+                try:
+                    background_active = (
+                        bool(await activity_reader()) if callable(activity_reader) else False
+                    )
+                    active = active_stream or background_active
+                    activity_error = None
+                except Exception as error:
+                    # Losing the daemon would pause and invalidate live target contexts.
+                    # Preserve possible work and retry the authoritative activity check.
+                    active = True
+                    background_active = None
+                    activity_error = f"{type(error).__module__}.{type(error).__qualname__}: {error}"
+                observations.append(
+                    {
+                        "observed_at": time.time(),
+                        "active_stream": active_stream,
+                        "background_active": background_active,
+                        "activity_error": activity_error,
+                        "active": active,
+                    }
+                )
+                if active:
+                    inactive_observations = 0
+                else:
+                    inactive_observations += 1
+                if inactive_observations >= 2:
+                    await request_shutdown(
+                        "idle_watchdog",
+                        clean=True,
+                        details={
+                            "grace_seconds": grace_seconds,
+                            "inactive_observations": inactive_observations,
+                            "observations": observations[-10:],
+                        },
+                    )
+                    return
+                try:
+                    await asyncio.wait_for(
+                        shutdown.wait(),
+                        timeout=(
+                            _IDLE_SHUTDOWN_CONFIRM_SECONDS
+                            if inactive_observations
+                            else _RECOVERY_WATCHDOG_SECONDS
+                        ),
+                    )
+                except TimeoutError:
+                    pass
+
+        async def arm_idle_shutdown(*, grace_seconds: float) -> None:
+            nonlocal unclaimed_shutdown
+            if unclaimed_shutdown is not None:
+                unclaimed_shutdown.cancel()
+                await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+            unclaimed_shutdown = asyncio.create_task(
+                stop_if_daemon_remains_unclaimed(grace_seconds=grace_seconds),
+                name="local-control:foreground-idle-watchdog",
+            )
+
+        async def watch_configuration() -> None:
+            from merlin_config import ConfigPaths, load_config
+
+            path = ConfigPaths.default().config
+            try:
+                initial = await asyncio.to_thread(path.stat)
+                signature: tuple[int, int, int] | None = (
+                    initial.st_ino,
+                    initial.st_mtime_ns,
+                    initial.st_size,
+                )
+            except FileNotFoundError:
+                signature = None
+            while not shutdown.is_set():
+                try:
+                    await asyncio.wait_for(
+                        shutdown.wait(), timeout=tuning.config_reload_poll_seconds
+                    )
+                    continue
+                except TimeoutError:
+                    pass
+                try:
+                    stat = await asyncio.to_thread(path.stat)
+                    observed = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                except FileNotFoundError:
+                    observed = None
+                if observed == signature:
+                    continue
+                signature = observed
+                try:
+                    newer = await asyncio.to_thread(load_config)
+                    await reload_configuration(newer)
+                except Exception as error:
+                    # Atomic config writers will produce another signature when corrected.
+                    # Keep serving with the last valid applied configuration meanwhile.
+                    failed = getattr(backend, "configuration_reload_failed", None)
+                    if callable(failed):
+                        failed(error)
+                    continue
+
+        async def watch_campaign_ownership() -> None:
+            """Renew daemon ownership of durable campaigns after supervisor failure."""
+            if not callable(recover):
+                return
+            last_error: str | None = None
+            last_reported = 0.0
+            while not shutdown.is_set():
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=_RECOVERY_WATCHDOG_SECONDS)
+                    continue
+                except TimeoutError:
+                    pass
+                try:
+                    await recover()
+                except Exception as error:
+                    # Keep the watchdog alive across transient database teardown;
+                    # durable state is retried on the next pass. Report a persistent
+                    # failure once a minute instead of spamming every pass.
+                    message = str(error)
+                    now = time.monotonic()
+                    if message != last_error or now - last_reported >= 60.0:
+                        print(f"campaign recovery watchdog: {error}", file=sys.stderr)
+                        last_reported = now
+                    last_error = message
+                else:
+                    last_error = None
+
+        reload_configuration = getattr(backend, "reload_configuration", None)
+        config_watcher: asyncio.Task[None] | None = None
+        recovery_watcher: asyncio.Task[None] | None = None
+        journal_path = socket_path.with_suffix(".journal.json")
+        completed, streams = await asyncio.to_thread(
+            _load_journal, journal_path, tuning.max_stream_events
+        )
+        journal_lock = asyncio.Lock()
+
+        async def persist_journal() -> None:
+            nonlocal storage_exhausted
+            async with journal_lock:
+                if storage_exhausted:
+                    raise LocalStorageExhaustedError()
+                # Snapshot event-loop-owned collections before handing them to a writer thread.
+                # Otherwise another client may add a request while json is iterating the dict.
+                completed_snapshot = dict(completed)
+                stream_snapshot = {
+                    key: _StreamState(
+                        request_id=state.request_id,
+                        prompt=state.prompt,
+                        events=list(state.events),
+                        first_cursor=state.first_cursor,
+                        done=state.done,
+                        error=state.error,
+                    )
+                    for key, state in tuple(streams.items())
+                }
+                try:
+                    await asyncio.to_thread(
+                        _write_journal,
+                        journal_path,
+                        completed_snapshot,
+                        stream_snapshot,
+                        tuning.max_stream_events,
+                    )
+                except OSError as error:
+                    if error.errno != errno.ENOSPC:
+                        raise
+                    storage_exhausted = True
+                    raise LocalStorageExhaustedError() from error
+
+        async def produce_stream(state: _StreamState, channel: _Channel) -> None:
+            nonlocal storage_exhausted
+            token = _active_channel.set(channel)
+            unpersisted = 0
+            try:
+                async for event in backend.stream(state.prompt):
+                    encoded = _json(event)
+                    session_id = getattr(getattr(backend, "kernel", None), "session_id", None)
+                    if isinstance(session_id, str) and session_id:
+                        encoded.setdefault("session_id", session_id)
+                    async with state.changed:
+                        state.events.append(encoded)
+                        state.changed.notify_all()
+                    unpersisted += 1
+                    if (
+                        unpersisted >= tuning.stream_journal_batch
+                        or encoded.get("kind") not in _BATCHABLE_STREAM_KINDS
+                    ):
+                        await persist_journal()
+                        unpersisted = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                    storage_exhausted = True
+                state.error = str(error)[:1_000]
+            finally:
+                _active_channel.reset(token)
+                async with state.changed:
+                    state.done = True
+                    state.changed.notify_all()
+                if not storage_exhausted:
+                    try:
+                        await persist_journal()
+                    except LocalStorageExhaustedError:
+                        state.error = str(LocalStorageExhaustedError())
+
+        async def send_stream(channel: _Channel, state: _StreamState, cursor: int) -> None:
+            if cursor < state.first_cursor - 1:
+                raise ValueError("local-control stream cursor is no longer available")
+            while True:
+                async with state.changed:
+                    index = cursor - state.first_cursor + 1
+                    if 0 <= index < len(state.events):
+                        value = state.events[index]
+                    elif state.done:
+                        # Do not acknowledge terminal delivery until the replay
+                        # journal also records it.  An immediate daemon restart
+                        # must not turn a completed turn into an interrupted one.
+                        await persist_journal()
+                        if state.error:
+                            await channel.send({"type": "error", "error": state.error})
+                        else:
+                            await channel.send({"type": "end", "cursor": cursor})
+                        # Once terminal delivery succeeds, keep a tombstone at the
+                        # final cursor instead of every token delta. A reconnect at
+                        # that cursor can still receive `end`; an older cursor gets
+                        # an explicit replay-gap error and can never rerun the turn.
+                        state.first_cursor += len(state.events)
+                        state.events.clear()
+                        await persist_journal()
+                        return
+                    else:
+                        await state.changed.wait()
+                        continue
+                cursor += 1
+                await channel.send(
+                    {"type": "event", "cursor": cursor, "value": _wire_client_event(value)}
+                )
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            nonlocal clean_shutdown, storage_exhausted
+            nonlocal foreground_lease_id, foreground_channel, foreground_accepts_close
+            nonlocal unclaimed_shutdown
+            channel = _Channel(reader, writer)
+            try:
+                if not _peer_is_owner(writer):
+                    raise PermissionError("local-control peer is not the daemon owner")
+                request = await channel.receive(deadline_seconds=tuning.request_timeout_seconds)
+                method = request.get("method")
+                if method == "ping":
+                    await channel.send(
+                        {"type": "result", "value": "pong", "protocol": PROTOCOL_VERSION}
+                    )
+                    return
+                if method in {"shutdown", "shutdown_clean"}:
+                    requested_lease = request.get("lease_id")
+                    if foreground_lease_id is not None and requested_lease != foreground_lease_id:
+                        raise PermissionError("clean shutdown is reserved for the foreground owner")
+                    await channel.send({"type": "result", "value": "stopping"})
+                    await request_shutdown(
+                        "explicit_request",
+                        clean=True,
+                        details={"method": method, "requested_lease_id": requested_lease},
+                    )
+                    return
+                if method == "close_foreground":
+                    if foreground_channel is not None:
+                        if not foreground_accepts_close:
+                            raise RuntimeError(
+                                "The existing Merlin window needs an update. "
+                                "Close it with /quit once, then relaunch Merlin."
+                            )
+                        await foreground_channel.send({"type": "foreground_close"})
+                        await channel.send({"type": "result", "value": "closing"})
+                    else:
+                        await channel.send({"type": "result", "value": "no_owner"})
+                    return
+                if method == "arm_unclaimed_shutdown":
+                    if foreground_lease_id is None:
+                        await arm_idle_shutdown(grace_seconds=_FOREGROUND_ATTACH_GRACE_SECONDS)
+                        value = "armed"
+                    else:
+                        value = "claimed"
+                    await channel.send({"type": "result", "value": value})
+                    return
+                if method == "foreground_lease":
+                    if foreground_lease_id is not None:
+                        raise RuntimeError("Merlin already has a foreground owner")
+                    lease_id = str(uuid4())
+                    foreground_lease_id = lease_id
+                    foreground_channel = channel
+                    foreground_accepts_close = request.get("close_notifications") is True
+                    if unclaimed_shutdown is not None:
+                        unclaimed_shutdown.cancel()
+                        await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+                        unclaimed_shutdown = None
+                    await channel.send(
+                        {
+                            "type": "result",
+                            "value": "attached",
+                            "lease_id": lease_id,
+                            "heartbeat_seconds": _FOREGROUND_HEARTBEAT_SECONDS,
+                        }
+                    )
+                    lease_end_reason = "foreground_eof"
+                    last_heartbeat_at = time.monotonic()
+                    try:
+                        # EOF handles normal and abrupt exits. Heartbeats also detect a
+                        # suspended frontend, which otherwise keeps its Unix socket open
+                        # forever while the daemon continues serving stale code.
+                        while True:
+                            try:
+                                heartbeat = await channel.receive(
+                                    deadline_seconds=_FOREGROUND_LEASE_TIMEOUT_SECONDS
+                                )
+                            except TimeoutError:
+                                lease_end_reason = "heartbeat_timeout"
+                                break
+                            if (
+                                heartbeat.get("method") != "foreground_heartbeat"
+                                or heartbeat.get("lease_id") != lease_id
+                            ):
+                                lease_end_reason = "invalid_heartbeat"
+                                raise ValueError("invalid foreground lease heartbeat")
+                            last_heartbeat_at = time.monotonic()
+                    finally:
+                        logging.getLogger(__name__).warning(
+                            "MERLIN_FOREGROUND_LEASE_RELEASED %s",
+                            json.dumps(
+                                {
+                                    "event": "merlin_foreground_lease_released",
+                                    "reason": lease_end_reason,
+                                    "lease_id": lease_id,
+                                    "seconds_since_heartbeat": max(
+                                        0.0, time.monotonic() - last_heartbeat_at
+                                    ),
+                                    "timeout_seconds": _FOREGROUND_LEASE_TIMEOUT_SECONDS,
+                                },
+                                separators=(",", ":"),
+                            ),
+                        )
+                        if foreground_lease_id == lease_id:
+                            foreground_lease_id = None
+                            foreground_channel = None
+                            foreground_accepts_close = False
+                        if not shutdown.is_set():
+                            await arm_idle_shutdown(grace_seconds=0)
+                    return
+                if method == "stream":
+                    request_id = _request_id(request)
+                    prompt = str(request.get("prompt", ""))
+                    cursor = request.get("cursor", 0)
+                    if not isinstance(cursor, int) or cursor < 0:
+                        raise ValueError("local-control cursor must be a non-negative integer")
+                    state = streams.get(request_id)
+                    if state is None:
+                        if storage_exhausted:
+                            raise LocalStorageExhaustedError()
+                        state = _StreamState(request_id, prompt)
+                        streams[request_id] = state
+                        state.task = asyncio.create_task(
+                            produce_stream(state, channel), name=f"local-control:{request_id}"
+                        )
+                    elif state.prompt != prompt:
+                        raise ValueError("request_id was already used with a different prompt")
+                    await send_stream(channel, state, cursor)
+                    return
+                if method not in _ALLOWED:
+                    raise ValueError("local-control method is not admitted")
+                request_id = _request_id(request)
+                if cached := completed.get(request_id):
+                    if storage_exhausted and method not in _READ_ONLY_METHODS:
+                        raise LocalStorageExhaustedError()
+                    await channel.send(cached)
+                    return
+                if storage_exhausted and method not in _READ_ONLY_METHODS:
+                    raise LocalStorageExhaustedError()
+                function = getattr(backend, str(method))
+                value = await function(*request.get("args", ()), **request.get("kwargs", {}))
+                response = {"type": "result", "value": _json(value)}
+                if method in _SNAPSHOT_METHODS or (
+                    storage_exhausted and method in _READ_ONLY_METHODS
+                ):
+                    await channel.send(response)
+                    return
+                completed[request_id] = response
+                if len(completed) > _MAX_CACHED_REQUESTS:
+                    completed.pop(next(iter(completed)))
+                await persist_journal()
+                await channel.send(response)
+            except (BrokenPipeError, ConnectionError, asyncio.IncompleteReadError):
+                return
+            except ClientEventDecodeError as error:
+                await channel.send(
+                    {
+                        "type": "error",
+                        "error": str(error),
+                        "code": error.code,
+                        "schema_version": error.schema_version,
+                    }
+                )
+            except Exception as error:
+                logging.getLogger(__name__).exception("Local-control request failed")
+                try:
+                    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                        storage_exhausted = True
+                        storage_exhausted_error = LocalStorageExhaustedError()
+                    else:
+                        storage_exhausted_error = error
+                    await channel.send(
+                        storage_exhausted_error.response()
+                        if isinstance(storage_exhausted_error, LocalStorageExhaustedError)
+                        else {"type": "error", "error": str(error)}
+                    )
+                except (BrokenPipeError, ConnectionError):
+                    pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionError):
+                    pass
+
+        server = await asyncio.start_unix_server(handle, socket_path, limit=_MAX_FRAME_BYTES + 1)
+        owns_socket = True
+        os.chmod(socket_path, 0o600)
+        if callable(reload_configuration):
+            config_watcher = asyncio.create_task(
+                watch_configuration(), name="local-control:config-watcher"
+            )
+        if callable(recover):
+            recovery_watcher = asyncio.create_task(
+                watch_campaign_ownership(), name="local-control:campaign-recovery-watchdog"
+            )
+        exit_error: BaseException | None = None
+        heartbeat_task = asyncio.create_task(heartbeat_run(), name="daemon-run:heartbeat")
+        signal_tasks: set[asyncio.Task[None]] = set()
+        loop = asyncio.get_running_loop()
+        previous_signal_handlers = {
+            signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+
+        def on_signal(name: str) -> None:
+            task = asyncio.create_task(request_shutdown(name, clean=True))
+            signal_tasks.add(task)
+            task.add_done_callback(signal_tasks.discard)
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(signum, on_signal, signum.name)
+        try:
+            async with server:
+                await shutdown.wait()
+        except BaseException as error:
+            exit_error = error
+            await request_shutdown(
+                "fatal_exception",
+                clean=False,
+                details={"error": str(error), "traceback": traceback.format_exc()},
+            )
+            raise
+        finally:
+            cleanup_started = True
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(signum)
+                signal.signal(signum, previous_signal_handlers[signum])
+            if signal_tasks:
+                await asyncio.gather(*signal_tasks, return_exceptions=True)
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if unclaimed_shutdown is not None:
+                unclaimed_shutdown.cancel()
+                await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
+            if config_watcher is not None:
+                config_watcher.cancel()
+                await asyncio.gather(config_watcher, return_exceptions=True)
+            if recovery_watcher is not None:
+                recovery_watcher.cancel()
+                await asyncio.gather(recovery_watcher, return_exceptions=True)
+            for state in streams.values():
+                if state.task is not None and not state.task.done():
+                    state.task.cancel()
+            await asyncio.gather(
+                *(state.task for state in streams.values() if state.task is not None),
+                return_exceptions=True,
+            )
+            cleanup_error: BaseException | None = None
+            try:
+                if not storage_exhausted:
+                    await persist_journal()
+            except LocalStorageExhaustedError:
+                pass
+            except Exception as error:
+                cleanup_error = error
+            try:
+                detach = getattr(backend, "detach", None)
+                close = getattr(backend, "close", None)
+                if clean_shutdown and callable(close):
+                    await close()
+                elif callable(detach):
+                    await detach()
+                elif callable(close):
+                    await close()
+                else:
+                    raise RuntimeError("local-control backend exposes neither close nor detach")
+            except BaseException as error:
+                cleanup_error = error
+            finally:
+                final_record = {
+                    "event": "merlin_daemon_shutdown_finished",
+                    "reason": (shutdown_record or {}).get("reason", "unknown"),
+                    "clean": clean_shutdown,
+                    "local_storage_exhausted": storage_exhausted,
+                    "exit_error": (
+                        None
+                        if exit_error is None
+                        else (
+                            f"{type(exit_error).__module__}."
+                            f"{type(exit_error).__qualname__}: {exit_error}"
+                        )
+                    ),
+                    "cleanup_error": (
+                        None
+                        if cleanup_error is None
+                        else (
+                            f"{type(cleanup_error).__module__}."
+                            f"{type(cleanup_error).__qualname__}: {cleanup_error}"
+                        )
+                    ),
+                }
+                logging.getLogger(__name__).warning(
+                    "MERLIN_DAEMON_SHUTDOWN_FINISHED %s",
+                    json.dumps(final_record, separators=(",", ":"), default=str),
+                )
+                if run_store is not None and cleanup_error is None:
+                    await asyncio.to_thread(
+                        run_store.finish,
+                        run_id,
+                        stop_kind=stop_kind,
+                        reason=(shutdown_record or {}).get("reason", "unknown"),
+                        details=final_record,
+                    )
+            if cleanup_error is not None:
+                raise cleanup_error
+    except BaseException as error:
+        if backend is not None and not cleanup_started:
+            # Startup can fail before the server's normal teardown is armed.
+            if run_started:
+                try:
+                    await asyncio.to_thread(
+                        run_store.request_stop,
+                        run_id,
+                        stop_kind="fatal_exception",
+                        reason="startup_failure",
+                        details={"error": str(error)},
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not attribute startup failure")
+            close = getattr(backend, "detach", None) or getattr(backend, "close", None)
+            if callable(close):
+                await close()
+                if run_started:
+                    await asyncio.to_thread(
+                        run_store.finish,
+                        run_id,
+                        stop_kind="fatal_exception",
+                        reason="startup_failure",
+                        details={"error": str(error)},
+                    )
         raise
     finally:
-        if unclaimed_shutdown is not None:
-            unclaimed_shutdown.cancel()
-            await asyncio.gather(unclaimed_shutdown, return_exceptions=True)
-        if config_watcher is not None:
-            config_watcher.cancel()
-            await asyncio.gather(config_watcher, return_exceptions=True)
-        if recovery_watcher is not None:
-            recovery_watcher.cancel()
-            await asyncio.gather(recovery_watcher, return_exceptions=True)
-        for state in streams.values():
-            if state.task is not None and not state.task.done():
-                state.task.cancel()
-        await asyncio.gather(
-            *(state.task for state in streams.values() if state.task is not None),
-            return_exceptions=True,
-        )
-        await persist_journal()
-        cleanup_error: BaseException | None = None
         try:
-            detach = getattr(backend, "detach", None)
-            close = getattr(backend, "close", None)
-            if clean_shutdown and callable(close):
-                await close()
-            elif callable(detach):
-                await detach()
-            elif callable(close):
-                await close()
-            else:
-                raise RuntimeError("local-control backend exposes neither close nor detach")
-        except BaseException as error:
-            cleanup_error = error
+            if run_store is not None:
+                await asyncio.to_thread(run_store.connection.close)
         finally:
-            final_record = {
-                "event": "merlin_daemon_shutdown_finished",
-                "reason": (shutdown_record or {}).get("reason", "unknown"),
-                "clean": clean_shutdown,
-                "exit_error": (
-                    None
-                    if exit_error is None
-                    else f"{type(exit_error).__module__}.{type(exit_error).__qualname__}: {exit_error}"
-                ),
-                "cleanup_error": (
-                    None
-                    if cleanup_error is None
-                    else (
-                        f"{type(cleanup_error).__module__}."
-                        f"{type(cleanup_error).__qualname__}: {cleanup_error}"
-                    )
-                ),
-            }
-            logging.getLogger(__name__).warning(
-                "MERLIN_DAEMON_SHUTDOWN_FINISHED %s",
-                json.dumps(final_record, separators=(",", ":"), default=str),
-            )
-            await asyncio.to_thread(socket_path.unlink, missing_ok=True)
-            if hold_lock_until_process_exit:
-                # asyncio.run() waits for default-executor work only after this
-                # coroutine returns. A cancelled to_thread checkpoint may therefore
-                # keep the old process alive after the socket is removed. Retain
-                # ownership until interpreter exit so restart cannot launch a
-                # second daemon during that shutdown tail.
-                _PROCESS_LIFETIME_LOCKS.append(daemon_lock)
-            else:
-                daemon_lock.close()
-        if cleanup_error is not None:
-            raise cleanup_error
+            try:
+                database = getattr(backend, "daemon_database", None)
+                if database is not None:
+                    await asyncio.to_thread(database.stop)
+            finally:
+                if owns_socket:
+                    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+                if hold_lock_until_process_exit:
+                    if daemon_lock not in _PROCESS_LIFETIME_LOCKS:
+                        _PROCESS_LIFETIME_LOCKS.append(daemon_lock)
+                else:
+                    daemon_lock.close()
 
 
 def _legacy_foreground_pid(socket_path: Path) -> int:
@@ -1338,7 +1521,7 @@ class LocalControlClient:
             if not line:
                 raise ConnectionError(
                     "The Merlin session disconnected. Run ./merlin and choose "
-                    "\"Resume last session\" to reconnect."
+                    '"Resume last session" to reconnect.'
                 )
             if json.loads(line).get("type") != "foreground_close":
                 raise RuntimeError("Unexpected foreground session notification")
@@ -1457,8 +1640,8 @@ class LocalControlClient:
                         next_cursor = response.get("cursor")
                         if not isinstance(next_cursor, int) or next_cursor != cursor + 1:
                             raise RuntimeError("daemon returned an out-of-order stream cursor")
-                        event = decode_client_event(response["value"])
                         cursor = next_cursor
+                        event = decode_client_event(response["value"])
                         yield StreamEvent(kind=event.kind, text=event.text)
                     elif kind == "approval":
                         decision: object = False
@@ -1751,9 +1934,7 @@ async def restart_daemon(socket_path: Path = _SOCKET) -> None:
 
 async def _arm_unclaimed_shutdown(socket_path: Path = _SOCKET) -> None:
     """Give a newly started daemon a bounded window for a TUI to attach."""
-    reader, writer = await asyncio.open_unix_connection(
-        socket_path, limit=_MAX_FRAME_BYTES + 1
-    )
+    reader, writer = await asyncio.open_unix_connection(socket_path, limit=_MAX_FRAME_BYTES + 1)
     try:
         channel = _Channel(reader, writer)
         await channel.send({"method": "arm_unclaimed_shutdown"})

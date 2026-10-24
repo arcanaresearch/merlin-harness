@@ -353,6 +353,72 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
             assert store.list_arms("target-1", "sha256:scenario-one")[0]["status"] == "active"
 
 
+def test_pg0_storage_exhaustion_is_infrastructure_without_quality(tmp_path: Path) -> None:
+    from merlin_contracts.storage_failures import storage_failure_category
+    from psycopg.errors import DiskFull
+
+    category = storage_failure_category(DiskFull("injected"))
+    assert category is not None
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create()
+            CampaignStore(connection).prepare("campaign-1", session.id, {}, "digest")
+            attempt_id = str(uuid4())
+            TechniqueAttemptRepository(connection).begin(
+                TechniqueAttempt(
+                    id=attempt_id,
+                    campaign_id="campaign-1",
+                    wave=0,
+                    task_id="worker-1",
+                    technique_id="technique/one",
+                    strategy_id="direct",
+                    language="en",
+                    control_kind="attack",
+                    oracle_digest="sha256:" + "c" * 64,
+                )
+            )
+            store = CampaignArmStore(connection)
+            arm = _arm()
+            store.record_arm(arm)
+            observation = {
+                **_observation(arm, attempt_id),
+                "outcome": "infrastructure_failure",
+                "target_calls": 0,
+                "infrastructure_failure_category": category.value,
+            }
+            store.record_arm_observation(observation)
+            history = store.list_arm_observations("target-1", "sha256:scenario-one")
+            assert len(history) == 1
+            assert history[0]["infrastructure_failure"] is True
+            assert history[0]["outcome"] == "infrastructure_failure"
+            assert history[0]["attempt_disposition"] == "uncertain"
+            assert history[0]["outcome_authority"] == "none"
+            assert store.list_arms("target-1", "sha256:scenario-one")[0]["status"] == "trial"
+            counters = CampaignObservabilityRepository(connection).counters("campaign-1")
+            assert counters.infrastructure_failures == 1
+            assert counters.target_calls == 0
+            hypothesis = store.record_hypothesis(
+                {
+                    "id": "hypothesis:storage",
+                    "campaign_id": "campaign-1",
+                    "target_id": "target-1",
+                    "scenario_fingerprint": "sha256:scenario-one",
+                    "claim": "Unverified claim",
+                    "evidence_refs": ("receipt:one",),
+                }
+            )
+            blocked = store.transition_hypothesis(
+                {
+                    **observation,
+                    "hypothesis_id": hypothesis.id,
+                    "reason": "storage unavailable",
+                }
+            )
+            assert blocked.state == "blocked_by_infrastructure"
+            assert blocked.infrastructure_failure_category == category
+
+
 def _observation(arm: dict[str, object], attempt_id: str) -> dict[str, object]:
     return {
         "campaign_id": "campaign-1",

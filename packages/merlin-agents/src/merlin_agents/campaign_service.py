@@ -18117,7 +18117,14 @@ class CampaignService:
                 {
                     "wave": wave_number,
                     "kind": str(item["kind"]),
-                    "status": str(item["status"]),
+                    "status": (
+                        str(schedule_projection["status"])
+                        if isinstance(schedule_projection, Mapping)
+                        and str(item["status"]) in {"running", "paused"}
+                        and str(schedule_projection.get("status"))
+                        in {"completed", "failed", "cancelled"}
+                        else str(item["status"])
+                    ),
                     "schedule_id": schedule_id,
                     "progress": progress,
                     "tasks": tuple(projected_tasks),

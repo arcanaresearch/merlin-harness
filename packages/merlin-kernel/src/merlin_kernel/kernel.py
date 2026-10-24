@@ -36,6 +36,7 @@ from merlin_contracts import (
     ToolContext,
     ToolResult,
 )
+from merlin_contracts.storage_failures import storage_failure_category
 
 from .commands import CommandError, help_text, parse_command
 from .context import (
@@ -1262,7 +1263,10 @@ class Kernel:
                             is_error=True,
                             metadata={
                                 "infrastructure_failure_category": (
-                                    InfrastructureFailureCategory.DELIVERY_FAILURE.value
+                                    (
+                                        storage_failure_category(error)
+                                        or InfrastructureFailureCategory.DELIVERY_FAILURE
+                                    ).value
                                 )
                             },
                         )
@@ -1996,7 +2000,10 @@ class Kernel:
                     is_error=True,
                     metadata={
                         "infrastructure_failure_category": (
-                            InfrastructureFailureCategory.DELIVERY_FAILURE.value
+                            (
+                                storage_failure_category(error)
+                                or InfrastructureFailureCategory.DELIVERY_FAILURE
+                            ).value
                         )
                     },
                 )
