@@ -28,6 +28,23 @@ from merlin_contracts import ToolContext, ToolSpec
 from merlin_permissions import PermissionDecision
 
 from .backend import StreamEvent
+from .wire_events import (
+    CLIENT_EVENT_SCHEMA_VERSION,
+    ClientEventDecodeError,
+    decode_client_event,
+    encode_client_event,
+)
+
+
+def _wire_client_event(value: Mapping[str, object]) -> dict[str, object]:
+    """Wrap journal presentations without changing retention or cursor identity."""
+    if "schema_version" not in value:
+        value = {
+            **value,
+            "schema_version": CLIENT_EVENT_SCHEMA_VERSION,
+            "presentation": {"kind": value.get("kind"), "text": value.get("text")},
+        }
+    return encode_client_event(decode_client_event(value))
 
 
 def _default_socket_path() -> Path:
@@ -772,6 +789,9 @@ async def serve(
         try:
             async for event in backend.stream(state.prompt):
                 encoded = _json(event)
+                session_id = getattr(getattr(backend, "kernel", None), "session_id", None)
+                if isinstance(session_id, str) and session_id:
+                    encoded.setdefault("session_id", session_id)
                 async with state.changed:
                     state.events.append(encoded)
                     state.changed.notify_all()
@@ -822,7 +842,9 @@ async def serve(
                     await state.changed.wait()
                     continue
             cursor += 1
-            await channel.send({"type": "event", "cursor": cursor, "value": value})
+            await channel.send(
+                {"type": "event", "cursor": cursor, "value": _wire_client_event(value)}
+            )
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         nonlocal clean_shutdown
@@ -969,6 +991,15 @@ async def serve(
             await channel.send(response)
         except (BrokenPipeError, ConnectionError, asyncio.IncompleteReadError):
             return
+        except ClientEventDecodeError as error:
+            await channel.send(
+                {
+                    "type": "error",
+                    "error": str(error),
+                    "code": error.code,
+                    "schema_version": error.schema_version,
+                }
+            )
         except Exception as error:
             logging.getLogger(__name__).exception("Local-control request failed")
             try:
@@ -1426,9 +1457,9 @@ class LocalControlClient:
                         next_cursor = response.get("cursor")
                         if not isinstance(next_cursor, int) or next_cursor != cursor + 1:
                             raise RuntimeError("daemon returned an out-of-order stream cursor")
+                        event = decode_client_event(response["value"])
                         cursor = next_cursor
-                        value = response["value"]
-                        yield StreamEvent(**value)
+                        yield StreamEvent(kind=event.kind, text=event.text)
                     elif kind == "approval":
                         decision: object = False
                         if self._confirmer is not None:
@@ -1447,6 +1478,15 @@ class LocalControlClient:
                     elif kind == "end":
                         return
                     elif kind == "error":
+                        if response.get("code") in {
+                            "unsupported_client_event_version",
+                            "invalid_client_event",
+                        }:
+                            raise ClientEventDecodeError(
+                                response["code"],
+                                str(response.get("error", "invalid client event")),
+                                schema_version=response.get("schema_version"),
+                            )
                         raise RuntimeError(str(response.get("error", "daemon request failed")))
             except (ConnectionError, OSError) as exc:
                 if (

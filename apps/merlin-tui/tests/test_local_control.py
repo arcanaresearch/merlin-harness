@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -24,6 +25,215 @@ from merlin_tui.local_control import (
     serve,
     stop_daemon,
 )
+from merlin_tui.wire_events import (
+    CLIENT_EVENT_SCHEMA_VERSION,
+    ClientEventDecodeError,
+    ClientEventEnvelope,
+    encode_client_event,
+)
+
+
+@pytest.fixture
+def event_socket_dir():
+    # macOS Unix socket paths cannot fit pytest's default temporary directory.
+    with tempfile.TemporaryDirectory(prefix="merlin-events-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("versioned", [False, True])
+async def test_client_event_compatibility_and_cursor_reconnect(event_socket_dir, versioned):
+    path = event_socket_dir / "events.sock"
+    requests = []
+
+    async def handle(reader, writer):
+        request = json.loads(await reader.readline())
+        requests.append(request)
+        cursor = request["cursor"]
+        if cursor == 0:
+            value = {"kind": "tool", "text": "unchanged"}
+            if versioned:
+                value = encode_client_event(
+                    ClientEventEnvelope(**value, event_id="event-1", durable_sequence=47)
+                )
+            writer.write(
+                json.dumps({"type": "event", "cursor": 1, "value": value}).encode() + b"\n"
+            )
+        else:
+            writer.write(b'{"type":"end","cursor":1}\n')
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async with await asyncio.start_unix_server(handle, path):
+        events = [event async for event in LocalControlClient(socket_path=path).stream("hello")]
+    assert events == [StreamEvent("tool", "unchanged")]
+    assert [request["cursor"] for request in requests] == [0, 1]
+    assert requests[0]["request_id"] == requests[1]["request_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("structured_response", [False, True])
+async def test_client_unknown_event_version_is_typed(event_socket_dir, structured_response):
+    path = event_socket_dir / "unknown.sock"
+
+    async def handle(reader, writer):
+        await reader.readline()
+        response = {
+            "type": "event",
+            "cursor": 1,
+            "value": {"schema_version": "future", "presentation": {"kind": "tool", "text": "x"}},
+        }
+        if structured_response:
+            response = {
+                "type": "error",
+                "code": "unsupported_client_event_version",
+                "schema_version": "future",
+                "error": "unsupported version",
+            }
+        writer.write(json.dumps(response).encode() + b"\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async with await asyncio.start_unix_server(handle, path):
+        with pytest.raises(ClientEventDecodeError) as captured:
+            _ = [event async for event in LocalControlClient(socket_path=path).stream("hello")]
+    assert captured.value.code == "unsupported_client_event_version"
+    assert captured.value.schema_version == "future"
+
+
+@pytest.mark.asyncio
+async def test_event_journal_replays_after_restart_with_identity(event_socket_dir):
+    from types import SimpleNamespace
+
+    path = event_socket_dir / "replay.sock"
+    journal = path.with_suffix(".journal.json")
+    yielded = asyncio.Event()
+    release = asyncio.Event()
+
+    class InterruptedBackend(Backend):
+        kernel = SimpleNamespace(session_id="session-actual")
+
+        async def stream(self, prompt):
+            yield StreamEvent("tool", "saved")
+            yielded.set()
+            await release.wait()
+
+    async def start(backend):
+        task = asyncio.create_task(
+            serve(
+                path,
+                backend_factory=lambda **_: backend,
+                tuning=LocalControlTuning(stream_journal_batch=1),
+            )
+        )
+        for _ in range(100):
+            if path.exists():
+                return task
+            await asyncio.sleep(0.01)
+        raise AssertionError("daemon did not start")
+
+    request = {"method": "stream", "request_id": "replay", "prompt": "hello", "cursor": 0}
+    first = await start(InterruptedBackend())
+    try:
+        reader, writer = await asyncio.open_unix_connection(path)
+        writer.write(json.dumps(request).encode() + b"\n")
+        await writer.drain()
+        live = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        await asyncio.wait_for(yielded.wait(), 2)
+        checkpoint = json.loads(journal.read_text())
+        release.set()
+        assert json.loads(await asyncio.wait_for(reader.readline(), 2))["type"] == "end"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        release.set()
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+    # Restore the persisted checkpoint of an interrupted daemon, before its
+    # terminal tombstone, to exercise startup recovery of an in-flight stream.
+    persisted = checkpoint["streams"]["replay"]
+    # Add identities that a durable producer already supplied, without deriving
+    # an event ID or durable sequence from the transport cursor.
+    persisted["events"][0].update(event_id="event-7", durable_sequence=47, correlation_id="run-3")
+    journal.write_text(json.dumps(checkpoint))
+    second = await start(Backend())
+    try:
+        replay = await _request(path, request)
+        assert replay["cursor"] == live["cursor"] == 1
+        assert replay["value"] == {
+            **live["value"],
+            "event_id": "event-7",
+            "durable_sequence": 47,
+            "correlation_id": "run-3",
+        }
+        assert live["value"] == {
+            "schema_version": CLIENT_EVENT_SCHEMA_VERSION,
+            "presentation": {"kind": "tool", "text": "saved"},
+            "session_id": "session-actual",
+        }
+    finally:
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [None, CLIENT_EVENT_SCHEMA_VERSION, "future"])
+async def test_server_replays_legacy_and_versioned_journals(event_socket_dir, version):
+    path = event_socket_dir / "journal.sock"
+    value = {"kind": "tool", "text": "second"}
+    if version is not None:
+        value = {
+            "schema_version": version,
+            "presentation": value,
+            "event_id": "event-2",
+            "durable_sequence": 90,
+            "correlation_id": "correlation-1",
+        }
+    path.with_suffix(".journal.json").write_text(
+        json.dumps(
+            {
+                "streams": {
+                    "saved": {
+                        "prompt": "saved prompt",
+                        "done": True,
+                        "first_cursor": 1,
+                        "events": [{"kind": "tool", "text": "first"}, value],
+                    }
+                },
+            }
+        )
+    )
+    daemon = asyncio.create_task(serve(path, backend_factory=lambda **_: Backend()))
+    try:
+        for _ in range(100):
+            if path.exists():
+                break
+            await asyncio.sleep(0.01)
+        response = await _request(
+            path,
+            {
+                "method": "stream",
+                "request_id": "saved",
+                "prompt": "saved prompt",
+                "cursor": 1,
+            },
+        )
+        if version == "future":
+            assert response["type"] == "error"
+            assert response["code"] == "unsupported_client_event_version"
+            assert response["schema_version"] == "future"
+        else:
+            assert response["type"] == "event"
+            assert response["cursor"] == 2
+            assert response["value"]["schema_version"] == CLIENT_EVENT_SCHEMA_VERSION
+            assert response["value"]["presentation"] == {"kind": "tool", "text": "second"}
+            if version is not None:
+                assert response["value"] == value
+    finally:
+        daemon.cancel()
+        await asyncio.gather(daemon, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -344,6 +344,18 @@ kernel as reviewed tools such as preparation, execution, status, list, and cance
 
 ## Where to start when debugging
 
+Local-control stream frames retain the outer `type`, ordered `cursor`, and `value`
+fields. At the send/replay boundary, `value` uses the `wire_events.py`
+`merlin.client-event.v1` envelope with the unchanged `{kind, text}` pair under
+`presentation`. The client accepts both this envelope and legacy bare pairs, and
+still yields the public `StreamEvent`. Journals retain their existing presentation
+layout and retention rules. Available identity/correlation fields survive wrapping;
+live events also retain the kernel session ID available when they are produced.
+Transport cursors are never used as durable event IDs or durable sequences.
+Unsupported versions raise `ClientEventDecodeError` with code
+`unsupported_client_event_version` and the received `schema_version`; replay-side
+failures send these fields alongside the existing string `error` response.
+
 | Symptom | First files to inspect |
 |---|---|
 | CLI will not start or daemon will not connect | `merlin_tui/cli.py`, `local_control.py`, `bootstrap.py` |
