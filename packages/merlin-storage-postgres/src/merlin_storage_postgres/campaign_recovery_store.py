@@ -124,3 +124,33 @@ class CampaignRecoveryRepository:
             ).fetchone()
             if row is None:
                 raise ValueError("recovery claim expired or was superseded")
+
+    def reject_incompatible(self, campaign_id: str, *, claim_id: str, error: str) -> None:
+        """Quarantine one unreadable sealed campaign without blocking daemon startup."""
+        if not error.strip():
+            raise ValueError("incompatible recovery requires an error")
+        with self._lock, self.connection.transaction():
+            campaign = self.connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET lifecycle_resume_status = coalesce(lifecycle_resume_status, status),
+                       status = 'paused', lifecycle_pause_reason = 'recovery_incompatible',
+                       lifecycle_wake_at = NULL, updated_at = now()
+                   WHERE id = %s AND status IN ('prepared', 'executing', 'paused')
+                   RETURNING id""",
+                (campaign_id,),
+            ).fetchone()
+            recovery = self.connection.execute(
+                """UPDATE merlin_storage.campaign_recovery
+                   SET application_state = 'rejected', application_error = %s
+                   WHERE campaign_id = %s AND claim_id = %s AND application_state = 'claimed'
+                     AND claim_expires_at > now() RETURNING campaign_id""",
+                (error, campaign_id, claim_id),
+            ).fetchone()
+            if campaign is None or recovery is None:
+                raise ValueError("incompatible recovery claim expired or was superseded")
+            self.connection.execute(
+                """UPDATE merlin_storage.campaign_waves
+                   SET status = 'paused', updated_at = now()
+                   WHERE campaign_id = %s AND status = 'running'""",
+                (campaign_id,),
+            )

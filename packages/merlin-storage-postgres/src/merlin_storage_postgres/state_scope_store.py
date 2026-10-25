@@ -17,6 +17,8 @@ from merlin_contracts.state_scope import (
 )
 from psycopg.types.json import Jsonb
 
+_RECOVERY_POLICY_VERSION = "merlin.campaign-recovery-policy.v2"
+
 
 class _StateScopeLeaseUnavailable(RuntimeError):
     pass
@@ -1399,7 +1401,10 @@ class StateScopeRepository:
                 blocked_count = int(quota["blocked_count"] or 0)
                 indefinite_count = int(quota["indefinite_count"] or 0)
                 wake = None if quota is None else quota["wake_at"]
-                if execution_format not in readable or (
+                if campaign["lifecycle_pause_reason"] == "recovery_incompatible":
+                    decision = "pause_fixed_forward"
+                    pause_reason = "recovery_incompatible"
+                elif execution_format not in readable or (
                     execution_format == STATE_SCOPE_SCHEMA_VERSION and writable != execution_format
                 ):
                     decision = "pause_fixed_forward"
@@ -1565,6 +1570,10 @@ class StateScopeRepository:
                 )
                 recovery_action = "pause_lifecycle" if decision != "resume" else scheduler_action
                 topology = {
+                    # The derived action policy evolves independently from the durable
+                    # topology. Version it inside the state identity so a newer policy
+                    # never collides with an immutable decision recorded by older code.
+                    "recovery_policy_version": _RECOVERY_POLICY_VERSION,
                     "campaign_status": resulting_status,
                     "lifecycle_decision": decision,
                     "lifecycle_wake_at": (None if wake is None else wake.isoformat()),

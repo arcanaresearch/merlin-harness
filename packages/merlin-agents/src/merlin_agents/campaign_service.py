@@ -1841,6 +1841,10 @@ class _FrontierScheduleBlocked(Exception):
         self.candidate_id = candidate_id
 
 
+class _CampaignRecoveryIncompatible(ValueError):
+    """A sealed campaign cannot be interpreted without rewriting its history."""
+
+
 @dataclass(slots=True)
 class _TerminalFrontierSchedule:
     """Read-only terminal schedule projection used during recovery settlement."""
@@ -16971,10 +16975,24 @@ class CampaignService:
                 }:
                     recovered += await self._recover_recorded_action(decision, resume_execution)
                 elif decision.recovery_action == "pause_inconsistent":
-                    await asyncio.to_thread(self._store.pause, decision.campaign_id)
+                    if decision.status == "executing":
+                        await asyncio.to_thread(self._store.pause, decision.campaign_id)
+                    elif decision.status != "paused":
+                        raise _CampaignRecoveryIncompatible(
+                            "inconsistent recovery topology cannot be paused from "
+                            f"campaign status {decision.status!r}"
+                        )
                 await asyncio.to_thread(
                     self._recovery_repository.apply, decision.campaign_id, claim_id=claim_id
                 )
+            except _CampaignRecoveryIncompatible as error:
+                await asyncio.to_thread(
+                    self._recovery_repository.reject_incompatible,
+                    decision.campaign_id,
+                    claim_id=claim_id,
+                    error=str(error),
+                )
+                continue
             except Exception as error:
                 await asyncio.to_thread(
                     self._recovery_repository.apply,
@@ -16998,8 +17016,13 @@ class CampaignService:
             return 1
         row = await asyncio.to_thread(self._store.get, campaign_id)
         envelope = row["manifest"]
-        manifest = _manifest(envelope["manifest"])
-        context = _assignment_context(envelope["assignment_context"])
+        try:
+            manifest = _manifest(envelope["manifest"])
+            context = _assignment_context(envelope["assignment_context"])
+        except ValueError as error:
+            raise _CampaignRecoveryIncompatible(
+                f"sealed campaign is incompatible with this runtime: {error}"
+            ) from error
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         action = decision.recovery_action
         batch = await asyncio.to_thread(self._store.load_active_frontier_batch, campaign_id)
@@ -17008,7 +17031,9 @@ class CampaignService:
                 campaign_id, manifest, context, waves
             )
             if successor is None:
-                raise RuntimeError("claimed recovery could not install successor")
+                raise _CampaignRecoveryIncompatible(
+                    "claimed recovery could not install successor"
+                )
             live, wave = successor
             wave_running = True
         elif action in {
@@ -17021,24 +17046,33 @@ class CampaignService:
                 campaign_id, manifest, context, batch, waves
             )
             if live is None:
-                raise RuntimeError("claimed recovery could not restore active batch")
+                raise _CampaignRecoveryIncompatible(
+                    "claimed recovery could not restore active batch"
+                )
             wave = int(batch["wave"])
             wave_running = True
         elif action in {"finalize_and_settle_terminal_batch", "settle_terminal_batch"}:
             if not isinstance(batch, Mapping) or not batch.get("schedule_id"):
-                raise RuntimeError("recorded terminal batch is missing")
+                raise _CampaignRecoveryIncompatible("recorded terminal batch is missing")
             live = _TerminalFrontierSchedule(str(batch["schedule_id"]))
             wave = int(batch["wave"])
             wave_running = action == "finalize_and_settle_terminal_batch"
         elif action in {"resume_active", "finalize_terminal_wave"}:
             latest = waves[-1]
-            live = await self._agents.reopen(
-                str(latest["schedule_id"]), resume_execution=action == "resume_active"
-            )
+            try:
+                live = await self._agents.reopen(
+                    str(latest["schedule_id"]), resume_execution=action == "resume_active"
+                )
+            except ValueError as error:
+                raise _CampaignRecoveryIncompatible(
+                    f"sealed scheduler graph is incompatible with this runtime: {error}"
+                ) from error
             wave = int(latest["wave"])
             wave_running = True
         else:
-            raise ValueError(f"unsupported recorded recovery action: {action}")
+            raise _CampaignRecoveryIncompatible(
+                f"unsupported recorded recovery action: {action}"
+            )
         self._supervisors[campaign_id] = asyncio.create_task(
             self._supervise(
                 campaign_id,

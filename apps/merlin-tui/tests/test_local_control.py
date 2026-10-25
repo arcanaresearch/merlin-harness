@@ -1226,6 +1226,15 @@ async def test_foreground_lease_heartbeat_keeps_daemon_alive(monkeypatch) -> Non
         await asyncio.gather(task, return_exceptions=True)
 
 
+def test_foreground_lease_timeout_tolerates_bounded_runtime_stalls() -> None:
+    from merlin_tui.local_control import (
+        _FOREGROUND_HEARTBEAT_SECONDS,
+        _FOREGROUND_LEASE_TIMEOUT_SECONDS,
+    )
+
+    assert _FOREGROUND_LEASE_TIMEOUT_SECONDS >= 60 * _FOREGROUND_HEARTBEAT_SECONDS
+
+
 @pytest.mark.asyncio
 async def test_active_stream_keeps_daemon_alive_after_foreground_lease_expires(
     monkeypatch,

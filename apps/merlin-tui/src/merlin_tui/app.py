@@ -4533,13 +4533,13 @@ class MerlinApp(App[None]):
                     await self._stream_task
             else:
                 self._active_session_id = ""
-                async with asyncio.timeout(5.0):
+                async with asyncio.timeout(30.0):
                     async for _event in self.backend.stream("/new"):
                         pass
                 await self._sync_active_session()
         except Exception as exc:
             detail = (
-                "The daemon did not finish creating the session within 5 seconds."
+                "The daemon did not finish creating the session within 30 seconds."
                 if isinstance(exc, TimeoutError) and resume_id is None
                 else str(exc).strip() or type(exc).__name__
             )

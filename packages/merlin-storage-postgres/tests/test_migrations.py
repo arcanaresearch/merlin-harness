@@ -15,10 +15,11 @@ from psycopg.errors import CheckViolation
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 96))
+    assert [migration.version for migration in migrations] == list(range(1, 97))
     assert next(item for item in migrations if item.version == 93).sql
     assert next(item for item in migrations if item.version == 94).sql
     assert next(item for item in migrations if item.version == 95).sql
+    assert next(item for item in migrations if item.version == 96).sql
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -33,8 +34,8 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "campaign_lead_directives_ready_idx" in migrations[90].sql
     assert "'planned', 'retry_wait', 'rejected', 'applied'" in migrations[90].sql
     assert "CREATE TABLE merlin_storage.daemon_runs" in migrations[91].sql
-    assert migrations[-1].version == 95
-    assert "'storage_exhausted'" in migrations[-1].sql
+    assert migrations[-1].version == 96
+    assert "'storage_exhausted'" in next(item for item in migrations if item.version == 95).sql
     assert "daemon_runs_one_active_idx" in migrations[91].sql
     assert "CREATE TABLE merlin_storage.technique_history" in migrations[60].sql
     assert "'blocked_terminal'" in migrations[61].sql

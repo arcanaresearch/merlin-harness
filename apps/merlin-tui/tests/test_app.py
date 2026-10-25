@@ -6213,7 +6213,7 @@ async def test_startup_error_retains_nonempty_cause_and_recovery_hint(failure):
         await pilot.pause()
         transcript = "\n".join(line.text for line in app.query_one("#transcript").lines)
         assert (
-            "within 5 seconds" in transcript
+            "within 30 seconds" in transcript
             if isinstance(failure, TimeoutError)
             else "RuntimeError" in transcript
         )

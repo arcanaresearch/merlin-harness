@@ -139,7 +139,10 @@ _STARTER_EXIT_GRACE_SECONDS = 0.5
 _RECOVERY_WATCHDOG_SECONDS = 5.0
 _IDLE_SHUTDOWN_CONFIRM_SECONDS = 0.25
 _FOREGROUND_HEARTBEAT_SECONDS = 1.0
-_FOREGROUND_LEASE_TIMEOUT_SECONDS = 5.0
+# Provider startup and durable-store reconciliation can briefly starve the Python
+# event loop on slower workspaces.  Keep this comfortably above those bounded
+# stalls while retaining renewable heartbeats to detect an abandoned frontend.
+_FOREGROUND_LEASE_TIMEOUT_SECONDS = 60.0
 _FOREGROUND_ATTACH_GRACE_SECONDS = 10.0
 _DAEMON_HEARTBEAT_SECONDS = 5.0
 _PROCESS_LIFETIME_LOCKS: list[BinaryIO] = []
