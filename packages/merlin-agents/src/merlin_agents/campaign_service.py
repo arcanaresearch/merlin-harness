@@ -236,6 +236,7 @@ from .telemetry import emit_arm_outcome, emit_judgment
 from .transforms import PromptTransformSpec
 
 _LOGGER = logging.getLogger(__name__)
+_RECOVERY_CLAIM_LEASE_SECONDS = 120
 
 ADAPTIVE_DISCOVERY_FLOOR = 10
 
@@ -10479,6 +10480,10 @@ class CampaignService:
         try:
             await self._report_runner(campaign_id, manifest, stop_reason)
         except Exception as error:
+            retryable = not isinstance(error, (KeyError, TypeError, ValueError)) or str(error) in {
+                "saturated report requires a ready completion receipt",
+                "saturated report requires a ready completion seal",
+            }
             await asyncio.to_thread(
                 self._store.append_lead,
                 campaign_id,
@@ -10486,7 +10491,7 @@ class CampaignService:
                 {
                     "report_error": str(error),
                     "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
-                    "retryable": not isinstance(error, (KeyError, TypeError, ValueError)),
+                    "retryable": retryable,
                 },
             )
 
@@ -16910,7 +16915,9 @@ class CampaignService:
                     )
 
     async def recover(
-        self, *, resume_execution: bool = True,
+        self,
+        *,
+        resume_execution: bool = True,
         lifecycle_report: LifecycleRecoveryReport | None = None,
     ) -> int:
         async with self._ownership_condition:
@@ -16923,8 +16930,18 @@ class CampaignService:
                 if lifecycle_report is None:
                     if self._lifecycle_recovery is None:
                         raise RuntimeError("production recovery requires a fenced lifecycle report")
-                    lifecycle_report = await self._lifecycle_recovery.reconcile()
-                return await self._apply_lifecycle_report(lifecycle_report, resume_execution)
+                    live_campaign_ids = tuple(
+                        campaign_id
+                        for campaign_id, supervisor in self._supervisors.items()
+                        if not supervisor.done()
+                    )
+                    lifecycle_report = await self._lifecycle_recovery.reconcile(
+                        exclude_campaign_ids=live_campaign_ids
+                    )
+                recovered = await self._apply_lifecycle_report(
+                    lifecycle_report, resume_execution
+                )
+                return recovered + await self._recover_retryable_reports()
             return await self._recover_owned(resume_execution=resume_execution)
         finally:
             async with self._ownership_condition:
@@ -16946,6 +16963,7 @@ class CampaignService:
                 decision_digest=decision.recovery_decision_digest,
                 fence_digest=decision.recovery_fence_digest,
                 claimant_id=f"campaign-service:{id(self)}",
+                lease_seconds=_RECOVERY_CLAIM_LEASE_SECONDS,
             )
             if claim_id is None:
                 continue
@@ -16957,7 +16975,10 @@ class CampaignService:
                 while True:
                     await asyncio.sleep(10)
                     renewed = await asyncio.to_thread(
-                        self._recovery_repository.renew, campaign_id, claim_id=token
+                        self._recovery_repository.renew,
+                        campaign_id,
+                        claim_id=token,
+                        lease_seconds=_RECOVERY_CLAIM_LEASE_SECONDS,
                     )
                     if not renewed:
                         if claim_owner is not None:
@@ -17406,6 +17427,11 @@ class CampaignService:
                 )
             )
             recovered += 1
+        recovered += await self._recover_retryable_reports()
+        return recovered
+
+    async def _recover_retryable_reports(self) -> int:
+        recovered = 0
         retryable_reports = getattr(self._store, "list_report_retryable", None)
         if retryable_reports is not None and self._report_runner is not None:
             for row in await asyncio.to_thread(retryable_reports):
@@ -27001,6 +27027,13 @@ def _campaign_list_projection(row: Mapping[str, object]) -> Mapping[str, object]
     manifest = envelope.get("manifest") if isinstance(envelope, Mapping) else None
     objective = manifest.get("objective") if isinstance(manifest, Mapping) else None
     profile = manifest.get("profile") if isinstance(manifest, Mapping) else None
+    created_at = _timestamp(row.get("created_at"))
+    updated_at = _timestamp(row.get("updated_at"))
+    elapsed_seconds = (
+        max(0.0, (updated_at - created_at).total_seconds())
+        if created_at is not None and updated_at is not None
+        else None
+    )
     return {
         "campaign_id": str(row["id"]),
         "session_id": str(row.get("session_id") or "unknown"),
@@ -27009,4 +27042,5 @@ def _campaign_list_projection(row: Mapping[str, object]) -> Mapping[str, object]
         "manifest_digest": str(row["manifest_digest"]),
         "objective": str(objective or "Legacy campaign metadata unavailable"),
         "profile": str(profile or "unknown"),
+        "elapsed_seconds": elapsed_seconds,
     }

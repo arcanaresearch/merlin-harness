@@ -1898,6 +1898,10 @@ class CampaignStore:
                      WHERE journal.campaign_id = campaign.id
                        AND journal.payload ? 'report_error'
                        AND journal.payload @> '{"retryable": false}'::jsonb
+                       AND journal.payload->>'report_error' NOT IN (
+                           'saturated report requires a ready completion receipt',
+                           'saturated report requires a ready completion seal'
+                       )
                  )
                ORDER BY campaign.updated_at, campaign.id"""
         ).fetchall()

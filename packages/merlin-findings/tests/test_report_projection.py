@@ -1104,6 +1104,33 @@ def _completion_seal(campaign_id: str, *, stop_reason: str = "capped"):
     return receipt, receipt_digest
 
 
+def test_incomplete_frontier_report_preserves_nonready_completion_receipt() -> None:
+    receipt, receipt_digest = _completion_seal(
+        "campaign-incomplete-frontier", stop_reason="frontier_exhausted"
+    )
+    service = DurableReportService(Repository())
+
+    report = service.create(
+        "campaign-incomplete-frontier",
+        stop_reason="frontier_exhausted",
+        cleanup_status="completed",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={},
+        metadata={"manifest_digest": "sha256:" + "a" * 64, "profile": "recommended"},
+        unsearched_frontier=({"candidate_id": "candidate/still-runnable"},),
+        report_state="incomplete",
+        limitations=("A runnable frontier remained when finalization ended.",),
+        completion_document=receipt,
+        completion_digest=receipt_digest,
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    assert report.report_state == "incomplete"
+    assert report.unsearched_frontier == ({"candidate_id": "candidate/still-runnable"},)
+
+
 class FrontierSnapshotProvider:
     def __init__(self, campaign_id: str, snapshot_id: str, rows) -> None:
         self.campaign_id = campaign_id

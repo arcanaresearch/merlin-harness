@@ -1268,6 +1268,7 @@ class StateScopeRepository:
         readable_formats: Sequence[str],
         writable_format: str,
         lease_seconds: int,
+        exclude_campaign_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Atomically reconcile global registries and classify campaign recovery."""
 
@@ -1276,6 +1277,9 @@ class StateScopeRepository:
             dict.fromkeys(_required(item, "readable format") for item in readable_formats)
         )
         writable = _required(writable_format, "writable format")
+        excluded = frozenset(
+            _required(campaign_id, "excluded campaign id") for campaign_id in exclude_campaign_ids
+        )
         if lease_seconds < 1 or not readable:
             raise ValueError("lifecycle reconciliation requires formats and a positive lease")
         with self._lock, self.connection.transaction():
@@ -1342,6 +1346,8 @@ class StateScopeRepository:
             results: list[dict[str, Any]] = []
             for campaign in campaigns:
                 campaign_id = str(campaign["id"])
+                if campaign_id in excluded:
+                    continue
                 recovered_acknowledged = self._settle_orphaned_acknowledged_scopes_locked(
                     campaign_id
                 )

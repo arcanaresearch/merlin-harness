@@ -7607,6 +7607,8 @@ def _render_scan_summary(campaign: CampaignView, report: ReportView | None) -> T
         # opened report screen even though the export is already available.
         rendered.append("Campaign report ready\n", style="bold green")
     rendered.append(f"Campaign: {campaign.id}\n", style="dim")
+    if campaign.elapsed_seconds is not None:
+        rendered.append(f"Scanned: {_review_duration(campaign.elapsed_seconds)}\n", style="dim")
     if report is None:
         state = _campaign_display_status(campaign.status)
         rendered.append(

@@ -186,6 +186,7 @@ class CampaignView:
     target_progress: Mapping[str, object] | None = None
     review_progress: Mapping[str, object] | None = None
     saturation_decision: Mapping[str, object] | None = None
+    elapsed_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

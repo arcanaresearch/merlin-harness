@@ -8250,13 +8250,9 @@ def build_backend(
             ):
                 raise ValueError("campaign completion receipt conflicts with durable campaign")
             completion_saturation = completion_document.get("saturation")
-            if stop_reason == CampaignTerminalReason.FRONTIER_EXHAUSTED.value and (
-                not isinstance(completion_saturation, Mapping)
-                or completion_saturation.get("ready") is not True
-            ):
-                raise ValueError("saturated report requires a ready completion receipt")
             completion_incomplete = (
                 not isinstance(completion_saturation, Mapping)
+                or completion_saturation.get("ready") is not True
                 or bool(completion_saturation.get("cleanup_unresolved"))
                 or int(completion_saturation.get("awaiting_validation", 1) or 0) != 0
             )

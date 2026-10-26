@@ -145,6 +145,10 @@ from merlin_agents.discovery import ArmIdentity, ArmObservation
 from merlin_agents.durable_service import ScheduleArtifactTooLarge
 from merlin_agents.jev import JevClient
 from merlin_agents.judgments import RefusalJudgment, RefusalVerdict
+from merlin_agents.lifecycle_recovery import (
+    LIFECYCLE_RECOVERY_SCHEMA,
+    lifecycle_recovery_report,
+)
 from merlin_agents.specialists import DynamicSpecialistPolicy, LanguageFrontierSpec
 from merlin_agents.technique_history import entries_for_completion, technique_cell_parts
 from merlin_agents.transforms import materialize_transform_envelope
@@ -3142,6 +3146,25 @@ def test_campaign_list_projection_labels_legacy_metadata_instead_of_crashing() -
     assert projected["profile"] == "unknown"
 
 
+def test_campaign_list_projection_includes_stable_elapsed_duration() -> None:
+    projected = _campaign_list_projection(
+        {
+            "id": "campaign/completed",
+            "session_id": "session-1",
+            "status": "completed",
+            "stop_reason": "frontier_exhausted",
+            "manifest_digest": "sha256:abc",
+            "manifest": {
+                "manifest": {"objective": "Assess", "profile": "exploration"}
+            },
+            "created_at": datetime(2026, 10, 25, 10, 0, tzinfo=UTC),
+            "updated_at": datetime(2026, 10, 25, 22, 24, tzinfo=UTC),
+        }
+    )
+
+    assert projected["elapsed_seconds"] == 44_640
+
+
 async def test_recovery_retries_terminal_report_without_reopening_workers() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
 
@@ -3175,6 +3198,66 @@ async def test_recovery_retries_terminal_report_without_reopening_workers() -> N
 
     service = CampaignService(  # type: ignore[arg-type]
         Store(), object(), preparation, report_runner=report
+    )
+
+    assert await service.recover() == 1
+    assert reports == [
+        (
+            prepared.manifest.id,
+            prepared.manifest.id,
+            "infrastructure_blocked_after_retry_policy",
+        )
+    ]
+
+
+async def test_production_recovery_retries_terminal_report_after_lifecycle_reconciliation() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+    class Store:
+        def list_report_retryable(self):
+            return [
+                {
+                    "id": prepared.manifest.id,
+                    "manifest": {
+                        "manifest": asdict(prepared.manifest),
+                        "assignment_context": asdict(prepared.assignment_context),
+                    },
+                    "stop_reason": "failed",
+                }
+            ]
+
+        def list_waves(self, campaign_id):
+            assert campaign_id == prepared.manifest.id
+            return [{"wave": 2}]
+
+        def append_lead(self, *_args):
+            raise AssertionError("successful retry must not journal another failure")
+
+    class LifecycleRecovery:
+        async def reconcile(self, *, exclude_campaign_ids=()):
+            assert exclude_campaign_ids == ()
+            return lifecycle_recovery_report(
+                {
+                    "schema": LIFECYCLE_RECOVERY_SCHEMA,
+                    "reconciled_at": datetime.now(UTC),
+                    "expired_global_leases": 0,
+                    "due_quota_wakes": 0,
+                    "campaigns": [],
+                }
+            )
+
+    reports = []
+
+    async def report(campaign_id, manifest, stop_reason):
+        reports.append((campaign_id, manifest.id, stop_reason))
+
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(),
+        object(),
+        preparation,
+        lifecycle_recovery=LifecycleRecovery(),
+        recovery_repository=object(),
+        report_runner=report,
     )
 
     assert await service.recover() == 1
@@ -3275,6 +3358,30 @@ async def test_report_invariant_failure_is_not_retried_forever() -> None:
 
     assert journal[0][:2] == (prepared.manifest.id, 2)
     assert journal[0][2]["retryable"] is False
+    assert journal[0][2]["error_type"] == "builtins.ValueError"
+
+
+async def test_nonready_completion_report_failure_remains_retryable() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    journal = []
+
+    class Store:
+        def append_lead(self, *args):
+            journal.append(args)
+
+    async def report(*_args):
+        raise ValueError("saturated report requires a ready completion receipt")
+
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(), object(), preparation, report_runner=report
+    )
+
+    await service._generate_report(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, 2, "frontier_exhausted"
+    )
+
+    assert journal[0][:2] == (prepared.manifest.id, 2)
+    assert journal[0][2]["retryable"] is True
     assert journal[0][2]["error_type"] == "builtins.ValueError"
 
 
@@ -3487,6 +3594,93 @@ async def test_recovery_replaces_finished_supervisor_for_executing_campaign() ->
     assert await service.recover() == 1
     await service.wait(prepared.manifest.id)
     assert events == [("reopen", "schedule-1"), ("supervise", 1, False)]
+
+
+async def test_recovery_excludes_campaign_with_live_supervisor_from_lifecycle_reconciliation() -> (
+    None
+):
+    exclusions = []
+
+    class LifecycleRecovery:
+        async def reconcile(self, *, exclude_campaign_ids=()):
+            exclusions.append(tuple(exclude_campaign_ids))
+            return lifecycle_recovery_report(
+                {
+                    "schema": LIFECYCLE_RECOVERY_SCHEMA,
+                    "reconciled_at": datetime.now(UTC),
+                    "expired_global_leases": 0,
+                    "due_quota_wakes": 0,
+                    "campaigns": [],
+                }
+            )
+
+    class RecoveryRepository:
+        pass
+
+    service = CampaignService(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        preparation,
+        lifecycle_recovery=LifecycleRecovery(),  # type: ignore[arg-type]
+        recovery_repository=RecoveryRepository(),
+    )
+    supervisor = asyncio.create_task(asyncio.sleep(60))
+    service._supervisors["campaign/live"] = supervisor  # noqa: SLF001
+    try:
+        assert await service.recover() == 0
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+    assert exclusions == [("campaign/live",)]
+
+
+async def test_recovery_claim_covers_long_terminal_report_generation() -> None:
+    claim_leases = []
+    applied = []
+
+    class RecoveryRepository:
+        def claim(self, campaign_id, **kwargs):
+            claim_leases.append(kwargs["lease_seconds"])
+            return "claim-1"
+
+        def apply(self, campaign_id, *, claim_id, error=None):
+            applied.append((campaign_id, claim_id, error))
+
+    report = lifecycle_recovery_report(
+        {
+            "schema": LIFECYCLE_RECOVERY_SCHEMA,
+            "reconciled_at": datetime.now(UTC),
+            "expired_global_leases": 0,
+            "due_quota_wakes": 0,
+            "campaigns": [
+                {
+                    "campaign_id": "campaign/terminal-report",
+                    "execution_format": "merlin.state-scope.v2",
+                    "status": "paused",
+                    "decision": "pause_fixed_forward",
+                    "wake_at": None,
+                    "open_state_scopes": 0,
+                    "acknowledged_state_scopes": 0,
+                    "cleanup_obligations": 0,
+                    "quota_indefinite": False,
+                    "recovery_action": "pause_lifecycle",
+                    "scheduler_action": "paused",
+                    "recovery_state_digest": "sha256:" + "1" * 64,
+                    "recovery_decision_digest": "sha256:" + "2" * 64,
+                    "target_call_count": 0,
+                    "recovery_fence_digest": "sha256:" + "3" * 64,
+                }
+            ],
+        }
+    )
+    service = CampaignService(  # type: ignore[arg-type]
+        object(), object(), preparation, recovery_repository=RecoveryRepository()
+    )
+
+    assert await service._apply_lifecycle_report(report, True) == 0  # noqa: SLF001
+    assert claim_leases == [120]
+    assert applied == [("campaign/terminal-report", "claim-1", None)]
 
 
 async def test_recovery_starts_next_frontier_batch_after_settlement_crash_window() -> None:

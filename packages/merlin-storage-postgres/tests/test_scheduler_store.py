@@ -1751,6 +1751,43 @@ def test_pg0_nonretryable_terminal_report_error_is_not_rediscovered(tmp_path: Pa
             assert campaigns.list_report_retryable() == []
 
 
+def test_pg0_nonready_completion_report_error_is_rediscovered(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("nonready completion report")
+            scheduler = DurableSchedulerStore(connection)
+            schedule_id = scheduler.create_schedule(
+                session.id, {"nodes": ["worker"]}, {}, ["worker"], ready_nodes=["worker"]
+            )
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                "campaign/nonready-report",
+                str(session.id),
+                {
+                    "manifest": {"objective": "nonready report"},
+                    "assignment_context": {},
+                },
+                "sha256:reviewed",
+            )
+            campaigns.begin_execution(
+                "campaign/nonready-report", "sha256:reviewed", schedule_id
+            )
+            campaigns.finish("campaign/nonready-report", "completed")
+            campaigns.append_lead(
+                "campaign/nonready-report",
+                0,
+                {
+                    "report_error": "saturated report requires a ready completion receipt",
+                    "retryable": False,
+                },
+            )
+
+            assert [row["id"] for row in campaigns.list_report_retryable()] == [
+                "campaign/nonready-report"
+            ]
+
+
 def test_pg0_terminal_campaign_with_running_schedule_is_reconciled(tmp_path: Path) -> None:
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
         with database.connect() as connection:

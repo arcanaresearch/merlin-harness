@@ -5613,6 +5613,23 @@ def test_failed_scan_without_report_is_terminal_and_actionable() -> None:
     assert "/campaign status" in rendered
 
 
+def test_terminal_scan_summary_shows_scanned_duration() -> None:
+    campaign = CampaignView(
+        "campaign/completed",
+        "session-demo",
+        "Target assessment",
+        "exploration",
+        "completed",
+        "digest",
+        stop_reason="frontier_exhausted",
+        elapsed_seconds=44_640,
+    )
+
+    rendered = app_module._render_scan_summary(campaign, None).plain
+
+    assert "Scanned: 12h 24m" in rendered
+
+
 @pytest.mark.asyncio
 async def test_partial_scan_recovery_preserves_report_and_resumes_same_campaign() -> None:
     class RecoverableBackend(DemoBackend):

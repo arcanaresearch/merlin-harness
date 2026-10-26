@@ -507,7 +507,7 @@ class DurableReportService:
             saturation = sealed_document.get("saturation")
             if require_frontier_ready and (
                 not isinstance(saturation, Mapping) or saturation.get("ready") is not True
-            ):
+            ) and state != "incomplete":
                 raise ValueError("saturated report requires a ready completion seal")
             cleanup = sealed_document.get("cleanup")
             if not isinstance(cleanup, Mapping):

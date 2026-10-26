@@ -42,6 +42,7 @@ class DurableLifecycleStore(Protocol):
         readable_formats: Sequence[str],
         writable_format: str,
         lease_seconds: int,
+        exclude_campaign_ids: Sequence[str] = (),
     ) -> Mapping[str, object]: ...
 
 
@@ -120,13 +121,16 @@ class DurableLifecycleRecovery:
         self._writable_format = writable
         self._lease_seconds = lease_seconds
 
-    async def reconcile(self) -> LifecycleRecoveryReport:
+    async def reconcile(
+        self, *, exclude_campaign_ids: Sequence[str] = ()
+    ) -> LifecycleRecoveryReport:
         value = await asyncio.to_thread(
             self._store.reconcile_durable_lifecycle,
             claimant_id=self._claimant_id,
             readable_formats=self._readable_formats,
             writable_format=self._writable_format,
             lease_seconds=self._lease_seconds,
+            exclude_campaign_ids=tuple(exclude_campaign_ids),
         )
         return lifecycle_recovery_report(value)
 

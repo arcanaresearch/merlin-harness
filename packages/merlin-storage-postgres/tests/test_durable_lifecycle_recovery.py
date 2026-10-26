@@ -263,6 +263,54 @@ def test_restart_settles_acknowledged_effect_once_after_lease_takeover(
             assert replayed_row["settled_acknowledged_state_scopes"] == 0
 
 
+def test_recovery_excludes_campaign_owned_by_live_supervisor(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-excluded-live")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            campaigns, campaign_id = _prepare_campaign(connection, "excluded-live")
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'executing' WHERE id = %s""",
+                (campaign_id,),
+            )
+            repository = StateScopeRepository(connection)
+            envelope = _scope(campaign_id, "excluded-live")
+            repository.create_state_scope(campaign_id, "target.example", envelope)
+            claim_id = repository.claim_state_scope_lease(
+                envelope.scope_id,
+                target_authority="target.example",
+                principal_key="anonymous",
+                equivalence_key="game-run/excluded-live",
+                claimant_id="daemon/live",
+                lease_seconds=30,
+            )
+            assert claim_id is not None
+            repository.acknowledge_state_scope(
+                envelope.scope_id,
+                claim_id=claim_id,
+                claimant_id="daemon/live",
+            )
+
+            report = repository.reconcile_durable_lifecycle(
+                claimant_id="daemon/watchdog",
+                readable_formats=(
+                    LEGACY_ATTEMPT_SCHEMA_VERSION,
+                    STATE_SCOPE_SCHEMA_VERSION,
+                ),
+                writable_format=STATE_SCOPE_SCHEMA_VERSION,
+                lease_seconds=30,
+                exclude_campaign_ids=(campaign_id,),
+            )
+
+            assert report["campaigns"] == []
+            campaign = campaigns.get(campaign_id)
+            assert campaign is not None
+            assert campaign["status"] == "executing"
+            scope = repository.load_state_scope(envelope.scope_id)
+            assert scope is not None
+            assert scope["status"] == "effect_acknowledged"
+
+
 def test_resource_replay_after_acknowledgement_never_readmits_target_action(
     tmp_path: Path,
 ) -> None:

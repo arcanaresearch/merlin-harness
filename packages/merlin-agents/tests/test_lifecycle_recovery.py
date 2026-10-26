@@ -178,7 +178,7 @@ async def test_lifecycle_recovery_fences_global_state_before_campaign_resume() -
             }
 
     recovery = DurableLifecycleRecovery(Store(), claimant_id="daemon/a", lease_seconds=45)
-    report = await recovery.reconcile()
+    report = await recovery.reconcile(exclude_campaign_ids=("campaign/live",))
 
     assert calls == [
         {
@@ -189,6 +189,7 @@ async def test_lifecycle_recovery_fences_global_state_before_campaign_resume() -
             ),
             "writable_format": STATE_SCOPE_SCHEMA_VERSION,
             "lease_seconds": 45,
+            "exclude_campaign_ids": ("campaign/live",),
         }
     ]
     assert report.resumable_campaign_ids == ("campaign/resumable",)
