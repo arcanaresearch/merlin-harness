@@ -141,7 +141,7 @@ def test_target_progress_is_preserved_across_report_exports() -> None:
 
     html = service.export(report.revision_id, "html", "customer")
     assert 'id="target-progress"' in html
-    assert "Security findings and target progress are separate measurements" in html
+    assert "These observations are separate from security findings" in html
     assert "call-secret" not in html
     assert "sha256:secret" not in html
 
@@ -317,13 +317,43 @@ def test_report_separates_current_history_and_unresolved_coverage() -> None:
     html_report = service.export(report.revision_id, "html")
     markdown_report = service.export(report.revision_id, "markdown")
 
-    assert "Coverage provenance" in html_report
+    assert "Where the results came from" in html_report
     assert "<strong>2</strong><span>Candidate variations executed now</span>" in html_report
     assert "<strong>1</strong><span>Candidate variations reused from history</span>" in html_report
     assert "<strong>2</strong><span>Candidate variations unresolved</span>" in html_report
     assert "Candidate variations executed in this campaign: 2" in markdown_report
     assert "Candidate variations reused from conclusive history: 1" in markdown_report
     assert "Candidate variations unresolved: 2" in markdown_report
+
+
+def test_html_report_starts_with_a_plain_language_decision_summary() -> None:
+    service = DurableReportService(Repository())
+    report = service.create(
+        "campaign-plain-summary",
+        stop_reason="capped",
+        cleanup_status="complete",
+        findings=(),
+        tasks=(),
+        evidence=(),
+        usage={"total_tokens": 1234},
+        techniques=(
+            {"id": "resisted", "outcome": "negative"},
+            {"id": "unclear", "outcome": "unclear"},
+        ),
+        unsearched_frontier=({"id": "follow-up", "reason": "Required follow-up did not finish."},),
+        created_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    rendered = service.export(report.revision_id, "html")
+
+    assert "No confirmed vulnerability; assessment incomplete" in rendered
+    assert "Complete the unresolved work before you treat the target as safe." in rendered
+    assert "What do these results mean?" in rendered
+    assert "The target rejected the tested attack." in rendered
+    assert "<strong>1</strong><span>Attacks resisted</span>" in rendered
+    assert "Model tokens</dt><dd>1,234" in rendered
+    header = rendered.split("</header>", 1)[0]
+    assert "1,234</strong><span>Model tokens" not in header
 
 
 def test_report_renders_partial_as_its_own_coverage_category() -> None:
@@ -378,9 +408,9 @@ def test_revision_projection_citations_comparison_and_same_projection_exports() 
     assert "operator_stopped" in markdown and "operator_stopped" in encoded
     html_report = service.export(second.revision_id, "html")
     assert "Adaptive controllers" in markdown
-    assert "Techniques and execution methods" in html_report
+    assert "Test-by-test results" in html_report
     assert "Direct comparison" in html_report
-    assert "Language coverage" in html_report
+    assert "Languages tested" in html_report
     assert "Recorded estimated model cost" in html_report
     assert "4 proposed; 2 selected; 2 executed." not in html_report
     assert "4 proposed; 2 selected; 2 executed." in encoded
@@ -783,8 +813,8 @@ def test_incomplete_report_distinguishes_technique_completion_from_required_foll
 
     rendered = service.export(report.revision_id, "html")
 
-    assert "All selected campaign tests ran" in rendered
-    assert "required target-derived exploration was not completed" in rendered
+    assert "The selected tests ran" in rendered
+    assert "required follow-up work did not finish" in rendered
     assert "Required target-derived exploration was not scheduled." in rendered
     assert "completed 5 of 5 required technique evaluations" not in rendered
 
@@ -813,7 +843,8 @@ def test_completed_with_limitations_does_not_claim_testing_was_unfinished() -> N
     assert report.report_state == "provisional"
     rendered = service.export(report.revision_id, "html")
     assert "Merlin scan completed · limitations present" in rendered
-    assert "campaign reached a terminal state and cleanup finished" in rendered
+    assert "Assessment completed with limitations" in rendered
+    assert "Some results remain inconclusive or unresolved" in rendered
     assert "required testing unfinished" not in rendered
     assert "This does not mean the target passed when required work remains" not in rendered
     assert "scan ended before all required tests" not in rendered.casefold()
@@ -844,8 +875,8 @@ def test_incomplete_completed_with_limitations_report_has_one_honest_status() ->
 
     rendered = service.export(report.revision_id, "html")
 
-    assert "Scan ended with unresolved results" in rendered
-    assert "Scan completed with limitations" not in rendered
+    assert "Assessment incomplete" in rendered
+    assert "Assessment completed with limitations" not in rendered
     assert "Merlin scan ended · some results remain unresolved" in rendered
     assert "Merlin scan completed · some results remain unresolved" not in rendered
     assert "2 selected techniques remain unresolved" in rendered
@@ -1015,7 +1046,7 @@ def test_retained_representative_reports_match_current_renderer(tmp_path: Path) 
         assert (tmp_path / name).read_bytes() == (retained / name).read_bytes()
     rendered = (tmp_path / "representative-report.html").read_text()
     assert "6</strong><span>Candidate variations executed now" in rendered
-    assert "2</strong><span>Validated findings" in rendered
+    assert "2</strong><span>Confirmed findings" in rendered
     assert "Security assessment · Customer report" in rendered
     assert 'href="#observability"' not in rendered
     assert rendered.count('<li class="exchange">') == 5
@@ -1042,7 +1073,7 @@ def test_retained_representative_reports_match_current_renderer(tmp_path: Path) 
     }
 
     no_findings = (tmp_path / "representative-no-findings-report.html").read_text()
-    assert "0</strong><span>Validated findings" in no_findings
+    assert "0</strong><span>Confirmed findings" in no_findings
     assert "5 / 8</strong><small>clear results" in no_findings
     assert 'href="#remediation"' not in no_findings
     assert "Travel completed" in no_findings
@@ -1050,15 +1081,15 @@ def test_retained_representative_reports_match_current_renderer(tmp_path: Path) 
     assert "Policy boundary" in no_findings
     assert "Required objectives" in no_findings
     for label in (
-        "Executive summary",
-        "Target progress",
+        "Summary",
+        "Target observations",
         "Findings",
-        "Coverage",
-        "Coverage provenance",
-        "Language coverage",
-        "Techniques & methods",
-        "Conversation",
-        "Details",
+        "What Merlin tested",
+        "Result sources",
+        "Languages tested",
+        "Test results",
+        "Evidence transcript",
+        "Technical details",
     ):
         assert label in rendered and label in no_findings
 
@@ -1629,7 +1660,7 @@ def test_html_report_desktop_mobile_print_and_accessible_navigation(tmp_path: Pa
         incomplete_html = service.export(incomplete.revision_id, "html")
         assert "https://plunder.me" not in incomplete_html
         assert "low confidence" not in incomplete_html
-        assert "Scan ended with unresolved results" in incomplete_html
+        assert "Assessment incomplete" in incomplete_html
         browser.close()
 
 
@@ -2263,8 +2294,8 @@ def test_human_html_explains_terminal_coverage_and_camel_case_test_prompts() -> 
 
     rendered = service.export(report.revision_id, "html")
 
-    assert "Scan ended with unresolved results" in rendered
-    assert "Scan completed with limitations" not in rendered
+    assert "Assessment incomplete" in rendered
+    assert "Assessment completed with limitations" not in rendered
     assert "2</strong><span>Techniques executed" in rendered
     assert "1 / 3</strong><small>clear results" in rendered
     assert "Test the refund rule." in rendered
@@ -2456,7 +2487,7 @@ def test_html_verdict_counts_only_validated_findings_and_distrusts_text_marker()
     rendered = service.export(report.revision_id, "html")
 
     assert "1 validated security finding" in rendered
-    assert "1</strong><span>Validated findings" in rendered
+    assert "1</strong><span>Confirmed findings" in rendered
     assert "2 validated security findings" not in rendered
     assert "Validation: Claimed — not independently reproduced" in rendered
     assert "Recommendation status: Recommended" in rendered
@@ -3354,7 +3385,7 @@ def test_unresolved_objective_authority_makes_inferred_report_incomplete() -> No
     )
 
     assert report.report_state == "incomplete"
-    assert "Scan ended with unresolved results" in service.export(report.revision_id, "html")
+    assert "Assessment incomplete" in service.export(report.revision_id, "html")
 
 
 def test_report_renders_objective_progress_and_campaign_result() -> None:

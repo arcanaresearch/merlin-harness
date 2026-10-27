@@ -2742,7 +2742,7 @@ def _human_technique_name(row: Mapping[str, Any]) -> str:
 def _canonical_outcome_label(row: Mapping[str, Any]) -> str:
     return {
         "confirmed": "Confirmed finding",
-        "negative": "Clear negative",
+        "negative": "Attack resisted",
         "partial": "Partial progress",
         "inconclusive": "Inconclusive",
         "retryable_infrastructure": "Retryable infrastructure failure",
@@ -3367,15 +3367,10 @@ def _html_report(
         verdict = f"{len(validated_findings)} validated security finding{'s' if len(validated_findings) != 1 else ''} require attention."
         verdict_class = "danger"
     elif objective_incomplete:
-        verdict_label = "Scan ended with unresolved results"
+        verdict_label = "Assessment incomplete"
         verdict = (
-            f"Merlin executed {executed} of {planned} selected techniques against the target: "
-            f"{clear} produced a clear result, {partial} made partial progress, and "
-            f"{inconclusive} were inconclusive. "
-            f"{retryable} hit retryable infrastructure failures, {unreachable} were proven "
-            f"physically unreachable, and {unresolved} remain unresolved. "
-            "No validated finding was established, "
-            "but this does not prove the target is safe."
+            "Some required objectives or tests do not have a clear result. No confirmed "
+            "vulnerability was found, but this does not prove that the target is safe."
         )
         verdict_class = "warning"
     elif not unfinished and clear == planned:
@@ -3386,41 +3381,68 @@ def _html_report(
         value.terminal_reason is CampaignTerminalReason.FRONTIER_EXHAUSTED
         and value.report_state == "provisional"
     ):
-        verdict_label = "Scan completed with limitations"
+        verdict_label = "Assessment completed with limitations"
         verdict = (
-            f"The campaign reached a terminal state and cleanup finished. Merlin addressed "
-            f"{executed} of {planned} selected techniques with a real target result: {clear} "
-            f"were clear, {partial} made partial progress, and {inconclusive} were "
-            f"inconclusive. {retryable} hit retryable "
-            f"infrastructure failures, {unreachable} were proven physically unreachable, "
-            f"and {unresolved} remain unresolved. No validated finding was established, but these "
-            "unresolved "
-            "results do not prove the target is safe."
+            "No confirmed vulnerability was found. Some results remain inconclusive or "
+            "unresolved, so this report does not prove that the target is safe."
         )
         verdict_class = "warning"
     elif executed == planned and value.unsearched_frontier and not retryable:
-        verdict_label = "Technique testing completed; exploration remains"
+        verdict_label = "Assessment incomplete"
         verdict = (
-            "All selected campaign tests ran, but required target-derived exploration was "
-            "not completed. Treat the report as provisional."
+            "The selected tests ran, but required follow-up work did not finish. No complete "
+            "security conclusion is available."
         )
         verdict_class = "warning"
     elif value.report_state == "incomplete":
-        verdict_label = "Scan ended with unresolved results"
+        verdict_label = "Assessment incomplete"
         verdict = (
-            f"Merlin executed {executed} of {planned} selected techniques against the target: "
-            f"{clear} produced a clear result, {partial} made partial progress, and "
-            f"{inconclusive} were inconclusive. "
-            f"{retryable} hit retryable infrastructure failures, {unreachable} were proven "
-            f"physically unreachable, and {unresolved} remain unresolved. "
-            "No validated finding was established, "
-            "but this does not prove the target is safe."
+            "Some tests do not have a clear result. No confirmed vulnerability was found, "
+            "but this does not prove that the target is safe."
         )
         verdict_class = "warning"
     else:
         verdict_label = "Unable to draw a complete security conclusion"
         verdict = "The scan ended before all required tests finished. Review the coverage and limitations before relying on this assessment."
         verdict_class = "warning"
+
+    if validated_findings:
+        plain_result = (
+            f"{len(validated_findings)} confirmed security issue"
+            f"{'s' if len(validated_findings) != 1 else ''}"
+        )
+        plain_meaning = "At least one tested path produced a validated security issue."
+        plain_next_step = "Review the findings, fix the affected behavior, and run the tests again."
+    elif value.report_state == "complete" and not unfinished and not value.unsearched_frontier:
+        plain_result = "No confirmed vulnerability"
+        plain_meaning = (
+            "All selected tests produced a clear result. This does not guarantee that the "
+            "target is safe."
+        )
+        plain_next_step = "Keep this report as a baseline and test again after important changes."
+    else:
+        plain_result = "No confirmed vulnerability; assessment incomplete"
+        plain_meaning = "Some tests or required follow-up work do not have a clear result."
+        plain_next_step = "Complete the unresolved work before you treat the target as safe."
+
+    decision_summary = (
+        '<section class="decision-summary" aria-label="Assessment in plain language">'
+        "<div><span>Result</span><strong>"
+        + html.escape(plain_result)
+        + "</strong></div><div><span>What this means</span><strong>"
+        + html.escape(plain_meaning)
+        + "</strong></div><div><span>What to do next</span><strong>"
+        + html.escape(plain_next_step)
+        + "</strong></div></section>"
+    )
+    result_terms = (
+        '<details class="result-terms"><summary>What do these results mean?</summary>'
+        "<dl><dt>Confirmed finding</dt><dd>Merlin validated a security issue with evidence.</dd>"
+        "<dt>Clear result</dt><dd>Merlin confirmed an issue or the target resisted the attack.</dd>"
+        "<dt>Resisted attack</dt><dd>The target rejected the tested attack.</dd>"
+        "<dt>Inconclusive</dt><dd>Merlin ran the test but did not collect enough evidence for a clear answer.</dd>"
+        "<dt>Unresolved</dt><dd>The test or required follow-up work did not finish.</dd></dl></details>"
+    )
 
     findings = "".join(_human_finding_html(row) for row in value.findings) or (
         '<p class="empty">No validated security finding was established. '
@@ -3529,9 +3551,9 @@ def _html_report(
                 + "</span></div>"
             )
         target_progress_html = (
-            '<section id="target-progress"><h2>Target progress</h2>'
-            '<p class="scope-note">Authoritative state observed from the target during this campaign. '
-            "Security findings and target progress are separate measurements.</p>"
+            '<section id="target-progress"><h2>Target observations</h2>'
+            '<p class="scope-note">State that Merlin observed directly from the target. '
+            "These observations are separate from security findings.</p>"
             f'<h3>Current state</h3><div class="metrics">{progress_cards}</div>{transition_note}'
             f"{exchange_note}{objective_list}{outcome_html}</section>"
         )
@@ -3762,18 +3784,26 @@ def _html_report(
         else "Not recorded"
     )
     summary_metrics = [
-        (len(validated_findings), "Validated findings"),
-        (len(technique_records), "Unique attack techniques selected"),
-        (len(candidate_records), "Technique variations selected"),
-        (specialist_count, "Worker executions"),
-        (f"{clear} / {planned}", "Techniques with a clear result"),
-        (usage_text, "Model tokens"),
+        (len(validated_findings), "Confirmed findings"),
+        (coverage.get("negative", 0), "Attacks resisted"),
+        (inconclusive, "Inconclusive tests"),
+        (len(value.unsearched_frontier), "Required follow-ups"),
     ]
-    if usd_cost is not None or undenominated_cost is not None:
-        summary_metrics.append((cost_text, "Recorded estimated model cost"))
     summary_cards = "".join(
         f'<div class="metric"><strong>{html.escape(str(metric))}</strong><span>{html.escape(label)}</span></div>'
         for metric, label in summary_metrics
+    )
+    technical_summary_metrics = [
+        (len(technique_records), "Unique attack techniques selected"),
+        (len(candidate_records), "Technique variations selected"),
+        (specialist_count, "Worker executions"),
+        (usage_text, "Model tokens"),
+    ]
+    if usd_cost is not None or undenominated_cost is not None:
+        technical_summary_metrics.append((cost_text, "Recorded estimated model cost"))
+    technical_summary_cards = "".join(
+        f'<div class="metric"><strong>{html.escape(str(metric))}</strong><span>{html.escape(label)}</span></div>'
+        for metric, label in technical_summary_metrics
     )
     specialist_states: dict[str, str] = {}
     for item in value.metadata.get("dynamic_specialists", ()):
@@ -3938,26 +3968,26 @@ def _html_report(
         else ""
     )
     nav_items = (
-        ("summary", "Executive summary"),
-        *((("target-progress", "Target progress"),) if target_progress_html else ()),
+        ("summary", "Summary"),
+        *((("target-progress", "Target observations"),) if target_progress_html else ()),
         ("findings", "Findings"),
         *((("remediation", "Actions"),) if value.findings else ()),
-        ("coverage", "Coverage"),
-        ("coverage-provenance", "Coverage provenance"),
-        *((("language", "Language coverage"),) if language_rows else ()),
-        ("techniques", "Techniques & methods"),
+        ("coverage", "What Merlin tested"),
+        ("coverage-provenance", "Result sources"),
+        *((("language", "Languages tested"),) if language_rows else ()),
+        ("techniques", "Test results"),
         *((("hypotheses", "Hypotheses"),) if hypothesis_rows else ()),
         *((("technique-skips", "Skipped cells"),) if technique_skip_rows else ()),
         *((("observability", "Execution observability"),) if observability_rows else ()),
-        ("conversation", "Conversation"),
-        ("details", "Details"),
+        ("conversation", "Evidence transcript"),
+        ("details", "Technical details"),
     )
     nav = "".join(f'<a href="#{section}">{label}</a>' for section, label in nav_items)
     target = _human_target(value)
     generated = value.created_at.astimezone(UTC).strftime("%d %b %Y, %H:%M UTC")
     audience_label = "Customer report" if value.audience == "customer" else "Internal report"
     rendered = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Merlin assessment report</title><style>
-:root{{--ink:#20262d;--muted:#5e6873;--line:#dce1e5;--paper:#fbfbfa;--panel:#f1f3f4;--accent:#a92835;--good:#176b4d;--warn:#885f00;--user:#dce9ff;--assistant:#eceff1}}*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}a{{color:#2458a6}}a:focus-visible,summary:focus-visible{{outline:3px solid #2458a6;outline-offset:3px}}.layout{{display:grid;grid-template-columns:190px minmax(0,820px);gap:48px;max-width:1120px;margin:auto;padding:40px 28px 80px}}nav{{position:sticky;top:24px;align-self:start;border-right:1px solid var(--line);padding-right:20px}}nav strong{{display:block;margin-bottom:10px}}nav a{{display:block;min-height:44px;padding:10px 4px;text-decoration:none}}main{{min-width:0}}header{{padding-bottom:32px;border-bottom:1px solid var(--line)}}.eyebrow{{font-weight:700;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}}h1{{font:600 clamp(34px,4vw,46px)/1.08 ui-serif,Georgia,serif;margin:8px 0}}h2{{font:600 28px/1.2 ui-serif,Georgia,serif;margin:56px 0 18px;padding-top:10px;border-top:1px solid var(--line)}}h3,h4{{margin:0 0 8px}}.target,.meta,.scope-note,.empty{{color:var(--muted)}}.verdict{{border-left:5px solid var(--warn);background:#fff7df;padding:18px 20px;margin-top:22px}}.verdict.success{{border-color:var(--good);background:#eaf6f0}}.verdict.danger{{border-color:var(--accent);background:#fff0f1}}.verdict strong{{display:block;font-size:19px;margin-bottom:4px}}.finding{{background:var(--panel);border-left:4px solid var(--accent);padding:20px;margin:12px 0}}.finding-heading{{display:flex;gap:12px;justify-content:space-between;align-items:start}}.finding-heading span,.outcome{{font-size:13px;font-weight:700;background:white;border:1px solid var(--line);border-radius:999px;padding:3px 8px}}.action-list{{padding-left:22px}}.action-list li{{margin:12px 0}}.action-list span{{display:block;color:var(--muted)}}.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.metric{{background:var(--panel);padding:15px;min-height:92px;min-width:0}}.metric strong,.metric span{{display:block}}.metric strong{{font-size:25px;overflow-wrap:anywhere}}.metric-detail{{display:block;margin-top:6px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}.metric span{{color:var(--muted)}}.scope-note{{max-width:72ch}}.conversations,.turns{{list-style:none;padding:0;margin:0}}.exchange{{border-bottom:1px solid var(--line);padding:18px 0}}.turn{{display:flex;flex-direction:column;align-items:flex-start;margin:12px 0}}.turn.user{{align-items:flex-end}}.speaker{{font-size:12px;font-weight:700;color:var(--muted);margin:0 8px 4px}}.bubble{{max-width:min(75ch,82%);padding:12px 15px;border-radius:16px 16px 16px 4px;background:var(--assistant);white-space:pre-wrap;overflow-wrap:anywhere}}.user .bubble{{background:var(--user);border-radius:16px 16px 4px 16px}}.techniques{{list-style:none;padding:0;display:grid;gap:8px}}.technique{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}}.detail-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}}.detail-card{{background:var(--panel);padding:16px}}.detail-card dt{{font-weight:700}}.detail-card dd{{margin:3px 0 0;color:var(--muted)}}.mobile-nav{{display:none}}@media(max-width:760px){{.layout{{display:block;padding:24px 18px 60px}}nav{{display:none}}.mobile-nav{{display:block;margin:20px 0}}.mobile-nav summary{{min-height:44px;padding:10px;border:1px solid var(--line);cursor:pointer}}.mobile-nav a{{display:block;min-height:44px;padding:10px}}.metrics,.detail-grid{{grid-template-columns:1fr 1fr}}.bubble{{max-width:92%}}h2{{margin-top:44px}}}}@media(max-width:430px){{.metrics,.detail-grid{{grid-template-columns:1fr}}}}@media print{{nav,.mobile-nav{{display:none}}.layout{{display:block;max-width:none;padding:0}}.bubble{{max-width:80%}}}}
+:root{{--ink:#20262d;--muted:#5e6873;--line:#dce1e5;--paper:#fbfbfa;--panel:#f1f3f4;--accent:#a92835;--good:#176b4d;--warn:#885f00;--user:#dce9ff;--assistant:#eceff1}}*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}a{{color:#2458a6}}a:focus-visible,summary:focus-visible{{outline:3px solid #2458a6;outline-offset:3px}}.layout{{display:grid;grid-template-columns:190px minmax(0,820px);gap:48px;max-width:1120px;margin:auto;padding:40px 28px 80px}}nav{{position:sticky;top:24px;align-self:start;border-right:1px solid var(--line);padding-right:20px}}nav strong{{display:block;margin-bottom:10px}}nav a{{display:block;min-height:44px;padding:10px 4px;text-decoration:none}}main{{min-width:0}}header{{padding-bottom:32px;border-bottom:1px solid var(--line)}}.eyebrow{{font-weight:700;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}}h1{{font:600 clamp(34px,4vw,46px)/1.08 ui-serif,Georgia,serif;margin:8px 0}}h2{{font:600 28px/1.2 ui-serif,Georgia,serif;margin:56px 0 18px;padding-top:10px;border-top:1px solid var(--line)}}h3,h4{{margin:0 0 8px}}.target,.meta,.scope-note,.empty{{color:var(--muted)}}.verdict{{border-left:5px solid var(--warn);background:#fff7df;padding:18px 20px;margin-top:22px}}.verdict.success{{border-color:var(--good);background:#eaf6f0}}.verdict.danger{{border-color:var(--accent);background:#fff0f1}}.verdict strong{{display:block;font-size:19px;margin-bottom:4px}}.decision-summary{{display:grid;grid-template-columns:repeat(3,1fr);margin:18px 0 0;border:1px solid var(--line);background:#fff}}.decision-summary div{{padding:16px;border-right:1px solid var(--line)}}.decision-summary div:last-child{{border-right:0}}.decision-summary span,.decision-summary strong{{display:block}}.decision-summary span{{margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}}.decision-summary strong{{font-size:15px;line-height:1.4}}.result-terms{{margin-top:14px;border:1px solid var(--line);background:#fff;padding:0 14px}}.result-terms summary{{cursor:pointer;min-height:44px;padding:11px 0;font-weight:700}}.result-terms dl{{display:grid;grid-template-columns:max-content 1fr;gap:8px 14px;margin:4px 0 16px}}.result-terms dt{{font-weight:700}}.result-terms dd{{margin:0;color:var(--muted)}}.finding{{background:var(--panel);border-left:4px solid var(--accent);padding:20px;margin:12px 0}}.finding-heading{{display:flex;gap:12px;justify-content:space-between;align-items:start}}.finding-heading span,.outcome{{font-size:13px;font-weight:700;background:white;border:1px solid var(--line);border-radius:999px;padding:3px 8px}}.action-list{{padding-left:22px}}.action-list li{{margin:12px 0}}.action-list span{{display:block;color:var(--muted)}}.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.metric{{background:var(--panel);padding:15px;min-height:92px;min-width:0}}.metric strong,.metric span{{display:block}}.metric strong{{font-size:25px;overflow-wrap:anywhere}}.metric-detail{{display:block;margin-top:6px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}.metric span{{color:var(--muted)}}.scope-note{{max-width:72ch}}.conversations,.turns{{list-style:none;padding:0;margin:0}}.exchange{{border-bottom:1px solid var(--line);padding:18px 0}}.turn{{display:flex;flex-direction:column;align-items:flex-start;margin:12px 0}}.turn.user{{align-items:flex-end}}.speaker{{font-size:12px;font-weight:700;color:var(--muted);margin:0 8px 4px}}.bubble{{max-width:min(75ch,82%);padding:12px 15px;border-radius:16px 16px 16px 4px;background:var(--assistant);white-space:pre-wrap;overflow-wrap:anywhere}}.user .bubble{{background:var(--user);border-radius:16px 16px 4px 16px}}.techniques{{list-style:none;padding:0;display:grid;gap:8px}}.technique{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}}.detail-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}}.detail-card{{background:var(--panel);padding:16px}}.detail-card dt{{font-weight:700}}.detail-card dd{{margin:3px 0 0;color:var(--muted)}}.mobile-nav{{display:none}}@media(max-width:760px){{.layout{{display:block;padding:24px 18px 60px}}nav{{display:none}}.mobile-nav{{display:block;margin:20px 0}}.mobile-nav summary{{min-height:44px;padding:10px;border:1px solid var(--line);cursor:pointer}}.mobile-nav a{{display:block;min-height:44px;padding:10px}}.metrics,.detail-grid{{grid-template-columns:1fr 1fr}}.decision-summary{{grid-template-columns:1fr}}.decision-summary div{{border-right:0;border-bottom:1px solid var(--line)}}.decision-summary div:last-child{{border-bottom:0}}.bubble{{max-width:92%}}h2{{margin-top:44px}}}}@media(max-width:430px){{.metrics,.detail-grid{{grid-template-columns:1fr}}.result-terms dl{{grid-template-columns:1fr;gap:2px}}.result-terms dd{{margin-bottom:8px}}}}@media print{{nav,.mobile-nav{{display:none}}.layout{{display:block;max-width:none;padding:0}}.bubble{{max-width:80%}}}}
 .summary-metrics{{margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}.language-chart{{list-style:none;padding:0;margin:0;display:grid;gap:14px}}.language-row>div:first-child{{display:flex;justify-content:space-between;gap:20px}}.language-row span{{color:var(--muted)}}.coverage-bar{{height:10px;background:#e1e5e8;border-radius:999px;overflow:hidden;margin-top:7px}}.coverage-bar span{{display:block;height:100%;background:var(--good)}}.table-wrap{{overflow-x:auto}}.result-table{{width:100%;border-collapse:collapse;text-align:left}}.result-table th,.result-table td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.result-table thead th{{font-size:13px;color:var(--muted);background:var(--panel)}}.result-table tbody th{{font-weight:600}}.objective-list{{list-style:none;padding:0;margin:12px 0 22px;display:grid;gap:8px}}.objective-row{{display:flex;gap:12px;align-items:flex-start;background:var(--panel);border-left:4px solid var(--line);padding:13px 15px}}.objective-icon{{font-size:19px;line-height:1.2;font-weight:700}}.objective-copy,.objective-copy strong,.objective-status,.campaign-result strong,.campaign-result span{{display:block}}.objective-status,.campaign-result span{{color:var(--muted)}}.objective-complete{{border-color:var(--good)}}.objective-active{{border-color:#2458a6}}.objective-blocked{{border-color:var(--warn)}}.objective-unmet,.objective-indeterminate{{border-color:var(--accent)}}.campaign-result{{border-left:5px solid var(--warn);background:#fff7df;padding:16px 18px;margin-top:18px}}@media(max-width:760px){{.summary-metrics{{grid-template-columns:1fr 1fr}}.language-row>div:first-child{{display:block}}}}@media(max-width:430px){{.summary-metrics{{grid-template-columns:1fr}}}}
 .conversation-details{{border:1px solid var(--line);background:#fff;padding:0 16px}}.conversation-details summary{{cursor:pointer;min-height:44px;padding:12px 0;font-weight:700}}.message-time{{display:block;margin:4px 8px 0;color:var(--muted);font-size:11px}}.technique-caption{{margin:18px 8px 2px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}}.hypotheses{{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:minmax(0,1fr);gap:10px}}.hypothesis{{min-width:0;background:var(--panel);padding:14px 16px}}.hypothesis p{{margin:8px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}}
 @media(max-width:760px){{main{{display:flex;flex-direction:column}}.mobile-nav{{order:-1;position:sticky;top:0;z-index:10;margin:0 0 20px;background:var(--paper);border-bottom:1px solid var(--line)}}.mobile-nav summary{{position:relative;padding-right:64px;font-weight:700;background:var(--paper)}}.mobile-nav summary::after{{content:"Menu";position:absolute;right:10px;font-size:12px;color:var(--muted);font-weight:600}}.mobile-nav[open] summary::after{{content:"Close"}}.mobile-nav a{{background:var(--paper);border-top:1px solid var(--line);text-decoration:none}}}}
@@ -3967,22 +3997,22 @@ def _html_report(
 <header id="summary"><div class="eyebrow">Security assessment · {html.escape(audience_label)}</div><h1>{html.escape(target)}</h1>
 <p class="target">Generated {html.escape(generated)}</p><div class="verdict {verdict_class}">
 <strong>{html.escape(verdict_label)}</strong><span>{html.escape(verdict)}</span></div>
-<div class="metrics summary-metrics">{summary_cards}</div></header>
+{decision_summary}{result_terms}<div class="metrics summary-metrics">{summary_cards}</div></header>
 <details class="mobile-nav"><summary>Report contents</summary>{nav}</details>
 {target_progress_html}<section id="findings"><h2>Findings</h2>{findings}</section>{remediation}
-<section id="coverage"><h2>Coverage</h2><p class="scope-note">Attack techniques are counted once by catalogue identity. Language, mutation, encoding, and strategy variations are candidates beneath those techniques. Specialist agents and scheduler task records are operational counts, not additional techniques.</p>
+<section id="coverage"><h2>What Merlin tested</h2><p class="scope-note">Each attack technique is counted once. Merlin can try several versions of the same technique, such as different languages or message styles. Those versions do not increase the technique count.</p>
 {coverage_chart}<div class="metrics">{coverage_cards}</div></section>
-<section id="coverage-provenance"><h2>Coverage provenance</h2><p class="scope-note">These are candidate-variation counts, not additional attack techniques. They separate work performed now from conclusive results imported from the same reviewed target generation. Inconclusive, retryable, and unstarted work stays unresolved and remains eligible for future execution; durably unreachable work is reported separately.</p><div class="metrics">{provenance_cards}</div></section>
-<section id="language"><h2>Language coverage</h2><p class="scope-note">Rows appear only for tests with an explicitly requested or durably observed language. Default-language behavior is not inferred when evidence is absent.</p><ul class="language-chart">{language_chart}</ul></section>
-<section id="techniques"><h2>Techniques and execution methods</h2>{unselected_note}<div class="table-wrap" role="region" aria-label="Technique results" tabindex="0"><table class="result-table"><thead><tr><th>Technique</th><th>Method used</th><th>Result</th></tr></thead><tbody>{technique_rows}</tbody></table></div></section>{hypotheses_html}{technique_skips_html}{observability}
-<section id="conversation"><h2>Conversation evidence</h2><p class="scope-note">Merlin test prompts appear on the right and target replies on the left. Internal request envelopes and evidence identifiers are excluded.</p>{_conversation_html(value.exchanges, _conversation_metadata(value, source))}</section>
-<section id="details"><h2>Assessment details</h2><div class="detail-grid"><dl class="detail-card"><dt>Specialist composition</dt><dd>{html.escape(composition.casefold())}</dd>{specialist_rows}</dl><dl class="detail-card"><dt>Cleanup</dt><dd>{html.escape(_friendly_value("cleanup", value.cleanup_status))}</dd></dl><dl class="detail-card"><dt>Model tokens</dt><dd>{html.escape(usage_text)}</dd></dl>{cost_detail}<dl class="detail-card"><dt>Result state</dt><dd>{html.escape(_report_state_label(value))}</dd></dl><dl class="detail-card"><dt>Audience</dt><dd>{html.escape(audience_label)}</dd></dl></div><h3>Limitations</h3><ul>{limitations}{frontier}</ul></section>
+<section id="coverage-provenance"><h2>Where the results came from</h2><p class="scope-note">A candidate variation is one version of an attack technique. These numbers show which variations Merlin ran now, reused from a prior scan, or could not resolve.</p><div class="metrics">{provenance_cards}</div></section>
+<section id="language"><h2>Languages tested</h2><p class="scope-note">Merlin lists a language only when the test requested it or the saved evidence recorded it. Merlin does not guess the language when that evidence is missing.</p><ul class="language-chart">{language_chart}</ul></section>
+<section id="techniques"><h2>Test-by-test results</h2>{unselected_note}<div class="table-wrap" role="region" aria-label="Technique results" tabindex="0"><table class="result-table"><thead><tr><th>Attack technique</th><th>How Merlin tested it</th><th>Result</th></tr></thead><tbody>{technique_rows}</tbody></table></div></section>{hypotheses_html}{technique_skips_html}{observability}
+<section id="conversation"><h2>Evidence transcript</h2><p class="scope-note">Merlin test prompts appear on the right. Target replies appear on the left. Internal request envelopes and evidence identifiers are not shown.</p>{_conversation_html(value.exchanges, _conversation_metadata(value, source))}</section>
+<section id="details"><h2>Technical details</h2><details class="result-terms"><summary>Operational counts and model usage</summary><div class="metrics">{technical_summary_cards}</div></details><div class="detail-grid"><dl class="detail-card"><dt>Specialist composition</dt><dd>{html.escape(composition.casefold())}</dd>{specialist_rows}</dl><dl class="detail-card"><dt>Cleanup</dt><dd>{html.escape(_friendly_value("cleanup", value.cleanup_status))}</dd></dl><dl class="detail-card"><dt>Model tokens</dt><dd>{html.escape(usage_text)}</dd></dl>{cost_detail}<dl class="detail-card"><dt>Result state</dt><dd>{html.escape(_report_state_label(value))}</dd></dl><dl class="detail-card"><dt>Audience</dt><dd>{html.escape(audience_label)}</dd></dl></div><h3>Limitations</h3><ul>{limitations}{frontier}</ul></section>
 </main></div></body></html>"""
     if not language_rows:
         empty_language_section = (
-            '<section id="language"><h2>Language coverage</h2><p class="scope-note">'
-            "Rows appear only for tests with an explicitly requested or durably observed "
-            "language. Default-language behavior is not inferred when evidence is absent."
+            '<section id="language"><h2>Languages tested</h2><p class="scope-note">'
+            "Merlin lists a language only when the test requested it or the saved evidence "
+            "recorded it. Merlin does not guess the language when that evidence is missing."
             '</p><ul class="language-chart"><li class="empty">'
             "No language coverage was recorded.</li></ul></section>"
         )
