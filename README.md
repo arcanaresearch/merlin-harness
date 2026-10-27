@@ -437,6 +437,14 @@ What remains incomplete:
 - Merlin has not been benchmarked against other scanners on comparable targets.
 - Packaged support currently targets macOS 14 on Apple silicon.
 
+## Benchmarking
+
+Merlin is benchmarked as an adaptive attacker that finds real, executable vulnerabilities under
+a fixed budget — not as a single dataset or one ASR number. The recommended stack (hidden
+executable suite, MUZZLE + The Zoo, AIRTBench, RIFT-Bench, Jailbreak Foundry, AgentHarm /
+AgentDojo regression tracks, REDAgentBench as an execution substrate) and the current, honest
+benchmark status live in [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Security and responsible use
 
 Merlin is an offensive assessment harness for authorized testing. Models, target content, tools,
