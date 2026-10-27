@@ -402,12 +402,12 @@ async def _export_and_check_report(
     assert html_path.is_file(), f"automatic report export missing: {html_path}"
     rendered = html_path.read_text(encoding="utf-8")
     for section in (
-        "Executive summary",
+        "Assessment in plain language",
         "Findings",
-        "Coverage",
-        "Conversation evidence",
-        "Technique results",
-        "Assessment details",
+        "What Merlin tested",
+        "Evidence transcript",
+        "Test-by-test results",
+        "Technical details",
     ):
         assert section in rendered, f"exported report is missing section: {section}"
     for internal_token in (
