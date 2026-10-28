@@ -30,6 +30,20 @@ __all__ = ["OpenAIResponsesConfig", "OpenAIResponsesProvider"]
 _TERMINAL_EVENTS = {"response.completed", "response.failed", "response.incomplete"}
 
 
+def _supports_required_reasoning_off(model: str) -> bool:
+    """Return whether official model documentation guarantees ``effort=none``."""
+    normalized = model.strip().casefold()
+    if normalized == "gpt-5.4":
+        return True
+    prefix = "gpt-5.4-"
+    snapshot = normalized.removeprefix(prefix)
+    return (
+        normalized.startswith(prefix)
+        and len(snapshot) == 10
+        and (snapshot[4:5] == "-" and snapshot[7:8] == "-" and snapshot.replace("-", "").isdigit())
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIResponsesConfig(ProviderConfig):
     """Responses-API route configuration.
@@ -94,7 +108,15 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         effort = request.reasoning_effort or self.config.reasoning_effort
-        if request.reasoning != "disabled" and (
+        required_off = request.reasoning == "disabled" and request.reasoning_control == "required"
+        if required_off:
+            model = request.model or self.config.model
+            if not _supports_required_reasoning_off(model):
+                raise ProviderError(
+                    f"model {model!r} does not have verified support for reasoning effort 'none'"
+                )
+            payload["reasoning"] = {"effort": "none"}
+        elif request.reasoning != "disabled" and (
             request.reasoning == "enabled" or effort != "default"
         ):
             payload["reasoning"] = {"effort": ("medium" if effort == "default" else effort)}

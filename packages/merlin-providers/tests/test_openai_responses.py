@@ -17,7 +17,7 @@ from merlin_contracts import (
     ToolCall,
 )
 
-from merlin_providers import OpenAIResponsesConfig, OpenAIResponsesProvider
+from merlin_providers import OpenAIResponsesConfig, OpenAIResponsesProvider, ProviderError
 
 
 def _sse(events: list[dict[str, object]]) -> str:
@@ -135,18 +135,29 @@ def test_payload_shapes_input_tools_and_reasoning() -> None:
 
 def test_required_off_cannot_be_reenabled_by_responses_config() -> None:
     provider = OpenAIResponsesProvider(
-        OpenAIResponsesConfig("https://api.test/v1", "", "gpt", reasoning_effort="high")
+        OpenAIResponsesConfig("https://api.test/v1", "", "gpt-5.4", reasoning_effort="high")
     )
     payload = provider._payload(
         ChatRequest(
-            model="gpt",
+            model="gpt-5.4",
             messages=[],
             workload="worker",
             reasoning="disabled",
             reasoning_control="required",
         )
     )
-    assert "reasoning" not in payload
+    assert payload["reasoning"] == {"effort": "none"}
+
+    with pytest.raises(ProviderError, match="does not have verified support"):
+        provider._payload(
+            ChatRequest(
+                model="gpt-5.4-pro",
+                messages=[],
+                workload="worker",
+                reasoning="disabled",
+                reasoning_control="required",
+            )
+        )
 
 
 def test_previous_response_continuation_sends_only_new_items() -> None:

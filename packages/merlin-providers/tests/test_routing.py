@@ -100,9 +100,7 @@ def test_explicit_workload_controls_resolve_before_transport() -> None:
 
 def test_output_limit_capability_distinguishes_native_truncation_and_unsupported() -> None:
     default = Provider("default")
-    default.route_identity = RouteIdentity(
-        transport="codex_app_server", endpoint="", model="codex"
-    )
+    default.route_identity = RouteIdentity(transport="codex_app_server", endpoint="", model="codex")
     claude = Provider("claude")
     claude.route_identity = RouteIdentity(transport="claude_cli", endpoint="", model="claude")
     native = Provider("native")
@@ -114,6 +112,20 @@ def test_output_limit_capability_distinguishes_native_truncation_and_unsupported
     assert routing.output_limit_capability("native") == "native"
     assert routing.output_limit_capability("claude") == "truncation"
     assert routing.output_limit_capability("codex") == "unsupported"
+
+    bounded = ModelRoutingProvider(
+        default,
+        {"claude": claude, "native": native},
+        request_output_tokens={"worker": 1_024},
+    )
+    native_request = bounded.resolve_request(
+        ChatRequest(model="native", messages=[], workload="worker", max_output_tokens=2_048)
+    )
+    assert native_request.max_output_tokens == 1_024
+    with pytest.raises(ValueError, match="cannot enforce request output limits before generation"):
+        bounded.resolve_request(
+            ChatRequest(model="claude", messages=[], workload="worker", max_output_tokens=2_048)
+        )
 
 
 def test_route_identity_for_model_returns_exact_routed_identity() -> None:

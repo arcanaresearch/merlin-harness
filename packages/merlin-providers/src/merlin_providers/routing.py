@@ -105,9 +105,10 @@ class ModelRoutingProvider:
             return request
         updates: dict[str, object] = {}
         limit = self.request_output_limit(request.workload)
-        if limit is not None and self.output_limit_capability(request.model) == "unsupported":
+        if limit is not None and self.output_limit_capability(request.model) != "native":
             raise ValueError(
-                f"transport for model {request.model!r} does not support request output limits"
+                f"transport for model {request.model!r} cannot enforce request output limits "
+                "before generation"
             )
         if limit is not None and (
             request.max_output_tokens is None or request.max_output_tokens > limit
