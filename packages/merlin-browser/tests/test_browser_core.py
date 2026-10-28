@@ -9683,7 +9683,7 @@ def test_api_handoff_schema_documents_exact_dynamic_rendered_state_templates() -
     assert "invariant marker" in witness["description"]
 
 
-def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> None:
+def test_target_ui_transition_separates_stage_boundaries_from_score_churn() -> None:
     from merlin_browser.tools import (
         _browser_rendered_state_observations,
         _browser_target_ui_transition,
@@ -9719,6 +9719,14 @@ def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> No
             "role": "score",
             "value_type": "integer",
             "capture": {"template": "{value}/100"},
+        },
+        {
+            "name": "status",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "Status: {value}"},
+            "success_values": ["complete"],
+            "failure_values": ["failed"],
         },
     ]
     compiled = compile_target_adapter(adapter).executable
@@ -9759,10 +9767,14 @@ def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> No
             ),
         )
 
-    before = BrowserObservation(**common, text="Level 1\n0/100", elements=elements("8"))
+    before = BrowserObservation(
+        **common,
+        text="Level 1\n0/100\nStatus: active",
+        elements=elements("8"),
+    )
     after = BrowserObservation(
         **common,
-        text="Level 2\n100/100",
+        text="Level 2\n100/100\nStatus: complete",
         elements=tuple(reversed(elements("9"))),
     )
     observations, uncertainties = _browser_rendered_state_observations(
@@ -9781,15 +9793,150 @@ def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> No
     )
 
     assert uncertainties == []
-    assert transition["material"] is False
+    assert transition["material"] is True
     assert transition["adapter_stale"] is False
-    assert transition["before_digest"] == transition["after_digest"]
+    assert transition["before_digest"] != transition["after_digest"]
     assert transition["added_controls"] == []
     assert transition["removed_controls"] == []
-    assert transition["changed_dimensions"] == []
+    assert transition["changed_dimensions"] == ["reviewed_state"]
     assert {item["name"] for item in transition["reviewed_state_changes"]} == {
         "level",
         "current_score",
+        "status",
+    }
+    level_change = next(
+        item for item in transition["reviewed_state_changes"] if item["name"] == "level"
+    )
+    assert level_change == {
+        "name": "level",
+        "role": "progress_ordinal",
+        "before": 1,
+        "after": 2,
+        "boundary": "stage",
+    }
+    score_change = next(
+        item
+        for item in transition["reviewed_state_changes"]
+        if item["name"] == "current_score"
+    )
+    assert score_change == {
+        "name": "current_score",
+        "role": "score",
+        "before": 0,
+        "after": 100,
+    }
+    status_change = next(
+        item for item in transition["reviewed_state_changes"] if item["name"] == "status"
+    )
+    assert status_change == {
+        "name": "status",
+        "role": "custom",
+        "before": "active",
+        "after": "complete",
+        "boundary": "success",
+    }
+
+    score_only_after = BrowserObservation(
+        **common,
+        text="Level 1\n100/100\nStatus: active",
+        elements=tuple(reversed(elements("9"))),
+    )
+    score_observations, score_uncertainties = _browser_rendered_state_observations(
+        compiled,
+        before.text,
+        score_only_after.text,
+    )
+    score_transition = _browser_target_ui_transition(
+        before,
+        score_only_after,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=score_observations,
+    )
+    assert score_uncertainties == []
+    assert score_transition["material"] is False
+    assert score_transition["adapter_stale"] is False
+    assert score_transition["before_digest"] != score_transition["after_digest"]
+    assert score_transition["changed_dimensions"] == []
+    assert score_transition["reviewed_state_changes"] == [score_change]
+
+    for terminal_value in ("complete", "failed"):
+        terminal_before = BrowserObservation(
+            **common,
+            text=f"Level 1\n0/100\nStatus: {terminal_value}",
+            elements=elements("8"),
+        )
+        reset_observations, reset_uncertainties = _browser_rendered_state_observations(
+            compiled,
+            terminal_before.text,
+            before.text,
+        )
+        reset_transition = _browser_target_ui_transition(
+            terminal_before,
+            before,
+            before_url="https://target.test/chat",
+            after_url="https://target.test/chat",
+            adapter=compiled,
+            state_observations=reset_observations,
+        )
+        assert reset_uncertainties == []
+        assert reset_transition["material"] is True
+        assert reset_transition["changed_dimensions"] == ["reviewed_state"]
+        assert reset_transition["reviewed_state_changes"] == [
+            {
+                "name": "status",
+                "role": "custom",
+                "before": terminal_value,
+                "after": "active",
+                "boundary": "stage",
+            }
+        ]
+
+    many_state_observations = [
+        {
+            "name": f"score_{index:02d}",
+            "role": "score",
+            "phase": phase,
+            "selected_value": index + (phase == "result"),
+        }
+        for index in range(32)
+        for phase in ("baseline", "result")
+    ]
+    many_state_observations.extend(
+        [
+            {
+                "name": "z_level",
+                "role": "progress_ordinal",
+                "phase": "baseline",
+                "selected_value": 1,
+            },
+            {
+                "name": "z_level",
+                "role": "progress_ordinal",
+                "phase": "result",
+                "selected_value": 2,
+            },
+        ]
+    )
+    bounded_state_transition = _browser_target_ui_transition(
+        before,
+        before,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=many_state_observations,
+    )
+    assert bounded_state_transition["material"] is True
+    assert bounded_state_transition["before_digest"] != bounded_state_transition["after_digest"]
+    assert bounded_state_transition["state_changes_truncated"] is True
+    assert len(bounded_state_transition["reviewed_state_changes"]) == 32
+    assert bounded_state_transition["reviewed_state_changes"][0] == {
+        "name": "z_level",
+        "role": "progress_ordinal",
+        "before": 1,
+        "after": 2,
+        "boundary": "stage",
     }
 
     duplicate_send = ElementRef(
@@ -9864,20 +10011,62 @@ def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> No
         frame_ref="main",
         role="button",
         name="Copy response",
+        surface_scope="transcript",
     )
-    repeated_copy = copy_control.model_copy(update={"ref": "copy-2"})
-    transcript_growth = _browser_target_ui_transition(
-        before.model_copy(update={"elements": (*before.elements, copy_control)}),
-        after.model_copy(update={"elements": (*after.elements, copy_control, repeated_copy)}),
+    feedback_control = ElementRef(
+        ref="feedback-1",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Helpful",
+        surface_scope="transcript",
+    )
+    response_link = ElementRef(
+        ref="source-1",
+        tab_ref="tab",
+        frame_ref="main",
+        role="link",
+        name="Source",
+        surface_scope="transcript",
+    )
+    first_response_chrome = _browser_target_ui_transition(
+        before,
+        score_only_after.model_copy(
+            update={
+                "elements": (
+                    *score_only_after.elements,
+                    copy_control,
+                    feedback_control,
+                    response_link,
+                )
+            }
+        ),
         before_url="https://target.test/chat",
         after_url="https://target.test/chat",
         adapter=compiled,
-        state_observations=observations,
+        state_observations=score_observations,
+    )
+
+    assert first_response_chrome["material"] is False
+    assert first_response_chrome["adapter_stale"] is False
+    assert first_response_chrome["before_digest"] != first_response_chrome["after_digest"]
+    assert first_response_chrome["added_controls"] == []
+
+    repeated_copy = copy_control.model_copy(update={"ref": "copy-2"})
+    transcript_growth = _browser_target_ui_transition(
+        before.model_copy(update={"elements": (*before.elements, copy_control)}),
+        score_only_after.model_copy(
+            update={"elements": (*score_only_after.elements, copy_control, repeated_copy)}
+        ),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=score_observations,
     )
 
     assert transcript_growth["material"] is False
     assert transcript_growth["adapter_stale"] is False
-    assert transcript_growth["before_digest"] == transcript_growth["after_digest"]
+    assert transcript_growth["before_digest"] != transcript_growth["after_digest"]
     assert transcript_growth["added_controls"] == []
 
 
@@ -10085,7 +10274,10 @@ def test_rendered_state_omits_all_phases_for_prompt_attributable_values() -> Non
 
 
 def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
-    from merlin_browser.tools import _browser_target_ui_transition
+    from merlin_browser.tools import (
+        _browser_response_snapshot_signature,
+        _browser_target_ui_transition,
+    )
     from merlin_contracts.target_adapter_compiler import BrowserChat, compile_target_adapter
 
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -10138,6 +10330,7 @@ def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
         frame_ref="main",
         role="button",
         name="Continue",
+        surface_scope="top_layer",
     )
     overlay = before.model_copy(update={"elements": (message, send, consent)})
     overlay_transition = _browser_target_ui_transition(
@@ -10151,6 +10344,67 @@ def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
     assert overlay_transition["material"] is True
     assert overlay_transition["adapter_stale"] is False
     assert overlay_transition["before_digest"] != overlay_transition["after_digest"]
+
+    unlabeled_modal_action = ElementRef(
+        ref="modal-action",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Action",
+        surface_scope="modal",
+    )
+    modal_transition = _browser_target_ui_transition(
+        before,
+        before.model_copy(update={"elements": (*before.elements, unlabeled_modal_action)}),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert modal_transition["material"] is True
+    assert modal_transition["adapter_stale"] is False
+    assert modal_transition["added_controls"][0]["surface_scope"] == "modal"
+
+    modal_state_transition = _browser_target_ui_transition(
+        before.model_copy(update={"elements": (*before.elements, unlabeled_modal_action)}),
+        before.model_copy(
+            update={
+                "elements": (
+                    *before.elements,
+                    unlabeled_modal_action.model_copy(update={"disabled": True}),
+                )
+            }
+        ),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert modal_state_transition["material"] is True
+    assert modal_state_transition["before_digest"] != modal_state_transition["after_digest"]
+    assert modal_state_transition["added_controls"][0]["disabled"] is True
+
+    occluded_transition = _browser_target_ui_transition(
+        before,
+        before.model_copy(
+            update={
+                "elements": tuple(
+                    item.model_copy(update={"occluded": True}) for item in before.elements
+                )
+            }
+        ),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert occluded_transition["material"] is True
+    assert occluded_transition["adapter_stale"] is True
+    assert {item["name"] for item in occluded_transition["added_controls"]} == {
+        "Message",
+        "Send",
+    }
+    assert "reviewed_controls" in occluded_transition["changed_dimensions"]
 
     blocker = before.model_copy(update={"kind": "blocker", "elements": (consent,)})
     blocker_transition = _browser_target_ui_transition(
@@ -10193,6 +10447,45 @@ def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
     assert navigated_transition["adapter_stale"] is True
     assert navigated_transition["changed_dimensions"] == ["url"]
 
+    titled_transition = _browser_target_ui_transition(
+        before.model_copy(update={"title": "Level 1"}),
+        before.model_copy(update={"title": "Level complete"}),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert titled_transition["material"] is False
+    assert titled_transition["adapter_stale"] is False
+    assert titled_transition["changed_dimensions"] == ["title"]
+    assert titled_transition["title_change"] == {
+        "before": "Level 1",
+        "after": "Level complete",
+    }
+    assert _browser_response_snapshot_signature(
+        before.model_copy(update={"title": "Level 1"}),
+        "https://target.test/chat",
+    ) == _browser_response_snapshot_signature(
+        before.model_copy(update={"title": "Level complete"}),
+        "https://target.test/chat",
+    )
+
+    titled_modal_transition = _browser_target_ui_transition(
+        before.model_copy(update={"title": "Level 1"}),
+        before.model_copy(
+            update={
+                "title": "Level complete",
+                "elements": (*before.elements, unlabeled_modal_action),
+            }
+        ),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert titled_modal_transition["material"] is True
+    assert titled_modal_transition["changed_dimensions"] == ["title", "controls"]
+
     equivalent_names = before.model_copy(
         update={
             "elements": (
@@ -10212,6 +10505,312 @@ def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
     assert equivalent_transition["material"] is False
     assert equivalent_transition["adapter_stale"] is False
     assert equivalent_transition["before_digest"] == equivalent_transition["after_digest"]
+
+
+@pytest.mark.asyncio
+async def test_element_surface_metadata_is_batched_per_locator_group() -> None:
+    from merlin_browser.core import _element_surface_metadata
+
+    class Locators:
+        calls = 0
+
+        async def evaluate_all(self, _script, limit):
+            self.calls += 1
+            return [
+                {"scope": "document", "occluded": False},
+                {"scope": "modal", "occluded": True},
+            ][:limit]
+
+    locators = Locators()
+    assert await _element_surface_metadata(locators, 2) == (
+        ("document", False),
+        ("modal", True),
+    )
+    assert locators.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_surface_scope_distinguishes_shell_overlay_and_offscreen_controls() -> None:
+    from merlin_browser.tools import _browser_target_ui_transition
+
+    fixed_shell = b"""
+    <main style="position:fixed;inset:0;z-index:50">
+      <textarea aria-label="Message"></textarea>
+      <button aria-label="Send">Send</button>
+      <section role="log"><button aria-label="Copy response">Copy</button></section>
+      <button aria-label="Show overlay" onclick="
+        const overlay=document.createElement('div');
+        overlay.style='position:fixed;inset:0;z-index:999;background:white';
+        overlay.innerHTML='<button>Continue</button>';
+        document.body.appendChild(overlay);
+      ">Show overlay</button>
+    </main>
+    """
+    async with web_fixture(fixed_shell) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            before = await session.snapshot(tab)
+            controls = {item.name: item for item in before.elements}
+            assert controls["Message"].surface_scope == "document"
+            assert controls["Send"].surface_scope == "document"
+            assert controls["Copy response"].surface_scope == "transcript"
+            assert all(not controls[name].occluded for name in ("Message", "Send", "Copy response"))
+            await session.act(
+                action(
+                    session,
+                    tab,
+                    "click",
+                    element_ref=controls["Show overlay"].ref,
+                )
+            )
+            after = await session.snapshot(tab)
+            after_controls = {item.name: item for item in after.elements}
+            assert after_controls["Message"].occluded is True
+            assert after_controls["Send"].occluded is True
+
+            from merlin_contracts.target_adapter_compiler import compile_target_adapter
+
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {"tool": "browser_fill", "arguments": {"locator": "textbox Message"}},
+                {"tool": "browser_click", "arguments": {"locator": "button Send"}},
+            ]
+            compiled = compile_target_adapter(adapter).executable
+            transition = _browser_target_ui_transition(
+                before,
+                after,
+                before_url=origin,
+                after_url=origin,
+                adapter=compiled,
+                state_observations=(),
+            )
+            assert transition["material"] is True
+            assert transition["adapter_stale"] is True
+            assert "reviewed_controls" in transition["changed_dimensions"]
+
+    offscreen_controls = b"""
+    <div style="height:200vh"></div>
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+    async with web_fixture(offscreen_controls) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            observation = await session.snapshot(tab)
+            controls = {item.name: item for item in observation.elements}
+            assert controls["Message"].occluded is False
+            assert controls["Send"].occluded is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_surface_scope_crosses_iframe_and_shadow_boundaries() -> None:
+    iframe_body = b"""
+    <iframe name="reviewed-chat" style="width:400px;height:240px" srcdoc="
+      <textarea aria-label='Message'></textarea>
+      <button aria-label='Send'>Send</button>
+    "></iframe>
+    <button aria-label="Cover frame" onclick="
+      const overlay=document.createElement('div');
+      overlay.style='position:fixed;inset:0;z-index:999;background:white';
+      document.body.appendChild(overlay);
+    ">Cover frame</button>
+    """
+    async with web_fixture(iframe_body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            frame_ref = None
+            for _ in range(20):
+                session.frame_refs(tab)
+                frame_ref = next(
+                    (
+                        ref
+                        for frame, ref in session._frame_refs.items()  # noqa: SLF001
+                        if frame.name == "reviewed-chat"
+                    ),
+                    None,
+                )
+                if frame_ref is not None:
+                    break
+                await asyncio.sleep(0.05)
+            assert frame_ref is not None
+            before = await session.snapshot(tab, frame_ref)
+            assert all(not item.occluded for item in before.elements)
+            main = await session.snapshot(tab)
+            cover = next(item for item in main.elements if item.name == "Cover frame")
+            await session.act(action(session, tab, "click", element_ref=cover.ref))
+            after = await session.snapshot(tab, frame_ref)
+            assert {item.name: item.occluded for item in after.elements} == {
+                "Message": True,
+                "Send": True,
+            }
+
+    shadow_body = b"""
+    <div id="chat-host"></div>
+    <button aria-label="Cover shadow" onclick="
+      const overlay=document.createElement('div');
+      overlay.style='position:fixed;inset:0;z-index:999;background:white';
+      document.body.appendChild(overlay);
+    ">Cover shadow</button>
+    <script>
+      const root=document.getElementById('chat-host').attachShadow({mode:'open'});
+      root.innerHTML=`<textarea aria-label="Message"></textarea>
+        <button aria-label="Send">Send</button>`;
+    </script>
+    """
+    async with web_fixture(shadow_body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            before = await session.snapshot(tab)
+            controls = {item.name: item for item in before.elements}
+            assert controls["Message"].occluded is False
+            assert controls["Send"].occluded is False
+            await session.act(
+                action(
+                    session,
+                    tab,
+                    "click",
+                    element_ref=controls["Cover shadow"].ref,
+                )
+            )
+            after = await session.snapshot(tab)
+            controls = {item.name: item for item in after.elements}
+            assert controls["Message"].occluded is True
+            assert controls["Send"].occluded is True
+
+
+@pytest.mark.asyncio
+async def test_snapshot_surface_scope_uses_nearest_semantic_boundary() -> None:
+    from merlin_browser.tools import _browser_target_ui_transition
+
+    body = b"""
+    <section role="dialog" aria-label="Persistent chat shell">
+      <textarea aria-label="Message"></textarea>
+      <button aria-label="Send">Send</button>
+      <div role="log" id="log"></div>
+      <div role="status" id="status"></div>
+      <div aria-live="polite" id="live"></div>
+    </section>
+    <dialog open id="plain-dialog">Plain nonmodal dialog</dialog>
+    <dialog id="new-modal">Text-only modal</dialog>
+    <div id="new-popover" popover>Text-only popover</div>
+    <button aria-label="Add response chrome" onclick="
+      document.getElementById('log').innerHTML='<button>Copy response</button>';
+      document.getElementById('live').innerHTML='<button>Feedback</button>';
+      document.body.insertAdjacentHTML(
+        'beforeend',
+        '<dialog><input type=file aria-label=Hidden-upload></dialog>'
+      );
+      const responseFrame=document.createElement('iframe');
+      responseFrame.name='response-content';
+      responseFrame.srcdoc='<div role=log><a href=#>Source</a></div>';
+      document.body.appendChild(responseFrame);
+    ">Add response chrome</button>
+    <button aria-label="Add status action" onclick="
+      document.getElementById('status').innerHTML='<button>Retry</button>';
+    ">Add status action</button>
+    <button aria-label="Open surfaces" onclick="
+      document.getElementById('new-modal').showModal();
+      document.getElementById('new-popover').showPopover();
+    ">Open surfaces</button>
+    """
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            before = await session.snapshot(tab)
+            controls = {item.name: item for item in before.elements}
+            plain_surfaces = [
+                item for item in before.elements if item.role == "surface"
+            ]
+            assert plain_surfaces
+            assert {item.surface_scope for item in plain_surfaces} == {"dialog", "status"}
+
+            await session.act(
+                action(
+                    session,
+                    tab,
+                    "click",
+                    element_ref=controls["Add response chrome"].ref,
+                )
+            )
+            response = await session.snapshot(tab)
+            response_controls = {item.name: item for item in response.elements}
+            assert response_controls["Copy response"].surface_scope == "transcript"
+            assert response_controls["Feedback"].surface_scope == "document"
+            assert response_controls["Hidden-upload"].surface_scope == "document"
+
+            from merlin_contracts.target_adapter_compiler import compile_target_adapter
+
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {"tool": "browser_fill", "arguments": {"locator": "textbox Message"}},
+                {"tool": "browser_click", "arguments": {"locator": "button Send"}},
+            ]
+            compiled = compile_target_adapter(adapter).executable
+            response_transition = _browser_target_ui_transition(
+                before,
+                response,
+                before_url=origin,
+                after_url=origin,
+                adapter=compiled,
+                state_observations=(),
+            )
+            assert response_transition["material"] is False
+            assert response_transition["before_digest"] == response_transition["after_digest"]
+
+            await session.act(
+                action(
+                    session,
+                    tab,
+                    "click",
+                    element_ref=response_controls["Add status action"].ref,
+                )
+            )
+            status_response = await session.snapshot(tab)
+            status_controls = {item.name: item for item in status_response.elements}
+            assert status_controls["Retry"].surface_scope == "status"
+            status_transition = _browser_target_ui_transition(
+                response,
+                status_response,
+                before_url=origin,
+                after_url=origin,
+                adapter=compiled,
+                state_observations=(),
+            )
+            assert status_transition["material"] is True
+            assert {item["name"] for item in status_transition["added_controls"]} == {"Retry"}
+
+            await session.act(
+                action(
+                    session,
+                    tab,
+                    "click",
+                    element_ref=status_controls["Open surfaces"].ref,
+                )
+            )
+            opened = await session.snapshot(tab)
+            opened_scopes = {
+                item.surface_scope for item in opened.elements if item.role == "surface"
+            }
+            assert {"dialog", "modal", "top_layer"} <= opened_scopes
+            opened_transition = _browser_target_ui_transition(
+                status_response,
+                opened,
+                before_url=origin,
+                after_url=origin,
+                adapter=compiled,
+                state_observations=(),
+            )
+            assert opened_transition["material"] is True
 
 
 @pytest.mark.asyncio
@@ -11257,9 +11856,52 @@ async def test_browser_checkpoint_requires_sealed_gate_then_restores_under_fresh
                 rejected.content,
                 rejected.metadata,
             )
+            assert rejected.metadata["target_session_id"] == (
+                f"browser:{rejected_session.context_id}"
+            )
+            assert rejected.metadata["target_effect_attempted"] is True
+            assert rejected.metadata["target_call_budget_charge"] == 1
+            assert rejected.metadata["limit_interaction_count"] == 1
             rejected_exchange = rejected.metadata["target_exchanges"][0]
             assert rejected_exchange["oracle_observation"]["matched"] is True
             assert vault.secrets == {}
+
+        missing_adapter = checkpoint_adapter(origin)
+        missing_capabilities = missing_adapter["state_capabilities"]
+        assert isinstance(missing_capabilities, dict)
+        missing_checkpoint = missing_capabilities["checkpoint"]
+        assert isinstance(missing_checkpoint, dict)
+        missing_selector = missing_checkpoint["capture_selector"]
+        assert isinstance(missing_selector, dict)
+        missing_selector["pointer"] = "/elements/99/name"
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as missing_session:
+            await missing_session.new_tab(origin)
+            missing = await ToolBroker(
+                browser_tools(
+                    lambda _: missing_session,
+                    Recorder(),
+                    lambda _: missing_adapter,
+                    store,
+                    store,
+                    vault,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                context("capture"),
+                {"prompt": "prerequisite", "timeout_ms": 1000},
+            )
+            assert missing.is_error is True
+            assert missing.metadata["failure_code"] == "checkpoint_capture_missing"
+            assert missing.metadata["target_session_id"] == (
+                f"browser:{missing_session.context_id}"
+            )
+            assert missing.metadata["target_effect_attempted"] is True
+            assert missing.metadata["target_call_budget_charge"] == 1
+            assert missing.metadata["limit_interaction_count"] == 1
+            assert len(missing.metadata["target_exchanges"]) == 1
 
         async with await launch_isolated(
             BrowserBounds(target_id="target", allowed_origins={origin}), owner()
@@ -13209,7 +13851,8 @@ async def test_compiled_chat_exchange_records_adaptive_exchange_with_typed_oracl
             }
             assert observation["observation_digest"] == digest_of(unsigned)
             assert exchange["oracle_observation"] is observation
-            assert result.metadata["target_ui_transition"]["material"] is False
+            assert exchange["target_ui_transition"]["material"] is False
+            assert "target_ui_transition" not in result.metadata
             assert "preferred_next_tool" not in result.metadata
 
 
@@ -13349,6 +13992,7 @@ async def test_compiled_chat_exchange_returns_bounded_surface_drift_before_targe
             assert result.metadata["retryable"] is True
             assert result.metadata["target_effect_attempted"] is False
             assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["target_session_id"] == f"browser:{session.context_id}"
             assert result.metadata["reobserve_required"] is True
             assert result.metadata["preferred_next_tool"] == "browser_snapshot"
             transition = result.metadata["target_ui_transition"]
@@ -13365,6 +14009,67 @@ async def test_compiled_chat_exchange_returns_bounded_surface_drift_before_targe
                 "Next Level",
             }
             assert json.loads(result.content)["target_ui_transition"] == transition
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_rejects_occluded_reviewed_controls_pre_effect() -> None:
+    blocked = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    <div style="position:fixed;inset:0;z-index:999;background:white">
+      <button>Continue</button>
+    </div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            raise AssertionError("occluded reviewed controls must stop before target action")
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(blocked) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello"},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "target_tab_unavailable"
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["target_ui_transition"]["material"] is True
+            assert result.metadata["target_ui_transition"]["adapter_stale"] is True
 
 
 @pytest.mark.asyncio
@@ -13390,7 +14095,7 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
     ">Send</button>
     <div id="status"></div>
     <div id="reply"><div>Score: 0</div></div>
-    <div id="modal" hidden>
+    <div id="modal" role="dialog" aria-modal="true" hidden>
       <div>Level passed</div>
       <button aria-label="Keep Playing">Keep Playing</button>
       <button aria-label="Try Another App">Try Another App</button>
@@ -13771,12 +14476,14 @@ async def test_response_settling_includes_delayed_control_only_transition() -> N
       setTimeout(() => {
         document.getElementById('reply').textContent='Score: 100';
       }, 100);
-      setTimeout(() => {
-        document.getElementById('continue').hidden=false;
+          setTimeout(() => {
+            document.getElementById('transition-dialog').hidden=false;
       }, 400);
     ">Send</button>
     <div id="reply"></div>
-    <button id="continue" aria-label="Continue" hidden></button>
+        <div id="transition-dialog" role="dialog" aria-modal="true" hidden>
+          <button id="continue" aria-label="Continue"></button>
+        </div>
     """
 
     class Recorder:
@@ -13837,7 +14544,10 @@ async def test_response_settling_includes_delayed_control_only_transition() -> N
             assert ("button", "Continue") in controls
             transition = result.metadata["target_ui_transition"]
             assert transition["material"] is True
-            assert {item["name"] for item in transition["added_controls"]} == {"Continue"}
+            assert {item["name"] for item in transition["added_controls"]} == {
+                "Continue",
+                "Modal surface 1",
+            }
 
 
 @pytest.mark.asyncio

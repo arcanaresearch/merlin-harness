@@ -65,12 +65,31 @@ def test_hypothesis_failure_requires_typed_infrastructure_category() -> None:
         contract,
         {**base, "infrastructure_failure_category": "missing_response_pointer"},
     )
+    disrupted = _hypothesis_task_observation(
+        "campaign-1",
+        task,
+        contract,
+        {
+            **base,
+            "target_ui_transition_receipts": {
+                "surface-change": {
+                    "is_error": True,
+                    "target_ui_transition": {
+                        "schema": "merlin.target-ui-transition.v1",
+                        "material": True,
+                        "reobservation_recommended": True,
+                    },
+                }
+            },
+        },
+    )
 
     assert ambiguous["outcome"] == "ambiguous"
     assert typed["outcome"] == "infrastructure_failure"
     assert typed["infrastructure_failure_category"] == "missing_response_pointer"
     assert completed_typed["outcome"] == "infrastructure_failure"
     assert completed_typed["signal"] is None
+    assert disrupted is None
 
 
 def test_arm_observation_requires_an_acknowledged_target_attempt() -> None:

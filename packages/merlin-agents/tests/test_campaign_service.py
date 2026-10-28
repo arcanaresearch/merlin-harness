@@ -142,7 +142,7 @@ from merlin_agents.capability_probes import (
 )
 from merlin_agents.completion_frontier import CompletionScope
 from merlin_agents.discovery import ArmIdentity, ArmObservation
-from merlin_agents.durable_service import ScheduleArtifactTooLarge
+from merlin_agents.durable_service import DurableAgentService, ScheduleArtifactTooLarge
 from merlin_agents.jev import JevClient
 from merlin_agents.judgments import RefusalJudgment, RefusalVerdict
 from merlin_agents.lifecycle_recovery import (
@@ -16871,6 +16871,218 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
     assert applied_priorities == [{"candidate-b": 0.95}]
     assert any(event.get("kind") == "incremental_task_review_completed" for event in events)
     assert any(event.get("kind") == "incremental_review_merge_completed" for event in events)
+
+
+@pytest.mark.parametrize(
+    (
+        "is_error",
+        "adapter_stale",
+        "target_effect_attempted",
+        "committed_receipt_key",
+    ),
+    (
+        (True, True, False, "target_ui_transition_receipts"),
+        (True, False, True, "target_ui_transition_receipts"),
+        (False, False, True, "target_evidence_receipts"),
+    ),
+    ids=("pre-effect-error", "post-effect-error", "post-effect-success"),
+)
+async def test_incremental_review_context_preserves_signed_ui_transition_receipt(
+    is_error: bool,
+    adapter_stale: bool,
+    target_effect_attempted: bool,
+    committed_receipt_key: str,
+) -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    task = AgentTask(
+        id=f"{prepared.manifest.id}/ui-transition",
+        objective="observe the reviewed browser target",
+        status="failed" if is_error else "completed",
+        result=(
+            "reviewed browser locator became stale before the target effect"
+            if is_error
+            else '{"reply":"level complete"}'
+        ),
+        technique_ids=("prompt",),
+    )
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": adapter_stale,
+        "before_digest": "sha256:" + hashlib.sha256(b"level-one").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"level-complete-modal").hexdigest(),
+        "changed_dimensions": ["modal", "controls", "level"],
+        "added_controls": [
+            {
+                "role": "button",
+                "name": "Next Level",
+                "frame_ref": "frame-1",
+                "input_type": "button",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:before", "browser:after"],
+        "reobservation_recommended": True,
+    }
+    call_id = f"ui-transition-{'error' if is_error else 'success'}"
+    attempt_id = "attempt-ui-transition"
+    arguments = {"prompt": "exercise the reviewed target"}
+    interaction_count = int(target_effect_attempted)
+    effect_metadata = {
+        "interaction_role": "target_exchange",
+        "target_session_id": "browser:reviewed-session",
+        "target_exchanges": [
+            {"interaction": True, "cleanup": False, "status_code": 200}
+            for _ in range(interaction_count)
+        ],
+        "target_effect_attempted": target_effect_attempted,
+        "target_call_budget_charge": interaction_count,
+        "limit_interaction_count": interaction_count,
+        "target_ui_transition": transition,
+    }
+    receipt_body = {
+        "call_id": call_id,
+        "tool_name": "browser_chat_exchange",
+        "reference": f"target-call:{call_id}",
+        "campaign_id": prepared.manifest.id,
+        "assignment_id": task.id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": None,
+        "target_id": prepared.manifest.target.id,
+        "target_session_id": "browser:reviewed-session",
+        "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+            "browser_chat_exchange", arguments
+        ),
+        "content_sha256": hashlib.sha256(task.result.encode()).hexdigest(),
+        "content_bytes": len(task.result.encode()),
+        "metadata_sha256": WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            WorkerRuntime._semantic_value(effect_metadata)  # noqa: SLF001
+        ),
+        "is_error": is_error,
+        "acknowledged": not is_error,
+        "target_effect_attempted": target_effect_attempted,
+        "interaction_count": interaction_count,
+        "limit_interaction_count": interaction_count,
+        "target_call_budget_charge": interaction_count,
+        "attempt_disposition": "infrastructure_failed" if is_error else "valid",
+        "target_ui_transition": transition,
+        **(
+            {
+                "candidate_outcome_projection": project_candidate_outcome(
+                    candidate_id=task.technique_ids[0],
+                    attempt_disposition="valid",
+                    outcome_authority="none",
+                    outcome="unclear",
+                    evidence_digest=hashlib.sha256(task.result.encode()).hexdigest(),
+                )
+            }
+            if not is_error
+            else {}
+        ),
+    }
+    receipt = {
+        **receipt_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(receipt_body),  # noqa: SLF001
+    }
+    committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-ui-transition",
+        task,
+        {
+            "node_id": f"worker:{task.id}",
+            "attempt_id": attempt_id,
+            "payload_digest": hashlib.sha256(b"committed result").hexdigest(),
+            "payload": {
+                "content": task.result,
+                "target_id": prepared.manifest.target.id,
+                "target_session_id": "browser:reviewed-session",
+                "worker_checkpoint": {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "function": {
+                                        "name": "browser_chat_exchange",
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": call_id, "content": task.result},
+                    ],
+                    "technique_attempt_id": None,
+                    "target_evidence": [receipt],
+                },
+            },
+        },
+        durable_effects=(
+            SimpleNamespace(
+                call_id=call_id,
+                state="acknowledged",
+                agent_id=task.id,
+                attempt_id=attempt_id,
+                campaign_id=prepared.manifest.id,
+                target_id=prepared.manifest.target.id,
+                tool_name="browser_chat_exchange",
+                effect="target_network",
+                arguments_payload=arguments,
+                result_content=task.result,
+                result_is_error=is_error,
+                result_metadata=effect_metadata,
+            ),
+        ),
+    )
+    assert committed is not None
+    assert committed["target_call_ids"] == (() if is_error else (call_id,))
+    assert committed["target_evidence_receipts"] == (
+        {} if is_error else {call_id: receipt}
+    )
+    assert committed["target_ui_transition_receipts"] == (
+        {call_id: receipt} if is_error else {}
+    )
+
+    class Store:
+        def list_lead(self, _campaign_id):
+            return ()
+
+        def list_technique_attempts(self, _campaign_id):
+            return ()
+
+        def frontier_counts(self, _campaign_id):
+            return {}
+
+        def list_frontier_shortlist(self, _campaign_id, _limit):
+            return ()
+
+    class Agents:
+        async def completion_projection(self, schedule_id):
+            assert schedule_id == "schedule-ui-transition"
+            return {"evidence": {task.id: committed}}
+
+    service = CampaignService(Store(), Agents(), preparation)  # type: ignore[arg-type]
+    context = await service._incremental_review_context(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        "schedule-ui-transition",
+        task,
+        (task,),
+    )
+
+    evidence_delta = context["evidence_delta"]
+    assert isinstance(evidence_delta, Mapping)
+    assert evidence_delta == _json_value(committed)
+    transition_receipts = evidence_delta[committed_receipt_key]
+    assert isinstance(transition_receipts, Mapping)
+    projected_receipt = transition_receipts[call_id]
+    assert isinstance(projected_receipt, Mapping)
+    assert projected_receipt == receipt
+    assert projected_receipt["receipt_sha256"] == receipt["receipt_sha256"]
+    assert projected_receipt["target_ui_transition"] == transition
 
 
 def test_incremental_objective_projection_keeps_binding_state_without_candidate_ids() -> None:

@@ -12,6 +12,7 @@ import pytest
 from merlin_agents import (
     AssignmentBudget,
     ContextDocument,
+    DurableAgentService,
     PortableMemoryRecord,
     RetryFailureKind,
     ReviewedTargetAdapter,
@@ -650,6 +651,55 @@ async def test_objective_phase_gate_preserves_delivery_failure_for_fresh_retry()
 
 
 @pytest.mark.asyncio
+async def test_objective_phase_gate_hands_surface_drift_to_fresh_reobservation() -> None:
+    base = reviewed_handoff(interface="browser", tools=("browser_chat_exchange",))
+    gate = {
+        "id": "surface",
+        "actions": [{"id": "observe", "step_id": "message", "input_text": "verify"}],
+    }
+    assignment = replace(
+        base.assignment,
+        id="campaign/00000000-0000-0000-0000-000000000001/objective-gate/surface",
+        strategy_id="objective-phase-gate/v1",
+        strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
+        max_target_exchanges=1,
+    )
+    assert base.worker_context is not None
+    reviewed = replace(
+        base,
+        attempt_id="attempt-objective-surface",
+        assignment=assignment,
+        worker_context=replace(base.worker_context, assignment_id=assignment.id),
+    )
+    tools = BrowserSurfaceDriftTargetTools()
+
+    result = await WorkerRuntime(Provider([]), tools).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert tools.calls == ["browser_chat_exchange"]
+    assert result.target_session_id == "browser:context-1"
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["target_ui_transition"] == _surface_drift_transition()
+    assert any(
+        message["role"] == "tool"
+        and message["tool_call_id"] == receipt["call_id"]
+        and message["content"] == result.content
+        for message in result.checkpoint["messages"]
+    )
+
+    replacement_tools = BrowserSurfaceDriftTargetTools()
+    restored = await WorkerRuntime(Provider([]), replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_tools.calls == []
+
+
+@pytest.mark.asyncio
 async def test_unavailable_adaptive_strategy_is_terminal_without_provider_or_target_effect() -> (
     None
 ):
@@ -970,6 +1020,95 @@ def _test_digest(value: object) -> str:
     )
 
 
+def _surface_drift_transition() -> dict[str, object]:
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": _test_digest("surface-before"),
+        "after_digest": _test_digest("surface-after"),
+        "changed_dimensions": ["controls"],
+        "added_controls": [{"role": "button", "name": "Continue"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:surface-after"],
+        "reobservation_recommended": True,
+    }
+
+
+def _surface_drift_result() -> ToolResult:
+    return ToolResult(
+        content="reviewed browser controls changed before delivery",
+        is_error=True,
+        metadata={
+            "failure_code": "target_delivery_rejected",
+            "target_delivery_rejected": True,
+            "retryable": True,
+            "target_effect_attempted": False,
+            "target_call_budget_charge": 0,
+            "limit_interaction_count": 0,
+            "target_session_id": "browser:context-1",
+            "target_ui_transition": _surface_drift_transition(),
+        },
+    )
+
+
+class SurfaceDriftTargetTools(GoatTargetTools):
+    async def invoke(self, name, context, arguments):
+        self.calls.append(name)
+        self.arguments.append(arguments)
+        return _surface_drift_result()
+
+
+class BrowserSurfaceDriftTargetTools(Tools):
+    def __init__(self) -> None:
+        super().__init__(effect="target_network")
+
+    def describe(self):
+        return (
+            ToolSpec(
+                name="browser_chat_exchange",
+                description="Reviewed browser exchange",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    async def invoke(self, name, context, arguments):
+        assert name == "browser_chat_exchange"
+        self.calls.append(name)
+        return _surface_drift_result()
+
+
+def _browser_surface_handoff(*, attempt_id: str = "attempt-surface-restore") -> WorkerHandoff:
+    return replace(
+        reviewed_handoff(interface="browser", tools=("browser_chat_exchange",)),
+        attempt_id=attempt_id,
+    )
+
+
+async def _browser_surface_checkpoint():
+    reviewed = _browser_surface_handoff()
+    tools = BrowserSurfaceDriftTargetTools()
+    result = await WorkerRuntime(
+        Provider(
+            [
+                [
+                    ToolCall(
+                        call_id="surface-restore",
+                        name="browser_chat_exchange",
+                        arguments={"prompt": "authorized probe"},
+                    ),
+                    ModelCompleted(finish_reason="tool_calls"),
+                ]
+            ]
+        ),
+        tools,
+    ).run(reviewed)
+    assert result.error_code == "target_surface_disrupted"
+    assert tools.calls == ["browser_chat_exchange"]
+    return reviewed, result
+
+
 def _goat_plugin_handoff() -> WorkerHandoff:
     reviewed = goat_handoff()
     return replace(
@@ -1260,6 +1399,40 @@ async def test_hydra_select_reserves_selected_actions_and_settles_exact_invocati
             None,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_hydra_surface_drift_hands_off_without_replaying_pending_action() -> None:
+    proposal = {
+        "candidates": [
+            {"prompt": f"candidate prompt {index}", "rationale": f"reason {index}"}
+            for index in range(6)
+        ]
+    }
+    reviewed = replace(hydra_handoff(), attempt_id="attempt-hydra")
+    tools = SurfaceDriftTargetTools()
+
+    result = await WorkerRuntime(
+        Provider([[TextDelta(text=json.dumps(proposal)), ModelCompleted(finish_reason="stop")]]),
+        tools,
+    ).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert tools.calls == ["target_request"]
+    assert result.target_session_id == "browser:context-1"
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["target_ui_transition"] == _surface_drift_transition()
+
+    replacement_tools = SurfaceDriftTargetTools()
+    restored = await WorkerRuntime(Provider([]), replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_tools.calls == []
 
 
 @pytest.mark.asyncio
@@ -1629,6 +1802,38 @@ async def test_goat_restores_later_pending_plan_without_provider_regeneration() 
     assert replacement_tools.calls == ["target_request"]
     assert replacement_tools.arguments == [_goat_call(1).arguments]
     assert restored.target_session_id == "api:session-1"
+
+
+async def test_goat_surface_drift_survives_restart_without_target_replay() -> None:
+    reviewed = replace(goat_handoff(), attempt_id="attempt-goat")
+    first_tools = SurfaceDriftTargetTools()
+    result = await WorkerRuntime(
+        Provider([[_goat_call(0), ModelCompleted(finish_reason="tool_calls")]]),
+        first_tools,
+    ).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert first_tools.calls == ["target_request"]
+    receipt = result.checkpoint["target_evidence"][0]
+    assert receipt["target_ui_transition"] == _surface_drift_transition()
+
+    second_tools = SurfaceDriftTargetTools()
+    restored = await WorkerRuntime(Provider([]), second_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert second_tools.calls == []
+    assert restored.checkpoint["target_evidence"] == result.checkpoint["target_evidence"]
+    tool_messages = [
+        message
+        for message in restored.checkpoint["messages"]
+        if message["role"] == "tool" and message["tool_call_id"] == receipt["call_id"]
+    ]
+    assert [message["content"] for message in tool_messages] == [result.content]
 
 
 async def test_goat_planner_prose_loop_accepts_model_verdict_at_strike_limit() -> None:
@@ -10562,3 +10767,1162 @@ async def test_bound_adapter_error_missing_identity_is_not_a_target_change(obser
         assert result.status == "quarantined"
         assert result.infrastructure_failure_category == "adapter_state_integrity"
         assert "different reviewed target identity" in (result.error or "")
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_pre_effect_surface_drift_stops_after_one_target_call(dynamic: bool) -> None:
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": _test_digest("surface-before"),
+        "after_digest": _test_digest("surface-after"),
+        "changed_dimensions": ["controls"],
+        "added_controls": [
+            {
+                "role": "button",
+                "name": "Continue",
+                "frame_ref": "frame-1",
+                "input_type": "button",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:surface-after"],
+        "reobservation_recommended": True,
+    }
+
+    class SurfaceDriftTools(Tools):
+        def __init__(self) -> None:
+            super().__init__(effect="target_network")
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_chat_exchange",
+                    description="Reviewed browser exchange",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(
+                content="reviewed browser controls changed before delivery",
+                is_error=True,
+                metadata={
+                    "failure_code": "target_delivery_rejected",
+                    "target_delivery_rejected": True,
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "target_session_id": "browser:context-1",
+                    "target_ui_transition": transition,
+                },
+            )
+
+    call = ToolCall(
+        call_id="surface-drift",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized probe"},
+    )
+
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                self.requests.append(request)
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(call)
+                raise AssertionError("surface drift must terminate the provider stream")
+                yield ModelCompleted()
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider([[call, ModelCompleted(finish_reason="tool_calls")]])
+
+    tools = SurfaceDriftTools()
+    reviewed = replace(
+        reviewed_handoff(interface="browser", tools=("browser_chat_exchange",)),
+        attempt_id="attempt-surface-drift",
+    )
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert result.retry_failure_kind is None
+    assert result.infrastructure_failure_category is None
+    assert result.target_session_id == "browser:context-1"
+    assert tools.calls == ["browser_chat_exchange"]
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["call_id"] == "surface-drift"
+    assert receipt["is_error"] is True
+    assert receipt["target_effect_attempted"] is False
+    assert receipt["interaction_count"] == 0
+    assert receipt["limit_interaction_count"] == 0
+    assert receipt["target_call_budget_charge"] == 0
+    assert receipt["target_ui_transition"] == transition
+    transcript = result.checkpoint["messages"]
+    assert any(
+        message.get("role") == "assistant"
+        and any(
+            call.get("id") == "surface-drift"
+            for call in message.get("tool_calls", [])
+            if isinstance(call, Mapping)
+        )
+        for message in transcript
+        if isinstance(message, Mapping)
+    )
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "surface-drift"
+        and message.get("content") == result.content
+        for message in transcript
+        if isinstance(message, Mapping)
+    )
+
+    replacement_call = ToolCall(
+        call_id="surface-drift-replacement",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must not run before Lead re-observation"},
+    )
+    if dynamic:
+
+        class ReplacementDynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                self.requests.append(request)
+                raise AssertionError("restored disruption must stop before provider execution")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(replacement_call)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        replacement_provider = ReplacementDynamicProvider()
+    else:
+        replacement_provider = Provider(
+            [[replacement_call, ModelCompleted(finish_reason="tool_calls")]]
+        )
+    replacement_tools = SurfaceDriftTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+    assert reviewed.worker_context is not None
+    task = AgentTask(
+        id=reviewed.assignment.id,
+        objective=reviewed.assignment.objective,
+        status="failed",
+        result=result.content,
+    )
+    committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-surface-drift",
+        task,
+        {
+            "node_id": f"worker:{task.id}",
+            "attempt_id": reviewed.attempt_id,
+            "payload_digest": "a" * 64,
+            "payload": {
+                "content": result.content,
+                "target_id": reviewed.worker_context.target.id,
+                "target_session_id": result.target_session_id,
+                "worker_checkpoint": result.checkpoint,
+            },
+        },
+    )
+    assert committed is not None
+    assert committed["target_call_ids"] == ()
+    assert committed["target_evidence_receipts"] == {}
+    # A worker-authored checkpoint is a restart barrier, not durable evidence
+    # authority. Positive Lead projection is covered by broker-backed durable
+    # integration tests.
+    assert committed["target_ui_transition_receipts"] == {}
+
+
+async def test_restored_surface_transition_from_unrelated_attempt_fails_closed() -> None:
+    reviewed, initial = await _browser_surface_checkpoint()
+    replacement_provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="unrelated-attempt-call",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "must not execute"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    replacement_tools = BrowserSurfaceDriftTargetTools()
+
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        replace(reviewed, attempt_id="unrelated-attempt", effect_attempt_lineage=()),
+        checkpoint=initial.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+async def test_post_effect_error_transition_is_not_reclassified_as_pre_effect() -> None:
+    reviewed = _browser_surface_handoff(attempt_id="attempt-post-effect-transition")
+    first = ToolCall(
+        call_id="post-effect-transition",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized effect that replaces the surface"},
+    )
+    forbidden_follow_up = ToolCall(
+        call_id="post-effect-forbidden-follow-up",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must wait for Lead re-observation"},
+    )
+    provider = Provider(
+        [
+            [first, ModelCompleted(finish_reason="tool_calls")],
+            [forbidden_follow_up, ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+    tools = BrowserAttemptedTransitionTools()
+
+    result = await WorkerRuntime(provider, tools, max_model_turns=2).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert len(provider.requests) == 1
+    assert tools.calls == ["browser_chat_exchange"]
+    receipt = result.checkpoint["target_evidence"][0]
+    assert receipt["call_id"] == "post-effect-transition"
+    assert receipt["is_error"] is True
+    assert receipt["target_effect_attempted"] is True
+    assert receipt["interaction_count"] == 1
+    assert receipt["limit_interaction_count"] == 1
+    assert receipt["target_call_budget_charge"] == 1
+    assert receipt["target_ui_transition"] == _successful_material_transition()
+    assert result.checkpoint["effect_observed"] is True
+
+    replacement_provider = Provider(
+        [[forbidden_follow_up, ModelCompleted(finish_reason="tool_calls")]]
+    )
+    replacement_tools = BrowserAttemptedTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+    assert reviewed.worker_context is not None
+    evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-post-effect-transition",
+        AgentTask(
+            id=reviewed.assignment.id,
+            objective=reviewed.assignment.objective,
+            status="failed",
+            result=result.content,
+        ),
+        {
+            "node_id": f"worker:{reviewed.assignment.id}",
+            "attempt_id": reviewed.attempt_id,
+            "payload_digest": "c" * 64,
+            "payload": {
+                "content": result.content,
+                "target_id": reviewed.worker_context.target.id,
+                "target_session_id": result.target_session_id,
+                "worker_checkpoint": result.checkpoint,
+            },
+        },
+    )
+    assert evidence is not None
+    assert evidence["target_evidence_receipts"] == {}
+    assert evidence["target_ui_transition_receipts"] == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_tool",
+        "content",
+        "arguments",
+        "order",
+        "intervening_assistant",
+        "duplicate_evidence",
+        "erased_transition",
+        "malformed_transition",
+        "non_scalar_attempt_id",
+        "missing_checkpoint_session",
+    ],
+)
+async def test_restored_surface_transition_requires_exact_transcript(mutation: str) -> None:
+    reviewed, initial = await _browser_surface_checkpoint()
+    checkpoint = json.loads(json.dumps(initial.checkpoint))
+    call_id = checkpoint["target_evidence"][0]["call_id"]
+    messages = checkpoint["messages"]
+    assistant_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+        and any(call.get("id") == call_id for call in message.get("tool_calls", []))
+    )
+    tool_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "tool" and message.get("tool_call_id") == call_id
+    )
+    if mutation == "missing_tool":
+        messages.pop(tool_index)
+    elif mutation == "content":
+        messages[tool_index]["content"] = "tampered response"
+    elif mutation == "arguments":
+        raw_call = next(
+            call
+            for call in messages[assistant_index]["tool_calls"]
+            if call.get("id") == call_id
+        )
+        raw_call["function"]["arguments"] = json.dumps({"prompt": "tampered request"})
+    elif mutation == "order":
+        tool_message = messages.pop(tool_index)
+        assistant_index = next(
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "assistant"
+            and any(call.get("id") == call_id for call in message.get("tool_calls", []))
+        )
+        messages.insert(assistant_index, tool_message)
+    elif mutation == "intervening_assistant":
+        messages.insert(
+            tool_index,
+            {"role": "assistant", "content": "unrelated checkpoint message"},
+        )
+    elif mutation == "duplicate_evidence":
+        duplicate = dict(checkpoint["target_evidence"][0])
+        duplicate.pop("target_ui_transition")
+        checkpoint["target_evidence"].append(duplicate)
+    elif mutation == "erased_transition":
+        checkpoint["target_evidence"][0].pop("target_ui_transition")
+    elif mutation == "malformed_transition":
+        receipt = checkpoint["target_evidence"][0]
+        receipt["target_ui_transition"] = None
+        receipt["receipt_sha256"] = WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+        )
+    elif mutation == "non_scalar_attempt_id":
+        receipt = checkpoint["target_evidence"][0]
+        receipt["attempt_id"] = [reviewed.attempt_id]
+        receipt["receipt_sha256"] = WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+        )
+    else:
+        checkpoint.pop("target_session_id")
+
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="tampered-checkpoint-call",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "must not execute"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    tools = BrowserSurfaceDriftTargetTools()
+
+    restored = await WorkerRuntime(provider, tools).run(reviewed, checkpoint=checkpoint)
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert provider.requests == []
+    assert tools.calls == []
+
+
+async def test_restored_surface_transition_accepts_bound_elided_tool_result() -> None:
+    reviewed = _browser_surface_handoff(attempt_id="attempt-elided-surface-transition")
+    embedded_marker = (
+        f"[durable checkpoint elided 9 characters; sha256:{'f' * 64}; bytes:99]"
+    )
+    long_content = embedded_marker + "\nreviewed target surface changed\n" + "x" * 24_000
+    call = ToolCall(
+        call_id="elided-surface-transition",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized probe"},
+    )
+
+    class LongSurfaceDriftTools(BrowserSurfaceDriftTargetTools):
+        async def invoke(self, name, context, arguments):
+            result = await super().invoke(name, context, arguments)
+            return result.model_copy(update={"content": long_content})
+
+    tools = LongSurfaceDriftTools()
+    initial = await WorkerRuntime(
+        Provider([[call, ModelCompleted(finish_reason="tool_calls")]]), tools
+    ).run(reviewed)
+
+    assert initial.error_code == "target_surface_disrupted"
+    tool_message = next(
+        message
+        for message in initial.checkpoint["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "elided-surface-transition"
+    )
+    expected_hash = hashlib.sha256(long_content.encode()).hexdigest()
+    assert f"sha256:{expected_hash}" in tool_message["content"]
+    assert f"bytes:{len(long_content.encode())}" in tool_message["content"]
+    assert tool_message["content"].count("[durable checkpoint elided") == 2
+
+    replacement_provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="forbidden-after-elided-transition",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "must not execute"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    replacement_tools = BrowserSurfaceDriftTargetTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=initial.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+    tampered = json.loads(json.dumps(initial.checkpoint))
+    tampered_tool = next(
+        message
+        for message in tampered["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "elided-surface-transition"
+    )
+    tampered_tool["content"] = tampered_tool["content"].replace(
+        f"bytes:{len(long_content.encode())}",
+        f"bytes:{len(long_content.encode()) + 1}",
+    )
+    rejected = await WorkerRuntime(Provider([]), BrowserSurfaceDriftTargetTools()).run(
+        reviewed,
+        checkpoint=tampered,
+    )
+    assert rejected.status == "quarantined"
+    assert rejected.error_code == "target_surface_transition_invalid"
+
+
+async def test_restored_surface_transition_treats_short_fake_elision_as_verbatim() -> None:
+    reviewed = _browser_surface_handoff(attempt_id="attempt-fake-elision-transition")
+    fake_digest = "f" * 64
+    content = (
+        "target response includes marker-like text "
+        f"[durable checkpoint elided 7 characters; sha256:{fake_digest}; bytes:99] "
+        "but was never compacted"
+    )
+    call = ToolCall(
+        call_id="fake-elision-transition",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized probe"},
+    )
+
+    class FakeElisionTools(BrowserSurfaceDriftTargetTools):
+        async def invoke(self, name, context, arguments):
+            result = await super().invoke(name, context, arguments)
+            return result.model_copy(update={"content": content})
+
+    initial = await WorkerRuntime(
+        Provider([[call, ModelCompleted(finish_reason="tool_calls")]]), FakeElisionTools()
+    ).run(reviewed)
+    tool_message = next(
+        message
+        for message in initial.checkpoint["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "fake-elision-transition"
+    )
+    assert tool_message["content"] == content
+
+    replacement_provider = Provider([])
+    replacement_tools = BrowserSurfaceDriftTargetTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=initial.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+@pytest.mark.parametrize(
+    "replay_marker",
+    ("idempotent_replay", "idempotent_replacement_adoption"),
+)
+async def test_material_transition_replay_retains_restore_barrier(
+    replay_marker: str,
+) -> None:
+    reviewed = _browser_surface_handoff(attempt_id=f"attempt-{replay_marker}")
+
+    class ReplayedTransitionTools(BrowserMaterialTransitionTools):
+        async def invoke(self, name, context, arguments):
+            result = await super().invoke(name, context, arguments)
+            return result.model_copy(
+                update={"metadata": result.metadata | {replay_marker: True}}
+            )
+
+    initial = await WorkerRuntime(
+        Provider(
+            [[
+                ToolCall(
+                    call_id=f"transition-{replay_marker}",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "adopt acknowledged transition"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]]
+        ),
+        ReplayedTransitionTools(),
+    ).run(reviewed)
+
+    assert initial.status == "quarantined"
+    assert initial.retry_class == "terminal"
+    (receipt,) = initial.checkpoint["target_evidence"]
+    assert receipt["target_ui_transition"] == _successful_material_transition()
+    assert receipt["acknowledged"] is False
+    assert receipt["target_effect_attempted"] is False
+    assert receipt["interaction_count"] == 0
+    assert receipt["limit_interaction_count"] == 0
+    assert receipt["target_call_budget_charge"] == 0
+    assert receipt["attempt_disposition"] == "infrastructure_failed"
+    assert receipt["candidate_outcome_projection"]["valid"] is False
+    assert receipt["candidate_outcome_projection"]["outcome"] == "unclear"
+    replacement_provider = Provider([])
+    replacement_tools = BrowserMaterialTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=initial.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+async def test_restored_surface_transition_prefers_exact_verbatim_marker_shape() -> None:
+    reviewed = _browser_surface_handoff(attempt_id="attempt-verbatim-marker-transition")
+    content = WorkerRuntime._durable_checkpoint_text("z" * 20_000, 16_384)  # noqa: SLF001
+    assert len(content) == 16_384
+    assert "durable checkpoint elided" in content
+    call = ToolCall(
+        call_id="verbatim-marker-transition",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized probe"},
+    )
+
+    class VerbatimMarkerTools(BrowserSurfaceDriftTargetTools):
+        async def invoke(self, name, context, arguments):
+            result = await super().invoke(name, context, arguments)
+            return result.model_copy(update={"content": content})
+
+    initial = await WorkerRuntime(
+        Provider([[call, ModelCompleted(finish_reason="tool_calls")]]), VerbatimMarkerTools()
+    ).run(reviewed)
+    tool_message = next(
+        message
+        for message in initial.checkpoint["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "verbatim-marker-transition"
+    )
+    assert tool_message["content"] == content
+
+    replacement_provider = Provider([])
+    replacement_tools = BrowserSurfaceDriftTargetTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=initial.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+def _successful_material_transition() -> dict[str, object]:
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": False,
+        "before_digest": _test_digest("level-one-active"),
+        "after_digest": _test_digest("level-one-complete-modal"),
+        "changed_dimensions": ["modal", "controls", "state"],
+        "added_controls": [
+            {
+                "role": "button",
+                "name": "Next Level",
+                "frame_ref": "frame-main",
+                "input_type": "button",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:level-one-complete"],
+        "reobservation_recommended": True,
+    }
+
+
+def _successful_stage_boundary_transition() -> dict[str, object]:
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": False,
+        "before_digest": _test_digest("level-one-state"),
+        "after_digest": _test_digest("level-two-state"),
+        "changed_dimensions": ["reviewed_state"],
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [
+            {
+                "name": "level",
+                "role": "progress_ordinal",
+                "before": 1,
+                "after": 2,
+                "boundary": "stage",
+            }
+        ],
+        "evidence_refs": ["browser:level-two-state"],
+        "reobservation_recommended": True,
+    }
+
+
+def _with_successful_material_transition(result: ToolResult) -> ToolResult:
+    return result.model_copy(
+        update={
+            "content": "Congratulations! You pass the level. Attack quality: 100/100.",
+            "metadata": {
+                **result.metadata,
+                "target_effect_attempted": True,
+                "target_call_budget_charge": 1,
+                "limit_interaction_count": 1,
+                "target_ui_transition": _successful_material_transition(),
+            },
+        }
+    )
+
+
+class ApiMaterialTransitionTools(GoatTargetTools):
+    async def invoke(self, name, context, arguments):
+        return _with_successful_material_transition(
+            await super().invoke(name, context, arguments)
+        )
+
+
+class BrowserMaterialTransitionTools(BrowserGoatTargetTools):
+    async def invoke(self, name, context, arguments):
+        return _with_successful_material_transition(
+            await super().invoke(name, context, arguments)
+        )
+
+
+class BrowserStageBoundaryTools(BrowserGoatTargetTools):
+    async def invoke(self, name, context, arguments):
+        result = await super().invoke(name, context, arguments)
+        return result.model_copy(
+            update={
+                "content": "The reviewed target advanced to level 2.",
+                "metadata": {
+                    **result.metadata,
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "limit_interaction_count": 1,
+                    "target_ui_transition": _successful_stage_boundary_transition(),
+                },
+            }
+        )
+
+
+class BrowserAttemptedTransitionTools(Tools):
+    def __init__(self) -> None:
+        super().__init__(effect="target_network")
+
+    def describe(self):
+        return (
+            ToolSpec(
+                name="browser_chat_exchange",
+                description="Reviewed browser exchange",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    async def invoke(self, name, context, arguments):
+        assert name == "browser_chat_exchange"
+        self.calls.append(name)
+        return ToolResult(
+            content="The target attempted delivery, then replaced the active surface.",
+            is_error=True,
+            metadata={
+                "target_effect_attempted": True,
+                "target_call_budget_charge": 1,
+                "limit_interaction_count": 1,
+                "target_session_id": "browser:context-1",
+                "target_exchanges": [
+                    {
+                        "id": "attempted-transition",
+                        "interaction": True,
+                        "request": arguments,
+                        "response": {"status": "surface-replaced"},
+                    }
+                ],
+                "target_ui_transition": _successful_material_transition(),
+            },
+        )
+
+
+def _assert_successful_transition_receipt(result, call_id: str) -> Mapping[str, object]:
+    assert result.status == "completed", result.error
+    assert result.target_session_id == "browser:context-1" or result.target_session_id == (
+        "api:session-1"
+    )
+    receipt = next(
+        item for item in result.checkpoint["target_evidence"] if item["call_id"] == call_id
+    )
+    assert receipt["is_error"] is False
+    assert receipt["acknowledged"] is True
+    assert receipt["interaction_count"] == 1
+    assert receipt["target_ui_transition"] == _successful_material_transition()
+    assert result.checkpoint["effect_observed"] is True
+    return receipt
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_successful_material_transition_stops_direct_worker_and_restarts_at_lead_boundary(
+    dynamic: bool,
+) -> None:
+    first = ToolCall(
+        call_id="material-success",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized level-one attack"},
+    )
+    second = ToolCall(
+        call_id="material-success-forbidden-follow-up",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must wait for Lead re-observation"},
+    )
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+                self.reached_second_call = False
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(first)
+                self.reached_second_call = True
+                await handler(second)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [second, ModelCompleted(finish_reason="tool_calls")],
+            ]
+        )
+    reviewed = _browser_surface_handoff(attempt_id="attempt-material-success-direct")
+    tools = BrowserMaterialTransitionTools()
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert tools.calls == ["browser_chat_exchange"]
+    assert len(provider.requests) == 1
+    if dynamic:
+        assert provider.reached_second_call is False
+    _assert_successful_transition_receipt(result, "material-success")
+
+    replacement_provider = Provider(
+        [[second, ModelCompleted(finish_reason="tool_calls")]]
+    )
+    replacement_tools = BrowserMaterialTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+    assert reviewed.worker_context is not None
+    evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-material-success",
+        AgentTask(
+            id=reviewed.assignment.id,
+            objective=reviewed.assignment.objective,
+            status="completed",
+            result=result.content,
+        ),
+        {
+            "node_id": f"worker:{reviewed.assignment.id}",
+            "attempt_id": reviewed.attempt_id,
+            "payload_digest": "b" * 64,
+            "payload": {
+                "content": result.content,
+                "target_id": reviewed.worker_context.target.id,
+                "target_session_id": result.target_session_id,
+                "worker_checkpoint": result.checkpoint,
+            },
+        },
+    )
+    assert evidence is not None
+    # Successful transition credit also requires the daemon's authoritative
+    # ToolEffectRecord; this direct runtime fixture intentionally has none.
+    assert evidence["target_evidence_receipts"] == {}
+    assert evidence["target_ui_transition_receipts"] == {}
+
+
+async def test_reviewed_stage_boundary_stops_before_same_controls_can_attack_next_level() -> None:
+    first = ToolCall(
+        call_id="stage-boundary",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized level-one attack"},
+    )
+    forbidden_follow_up = ToolCall(
+        call_id="stage-boundary-follow-up",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must wait for level-two re-observation"},
+    )
+    provider = Provider(
+        [
+            [first, ModelCompleted(finish_reason="tool_calls")],
+            [forbidden_follow_up, ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+    tools = BrowserStageBoundaryTools()
+
+    result = await WorkerRuntime(provider, tools).run(
+        _browser_surface_handoff(attempt_id="attempt-stage-boundary")
+    )
+
+    assert result.status == "completed"
+    assert len(provider.requests) == 1
+    assert tools.calls == ["browser_chat_exchange"]
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["acknowledged"] is True
+    assert receipt["target_ui_transition"] == _successful_stage_boundary_transition()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("interaction_count", 0),
+        ("limit_interaction_count", 0),
+        ("target_call_budget_charge", 0),
+    ),
+)
+async def test_restored_successful_surface_transition_requires_exact_effect_counts(
+    field: str,
+    value: int,
+) -> None:
+    call = ToolCall(
+        call_id="material-success-counts",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized level-one attack"},
+    )
+    reviewed = _browser_surface_handoff(attempt_id="attempt-material-success-counts")
+    initial = await WorkerRuntime(
+        Provider([[call, ModelCompleted(finish_reason="tool_calls")]]),
+        BrowserMaterialTransitionTools(),
+    ).run(reviewed)
+    checkpoint = json.loads(json.dumps(initial.checkpoint))
+    receipt = checkpoint["target_evidence"][0]
+    receipt[field] = value
+    receipt["receipt_sha256"] = WorkerRuntime._json_fingerprint(  # noqa: SLF001
+        {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    )
+
+    provider = Provider([])
+    tools = BrowserMaterialTransitionTools()
+    restored = await WorkerRuntime(provider, tools).run(reviewed, checkpoint=checkpoint)
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert provider.requests == []
+    assert tools.calls == []
+
+
+async def test_successful_material_transition_stops_goat_before_second_turn() -> None:
+    provider = Provider(
+        [
+            [_goat_call(0), ModelCompleted(finish_reason="tool_calls")],
+            [_goat_call(1), ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+    tools = ApiMaterialTransitionTools()
+    reviewed = goat_handoff()
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert tools.calls == ["target_request"]
+    assert len(provider.requests) == 1
+    _assert_successful_transition_receipt(result, "goat-0")
+
+    replacement_provider = Provider(
+        [[_goat_call(1), ModelCompleted(finish_reason="tool_calls")]]
+    )
+    replacement_tools = ApiMaterialTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+async def test_successful_material_transition_stops_crescendo_before_next_stage() -> None:
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="crescendo-material-0",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "stage one prompt"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+            [
+                ToolCall(
+                    call_id="crescendo-material-1",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "must wait for Lead re-observation"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+        ]
+    )
+    tools = BrowserMaterialTransitionTools()
+    reviewed = browser_crescendo_handoff()
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert tools.calls == ["browser_chat_exchange"]
+    assert len(provider.requests) == 1
+    _assert_successful_transition_receipt(result, "crescendo-material-0")
+
+    replacement_provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="crescendo-material-1",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "must not execute on restore"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    replacement_tools = BrowserMaterialTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+async def test_successful_material_transition_stops_hydra_after_first_selected_action() -> None:
+    proposal = {
+        "candidates": [
+            {"prompt": f"candidate prompt {index}", "rationale": f"reason {index}"}
+            for index in range(6)
+        ]
+    }
+    provider = Provider(
+        [[TextDelta(text=json.dumps(proposal)), ModelCompleted(finish_reason="stop")]]
+    )
+    tools = ApiMaterialTransitionTools()
+    reviewed = hydra_handoff()
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert tools.calls == ["target_request"]
+    assert len(provider.requests) == 1
+    call_id = result.checkpoint["target_evidence"][0]["call_id"]
+    receipt = _assert_successful_transition_receipt(result, call_id)
+
+    replacement_provider = Provider(
+        [[TextDelta(text=json.dumps(proposal)), ModelCompleted(finish_reason="stop")]]
+    )
+    replacement_tools = ApiMaterialTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+    assert receipt["target_ui_transition"] == _successful_material_transition()
+
+
+def _two_action_objective_transition_handoff(attempt_id: str) -> WorkerHandoff:
+    base = reviewed_handoff(interface="browser", tools=("browser_chat_exchange",))
+    gate = {
+        "id": "material-transition",
+        "actions": [
+            {"id": "level-one", "step_id": "message", "input_text": "level one attack"},
+            {
+                "id": "level-two",
+                "step_id": "message",
+                "input_text": "must wait for Lead re-observation",
+            },
+        ],
+    }
+    assignment = replace(
+        base.assignment,
+        id=(
+            "campaign/00000000-0000-0000-0000-000000000001/"
+            f"objective-gate/{attempt_id}"
+        ),
+        strategy_id="objective-phase-gate/v1",
+        strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
+        max_target_exchanges=2,
+    )
+    assert base.worker_context is not None
+    return replace(
+        base,
+        attempt_id=attempt_id,
+        assignment=assignment,
+        worker_context=replace(base.worker_context, assignment_id=assignment.id),
+    )
+
+
+def _project_transition_result(
+    reviewed: WorkerHandoff,
+    result,
+) -> Mapping[str, object]:
+    assert reviewed.worker_context is not None
+    evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        f"schedule-{reviewed.attempt_id}",
+        AgentTask(
+            id=reviewed.assignment.id,
+            objective=reviewed.assignment.objective,
+            status=result.status,
+            result=result.content,
+        ),
+        {
+            "node_id": f"worker:{reviewed.assignment.id}",
+            "attempt_id": reviewed.attempt_id,
+            "payload_digest": "d" * 64,
+            "payload": {
+                "content": result.content,
+                "target_id": reviewed.worker_context.target.id,
+                "target_session_id": result.target_session_id,
+                "worker_checkpoint": result.checkpoint,
+            },
+        },
+    )
+    assert evidence is not None
+    return evidence
+
+
+async def test_objective_gate_success_transition_stops_before_second_sealed_action() -> None:
+    reviewed = _two_action_objective_transition_handoff("attempt-objective-success")
+    tools = BrowserMaterialTransitionTools()
+
+    result = await WorkerRuntime(Provider([]), tools).run(reviewed)
+
+    assert tools.calls == ["browser_chat_exchange"]
+    (receipt,) = result.checkpoint["target_evidence"]
+    _assert_successful_transition_receipt(result, str(receipt["call_id"]))
+    evidence = _project_transition_result(reviewed, result)
+    assert evidence["target_evidence_receipts"] == {}
+    assert evidence["target_ui_transition_receipts"] == {}
+
+    replacement_tools = BrowserMaterialTransitionTools()
+    restored = await WorkerRuntime(Provider([]), replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_tools.calls == []
+
+
+async def test_objective_gate_attempted_error_transition_stops_before_second_action() -> None:
+    reviewed = _two_action_objective_transition_handoff("attempt-objective-error")
+    tools = BrowserAttemptedTransitionTools()
+
+    result = await WorkerRuntime(Provider([]), tools).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert tools.calls == ["browser_chat_exchange"]
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["is_error"] is True
+    assert receipt["target_effect_attempted"] is True
+    assert receipt["interaction_count"] == 1
+    assert receipt["target_ui_transition"] == _successful_material_transition()
+    evidence = _project_transition_result(reviewed, result)
+    assert evidence["target_evidence_receipts"] == {}
+    assert evidence["target_ui_transition_receipts"] == {}
+
+    replacement_tools = BrowserAttemptedTransitionTools()
+    restored = await WorkerRuntime(Provider([]), replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.retry_class == "terminal"
+    assert replacement_tools.calls == []

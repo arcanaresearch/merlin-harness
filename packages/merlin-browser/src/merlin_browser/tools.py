@@ -269,7 +269,10 @@ def _resolve_reviewed_element(
     matches = _matching_reviewed_elements(observation, locator, default_role=default_role)
     if len(matches) != 1:
         return None
-    return matches[0].ref, matches[0].frame_ref
+    element = matches[0]
+    if element.disabled or element.occluded or (default_role == "textbox" and element.read_only):
+        return None
+    return element.ref, element.frame_ref
 
 
 def _locator_retry_metadata(
@@ -3452,6 +3455,7 @@ def _browser_reviewed_control_states(
                     "frame_ref": element.frame_ref,
                     "disabled": element.disabled,
                     "read_only": element.read_only,
+                    "occluded": element.occluded,
                 }
             )
         states.append(state)
@@ -3473,10 +3477,12 @@ def _browser_surface_snapshot(
             "role": element.role,
             "name": element.name,
             "frame_ref": element.frame_ref,
+            "surface_scope": element.surface_scope,
             **({"input_type": element.input_type} if element.input_type is not None else {}),
             **({"max_length": element.max_length} if element.max_length is not None else {}),
             **({"disabled": True} if element.disabled else {}),
             **({"read_only": True} if element.read_only else {}),
+            **({"occluded": True} if element.occluded else {}),
         }
         for element in observation.elements[:control_limit]
     ]
@@ -3507,20 +3513,23 @@ def _browser_surface_snapshot(
     stable_controls: list[dict[str, object]] = []
     seen_unreviewed: set[str] = set()
     for element in observation.elements:
+        if element.ref not in reviewed_refs and element.surface_scope not in {
+            "status",
+            "dialog",
+            "modal",
+            "top_layer",
+        }:
+            continue
         stable_control: dict[str, object] = {
             "role": element.role.casefold(),
             "name": _browser_stable_control_name(element.name),
             "frame_ref": element.frame_ref,
-            **(
-                {"input_type": element.input_type}
-                if element.input_type is not None
-                else {}
-            ),
-            **(
-                {"max_length": element.max_length}
-                if element.max_length is not None
-                else {}
-            ),
+            "surface_scope": element.surface_scope,
+            **({"input_type": element.input_type} if element.input_type is not None else {}),
+            **({"max_length": element.max_length} if element.max_length is not None else {}),
+            **({"disabled": True} if element.disabled else {}),
+            **({"read_only": True} if element.read_only else {}),
+            **({"occluded": True} if element.occluded else {}),
         }
         stable_key = json.dumps(stable_control, sort_keys=True, separators=(",", ":"))
         if element.ref not in reviewed_refs and stable_key in seen_unreviewed:
@@ -3532,10 +3541,15 @@ def _browser_surface_snapshot(
     stable_surface = {
         "url": url,
         "origin": observation.origin,
+        "title": observation.title,
         "observation_kind": observation.kind,
-        "frame_refs": sorted({item["frame_ref"] for item in controls}),
+        # Response content can legitimately arrive in a new iframe. Only the
+        # reviewed interaction controls and reliable top-layer structures are
+        # part of the adapter surface whose frame topology can become stale.
+        "frame_refs": sorted({item["frame_ref"] for item in stable_controls}),
         "controls": stable_controls,
         "reviewed_control_states": _browser_reviewed_control_states(observation, adapter),
+        "reviewed_state": current_state,
     }
     encoded_surface = json.dumps(
         stable_surface,
@@ -3550,6 +3564,7 @@ def _browser_surface_snapshot(
         "tab_ref": observation.tab_ref,
         "url": url,
         "origin": observation.origin,
+        "title": observation.title,
         "observation_kind": observation.kind,
         "frame_refs": stable_surface["frame_refs"],
         "controls": controls,
@@ -3587,11 +3602,16 @@ def _browser_response_snapshot_signature(
                 element.max_length,
                 element.disabled,
                 element.read_only,
+                element.occluded,
+                element.surface_scope,
             )
             for element in observation.elements
         ),
         key=repr,
     )
+    # Page titles often carry unread counters or transient loading text. They
+    # remain bounded transition evidence, but do not delay response settling
+    # unless a stable structural dimension changes with them.
     return (url, observation.kind, observation.frame_ref, tuple(controls))
 
 
@@ -3618,6 +3638,10 @@ def _browser_target_ui_transition(
             element.frame_ref,
             element.input_type,
             element.max_length,
+            element.surface_scope,
+            element.disabled,
+            element.read_only,
+            element.occluded,
         )
 
     def control_value(element: ElementRef) -> dict[str, object]:
@@ -3625,10 +3649,12 @@ def _browser_target_ui_transition(
             "role": element.role,
             "name": element.name,
             "frame_ref": element.frame_ref,
+            "surface_scope": element.surface_scope,
             **({"input_type": element.input_type} if element.input_type is not None else {}),
             **({"max_length": element.max_length} if element.max_length is not None else {}),
             **({"disabled": True} if element.disabled else {}),
             **({"read_only": True} if element.read_only else {}),
+            **({"occluded": True} if element.occluded else {}),
         }
 
     before_counts = Counter(control_key(item) for item in before.elements)
@@ -3644,11 +3670,22 @@ def _browser_target_ui_transition(
         )
         for item in _matching_reviewed_elements(observation, locator, default_role=role)
     }
+    structural_control_keys = {
+        control_key(item)
+        for observation in (before, after)
+        for item in observation.elements
+        if item.surface_scope in {"status", "dialog", "modal", "top_layer"}
+    }
+    material_control_keys = reviewed_control_keys | structural_control_keys
 
     def material_count_delta(key: tuple[object, ...]) -> int:
         before_count = before_counts[key]
         after_count = after_counts[key]
-        if key not in reviewed_control_keys and before_count > 0 and after_count > 0:
+        # Standalone document controls are ordinary response chrome unless
+        # they alter a reviewed control (including hit-test occlusion). Without
+        # that structural evidence, a nonsemantic non-occluding control is not
+        # distinguishable from Copy/feedback/link actions without label rules.
+        if key not in material_control_keys:
             return 0
         return after_count - before_count
 
@@ -3662,25 +3699,74 @@ def _browser_target_ui_transition(
         for key in sorted(before_counts.keys(), key=repr)
         for _ in range(max(0, -material_count_delta(key)))
     ]
-    before_frames = {item.frame_ref for item in before.elements}
-    after_frames = {item.frame_ref for item in after.elements}
+    before_frames = set(before_surface["frame_refs"])
+    after_frames = set(after_surface["frame_refs"])
 
     by_name: dict[str, dict[str, object]] = {}
     for item in state_observations:
         name = item.get("name")
         phase = item.get("phase")
         if isinstance(name, str) and phase in {"baseline", "result"}:
-            by_name.setdefault(name, {})[str(phase)] = item.get("selected_value")
-    reviewed_state_changes = [
-        {
-            "name": name,
-            "before": phases.get("baseline"),
-            "after": phases.get("result"),
-        }
-        for name, phases in sorted(by_name.items())
-        if "baseline" in phases and "result" in phases and phases["baseline"] != phases["result"]
+            state = by_name.setdefault(name, {})
+            state[str(phase)] = item.get("selected_value")
+            for key in ("role", "success_values", "failure_values"):
+                if key in item:
+                    state[key] = item[key]
+
+    def terminal_class(phases: Mapping[str, object], value: object) -> str | None:
+        for classification, key in (("success", "success_values"), ("failure", "failure_values")):
+            candidates = phases.get(key)
+            if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+                if any(
+                    type(value) is type(candidate) and value == candidate
+                    for candidate in candidates
+                ):
+                    return classification
+        return None
+
+    reviewed_state_changes: list[dict[str, object]] = []
+    for name, phases in sorted(by_name.items()):
+        if "baseline" not in phases or "result" not in phases:
+            continue
+        before_value = phases["baseline"]
+        after_value = phases["result"]
+        if type(before_value) is type(after_value) and before_value == after_value:
+            continue
+        role = phases.get("role") if isinstance(phases.get("role"), str) else "custom"
+        before_terminal = terminal_class(phases, before_value)
+        after_terminal = terminal_class(phases, after_value)
+        terminal_crossing = before_terminal != after_terminal and (
+            before_terminal is not None or after_terminal is not None
+        )
+        boundary = (
+            after_terminal or "stage"
+            if terminal_crossing
+            else "stage"
+            if role in {"state_identity", "progress_ordinal", "terminal_status"}
+            else None
+        )
+        reviewed_state_changes.append(
+            {
+                "name": name,
+                "role": role,
+                "before": before_value,
+                "after": after_value,
+                **({"boundary": boundary} if boundary is not None else {}),
+            }
+        )
+    boundary_state_changes = [
+        item for item in reviewed_state_changes if item.get("boundary") is not None
+    ]
+    ordered_state_changes = [
+        *boundary_state_changes,
+        *(item for item in reviewed_state_changes if item.get("boundary") is None),
     ]
     url_change = {"before": before_url, "after": after_url} if before_url != after_url else None
+    title_change = (
+        {"before": before.title, "after": after.title}
+        if before.title != after.title
+        else None
+    )
     frame_change = (
         {
             "added": sorted(after_frames - before_frames),
@@ -3710,21 +3796,30 @@ def _browser_target_ui_transition(
         or added_controls
         or removed_controls
         or reviewed_control_state_changes
+        or boundary_state_changes
     )
-    adapter_stale = bool(url_change) or after.kind == "blocker" or any(
-        state.get("match_count") != 1
-        or state.get("disabled") is True
-        or state.get("read_only") is True
-        for state in after_reviewed_controls
+    adapter_stale = (
+        bool(url_change)
+        or any(item.get("role") == "state_identity" for item in boundary_state_changes)
+        or after.kind == "blocker"
+        or any(
+            state.get("match_count") != 1
+            or state.get("disabled") is True
+            or state.get("read_only") is True
+            or state.get("occluded") is True
+            for state in after_reviewed_controls
+        )
     )
     changed_dimensions = [
         name
         for name, changed in (
             ("url", url_change is not None),
+            ("title", title_change is not None),
             ("frames", frame_change is not None),
             ("observation_kind", observation_kind_change is not None),
             ("controls", bool(added_controls or removed_controls)),
             ("reviewed_controls", bool(reviewed_control_state_changes)),
+            ("reviewed_state", bool(boundary_state_changes)),
         )
         if changed
     ]
@@ -3736,6 +3831,35 @@ def _browser_target_ui_transition(
     ][:text_line_limit]
     before_digest = str(before_surface["surface_fingerprint"])
     after_digest = str(after_surface["surface_fingerprint"])
+    if boundary_state_changes:
+        before_digest = _digest_json(
+            {
+                "surface": before_digest,
+                "reviewed_state": [
+                    {
+                        "name": item["name"],
+                        "role": item["role"],
+                        "value": item["before"],
+                        "boundary": item["boundary"],
+                    }
+                    for item in boundary_state_changes
+                ],
+            }
+        )
+        after_digest = _digest_json(
+            {
+                "surface": after_digest,
+                "reviewed_state": [
+                    {
+                        "name": item["name"],
+                        "role": item["role"],
+                        "value": item["after"],
+                        "boundary": item["boundary"],
+                    }
+                    for item in boundary_state_changes
+                ],
+            }
+        )
     return {
         "schema": "merlin.target-ui-transition.v1",
         "material": material,
@@ -3745,9 +3869,7 @@ def _browser_target_ui_transition(
         "transition_digest": _digest_json([before_digest, after_digest]),
         "changed_dimensions": changed_dimensions,
         "url_change": url_change,
-        # BrowserObservation does not currently carry a document title. Keep the
-        # normalized field explicit instead of guessing from visible text.
-        "title_change": None,
+        "title_change": title_change,
         "frame_change": frame_change,
         "observation_kind_change": observation_kind_change,
         "added_controls": added_controls[:control_limit],
@@ -3755,7 +3877,8 @@ def _browser_target_ui_transition(
         "controls_truncated": (
             len(added_controls) > control_limit or len(removed_controls) > control_limit
         ),
-        "reviewed_state_changes": reviewed_state_changes[:control_limit],
+        "reviewed_state_changes": ordered_state_changes[:32],
+        "state_changes_truncated": len(ordered_state_changes) > 32,
         "reviewed_control_state_changes": reviewed_control_state_changes,
         "added_visible_text": added_visible_text if material else [],
         "evidence_refs": [
@@ -4339,6 +4462,7 @@ class BrowserChatExchangeTool:
                     "retryable": True,
                     "target_effect_attempted": False,
                     "target_call_budget_charge": 0,
+                    "target_session_id": f"browser:{session.context_id}",
                     "compatible_tab_count": compatible_tab_count,
                     "reviewed_tab_affinity": reviewed_affinity_status,
                     "reobserve_required": True,
@@ -4907,14 +5031,18 @@ class BrowserChatExchangeTool:
                     if checkpoint_contract.capture_selector.evaluation_root == "response_body"
                     else result.metadata.get("captures", {})
                 )
-                checkpoint_secret = _json_pointer_value(
-                    capture_root,
-                    checkpoint_contract.capture_selector.pointer,
-                )
-                if not isinstance(checkpoint_secret, str) or not checkpoint_secret:
-                    raise ValueError("checkpoint capture selector did not resolve to a token")
-                captured_checkpoint_secret = checkpoint_secret
-                captured_checkpoint_evidence_digest = _checkpoint_evidence_digest(response_document)
+                try:
+                    checkpoint_secret = _json_pointer_value(
+                        capture_root,
+                        checkpoint_contract.capture_selector.pointer,
+                    )
+                except ValueError:
+                    checkpoint_secret = None
+                if isinstance(checkpoint_secret, str) and checkpoint_secret:
+                    captured_checkpoint_secret = checkpoint_secret
+                    captured_checkpoint_evidence_digest = _checkpoint_evidence_digest(
+                        response_document
+                    )
         submitted = await session.snapshot(tab_ref, response_frame, step=len(executable) + 1)
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
         after = submitted
@@ -5228,7 +5356,7 @@ class BrowserChatExchangeTool:
             executable_adapter,
             checkpoint_step_documents,
         )
-        state_metadata: dict[str, object] = {}
+        state_metadata: dict[str, object] = {"target_session_id": f"browser:{session.context_id}"}
         if state_observations:
             exchange["state_observations"] = state_observations
             state_metadata["state_observations"] = state_observations
@@ -5245,8 +5373,11 @@ class BrowserChatExchangeTool:
             state_observations=state_observations,
         )
         exchange["target_ui_transition"] = target_ui_transition
-        state_metadata["target_ui_transition"] = target_ui_transition
-        if target_ui_transition["reobservation_recommended"] is True:
+        if (
+            target_ui_transition["material"] is True
+            and target_ui_transition["reobservation_recommended"] is True
+        ):
+            state_metadata["target_ui_transition"] = target_ui_transition
             state_metadata["preferred_next_tool"] = "browser_snapshot"
             state_metadata["preferred_next_tool_mode"] = "strict"
         if isolation_plan.isolated and state_transition.get("identity_match") is not True:
@@ -5271,6 +5402,7 @@ class BrowserChatExchangeTool:
                     "retryable": True,
                     "target_effect_attempted": True,
                     "target_call_budget_charge": 1,
+                    "limit_interaction_count": 1,
                     "target_exchanges": [exchange],
                 },
             )
@@ -5301,6 +5433,8 @@ class BrowserChatExchangeTool:
                         "failure_code": "checkpoint_success_unproven",
                         "retryable": True,
                         "target_effect_attempted": True,
+                        "target_call_budget_charge": 1,
+                        "limit_interaction_count": 1,
                         "target_state_transition": gate_transition,
                         "target_exchanges": [exchange],
                     },
@@ -5323,6 +5457,10 @@ class BrowserChatExchangeTool:
                             **state_metadata,
                             "failure_code": "checkpoint_capture_missing",
                             "retryable": True,
+                            "target_effect_attempted": True,
+                            "target_call_budget_charge": 1,
+                            "limit_interaction_count": 1,
+                            "target_exchanges": [exchange],
                         },
                     )
                 entry = await asyncio.to_thread(

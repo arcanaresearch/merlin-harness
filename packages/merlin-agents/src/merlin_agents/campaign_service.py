@@ -24269,6 +24269,15 @@ def _hypothesis_task_observation(
     committed: Mapping[str, object],
 ) -> Mapping[str, object] | None:
     """Derive one hypothesis lifecycle event only from committed task evidence."""
+    transition_receipts = committed.get("target_ui_transition_receipts")
+    if isinstance(transition_receipts, Mapping) and any(
+        isinstance(receipt, Mapping) for receipt in transition_receipts.values()
+    ):
+        # An authenticated error-lane surface transition is a control-plane
+        # re-observation boundary, not an attack or infrastructure outcome.
+        # Lead must refresh the target generation before ARM or hypothesis
+        # learning can interpret a later attempt.
+        return None
     hypothesis_id = contract.get("id")
     attempt_id = committed.get("attempt_id")
     if (

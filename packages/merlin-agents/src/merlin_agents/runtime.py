@@ -85,6 +85,10 @@ from .mailbox import (
 )
 from .memory import PortableMemoryRecord
 from .repeat_planning import repeat_plan_audit
+from .runtime_ui_transition import (
+    normalize_target_ui_transition,
+    strict_pre_effect_transition,
+)
 from .scheduler import RetryFailureKind
 from .specialists import AssignmentContext, WorkerAssignment, WorkerProfile
 from .strategy_controller import EvaluationUncertainty, StrategyProposal, propose_strategy_action
@@ -185,6 +189,10 @@ def _provider_retry_failure_kind(error: ModelError) -> RetryFailureKind:
 
 _DURABLE_MESSAGE_CONTENT_CHARS = 16_384
 _DURABLE_MESSAGE_REASONING_CHARS = 8_192
+_DURABLE_CHECKPOINT_ELISION_RE = re.compile(
+    r"\[durable checkpoint elided (?P<characters>\d+) characters; "
+    r"sha256:(?P<sha256>[0-9a-f]{64})(?:; bytes:(?P<bytes>\d+))?\]"
+)
 # Safety margin covering tokenizer drift plus provider continuation metadata.
 # Output tokens are reserved from the exact request limit, not a hidden fixed
 # allowance shared by heterogeneous routes.
@@ -323,6 +331,382 @@ def _target_limit_interaction_count(result: ToolResult) -> int:
     if type(explicit) is int and explicit >= 0:
         return explicit
     return _target_interaction_count(result)
+
+
+def _strict_target_surface_transition(result: ToolResult) -> dict[str, object] | None:
+    return strict_pre_effect_transition(
+        result.metadata,
+        is_error=result.is_error,
+        interaction_count=_target_interaction_count(result),
+        limit_interaction_count=_target_limit_interaction_count(result),
+    )
+
+
+def _target_evidence_effect_observed(
+    target_evidence: Mapping[str, Mapping[str, object]],
+) -> bool:
+    return any(
+        receipt.get("acknowledged") is True
+        or receipt.get("target_effect_attempted") is True
+        or (
+            type(receipt.get("interaction_count")) is int
+            and int(receipt["interaction_count"]) > 0
+        )
+        or (
+            type(receipt.get("target_call_budget_charge")) is int
+            and int(receipt["target_call_budget_charge"]) > 0
+        )
+        for receipt in target_evidence.values()
+    )
+
+
+def _target_surface_disrupted_result(
+    handoff: WorkerHandoff,
+    content: str,
+    *,
+    target_session_id: str | None,
+    checkpoint: Mapping[str, object] | None = None,
+) -> WorkerResult:
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="failed",
+        content=content,
+        error="material target surface transition requires Lead/operator re-observation",
+        error_code="target_surface_disrupted",
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
+    )
+
+
+def _target_surface_transition_result(
+    handoff: WorkerHandoff,
+    content: str,
+    *,
+    is_error: bool,
+    target_session_id: str | None,
+    checkpoint: Mapping[str, object] | None = None,
+) -> WorkerResult:
+    if is_error:
+        return _target_surface_disrupted_result(
+            handoff,
+            content,
+            target_session_id=target_session_id,
+            checkpoint=checkpoint,
+        )
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="completed",
+        content=content,
+        structured={"attempted_techniques": list(handoff.assignment.technique_ids)},
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
+    )
+
+
+def _target_surface_transition_decision(
+    handoff: WorkerHandoff,
+    result: ToolResult,
+    *,
+    target_session_id: str | None,
+) -> WorkerResult | None:
+    if not _target_surface_transition_claimed(result.metadata):
+        return None
+    transition = normalize_target_ui_transition(result.metadata)
+    if transition is None:
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="quarantined",
+            content=result.content,
+            error="target surface transition metadata is malformed",
+            error_code="target_surface_transition_invalid",
+            retry_class="terminal",
+            target_session_id=target_session_id,
+            infrastructure_failure_category="adapter_state_integrity",
+        )
+    strict_pre_effect = _strict_target_surface_transition(result)
+    result_session_id = result.metadata.get("target_session_id")
+    disposition_valid = bool(
+        isinstance(target_session_id, str)
+        and bool(target_session_id.strip())
+        and isinstance(result_session_id, str)
+        and bool(result_session_id.strip())
+        and result_session_id == target_session_id
+        and (
+            not result.is_error
+            and _target_interaction_count(result) == 1
+            or result.is_error
+            and (
+                result.metadata.get("target_effect_attempted") is True
+                or strict_pre_effect is not None
+            )
+        )
+    )
+    if not disposition_valid:
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="quarantined",
+            content=result.content,
+            error="material target surface transition lacks attributable effect state",
+            error_code="target_surface_transition_invalid",
+            retry_class="terminal",
+            target_session_id=target_session_id,
+            infrastructure_failure_category="adapter_state_integrity",
+        )
+    return _target_surface_transition_result(
+        handoff,
+        result.content,
+        is_error=result.is_error,
+        target_session_id=target_session_id,
+    )
+
+
+def _target_surface_transition_claimed(metadata: Mapping[str, object]) -> bool:
+    """Distinguish a barrier claim from the producer's ordinary nonmaterial diff."""
+
+    if "target_ui_transition" not in metadata:
+        return False
+    raw = metadata.get("target_ui_transition")
+    return not (
+        isinstance(raw, Mapping)
+        and raw.get("material") is False
+        and raw.get("reobservation_recommended") is False
+    )
+
+
+def _append_target_exchange_transcript(
+    messages: list[ChatMessage], call: ToolCall, result: ToolResult
+) -> None:
+    restored_call = _restored_target_call(messages, call.call_id)
+    if restored_call is None:
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments),
+                        },
+                    }
+                ],
+            )
+        )
+    elif restored_call != call:
+        raise ValueError("restored target call differs from its signed request")
+    restored_result = _restored_target_result(messages, call.call_id)
+    if restored_result is None:
+        messages.append(
+            ChatMessage(
+                role="tool",
+                name=call.name,
+                tool_call_id=call.call_id,
+                content=result.content,
+            )
+        )
+    elif restored_result.name != call.name or restored_result.content != result.content:
+        raise ValueError("restored target result differs from its signed response")
+
+
+def _restored_target_call(messages: Sequence[ChatMessage], call_id: str) -> ToolCall | None:
+    matches: list[Mapping[str, object]] = []
+    for message in messages:
+        if message.role != "assistant":
+            continue
+        matches.extend(
+            raw
+            for raw in (message.tool_calls or ())
+            if isinstance(raw, Mapping) and raw.get("id") == call_id
+        )
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("restored target call identity is ambiguous")
+    raw = matches[0]
+    function = raw.get("function")
+    if not isinstance(function, Mapping):
+        raise ValueError("restored target call function is malformed")
+    name = function.get("name")
+    raw_arguments = function.get("arguments")
+    if not isinstance(name, str) or not name:
+        raise ValueError("restored target call name is malformed")
+    try:
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    except json.JSONDecodeError as error:
+        raise ValueError("restored target call arguments are malformed") from error
+    if not isinstance(arguments, Mapping):
+        raise ValueError("restored target call arguments are malformed")
+    return ToolCall(call_id=call_id, name=name, arguments=dict(arguments))
+
+
+def _restored_target_result(
+    messages: Sequence[ChatMessage], call_id: str
+) -> ChatMessage | None:
+    matches = [
+        message
+        for message in messages
+        if message.role == "tool" and message.tool_call_id == call_id
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("restored target result identity is ambiguous")
+    return matches[0]
+
+
+def _checkpoint_tool_content_identity(
+    content: str,
+    *,
+    call_id: str | None = None,
+    tool_name: str | None = None,
+) -> tuple[str, int | None, bool]:
+    """Return the original digest/size represented by a durable tool message.
+
+    Durable checkpoints can retain a tool result verbatim, replace an older
+    result with a typed receipt, or bound a current long result with an elision
+    marker.  Only the latter two forms may speak for bytes that are not present
+    in the checkpoint itself, so their embedded identity is validated before it
+    is used to authenticate a target receipt.
+    """
+    try:
+        compact_receipt = json.loads(content)
+    except json.JSONDecodeError:
+        compact_receipt = None
+    if isinstance(compact_receipt, Mapping) and compact_receipt.get(
+        "type"
+    ) == "tool_result_receipt":
+        receipt_call_id = compact_receipt.get("call_id")
+        receipt_name = compact_receipt.get("name")
+        receipt_hash = compact_receipt.get("content_sha256")
+        receipt_bytes = compact_receipt.get("content_bytes")
+        if (
+            (call_id is None or receipt_call_id == call_id)
+            and (tool_name is None or receipt_name == tool_name)
+            and isinstance(receipt_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", receipt_hash)
+            and type(receipt_bytes) is int
+            and int(receipt_bytes) >= 0
+        ):
+            return receipt_hash, int(receipt_bytes), True
+
+    elisions = tuple(_DURABLE_CHECKPOINT_ELISION_RE.finditer(content))
+    generated_elisions: list[tuple[re.Match[str], int]] = []
+    for match in elisions:
+        byte_count = match.group("bytes")
+        omitted_characters = int(match.group("characters"))
+        marker = match.group(0)
+        framed_marker = f"\n{marker}\n"
+        head = max(
+            1,
+            (_DURABLE_MESSAGE_CONTENT_CHARS - len(framed_marker)) * 2 // 3,
+        )
+        tail = max(
+            1,
+            _DURABLE_MESSAGE_CONTENT_CHARS - len(framed_marker) - head,
+        )
+        original_bytes = int(byte_count) if byte_count is not None else None
+        exact_elision_shape = (
+            len(content) == _DURABLE_MESSAGE_CONTENT_CHARS
+            and omitted_characters > 0
+            and original_bytes is not None
+            and original_bytes >= _DURABLE_MESSAGE_CONTENT_CHARS + omitted_characters
+            and match.start() == head + 1
+            and match.end() == len(content) - tail - 1
+            and content[head : match.start()] == "\n"
+            and content[match.end() : match.end() + 1] == "\n"
+        )
+        if exact_elision_shape:
+            assert original_bytes is not None
+            generated_elisions.append((match, original_bytes))
+    if len(generated_elisions) == 1:
+        generated, original_bytes = generated_elisions[0]
+        return generated.group("sha256"), original_bytes, True
+    return (
+        hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        len(content.encode("utf-8")),
+        False,
+    )
+
+
+def _strict_restored_transition_evidence(
+    checkpoint: Mapping[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    """Restore transition evidence without silently dropping corrupt identities."""
+    raw = (checkpoint or {}).get("target_evidence")
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        raise ValueError("restored target evidence is malformed")
+    restored: dict[str, dict[str, object]] = {}
+    transition_claimed = False
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("restored target evidence contains a malformed receipt")
+        transition_key_present = "target_ui_transition" in item
+        # Legacy interaction-bound checkpoints predate signed receipts. They
+        # cannot assert a transition, so keep their ordinary restore behavior.
+        # Modern receipts are always verified, even if their transition key was
+        # erased, so mutation cannot silently remove an authenticated barrier.
+        if item.get("receipt_sha256") is None and not transition_key_present:
+            continue
+        call_id = item.get("call_id")
+        reference = item.get("reference")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or reference != f"target-call:{call_id}"
+        ):
+            raise ValueError("restored target evidence contains a malformed identity")
+        if call_id in restored:
+            raise ValueError("restored target evidence contains a duplicate call identity")
+        body = {key: value for key, value in item.items() if key != "receipt_sha256"}
+        if item.get("receipt_sha256") != WorkerRuntime._json_fingerprint(body):
+            raise ValueError("restored target evidence receipt hash is invalid")
+        transition_claimed = transition_claimed or transition_key_present
+        restored[call_id] = dict(item)
+    return restored if transition_claimed else {}
+
+
+def _restored_surface_transition_result(
+    handoff: WorkerHandoff,
+    checkpoint: Mapping[str, object] | None,
+) -> WorkerResult | None:
+    target_session_id = (
+        str(checkpoint["target_session_id"])
+        if checkpoint is not None and checkpoint.get("target_session_id") is not None
+        else None
+    )
+    try:
+        target_evidence = _strict_restored_transition_evidence(checkpoint)
+        if not target_evidence:
+            return None
+    except (TypeError, ValueError) as error:
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="quarantined",
+            error=f"restored target surface transition is not attributable: {error}",
+            error_code="target_surface_transition_invalid",
+            retry_class="terminal",
+            checkpoint=checkpoint,
+            target_session_id=target_session_id,
+            infrastructure_failure_category="adapter_state_integrity",
+        )
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="quarantined",
+        error=(
+            "restored target surface transition requires authoritative durable-effect "
+            "reconciliation before provider or tool execution"
+        ),
+        error_code="target_surface_transition_invalid",
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
+        infrastructure_failure_category="adapter_state_integrity",
+    )
 
 
 def _protocol_invalid_request(
@@ -1714,6 +2098,12 @@ class WorkerRuntime:
                 "checkpoint technique-attempt identity differs from the active ledger",
                 retry_class="terminal",
             )
+        restored_surface_result = _restored_surface_transition_result(
+            handoff,
+            checkpoint,
+        )
+        if restored_surface_result is not None:
+            return restored_surface_result
         strategy_values = dict(handoff.assignment.strategy_contract)
         try:
             objective_checkpoint_context = _objective_phase_checkpoint_context(strategy_values)
@@ -2748,6 +3138,15 @@ class WorkerRuntime:
             kwargs["finalization_progress"] = finalization_progress
             await self._checkpoint(*args, **kwargs)
 
+        async def write_transition_checkpoint(*args: Any, **kwargs: Any) -> None:
+            try:
+                await write_checkpoint(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - terminal in-memory receipt must win
+                _logger.exception(
+                    "material target transition checkpoint write failed; "
+                    "settling the non-retryable in-memory boundary"
+                )
+
         def record_finalization_progress(candidate: str) -> bool:
             nonlocal finalization_progress
             normalized = " ".join(candidate.split())
@@ -3648,6 +4047,48 @@ class WorkerRuntime:
                     )
                 self._record_target_evidence(target_evidence, handoff, call, result)
                 target_exchange_count += _target_limit_interaction_count(result)
+                if _target_surface_transition_claimed(result.metadata):
+                    try:
+                        _append_target_exchange_transcript(messages, call, result)
+                        target_session_id, target_session_generation = self._merge_target_session(
+                            target_session_id, target_session_generation, result
+                        )
+                    except ValueError as error:
+                        return target_adapter_quarantined(
+                            call.name,
+                            str(error),
+                            result.content,
+                            "adapter_state_integrity",
+                        )
+                    effect_observed = (
+                        effect_observed or _target_evidence_effect_observed(target_evidence)
+                    )
+                    transition_decision = _target_surface_transition_decision(
+                        handoff,
+                        result,
+                        target_session_id=target_session_id,
+                    )
+                    assert transition_decision is not None
+                    await write_transition_checkpoint(
+                        messages,
+                        usage_totals,
+                        effect_observed,
+                        control.take_consumed_ids(),
+                        action_history=action_history,
+                        provider_failures=provider_failures,
+                        elapsed_seconds=elapsed_before + time.monotonic() - started,
+                        action_count=action_count,
+                        result_repairs=result_repairs,
+                        browser_observation_streak=browser_observation_streak,
+                        browser_observation_interventions=browser_observation_interventions,
+                        turns_completed=model_turns,
+                        active_phase="target",
+                    )
+                    await close_reservation()
+                    return replace(
+                        transition_decision,
+                        checkpoint=terminal_checkpoint(),
+                    )
                 if result.is_error:
                     return await terminal_failure(
                         "Hydra-Select selected target effect failed or is incomplete",
@@ -3797,6 +4238,36 @@ class WorkerRuntime:
                 )
             self._record_target_evidence(target_evidence, handoff, pending_call, pending_result)
             target_exchange_count += _target_limit_interaction_count(pending_result)
+            if _target_surface_transition_claimed(pending_result.metadata):
+                try:
+                    _append_target_exchange_transcript(messages, pending_call, pending_result)
+                    target_session_id, target_session_generation = self._merge_target_session(
+                        target_session_id, target_session_generation, pending_result
+                    )
+                except ValueError as error:
+                    return target_adapter_quarantined(
+                        pending_call.name,
+                        str(error),
+                        pending_result.content,
+                        "adapter_state_integrity",
+                    )
+                effect_observed = (
+                    effect_observed or _target_evidence_effect_observed(target_evidence)
+                )
+                transition_decision = _target_surface_transition_decision(
+                    handoff,
+                    pending_result,
+                    target_session_id=target_session_id,
+                )
+                assert transition_decision is not None
+                await write_transition_checkpoint(
+                    messages,
+                    usage_totals,
+                    effect_observed,
+                    control.take_consumed_ids(),
+                    active_phase="target",
+                )
+                return terminal_runtime_result(transition_decision)
             if pending_result.is_error:
                 return self._failed(
                     handoff,
@@ -4538,6 +5009,15 @@ class WorkerRuntime:
                                 "adapter_state_integrity",
                             )
                         )
+                surface_transition = (
+                    normalize_target_ui_transition(result.metadata)
+                    if is_target_exchange_call
+                    else None
+                )
+                surface_transition_claimed = (
+                    is_target_exchange_call
+                    and _target_surface_transition_claimed(result.metadata)
+                )
                 probe_server_failure = (
                     _capability_probe_http_transport_failure(result, allow_status_only=probe_worker)
                     if is_target_exchange_call
@@ -4571,6 +5051,7 @@ class WorkerRuntime:
                     call, result, action_history, history_entry
                 )
                 target_interactions = _target_interaction_count(result)
+                evidence_result = result
                 if is_target_exchange_call or target_interactions:
                     evidence_result = (
                         result.model_copy(update={"is_error": True})
@@ -4587,6 +5068,28 @@ class WorkerRuntime:
                 action_history.append(history_entry)
                 action_count += 1
                 target_decision: WorkerResult | None = session_isolation_failure
+                if (
+                    is_target_exchange_call
+                    and target_decision is None
+                    and surface_transition_claimed
+                ):
+                    try:
+                        target_session_id, target_session_generation = self._merge_target_session(
+                            target_session_id, target_session_generation, result
+                        )
+                    except ValueError as error:
+                        target_decision = target_adapter_quarantined(
+                            call.name,
+                            str(error),
+                            content_so_far,
+                            self._target_adapter_failure_category(result),
+                        )
+                    else:
+                        target_decision = _target_surface_transition_decision(
+                            handoff,
+                            evidence_result,
+                            target_session_id=target_session_id,
+                        )
                 if is_target_exchange_call and target_decision is None:
                     target_decision = target_delivery_rejection_failure_result(result)
                 if is_target_exchange_call and target_decision is None:
@@ -4661,6 +5164,11 @@ class WorkerRuntime:
                             )
                         )
                 if target_decision is not None:
+                    if surface_transition_claimed:
+                        effect_observed = (
+                            effect_observed
+                            or _target_evidence_effect_observed(target_evidence)
+                        )
                     if (
                         effect in {"target_network", "target_read"}
                         and not result.is_error
@@ -4669,20 +5177,28 @@ class WorkerRuntime:
                     ):
                         effect_observed = True
                     if not probe_transport_receipt_appended:
-                        messages.append(self._assistant_tool_message("", [call]))
-                        messages.append(
-                            ChatMessage(
-                                role="tool",
-                                name=call.name,
-                                tool_call_id=call.call_id,
-                                content=(
-                                    f"{result.content}\n\n{_TARGET_EXCHANGE_BOUND_INTERVENTION}"
-                                    if finalization_only
-                                    else result.content
-                                ),
+                        if surface_transition is not None:
+                            _append_target_exchange_transcript(messages, call, result)
+                        else:
+                            messages.append(self._assistant_tool_message("", [call]))
+                            messages.append(
+                                ChatMessage(
+                                    role="tool",
+                                    name=call.name,
+                                    tool_call_id=call.call_id,
+                                    content=(
+                                        f"{result.content}\n\n{_TARGET_EXCHANGE_BOUND_INTERVENTION}"
+                                        if finalization_only
+                                        else result.content
+                                    ),
+                                )
                             )
-                        )
-                    await write_checkpoint(
+                    checkpoint_writer = (
+                        write_transition_checkpoint
+                        if surface_transition_claimed
+                        else write_checkpoint
+                    )
+                    await checkpoint_writer(
                         messages,
                         usage_totals,
                         effect_observed,
@@ -4697,6 +5213,8 @@ class WorkerRuntime:
                         turns_completed=turn_model_turns,
                         active_phase="target",
                     )
+                    if surface_transition_claimed:
+                        target_decision = terminal_runtime_result(target_decision)
                     raise _DynamicToolTerminated(target_decision)
                 if crescendo_state is not None:
                     try:
@@ -5582,6 +6100,15 @@ class WorkerRuntime:
                                 content,
                                 "adapter_state_integrity",
                             )
+                    surface_transition = (
+                        normalize_target_ui_transition(result.metadata)
+                        if is_target_exchange_call
+                        else None
+                    )
+                    surface_transition_claimed = (
+                        is_target_exchange_call
+                        and _target_surface_transition_claimed(result.metadata)
+                    )
                     probe_server_failure = (
                         _capability_probe_http_transport_failure(
                             result, allow_status_only=probe_worker
@@ -5617,6 +6144,7 @@ class WorkerRuntime:
                         call, result, action_history, history_entry
                     )
                     target_interactions = _target_interaction_count(result)
+                    evidence_result = result
                     if is_target_exchange_call or target_interactions:
                         evidence_result = (
                             result.model_copy(update={"is_error": True})
@@ -5635,6 +6163,30 @@ class WorkerRuntime:
                     action_history.append(history_entry)
                     action_count += 1
                     target_decision: WorkerResult | None = session_isolation_failure
+                    if (
+                        is_target_exchange_call
+                        and target_decision is None
+                        and surface_transition_claimed
+                    ):
+                        try:
+                            target_session_id, target_session_generation = (
+                                self._merge_target_session(
+                                    target_session_id, target_session_generation, result
+                                )
+                            )
+                        except ValueError as error:
+                            target_decision = target_adapter_quarantined(
+                                call.name,
+                                str(error),
+                                content,
+                                self._target_adapter_failure_category(result),
+                            )
+                        else:
+                            target_decision = _target_surface_transition_decision(
+                                handoff,
+                                evidence_result,
+                                target_session_id=target_session_id,
+                            )
                     if is_target_exchange_call and target_decision is None:
                         target_decision = target_delivery_rejection_failure_result(result)
                     if is_target_exchange_call and target_decision is None:
@@ -5711,6 +6263,11 @@ class WorkerRuntime:
                                 )
                             )
                     if target_decision is not None:
+                        if surface_transition_claimed:
+                            effect_observed = (
+                                effect_observed
+                                or _target_evidence_effect_observed(target_evidence)
+                            )
                         if (
                             effect in {"target_network", "target_read"}
                             and not result.is_error
@@ -5719,15 +6276,23 @@ class WorkerRuntime:
                         ):
                             effect_observed = True
                         if not probe_transport_receipt_appended:
-                            messages.append(
-                                ChatMessage(
-                                    role="tool",
-                                    name=call.name,
-                                    tool_call_id=call.call_id,
-                                    content=result.content,
+                            if surface_transition is not None:
+                                _append_target_exchange_transcript(messages, call, result)
+                            else:
+                                messages.append(
+                                    ChatMessage(
+                                        role="tool",
+                                        name=call.name,
+                                        tool_call_id=call.call_id,
+                                        content=result.content,
+                                    )
                                 )
-                            )
-                        await write_checkpoint(
+                        checkpoint_writer = (
+                            write_transition_checkpoint
+                            if surface_transition_claimed
+                            else write_checkpoint
+                        )
+                        await checkpoint_writer(
                             messages,
                             usage_totals,
                             effect_observed,
@@ -5742,6 +6307,8 @@ class WorkerRuntime:
                             turns_completed=model_turns,
                             active_phase="target",
                         )
+                        if surface_transition_claimed:
+                            target_decision = terminal_runtime_result(target_decision)
                         return target_decision
                     if crescendo_state is not None:
                         try:
@@ -6459,7 +7026,7 @@ class WorkerRuntime:
             return self._checkpoint_payload(
                 messages,
                 {},
-                bool(target_evidence),
+                _target_evidence_effect_observed(target_evidence),
                 action_count=len(target_evidence),
                 elapsed_seconds=elapsed_before + time.monotonic() - started,
                 active_phase="target",
@@ -6567,6 +7134,7 @@ class WorkerRuntime:
                 )
             self._record_target_evidence(target_evidence, handoff, call, result)
             try:
+                _append_target_exchange_transcript(messages, call, result)
                 target_session_id, target_session_generation = self._merge_target_session(
                     target_session_id,
                     target_session_generation,
@@ -6582,20 +7150,41 @@ class WorkerRuntime:
                     checkpoint=checkpoint_payload(),
                     target_session_id=target_session_id,
                 )
-            await self._checkpoint(
+            surface_transition_claimed = _target_surface_transition_claimed(result.metadata)
+            checkpoint_arguments = (
                 messages,
                 {},
-                True,
+                _target_evidence_effect_observed(target_evidence),
                 (),
-                action_count=len(target_evidence),
-                elapsed_seconds=elapsed_before + time.monotonic() - started,
-                active_phase="target",
-                target_session_id=target_session_id,
-                target_session_generation=target_session_generation,
-                technique_attempt_id=handoff.technique_attempt_id,
-                target_evidence=tuple(target_evidence.values()),
-                provider_model=handoff.assignment.provider_model or handoff.model,
             )
+            checkpoint_keywords = {
+                "action_count": len(target_evidence),
+                "elapsed_seconds": elapsed_before + time.monotonic() - started,
+                "active_phase": "target",
+                "target_session_id": target_session_id,
+                "target_session_generation": target_session_generation,
+                "technique_attempt_id": handoff.technique_attempt_id,
+                "target_evidence": tuple(target_evidence.values()),
+                "provider_model": handoff.assignment.provider_model or handoff.model,
+            }
+            if not surface_transition_claimed:
+                await self._checkpoint(*checkpoint_arguments, **checkpoint_keywords)
+            else:
+                try:
+                    await self._checkpoint(*checkpoint_arguments, **checkpoint_keywords)
+                except Exception:  # noqa: BLE001 - preserve the sealed in-memory boundary
+                    _logger.exception(
+                        "objective gate material transition checkpoint write failed; "
+                        "settling the non-retryable in-memory boundary"
+                    )
+            if surface_transition_claimed:
+                transition_decision = _target_surface_transition_decision(
+                    handoff,
+                    result,
+                    target_session_id=target_session_id,
+                )
+                assert transition_decision is not None
+                return replace(transition_decision, checkpoint=checkpoint_payload())
             if result.is_error:
                 return WorkerResult(
                     task_id=handoff.assignment.id,
@@ -6933,8 +7522,12 @@ class WorkerRuntime:
     def _durable_checkpoint_text(value: str, limit: int) -> str:
         if len(value) <= limit:
             return value
-        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-        marker = f"\n[durable checkpoint elided {len(value) - limit} characters; sha256:{digest}]\n"
+        encoded = value.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        marker = (
+            f"\n[durable checkpoint elided {len(value) - limit} characters; "
+            f"sha256:{digest}; bytes:{len(encoded)}]\n"
+        )
         head = max(1, (limit - len(marker)) * 2 // 3)
         tail = max(1, limit - len(marker) - head)
         return value[:head] + marker + value[-tail:]
@@ -8034,7 +8627,9 @@ class WorkerRuntime:
         call: ToolCall,
         result: ToolResult,
     ) -> None:
-        if cls._is_idempotent_result_replay(result):
+        idempotent_replay = cls._is_idempotent_result_replay(result)
+        normalized_ui_transition = normalize_target_ui_transition(result.metadata)
+        if idempotent_replay and normalized_ui_transition is None:
             return
         metadata_digest = cls._json_fingerprint(cls._semantic_value(result.metadata))
         exchanges = result.metadata.get(
@@ -8048,7 +8643,8 @@ class WorkerRuntime:
             and item.get("cleanup") is not True
         ]
         acknowledged = (
-            not result.is_error
+            not idempotent_replay
+            and not result.is_error
             and isinstance(result.metadata.get("target_session_id"), str)
             and sum(
                 1
@@ -8061,7 +8657,9 @@ class WorkerRuntime:
         )
         explicit_limit_count = result.metadata.get("limit_interaction_count")
         limit_interaction_count = (
-            explicit_limit_count
+            0
+            if idempotent_replay
+            else explicit_limit_count
             if type(explicit_limit_count) is int and explicit_limit_count >= 0
             else (
                 sum(
@@ -8081,7 +8679,9 @@ class WorkerRuntime:
         )
         explicit_target_call_charge = result.metadata.get("target_call_budget_charge")
         target_call_budget_charge = (
-            explicit_target_call_charge
+            0
+            if idempotent_replay
+            else explicit_target_call_charge
             if type(explicit_target_call_charge) is int and explicit_target_call_charge >= 0
             else sum(
                 1
@@ -8119,8 +8719,14 @@ class WorkerRuntime:
             "limit_interaction_count": limit_interaction_count,
             "target_call_budget_charge": target_call_budget_charge,
         }
-        attempt_disposition = cls._target_attempt_disposition(
-            result.metadata, is_error=result.is_error
+        if idempotent_replay:
+            receipt_body["target_effect_attempted"] = False
+        elif type(result.metadata.get("target_effect_attempted")) is bool:
+            receipt_body["target_effect_attempted"] = result.metadata["target_effect_attempted"]
+        attempt_disposition = (
+            "infrastructure_failed"
+            if idempotent_replay
+            else cls._target_attempt_disposition(result.metadata, is_error=result.is_error)
         )
         receipt_body["attempt_disposition"] = attempt_disposition
         disposition_reason = result.metadata.get("disposition_reason")
@@ -8172,6 +8778,8 @@ class WorkerRuntime:
             if attempt_disposition != "valid" and state_transition.get("outcome") != "unclear":
                 state_transition = {**state_transition, "outcome": "unclear"}
             receipt_body["target_state_transition"] = state_transition
+        if normalized_ui_transition is not None:
+            receipt_body["target_ui_transition"] = normalized_ui_transition
         if attempt_disposition == "valid":
             authoritative_outcome, authoritative_conflict = cls._target_authoritative_outcome(
                 result.metadata

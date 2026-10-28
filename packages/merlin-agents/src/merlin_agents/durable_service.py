@@ -36,7 +36,9 @@ from merlin_contracts import (
     ScheduleProjection,
     SwarmRequest,
     TextDelta,
+    ToolCall,
     ToolInteractionRole,
+    ToolResult,
     candidate_evidence_digest,
     candidate_id_for_identity,
     project_candidate_outcome,
@@ -72,7 +74,17 @@ from .mailbox import (
     render_mail,
 )
 from .memory import PortableMemoryProvider, PortableMemoryQuery, PortableMemoryScope
-from .runtime import WorkerControl, WorkerHandoff, WorkerResult, WorkerRuntime, WorkerTools
+from .runtime import (
+    WorkerControl,
+    WorkerHandoff,
+    WorkerResult,
+    WorkerRuntime,
+    WorkerTools,
+    _checkpoint_tool_content_identity,
+    _target_interaction_count,
+    _target_limit_interaction_count,
+)
+from .runtime_ui_transition import normalize_target_ui_transition
 
 if TYPE_CHECKING:
     from .judgments import RefusalJudge
@@ -1434,6 +1446,20 @@ class DurableAgentService:
             ),
             None,
         )
+        return await self._committed_task_evidence_with_authority(
+            schedule_id,
+            task,
+            row,
+        )
+
+    async def _committed_task_evidence_with_authority(
+        self,
+        schedule_id: str,
+        task: AgentTask,
+        row: Mapping[str, object] | None,
+    ) -> Mapping[str, object] | None:
+        """Bind one stored result to its replacement lineage and durable effects."""
+
         effects: Sequence[object] = ()
         attempt_id = row.get("attempt_id") if isinstance(row, Mapping) else None
         evidence_attempt_ids: tuple[str, ...] = ()
@@ -1483,13 +1509,32 @@ class DurableAgentService:
         valid_attempt_id_set = frozenset(valid_attempt_ids)
         payload = row.get("payload")
         checkpoint = payload.get("worker_checkpoint") if isinstance(payload, Mapping) else None
+        expected_candidate_id = _expected_task_candidate_id(
+            task,
+            payload if isinstance(payload, Mapping) else {},
+        )
         messages = checkpoint.get("messages") if isinstance(checkpoint, Mapping) else None
+        ordered_tool_pairs = _ordered_checkpoint_tool_pairs(messages)
+        terminal_ordered_target_ids = {
+            call_id
+            for call_id, (_, result_index, tool_name) in ordered_tool_pairs.items()
+            if tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+            and not any(
+                later_result_index > result_index
+                and later_tool in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+                for _, (_, later_result_index, later_tool) in ordered_tool_pairs.items()
+            )
+        }
         target_call_ids: set[str] = set()
         completed_call_ids: set[str] = set()
         tool_call_tools: dict[str, str] = {}
         target_call_documents: dict[str, object] = {}
         request_hashes: dict[str, str] = {}
         content_hashes: dict[str, str] = {}
+        content_bytes: dict[str, int | None] = {}
+        compacted_content_hashes: dict[str, str] = {}
+        compacted_content_bytes: dict[str, int | None] = {}
+        compact_receipt_shaped_documents: dict[str, Mapping[str, object]] = {}
         target_delivery_receipts: dict[str, Mapping[str, object]] = {}
         durably_acknowledged_receipt_ids: set[str] = set()
         probe_effect_calls: dict[str, str] = {}
@@ -1528,36 +1573,38 @@ class DurableAgentService:
                     completed_call_ids.add(call_id)
                     content = message.get("content")
                     if isinstance(content, str):
+                        content_hash, content_size, compacted_identity = (
+                            _checkpoint_tool_content_identity(
+                                content,
+                                call_id=call_id,
+                                tool_name=tool_call_tools.get(call_id),
+                            )
+                        )
+                        encoded_content = content.encode("utf-8")
+                        content_hashes[call_id] = hashlib.sha256(encoded_content).hexdigest()
+                        content_bytes[call_id] = len(encoded_content)
+                        if compacted_identity:
+                            compacted_content_hashes[call_id] = content_hash
+                            compacted_content_bytes[call_id] = content_size
                         try:
                             compact_receipt = json.loads(content)
                         except json.JSONDecodeError:
                             compact_receipt = None
-                        compact_hash = (
-                            compact_receipt.get("content_sha256")
-                            if isinstance(compact_receipt, Mapping)
+                        is_compact_receipt = (
+                            compacted_identity
+                            and isinstance(compact_receipt, Mapping)
                             and compact_receipt.get("type") == "tool_result_receipt"
-                            else None
                         )
-                        elided = re.search(
-                            r"\[durable checkpoint elided \d+ characters; "
-                            r"sha256:([0-9a-f]{64})\]",
-                            content,
-                        )
-                        content_hashes[call_id] = (
-                            str(compact_hash)
-                            if isinstance(compact_hash, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", compact_hash)
-                            else elided.group(1)
-                            if elided is not None
-                            else hashlib.sha256(content.encode()).hexdigest()
-                        )
-                        if elided is None and compact_hash is None:
+                        is_elided = compacted_identity and not is_compact_receipt
+                        if is_compact_receipt:
+                            compact_receipt_shaped_documents[call_id] = dict(compact_receipt)
+                        if not is_elided and not is_compact_receipt:
                             target_call_documents[call_id] = (
                                 content if compact_receipt is None else compact_receipt
                             )
                     elif content is None or isinstance(content, (bool, int, float, list, dict)):
                         target_call_documents[call_id] = content
-        target_evidence_receipts = _validated_target_evidence_receipts(
+        validated_target_evidence_receipts = _validated_target_evidence_receipts(
             checkpoint.get("target_evidence") if isinstance(checkpoint, Mapping) else None,
             task=task,
             attempt_id=attempt_id,
@@ -1565,8 +1612,59 @@ class DurableAgentService:
             payload=payload if isinstance(payload, Mapping) else {},
             request_hashes=request_hashes,
             content_hashes=content_hashes,
+            content_bytes=content_bytes,
+            compacted_content_hashes=compacted_content_hashes,
+            compacted_content_bytes=compacted_content_bytes,
         )
-        for effect in durable_effects:
+        target_ui_transition_receipts = {
+            call_id: receipt
+            for call_id, receipt in validated_target_evidence_receipts.items()
+            if (
+                transition := normalize_target_ui_transition(
+                    {"target_ui_transition": receipt.get("target_ui_transition")}
+                )
+            )
+            is not None
+            and receipt.get("target_ui_transition") == transition
+            and call_id in terminal_ordered_target_ids
+            and call_id in request_hashes
+            and call_id in completed_call_ids
+            and receipt.get("is_error") is True
+            and (
+                receipt.get("target_effect_attempted") is True
+                or (
+                    transition["adapter_stale"] is True
+                    and receipt.get("target_effect_attempted") is False
+                    and type(receipt.get("interaction_count")) is int
+                    and receipt.get("interaction_count") == 0
+                    and type(receipt.get("limit_interaction_count")) is int
+                    and receipt.get("limit_interaction_count") == 0
+                    and type(receipt.get("target_call_budget_charge")) is int
+                    and receipt.get("target_call_budget_charge") == 0
+                )
+            )
+        }
+        target_evidence_receipts = {
+            call_id: receipt
+            for call_id, receipt in validated_target_evidence_receipts.items()
+            if receipt.get("is_error") is False
+        }
+        for call_id, document in compact_receipt_shaped_documents.items():
+            receipt = validated_target_evidence_receipts.get(call_id)
+            if (
+                receipt is not None
+                and content_hashes.get(call_id) == receipt.get("content_sha256")
+                and content_bytes.get(call_id) == receipt.get("content_bytes")
+            ):
+                # The target itself may legitimately return JSON that resembles
+                # the checkpoint compaction envelope. Preserve it when the
+                # authenticated receipt binds the bytes actually in transcript;
+                # generated compaction envelopes bind different original bytes.
+                target_call_documents[call_id] = document
+        transition_effect_indices: dict[str, int] = {}
+        target_effect_indices: list[int] = []
+        target_effect_call_counts: dict[str, int] = {}
+        for effect_index, effect in enumerate(durable_effects):
             call_id = getattr(effect, "call_id", None)
             effect_metadata = getattr(effect, "result_metadata", None)
             interaction_role = (
@@ -1591,6 +1689,18 @@ class DurableAgentService:
             if (
                 isinstance(call_id, str)
                 and call_id
+                and is_target_exchange
+                and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
+                and getattr(effect, "agent_id", None) == task.id
+                and str(getattr(effect, "attempt_id", "")) in valid_attempt_id_set
+            ):
+                target_effect_indices.append(effect_index)
+                target_effect_call_counts[call_id] = (
+                    target_effect_call_counts.get(call_id, 0) + 1
+                )
+            if (
+                isinstance(call_id, str)
+                and call_id
                 and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
                 and getattr(effect, "agent_id", None) == task.id
                 and str(getattr(effect, "attempt_id", "")) in valid_attempt_id_set
@@ -1604,9 +1714,72 @@ class DurableAgentService:
             ):
                 probe_effect_calls[call_id] = str(effect.tool_name)
             receipt = target_evidence_receipts.get(call_id) if is_target_exchange else None
+            transition_receipt = (
+                target_ui_transition_receipts.get(call_id) if is_target_exchange else None
+            )
             arguments = getattr(effect, "arguments_payload", None)
             content = getattr(effect, "result_content", None)
             metadata = getattr(effect, "result_metadata", None)
+            receipt_transition = (
+                normalize_target_ui_transition(
+                    {"target_ui_transition": receipt.get("target_ui_transition")}
+                )
+                if receipt is not None
+                else None
+            )
+            transition_success_binding_invalid = bool(
+                receipt_transition is not None
+                and (
+                    getattr(effect, "effect", None) != "target_network"
+                    or not isinstance(metadata, Mapping)
+                    or metadata.get("target_session_id")
+                    != receipt.get("target_session_id")
+                    or normalize_target_ui_transition(metadata) != receipt_transition
+                    or receipt.get("acknowledged") is not True
+                    or receipt.get("interaction_count") != 1
+                    or receipt.get("limit_interaction_count") != 1
+                    or receipt.get("target_call_budget_charge") != 1
+                    or not _effect_receipt_counters_match(effect, receipt)
+                    or not _effect_receipt_outcome_matches(
+                        effect,
+                        receipt,
+                        expected_candidate_id=expected_candidate_id,
+                    )
+                )
+            )
+            if (
+                transition_receipt is not None
+                and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
+                and getattr(effect, "agent_id", None) == task.id
+                and str(getattr(effect, "attempt_id", ""))
+                == transition_receipt.get("attempt_id")
+                and getattr(effect, "campaign_id", None)
+                == transition_receipt.get("campaign_id")
+                and getattr(effect, "target_id", None) == transition_receipt.get("target_id")
+                and getattr(effect, "tool_name", None) == transition_receipt.get("tool_name")
+                and getattr(effect, "effect", None) == "target_network"
+                and isinstance(arguments, Mapping)
+                and isinstance(content, str)
+                and isinstance(metadata, Mapping)
+                and getattr(effect, "result_is_error", None)
+                is transition_receipt.get("is_error")
+                and metadata.get("target_session_id")
+                == transition_receipt.get("target_session_id")
+                and WorkerRuntime._action_fingerprint(  # noqa: SLF001
+                    str(effect.tool_name), arguments
+                )
+                == transition_receipt.get("request_sha256")
+                and hashlib.sha256(content.encode()).hexdigest()
+                == transition_receipt.get("content_sha256")
+                and WorkerRuntime._json_fingerprint(  # noqa: SLF001
+                    WorkerRuntime._semantic_value(metadata)  # noqa: SLF001
+                )
+                == transition_receipt.get("metadata_sha256")
+                and normalize_target_ui_transition(metadata)
+                == transition_receipt.get("target_ui_transition")
+                and _effect_receipt_counters_match(effect, transition_receipt)
+            ):
+                transition_effect_indices[str(call_id)] = effect_index
             if (
                 receipt is None
                 or str(getattr(effect, "state", "")) not in {"acknowledged", "reconciled"}
@@ -1619,6 +1792,7 @@ class DurableAgentService:
                 or not isinstance(content, str)
                 or not isinstance(metadata, Mapping)
                 or getattr(effect, "result_is_error", None) is not False
+                or transition_success_binding_invalid
                 or WorkerRuntime._action_fingerprint(  # noqa: SLF001
                     str(effect.tool_name), arguments
                 )
@@ -1631,6 +1805,10 @@ class DurableAgentService:
             ):
                 continue
             durably_acknowledged_receipt_ids.add(str(call_id))
+            if normalize_target_ui_transition(
+                {"target_ui_transition": receipt.get("target_ui_transition")}
+            ) is not None:
+                transition_effect_indices[str(call_id)] = effect_index
             try:
                 target_call_documents[str(call_id)] = json.loads(content)
             except json.JSONDecodeError:
@@ -1638,11 +1816,29 @@ class DurableAgentService:
             delivery = metadata.get("target_delivery_receipt")
             if isinstance(delivery, Mapping):
                 target_delivery_receipts[str(call_id)] = dict(delivery)
+        latest_target_effect_index = max(target_effect_indices, default=-1)
+        target_ui_transition_receipts = {
+            call_id: receipt
+            for call_id, receipt in target_ui_transition_receipts.items()
+            if transition_effect_indices.get(call_id) == latest_target_effect_index
+            and target_effect_call_counts.get(call_id) == 1
+        }
         target_evidence_receipts = {
             call_id: receipt
             for call_id, receipt in target_evidence_receipts.items()
             if call_id in target_call_ids
             and (receipt.get("acknowledged") is True or call_id in durably_acknowledged_receipt_ids)
+            and (
+                normalize_target_ui_transition(
+                    {"target_ui_transition": receipt.get("target_ui_transition")}
+                )
+                is None
+                or (
+                    call_id in terminal_ordered_target_ids
+                    and transition_effect_indices.get(call_id) == latest_target_effect_index
+                    and target_effect_call_counts.get(call_id) == 1
+                )
+            )
         }
         completed_target_call_ids = target_call_ids & completed_call_ids
         if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("target_evidence"), list):
@@ -1676,6 +1872,7 @@ class DurableAgentService:
                 if call_id in target_call_documents
             },
             "target_evidence_receipts": target_evidence_receipts,
+            "target_ui_transition_receipts": target_ui_transition_receipts,
             "target_delivery_receipts": {
                 call_id: target_delivery_receipts[call_id]
                 for call_id in sorted(completed_target_call_ids)
@@ -1768,7 +1965,11 @@ class DurableAgentService:
             )
             tasks.append(task)
             strategies[task.id] = assignment.strategy_id
-            committed = self._committed_task_evidence(schedule_id, task, results.get(node_id))
+            committed = await self._committed_task_evidence_with_authority(
+                schedule_id,
+                task,
+                results.get(node_id),
+            )
             if committed is not None:
                 evidence[task.id] = committed
         progress: list[tuple[object, ...]] = []
@@ -3358,6 +3559,10 @@ class DurableAgentService:
             )
             if result.error_code == "target_adapter_unhealthy":
                 reason = f"target adapter unhealthy: {reason}"
+            elif result.error_code == "target_surface_disrupted":
+                reason = result.error or (
+                    "material target surface transition requires Lead/operator re-observation"
+                )
             elif result.infrastructure_failure_category is not None:
                 reason = (
                     "infrastructure unavailable "
@@ -3374,11 +3579,25 @@ class DurableAgentService:
                 or result.reasoning
                 or result.usage
                 or result.infrastructure_failure_category
+                or result.error_code == "target_surface_disrupted"
             ):
                 stored_worker_checkpoint = await self._latest_worker_checkpoint(
                     live.id, handle.node_id
                 )
-                if stored_worker_checkpoint is not None:
+                terminal_transition_checkpoint = (
+                    result.checkpoint
+                    if result.error_code == "target_surface_disrupted"
+                    and result.retry_class == RetryClass.TERMINAL.value
+                    and isinstance(result.checkpoint, Mapping)
+                    else None
+                )
+                if terminal_transition_checkpoint is not None:
+                    # A material transition can be observed after the last
+                    # successfully stored partial.  Its complete in-memory
+                    # assistant+tool receipt is the terminal safety boundary;
+                    # never overwrite it with an older resumable checkpoint.
+                    worker_checkpoint = terminal_transition_checkpoint
+                elif stored_worker_checkpoint is not None:
                     worker_checkpoint = stored_worker_checkpoint
                 elif worker_checkpoint is None and isinstance(result.checkpoint, Mapping):
                     # In-memory and lightweight stores may not expose partial-result
@@ -3399,6 +3618,8 @@ class DurableAgentService:
                             "usage": result.usage,
                             "error": reason,
                             "partial": True,
+                            "target_id": assignment.target_profile_id,
+                            "target_session_id": result.target_session_id,
                             "infrastructure_failure_category": (
                                 result.infrastructure_failure_category
                             ),
@@ -3728,6 +3949,168 @@ class DurableAgentService:
                 await asyncio.gather(*pending, return_exceptions=True)
             raise
 
+    async def _material_transition_effect_outcome(
+        self,
+        live: _LiveSchedule,
+        assignment: WorkerAssignment,
+        attempt_ids: Sequence[str],
+    ) -> tuple[object | None, WorkerResult, str | None] | None:
+        effect_loader = getattr(self._tools, "list_effects_for_attempt", None)
+        if not callable(effect_loader):
+            return None
+        loaded_effects: list[object] = []
+        for attempt_id in dict.fromkeys(attempt_ids):
+            loaded_effects.extend(await effect_loader(attempt_id))
+        effects = tuple(loaded_effects)
+        worker_context = live.worker_contexts.get(assignment.id)
+        profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or live.profiles.get(
+            assignment.id
+        )
+        if profile is None and worker_context is not None:
+            profile = WorkerProfile(
+                assignment.profile_id,
+                int(worker_context.profile.id.rsplit("@", 1)[1]),
+                "",
+                worker_context.profile.content,
+                frozenset(),
+            )
+        if profile is not None and worker_context is not None:
+            profile = replace(profile, instructions=worker_context.profile.content)
+        sealed_arm = _sealed_arm_contract(assignment.objective)
+        raw_candidate_identity = _sealed_assignment_candidate_identity(
+            assignment,
+            sealed_arm=sealed_arm,
+        )
+        candidate_identity = (
+            CompletionCandidateIdentity(**raw_candidate_identity)
+            if raw_candidate_identity is not None
+            else None
+        )
+        target_effects: list[object] = []
+        projected_effects: list[tuple[object, WorkerResult, str | None]] = []
+        for effect in effects:
+            metadata = getattr(effect, "result_metadata", None)
+            interaction_role = (
+                metadata.get("interaction_role") if isinstance(metadata, Mapping) else None
+            )
+            tool_name = getattr(effect, "tool_name", None)
+            is_target_exchange = (
+                interaction_role == ToolInteractionRole.TARGET_EXCHANGE.value
+                or interaction_role is None
+                and tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+            )
+            if getattr(effect, "effect", None) != "target_network" or not is_target_exchange:
+                continue
+            target_effects.append(effect)
+            if not isinstance(metadata, Mapping) or "target_ui_transition" not in metadata:
+                continue
+            if normalize_target_ui_transition(metadata) is None:
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error="durable target effect contains an invalid UI transition claim",
+                            error_code="target_surface_transition_invalid",
+                            retry_class=RetryClass.TERMINAL.value,
+                            target_session_id=(
+                                str(metadata["target_session_id"])
+                                if isinstance(metadata.get("target_session_id"), str)
+                                and str(metadata["target_session_id"]).strip()
+                                else None
+                            ),
+                            infrastructure_failure_category="adapter_state_integrity",
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if profile is None:
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error="durable material target transition lacks worker identity",
+                            error_code="target_surface_transition_invalid",
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category="adapter_state_integrity",
+                        ),
+                        None,
+                    )
+                )
+                continue
+            technique_attempt_id = (
+                str(metadata["technique_attempt_id"])
+                if isinstance(metadata, Mapping)
+                and isinstance(metadata.get("technique_attempt_id"), str)
+                and metadata["technique_attempt_id"]
+                else None
+            )
+            projected = _material_transition_effect_result(
+                WorkerHandoff(
+                    live.session_id,
+                    self._workspace_root,
+                    assignment.provider_model or self._model,
+                    profile,
+                    assignment,
+                    (),
+                    worker_context,
+                    str(getattr(effect, "attempt_id", "")),
+                    technique_attempt_id=technique_attempt_id,
+                    candidate_identity=candidate_identity,
+                    schedule_id=live.id,
+                ),
+                effect,
+            )
+            if projected is None:
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error="durable target transition could not be authenticated",
+                            error_code="target_surface_transition_invalid",
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category="adapter_state_integrity",
+                        ),
+                        None,
+                    )
+                )
+            else:
+                projected_effects.append((effect, *projected))
+        if len(projected_effects) > 1:
+            return (
+                None,
+                WorkerResult(
+                    task_id=assignment.id,
+                    status="quarantined",
+                    error="multiple durable material target transitions are ambiguous",
+                    error_code="target_surface_transition_ambiguous",
+                    retry_class=RetryClass.TERMINAL.value,
+                    infrastructure_failure_category="adapter_state_integrity",
+                ),
+                None,
+            )
+        if projected_effects and target_effects[-1] is not projected_effects[0][0]:
+            effect = projected_effects[0][0]
+            return (
+                effect,
+                WorkerResult(
+                    task_id=assignment.id,
+                    status="quarantined",
+                    error="durable target activity continued after a material UI transition",
+                    error_code="target_surface_transition_invalid",
+                    retry_class=RetryClass.TERMINAL.value,
+                    infrastructure_failure_category="adapter_state_integrity",
+                ),
+                None,
+            )
+        return projected_effects[0] if projected_effects else None
+
     async def _crashed_worker_outcome(
         self,
         live: _LiveSchedule,
@@ -3784,6 +4167,31 @@ class DurableAgentService:
             )
             return None
         lease = SimpleNamespace(id=str(row["id"]), generation=int(row["generation"]))
+        projected = await self._material_transition_effect_outcome(
+            live,
+            assignment,
+            (lease.id,),
+        )
+        if projected is not None:
+            effect, transition_result, technique_attempt_id = projected
+            await self._journal_lifecycle(
+                live.id,
+                "worker_crash_transition_recovered",
+                {
+                    "node_id": node_id,
+                    "attempt_id": lease.id,
+                    "call_id": getattr(effect, "call_id", None),
+                    "status": transition_result.status,
+                },
+            )
+            return (
+                handle,
+                lease,
+                transition_result,
+                None,
+                (),
+                technique_attempt_id,
+            )
         return (
             handle,
             lease,
@@ -4549,6 +4957,43 @@ class DurableAgentService:
                     # an otherwise authorized target attempt.
                     target_effects_blocked = False
                     lineage_loader = getattr(self._store, "replacement_attempt_lineage", None)
+                    replacement_lineage = (
+                        (lease.id,)
+                        if lineage_loader is None
+                        else tuple(await self._call(lineage_loader, lease.id))
+                    )
+                    inherited_transition = await self._material_transition_effect_outcome(
+                        live,
+                        assignment,
+                        tuple(
+                            attempt_id
+                            for attempt_id in replacement_lineage
+                            if str(attempt_id) != str(lease.id)
+                        ),
+                    )
+                    if inherited_transition is not None:
+                        effect, transition_result, inherited_technique_attempt_id = (
+                            inherited_transition
+                        )
+                        await self._journal_lifecycle(
+                            live.id,
+                            "worker_restart_transition_recovered",
+                            {
+                                "node_id": node_id,
+                                "attempt_id": str(lease.id),
+                                "source_attempt_id": getattr(effect, "attempt_id", None),
+                                "call_id": getattr(effect, "call_id", None),
+                                "status": transition_result.status,
+                            },
+                        )
+                        return (
+                            handle,
+                            lease,
+                            transition_result,
+                            memory_query,
+                            (),
+                            inherited_technique_attempt_id,
+                        )
                     effect_attempt_lineage = (
                         ()
                         if assignment.execution_stage is None
@@ -4556,7 +5001,7 @@ class DurableAgentService:
                         and not _is_capability_probe(assignment)
                         else (lease.id,)
                         if lineage_loader is None
-                        else tuple(await self._call(lineage_loader, lease.id))
+                        else replacement_lineage
                     )
                     if (
                         assignment.strategy_id == "goat"
@@ -7155,6 +7600,266 @@ def _receipt_arm_execution_context(
     }
 
 
+def _ordered_checkpoint_tool_pairs(
+    messages: object,
+) -> dict[str, tuple[int, int, str]]:
+    """Return unique assistant/tool pairs from complete contiguous protocol groups."""
+    if not isinstance(messages, list):
+        return {}
+    seen_calls: set[str] = set()
+    seen_results: set[str] = set()
+    ambiguous: set[str] = set()
+    ordered: dict[str, tuple[int, int, str]] = {}
+    active_all: set[str] = set()
+    active_pending: set[str] = set()
+    active_tools: dict[str, str] = {}
+    active_index = -1
+
+    def invalidate_active() -> None:
+        ambiguous.update(active_all)
+        for call_id in active_all:
+            ordered.pop(call_id, None)
+        active_all.clear()
+        active_pending.clear()
+        active_tools.clear()
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            if active_pending:
+                invalidate_active()
+            continue
+        role = message.get("role")
+        if role != "tool" and active_pending:
+            invalidate_active()
+        if role == "assistant":
+            raw_calls = message.get("tool_calls")
+            if not isinstance(raw_calls, list) or not raw_calls:
+                continue
+            group_ids: set[str] = set()
+            group_tools: dict[str, str] = {}
+            for raw_call in raw_calls:
+                call_id = raw_call.get("id") if isinstance(raw_call, Mapping) else None
+                function = (
+                    raw_call.get("function") if isinstance(raw_call, Mapping) else None
+                )
+                tool_name = function.get("name") if isinstance(function, Mapping) else None
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                if call_id in seen_calls or call_id in group_ids:
+                    ambiguous.add(call_id)
+                    ordered.pop(call_id, None)
+                    continue
+                seen_calls.add(call_id)
+                if not isinstance(tool_name, str) or not tool_name:
+                    ambiguous.add(call_id)
+                    continue
+                group_ids.add(call_id)
+                group_tools[call_id] = tool_name
+            active_all = group_ids
+            active_pending = set(group_ids)
+            active_tools = group_tools
+            active_index = index
+            continue
+        if role != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            if active_pending:
+                invalidate_active()
+            continue
+        if call_id in seen_results:
+            ambiguous.add(call_id)
+            ordered.pop(call_id, None)
+            if call_id in active_all:
+                invalidate_active()
+            continue
+        seen_results.add(call_id)
+        if call_id not in active_pending:
+            ambiguous.add(call_id)
+            ordered.pop(call_id, None)
+            if active_pending:
+                invalidate_active()
+            continue
+        ordered[call_id] = (active_index, index, active_tools[call_id])
+        active_pending.remove(call_id)
+        if not active_pending:
+            active_all.clear()
+            active_tools.clear()
+            active_index = -1
+    if active_pending:
+        invalidate_active()
+    return {
+        call_id: pair
+        for call_id, pair in ordered.items()
+        if call_id not in ambiguous
+    }
+
+
+def _effect_receipt_counters_match(
+    effect: object,
+    receipt: Mapping[str, object],
+) -> bool:
+    """Bind worker-projected interaction counters to the durable tool result."""
+    metadata = getattr(effect, "result_metadata", None)
+    content = getattr(effect, "result_content", None)
+    is_error = getattr(effect, "result_is_error", None)
+    if (
+        not isinstance(metadata, Mapping)
+        or not isinstance(content, str)
+        or type(is_error) is not bool
+    ):
+        return False
+    result = ToolResult(content=content, is_error=is_error, metadata=dict(metadata))
+    exchanges = metadata.get("current_target_exchanges", metadata.get("target_exchanges"))
+    explicit_charge = metadata.get("target_call_budget_charge")
+    charge = (
+        explicit_charge
+        if type(explicit_charge) is int and explicit_charge >= 0
+        else sum(
+            1
+            for item in exchanges or ()
+            if isinstance(item, Mapping) and item.get("cleanup") is not True
+        )
+    )
+    expected_effect_attempted = metadata.get("target_effect_attempted")
+    return bool(
+        receipt.get("interaction_count") == _target_interaction_count(result)
+        and receipt.get("limit_interaction_count") == _target_limit_interaction_count(result)
+        and receipt.get("target_call_budget_charge") == charge
+        and (
+            type(expected_effect_attempted) is not bool
+            or receipt.get("target_effect_attempted") is expected_effect_attempted
+        )
+        and receipt.get("attempt_disposition")
+        == WorkerRuntime._target_attempt_disposition(  # noqa: SLF001
+            metadata,
+            is_error=is_error,
+        )
+    )
+
+
+def _effect_receipt_outcome_matches(
+    effect: object,
+    receipt: Mapping[str, object],
+    *,
+    expected_candidate_id: str | None,
+) -> bool:
+    """Recompute credit-bearing outcome fields from authoritative effect metadata."""
+    metadata = getattr(effect, "result_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return False
+    disposition = WorkerRuntime._target_attempt_disposition(  # noqa: SLF001
+        metadata,
+        is_error=bool(getattr(effect, "result_is_error", False)),
+    )
+    state_transition, state_outcome = WorkerRuntime._target_state_transition(  # noqa: SLF001
+        metadata
+    )
+    if (
+        state_transition is not None
+        and disposition != "valid"
+        and state_transition.get("outcome") != "unclear"
+    ):
+        state_transition = {**state_transition, "outcome": "unclear"}
+    authoritative_outcome, authoritative_conflict = (
+        WorkerRuntime._target_authoritative_outcome(metadata)  # noqa: SLF001
+        if disposition == "valid"
+        else (None, False)
+    )
+    expected_authority = "target" if authoritative_outcome is not None else "none"
+    expected_outcome = authoritative_outcome or state_outcome or "unclear"
+    projection = receipt.get("candidate_outcome_projection")
+    if not isinstance(projection, Mapping):
+        return False
+    candidate_id = projection.get("candidate_id")
+    if (
+        expected_candidate_id is None
+        or not isinstance(candidate_id, str)
+        or candidate_id != expected_candidate_id
+    ):
+        return False
+    expected_projection = project_candidate_outcome(
+        candidate_id=candidate_id,
+        attempt_disposition=disposition,
+        outcome_authority=expected_authority,
+        outcome=expected_outcome,
+        evidence_digest=str(receipt.get("content_sha256") or ""),
+    )
+    return bool(
+        receipt.get("attempt_disposition") == disposition
+        and receipt.get("target_state_transition") == state_transition
+        and receipt.get("candidate_outcome_projection") == expected_projection
+        and (
+            receipt.get("target_authoritative_outcome") == authoritative_outcome
+            if authoritative_outcome is not None
+            else "target_authoritative_outcome" not in receipt
+        )
+        and (
+            receipt.get("outcome_authority") == "target"
+            if authoritative_outcome is not None
+            else "outcome_authority" not in receipt
+        )
+        and (
+            receipt.get("target_authoritative_conflict") is True
+            if authoritative_conflict
+            else "target_authoritative_conflict" not in receipt
+        )
+        and (
+            receipt.get("target_authoritative_state_outcome") == state_outcome
+            if disposition == "valid" and state_outcome is not None
+            else "target_authoritative_state_outcome" not in receipt
+        )
+    )
+
+
+def _expected_task_candidate_id(
+    task: AgentTask,
+    payload: Mapping[str, object],
+) -> str | None:
+    """Resolve one candidate id from daemon-sealed task identity."""
+    values: object = ()
+    _prefix, marker, raw = task.objective.partition("Sealed hypothesis contract:")
+    if marker:
+        try:
+            document = json.loads(raw.strip())
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(document, Mapping):
+            return None
+        values = document.get("candidate_identities")
+        if not isinstance(values, (tuple, list)):
+            singleton = document.get("candidate_identity")
+            values = (singleton,) if singleton is not None else ()
+    else:
+        _prefix, marker, raw = task.objective.partition("Sealed candidate identities:")
+        if marker:
+            try:
+                values = json.loads(raw.strip())
+            except (TypeError, ValueError):
+                return None
+    sequence = values if isinstance(values, (tuple, list)) else ()
+    campaign_id = _campaign_id_for_assignment(task.id)
+    target_id = payload.get("target_id")
+    technique_ids = frozenset(task.technique_ids)
+    sealed_ids = {
+        candidate_id_for_identity(
+            {name: str(value[name]).strip() for name in _CANDIDATE_IDENTITY_FIELDS}
+        )
+        for value in sequence
+        if isinstance(value, Mapping)
+        and all(
+            isinstance(value.get(name), str) and str(value[name]).strip()
+            for name in _CANDIDATE_IDENTITY_FIELDS
+        )
+        and value.get("campaign_id") == campaign_id
+        and value.get("target_id") == target_id
+        and (not technique_ids or value.get("technique_id") in technique_ids)
+    }
+    if sealed_ids:
+        return next(iter(sealed_ids)) if len(sealed_ids) == 1 else None
+    return task.technique_ids[0] if len(task.technique_ids) == 1 else task.id
+
+
 def _validated_target_evidence_receipts(
     raw: object,
     *,
@@ -7164,13 +7869,15 @@ def _validated_target_evidence_receipts(
     payload: Mapping[str, object],
     request_hashes: Mapping[str, str],
     content_hashes: Mapping[str, str],
+    content_bytes: Mapping[str, int | None],
+    compacted_content_hashes: Mapping[str, str] | None = None,
+    compacted_content_bytes: Mapping[str, int | None] | None = None,
 ) -> dict[str, Mapping[str, object]]:
     """Authenticate compact target-effect receipts against their durable assignment."""
     # The runtime may append bounded-finalization or loop guidance to the tool
     # transcript after recording the target effect.  That changes the transcript
     # hash without changing the daemon-owned target receipt, so transcript content
     # is a document source only; it is not receipt authority.
-    del content_hashes
     if not isinstance(raw, list):
         return {}
     expected_campaign_id = (
@@ -7185,10 +7892,18 @@ def _validated_target_evidence_receipts(
     )
     valid_attempt_ids = frozenset((*evidence_attempt_ids, attempt_id))
     admitted: dict[str, Mapping[str, object]] = {}
+    seen_call_ids: set[str] = set()
+    ambiguous_call_ids: set[str] = set()
     for item in raw:
         if not isinstance(item, Mapping):
             continue
         call_id = item.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            if call_id in seen_call_ids:
+                ambiguous_call_ids.add(call_id)
+                admitted.pop(call_id, None)
+                continue
+            seen_call_ids.add(call_id)
         body = {key: value for key, value in item.items() if key != "receipt_sha256"}
         hashes = (
             item.get("request_sha256"),
@@ -7203,6 +7918,7 @@ def _validated_target_evidence_receipts(
             or item.get("tool_name") not in LEGACY_TARGET_EXCHANGE_TOOL_IDS
             or item.get("assignment_id") != task.id
             or item.get("campaign_id") != expected_campaign_id
+            or not isinstance(item.get("attempt_id"), str)
             or item.get("attempt_id") not in valid_attempt_ids
             or item.get("technique_attempt_id") != expected_technique_attempt_id
             or item.get("target_id") != payload.get("target_id")
@@ -7210,8 +7926,8 @@ def _validated_target_evidence_receipts(
             or not isinstance(item.get("content_bytes"), int)
             or isinstance(item.get("content_bytes"), bool)
             or int(item["content_bytes"]) < 0
-            or item.get("acknowledged") not in {True, False}
-            or item.get("is_error") is not False
+            or type(item.get("acknowledged")) is not bool
+            or type(item.get("is_error")) is not bool
             or not all(
                 isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes
             )
@@ -7220,8 +7936,205 @@ def _validated_target_evidence_receipts(
             and request_hashes[call_id] != item.get("request_sha256")
         ):
             continue
+        raw_transition = item.get("target_ui_transition")
+        if raw_transition is not None:
+            verbatim_content_matches = (
+                content_hashes.get(call_id) == item.get("content_sha256")
+                and content_bytes.get(call_id) == item.get("content_bytes")
+            )
+            compacted_content_matches = (
+                compacted_content_hashes is not None
+                and compacted_content_bytes is not None
+                and compacted_content_hashes.get(call_id) == item.get("content_sha256")
+                and compacted_content_bytes.get(call_id) == item.get("content_bytes")
+            )
+            if (
+                not isinstance(item.get("target_session_id"), str)
+                or not str(item["target_session_id"]).strip()
+                or raw_transition
+                != normalize_target_ui_transition({"target_ui_transition": raw_transition})
+                or not (verbatim_content_matches or compacted_content_matches)
+            ):
+                continue
         admitted[call_id] = dict(item)
-    return {call_id: admitted[call_id] for call_id in sorted(admitted)}
+    return {
+        call_id: admitted[call_id]
+        for call_id in sorted(admitted)
+        if call_id not in ambiguous_call_ids
+    }
+
+
+def _material_transition_effect_result(
+    handoff: WorkerHandoff,
+    effect: object,
+) -> tuple[WorkerResult, str | None] | None:
+    """Project one daemon-acknowledged UI transition after a worker crash.
+
+    ToolBroker finishes the immutable target effect before returning to the
+    runtime.  If the runtime then crashes before its transition checkpoint,
+    this projection preserves the same no-continuation boundary without
+    inventing another target call or trusting model-authored state.
+    """
+
+    metadata = getattr(effect, "result_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    raw_transition = metadata.get("target_ui_transition")
+    transition = normalize_target_ui_transition(
+        {"target_ui_transition": raw_transition}
+    )
+    if transition is None:
+        return None
+    interaction_role = metadata.get("interaction_role")
+    tool_name = getattr(effect, "tool_name", None)
+    is_target_exchange = interaction_role == ToolInteractionRole.TARGET_EXCHANGE.value or (
+        interaction_role is None and tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+    )
+    if getattr(effect, "effect", None) != "target_network" or not is_target_exchange:
+        return None
+
+    content = getattr(effect, "result_content", None)
+    arguments = getattr(effect, "arguments_payload", None)
+    call_id = getattr(effect, "call_id", None)
+    is_error = getattr(effect, "result_is_error", None)
+    target_session_id = metadata.get("target_session_id")
+    assignment = handoff.assignment
+    attempt_id = str(handoff.attempt_id or "")
+    expected_campaign_id = _campaign_id_for_assignment(assignment.id)
+    binding_valid = bool(
+        str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
+        and getattr(effect, "session_id", None) == handoff.session_id
+        and getattr(effect, "agent_id", None) == assignment.id
+        and str(getattr(effect, "attempt_id", "")) == attempt_id
+        and getattr(effect, "campaign_id", None) == expected_campaign_id
+        and getattr(effect, "target_id", None) == assignment.target_profile_id
+        and isinstance(tool_name, str)
+        and bool(tool_name)
+        and tool_name in assignment.tool_ids
+        and isinstance(call_id, str)
+        and bool(call_id)
+        and isinstance(arguments, Mapping)
+        and isinstance(content, str)
+        and type(is_error) is bool
+        and isinstance(target_session_id, str)
+        and bool(target_session_id.strip())
+    )
+    if not binding_valid:
+        return (
+            WorkerResult(
+                task_id=assignment.id,
+                status="quarantined",
+                content=content if isinstance(content, str) else "",
+                error="durable material target transition lacks attributable effect state",
+                error_code="target_surface_transition_invalid",
+                retry_class=RetryClass.TERMINAL.value,
+                target_session_id=(
+                    target_session_id
+                    if isinstance(target_session_id, str) and target_session_id.strip()
+                    else None
+                ),
+                infrastructure_failure_category="adapter_state_integrity",
+            ),
+            None,
+        )
+
+    call = ToolCall(call_id=call_id, name=tool_name, arguments=dict(arguments))
+    result = ToolResult(content=content, is_error=is_error, metadata=dict(metadata))
+    evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        evidence,
+        handoff,
+        call,
+        result,
+    )
+    receipt = evidence.get(call_id)
+    if receipt is None:
+        return None
+    strict_pre_effect = bool(
+        is_error is True
+        and transition["adapter_stale"] is True
+        and receipt.get("target_effect_attempted") is False
+        and receipt.get("interaction_count") == 0
+        and receipt.get("limit_interaction_count") == 0
+        and receipt.get("target_call_budget_charge") == 0
+    )
+    disposition_valid = bool(
+        is_error is False and receipt.get("acknowledged") is True
+        or is_error is True
+        and (metadata.get("target_effect_attempted") is True or strict_pre_effect)
+    )
+    if not disposition_valid:
+        return (
+            WorkerResult(
+                task_id=assignment.id,
+                status="quarantined",
+                content=content,
+                error="durable material target transition has invalid effect counts",
+                error_code="target_surface_transition_invalid",
+                retry_class=RetryClass.TERMINAL.value,
+                target_session_id=target_session_id,
+                infrastructure_failure_category="adapter_state_integrity",
+            ),
+            None,
+        )
+
+    checkpoint = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(
+                                arguments, sort_keys=True, separators=(",", ":")
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": tool_name,
+                "tool_call_id": call_id,
+                "content": content,
+            },
+        ],
+        "effect_observed": bool(is_error is False or receipt.get("target_effect_attempted")),
+        "target_session_id": target_session_id,
+        "technique_attempt_id": metadata.get("technique_attempt_id"),
+        "target_evidence": [receipt],
+        "turns_completed": 0,
+    }
+    technique_attempt_id = metadata.get("technique_attempt_id")
+    return (
+        WorkerResult(
+            task_id=assignment.id,
+            status="failed" if is_error else "completed",
+            content=content,
+            structured=(
+                None
+                if is_error
+                else {"attempted_techniques": list(assignment.technique_ids)}
+            ),
+            error=(
+                "material target surface transition requires Lead/operator re-observation"
+                if is_error
+                else None
+            ),
+            error_code="target_surface_disrupted" if is_error else None,
+            retry_class=RetryClass.TERMINAL.value if is_error else None,
+            checkpoint=checkpoint,
+            target_session_id=target_session_id,
+        ),
+        (
+            str(technique_attempt_id)
+            if isinstance(technique_attempt_id, str) and technique_attempt_id
+            else None
+        ),
+    )
 
 
 _CANDIDATE_IDENTITY_FIELDS = (

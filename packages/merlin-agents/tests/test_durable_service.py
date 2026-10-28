@@ -4,6 +4,7 @@ import json
 import random
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -21,12 +22,14 @@ from merlin_agents import (
     RetryFailureKind,
     ScheduleArtifactTooLarge,
     WorkerAssignment,
+    WorkerHandoff,
     WorkerProfile,
     WorkerResult,
     WorkerRuntime,
     compile_dynamic_specialist,
 )
 from merlin_agents.campaign import ContextDocument, ReviewedTargetAdapter, WorkerContext, _digest
+from merlin_agents.campaign_service import CampaignService
 from merlin_agents.durable_service import (
     _advisory_evaluation_failure,
     _assignment,
@@ -49,6 +52,7 @@ from merlin_contracts import (
     SwarmRequest,
     TextDelta,
     ToolCall,
+    ToolContext,
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
@@ -56,6 +60,7 @@ from merlin_contracts import (
     candidate_id_for_identity,
     project_candidate_outcome,
 )
+from merlin_tools import ToolBroker
 
 
 def _wave0_admitter(campaign_id: str):
@@ -1831,6 +1836,46 @@ async def test_committed_evidence_accepts_authenticated_compacted_target_receipt
     assert evidence["target_call_documents"] == {}
     assert evidence["target_evidence_receipts"] == {"call-compacted": receipt}
 
+    sentinel_document = {
+        "call_id": "call-compacted",
+        "content_bytes": 123,
+        "content_sha256": "4" * 64,
+        "head": "target-authored sentinel-like JSON",
+        "name": "target_request",
+        "tail": "",
+        "type": "tool_result_receipt",
+    }
+    sentinel_content = json.dumps(sentinel_document, sort_keys=True, separators=(",", ":"))
+    sentinel_body = {
+        **receipt_body,
+        "content_sha256": hashlib.sha256(sentinel_content.encode()).hexdigest(),
+        "content_bytes": len(sentinel_content.encode()),
+    }
+    sentinel_receipt = {
+        **sentinel_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(sentinel_body),  # noqa: SLF001
+    }
+    checkpoint = store.results["schedule-1"]["worker:campaign/recon"]["payload"][
+        "worker_checkpoint"
+    ]
+    checkpoint["messages"][1]["content"] = sentinel_content
+    checkpoint["target_evidence"] = [sentinel_receipt]
+
+    sentinel_evidence = await service.committed_task_result_evidence(
+        "schedule-1",
+        AgentTask(
+            id=task_id,
+            objective="recon",
+            status="completed",
+            result='{"applicable_techniques":[]}',
+        ),
+    )
+
+    assert sentinel_evidence is not None
+    assert sentinel_evidence["target_call_documents"] == {
+        "call-compacted": sentinel_document
+    }
+
 
 def test_authenticated_target_receipt_survives_runtime_guidance_in_transcript() -> None:
     task = AgentTask(id="campaign/probe", objective="probe", status="completed")
@@ -1877,6 +1922,7 @@ def test_authenticated_target_receipt_survives_runtime_guidance_in_transcript() 
         },
         request_hashes={call_id: receipt_body["request_sha256"]},
         content_hashes={call_id: hashlib.sha256(transcript_content.encode()).hexdigest()},
+        content_bytes={call_id: len(transcript_content.encode())},
     )
 
     assert admitted == {call_id: receipt}
@@ -1923,6 +1969,7 @@ def test_authenticated_injection_receipt_is_admitted() -> None:
         },
         request_hashes={call_id: receipt_body["request_sha256"]},
         content_hashes={call_id: hashlib.sha256(content.encode()).hexdigest()},
+        content_bytes={call_id: len(content.encode())},
     )
 
     assert admitted == {call_id: receipt}
@@ -2102,6 +2149,1138 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
     assert unmatched is not None
     assert unmatched["target_call_ids"] == ()
     assert unmatched["target_evidence_receipts"] == {}
+
+
+def test_transition_receipts_require_complete_call_pair_and_canonical_payload() -> None:
+    task = AgentTask(
+        id="campaign/one/surface-drift",
+        objective="observe target surface drift",
+        status="failed",
+        result="reviewed surface changed",
+    )
+    call_id = "surface-drift"
+    attempt_id = "attempt-surface-drift"
+    arguments = {"prompt": "authorized probe"}
+    content = task.result or ""
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": "sha256:" + hashlib.sha256(b"before").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"after").hexdigest(),
+        "changed_dimensions": ["controls"],
+        "added_controls": [{"role": "button", "name": "Continue"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:after"],
+        "reobservation_recommended": True,
+    }
+
+    def effect_record(
+        *,
+        projected_transition: dict[str, object],
+        effect_content: str = content,
+        effect_call_id: str = call_id,
+        effect_tool: str = "browser_chat_exchange",
+        effect_is_error: bool = True,
+        effect_kind: str = "target_network",
+        effect_session: str = "browser:context-1",
+    ) -> SimpleNamespace:
+        interaction_count = 0 if effect_is_error else 1
+        return SimpleNamespace(
+            call_id=effect_call_id,
+            state="acknowledged",
+            agent_id=task.id,
+            attempt_id=attempt_id,
+            campaign_id="campaign/one",
+            target_id="target-1",
+            tool_name=effect_tool,
+            effect=effect_kind,
+            arguments_payload=arguments,
+            result_content=effect_content,
+            result_is_error=effect_is_error,
+            result_metadata={
+                "interaction_role": ToolInteractionRole.TARGET_EXCHANGE.value,
+                "target_session_id": effect_session,
+                "target_exchanges": [
+                    {"interaction": True, "cleanup": False, "status_code": 200}
+                    for _ in range(interaction_count)
+                ],
+                "target_effect_attempted": not effect_is_error,
+                "target_call_budget_charge": interaction_count,
+                "limit_interaction_count": interaction_count,
+                "target_ui_transition": projected_transition,
+            },
+        )
+
+    def committed(
+        *,
+        messages: list[dict[str, object]],
+        projected_transition: dict[str, object],
+        effect_transition: dict[str, object] | None = None,
+        effect_tool: str = "browser_chat_exchange",
+        effect_is_error: bool = True,
+        effect_kind: str = "target_network",
+        effect_session: str = "browser:context-1",
+        receipt_overrides: Mapping[str, object] | None = None,
+        extra_receipts: tuple[Mapping[str, object], ...] = (),
+        extra_effects: tuple[SimpleNamespace, ...] = (),
+    ) -> Mapping[str, object]:
+        receipt_metadata = effect_record(
+            projected_transition=projected_transition,
+            effect_is_error=effect_is_error,
+            effect_kind=effect_kind,
+            effect_session=effect_session,
+        ).result_metadata
+        interaction_count = 0 if effect_is_error else 1
+        receipt_body = {
+            "call_id": call_id,
+            "tool_name": "browser_chat_exchange",
+            "reference": f"target-call:{call_id}",
+            "campaign_id": "campaign/one",
+            "assignment_id": task.id,
+            "attempt_id": attempt_id,
+            "technique_attempt_id": None,
+            "target_id": "target-1",
+            "target_session_id": "browser:context-1",
+            "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+                "browser_chat_exchange", arguments
+            ),
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "content_bytes": len(content.encode()),
+            "metadata_sha256": WorkerRuntime._json_fingerprint(  # noqa: SLF001
+                WorkerRuntime._semantic_value(receipt_metadata)  # noqa: SLF001
+            ),
+            "is_error": effect_is_error,
+            "acknowledged": not effect_is_error,
+            "target_effect_attempted": not effect_is_error,
+            "interaction_count": interaction_count,
+            "limit_interaction_count": interaction_count,
+            "target_call_budget_charge": interaction_count,
+            "attempt_disposition": "infrastructure_failed" if effect_is_error else "valid",
+            "target_ui_transition": projected_transition,
+            **(
+                {
+                    "candidate_outcome_projection": project_candidate_outcome(
+                        candidate_id=task.id,
+                        attempt_disposition="valid",
+                        outcome_authority="none",
+                        outcome="unclear",
+                        evidence_digest=hashlib.sha256(content.encode()).hexdigest(),
+                    )
+                }
+                if not effect_is_error
+                else {}
+            ),
+            **dict(receipt_overrides or {}),
+        }
+        receipt = {
+            **receipt_body,
+            "receipt_sha256": WorkerRuntime._json_fingerprint(receipt_body),  # noqa: SLF001
+        }
+        evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+            "schedule-1",
+            task,
+            {
+                "node_id": f"worker:{task.id}",
+                "attempt_id": attempt_id,
+                "payload_digest": "a" * 64,
+                "payload": {
+                    "content": content,
+                    "target_id": "target-1",
+                    "target_session_id": "browser:context-1",
+                    "worker_checkpoint": {
+                        "messages": messages,
+                        "technique_attempt_id": None,
+                        "target_evidence": [receipt, *extra_receipts],
+                    },
+                },
+            },
+            durable_effects=(
+                effect_record(
+                    projected_transition=(effect_transition or projected_transition),
+                    effect_tool=effect_tool,
+                        effect_is_error=effect_is_error,
+                        effect_kind=effect_kind,
+                        effect_session=effect_session,
+                ),
+                *extra_effects,
+            ),
+        )
+        assert evidence is not None
+        return evidence
+
+    complete_messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "function": {
+                        "name": "browser_chat_exchange",
+                        "arguments": json.dumps(arguments),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": content},
+    ]
+
+    admitted = committed(messages=complete_messages, projected_transition=transition)
+    assert tuple(admitted["target_ui_transition_receipts"]) == (call_id,)
+
+    duplicate_receipt = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        extra_receipts=({"call_id": call_id},),
+    )
+    assert duplicate_receipt["target_ui_transition_receipts"] == {}
+
+    for field in ("attempt_id", "acknowledged"):
+        malformed_receipt = committed(
+            messages=complete_messages,
+            projected_transition=transition,
+            receipt_overrides={field: ["not-scalar"]},
+        )
+        assert malformed_receipt["target_ui_transition_receipts"] == {}
+
+    successful = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+    )
+    assert tuple(successful["target_evidence_receipts"]) == (call_id,)
+
+    rewritten_success = committed(
+        messages=complete_messages,
+        projected_transition={
+            **transition,
+            "after_digest": "sha256:" + hashlib.sha256(b"forged-success").hexdigest(),
+        },
+        effect_transition=transition,
+        effect_is_error=False,
+    )
+    assert rewritten_success["target_evidence_receipts"] == {}
+
+    wrong_session_success = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        effect_session="browser:other-context",
+    )
+    assert wrong_session_success["target_evidence_receipts"] == {}
+
+    wrong_effect_success = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        effect_kind="filesystem_read",
+    )
+    assert wrong_effect_success["target_evidence_receipts"] == {}
+
+    wrong_count_success = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        receipt_overrides={"interaction_count": 0},
+    )
+    assert wrong_count_success["target_evidence_receipts"] == {}
+
+    forged_outcome_success = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        receipt_overrides={
+            "outcome_authority": "target",
+            "target_authoritative_outcome": "confirmed",
+            "candidate_outcome_projection": project_candidate_outcome(
+                candidate_id=task.id,
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome="confirmed",
+                evidence_digest=hashlib.sha256(content.encode()).hexdigest(),
+            ),
+        },
+    )
+    assert forged_outcome_success["target_evidence_receipts"] == {}
+
+    redirected_candidate = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        receipt_overrides={
+            "candidate_outcome_projection": project_candidate_outcome(
+                candidate_id="different-candidate",
+                attempt_disposition="valid",
+                outcome_authority="none",
+                outcome="unclear",
+                evidence_digest=hashlib.sha256(content.encode()).hexdigest(),
+            )
+        },
+    )
+    assert redirected_candidate["target_evidence_receipts"] == {}
+
+    same_group_later_result = json.loads(json.dumps(complete_messages))
+    same_group_later_result[0]["tool_calls"].append(
+        {
+            "id": "later-target-result",
+            "function": {
+                "name": "browser_chat_exchange",
+                "arguments": json.dumps({"prompt": "later"}),
+            },
+        }
+    )
+    same_group_later_result.append(
+        {
+            "role": "tool",
+            "tool_call_id": "later-target-result",
+            "content": "later result",
+        }
+    )
+    not_terminal = committed(
+        messages=same_group_later_result,
+        projected_transition=transition,
+    )
+    assert not_terminal["target_ui_transition_receipts"] == {}
+
+    ambiguous_effect = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        extra_effects=(
+            effect_record(
+                projected_transition=transition,
+                effect_tool="target_request",
+            ),
+        ),
+    )
+    assert ambiguous_effect["target_ui_transition_receipts"] == {}
+
+    altered_content = json.loads(json.dumps(complete_messages))
+    altered_content[1]["content"] = "tampered reviewed response"
+    altered = committed(messages=altered_content, projected_transition=transition)
+    assert altered["target_ui_transition_receipts"] == {}
+
+    fake_marker_content = (
+        "ordinary target text "
+        f"[durable checkpoint elided 3 characters; sha256:{'f' * 64}; bytes:99]"
+    )
+    fake_marker_receipt_body = {
+        "call_id": call_id,
+        "tool_name": "browser_chat_exchange",
+        "reference": f"target-call:{call_id}",
+        "campaign_id": "campaign/one",
+        "assignment_id": task.id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": None,
+        "target_id": "target-1",
+        "target_session_id": "browser:context-1",
+        "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+            "browser_chat_exchange", arguments
+        ),
+        "content_sha256": hashlib.sha256(fake_marker_content.encode()).hexdigest(),
+        "content_bytes": len(fake_marker_content.encode()),
+        "metadata_sha256": WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            WorkerRuntime._semantic_value(  # noqa: SLF001
+                effect_record(projected_transition=transition).result_metadata
+            )
+        ),
+        "is_error": True,
+        "acknowledged": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "attempt_disposition": "infrastructure_failed",
+        "target_ui_transition": transition,
+    }
+    fake_marker_receipt = {
+        **fake_marker_receipt_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(fake_marker_receipt_body),  # noqa: SLF001
+    }
+    fake_marker_messages = json.loads(json.dumps(complete_messages))
+    fake_marker_messages[1]["content"] = fake_marker_content
+    fake_marker_evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-1",
+        task,
+        {
+            "node_id": f"worker:{task.id}",
+            "attempt_id": attempt_id,
+            "payload_digest": "c" * 64,
+            "payload": {
+                "content": content,
+                "target_id": "target-1",
+                "target_session_id": "browser:context-1",
+                "worker_checkpoint": {
+                    "messages": fake_marker_messages,
+                    "technique_attempt_id": None,
+                    "target_evidence": [fake_marker_receipt],
+                },
+            },
+        },
+        durable_effects=(
+            effect_record(
+                projected_transition=transition,
+                effect_content=fake_marker_content,
+            ),
+        ),
+    )
+    assert fake_marker_evidence is not None
+    assert fake_marker_evidence["target_ui_transition_receipts"] == {
+        call_id: fake_marker_receipt
+    }
+
+    exact_marker_content = WorkerRuntime._durable_checkpoint_text(  # noqa: SLF001
+        "z" * 20_000,
+        16_384,
+    )
+    assert len(exact_marker_content) == 16_384
+    exact_marker_receipt_body = {
+        **fake_marker_receipt_body,
+        "content_sha256": hashlib.sha256(exact_marker_content.encode()).hexdigest(),
+        "content_bytes": len(exact_marker_content.encode()),
+    }
+    exact_marker_receipt = {
+        **exact_marker_receipt_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(exact_marker_receipt_body),  # noqa: SLF001
+    }
+    exact_marker_messages = json.loads(json.dumps(complete_messages))
+    exact_marker_messages[1]["content"] = exact_marker_content
+    exact_marker_evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-1",
+        task,
+        {
+            "node_id": f"worker:{task.id}",
+            "attempt_id": attempt_id,
+            "payload_digest": "d" * 64,
+            "payload": {
+                "content": content,
+                "target_id": "target-1",
+                "target_session_id": "browser:context-1",
+                "worker_checkpoint": {
+                    "messages": exact_marker_messages,
+                    "technique_attempt_id": None,
+                    "target_evidence": [exact_marker_receipt],
+                },
+            },
+        },
+        durable_effects=(
+            effect_record(
+                projected_transition=transition,
+                effect_content=exact_marker_content,
+            ),
+        ),
+    )
+    assert exact_marker_evidence is not None
+    assert exact_marker_evidence["target_ui_transition_receipts"] == {
+        call_id: exact_marker_receipt
+    }
+
+    elided_original = (
+        content
+        + f"[durable checkpoint elided 5 characters; sha256:{'e' * 64}; bytes:77]"
+        + "x" * 20_000
+    )
+    elided_content = WorkerRuntime._durable_checkpoint_text(  # noqa: SLF001
+        elided_original,
+        16_384,
+    )
+    assert elided_content.count("[durable checkpoint elided") == 2
+    elided_receipt_hash = hashlib.sha256(elided_original.encode()).hexdigest()
+    elided_receipt_body = {
+        "call_id": call_id,
+        "tool_name": "browser_chat_exchange",
+        "reference": f"target-call:{call_id}",
+        "campaign_id": "campaign/one",
+        "assignment_id": task.id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": None,
+        "target_id": "target-1",
+        "target_session_id": "browser:context-1",
+        "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+            "browser_chat_exchange", arguments
+        ),
+        "content_sha256": elided_receipt_hash,
+        "content_bytes": len(elided_original.encode()),
+        "metadata_sha256": WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            WorkerRuntime._semantic_value(  # noqa: SLF001
+                effect_record(projected_transition=transition).result_metadata
+            )
+        ),
+        "is_error": True,
+        "acknowledged": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "attempt_disposition": "infrastructure_failed",
+        "target_ui_transition": transition,
+    }
+    elided_receipt = {
+        **elided_receipt_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(elided_receipt_body),  # noqa: SLF001
+    }
+    elided_messages = json.loads(json.dumps(complete_messages))
+    elided_messages[1]["content"] = elided_content
+    elided_evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-1",
+        task,
+        {
+            "node_id": f"worker:{task.id}",
+            "attempt_id": attempt_id,
+            "payload_digest": "b" * 64,
+            "payload": {
+                "content": content,
+                "target_id": "target-1",
+                "target_session_id": "browser:context-1",
+                "worker_checkpoint": {
+                    "messages": elided_messages,
+                    "technique_attempt_id": None,
+                    "target_evidence": [elided_receipt],
+                },
+            },
+        },
+        durable_effects=(
+            effect_record(
+                projected_transition=transition,
+                effect_content=elided_original,
+            ),
+        ),
+    )
+    assert elided_evidence is not None
+    assert elided_evidence["target_ui_transition_receipts"] == {
+        call_id: elided_receipt
+    }
+
+    ghost = committed(messages=[], projected_transition=transition)
+    assert ghost["target_ui_transition_receipts"] == {}
+
+    noncanonical = committed(
+        messages=complete_messages,
+        projected_transition={**transition, "unbounded_extra": "x" * 10_000},
+    )
+    assert noncanonical["target_ui_transition_receipts"] == {}
+
+    duplicate_pair = committed(
+        messages=[*complete_messages, *json.loads(json.dumps(complete_messages))],
+        projected_transition=transition,
+    )
+    assert duplicate_pair["target_ui_transition_receipts"] == {}
+
+    interrupted_pair_messages = json.loads(json.dumps(complete_messages))
+    interrupted_pair_messages.insert(
+        1,
+        {"role": "assistant", "content": "intervening provider turn"},
+    )
+    interrupted_pair = committed(
+        messages=interrupted_pair_messages,
+        projected_transition=transition,
+    )
+    assert interrupted_pair["target_ui_transition_receipts"] == {}
+
+    wrong_tool_messages = json.loads(json.dumps(complete_messages))
+    wrong_tool_messages[0]["tool_calls"][0]["function"]["name"] = "read_file"
+    wrong_tool = committed(
+        messages=wrong_tool_messages,
+        projected_transition=transition,
+        effect_tool="read_file",
+    )
+    assert wrong_tool["target_ui_transition_receipts"] == {}
+
+    rewritten_transition = {
+        **transition,
+        "after_digest": "sha256:" + hashlib.sha256(b"rewritten-after").hexdigest(),
+    }
+    rewritten_receipt = committed(
+        messages=complete_messages,
+        projected_transition=rewritten_transition,
+        effect_transition=transition,
+    )
+    assert rewritten_receipt["target_ui_transition_receipts"] == {}
+
+    later_effect = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        extra_effects=(
+            effect_record(
+                projected_transition=transition,
+                effect_call_id="later-target-call",
+            ),
+        ),
+    )
+    assert later_effect["target_ui_transition_receipts"] == {}
+
+
+@pytest.mark.parametrize("target_effect_attempted", (False, True))
+async def test_terminal_surface_drift_commits_transition_without_replacement(
+    target_effect_attempted: bool,
+) -> None:
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": "sha256:" + hashlib.sha256(b"surface-before").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"surface-after").hexdigest(),
+        "changed_dimensions": ["controls"],
+        "added_controls": [
+            {
+                "role": "button",
+                "name": "Continue",
+                "frame_ref": "frame-1",
+                "input_type": "button",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:surface-after"],
+        "reobservation_recommended": True,
+    }
+
+    class PartialStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.partial_rows: list[dict[str, object]] = []
+            self.retry_failed_calls = 0
+            self.transition_checkpoint_failures = 0
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            del applied_message_ids
+            lease = self.attempts[attempt_id]
+            assert lease.generation == generation
+            payload = dict(result)
+            checkpoint = payload.get("worker_checkpoint")
+            transition_checkpoint = bool(
+                isinstance(checkpoint, Mapping)
+                and any(
+                    isinstance(item, Mapping) and item.get("target_ui_transition") is not None
+                    for item in checkpoint.get("target_evidence", ())
+                )
+            )
+            if (
+                transition_checkpoint
+                and set(payload) == {"worker_checkpoint", "partial"}
+                and self.transition_checkpoint_failures == 0
+            ):
+                self.transition_checkpoint_failures += 1
+                raise RuntimeError("injected transition checkpoint write failure")
+            payload_digest = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+            ).hexdigest()
+            row = {
+                "node_id": lease.node_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "schema_id": "schema/partial-result",
+                "payload_digest": payload_digest,
+                "payload": payload,
+            }
+            self.partial_rows.append(row)
+            self.results.setdefault(lease.schedule_id, {})[
+                f"partial:{attempt_id}:{len(self.partial_rows)}"
+            ] = row
+            return payload_digest
+
+        def retry_failed(self, schedule_id, node_id, *, checkpoint, expected_event_count):
+            self.retry_failed_calls += 1
+            return super().retry_failed(
+                schedule_id,
+                node_id,
+                checkpoint=checkpoint,
+                expected_event_count=expected_event_count,
+            )
+
+    class SurfaceProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            self.calls += 1
+            assert self.calls == 1, "terminal surface drift must not start a replacement worker"
+            assert request.tools
+            yield ToolCall(
+                call_id="surface-drift",
+                name="browser_chat_exchange",
+                arguments={"prompt": "authorized probe"},
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    class EffectStore:
+        def __init__(self) -> None:
+            self.records = {}
+
+        async def begin(self, record):
+            existing = self.records.get(record.idempotency_key)
+            if existing is not None:
+                return existing, False
+            self.records[record.idempotency_key] = record
+            return record, True
+
+        async def finish(self, record):
+            self.records[record.idempotency_key] = record
+            return record
+
+        async def list_for_session(self, session_id, *, tool_name=None):
+            return [
+                item
+                for item in self.records.values()
+                if item.session_id == session_id
+                and (tool_name is None or item.tool_name == tool_name)
+            ]
+
+        async def list_for_attempt(self, attempt_id):
+            return [
+                item for item in self.records.values() if item.attempt_id == attempt_id
+            ]
+
+        async def list_for_campaign(self, campaign_id, *, limit=None):
+            records = [
+                item for item in self.records.values() if item.campaign_id == campaign_id
+            ]
+            return records if limit is None else records[-limit:]
+
+    class SurfaceTool:
+        effect = "target_network"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return ToolSpec(
+                name="browser_chat_exchange",
+                description="Reviewed browser exchange",
+                input_schema={"type": "object"},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+
+        async def invoke(self, context, arguments):
+            del context, arguments
+            self.calls.append("browser_chat_exchange")
+            interaction_count = int(target_effect_attempted)
+            return ToolResult(
+                content="",
+                is_error=True,
+                metadata={
+                    **(
+                        {
+                            "failure_code": "target_delivery_rejected",
+                            "target_delivery_rejected": True,
+                            "retryable": True,
+                        }
+                        if not target_effect_attempted
+                        else {}
+                    ),
+                    "target_effect_attempted": target_effect_attempted,
+                    "target_call_budget_charge": interaction_count,
+                    "limit_interaction_count": interaction_count,
+                    "target_exchanges": (
+                        [{"interaction": True, "cleanup": False}]
+                        if target_effect_attempted
+                        else []
+                    ),
+                    "target_session_id": "browser:context-1",
+                    "target_ui_transition": transition,
+                },
+            )
+
+    assignment = WorkerAssignment(
+        id="campaign/surface-drift/worker",
+        objective="Run one authorized browser exchange.",
+        profile_id="recon",
+        target_profile_id="target-surface",
+        technique_ids=("surface-drift",),
+        guidance_ids=(),
+        tool_ids=("browser_chat_exchange",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=20_000, max_seconds=30),
+        max_target_exchanges=1,
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        strategy_id="direct",
+    )
+    profile = ContextDocument.create("profile:recon@1", "Observe the reviewed browser surface.")
+    target = ReviewedTargetAdapter(
+        "target-surface",
+        "browser",
+        "https://target.test/chat",
+        "web-chat",
+        authentication="ambient authenticated browser context",
+    )
+    context_values = {
+        "assignment_id": assignment.id,
+        "profile": asdict(profile),
+        "guidance": [],
+        "skills": [],
+        "tool_ids": assignment.tool_ids,
+        "target": asdict(target),
+        "authority_ids": assignment.authority_ids,
+        "strategy_id": "direct",
+        "strategy_contract": (),
+    }
+    worker_context = WorkerContext(
+        assignment_id=assignment.id,
+        profile=profile,
+        guidance=(),
+        skills=(),
+        tool_ids=assignment.tool_ids,
+        target=target,
+        authority_ids=assignment.authority_ids,
+        digest=_digest(context_values),
+    )
+    provider = SurfaceProvider()
+    async def allow(*_args):
+        return True
+
+    surface_tool = SurfaceTool()
+    tools = ToolBroker(
+        (surface_tool,),
+        confirmer=allow,
+        effect_store=EffectStore(),
+    )
+    store = PartialStore()
+    service = DurableAgentService(provider, tools, store, model="test")
+
+    live = await service.submit(
+        "session-surface-drift",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+        worker_contexts={assignment.id: worker_context},
+    )
+    assert live.execution is not None
+    await asyncio.wait_for(live.execution, timeout=1)
+
+    node_id = f"worker:{assignment.id}"
+    task = (await service.list_schedule_tasks(live.id))[0]
+    attempts = [
+        attempt
+        for attempt in store.attempts.values()
+        if attempt.node_id == node_id
+    ]
+    assert task.status == "failed"
+    assert store.nodes[live.id][node_id]["state"] == "failed"
+    assert live.scheduler.status(node_id).value == "failed"
+    assert len(attempts) == 1
+    assert attempts[0].state == "failed"
+    assert store.retry_failed_calls == 0
+    assert store.transition_checkpoint_failures == 1
+    assert provider.calls == 1
+    assert surface_tool.calls == ["browser_chat_exchange"]
+
+    row = next(row for row in reversed(store.partial_rows) if row["payload"].get("partial"))
+    payload = row["payload"]
+    checkpoint = payload["worker_checkpoint"]
+    (receipt,) = checkpoint["target_evidence"]
+    assert row["schema_id"] == "schema/partial-result"
+    assert payload["retry_failure_kind"] == RetryFailureKind.UNKNOWN.value
+    assert payload["target_id"] == "target-surface"
+    assert payload["target_session_id"] == "browser:context-1"
+    assert payload["infrastructure_failure_category"] is None
+    assert "Lead/operator re-observation" in payload["error"]
+    assert "provider rejected" not in payload["error"]
+    assert receipt["assignment_id"] == assignment.id
+    assert receipt["attempt_id"] == row["attempt_id"]
+    assert receipt["target_id"] == payload["target_id"]
+    assert receipt["target_session_id"] == payload["target_session_id"]
+    assert receipt["target_effect_attempted"] is target_effect_attempted
+    assert receipt["target_call_budget_charge"] == int(target_effect_attempted)
+
+    committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        live.id,
+        task,
+        row,
+        durable_effects=await tools.list_effects_for_attempt(row["attempt_id"]),
+        evidence_attempt_ids=(row["attempt_id"],),
+    )
+    assert committed is not None
+    assert committed["target_call_ids"] == ()
+    assert committed["target_evidence_receipts"] == {}
+    assert committed["target_ui_transition_receipts"] == {"surface-drift": receipt}
+
+
+@pytest.mark.parametrize("transition_case", ("success", "malformed"))
+async def test_crash_after_durable_material_transition_does_not_replace_worker(
+    monkeypatch,
+    transition_case: str,
+) -> None:
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": False,
+        "before_digest": "sha256:" + hashlib.sha256(b"before-win").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"after-win").hexdigest(),
+        "changed_dimensions": ["controls"],
+        "added_controls": [
+            {
+                "role": "dialog",
+                "name": "Level complete",
+                "frame_ref": "main",
+                "surface_scope": "modal",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:after-win"],
+        "reobservation_recommended": True,
+        "transition_digest": "sha256:" + hashlib.sha256(b"raw-transition").hexdigest(),
+        "url_change": None,
+        "frame_change": None,
+        "added_visible_text": ["Congratulations! You pass the level."],
+    }
+    if transition_case == "malformed":
+        transition["after_digest"] = transition["before_digest"]
+
+    class EffectStore:
+        def __init__(self) -> None:
+            self.records = {}
+
+        async def begin(self, record):
+            existing = self.records.get(record.idempotency_key)
+            if existing is not None:
+                return existing, False
+            self.records[record.idempotency_key] = record
+            return record, True
+
+        async def finish(self, record):
+            self.records[record.idempotency_key] = record
+            return record
+
+        async def list_for_session(self, session_id, *, tool_name=None):
+            return [
+                item
+                for item in self.records.values()
+                if item.session_id == session_id
+                and (tool_name is None or item.tool_name == tool_name)
+            ]
+
+        async def list_for_attempt(self, attempt_id):
+            return [
+                item for item in self.records.values() if item.attempt_id == attempt_id
+            ]
+
+        async def list_for_campaign(self, campaign_id, *, limit=None):
+            records = [
+                item for item in self.records.values() if item.campaign_id == campaign_id
+            ]
+            return records if limit is None else records[-limit:]
+
+    class SurfaceTool:
+        effect = "target_network"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return ToolSpec(
+                name="browser_chat_exchange",
+                description="Reviewed browser exchange",
+                input_schema={"type": "object"},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+
+        async def invoke(self, context, arguments):
+            del context, arguments
+            self.calls += 1
+            assert self.calls == 1, "material transition must fence replacement delivery"
+            malformed = transition_case == "malformed"
+            return ToolResult(
+                content="invalid transition observation" if malformed else "",
+                is_error=malformed,
+                metadata={
+                    "target_session_id": "browser:context-1",
+                    "target_exchanges": (
+                        []
+                        if malformed
+                        else [
+                            {
+                                "interaction": True,
+                                "cleanup": False,
+                                "request_id": "request-1",
+                                "status_code": 200,
+                            }
+                        ]
+                    ),
+                    "target_effect_attempted": False if malformed else True,
+                    "target_call_budget_charge": 0 if malformed else 1,
+                    "limit_interaction_count": 0 if malformed else 1,
+                    "target_ui_transition": transition,
+                    "oracle_observations": (
+                        []
+                        if malformed
+                        else [
+                            {
+                                "purpose": "objective",
+                                "target_authoritative": True,
+                                "matched": True,
+                            }
+                        ]
+                    ),
+                },
+            )
+
+    async def allow(*_args):
+        return True
+
+    async def crash_after_ack(self, handoff, control=None, *, checkpoint=None):
+        del control, checkpoint
+        result = await self._tools.invoke(  # noqa: SLF001
+            "browser_chat_exchange",
+            ToolContext(
+                session_id=handoff.session_id,
+                workspace_root=handoff.workspace_root,
+                call_id="crash-transition",
+                agent_id=handoff.assignment.id,
+                attempt_id=handoff.attempt_id,
+                technique_attempt_id=handoff.technique_attempt_id,
+                campaign_id="campaign/crash-transition",
+                target_id=handoff.assignment.target_profile_id,
+            ),
+            {"prompt": "authorized probe"},
+        )
+        assert result.metadata["target_ui_transition"] == transition
+        raise RuntimeError("injected crash after durable target acknowledgement")
+
+    monkeypatch.setattr(WorkerRuntime, "run", crash_after_ack)
+
+    class CrashStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retry_failed_calls = 0
+
+        def retry_failed(self, *args, **kwargs):
+            self.retry_failed_calls += 1
+            return super().retry_failed(*args, **kwargs)
+
+        def commit_reducer(self, attempt_id, generation, **kwargs):
+            digest = super().commit_reducer(attempt_id, generation, **kwargs)
+            lease = self.attempts[attempt_id]
+            self.results[lease.schedule_id][lease.node_id]["attempt_id"] = attempt_id
+            return digest
+
+    assignment = WorkerAssignment(
+        id="campaign/crash-transition/worker",
+        objective="Run one authorized browser exchange.",
+        profile_id="recon",
+        target_profile_id="target-surface",
+        technique_ids=("surface-transition",),
+        guidance_ids=(),
+        tool_ids=("browser_chat_exchange",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=20_000, max_seconds=30),
+        max_target_exchanges=1,
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        strategy_id="direct",
+    )
+    profile = ContextDocument.create("profile:recon@1", "Observe the reviewed surface.")
+    target = ReviewedTargetAdapter(
+        "target-surface",
+        "browser",
+        "https://target.test/chat",
+        "web-chat",
+        authentication="ambient authenticated browser context",
+    )
+    context_values = {
+        "assignment_id": assignment.id,
+        "profile": asdict(profile),
+        "guidance": [],
+        "skills": [],
+        "tool_ids": assignment.tool_ids,
+        "target": asdict(target),
+        "authority_ids": assignment.authority_ids,
+        "strategy_id": "direct",
+        "strategy_contract": (),
+    }
+    worker_context = WorkerContext(
+        assignment_id=assignment.id,
+        profile=profile,
+        guidance=(),
+        skills=(),
+        tool_ids=assignment.tool_ids,
+        target=target,
+        authority_ids=assignment.authority_ids,
+        digest=_digest(context_values),
+    )
+    target_tool = SurfaceTool()
+    broker = ToolBroker(
+        (target_tool,),
+        confirmer=allow,
+        effect_store=EffectStore(),
+    )
+    store = CrashStore()
+    service = DurableAgentService(Provider(), broker, store, model="test")
+
+    live = await service.submit(
+        "session-crash-transition",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+        worker_contexts={assignment.id: worker_context},
+    )
+    assert live.execution is not None
+    await asyncio.wait_for(live.execution, timeout=1)
+
+    node_id = f"worker:{assignment.id}"
+    attempts = [
+        attempt for attempt in store.attempts.values() if attempt.node_id == node_id
+    ]
+    assert store.nodes[live.id][node_id]["state"] == (
+        "quarantined" if transition_case == "malformed" else "completed"
+    )
+    assert len(attempts) == 1
+    assert store.retry_failed_calls == 0
+    assert target_tool.calls == 1
+    assert any(
+        event_type == "worker_crash_transition_recovered"
+        for _, event_type, _ in store.lifecycle_events
+    )
+    if transition_case == "malformed":
+        assert node_id not in store.results.get(live.id, {})
+        return
+    effect = next(iter(broker._effect_store.records.values()))  # noqa: SLF001
+    payload = store.results[live.id][node_id]["payload"]
+    crash_receipt = payload["worker_checkpoint"]["target_evidence"][0]
+    normal_receipts = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        normal_receipts,
+        WorkerHandoff(
+            live.session_id,
+            ".",
+            "test",
+            WorkerProfile("recon", 1, "", profile.content, frozenset()),
+            assignment,
+            worker_context=worker_context,
+            attempt_id=attempts[0].id,
+        ),
+        ToolCall(
+            call_id=str(effect.call_id),
+            name=str(effect.tool_name),
+            arguments=dict(effect.arguments_payload or {}),
+        ),
+        ToolResult(
+            content=str(effect.result_content or ""),
+            is_error=bool(effect.result_is_error),
+            metadata=dict(effect.result_metadata),
+        ),
+    )
+    assert crash_receipt == normal_receipts["crash-transition"]
+    assert crash_receipt["target_authoritative_outcome"] == "confirmed"
+    assert crash_receipt["outcome_authority"] == "target"
+    assert crash_receipt["candidate_outcome_projection"]["outcome"] == "confirmed"
+
+    task = (await service.list_schedule_tasks(live.id))[0]
+    committed = await service.committed_task_result_evidence(live.id, task)
+    assert committed is not None
+    assert committed["target_evidence_receipts"] == {
+        "crash-transition": crash_receipt
+    }
 
 
 async def test_replacement_result_inherits_authenticated_ancestor_evidence_after_restart() -> None:
@@ -8876,6 +10055,424 @@ class FencingStore(Store):
         lease.state = "expired"
         node = self.nodes[lease.schedule_id][lease.node_id]
         node["state"] = "ready"
+
+
+@pytest.mark.parametrize(
+    "transition_case",
+    (
+        "success",
+        "pre_effect",
+        "malformed",
+        "ambiguous",
+        "continued",
+        "wrong_session",
+        "unauthorized_tool",
+    ),
+)
+async def test_restart_adopts_durable_material_transition_before_provider_or_target_call(
+    transition_case: str,
+) -> None:
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": False,
+        "before_digest": "sha256:" + hashlib.sha256(b"restart-before").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"restart-after").hexdigest(),
+        "changed_dimensions": ["controls"],
+        "added_controls": [
+            {
+                "role": "dialog",
+                "name": "Level complete",
+                "frame_ref": "main",
+                "surface_scope": "modal",
+            }
+        ],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:restart-after"],
+        "reobservation_recommended": True,
+        "transition_digest": "sha256:" + hashlib.sha256(b"raw-restart").hexdigest(),
+        "url_change": None,
+        "frame_change": None,
+        "added_visible_text": ["Congratulations! You pass the level."],
+    }
+    if transition_case in {"pre_effect", "malformed"}:
+        transition["adapter_stale"] = True
+    if transition_case == "malformed":
+        transition["after_digest"] = transition["before_digest"]
+
+    class EffectStore:
+        def __init__(self) -> None:
+            self.records = {}
+
+        async def begin(self, record):
+            existing = self.records.get(record.idempotency_key)
+            if existing is not None:
+                return existing, False
+            self.records[record.idempotency_key] = record
+            return record, True
+
+        async def finish(self, record):
+            self.records[record.idempotency_key] = record
+            return record
+
+        async def list_for_session(self, session_id, *, tool_name=None):
+            return [
+                item
+                for item in self.records.values()
+                if item.session_id == session_id
+                and (tool_name is None or item.tool_name == tool_name)
+            ]
+
+        async def list_for_attempt(self, attempt_id):
+            return [
+                item for item in self.records.values() if item.attempt_id == attempt_id
+            ]
+
+        async def list_for_campaign(self, campaign_id, *, limit=None):
+            records = [
+                item for item in self.records.values() if item.campaign_id == campaign_id
+            ]
+            return records if limit is None else records[-limit:]
+
+    class SurfaceTool:
+        effect = "target_network"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return ToolSpec(
+                name="browser_chat_exchange",
+                description="Reviewed browser exchange",
+                input_schema={"type": "object"},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+
+        async def invoke(self, context, arguments):
+            del context, arguments
+            self.calls += 1
+            assert self.calls <= (2 if transition_case in {"ambiguous", "continued"} else 1)
+            if self.calls == 2 and transition_case == "continued":
+                return ToolResult(
+                    content="stale worker continued after the transition",
+                    metadata={
+                        "target_session_id": "browser:restart-context",
+                        "target_exchanges": [
+                            {
+                                "interaction": True,
+                                "cleanup": False,
+                                "request_id": "continued-request",
+                                "status_code": 200,
+                            }
+                        ],
+                        "target_effect_attempted": True,
+                        "target_call_budget_charge": 1,
+                        "limit_interaction_count": 1,
+                    },
+                )
+            pre_effect_error = transition_case in {"pre_effect", "malformed"}
+            return ToolResult(
+                content=(
+                    "reviewed controls changed before delivery"
+                    if pre_effect_error
+                    else "level completed before daemon restart"
+                ),
+                is_error=pre_effect_error,
+                metadata={
+                    "target_session_id": "browser:restart-context",
+                    "target_exchanges": (
+                        []
+                        if pre_effect_error
+                        else [
+                            {
+                                "interaction": True,
+                                "cleanup": False,
+                                "request_id": "restart-request",
+                                "status_code": 200,
+                            }
+                        ]
+                    ),
+                    "target_effect_attempted": False if pre_effect_error else True,
+                    "target_call_budget_charge": 0 if pre_effect_error else 1,
+                    "limit_interaction_count": 0 if pre_effect_error else 1,
+                    "target_ui_transition": transition,
+                },
+            )
+
+    class RestartStore(FencingStore):
+        def commit_reducer(self, attempt_id, generation, **kwargs):
+            digest = super().commit_reducer(attempt_id, generation, **kwargs)
+            lease = self.attempts[attempt_id]
+            self.results[lease.schedule_id][lease.node_id]["attempt_id"] = attempt_id
+            return digest
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            del applied_message_ids
+            lease = self.attempts[attempt_id]
+            assert lease.generation == generation
+            payload = dict(result)
+            payload_digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+            ).hexdigest()
+            row = {
+                "node_id": lease.node_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "schema_id": "schema/partial-result",
+                "payload_digest": payload_digest,
+                "payload": payload,
+            }
+            self.results.setdefault(lease.schedule_id, {})[
+                f"partial:{attempt_id}"
+            ] = row
+            return payload_digest
+
+        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+            prior = next(
+                (
+                    attempt
+                    for attempt in reversed(tuple(self.attempts.values()))
+                    if attempt.schedule_id == schedule_id
+                    and attempt.node_id == node_id
+                    and attempt.state == "expired"
+                ),
+                None,
+            )
+            lease = super().claim(
+                schedule_id,
+                node_id,
+                owner,
+                lease_expires_at=lease_expires_at,
+                attempt_id=attempt_id,
+            )
+            lease.replaced_attempt_id = prior.id if prior is not None else None
+            return lease
+
+        def replacement_attempt_lineage(self, attempt_id):
+            lineage = []
+            current = self.attempts[attempt_id]
+            while current is not None:
+                lineage.append(current.id)
+                replaced = getattr(current, "replaced_attempt_id", None)
+                current = self.attempts.get(replaced) if replaced is not None else None
+            return tuple(reversed(lineage))
+
+    class NoWorkerProvider(Provider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            del request
+            self.calls += 1
+            raise AssertionError("restart transition recovery must not call the provider")
+            yield  # pragma: no cover
+
+    async def allow(*_args):
+        return True
+
+    assignment = WorkerAssignment(
+        id="campaign/restart-transition/worker",
+        objective="Run one authorized browser exchange.",
+        profile_id="recon",
+        target_profile_id="target-surface",
+        technique_ids=("surface-transition",),
+        guidance_ids=(),
+        tool_ids=("browser_chat_exchange",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=20_000, max_seconds=30),
+        max_target_exchanges=1,
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        strategy_id="direct",
+    )
+    profile = ContextDocument.create("profile:recon@1", "Observe the reviewed surface.")
+    target = ReviewedTargetAdapter(
+        "target-surface",
+        "browser",
+        "https://target.test/chat",
+        "web-chat",
+        authentication="ambient authenticated browser context",
+    )
+    worker_context = WorkerContext(
+        assignment_id=assignment.id,
+        profile=profile,
+        guidance=(),
+        skills=(),
+        tool_ids=assignment.tool_ids,
+        target=target,
+        authority_ids=assignment.authority_ids,
+        digest=_digest(
+            {
+                "assignment_id": assignment.id,
+                "profile": asdict(profile),
+                "guidance": [],
+                "skills": [],
+                "tool_ids": assignment.tool_ids,
+                "target": asdict(target),
+                "authority_ids": assignment.authority_ids,
+                "strategy_id": "direct",
+                "strategy_contract": (),
+            }
+        ),
+    )
+    surface_tool = SurfaceTool()
+    effect_store = EffectStore()
+    broker = ToolBroker(
+        (surface_tool,),
+        confirmer=allow,
+        effect_store=effect_store,
+    )
+    store = RestartStore()
+    first = DurableAgentService(
+        NoWorkerProvider(), broker, store, model="test", lease_seconds=0.05
+    )
+    live = await first.submit(
+        "session-restart-transition",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+        worker_contexts={assignment.id: worker_context},
+        start_immediately=False,
+    )
+
+    start_handle = live.scheduler.claim("start", "scheduler", 1)
+    start_lease = await first._claim(live, start_handle)  # noqa: SLF001
+    live.scheduler.complete(start_handle, "start", 2)
+    await first._commit(live, start_lease, {"started": True}, "schema/envelope")  # noqa: SLF001
+    await first._ready(live, live.scheduler.ready_nodes())  # noqa: SLF001
+    node_id = f"worker:{assignment.id}"
+    worker_handle = live.scheduler.claim(node_id, node_id, 4)
+    worker_lease = await first._claim(live, worker_handle)  # noqa: SLF001
+    store.schedules[live.id]["checkpoint"] = live.scheduler.checkpoint()
+
+    await broker.invoke(
+        "browser_chat_exchange",
+        ToolContext(
+            session_id=live.session_id,
+            workspace_root=".",
+            call_id="restart-transition",
+            agent_id=assignment.id,
+            attempt_id=worker_lease.id,
+            campaign_id="campaign/restart-transition",
+            target_id=assignment.target_profile_id,
+        ),
+        {"prompt": "authorized probe"},
+    )
+    if transition_case in {"ambiguous", "continued"}:
+        await broker.invoke(
+            "browser_chat_exchange",
+            ToolContext(
+                session_id=live.session_id,
+                workspace_root=".",
+                call_id="restart-transition-2",
+                agent_id=assignment.id,
+                attempt_id=worker_lease.id,
+                campaign_id="campaign/restart-transition",
+                target_id=assignment.target_profile_id,
+            ),
+            {"prompt": "stale follow-up"},
+        )
+    if transition_case in {"wrong_session", "unauthorized_tool"}:
+        key, effect = next(iter(effect_store.records.items()))
+        effect_store.records[key] = effect.model_copy(
+            update=(
+                {"session_id": "unrelated-session"}
+                if transition_case == "wrong_session"
+                else {"tool_name": "unreviewed_target_exchange"}
+            )
+        )
+    worker_lease.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    first._live.clear()  # noqa: SLF001 - simulate daemon process loss
+
+    provider = NoWorkerProvider()
+    replacement = DurableAgentService(
+        provider, broker, store, model="test", lease_seconds=0.05
+    )
+    reopened = await replacement.reopen(live.id)
+    assert reopened.execution is not None
+    await asyncio.wait_for(reopened.execution, timeout=2)
+
+    attempts = [
+        attempt for attempt in store.attempts.values() if attempt.node_id == node_id
+    ]
+    assert len(attempts) == 2
+    assert store.nodes[live.id][node_id]["state"] == {
+        "success": "completed",
+        "pre_effect": "failed",
+        "malformed": "quarantined",
+        "ambiguous": "quarantined",
+        "continued": "quarantined",
+        "wrong_session": "quarantined",
+        "unauthorized_tool": "quarantined",
+    }[transition_case]
+    assert provider.calls == 0
+    assert surface_tool.calls == (
+        2 if transition_case in {"ambiguous", "continued"} else 1
+    )
+    assert len(effect_store.records) == (
+        2 if transition_case in {"ambiguous", "continued"} else 1
+    )
+    assert any(
+        event_type == "worker_restart_transition_recovered"
+        for _, event_type, _ in store.lifecycle_events
+    )
+    task = next(
+        item
+        for item in await replacement.list_schedule_tasks(live.id)
+        if item.id == assignment.id
+    )
+    if transition_case == "success":
+        committed = await replacement.committed_task_result_evidence(live.id, task)
+    else:
+        row = next(
+            item
+            for item in reversed(store.list_results(live.id))
+            if item.get("node_id") == node_id
+            and item.get("schema_id") == "schema/partial-result"
+        )
+        committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+            live.id,
+            task,
+            row,
+            durable_effects=tuple(broker._effect_store.records.values()),  # noqa: SLF001
+            evidence_attempt_ids=tuple(item.id for item in attempts),
+        )
+    assert committed is not None
+    projection = await replacement.completion_projection(live.id)
+    assert projection["evidence"][assignment.id] == committed
+    lead_evidence = await CampaignService._source_evidence(  # noqa: SLF001
+        SimpleNamespace(_agents=replacement),
+        live.id,
+        (task,),
+    )
+    assert lead_evidence[assignment.id] == committed
+    assert committed["attempt_id"] == attempts[-1].id
+    assert committed["evidence_attempt_ids"] == tuple(item.id for item in attempts)
+    if transition_case == "success":
+        assert tuple(committed["target_evidence_receipts"]) == ("restart-transition",)
+        assert committed["target_ui_transition_receipts"] == {}
+        receipt = committed["target_evidence_receipts"]["restart-transition"]
+        assert receipt["attempt_id"] == attempts[0].id
+        assert receipt["acknowledged"] is True
+        assert receipt["candidate_outcome_projection"]["outcome"] == "unclear"
+    elif transition_case == "pre_effect":
+        assert committed["target_evidence_receipts"] == {}
+        assert tuple(committed["target_ui_transition_receipts"]) == (
+            "restart-transition",
+        )
+        receipt = committed["target_ui_transition_receipts"]["restart-transition"]
+        assert receipt["attempt_id"] == attempts[0].id
+        assert receipt["target_effect_attempted"] is False
+        assert receipt["interaction_count"] == 0
+        assert receipt["limit_interaction_count"] == 0
+        assert receipt["target_call_budget_charge"] == 0
+        assert committed["target_call_ids"] == ()
+    else:
+        assert committed["target_evidence_receipts"] == {}
+        assert committed["target_ui_transition_receipts"] == {}
 
 
 def _fencing_assignments(prefix: str, count: int = 2) -> tuple[WorkerAssignment, ...]:

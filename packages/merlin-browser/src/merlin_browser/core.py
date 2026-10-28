@@ -51,6 +51,155 @@ _VISUAL_MIN_AXIS_PX = 96
 _VISUAL_MIN_AREA_PX = 24_000
 _VISUAL_MAX_BYTES = 5_242_880
 
+_ELEMENT_SURFACE_METADATA_SCRIPT = """
+    (elements, limit) => {
+        const composedParent = (node) => {
+            if (node.assignedSlot) return node.assignedSlot;
+            if (node.parentElement) return node.parentElement;
+            const root = node.getRootNode ? node.getRootNode() : null;
+            return root && root.host ? root.host : null;
+        };
+        const ownsRetargetedHit = (element, hit) => {
+            if (!hit) return false;
+            if (hit === element || element.contains(hit)) return true;
+            // document.elementFromPoint retargets an open-shadow descendant to
+            // its host. Only exact hosts in the element's composed ancestry are
+            // accepted; unrelated light-DOM descendants of a host remain blockers.
+            let root = element.getRootNode ? element.getRootNode() : null;
+            while (root && root.host) {
+                if (hit === root.host) return true;
+                root = root.host.getRootNode ? root.host.getRootNode() : null;
+            }
+            return false;
+        };
+        return elements.slice(0, limit).map((element) => {
+            let scope = "document";
+            const style = element.ownerDocument.defaultView.getComputedStyle(element);
+            const rendered = element.getClientRects().length > 0
+                && style.display !== "none" && style.visibility !== "hidden";
+            // Use the nearest meaningful composed ancestor. A transcript nested
+            // in a persistent dialog stays transcript-like, while an inner modal
+            // or popover still wins because it is encountered first.
+            for (let node = rendered ? element : null; node; node = composedParent(node)) {
+                const role = (node.getAttribute("role") || "").toLowerCase();
+                const tag = node.tagName.toLowerCase();
+                const ariaModal = node.getAttribute("aria-modal") === "true";
+                let cssModal = false;
+                let openPopover = false;
+                try {
+                    cssModal = node.matches(":modal");
+                    openPopover = node.matches(":popover-open");
+                } catch (_) {
+                    // Older browser engines can omit these structural selectors.
+                }
+                if (cssModal || ariaModal) {
+                    scope = "modal";
+                    break;
+                }
+                if (role === "dialog" || role === "alertdialog" || tag === "dialog") {
+                    scope = "dialog";
+                    break;
+                }
+                if (openPopover) {
+                    scope = "top_layer";
+                    break;
+                }
+                if (["log", "feed"].includes(role)) {
+                    scope = "transcript";
+                    break;
+                }
+                if (["status", "alert"].includes(role)) {
+                    scope = "status";
+                    break;
+                }
+                if (["polite", "assertive"].includes(node.getAttribute("aria-live"))) {
+                    // A generic live region is common response chrome. It is a
+                    // neutral boundary: do not promote its actions merely
+                    // because an outer application shell is a dialog.
+                    scope = "document";
+                    break;
+                }
+            }
+            const rect = element.getBoundingClientRect();
+            const left = Math.max(rect.left, 0);
+            const right = Math.min(rect.right, window.innerWidth);
+            const top = Math.max(rect.top, 0);
+            const bottom = Math.min(rect.bottom, window.innerHeight);
+            const visible = rendered && right > left && bottom > top;
+            const hit = visible
+                ? element.ownerDocument.elementFromPoint((left + right) / 2, (top + bottom) / 2)
+                : null;
+            return {scope, occluded: visible && !ownsRetargetedHit(element, hit)};
+        });
+    }
+"""
+
+_FRAME_SURFACE_OCCLUSION_SCRIPT = """
+    (element) => {
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(rect.left, 0);
+        const right = Math.min(rect.right, window.innerWidth);
+        const top = Math.max(rect.top, 0);
+        const bottom = Math.min(rect.bottom, window.innerHeight);
+        const visible = element.getClientRects().length > 0 && right > left && bottom > top;
+        if (!visible) return false;
+        const hit = element.ownerDocument.elementFromPoint(
+            (left + right) / 2,
+            (top + bottom) / 2,
+        );
+        if (!hit) return true;
+        if (hit === element || element.contains(hit)) return false;
+        let root = element.getRootNode ? element.getRootNode() : null;
+        while (root && root.host) {
+            if (hit === root.host) return false;
+            root = root.host.getRootNode ? root.host.getRootNode() : null;
+        }
+        return true;
+    }
+"""
+
+
+async def _element_surface_metadata(
+    locators: Locator,
+    count: int,
+) -> tuple[tuple[str, bool], ...]:
+    """Classify bounded structure and hit-test state in one browser round trip."""
+
+    try:
+        raw = await locators.evaluate_all(_ELEMENT_SURFACE_METADATA_SCRIPT, count)
+    except PlaywrightError:
+        return tuple(("document", False) for _ in range(count))
+    if not isinstance(raw, list) or len(raw) != count:
+        return tuple(("document", False) for _ in range(count))
+    allowed = {"document", "transcript", "status", "dialog", "modal", "top_layer"}
+    return tuple(
+        (
+            str(item.get("scope")) if item.get("scope") in allowed else "document",
+            item.get("occluded") is True,
+        )
+        if isinstance(item, Mapping)
+        else ("document", False)
+        for item in raw
+    )
+
+
+async def _frame_surface_occluded(frame: Frame) -> bool:
+    """Detect a parent-document overlay that blocks an embedded target frame."""
+
+    current = frame
+    while current.parent_frame is not None:
+        try:
+            frame_element = await current.frame_element()
+            try:
+                if await frame_element.evaluate(_FRAME_SURFACE_OCCLUSION_SCRIPT) is True:
+                    return True
+            finally:
+                await frame_element.dispose()
+        except PlaywrightError:
+            return False
+        current = current.parent_frame
+    return False
+
 
 def _sanitized_visual_source_url(value: str) -> str:
     """Keep visual attribution without persisting URL credentials or inline image bytes."""
@@ -555,6 +704,8 @@ class BrowserSession:
         page = self._page(tab_ref)
         await self._enforce_page(page)
         frame, resolved_frame_ref = self._frame(page, frame_ref)
+        frame_surface_occluded = await _frame_surface_occluded(frame)
+        title = " ".join((await frame.title()).split())[:512]
         text = await frame.locator("body").inner_text(timeout=2_000)
         lowered = text.lower()
         if "captcha" in lowered or "verify you are human" in lowered:
@@ -562,6 +713,7 @@ class BrowserSession:
                 tab_ref,
                 "blocker",
                 frame_ref=resolved_frame_ref,
+                title=title,
                 text="manual CAPTCHA blocker",
                 step=step,
             )
@@ -571,7 +723,9 @@ class BrowserSession:
         match_counts: dict[tuple[str, str], int] = {}
         for role in ("button", "link", "textbox", "checkbox", "radio", "combobox"):
             locators = frame.get_by_role(role)
-            for index in range(min(await locators.count(), 50)):
+            role_count = min(await locators.count(), 50)
+            surface_metadata = await _element_surface_metadata(locators, role_count)
+            for index in range(role_count):
                 locator = locators.nth(index)
                 name = await self._element_name(locator, role, index)
                 match_key = (role, name)
@@ -604,10 +758,14 @@ class BrowserSession:
                         max_length=max_length,
                         disabled=await locator.is_disabled(),
                         read_only=(await locator.get_attribute("readonly")) is not None,
+                        surface_scope=surface_metadata[index][0],
+                        occluded=surface_metadata[index][1] or frame_surface_occluded,
                     )
                 )
         uploads = frame.locator('input[type="file"]')
-        for index in range(min(await uploads.count(), 20)):
+        upload_count = min(await uploads.count(), 20)
+        upload_surface_metadata = await _element_surface_metadata(uploads, upload_count)
+        for index in range(upload_count):
             locator = uploads.nth(index)
             name = (await locator.get_attribute("aria-label")) or f"File upload {index + 1}"
             ref = f"{tab_ref}:{generation}:{len(elements)}"
@@ -629,6 +787,45 @@ class BrowserSession:
                     frame_ref=resolved_frame_ref,
                     role="file",
                     name=name,
+                    surface_scope=upload_surface_metadata[index][0],
+                    occluded=upload_surface_metadata[index][1] or frame_surface_occluded,
+                )
+            )
+        structural_surfaces = frame.locator(
+            "dialog[open], [role=dialog], [role=alertdialog], [role=status], "
+            "[role=alert], [popover]"
+        )
+        structural_count = min(await structural_surfaces.count(), 20)
+        structural_metadata = await _element_surface_metadata(
+            structural_surfaces, structural_count
+        )
+        for index in range(structural_count):
+            surface_scope, occluded = structural_metadata[index]
+            if surface_scope not in {"status", "dialog", "modal", "top_layer"}:
+                continue
+            locator = structural_surfaces.nth(index)
+            name = f"{surface_scope.replace('_', ' ').title()} surface {index + 1}"
+            ref = f"{tab_ref}:{generation}:{len(elements)}"
+            match_key = ("surface", name)
+            match_index = match_counts.get(match_key, 0)
+            match_counts[match_key] = match_index + 1
+            self._elements[ref] = _Element(
+                generation,
+                resolved_frame_ref,
+                "surface",
+                name,
+                match_index,
+                locator,
+            )
+            elements.append(
+                ElementRef(
+                    ref=ref,
+                    tab_ref=tab_ref,
+                    frame_ref=resolved_frame_ref,
+                    role="surface",
+                    name=name,
+                    surface_scope=surface_scope,
+                    occluded=occluded or frame_surface_occluded,
                 )
             )
         # Visible target text may legitimately discuss tokens (especially in security tests).
@@ -642,6 +839,7 @@ class BrowserSession:
             tab_ref,
             "snapshot",
             frame_ref=resolved_frame_ref,
+            title=title,
             text=safe_text,
             elements=tuple(elements),
             redacted=redacted,
@@ -1442,6 +1640,7 @@ class BrowserSession:
         kind: str,
         *,
         frame_ref: str | None = None,
+        title: str = "",
         text: str = "",
         elements: tuple[ElementRef, ...] = (),
         evidence: tuple[str, ...] = (),
@@ -1462,6 +1661,7 @@ class BrowserSession:
             frame_ref=frame_ref,
             kind=kind,
             step=step,
+            title=title,
             text=text,
             elements=elements,
             evidence_refs=evidence,

@@ -101,6 +101,10 @@ class ElementRef(BrowserModel):
     max_length: int | None = Field(default=None, ge=1)
     disabled: bool = False
     read_only: bool = False
+    occluded: bool = False
+    surface_scope: Literal[
+        "document", "transcript", "status", "dialog", "modal", "top_layer"
+    ] = "document"
 
 
 class BrowserObservation(BrowserModel):
@@ -112,6 +116,7 @@ class BrowserObservation(BrowserModel):
     frame_ref: str | None = None
     kind: Literal["snapshot", "navigation", "network", "popup", "blocker", "cleanup"]
     step: int = Field(default=0, ge=0)
+    title: str = Field(default="", max_length=512)
     text: str = ""
     elements: tuple[ElementRef, ...] = ()
     evidence_refs: tuple[str, ...] = ()
