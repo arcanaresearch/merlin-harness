@@ -296,6 +296,21 @@ def _automatic_tool_progress_fingerprint(
     )
 
 
+def _preferred_tool_retry_exhausted(
+    state: dict[str, object],
+    call: ToolCall,
+    *,
+    max_retries: int,
+) -> bool:
+    attempts = int(state.get("attempts", 0)) + 1
+    state.update(
+        attempts=attempts,
+        tool_name=call.name,
+        exhausted=attempts > max_retries,
+    )
+    return attempts > max_retries
+
+
 def _durable_automatic_recon_marker(
     tool_name: str, result: ToolResult, *, progress_key: str | None = None
 ) -> str | None:
@@ -830,6 +845,7 @@ class Kernel:
         repair_messages: list[ChatMessage] = []
         follow_through_recoveries = 0
         preferred_tool_follow_through_failures = 0
+        preferred_tool_retry_state: dict[str, object] = {}
         preferred_transition_observation_used = False
         automatic_recon_continuation: dict[str, object] | None = None
         automatic_no_progress_key: str | None = None
@@ -915,6 +931,24 @@ class Kernel:
                 )
                 return "exhausted"
 
+            async def emit_preferred_tool_retry_exhausted() -> None:
+                await self._emit(
+                    self._event(
+                        "error",
+                        code="preferred_tool_retry_exhausted",
+                        text=(
+                            "preferred tool repeatedly returned retryable failures without "
+                            "completing the obligation"
+                        ),
+                        retryable=True,
+                        preferred_tool=preferred_tool_retry_state.get("tool_name"),
+                        attempts=preferred_tool_retry_state.get("attempts"),
+                        **failure_event_payload(
+                            InfrastructureFailureCategory.DELIVERY_FAILURE
+                        ),
+                    )
+                )
+
             while True:
                 request_steering_version = self._steering_version
                 request_has_followup = request_steering_version != consumed_steering_version
@@ -927,6 +961,7 @@ class Kernel:
                 request_recovery_reasoning = recovery_reasoning
                 recovery_reasoning = None
                 request_preferred_tool_name = preferred_next_tool_name
+                request_preferred_tool_mode = preferred_next_tool_mode
                 request_preferred_tool_is_strict = (
                     request_preferred_tool_name is not None
                     and preferred_next_tool_mode != "after_one_admitted_action"
@@ -1182,7 +1217,14 @@ class Kernel:
                         }
                         and call.name in _described_tool_names
                     )
-                    if is_preferred_tool_call and not duplicate_owned_cleanup:
+                    preferred_retry_exhausted = (
+                        preferred_tool_retry_state.get("exhausted") is True
+                    )
+                    if (
+                        is_preferred_tool_call
+                        and not duplicate_owned_cleanup
+                        and not preferred_retry_exhausted
+                    ):
                         # Invocation initially discharges the obligation. A typed retryable
                         # failure below re-establishes it from durable tool evidence.
                         preferred_next_tool_name = None
@@ -1217,6 +1259,7 @@ class Kernel:
                             )
                         )
                         and not duplicate_owned_cleanup
+                        and not preferred_retry_exhausted
                     )
                     if is_required_owned_cleanup and not duplicate_owned_cleanup:
                         owned_cleanup_attempted_keys.add(owned_cleanup_key)
@@ -1298,7 +1341,40 @@ class Kernel:
                     )
                     if call.name == "request_user_input" and not result.is_error:
                         raise _AwaitingUserInput
-                    next_tool = result.metadata.get("preferred_next_tool")
+                    if preferred_retry_exhausted:
+                        return DynamicToolOutput(
+                            content=result.content,
+                            success=False,
+                        )
+                    raw_next_tool = result.metadata.get("preferred_next_tool")
+                    next_tool = (
+                        raw_next_tool.strip()
+                        if isinstance(raw_next_tool, str) and raw_next_tool.strip()
+                        else None
+                    )
+                    retryable_error = (
+                        result.is_error and result.metadata.get("retryable") is True
+                    )
+                    retained_preferred_error = (
+                        result.is_error
+                        and is_preferred_tool_call
+                        and current_preferred_tool_name is not None
+                        and (
+                            next_tool == current_preferred_tool_name
+                            or (next_tool is None and retryable_error)
+                        )
+                    )
+                    if retained_preferred_error:
+                        _preferred_tool_retry_exhausted(
+                            preferred_tool_retry_state,
+                            call,
+                            max_retries=self._max_provider_retries,
+                        )
+                    elif is_preferred_tool_call or (
+                        isinstance(next_tool, str)
+                        and next_tool != current_preferred_tool_name
+                    ):
+                        preferred_tool_retry_state.clear()
                     if isinstance(next_tool, str):
                         if next_tool != current_preferred_tool_name:
                             preferred_transition_observation_used = False
@@ -1307,15 +1383,10 @@ class Kernel:
                             result.metadata.get("preferred_next_tool_mode") or "strict"
                         )
                         preferred_tool_follow_through_failures = 0
-                    elif (
-                        result.is_error
-                        and result.metadata.get("retryable") is True
-                        and is_preferred_tool_call
-                        and current_preferred_tool_name is not None
-                    ):
+                    elif retained_preferred_error:
                         # A retryable typed failure means the required action remains
-                        # incomplete. Keep the same strict obligation unless the tool
-                        # explicitly selected a different repair tool above.
+                        # incomplete. The one-observation allowance has been consumed by
+                        # the attempted preferred action, so its retry is strict.
                         preferred_next_tool_name = current_preferred_tool_name
                         preferred_next_tool_mode = "strict"
                         preferred_tool_follow_through_failures = 0
@@ -1387,8 +1458,11 @@ class Kernel:
                 )
                 async for event in provider_stream:
                     if isinstance(event, TextDelta):
-                        assistant += event.text
-                        await self._emit(self._event("stream", text=event.text))
+                        # Prose cannot discharge a durable preferred-tool obligation. Do not
+                        # flash text in the UI that will be discarded after the miss is detected.
+                        if preferred_next_tool_name is None:
+                            assistant += event.text
+                            await self._emit(self._event("stream", text=event.text))
                     elif isinstance(event, ToolCall):
                         used_tool = True
                         tool_calls.append(event)
@@ -1525,6 +1599,9 @@ class Kernel:
                     assistant = ""
                     reasoning = ""
                     continue
+                if preferred_tool_retry_state.get("exhausted") is True:
+                    await emit_preferred_tool_retry_exhausted()
+                    return
                 if owned_cleanup_failed:
                     await self._emit(
                         self._event(
@@ -1593,12 +1670,31 @@ class Kernel:
                             if request_preferred_tool_is_strict
                             else None
                         ),
+                        preferred_tool_name=request_preferred_tool_name,
+                        preferred_tool_mode=request_preferred_tool_mode,
+                        preferred_retry_state=preferred_tool_retry_state,
                         recon_recall_completed=recon_recall_completed,
                     )
                     preferred_tool_invoked = request_preferred_tool_name is not None and any(
                         call.name == request_preferred_tool_name for call in tool_calls
                     )
-                    if preferred_tool_invoked:
+                    preferred_obligation_transitioned = (
+                        request_preferred_tool_name is not None
+                        and next_preferred_tool_name != request_preferred_tool_name
+                    )
+                    preferred_obligation_mode_changed = (
+                        request_preferred_tool_name is not None
+                        and next_preferred_tool_name == request_preferred_tool_name
+                        and next_preferred_tool_mode != request_preferred_tool_mode
+                    )
+                    if preferred_tool_retry_state.get("exhausted") is True:
+                        await emit_preferred_tool_retry_exhausted()
+                        return
+                    if (
+                        preferred_tool_invoked
+                        or preferred_obligation_transitioned
+                        or preferred_obligation_mode_changed
+                    ):
                         preferred_next_tool_name = next_preferred_tool_name
                         preferred_next_tool_mode = next_preferred_tool_mode
                         preferred_tool_follow_through_failures = 0
@@ -1608,7 +1704,12 @@ class Kernel:
                         preferred_next_tool_name = next_preferred_tool_name
                         preferred_next_tool_mode = next_preferred_tool_mode
                         preferred_tool_follow_through_failures = 0
-                    if request_preferred_tool_name is not None and not preferred_tool_invoked:
+                    if (
+                        request_preferred_tool_name is not None
+                        and not preferred_tool_invoked
+                        and not preferred_obligation_transitioned
+                        and not preferred_obligation_mode_changed
+                    ):
                         disposition = await handle_preferred_tool_miss(request_preferred_tool_name)
                         if disposition == "retry":
                             assistant = ""
@@ -1901,18 +2002,30 @@ class Kernel:
         advertised_tool_names: frozenset[str] | None = None,
         automatic_recon_continuation: Mapping[str, object] | None = None,
         required_tool_name: str | None = None,
+        preferred_tool_name: str | None = None,
+        preferred_tool_mode: str = "strict",
+        preferred_retry_state: dict[str, object] | None = None,
         recon_recall_completed: bool = False,
     ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
         if not events:
-            return None, None, None, None, recon_recall_completed, "strict"
-        preferred_next_tool: str | None = None
-        preferred_next_tool_mode = "strict"
+            return (
+                preferred_tool_name or required_tool_name,
+                None,
+                None,
+                None,
+                recon_recall_completed,
+                preferred_tool_mode if preferred_tool_name else "strict",
+            )
+        preferred_next_tool = preferred_tool_name or required_tool_name
+        preferred_next_tool_mode = preferred_tool_mode if preferred_tool_name else "strict"
         admitted_tool_name = required_tool_name
+        retry_state = preferred_retry_state if preferred_retry_state is not None else {}
         automatic_continuation: dict[str, object] | None = None
         last_known_continuation: dict[str, object] | None = None
         automatic_progress_fingerprint: str | None = None
         prepare_succeeded: bool | None = None
         owned_cleanup_invoked = False
+        preferred_nonpreferred_action_used = False
         signatures = getattr(self._provider, "tool_call_signatures", None)
         await self._store.append_message(
             session_id,
@@ -1939,6 +2052,17 @@ class Kernel:
             ),
         )
         for position, event in enumerate(events):
+            current_preferred_tool = preferred_next_tool
+            bounded_preferred_action = (
+                current_preferred_tool == "browser_compile_api_handoff"
+                and preferred_next_tool_mode == "after_one_admitted_action"
+                and event.name
+                in {
+                    "browser_snapshot",
+                    "browser_network_events",
+                    "browser_wait_for_text",
+                }
+            )
             invocation = _safe_shell_invocation(
                 event.name, event.arguments, self._workspace_root
             )
@@ -1960,15 +2084,24 @@ class Kernel:
                 and automatic_recon_continuation.get("session_ownership") == "owned"
                 and not duplicate_owned_cleanup
             )
+            preferred_action_admitted = (
+                current_preferred_tool is None
+                or event.name == current_preferred_tool
+                or (bounded_preferred_action and not preferred_nonpreferred_action_used)
+            )
             tool_admitted = cleanup_admitted and (
                 admitted_tool_name is None or event.name == admitted_tool_name
-            ) and (
+            ) and preferred_action_admitted and (
                 not recon_recall_completed
                 or _tool_admitted_after_recon_recall(event.name)
             )
             try:
                 if not tool_admitted:
                     raise PermissionError("tool is not admitted for this provider request")
+                if bounded_preferred_action:
+                    preferred_nonpreferred_action_used = True
+                    preferred_next_tool_mode = "strict"
+                    admitted_tool_name = current_preferred_tool
                 if event.name == _OWNED_SESSION_CLEANUP_TOOL:
                     owned_cleanup_invoked = True
                 async with asyncio.timeout(self._tool_timeout_seconds):
@@ -2051,20 +2184,58 @@ class Kernel:
                         content="Not executed: waiting for the operator's structured answer.",
                     )
                 raise _AwaitingUserInput
-            next_tool = result.metadata.get("preferred_next_tool")
+            raw_next_tool = result.metadata.get("preferred_next_tool")
+            next_tool = (
+                raw_next_tool.strip()
+                if isinstance(raw_next_tool, str) and raw_next_tool.strip()
+                else None
+            )
             retryable_error = result.is_error and result.metadata.get("retryable") is True
-            if isinstance(next_tool, str) and (not result.is_error or retryable_error):
+            is_preferred_tool_call = event.name == current_preferred_tool
+            retained_preferred_error = (
+                result.is_error
+                and is_preferred_tool_call
+                and current_preferred_tool is not None
+                and (
+                    next_tool == current_preferred_tool
+                    or (next_tool is None and retryable_error)
+                )
+            )
+            if retained_preferred_error:
+                _preferred_tool_retry_exhausted(
+                    retry_state,
+                    event,
+                    max_retries=self._max_provider_retries,
+                )
+            elif is_preferred_tool_call or (
+                isinstance(next_tool, str) and next_tool != current_preferred_tool
+            ):
+                retry_state.clear()
+            if isinstance(next_tool, str):
                 preferred_next_tool = next_tool
                 preferred_next_tool_mode = str(
                     result.metadata.get("preferred_next_tool_mode") or "strict"
                 )
                 admitted_tool_name = next_tool
-            elif retryable_error and admitted_tool_name == event.name:
+            elif retained_preferred_error:
                 # Invoking a required tool does not discharge the obligation when
                 # that tool reports a retryable failure without another repair step.
-                preferred_next_tool = event.name
+                preferred_next_tool = current_preferred_tool
                 preferred_next_tool_mode = "strict"
-                admitted_tool_name = event.name
+                admitted_tool_name = current_preferred_tool
+            elif is_preferred_tool_call:
+                preferred_next_tool = None
+            if retry_state.get("exhausted") is True:
+                for deferred in events[position + 1 :]:
+                    await self._append_tool_terminal(
+                        session_id,
+                        name=deferred.name,
+                        call_id=deferred.call_id,
+                        content=(
+                            "Not executed: preferred tool retries made no durable progress."
+                        ),
+                    )
+                break
             if event.name == _RECON_RECALL_TOOL and not result.is_error:
                 recon_recall_completed = True
             if continuation is not None:

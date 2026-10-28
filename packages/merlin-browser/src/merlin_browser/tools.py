@@ -36,6 +36,7 @@ from merlin_contracts.state_isolation import StateIsolationPlan, resolve_state_i
 from merlin_contracts.state_scope import MissingEvidenceReason, StateScopeActionKind
 from merlin_contracts.state_scope_runtime import StateScopeLifecycle
 from merlin_contracts.target_adapter_compiler import (
+    BROWSER_STEP_SOURCE_INDEX_KEY,
     AdapterCompilation,
     AdapterCompileError,
     AdapterCompileFailureKind,
@@ -57,7 +58,7 @@ _REVIEWED_LOCATOR_ROLES = ("button", "textbox", "link", "checkbox", "radio", "co
 _REVIEWED_LOCATOR_ROLE_PATTERN = "|".join(_REVIEWED_LOCATOR_ROLES)
 _QUOTED_LOCATOR_NAME_PATTERN = r'''(?P<quoted>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
 _REVIEWED_LOCATOR_EXAMPLES = (
-    '{"role":"textbox","name":"Message"}',
+    {"role": "textbox", "name": "Message"},
     'textbox[name="Message"]',
     'role=textbox name="Message"',
     "textbox Message",
@@ -92,13 +93,29 @@ def _decoded_quoted_locator_name(value: str) -> str | None:
 
 
 def _reviewed_locator_text(value: str) -> str:
-    locator = " ".join(value.strip().split())
-    lowered = locator.casefold()
-    for verb in ("click ", "press ", "fill "):
-        if lowered.startswith(verb):
-            locator = locator[len(verb) :].strip()
-            break
-    return locator
+    return " ".join(value.strip().split())
+
+
+def _explicit_reviewed_locator_identity(locator: str) -> tuple[str, str] | None:
+    quoted_patterns = (
+        rf"^(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s*\[\s*name\s*=\s*{_QUOTED_LOCATOR_NAME_PATTERN}\s*\]$",
+        rf"^(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+named\s+{_QUOTED_LOCATOR_NAME_PATTERN}$",
+        rf"^role\s*=\s*(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+name\s*=\s*{_QUOTED_LOCATOR_NAME_PATTERN}$",
+    )
+    for pattern in quoted_patterns:
+        match = re.fullmatch(pattern, locator, flags=re.IGNORECASE)
+        if match is not None:
+            name = _decoded_quoted_locator_name(match.group("quoted"))
+            return (match.group("role").casefold(), name) if name is not None else None
+
+    unquoted = re.fullmatch(
+        rf"role\s*=\s*(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+name\s*=\s*(?P<name>[^'\"\[\]{{}}]+?)",
+        locator,
+        flags=re.IGNORECASE,
+    )
+    if unquoted is not None:
+        return unquoted.group("role").casefold(), unquoted.group("name").strip()
+    return None
 
 
 def _reviewed_locator_identities(
@@ -120,44 +137,38 @@ def _reviewed_locator_identities(
         return ((role.casefold(), " ".join(name.strip().split())),)
     if not isinstance(value, str) or not value.strip():
         return ()
-    locator = _reviewed_locator_text(value)
-    lowered = locator.casefold()
-    if lowered.startswith(("css=", "xpath=", "//", "getbyrole(", "page.")) or locator.startswith(
-        ("#", ".", "[")
-    ):
+    raw_locator = _reviewed_locator_text(value)
+    lowered = raw_locator.casefold()
+    if lowered.startswith(
+        ("css=", "xpath=", "//", "getbyrole(", "page.")
+    ) or raw_locator.startswith(("#", ".", "[")):
         return ()
-    quoted_patterns = (
-        rf"^(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s*\[\s*name\s*=\s*{_QUOTED_LOCATOR_NAME_PATTERN}\s*\]$",
-        rf"^(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+named\s+{_QUOTED_LOCATOR_NAME_PATTERN}$",
-        rf"^role\s*=\s*(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+name\s*=\s*{_QUOTED_LOCATOR_NAME_PATTERN}$",
-    )
-    for pattern in quoted_patterns:
-        match = re.fullmatch(pattern, locator, flags=re.IGNORECASE)
-        if match is not None:
-            name = _decoded_quoted_locator_name(match.group("quoted"))
-            if name is not None:
-                return ((match.group("role").casefold(), name),)
-            return ()
+    locators = [raw_locator]
+    for verb in ("click ", "press ", "fill "):
+        if lowered.startswith(verb):
+            locators.append(raw_locator[len(verb) :].strip())
+            break
 
-    unquoted = re.fullmatch(
-        rf"role\s*=\s*(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+name\s*=\s*(?P<name>[^'\"\[\]{{}}]+?)",
-        locator,
-        flags=re.IGNORECASE,
-    )
-    if unquoted is not None:
-        return ((unquoted.group("role").casefold(), unquoted.group("name").strip()),)
-
-    # A bare accessible name is the least surprising representation for fields
-    # whose role is already known.  Preserve the legacy ``role name`` spelling
-    # as a second exact interpretation; resolution rejects genuine ambiguity.
-    identities = [(default_role.casefold(), locator.strip(" '\""))]
-    legacy = re.fullmatch(
-        rf"(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+(?P<name>.+)",
-        locator,
-        flags=re.IGNORECASE,
-    )
-    if legacy is not None:
-        identities.append((legacy.group("role").casefold(), legacy.group("name").strip(" '\"")))
+    identities: list[tuple[str, str]] = []
+    for locator in locators:
+        explicit = _explicit_reviewed_locator_identity(locator)
+        if explicit is not None:
+            identities.append(explicit)
+            continue
+        if locator.casefold().startswith(
+            ("css=", "xpath=", "//", "getbyrole(", "page.")
+        ) or locator.startswith(("#", ".", "[")):
+            continue
+        identities.append((default_role.casefold(), locator.strip(" '\"")))
+        legacy = re.fullmatch(
+            rf"(?P<role>{_REVIEWED_LOCATOR_ROLE_PATTERN})\s+(?P<name>.+)",
+            locator,
+            flags=re.IGNORECASE,
+        )
+        if legacy is not None:
+            identities.append(
+                (legacy.group("role").casefold(), legacy.group("name").strip(" '\""))
+            )
     return tuple(dict.fromkeys(identities))
 
 
@@ -167,21 +178,64 @@ def _reviewed_locator_identity(value: object, *, default_role: str) -> tuple[str
     return identities[0] if identities else None
 
 
+def _matching_reviewed_element_groups(
+    observation: BrowserObservation,
+    locator: object,
+    *,
+    default_role: str,
+) -> tuple[tuple[tuple[str, str], tuple[ElementRef, ...]], ...]:
+    identities = _reviewed_locator_identities(locator, default_role=default_role)
+    return tuple(
+        (
+            (role, name),
+            tuple(
+                {
+                    element.ref: element
+                    for element in observation.elements
+                    if element.role.casefold() == role
+                    and _normalized_accessible_name(element.name)
+                    == _normalized_accessible_name(name)
+                }.values()
+            ),
+        )
+        for role, name in identities
+    )
+
+
 def _matching_reviewed_elements(
     observation: BrowserObservation,
     locator: object,
     *,
     default_role: str,
 ) -> tuple[ElementRef, ...]:
-    identities = _reviewed_locator_identities(locator, default_role=default_role)
     matches = {
         element.ref: element
-        for role, name in identities
-        for element in observation.elements
-        if element.role.casefold() == role
-        and _normalized_accessible_name(element.name) == _normalized_accessible_name(name)
+        for _, identity_matches in _matching_reviewed_element_groups(
+            observation,
+            locator,
+            default_role=default_role,
+        )
+        for element in identity_matches
     }
     return tuple(matches.values())
+
+
+def _irreducibly_ambiguous_reviewed_locator(
+    observation: BrowserObservation,
+    locator: object,
+    *,
+    default_role: str,
+) -> bool:
+    matching_groups = [
+        matches
+        for _, matches in _matching_reviewed_element_groups(
+            observation,
+            locator,
+            default_role=default_role,
+        )
+        if matches
+    ]
+    return bool(matching_groups) and all(len(matches) > 1 for matches in matching_groups)
 
 
 def _canonical_reviewed_locator(
@@ -194,7 +248,8 @@ def _canonical_reviewed_locator(
     if len(matches) != 1:
         return None
     element = matches[0]
-    return f"{element.role.casefold()}[name={json.dumps(element.name, ensure_ascii=False)}]"
+    canonical_name = " ".join(element.name.strip().split())
+    return f"{element.role.casefold()}[name={json.dumps(canonical_name, ensure_ascii=False)}]"
 
 
 def _resolve_reviewed_element(
@@ -223,6 +278,31 @@ def _locator_retry_metadata(
         "preferred_next_tool_mode": "strict",
         "invalid_fields": list(invalid_fields),
         "accepted_locator_examples": list(_REVIEWED_LOCATOR_EXAMPLES),
+        "current_locator_candidates": [
+            {
+                "role": element.role,
+                "name": element.name,
+                "frame_context": element.frame_ref,
+            }
+            for element in observation.elements
+            if element.role.casefold() in _REVIEWED_LOCATOR_ROLES
+        ],
+    }
+
+
+def _locator_ambiguity_metadata(
+    observation: BrowserObservation,
+    *,
+    effect: str,
+    ambiguous_fields: Sequence[str],
+) -> dict[str, object]:
+    return {
+        "effect": effect,
+        "failure_code": "browser_locator_ambiguous",
+        "retryable": False,
+        "effect_applied": False,
+        "target_call_budget_charge": 0,
+        "ambiguous_fields": list(ambiguous_fields),
         "current_locator_candidates": [
             {
                 "role": element.role,
@@ -362,7 +442,14 @@ def _repair_v1_browser_steps(adapter: Mapping[str, object]) -> dict[str, object]
     contract = adapter.get("interaction_contract")
     if not isinstance(raw_steps, list) or not isinstance(contract, Mapping):
         return repaired
-    steps = [dict(step) if isinstance(step, Mapping) else step for step in raw_steps]
+    steps: list[object] = []
+    for source_index, raw_step in enumerate(raw_steps):
+        if not isinstance(raw_step, Mapping):
+            steps.append(raw_step)
+            continue
+        step = dict(raw_step)
+        step[BROWSER_STEP_SOURCE_INDEX_KEY] = source_index
+        steps.append(step)
     has_fill = any(
         isinstance(step, Mapping) and step.get("tool") == "browser_fill" for step in steps
     )
@@ -381,6 +468,7 @@ def _repair_v1_browser_steps(adapter: Mapping[str, object]) -> dict[str, object]
                     "value": "{{input}}",
                 },
                 "interaction": True,
+                BROWSER_STEP_SOURCE_INDEX_KEY: None,
             },
         )
     repaired["browser_steps"] = steps
@@ -1666,8 +1754,18 @@ class ApiReconHandoffTool:
                         "type": "object",
                         "properties": {
                             "step_id": {"type": "string", "minLength": 1},
-                            "tool": {"type": "string", "minLength": 1},
-                            "arguments": {"type": "object"},
+                            "tool": {
+                                "enum": ["browser_fill", "browser_click", "browser_press"]
+                            },
+                            "arguments": {
+                                "type": "object",
+                                "properties": {"locator": reviewed_locator_schema},
+                                "additionalProperties": True,
+                            },
+                            "interaction": {"type": "boolean"},
+                            "cleanup": {"type": "boolean"},
+                            "repeat": {"type": "integer", "minimum": 1},
+                            "idempotency_key": {"type": ["string", "null"]},
                         },
                         "required": ["step_id", "tool", "arguments"],
                         "additionalProperties": False,
@@ -1868,6 +1966,7 @@ class ApiReconHandoffTool:
             if legacy_execution_error is not None:
                 result = result.model_copy(update={"content": legacy_execution_error})
             return result
+        initial_compilation_uncertainties = _compilation_uncertainties(compilation)
         if fallback is not None and not isinstance(compilation.executable, BrowserChat):
             return ToolResult(
                 content="DOM fallback reusable_adapter must compile as browser chat",
@@ -1914,6 +2013,26 @@ class ApiReconHandoffTool:
                     metadata={"effect": self.effect},
                 )
             current = await session.snapshot(open_tabs[0])
+            input_matches = _matching_reviewed_elements(
+                current,
+                reviewed_contract["input_locator"],
+                default_role="textbox",
+            )
+            submit_matches = _matching_reviewed_elements(
+                current,
+                reviewed_contract["submit_action"],
+                default_role="button",
+            )
+            input_irreducibly_ambiguous = _irreducibly_ambiguous_reviewed_locator(
+                current,
+                reviewed_contract["input_locator"],
+                default_role="textbox",
+            )
+            submit_irreducibly_ambiguous = _irreducibly_ambiguous_reviewed_locator(
+                current,
+                reviewed_contract["submit_action"],
+                default_role="button",
+            )
             canonical_input = _canonical_reviewed_locator(
                 current,
                 reviewed_contract["input_locator"],
@@ -1924,42 +2043,105 @@ class ApiReconHandoffTool:
                 reviewed_contract["submit_action"],
                 default_role="button",
             )
+            ambiguous_fields = [
+                field
+                for field, ambiguous in (
+                    (
+                        "reusable_adapter.interaction_contract.input_locator",
+                        input_irreducibly_ambiguous,
+                    ),
+                    (
+                        "reusable_adapter.interaction_contract.submit_action",
+                        submit_irreducibly_ambiguous,
+                    ),
+                )
+                if ambiguous
+            ]
             invalid_fields = [
                 field
-                for field, locator in (
-                    ("reusable_adapter.interaction_contract.input_locator", canonical_input),
-                    ("reusable_adapter.interaction_contract.submit_action", canonical_submit),
+                for field, matches, irreducibly_ambiguous in (
+                    (
+                        "reusable_adapter.interaction_contract.input_locator",
+                        input_matches,
+                        input_irreducibly_ambiguous,
+                    ),
+                    (
+                        "reusable_adapter.interaction_contract.submit_action",
+                        submit_matches,
+                        submit_irreducibly_ambiguous,
+                    ),
                 )
-                if locator is None
+                if not matches or (len(matches) > 1 and not irreducibly_ambiguous)
             ]
-            canonical_steps: list[tuple[dict[str, object], str]] = []
-            for index, step in enumerate(reviewed_browser.get("browser_steps", [])):
-                if not isinstance(step, dict) or not isinstance(step.get("arguments"), dict):
-                    continue
-                tool_name = step.get("tool")
-                if tool_name not in {"browser_fill", "browser_click", "browser_press"}:
-                    continue
-                step_arguments = step["arguments"]
-                default_role = "button" if tool_name == "browser_click" else "textbox"
-                fallback_locator = (
-                    canonical_submit if tool_name == "browser_click" else canonical_input
+            canonical_steps: list[dict[str, object]] = []
+            assert isinstance(compilation.executable, BrowserChat)
+            for index, step in enumerate(compilation.executable.steps):
+                step_arguments = deepcopy(step.arguments)
+                default_role = "button" if step.tool == "browser_click" else "textbox"
+                step_locator = step_arguments.get("locator")
+                contract_locator = (
+                    compilation.executable.interaction.submit_action
+                    if step.tool == "browser_click"
+                    else compilation.executable.interaction.input_locator
                 )
-                step_locator = step_arguments.get("locator", fallback_locator)
+                contract_matches = submit_matches if step.tool == "browser_click" else input_matches
+                locator_repeats_contract_failure = (
+                    step_locator == contract_locator and len(contract_matches) != 1
+                )
+                step_matches = _matching_reviewed_elements(
+                    current,
+                    step_locator,
+                    default_role=default_role,
+                )
+                step_irreducibly_ambiguous = _irreducibly_ambiguous_reviewed_locator(
+                    current,
+                    step_locator,
+                    default_role=default_role,
+                )
                 canonical_step = _canonical_reviewed_locator(
                     current,
                     step_locator,
                     default_role=default_role,
                 )
-                if canonical_step is None:
-                    if (
-                        "locator" in step_arguments
-                        and step.get("step_id") != "legacy-hydrated-input"
-                    ):
-                        invalid_fields.append(
-                            f"reusable_adapter.browser_steps[{index}].arguments.locator"
-                        )
+                source_index = step.source_index if step.source_index is not None else index
+                field = (
+                    f"reusable_adapter.browser_steps[{source_index}].arguments.locator"
+                )
+                if step_irreducibly_ambiguous:
+                    if not locator_repeats_contract_failure:
+                        ambiguous_fields.append(field)
                     continue
-                canonical_steps.append((step_arguments, canonical_step))
+                if not step_matches or len(step_matches) > 1 or canonical_step is None:
+                    if not locator_repeats_contract_failure:
+                        invalid_fields.append(field)
+                    continue
+                step_arguments["locator"] = canonical_step
+                canonical_step_payload: dict[str, object] = {
+                    "step_id": step.step_id or f"canonical-browser-step-{index + 1}",
+                    "tool": step.tool,
+                    "arguments": step_arguments,
+                    "interaction": step.role.value == "interaction",
+                    "cleanup": step.role.value == "cleanup",
+                    "repeat": step.repeat,
+                }
+                if step.idempotency_key is not None:
+                    canonical_step_payload["idempotency_key"] = step.idempotency_key
+                canonical_steps.append(canonical_step_payload)
+            if ambiguous_fields:
+                return ToolResult(
+                    content=(
+                        "DOM fallback locator validation found duplicate current elements for "
+                        + ", ".join(ambiguous_fields)
+                        + "; role/name is not a unique durable identity, so this handoff cannot "
+                        "be repaired by retrying the same locator contract"
+                    ),
+                    is_error=True,
+                    metadata=_locator_ambiguity_metadata(
+                        current,
+                        effect=self.effect,
+                        ambiguous_fields=ambiguous_fields,
+                    ),
+                )
             if invalid_fields:
                 return ToolResult(
                     content=(
@@ -1978,8 +2160,7 @@ class ApiReconHandoffTool:
             assert canonical_submit is not None
             reviewed_contract["input_locator"] = canonical_input
             reviewed_contract["submit_action"] = canonical_submit
-            for step_arguments, canonical_step in canonical_steps:
-                step_arguments["locator"] = canonical_step
+            reviewed_browser["browser_steps"] = canonical_steps
             reusable_adapter = json.dumps(
                 reusable_adapter_value, sort_keys=True, separators=(",", ":")
             )
@@ -2074,7 +2255,12 @@ class ApiReconHandoffTool:
                         }
                     )
                 derived_handoff = derived
-        handoff_uncertainties.extend(_compilation_uncertainties(compilation))
+        for uncertainty in (
+            *initial_compilation_uncertainties,
+            *_compilation_uncertainties(compilation),
+        ):
+            if uncertainty not in handoff_uncertainties:
+                handoff_uncertainties.append(uncertainty)
         identity = "|".join(
             str(arguments[key])
             for key in ("method", "url", "request_evidence_ref", "response_evidence_ref")

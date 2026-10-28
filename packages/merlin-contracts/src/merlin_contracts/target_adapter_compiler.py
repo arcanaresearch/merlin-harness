@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from functools import wraps
@@ -32,6 +33,7 @@ from .target_capabilities import (
 
 COMPILED_TARGET_ADAPTER_VERSION = "merlin.compiled-target-adapter.v1"
 ADAPTER_COMPILATION_VERSION = "merlin.target-adapter-compilation.v1"
+BROWSER_STEP_SOURCE_INDEX_KEY = "__merlin_source_index"
 
 
 class CompiledAdapterKind(StrEnum):
@@ -138,6 +140,7 @@ class HttpApiStep(AdapterContract):
 class BrowserStep(AdapterContract):
     kind: Literal["browser"] = "browser"
     role: AdapterStepRole
+    source_index: int | None = Field(default=None, ge=0, exclude=True)
     step_id: str | None = Field(default=None, min_length=1, exclude_if=lambda value: value is None)
     tool: Literal["browser_fill", "browser_click", "browser_press"]
     arguments: dict[str, object]
@@ -658,11 +661,33 @@ def _json_pointer_exists(value: object, pointer: str) -> bool:
 
 
 _BROWSER_LOCATOR_ROLES = frozenset({"button", "textbox", "link", "checkbox", "radio", "combobox"})
+_BROWSER_LOCATOR_ROLE_PATTERN = "|".join(sorted(_BROWSER_LOCATOR_ROLES))
+_CANONICAL_BROWSER_LOCATOR_PATTERN = re.compile(
+    rf'^(?P<role>{_BROWSER_LOCATOR_ROLE_PATTERN})\s*\[\s*name\s*=\s*'
+    r'(?P<name>"(?:\\.|[^"\\])*")\s*\]$',
+    flags=re.IGNORECASE,
+)
 
 
 def _canonical_browser_locator(value: object) -> str | None:
     if isinstance(value, str):
-        return value.strip() or None
+        locator = value.strip()
+        if not locator:
+            return None
+        match = _CANONICAL_BROWSER_LOCATOR_PATTERN.fullmatch(locator)
+        if match is None:
+            return locator
+        try:
+            name = json.loads(match.group("name"))
+        except json.JSONDecodeError:
+            return locator
+        if not isinstance(name, str) or not name.strip():
+            return locator
+        normalized_name = " ".join(name.strip().split())
+        return (
+            f"{match.group('role').casefold()}"
+            f"[name={json.dumps(normalized_name, ensure_ascii=False)}]"
+        )
     if not isinstance(value, Mapping) or set(value) != {"role", "name"}:
         return None
     role = value.get("role")
@@ -1140,6 +1165,12 @@ def _compile_browser_steps(
                 value=item,
             )
             continue
+        raw_source_index = item.get(BROWSER_STEP_SOURCE_INDEX_KEY, index)
+        source_index = (
+            raw_source_index
+            if type(raw_source_index) is int and raw_source_index >= 0
+            else None
+        )
         if item.get("interaction") is True and item.get("cleanup") is True:
             raise AdapterCompileError(
                 AdapterCompileFailureKind.NON_EXECUTABLE_CLEANUP,
@@ -1221,6 +1252,7 @@ def _compile_browser_steps(
         compiled.append(
             BrowserStep(
                 role=role,
+                source_index=source_index,
                 step_id=step_id if include_step_ids else None,
                 tool=tool,
                 arguments=normalized_arguments,

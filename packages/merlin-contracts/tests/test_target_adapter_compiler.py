@@ -686,6 +686,73 @@ def test_structured_browser_locators_compile_to_canonical_role_name_identity() -
     )
 
 
+def test_canonical_browser_locator_whitespace_has_one_executable_digest() -> None:
+    structured = _browser_adapter()
+    structured_steps = structured["browser_steps"]
+    structured_contract = structured["interaction_contract"]
+    assert isinstance(structured_steps, list)
+    assert isinstance(structured_contract, dict)
+    structured_steps[0]["arguments"]["locator"] = {
+        "role": "textbox",
+        "name": "  Message   body  ",
+    }
+    structured_steps[1]["arguments"]["locator"] = {
+        "role": "button",
+        "name": "  Send   now  ",
+    }
+    structured_contract["input_locator"] = {
+        "role": "textbox",
+        "name": "  Message   body  ",
+    }
+    structured_contract["submit_action"] = {
+        "role": "button",
+        "name": "  Send   now  ",
+    }
+
+    canonical = deepcopy(structured)
+    canonical_steps = canonical["browser_steps"]
+    canonical_contract = canonical["interaction_contract"]
+    assert isinstance(canonical_steps, list)
+    assert isinstance(canonical_contract, dict)
+    canonical_steps[0]["arguments"]["locator"] = 'textbox[name="Message   body"]'
+    canonical_steps[1]["arguments"]["locator"] = 'button[name="Send   now"]'
+    canonical_contract["input_locator"] = 'textbox[name="Message   body"]'
+    canonical_contract["submit_action"] = 'button[name="Send   now"]'
+
+    compiled = compile_target_adapter(structured)
+    canonical_compiled = compile_target_adapter(canonical)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.input_locator == 'textbox[name="Message body"]'
+    assert compiled.executable.interaction.submit_action == 'button[name="Send now"]'
+    assert compiled_target_adapter_digest(compiled) == compiled_target_adapter_digest(
+        canonical_compiled
+    )
+
+
+def test_browser_step_source_index_tracks_survivors_without_entering_identity() -> None:
+    baseline = compile_target_adapter(_browser_adapter())
+    raw = _browser_adapter()
+    steps = raw["browser_steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        0,
+        {
+            "step_id": "omitted-press",
+            "tool": "browser_press",
+            "arguments": {"locator": "textbox Old control"},
+        },
+    )
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert [step.source_index for step in compiled.executable.steps] == [1, 2]
+    serialized_steps = compiled.executable.model_dump(mode="json")["steps"]
+    assert all("source_index" not in step for step in serialized_steps)
+    assert compiled_target_adapter_digest(compiled) == compiled_target_adapter_digest(baseline)
+
+
 @pytest.mark.parametrize("interface", ["api", "open_ai_compatible", "browser"])
 def test_delivery_contradiction_is_typed_advisory_not_execution_gate(interface: str) -> None:
     raw = (

@@ -2360,7 +2360,7 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
 
     provider = Provider()
     tools = HandoffTools()
-    kernel = Kernel(provider, Store(), tools, Settings())
+    kernel = Kernel(provider, Store(), tools, Settings(), max_provider_retries=0)
     await kernel.start()
     await kernel.submit("recon")
     await kernel.wait_for_turn()
@@ -2372,11 +2372,9 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
     ]
     assert provider.requests[1].required_tool_name is None
     assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
-        "browser_snapshot",
-        "browser_wait_for_text",
-        "browser_compile_api_handoff",
+        "browser_compile_api_handoff"
     ]
-    assert provider.requests[2].required_tool_name is None
+    assert provider.requests[2].required_tool_name == "browser_compile_api_handoff"
     assert tools.calls == [
         "browser_snapshot",
         "browser_wait_for_text",
@@ -2865,7 +2863,7 @@ async def test_retryable_preferred_tool_error_retains_same_obligation() -> None:
                 return ToolResult(
                     content="locator remains ambiguous",
                     is_error=True,
-                    metadata={"retryable": True},
+                    metadata={"retryable": True, "preferred_next_tool": 123},
                 )
             return ToolResult(content="repaired")
 
@@ -2912,6 +2910,10 @@ async def test_retryable_preferred_tool_error_retains_same_obligation() -> None:
     assert not any(
         message.role == "assistant" and "manual attack" in message.content
         for message in store.messages[kernel.session_id]
+    )
+    assert not any(
+        event.type == "stream" and "manual attack" in str(event.payload.get("text"))
+        for event in store.events
     )
     assert store.messages[kernel.session_id][-1].content == "Repair complete."
 
@@ -2980,6 +2982,143 @@ async def test_retryable_preferred_tool_error_can_select_repair_transition() -> 
 
 
 @pytest.mark.asyncio
+async def test_after_one_preferred_tool_retry_becomes_strict_without_losing_obligation() -> None:
+    class RetryableTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+            self.compile_attempts = 0
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("observe", "compile")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="one final observation is allowed",
+                    metadata={
+                        "preferred_next_tool": "compile",
+                        "preferred_next_tool_mode": "after_one_admitted_action",
+                    },
+                )
+            self.compile_attempts += 1
+            if self.compile_attempts == 1:
+                return ToolResult(
+                    content="compile input needs repair",
+                    is_error=True,
+                    metadata={"retryable": True},
+                )
+            return ToolResult(content="compiled")
+
+    class RetryableProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="observe", name="observe", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 2:
+                yield TextDelta(text="Use a manual fallback instead.")
+                yield ToolCall(call_id="compile-1", name="compile", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 3:
+                yield ToolCall(call_id="compile-2", name="compile", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Compiled.")
+            yield ModelCompleted()
+
+    provider = RetryableProvider()
+    tools = RetryableTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("compile the handoff")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 4
+    assert provider.requests[1].required_tool_name is None
+    assert provider.requests[2].required_tool_name == "compile"
+    assert [tool["function"]["name"] for tool in provider.requests[2].tools] == ["compile"]
+    assert tools.calls == ["observe", "compile", "compile"]
+    assert not any(
+        event.type == "stream" and "manual fallback" in str(event.payload.get("text"))
+        for event in store.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_retryable_preferred_tool_failures_are_bounded() -> None:
+    class RetryableTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("observe", "repair")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    metadata={"preferred_next_tool": "repair"},
+                )
+            return ToolResult(
+                content="same unresolved locator",
+                is_error=True,
+                metadata={"retryable": True, "failure_code": "locator_unresolved"},
+            )
+
+    class RetryableProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="observe", name="observe", arguments={})
+            else:
+                yield ToolCall(
+                    call_id=f"repair-{len(self.requests)}",
+                    name="repair",
+                    arguments={
+                        "locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]
+                    },
+                )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    provider = RetryableProvider()
+    tools = RetryableTools()
+    store = Store()
+    kernel = Kernel(
+        provider,
+        store,
+        tools,
+        Settings(),
+        max_provider_retries=2,
+    )
+    await kernel.start()
+    await kernel.submit("repair")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 4
+    assert tools.calls == ["observe", "repair", "repair", "repair"]
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "preferred_tool_retry_exhausted"
+    assert errors[-1].payload["attempts"] == 3
+
+
+@pytest.mark.asyncio
 async def test_dynamic_retryable_preferred_tool_error_retains_same_obligation() -> None:
     class DynamicTools(Tools):
         def __init__(self):
@@ -3004,7 +3143,7 @@ async def test_dynamic_retryable_preferred_tool_error_retains_same_obligation() 
                 return ToolResult(
                     content="locator remains ambiguous",
                     is_error=True,
-                    metadata={"retryable": True},
+                    metadata={"retryable": True, "preferred_next_tool": 123},
                 )
             return ToolResult(content="repaired")
 
@@ -3051,6 +3190,79 @@ async def test_dynamic_retryable_preferred_tool_error_retains_same_obligation() 
         for message in store.messages[kernel.session_id]
     )
     assert store.messages[kernel.session_id][-1].content == "Repair complete."
+
+
+@pytest.mark.asyncio
+async def test_dynamic_identical_retryable_preferred_tool_failures_are_bounded() -> None:
+    class RetryableTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("observe", "repair")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    metadata={"preferred_next_tool": "repair"},
+                )
+            return ToolResult(
+                content="same unresolved locator",
+                is_error=True,
+                metadata={"retryable": True, "failure_code": "locator_unresolved"},
+            )
+
+    class RetryableProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            name = "observe" if len(self.requests) == 1 else "repair"
+            result = await handler(
+                ToolCall(
+                    call_id=f"{name}-{len(self.requests)}",
+                    name=name,
+                    arguments=(
+                        {}
+                        if name == "observe"
+                        else {
+                            "locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]
+                        }
+                    ),
+                )
+            )
+            assert result.success is (name == "observe")
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    provider = RetryableProvider()
+    tools = RetryableTools()
+    store = Store()
+    kernel = Kernel(
+        provider,
+        store,
+        tools,
+        Settings(),
+        max_provider_retries=2,
+    )
+    await kernel.start()
+    await kernel.submit("repair")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 4
+    assert tools.calls == ["observe", "repair", "repair", "repair"]
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "preferred_tool_retry_exhausted"
+    assert errors[-1].payload["attempts"] == 3
 
 
 @pytest.mark.asyncio
@@ -4051,8 +4263,114 @@ async def test_required_tool_batch_admits_only_receipt_authorized_successor() ->
     )
 
     assert tools.calls == ["browser_compile_api_handoff", "assessment_prepare"]
-    assert next_tool == "assessment_prepare"
+    assert next_tool is None
     assert prepare_succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_required_tool_batch_later_success_clears_same_retry_obligation() -> None:
+    class BatchTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if len(self.calls) == 1:
+                return ToolResult(
+                    content="repair again",
+                    is_error=True,
+                    metadata={"retryable": True},
+                )
+            return ToolResult(content="repaired")
+
+    tools = BatchTools()
+    kernel = Kernel(Provider(), Store(), tools, Settings())
+    session_id = await kernel.start()
+
+    next_tool, *_ = await kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(call_id="repair-1", name="repair", arguments={}),
+            ToolCall(call_id="repair-2", name="repair", arguments={}),
+        ],
+        required_tool_name="repair",
+        preferred_tool_name="repair",
+        preferred_retry_state={},
+    )
+
+    assert tools.calls == ["repair", "repair"]
+    assert next_tool is None
+
+
+@pytest.mark.asyncio
+async def test_buffered_nonretryable_error_can_select_and_complete_repair_transition() -> None:
+    class BatchTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="observation failed; compile captured evidence",
+                    is_error=True,
+                    metadata={"preferred_next_tool": "compile"},
+                )
+            return ToolResult(content="compiled")
+
+    tools = BatchTools()
+    kernel = Kernel(Provider(), Store(), tools, Settings())
+    session_id = await kernel.start()
+
+    next_tool, *_ = await kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(call_id="observe", name="observe", arguments={}),
+            ToolCall(call_id="compile", name="compile", arguments={}),
+        ],
+        required_tool_name="observe",
+        preferred_tool_name="observe",
+    )
+
+    assert tools.calls == ["observe", "compile"]
+    assert next_tool is None
+
+
+@pytest.mark.asyncio
+async def test_buffered_after_one_mode_admits_only_one_nonpreferred_batch_action() -> None:
+    class BatchTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(content="observed")
+
+    tools = BatchTools()
+    store = Store()
+    kernel = Kernel(Provider(), store, tools, Settings())
+    session_id = await kernel.start()
+
+    next_tool, *_, next_mode = await kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(call_id="click", name="browser_click", arguments={}),
+            ToolCall(call_id="snapshot", name="browser_snapshot", arguments={}),
+            ToolCall(call_id="wait", name="browser_wait_for_text", arguments={}),
+        ],
+        preferred_tool_name="browser_compile_api_handoff",
+        preferred_tool_mode="after_one_admitted_action",
+    )
+
+    assert tools.calls == ["browser_snapshot"]
+    assert next_tool == "browser_compile_api_handoff"
+    assert next_mode == "strict"
+    rejected = [
+        message.name
+        for message in store.messages[session_id]
+        if message.role == "tool" and "not admitted" in message.content
+    ]
+    assert rejected == ["browser_click", "browser_wait_for_text"]
 
 
 @pytest.mark.asyncio

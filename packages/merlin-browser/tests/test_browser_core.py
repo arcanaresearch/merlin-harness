@@ -8853,6 +8853,7 @@ def _dom_fallback_session(
     input_name: str = "Message",
     submit_name: str = "Send",
     duplicate_input: bool = False,
+    extra_input_names: tuple[str, ...] = (),
 ) -> type:
     class Session:
         context_id = "browser-context"
@@ -8883,6 +8884,15 @@ def _dom_fallback_session(
                         frame_ref="main",
                     )
                 )
+            inputs.extend(
+                SimpleNamespace(
+                    role="textbox",
+                    name=name,
+                    ref=f"tab-1:message-extra-{index}",
+                    frame_ref="main",
+                )
+                for index, name in enumerate(extra_input_names)
+            )
             return SimpleNamespace(
                 elements=[
                     *inputs,
@@ -9096,29 +9106,158 @@ async def test_dom_fallback_canonical_locator_round_trips_quotes_and_backslashes
     assert replay_recorder.handoff is not None
 
 
-@pytest.mark.parametrize(
-    ("input_locator", "duplicate_input"),
-    [("css=#message", False), ("Textbox 1", True)],
-)
+@pytest.mark.parametrize("input_name", ["Click here", "Fill details", "Press release"])
 @pytest.mark.asyncio
-async def test_dom_fallback_locator_errors_return_actionable_retry_metadata(
-    input_locator: object,
-    duplicate_input: bool,
+async def test_dom_fallback_preserves_bare_names_that_begin_with_legacy_verbs(
+    input_name: str,
 ) -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
         lambda _: _dom_fallback_session(
             {},
-            input_name="Textbox 1",
+            input_name=input_name,
             submit_name="Button 8",
-            duplicate_input=duplicate_input,
         )(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
     contract = adapter["interaction_contract"]
     assert isinstance(contract, dict)
-    contract["input_locator"] = input_locator
+    contract["input_locator"] = input_name
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    persisted = json.loads(recorder.handoff.reusable_adapter)
+    assert persisted["interaction_contract"]["input_locator"] == (
+        f"textbox[name={json.dumps(input_name)}]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_ignores_locator_on_compiler_omitted_step() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {}, input_name="Textbox 1", submit_name="Button 8"
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    steps = adapter["browser_steps"]
+    contract = adapter["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    steps.insert(
+        0,
+        {
+            "step_id": "omitted-press",
+            "tool": "browser_press",
+            "arguments": {"locator": "textbox Old control"},
+        },
+    )
+    contract["input_locator"] = "Textbox 1"
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    persisted = json.loads(recorder.handoff.reusable_adapter)
+    assert [step["tool"] for step in persisted["browser_steps"]] == [
+        "browser_fill",
+        "browser_click",
+    ]
+    uncertainties = result.metadata["evaluation_uncertainties"]
+    assert any(
+        item["source"] == "target_adapter_compiler.browser_steps[1].arguments.value"
+        for item in uncertainties
+    )
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_empty_step_locator_uses_compiler_fallback() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {}, input_name="Textbox 1", submit_name="Button 8"
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    steps = adapter["browser_steps"]
+    contract = adapter["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    steps.insert(
+        0,
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "", "value": "{{input}}"},
+            "interaction": True,
+        },
+    )
+    contract["input_locator"] = "Textbox 1"
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is False
+    assert recorder.handoff is not None
+    persisted = json.loads(recorder.handoff.reusable_adapter)
+    assert persisted["browser_steps"][0]["arguments"]["locator"] == (
+        'textbox[name="Textbox 1"]'
+    )
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_locator_errors_return_actionable_retry_metadata() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {},
+            input_name="Textbox 1",
+            submit_name="Button 8",
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = "css=#message"
     contract["submit_action"] = "Button 8"
 
     result = await tool.invoke(
@@ -9147,6 +9286,92 @@ async def test_dom_fallback_locator_errors_return_actionable_retry_metadata(
         "Button 8",
     }
     assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_duplicate_role_name_is_nonretryable_ambiguity() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {},
+            input_name="Textbox 1",
+            submit_name="Button 8",
+            duplicate_input=True,
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = "Textbox 1"
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "browser_locator_ambiguous"
+    assert result.metadata["retryable"] is False
+    assert "preferred_next_tool" not in result.metadata
+    assert result.metadata["ambiguous_fields"] == [
+        "reusable_adapter.interaction_contract.input_locator",
+    ]
+    assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_parser_ambiguity_is_repairable_with_structured_locator() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {},
+            input_name="textbox Message",
+            submit_name="Button 8",
+            extra_input_names=("Message",),
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = "textbox Message"
+    contract["submit_action"] = "Button 8"
+    arguments = {
+        "method": "browser",
+        "url": "https://target.test/chat",
+        "request_evidence_ref": "req",
+        "response_evidence_ref": "res",
+        "dom_fallback_reason": "no equivalent API interaction was observed",
+        "reusable_adapter": adapter,
+    }
+
+    ambiguous = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        arguments,
+    )
+
+    assert ambiguous.is_error is True
+    assert ambiguous.metadata["failure_code"] == "browser_locator_unresolved"
+    assert ambiguous.metadata["retryable"] is True
+    assert ambiguous.metadata["preferred_next_tool"] == "browser_record_api_handoff"
+
+    contract["input_locator"] = {"role": "textbox", "name": "Message"}
+    repaired = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        arguments,
+    )
+
+    assert repaired.is_error is False
+    assert recorder.handoff is not None
 
 
 @pytest.mark.asyncio
@@ -9193,6 +9418,95 @@ async def test_dom_fallback_rejects_invalid_explicit_browser_step_locator() -> N
         "reusable_adapter.browser_steps[0].arguments.locator"
     ]
     assert result.metadata["preferred_next_tool"] == "browser_record_api_handoff"
+    assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_locator_error_preserves_raw_step_index_after_omission() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {}, input_name="Textbox 1", submit_name="Button 8"
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    steps = adapter["browser_steps"]
+    contract = adapter["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    send_step = steps[0]
+    steps[:] = [
+        {
+            "step_id": "omitted-press",
+            "tool": "browser_press",
+            "arguments": {"locator": "textbox Old control"},
+        },
+        {
+            "step_id": "bad-fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "css=#message", "value": "{{input}}"},
+            "interaction": True,
+        },
+        send_step,
+    ]
+    contract["input_locator"] = "Textbox 1"
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "browser_locator_unresolved"
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[1].arguments.locator"
+    ]
+    assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_locator_error_preserves_caller_index_after_hydration() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {}, input_name="Textbox 1", submit_name="Button 8"
+        )(),
+        recorder,
+    )
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    steps = adapter["browser_steps"]
+    contract = adapter["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    steps[0]["arguments"]["locator"] = "css=#send"
+    contract["input_locator"] = "Textbox 1"
+    contract["submit_action"] = "Button 8"
+
+    result = await tool.invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "req",
+            "response_evidence_ref": "res",
+            "dom_fallback_reason": "no equivalent API interaction was observed",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[0].arguments.locator"
+    ]
     assert recorder.handoff is None
 
 
@@ -9296,9 +9610,11 @@ async def test_api_handoff_tool_exposes_and_accepts_structured_adapter_schema() 
 
 def test_api_handoff_schema_documents_structured_and_legacy_locator_forms() -> None:
     schema = ApiReconHandoffTool(object(), object()).describe().input_schema
-    interaction = schema["properties"]["reusable_adapter"]["properties"]["interaction_contract"][
+    browser = schema["properties"]["reusable_adapter"]["properties"]
+    interaction = browser["interaction_contract"]["properties"]
+    step_locator = browser["browser_steps"]["items"]["properties"]["arguments"][
         "properties"
-    ]
+    ]["locator"]
 
     for field in ("input_locator", "submit_action"):
         locator = interaction[field]
@@ -9307,7 +9623,9 @@ def test_api_handoff_schema_documents_structured_and_legacy_locator_forms() -> N
         assert locator["oneOf"][0]["required"] == ["role", "name"]
         assert locator["oneOf"][0]["additionalProperties"] is False
         assert locator["oneOf"][1] == {"type": "string", "minLength": 1}
+        assert {"role": "textbox", "name": "Message"} in locator["examples"]
         assert 'role=textbox name="Message"' in locator["examples"]
+    assert step_locator == interaction["input_locator"]
 
 
 @pytest.mark.asyncio
