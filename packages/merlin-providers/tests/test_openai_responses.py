@@ -133,6 +133,22 @@ def test_payload_shapes_input_tools_and_reasoning() -> None:
     assert "previous_response_id" not in payload
 
 
+def test_required_off_cannot_be_reenabled_by_responses_config() -> None:
+    provider = OpenAIResponsesProvider(
+        OpenAIResponsesConfig("https://api.test/v1", "", "gpt", reasoning_effort="high")
+    )
+    payload = provider._payload(
+        ChatRequest(
+            model="gpt",
+            messages=[],
+            workload="worker",
+            reasoning="disabled",
+            reasoning_control="required",
+        )
+    )
+    assert "reasoning" not in payload
+
+
 def test_previous_response_continuation_sends_only_new_items() -> None:
     provider = OpenAIResponsesProvider(
         OpenAIResponsesConfig(

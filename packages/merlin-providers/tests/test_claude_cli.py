@@ -23,6 +23,36 @@ def _write_cli(path: Path, body: str) -> tuple[str, ...]:
     return (sys.executable, "-u", str(path))
 
 
+def test_claude_cli_preserves_legacy_advisory_off_and_rejects_required_off(
+    tmp_path: Path,
+) -> None:
+    provider = ClaudeCliProvider(
+        ClaudeCliConfig(command=("does-not-exist",), model="claude", state_directory=tmp_path)
+    )
+
+    async def collect(request: ChatRequest) -> list[object]:
+        return [event async for event in provider.stream(request)]
+
+    advisory = asyncio.run(
+        collect(ChatRequest(model="claude", messages=[], reasoning="disabled"))
+    )
+    required = asyncio.run(
+        collect(
+            ChatRequest(
+                model="claude",
+                messages=[],
+                workload="structured_generation",
+                reasoning="disabled",
+                reasoning_control="required",
+            )
+        )
+    )
+    assert isinstance(advisory[0], ModelError)
+    assert advisory[0].code != "unsupported_request_control"
+    assert isinstance(required[0], ModelError)
+    assert required[0].code == "unsupported_request_control"
+
+
 def test_claude_cli_streams_partial_events_and_reuses_owned_session(tmp_path: Path) -> None:
     record = tmp_path / "calls.jsonl"
     command = _write_cli(

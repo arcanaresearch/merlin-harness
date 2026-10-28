@@ -65,6 +65,12 @@ _PROVIDER_REQUEST_WORKLOADS = {
     "judge",
     "assessment_attacker",
     "assessment_target",
+    "structured_generation",
+    "automation",
+    "arm_generation",
+    "phase_gate",
+    "kernel",
+    "provider_evaluation",
 }
 _PROVIDER_PROFILE_ROUTES = {
     "auth-session",
@@ -804,8 +810,14 @@ def _validate(values: Mapping[str, object]) -> None:
             raise ValueError(
                 "provider.output_token_parameter must be 'max_completion_tokens' or 'max_tokens'"
             )
-        if provider.get("reasoning_parameter", "none") not in {"none", "thinking"}:
-            raise ValueError("provider.reasoning_parameter must be 'none' or 'thinking'")
+        if provider.get("reasoning_parameter", "none") not in {
+            "none",
+            "thinking",
+            "reasoning_effort",
+        }:
+            raise ValueError(
+                "provider.reasoning_parameter must be 'none', 'thinking', or 'reasoning_effort'"
+            )
         replay_requirement = provider.get("requires_reasoning_content_for_tool_calls")
         if replay_requirement is not None and not isinstance(replay_requirement, bool):
             raise TypeError("provider.requires_reasoning_content_for_tool_calls must be a boolean")

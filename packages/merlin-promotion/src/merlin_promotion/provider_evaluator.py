@@ -181,6 +181,7 @@ class ProviderCaseEvaluator:
                         temperature=0,
                         reasoning="disabled",
                         budget_id=f"evaluation:{binding.suite_id}:{case.id}:cancel",
+                        workload="provider_evaluation",
                     )
                 )
                 closer = getattr(iterator, "aclose", None)
@@ -217,6 +218,7 @@ class ProviderCaseEvaluator:
                     temperature=0,
                     reasoning="disabled",
                     budget_id=f"evaluation:{binding.suite_id}:{case.id}:result",
+                    workload="provider_evaluation",
                     tools=list(fixture.tools),
                 ),
                 max_events=max_events,

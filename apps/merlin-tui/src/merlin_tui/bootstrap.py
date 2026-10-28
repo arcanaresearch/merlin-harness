@@ -355,6 +355,7 @@ async def _request_structured_json(
     messages: Sequence[ChatMessage],
     expected_container: str,
     max_attempts: int,
+    workload: str = "structured_generation",
     budget_id: str | None = None,
     usage_sink: Callable[[ModelUsage], None] | None = None,
     execution_contract: GeneratorExecutionContract | None = None,
@@ -395,6 +396,7 @@ async def _request_structured_json(
                 max_output_tokens=output_limit,
                 budget_id=budget_id,
                 reasoning="disabled",
+                workload=workload,  # validated by ChatRequest's workload contract
             )
         )
 
@@ -6573,6 +6575,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=selected_model,
+                    workload="lead",
                     messages=(
                         ChatMessage(
                             role="system",
@@ -6727,6 +6730,7 @@ def build_backend(
                 provider=provider,
                 capability_registry=capability_registry,
                 selected_model=selected_model,
+                workload="lead",
                 messages=(
                     ChatMessage(
                         role="system",
@@ -6804,6 +6808,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=selected_model,
+                    workload="judge" if "critic" in role else "planner",
                     messages=(
                         ChatMessage(role="system", content=instruction),
                         ChatMessage(
@@ -10217,6 +10222,7 @@ def build_backend(
                         ),
                         max_output_tokens=4_096,
                         budget_id=manifest.id,
+                        workload="automation",
                     )
                 ):
                     if isinstance(event, TextDelta):
@@ -10459,6 +10465,7 @@ def build_backend(
                 provider=provider,
                 capability_registry=capability_registry,
                 selected_model=arm_generation_model,
+                workload="arm_generation",
                 messages=(
                     ChatMessage(
                         role="system",
@@ -10669,6 +10676,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=lead_model,
+                    workload="phase_gate",
                     messages=tuple(audit_messages),
                     expected_container="object",
                     max_attempts=config.provider_runtime.worker_retry_attempts,

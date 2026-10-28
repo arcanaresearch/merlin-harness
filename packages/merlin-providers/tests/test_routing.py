@@ -90,6 +90,7 @@ def test_explicit_workload_controls_resolve_before_transport() -> None:
     )
     assert disabled.reasoning == "disabled"
     assert disabled.reasoning_effort is None
+    assert disabled.reasoning_control == "required"
     assert disabled.max_output_tokens == 1024
 
     lead = routing.resolve_request(ChatRequest(model="model", messages=[], workload="lead"))

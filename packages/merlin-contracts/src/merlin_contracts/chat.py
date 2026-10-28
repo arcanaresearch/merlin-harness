@@ -51,10 +51,17 @@ class ChatRequest(ContractModel):
             "judge",
             "assessment_attacker",
             "assessment_target",
+            "structured_generation",
+            "automation",
+            "arm_generation",
+            "phase_gate",
+            "kernel",
+            "provider_evaluation",
         ]
         | None
     ) = None
     reasoning_effort: Literal["default", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    reasoning_control: Literal["required"] | None = None
 
     @model_validator(mode="after")
     def require_advertised_tool(self) -> "ChatRequest":

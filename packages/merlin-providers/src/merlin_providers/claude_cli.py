@@ -85,7 +85,7 @@ class ClaudeCliProvider:
         return RouteIdentity(transport="claude_cli", endpoint="", model=self.config.model or "")
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
-        if request.reasoning == "disabled":
+        if request.reasoning == "disabled" and request.reasoning_control == "required":
             yield ModelError(
                 message="Claude CLI cannot authoritatively disable reasoning",
                 code="unsupported_request_control",

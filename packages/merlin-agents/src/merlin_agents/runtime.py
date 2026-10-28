@@ -3959,6 +3959,7 @@ class WorkerRuntime:
                 # already proved too small, so ask the provider to skip them.
                 reasoning=effective_request.reasoning,
                 reasoning_effort=effective_request.reasoning_effort,
+                reasoning_control=effective_request.reasoning_control,
                 max_output_tokens=output_limit,
                 budget_id=handoff.assignment.id,
                 workload=request_workload,
@@ -6733,8 +6734,15 @@ class WorkerRuntime:
     def _provider_request_digest(request: ChatRequest) -> str:
         # v1 deliberately excludes fields introduced after durable checkpoints shipped.
         # Once a workload control is present, v2 binds the exact effective request.
-        if request.workload is None and request.reasoning_effort is None:
-            dumped = request.model_dump(mode="json", exclude={"workload", "reasoning_effort"})
+        if (
+            request.workload is None
+            and request.reasoning_effort is None
+            and request.reasoning_control is None
+        ):
+            dumped = request.model_dump(
+                mode="json",
+                exclude={"workload", "reasoning_effort", "reasoning_control"},
+            )
         else:
             dumped = request.model_dump(mode="json")
         payload = json.dumps(

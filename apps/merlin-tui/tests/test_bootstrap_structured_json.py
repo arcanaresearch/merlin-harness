@@ -120,6 +120,9 @@ async def test_structured_json_repairs_reasoning_only_truncation_and_records_usa
         max_attempts=3,
         usage_sink=usage.append,
     )
+    assert provider.requests[0].workload == "structured_generation"
+    assert provider.requests[0].reasoning == "disabled"
+    assert provider.requests[0].reasoning_control is None
 
     assert result == [{"semantic_id": "tenant-boundary"}]
     assert len(provider.requests) == 2
@@ -153,10 +156,12 @@ async def test_structured_json_retries_wrong_shape_then_reports_typed_exhaustion
             messages=(ChatMessage(role="user", content="Return an array."),),
             expected_container="array",
             max_attempts=2,
+            workload="arm_generation",
         )
 
     assert len(provider.requests) == 2
     assert all(request.max_output_tokens == 16_384 for request in provider.requests)
+    assert all(request.workload == "arm_generation" for request in provider.requests)
 
 
 @pytest.mark.asyncio

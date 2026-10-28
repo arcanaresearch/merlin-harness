@@ -118,7 +118,8 @@ class ModelRoutingProvider:
             # Disabled is authoritative and no fallback effort survives it.
             updates["reasoning"] = "disabled"
             updates["reasoning_effort"] = None
-        elif effort is not None and request.reasoning != "disabled":
+            updates["reasoning_control"] = "required"
+        elif effort not in {None, "default"} and request.reasoning != "disabled":
             updates["reasoning_effort"] = effort
         return request.model_copy(update=updates) if updates else request
 

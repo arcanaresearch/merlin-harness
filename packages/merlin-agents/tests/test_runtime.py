@@ -4390,7 +4390,9 @@ def test_legacy_checkpoint_marks_terminal_prompt_attribution_incomplete() -> Non
 
 def test_provider_request_digest_preserves_legacy_shape_until_controls_are_present() -> None:
     request = ChatRequest(model="model", messages=[ChatMessage(role="user", content="hello")])
-    legacy = request.model_dump(mode="json", exclude={"workload", "reasoning_effort"})
+    legacy = request.model_dump(
+        mode="json", exclude={"workload", "reasoning_effort", "reasoning_control"}
+    )
     serialized = json.dumps(legacy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     assert WorkerRuntime._provider_request_digest(request) == (  # noqa: SLF001
         "sha256:" + hashlib.sha256(serialized.encode()).hexdigest()

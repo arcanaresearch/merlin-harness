@@ -120,7 +120,7 @@ class CodexAppServerProvider:
         )
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
-        if request.reasoning == "disabled":
+        if request.reasoning == "disabled" and request.reasoning_control == "required":
             yield ModelError(
                 message="Codex App Server cannot authoritatively disable reasoning",
                 code="unsupported_request_control",
@@ -148,7 +148,7 @@ class CodexAppServerProvider:
     async def _stream(
         self, request: ChatRequest, handler: DynamicToolHandler | None
     ) -> AsyncIterator[ModelEvent]:
-        if request.reasoning == "disabled":
+        if request.reasoning == "disabled" and request.reasoning_control == "required":
             yield ModelError(
                 message="Codex App Server cannot authoritatively disable reasoning",
                 code="unsupported_request_control",

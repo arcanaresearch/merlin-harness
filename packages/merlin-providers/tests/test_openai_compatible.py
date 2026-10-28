@@ -47,6 +47,37 @@ DSML_OBSERVED_PARAMETERS = (
     'string="true">tab:1</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>'
     "</｜｜DSML｜｜tool_calls>"
 )
+
+
+def test_request_reasoning_effort_is_native_or_explicitly_rejected() -> None:
+    request = ChatRequest(
+        model="model",
+        messages=[],
+        workload="worker",
+        reasoning_effort="high",
+    )
+    unsupported = OpenAICompatibleProvider(ProviderConfig("https://api.test", "", "model"))
+    with pytest.raises(ProviderError, match="does not expose request reasoning effort"):
+        unsupported._payload(request)
+
+    native = OpenAICompatibleProvider(
+        ProviderConfig(
+            "https://api.test", "", "model", reasoning_parameter="reasoning_effort"
+        )
+    )
+    assert native._payload(request)["reasoning_effort"] == "high"
+
+
+def test_required_reasoning_off_rejects_silent_noop_but_legacy_advisory_survives() -> None:
+    provider = OpenAICompatibleProvider(ProviderConfig("https://api.test", "", "model"))
+    advisory = ChatRequest(model="model", messages=[], reasoning="disabled")
+    assert "reasoning_effort" not in provider._payload(advisory)
+    with pytest.raises(ProviderError, match="cannot authoritatively disable reasoning"):
+        provider._payload(
+            advisory.model_copy(
+                update={"workload": "worker", "reasoning_control": "required"}
+            )
+        )
 DSML_DIRECT_JSON = (
     '<｜DSML｜tool_calls><｜DSML｜invoke name="browser_snapshot">'
     '{"context_id":"ctx-1","tab_ref":"tab:1"}'

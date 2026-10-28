@@ -1357,6 +1357,7 @@ async def test_retryable_malformed_tool_call_is_repaired_inside_interactive_turn
         < len(repair_request.messages) - 1
     )
     assert provider.requests[1].reasoning == "disabled"
+    assert provider.requests[1].workload == "kernel"
     assert store.messages[kernel.session_id][-1].content == "Recovered"
 
 
@@ -1415,6 +1416,7 @@ async def test_truncated_tool_call_retries_exact_tool_without_reasoning() -> Non
 
     assert len(provider.requests) == 3
     assert provider.requests[1].reasoning == "disabled"
+    assert provider.requests[1].workload == "kernel"
     assert provider.requests[2].reasoning is None
     assert [tool["function"]["name"] for tool in provider.requests[1].tools] == ["shell_command"]
     assert tools.calls == [("shell_command", {"argv": ["python3", "-c", "print('ok')"]})]

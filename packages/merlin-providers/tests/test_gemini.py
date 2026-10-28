@@ -70,6 +70,22 @@ def test_gemini_effort_uses_native_levels_and_rejects_invented_legacy_budgets() 
         legacy._payload(ChatRequest(model="gemini-2.5-pro", messages=[]))
 
 
+def test_required_off_cannot_be_reenabled_by_gemini_config() -> None:
+    provider = GeminiProvider(
+        GeminiConfig("https://api.test/v1", "", "gemini-3-pro", reasoning_effort="high")
+    )
+    payload = provider._payload(
+        ChatRequest(
+            model="gemini-3-pro",
+            messages=[],
+            workload="worker",
+            reasoning="disabled",
+            reasoning_control="required",
+        )
+    )
+    assert "thinkingConfig" not in payload["generationConfig"]
+
+
 def _tool_call_chunk(args: dict[str, object], name: str = "read_file") -> dict[str, object]:
     return {
         "candidates": [
