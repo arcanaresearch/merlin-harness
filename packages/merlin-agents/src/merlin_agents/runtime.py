@@ -7229,6 +7229,7 @@ class WorkerRuntime:
             "open_ai_compatible",
             "openai_compatible",
             "openai_responses",
+            "anthropic_messages",
         }
 
     async def _boundary(

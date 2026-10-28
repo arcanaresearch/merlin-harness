@@ -62,7 +62,7 @@ from .lead_review import (
 )
 from .review_batch import AsyncReviewMicrobatcher
 
-_IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "openai_responses"})
+_IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "openai_responses", "anthropic_messages"})
 
 
 def _route_vision_enabled(

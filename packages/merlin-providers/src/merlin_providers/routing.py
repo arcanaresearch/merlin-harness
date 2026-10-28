@@ -12,7 +12,14 @@ from merlin_contracts import ChatRequest, DynamicToolHandler, ModelEvent, Provid
 from .capabilities import RouteIdentity
 
 logger = logging.getLogger(__name__)
-_IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "open_ai_compatible", "openai_responses"})
+_IMAGE_INPUT_TRANSPORTS = frozenset(
+    {
+        "openai_compatible",
+        "open_ai_compatible",
+        "openai_responses",
+        "anthropic_messages",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,7 @@ from .openai_compatible import (
     _classify_payload_failure,
     _merge_streamed_scalar,
     _plain,
+    _verified_image_data,
 )
 
 __all__ = ["AnthropicMessagesConfig", "AnthropicMessagesProvider"]
@@ -137,8 +138,10 @@ class AnthropicMessagesProvider(OpenAICompatibleProvider):
         return finish
 
     def _payload(self, request: ChatRequest) -> dict[str, Any]:
-        if any(message.image_attachments for message in request.messages):
-            raise ProviderError("image attachments are not supported by this transport")
+        if any(message.image_attachments for message in request.messages) and not (
+            self._capabilities.vision
+        ):
+            raise ProviderError("provider vision capability is not enabled")
         self._pending_input_tokens = 0
         self._pending_request_id = None
         self._pending_cache_details = {}
@@ -412,6 +415,8 @@ def _messages_payload(
     converted: list[dict[str, Any]] = []
     for message in messages:
         role = message.role
+        if message.image_attachments and role != "user":
+            raise ProviderError("image attachments are only supported in user messages")
         if role == "system":
             continue
         if role == "tool":
@@ -442,9 +447,20 @@ def _messages_payload(
                 blocks.append(_tool_use_block(call))
             converted.append({"role": "assistant", "content": blocks})
             continue
-        converted.append(
-            {"role": "user", "content": [{"type": "text", "text": str(message.content)}]}
-        )
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": str(message.content)}]
+        attachments = [attachment.model_dump() for attachment in message.image_attachments]
+        for media_type, encoded in _verified_image_data(attachments):
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": encoded,
+                    },
+                }
+            )
+        converted.append({"role": "user", "content": blocks})
     for item in converted:
         item.pop("_tool_results", None)
     return converted

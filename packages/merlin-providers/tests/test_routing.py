@@ -399,24 +399,43 @@ def test_capabilities_for_model_config_override_wins() -> None:
 
 def test_capabilities_for_model_gates_vision_by_exact_transport_support() -> None:
     default = Provider("default")
-    unsupported = Provider("anthropic")
-    unsupported.capabilities = ProviderCapabilities(
+    anthropic = Provider("anthropic")
+    anthropic.capabilities = ProviderCapabilities(
         model="vision-model",
         vision=True,
         context_window_tokens=131_072,
     )
-    unsupported.route_identity = RouteIdentity(
+    anthropic.route_identity = RouteIdentity(
         transport="anthropic_messages",
         endpoint="https://api.example/v1",
         model="vision-model",
     )
-    provider = ModelRoutingProvider(default, {"vision-model": unsupported})
+    unsupported = Provider("cli")
+    unsupported.capabilities = ProviderCapabilities(
+        model="cli-vision-model",
+        vision=True,
+        context_window_tokens=131_072,
+    )
+    unsupported.route_identity = RouteIdentity(
+        transport="claude_cli",
+        endpoint="local://claude",
+        model="cli-vision-model",
+    )
+    provider = ModelRoutingProvider(
+        default,
+        {"vision-model": anthropic, "cli-vision-model": unsupported},
+    )
 
     capabilities = provider.capabilities_for_model("vision-model")
     assert capabilities is not None
     assert capabilities.model == "vision-model"
-    assert capabilities.vision is False
+    assert capabilities.vision is True
     assert capabilities.context_window_tokens == 131_072
+
+    cli_capabilities = provider.capabilities_for_model("cli-vision-model")
+    assert cli_capabilities is not None
+    assert cli_capabilities.model == "cli-vision-model"
+    assert cli_capabilities.vision is False
 
 
 def test_capabilities_for_model_unknown_model_warns_and_stays_unknown(

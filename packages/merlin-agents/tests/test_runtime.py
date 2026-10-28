@@ -3329,7 +3329,7 @@ async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tm
             return SimpleNamespace(vision=True, context_window_tokens=None)
 
         def route_identity_for_model(self, model):
-            return SimpleNamespace(transport="openai_compatible", model=model)
+            return SimpleNamespace(transport="anthropic_messages", model=model)
 
     class VisualTools(Tools):
         def describe(self):
@@ -3404,7 +3404,7 @@ async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tm
 
 @pytest.mark.parametrize(
     ("route_vision", "transport"),
-    ((False, "openai_compatible"), (True, "anthropic_messages")),
+    ((False, "openai_compatible"), (True, "claude_cli")),
 )
 async def test_unavailable_visual_route_preserves_pending_visual_review(
     tmp_path, route_vision, transport

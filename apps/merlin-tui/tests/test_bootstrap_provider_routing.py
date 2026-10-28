@@ -75,7 +75,7 @@ def test_text_default_and_vision_recon_construct_exact_provider_capabilities() -
 def test_route_vision_rejects_image_unsupported_transports() -> None:
     provider = {"model_capabilities": {"vision-model": ["vision", "tools"]}}
 
-    for transport in ("anthropic_messages", "gemini", "codex_app_server", "claude_cli"):
+    for transport in ("gemini", "codex_app_server", "claude_cli", "kimi_acp"):
         assert not _route_vision_enabled(
             provider,
             "vision-model",
@@ -90,6 +90,28 @@ def test_route_vision_rejects_image_unsupported_transports() -> None:
         )
         assert route_values["vision"] is False
         assert route_values["model_capabilities"] == {"vision-model": ["tools"]}
+
+
+def test_route_vision_accepts_exact_anthropic_messages_model() -> None:
+    provider = {
+        "model_capabilities": {
+            "claude-haiku-4-5": ["vision", "tools"],
+            "claude-text": ["tools"],
+        }
+    }
+
+    assert _route_vision_enabled(
+        provider,
+        "claude-haiku-4-5",
+        "anthropic_messages",
+        default_model="claude-text",
+    )
+    assert not _route_vision_enabled(
+        provider,
+        "claude-text",
+        "anthropic_messages",
+        default_model="claude-text",
+    )
 
 
 def test_legacy_vision_applies_only_to_its_exact_default_model() -> None:
@@ -130,8 +152,12 @@ async def test_build_backend_constructs_text_default_and_vision_recon_exactly(
     class CapturingResponsesProvider(CapturingOpenAIProvider):
         configs = []
 
+    class CapturingAnthropicProvider(CapturingOpenAIProvider):
+        configs = []
+
     CapturingOpenAIProvider.configs = []
     CapturingResponsesProvider.configs = []
+    CapturingAnthropicProvider.configs = []
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
         monkeypatch.setattr(
             "merlin_config.load_config",
@@ -144,9 +170,13 @@ async def test_build_backend_constructs_text_default_and_vision_recon_exactly(
                         "model_transports": {
                             "text-default": "openai_compatible",
                             "vision-recon": "openai_responses",
+                            "claude-vision": "anthropic_messages",
                         },
                         "role_models": {"recon": "vision-recon"},
-                        "model_capabilities": {"vision-recon": ["vision"]},
+                        "model_capabilities": {
+                            "vision-recon": ["vision"],
+                            "claude-vision": ["vision"],
+                        },
                     }
                 },
             ),
@@ -157,6 +187,9 @@ async def test_build_backend_constructs_text_default_and_vision_recon_exactly(
         )
         monkeypatch.setattr(
             "merlin_providers.OpenAIResponsesProvider", CapturingResponsesProvider
+        )
+        monkeypatch.setattr(
+            "merlin_providers.AnthropicMessagesProvider", CapturingAnthropicProvider
         )
 
         backend = build_backend(tmp_path / "workspace")
@@ -169,6 +202,10 @@ async def test_build_backend_constructs_text_default_and_vision_recon_exactly(
             assert [config.vision for config in CapturingResponsesProvider.configs] == [True]
             assert [config.model for config in CapturingResponsesProvider.configs] == [
                 "vision-recon"
+            ]
+            assert [config.vision for config in CapturingAnthropicProvider.configs] == [True]
+            assert [config.model for config in CapturingAnthropicProvider.configs] == [
+                "claude-vision"
             ]
         finally:
             await backend.close()

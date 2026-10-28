@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 
 import httpx
@@ -8,6 +10,7 @@ import pytest
 from merlin_contracts import (
     ChatMessage,
     ChatRequest,
+    ImageAttachment,
     ModelCompleted,
     ModelError,
     ModelUsage,
@@ -191,6 +194,150 @@ def test_payload_shapes_system_messages_tools_and_thinking() -> None:
         ],
     }
     assert "temperature" not in payload
+
+
+def test_vision_payload_embeds_only_digest_verified_user_images(tmp_path) -> None:
+    image = tmp_path / "diagnostic.png"
+    image.write_bytes(b"png evidence")
+    attachment = ImageAttachment(
+        media_type="image/png",
+        path=str(image),
+        sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        byte_length=image.stat().st_size,
+    )
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            "https://api.anthropic.test/v1",
+            "",
+            "claude-haiku-4-5",
+            vision=True,
+        )
+    )
+
+    payload = provider._payload(
+        ChatRequest(
+            model="claude-haiku-4-5",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content="Inspect this failure",
+                    image_attachments=[attachment],
+                )
+            ],
+        )
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect this failure"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(image.read_bytes()).decode("ascii"),
+                    },
+                },
+            ],
+        }
+    ]
+
+    image.write_bytes(b"tampered png")
+    with pytest.raises(ProviderError, match="digest verification"):
+        provider._payload(
+            ChatRequest(
+                model="claude-haiku-4-5",
+                messages=[
+                    ChatMessage(
+                        role="user",
+                        content="Inspect this failure",
+                        image_attachments=[attachment],
+                    )
+                ],
+            )
+        )
+
+
+def test_vision_payload_rejects_wrong_declared_length(tmp_path) -> None:
+    image = tmp_path / "diagnostic.webp"
+    image.write_bytes(b"webp evidence")
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            "https://api.anthropic.test/v1",
+            "",
+            "claude-haiku-4-5",
+            vision=True,
+        )
+    )
+    message = ChatMessage(
+        role="user",
+        content="Inspect",
+        image_attachments=[
+            ImageAttachment(
+                media_type="image/webp",
+                path=str(image),
+                sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                byte_length=image.stat().st_size + 1,
+            )
+        ],
+    )
+
+    with pytest.raises(ProviderError, match="size or digest verification"):
+        provider._payload(ChatRequest(model="claude-haiku-4-5", messages=[message]))
+
+
+def test_non_vision_anthropic_route_rejects_image_attachments(tmp_path) -> None:
+    image = tmp_path / "diagnostic.jpg"
+    image.write_bytes(b"jpeg evidence")
+    message = ChatMessage(
+        role="user",
+        content="Inspect",
+        image_attachments=[
+            ImageAttachment(
+                media_type="image/jpeg",
+                path=str(image),
+                sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                byte_length=image.stat().st_size,
+            )
+        ],
+    )
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig("https://api.anthropic.test/v1", "", "claude-haiku-4-5")
+    )
+
+    with pytest.raises(ProviderError, match="vision capability"):
+        provider._payload(ChatRequest(model="claude-haiku-4-5", messages=[message]))
+
+
+@pytest.mark.parametrize("role", ("system", "assistant", "tool"))
+def test_anthropic_images_are_rejected_outside_user_messages(tmp_path, role) -> None:
+    image = tmp_path / "diagnostic.jpg"
+    image.write_bytes(b"jpeg evidence")
+    message = ChatMessage(
+        role=role,
+        content="Inspect",
+        image_attachments=[
+            ImageAttachment(
+                media_type="image/jpeg",
+                path=str(image),
+                sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                byte_length=image.stat().st_size,
+            )
+        ],
+    )
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            "https://api.anthropic.test/v1",
+            "",
+            "claude-haiku-4-5",
+            vision=True,
+        )
+    )
+
+    with pytest.raises(ProviderError, match="only supported in user messages"):
+        provider._payload(ChatRequest(model="claude-haiku-4-5", messages=[message]))
 
 
 def test_required_off_cannot_be_reenabled_by_anthropic_config() -> None:
