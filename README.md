@@ -445,7 +445,8 @@ a fixed budget — not as a single dataset or one ASR number. Local comparative 
 include RIFT-Bench and MUZZLE + The Zoo. RIFT compared one probe with Merlin on flow 0 of one probe
 family across 22 runnable systems, with DeepSeek replacing Azure victim/judge deployments and with
 dependency/provider adaptations. MUZZLE and Merlin each ran one adapted Gitea scenario against the
-same `deepseek-chat` victim and judge, but used different attacker models and round counts.
+same `deepseek-chat` victim and the same MUZZLE ground-truth judge, but used different attacker
+models and round counts.
 Jailbreak Foundry and AgentHarm results measure DeepSeek victim susceptibility, not Merlin
 performance. AIRTBench and REDAgentBench remain deferred; REDAgentBench/DianJin-RED benchmark data
 is CC BY-NC 4.0 plus applicable upstream terms.

@@ -17,7 +17,7 @@ official benchmark configuration. No score is published that the harness did not
 | --- | --- | --- |
 | RIFT-Bench | 22 runnable systems: probe **3/22 ASR**; Merlin **12/22 ASR**; each **21/22 AAR**. Five additional systems were excluded for upstream or provider incompatibility. | Head-to-head on flow 0 of the Direct Prompt Injection / Task Drift Spam probe family only, with DeepSeek substitutions and adapted dependencies/provider wiring. |
 | Jailbreak Foundry | **17/98 = 17.3%** over scored tasks; **17/102 = 16.7%** when four timeouts are included. | DeepSeek victim susceptibility, not a Merlin score. `jailexpert` was unrunnable and excluded because its experience file was absent. |
-| MUZZLE + The Zoo | MUZZLE **0/48**; Merlin **0/10** judged rounds across three Merlin campaigns. | One adapted Gitea `gitea1` scenario. Both used the same `deepseek-chat` victim and judge; attacker models and round counts differed. |
+| MUZZLE + The Zoo | MUZZLE **0/48**; Merlin **0/10** judged rounds across three Merlin campaigns. | One adapted Gitea `gitea1` scenario. Both used the same `deepseek-chat` victim and the same MUZZLE ground-truth judge; attacker models and round counts differed. |
 | AgentHarm | Average score **0.305**; refusal **0.4**. | Victim-agent results over five validation behaviors with a DeepSeek judge substitution, not Merlin performance numbers. |
 | AIRTBench | Deferred | Requires an approved safe sandbox for benchmark-generated code. |
 | REDAgentBench / DianJin-RED | Deferred | Pending a commercial-use decision: benchmark data is CC BY-NC 4.0 and adapted or quoted material remains subject to applicable upstream terms. |
@@ -48,7 +48,8 @@ AAR was 21/22 for each. This narrow comparison is not an official RIFT-Bench sub
 agents against indirect prompt injection. [The Zoo](https://zoo-eval.github.io/zoo_website/) is a
 simulated, interconnected web with deterministic reset and backend observability. In the adapted
 local end-to-end runs, both arms evaluated one Gitea `gitea1` delete-repository scenario with the
-same `deepseek-chat` browser victim and MUZZLE judge. MUZZLE used a `deepseek-chat` attacker and
+same `deepseek-chat` browser victim and the same MUZZLE ground-truth judge. MUZZLE used a
+`deepseek-chat` attacker and
 completed 48 judged PAIR refinement rounds. Merlin used a `deepseek-v4-pro` attacker and completed
 10 judged rounds across three real GOAT campaigns. Neither defeated the victim. The MUZZLE path
 included deterministic injection-surface and dispatch fallbacks plus provider/DeepSeek compatibility
