@@ -52,10 +52,70 @@ _VISUAL_MIN_AREA_PX = 24_000
 _VISUAL_MAX_BYTES = 5_242_880
 _VISUAL_VIEWPORT_MAX_WIDTH_PX = 2_048
 _VISUAL_VIEWPORT_MAX_HEIGHT_PX = 1_440
-_SENSITIVE_RENDERED_CONTROL_SELECTOR = (
-    'input[type="password" i], '
-    'input[autocomplete~="current-password" i], '
-    'input[autocomplete~="new-password" i]'
+_VISUAL_CONTEXT_MAX_FILES = 16
+_VISUAL_CONTEXT_MAX_BYTES = 20 * 1_024 * 1_024
+_VISUAL_CONTEXT_MAX_IDENTITIES = 32
+_SENSITIVE_FRAME_INSPECTION_LIMIT = 64
+_SENSITIVE_CONTROL_INSPECTION_LIMIT = 256
+_SENSITIVE_CONTROL_ATTRIBUTE_MAX_CHARS = 256
+_SENSITIVE_AUTOCOMPLETE_TOKENS = (
+    "current-password",
+    "new-password",
+    "one-time-code",
+    "cc-name",
+    "cc-given-name",
+    "cc-additional-name",
+    "cc-family-name",
+    "cc-number",
+    "cc-exp",
+    "cc-exp-month",
+    "cc-exp-year",
+    "cc-csc",
+    "cc-type",
+    "transaction-currency",
+    "transaction-amount",
+)
+_SENSITIVE_CONTROL_SINGLE_TOKENS = (
+    "pin",
+    "otp",
+    "totp",
+    "mfa",
+    "passcode",
+    "password",
+    "credential",
+    "secret",
+    "token",
+    "apikey",
+    "cvv",
+    "cvc",
+    "csc",
+    "pan",
+    "card",
+    "payment",
+    "iban",
+    "routing",
+)
+_SENSITIVE_CONTROL_COMPACT_PATTERNS = (
+    "apikey",
+    "apitoken",
+    "accesstoken",
+    "refreshtoken",
+    "authtoken",
+    "clientsecret",
+    "privatekey",
+    "secretkey",
+    "onetimecode",
+    "verificationcode",
+    "securitycode",
+    "cardnumber",
+    "creditcard",
+    "debitcard",
+    "cardexpiry",
+    "cardexpiration",
+    "expirationdate",
+    "routingnumber",
+    "bankaccount",
+    "accountnumber",
 )
 
 _ELEMENT_SURFACE_METADATA_SCRIPT = """
@@ -322,11 +382,101 @@ def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
 
 
 async def _page_contains_sensitive_rendered_control(page: Page) -> bool:
-    """Fail closed when any attached frame contains a rendered credential control."""
-    for candidate_frame in page.frames:
-        if await candidate_frame.locator(_SENSITIVE_RENDERED_CONTROL_SELECTOR).count():
+    """Fail closed when bounded inspection finds a sensitive rendered form control.
+
+    This gate cannot inspect closed shadow roots or semantic values painted into canvas,
+    and it does not classify ordinary rendered text. A pre/post screenshot check narrows
+    but cannot eliminate the race where the target mutates after the final inspection.
+    """
+    inspection_script = """
+        (elements, config) => {
+            if (elements.length > config.limit) return true;
+            const autocompleteTokens = new Set(config.autocompleteTokens);
+            const singleTokens = new Set(config.singleTokens);
+            const compactPatterns = config.compactPatterns;
+            const normalize = value => String(value || "").normalize("NFKC").toLowerCase();
+            const bounded = value => {
+                const raw = String(value || "");
+                return raw.length <= config.maxChars ? normalize(raw) : null;
+            };
+            for (const element of elements.slice(0, config.limit)) {
+                const style = getComputedStyle(element);
+                const rendered = element.type !== "hidden"
+                    && element.getClientRects().length > 0
+                    && style.display !== "none"
+                    && style.visibility !== "hidden"
+                    && style.visibility !== "collapse"
+                    && Number(style.opacity || 1) > 0.05;
+                if (!rendered) continue;
+                const type = bounded(element.getAttribute("type"));
+                const autocomplete = bounded(element.getAttribute("autocomplete"));
+                const name = bounded(element.getAttribute("name"));
+                const id = bounded(element.id);
+                const ariaLabel = bounded(element.getAttribute("aria-label"));
+                const placeholder = bounded(element.getAttribute("placeholder"));
+                if ([type, autocomplete, name, id, ariaLabel, placeholder].some(
+                    value => value === null
+                )) return true;
+                if (type === "password") return true;
+                if (autocomplete.split(/\\s+/).some(token => autocompleteTokens.has(token))) {
+                    return true;
+                }
+                const identifier = `${name} ${id} ${ariaLabel} ${placeholder}`;
+                const tokens = identifier.split(/[^a-z0-9]+/).filter(Boolean);
+                const compact = tokens.join("");
+                if (tokens.some(token => singleTokens.has(token))) return true;
+                if (compactPatterns.some(pattern => compact.includes(pattern))) return true;
+            }
+            return false;
+        }
+    """
+    config = {
+        "limit": _SENSITIVE_CONTROL_INSPECTION_LIMIT,
+        "maxChars": _SENSITIVE_CONTROL_ATTRIBUTE_MAX_CHARS,
+        "autocompleteTokens": _SENSITIVE_AUTOCOMPLETE_TOKENS,
+        "singleTokens": _SENSITIVE_CONTROL_SINGLE_TOKENS,
+        "compactPatterns": _SENSITIVE_CONTROL_COMPACT_PATTERNS,
+    }
+    candidate_frames = page.frames
+    if len(candidate_frames) > _SENSITIVE_FRAME_INSPECTION_LIMIT:
+        return True
+    for candidate_frame in candidate_frames:
+        if await candidate_frame.locator("input, textarea, select").evaluate_all(
+            inspection_script,
+            config,
+        ):
             return True
     return False
+
+
+async def _rendered_viewport_dimensions(page: Page) -> tuple[int, int]:
+    raw_viewport = await page.evaluate(
+        """() => ({
+            width: window.innerWidth > 0
+                ? window.innerWidth
+                : document.documentElement.clientWidth || 0,
+            height: window.innerHeight > 0
+                ? window.innerHeight
+                : document.documentElement.clientHeight || 0,
+        })"""
+    )
+    if not isinstance(raw_viewport, dict):
+        return 0, 0
+    return int(raw_viewport.get("width", 0)), int(raw_viewport.get("height", 0))
+
+
+def _write_private_visual_file(path: Path, payload: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+        os.chmod(path, 0o600)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _json_string_paths(value: object, prefix: str = "") -> tuple[tuple[str, str], ...]:
@@ -466,7 +616,16 @@ class BrowserSession:
         self._active_submit: tuple[str, str, int, datetime] | None = None
         self._request_provenance: dict[int, dict[str, object]] = {}
         self._download_tasks: set[asyncio.Task[None]] = set()
+        # Screenshot retention is first-write-wins per logical context_id. Files are
+        # never evicted during the context lifetime; a sticky count/byte/identity
+        # limit stops later captures before Playwright or the filesystem is touched.
         self._visual_evidence_seen: set[tuple[str, str]] = set()
+        self._visual_retained_files: dict[str, int] = {}
+        self._visual_digest_paths: dict[str, Path] = {}
+        self._visual_retained_bytes = 0
+        self._visual_retention_exhausted = False
+        self._visual_retention_context_id: str | None = None
+        self._visual_retention_lock = asyncio.Lock()
         context.on("page", self._register_popup)
         context.on("response", self._record_response)
 
@@ -861,12 +1020,158 @@ class BrowserSession:
             step=step,
         )
 
+    @staticmethod
+    def _scan_visual_retention(
+        context_id: str,
+    ) -> tuple[dict[str, int], dict[str, Path], int, bool]:
+        retained_files: dict[str, int] = {}
+        digest_paths: dict[str, Path] = {}
+        retained_bytes = 0
+        roots = (
+            Path.home() / ".merlin" / "browser-evidence" / context_id,
+            Path.home() / ".merlin" / "browser-diagnostics" / context_id,
+        )
+        for root in roots:
+            try:
+                entries = os.scandir(root)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return retained_files, digest_paths, retained_bytes, True
+            with entries:
+                for entry in entries:
+                    try:
+                        if not entry.name.casefold().endswith(".jpg") or not entry.is_file(
+                            follow_symlinks=False
+                        ):
+                            continue
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        return retained_files, digest_paths, retained_bytes, True
+                    path = Path(entry.path)
+                    retained_files[str(path)] = size
+                    retained_bytes += size
+                    stem = path.stem.casefold()
+                    if len(stem) == 64 and all(
+                        character in "0123456789abcdef" for character in stem
+                    ):
+                        digest_paths.setdefault(stem, path)
+                    if (
+                        len(retained_files) >= _VISUAL_CONTEXT_MAX_FILES
+                        or retained_bytes >= _VISUAL_CONTEXT_MAX_BYTES
+                    ):
+                        return retained_files, digest_paths, retained_bytes, True
+        return retained_files, digest_paths, retained_bytes, False
+
+    async def _ensure_visual_retention(self) -> None:
+        if self._visual_retention_context_id == self.context_id:
+            return
+        (
+            self._visual_retained_files,
+            self._visual_digest_paths,
+            self._visual_retained_bytes,
+            self._visual_retention_exhausted,
+        ) = await asyncio.to_thread(self._scan_visual_retention, self.context_id)
+        self._visual_evidence_seen = set()
+        self._visual_retention_context_id = self.context_id
+
+    def _visual_retention_is_exhausted(self) -> bool:
+        if self._visual_retention_exhausted:
+            return True
+        self._visual_retention_exhausted = (
+            len(self._visual_retained_files) >= _VISUAL_CONTEXT_MAX_FILES
+            or self._visual_retained_bytes >= _VISUAL_CONTEXT_MAX_BYTES
+            or len(self._visual_evidence_seen) >= _VISUAL_CONTEXT_MAX_IDENTITIES
+        )
+        return self._visual_retention_exhausted
+
+    async def _retain_visual_capture(
+        self,
+        payload: bytes,
+        *,
+        identity_source: str,
+        directory_name: str,
+    ) -> tuple[dict[str, object] | None, str | None]:
+        if not payload or len(payload) > _VISUAL_MAX_BYTES:
+            return None, "attachment_size_out_of_bounds"
+        digest = hashlib.sha256(payload).hexdigest()
+        identity = (identity_source, digest)
+        if identity in self._visual_evidence_seen:
+            return None, "duplicate"
+        if self._visual_retention_is_exhausted():
+            return None, "context_budget_exhausted"
+
+        path = self._visual_digest_paths.get(digest)
+        if path is None:
+            if (
+                len(self._visual_retained_files) + 1 > _VISUAL_CONTEXT_MAX_FILES
+                or self._visual_retained_bytes + len(payload) > _VISUAL_CONTEXT_MAX_BYTES
+            ):
+                self._visual_retention_exhausted = True
+                return None, "context_budget_exhausted"
+            directory = Path.home() / ".merlin" / directory_name / self.context_id
+            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+            path = directory / f"{digest}.jpg"
+            cancelled: asyncio.CancelledError | None = None
+            write_task = asyncio.create_task(
+                asyncio.to_thread(_write_private_visual_file, path, payload)
+            )
+            while True:
+                try:
+                    await asyncio.shield(write_task)
+                    break
+                except asyncio.CancelledError as error:
+                    cancelled = cancelled or error
+                    continue
+                except FileExistsError:
+                    self._visual_retention_exhausted = True
+                    if cancelled is not None:
+                        raise cancelled from None
+                    return None, "context_budget_exhausted"
+                except BaseException:
+                    self._visual_retention_exhausted = True
+                    if cancelled is not None:
+                        raise cancelled from None
+                    raise
+            path_key = str(path)
+            if path_key not in self._visual_retained_files:
+                self._visual_retained_files[path_key] = len(payload)
+                self._visual_retained_bytes += len(payload)
+            self._visual_digest_paths[digest] = path
+            self._visual_retention_is_exhausted()
+            if cancelled is not None:
+                raise cancelled
+
+        self._visual_evidence_seen.add(identity)
+        self._visual_retention_is_exhausted()
+        return (
+            {
+                "media_type": "image/jpeg",
+                "path": str(path),
+                "sha256": digest,
+                "byte_length": len(payload),
+            },
+            None,
+        )
+
     async def capture_visual_evidence(
         self,
         tab_ref: str,
         frame_ref: str | None = None,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
         """Capture one bounded viewport plus supplemental visible content images."""
+        async with self._visual_retention_lock:
+            await self._ensure_visual_retention()
+            if self._visual_retention_is_exhausted():
+                return (), ("visual_capture:context_budget_exhausted",)
+            return await self._capture_visual_evidence(tab_ref, frame_ref)
+
+    async def _capture_visual_evidence(
+        self,
+        tab_ref: str,
+        frame_ref: str | None = None,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
         page = self._page(tab_ref)
         await self._enforce_page(page)
         frame, resolved_frame_ref = self._frame(page, frame_ref)
@@ -880,25 +1185,20 @@ class BrowserSession:
             source_url: str,
             evidence_frame_ref: str | None = resolved_frame_ref,
         ) -> dict[str, object] | None:
-            if not payload or len(payload) > _VISUAL_MAX_BYTES:
-                capture_kind = (
-                    "viewport_capture" if source_kind == "viewport" else "candidate_capture"
-                )
-                errors.append(f"{capture_kind}:attachment_size_out_of_bounds")
-                return None
-            digest = hashlib.sha256(payload).hexdigest()
             identity_source = f"viewport:{source_url}" if source_kind == "viewport" else source_url
-            identity = (identity_source, digest)
-            if identity in self._visual_evidence_seen:
+            attachment, rejection = await self._retain_visual_capture(
+                payload,
+                identity_source=identity_source,
+                directory_name="browser-evidence",
+            )
+            if attachment is None:
+                if rejection not in {None, "duplicate"}:
+                    capture_kind = (
+                        "viewport_capture" if source_kind == "viewport" else "candidate_capture"
+                    )
+                    errors.append(f"{capture_kind}:{rejection}")
                 return None
-            directory = Path.home() / ".merlin" / "browser-evidence" / self.context_id
-            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-            path = directory / f"{digest}.jpg"
-            if not await asyncio.to_thread(path.exists):
-                await asyncio.to_thread(path.write_bytes, payload)
-            os.chmod(path, 0o600)
-            self._visual_evidence_seen.add(identity)
+            digest = str(attachment["sha256"])
             evidence_digest = hashlib.sha256(f"{identity_source}\0{digest}".encode()).hexdigest()
             return {
                 "evidence_ref": f"sha256:{evidence_digest}",
@@ -907,12 +1207,7 @@ class BrowserSession:
                 "tab_ref": tab_ref,
                 "frame_ref": evidence_frame_ref,
                 "untrusted_target_evidence": True,
-                "attachment": {
-                    "media_type": "image/jpeg",
-                    "path": str(path),
-                    "sha256": digest,
-                    "byte_length": len(payload),
-                },
+                "attachment": attachment,
             }
 
         sensitive_control = False
@@ -929,22 +1224,7 @@ class BrowserSession:
             viewport_height = 0
             viewport_within_bounds = False
             try:
-                raw_viewport = await page.evaluate(
-                    """() => ({
-                        width: window.innerWidth > 0
-                            ? window.innerWidth
-                            : document.documentElement.clientWidth || 0,
-                        height: window.innerHeight > 0
-                            ? window.innerHeight
-                            : document.documentElement.clientHeight || 0,
-                    })"""
-                )
-                viewport_width = int(
-                    raw_viewport.get("width", 0) if isinstance(raw_viewport, dict) else 0
-                )
-                viewport_height = int(
-                    raw_viewport.get("height", 0) if isinstance(raw_viewport, dict) else 0
-                )
+                viewport_width, viewport_height = await _rendered_viewport_dimensions(page)
                 viewport_within_bounds = (
                     0 < viewport_width <= _VISUAL_VIEWPORT_MAX_WIDTH_PX
                     and 0 < viewport_height <= _VISUAL_VIEWPORT_MAX_HEIGHT_PX
@@ -961,6 +1241,16 @@ class BrowserSession:
                         scale="css",
                         timeout=_VISUAL_CAPTURE_TIMEOUT_MS,
                     )
+                    try:
+                        sensitive_after_capture = (
+                            await _page_contains_sensitive_rendered_control(page)
+                        )
+                    except PlaywrightError as error:
+                        errors.append(f"viewport_post_inspection:{type(error).__name__}")
+                        sensitive_after_capture = True
+                    if sensitive_after_capture:
+                        errors.append("viewport_capture:sensitive_form_redacted")
+                        return (), tuple(dict.fromkeys(errors))
                     retained = await retain_capture(
                         bytes(screenshot),
                         source_kind="viewport",
@@ -977,6 +1267,8 @@ class BrowserSession:
                                 "requested_frame_ref": resolved_frame_ref,
                             }
                         )
+                    if self._visual_retention_is_exhausted():
+                        return tuple(evidence), tuple(dict.fromkeys(errors))
             except PlaywrightError as error:
                 errors.append(f"viewport_capture:{type(error).__name__}")
         if not viewport_within_bounds:
@@ -1098,6 +1390,9 @@ class BrowserSession:
 
         capture_attempts = 0
         for locator, candidate in sorted(candidates, key=rank, reverse=True):
+            if self._visual_retention_is_exhausted():
+                errors.append("candidate_capture:context_budget_exhausted")
+                break
             if len(evidence) >= _VISUAL_CANDIDATE_LIMIT:
                 break
             if capture_attempts >= _VISUAL_CAPTURE_ATTEMPT_LIMIT:
@@ -1105,6 +1400,13 @@ class BrowserSession:
                 break
             capture_attempts += 1
             source_url = _sanitized_visual_source_url(str(candidate.get("source_url", "")))
+            try:
+                if await _page_contains_sensitive_rendered_control(page):
+                    errors.append("candidate_capture:sensitive_form_redacted")
+                    break
+            except PlaywrightError as error:
+                errors.append(f"candidate_pre_inspection:{type(error).__name__}")
+                break
             try:
                 bounding_box = await locator.bounding_box()
                 if bounding_box is None:
@@ -1149,6 +1451,13 @@ class BrowserSession:
             except PlaywrightError as error:
                 errors.append(f"candidate_capture:{type(error).__name__}")
                 continue
+            try:
+                if await _page_contains_sensitive_rendered_control(page):
+                    errors.append("candidate_capture:sensitive_form_redacted")
+                    break
+            except PlaywrightError as error:
+                errors.append(f"candidate_post_inspection:{type(error).__name__}")
+                break
             payload = bytes(screenshot)
             retained = await retain_capture(
                 payload,
@@ -1298,6 +1607,54 @@ class BrowserSession:
                 )
             await asyncio.sleep(0.1)
 
+    async def _capture_failure_screenshot(
+        self,
+        page: Page,
+        *,
+        tab_ref: str,
+    ) -> dict[str, object] | None:
+        if self._visual_retention_is_exhausted():
+            return None
+        try:
+            if await _page_contains_sensitive_rendered_control(page):
+                return None
+            viewport_width, viewport_height = await _rendered_viewport_dimensions(page)
+        except PlaywrightError:
+            return None
+        if not (
+            0 < viewport_width <= _VISUAL_VIEWPORT_MAX_WIDTH_PX
+            and 0 < viewport_height <= _VISUAL_VIEWPORT_MAX_HEIGHT_PX
+        ):
+            return None
+        payload = bytes(
+            await page.screenshot(
+                type="jpeg",
+                quality=60,
+                full_page=False,
+                scale="css",
+                animations="allow",
+                caret="initial",
+                timeout=5_000,
+            )
+        )
+        try:
+            if await _page_contains_sensitive_rendered_control(page):
+                return None
+        except PlaywrightError:
+            return None
+        attachment, _rejection = await self._retain_visual_capture(
+            payload,
+            identity_source=f"diagnostic:{tab_ref}",
+            directory_name="browser-diagnostics",
+        )
+        if attachment is None:
+            return None
+        digest = str(attachment["sha256"])
+        return {
+            "evidence_ref": f"sha256:{digest}",
+            **attachment,
+        }
+
     async def capture_failure_diagnostics(
         self,
         tab_ref: str,
@@ -1320,35 +1677,11 @@ class BrowserSession:
         )
         if not capture_screenshot:
             return snapshot, network, None
-        try:
-            sensitive_control = await _page_contains_sensitive_rendered_control(page)
-        except PlaywrightError:
-            sensitive_control = True
-        if sensitive_control:
+        async with self._visual_retention_lock:
+            await self._ensure_visual_retention()
+            screenshot = await self._capture_failure_screenshot(page, tab_ref=tab_ref)
+        if screenshot is None:
             return snapshot, network, None
-        directory = Path.home() / ".merlin" / "browser-diagnostics" / self.context_id
-        await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-        path = directory / f"{uuid4().hex}.jpg"
-        await page.screenshot(
-            path=str(path),
-            type="jpeg",
-            quality=60,
-            full_page=False,
-            animations="allow",
-            caret="initial",
-            timeout=5_000,
-        )
-        os.chmod(path, 0o600)
-        payload = await asyncio.to_thread(path.read_bytes)
-        digest = hashlib.sha256(payload).hexdigest()
-        screenshot = {
-            "evidence_ref": f"sha256:{digest}",
-            "sha256": digest,
-            "media_type": "image/jpeg",
-            "byte_length": len(payload),
-            "path": str(path),
-        }
         snapshot = snapshot.model_copy(
             update={"evidence_refs": (*snapshot.evidence_refs, screenshot["evidence_ref"])}
         )

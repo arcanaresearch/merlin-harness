@@ -4,12 +4,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import merlin_browser.core as browser_core_module
 import merlin_browser.service as browser_service_module
 import pytest
 from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
@@ -13460,6 +13462,125 @@ async def test_viewport_recon_skips_sensitive_forms(tmp_path, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control",
+    (
+        '<input autocomplete="one-time-code" value="123456">',
+        '<input autocomplete="section-checkout cc-number" value="4111111111111111">',
+        '<input name="API_KEY" value="do-not-capture">',
+        '<input id="payment-card-cvv" value="123">',
+        '<input aria-label="Credit card number" value="4111111111111111">',
+        '<input placeholder="OTP" value="123456">',
+    ),
+)
+async def test_viewport_recon_skips_sensitive_autofill_and_identifiers(
+    tmp_path, monkeypatch, control
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(control.encode()) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert evidence == ()
+    assert "viewport_capture:sensitive_form_redacted" in errors
+    assert not (tmp_path / ".merlin" / "browser-evidence").exists()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_control_inspection_fails_closed_at_bound(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    body = b"".join(
+        f'<input name="ordinary-{index}">'.encode()
+        for index in range(browser_core_module._SENSITIVE_CONTROL_INSPECTION_LIMIT + 1)
+    )
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert evidence == ()
+    assert "viewport_capture:sensitive_form_redacted" in errors
+
+
+@pytest.mark.asyncio
+async def test_viewport_recon_skips_sensitive_control_in_child_frame(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture seeds child-frame state
+            child_frame = next(frame for frame in page.frames if frame != page.main_frame)
+            await child_frame.evaluate(
+                """() => {
+                    const input = document.createElement('input');
+                    input.name = 'otp';
+                    input.value = '123456';
+                    document.body.append(input);
+                }"""
+            )
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert evidence == ()
+    assert "viewport_capture:sensitive_form_redacted" in errors
+    assert not (tmp_path / ".merlin" / "browser-evidence").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_kind", ["recon", "diagnostic"])
+async def test_post_screenshot_sensitive_mutation_discards_bytes_before_persist(
+    tmp_path, monkeypatch, capture_kind
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(b"<main>Initially safe</main>") as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture mutates after screenshot
+            original_screenshot = page.screenshot
+
+            async def mutate_after_screenshot(*args, **kwargs):
+                payload = await original_screenshot(*args, **kwargs)
+                await page.evaluate(
+                    """() => {
+                        const input = document.createElement('input');
+                        input.id = 'client-secret';
+                        input.value = 'do-not-persist';
+                        document.body.append(input);
+                    }"""
+                )
+                return payload
+
+            monkeypatch.setattr(page, "screenshot", mutate_after_screenshot)
+            if capture_kind == "recon":
+                evidence, errors = await session.capture_visual_evidence(tab)
+                assert evidence == ()
+                assert "viewport_capture:sensitive_form_redacted" in errors
+            else:
+                snapshot, network, screenshot = await session.capture_failure_diagnostics(
+                    tab,
+                    capture_screenshot=True,
+                )
+                assert snapshot.kind == "snapshot"
+                assert network.kind == "network"
+                assert screenshot is None
+
+    assert not (tmp_path / ".merlin" / "browser-evidence").exists()
+    assert not (tmp_path / ".merlin" / "browser-diagnostics").exists()
+
+
+@pytest.mark.asyncio
 async def test_viewport_recon_uses_rendered_viewport_not_tall_document(
     tmp_path, monkeypatch
 ) -> None:
@@ -13476,6 +13597,449 @@ async def test_viewport_recon_uses_rendered_viewport_not_tall_document(
     assert evidence[0]["viewport_width"] == 1280
     assert evidence[0]["viewport_height"] == 720
     assert evidence[0]["full_page"] is False
+
+
+@pytest.mark.asyncio
+async def test_visual_retention_budget_stops_capture_and_resets_for_new_context(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 2)
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_IDENTITIES", 8)
+    async with web_fixture(b'<main id="state">Score: 0</main>') as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        async with await launch_isolated(bounds, owner()) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits capture quota
+            original_screenshot = page.screenshot
+            screenshot_calls = 0
+
+            async def count_screenshot(*args, **kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", count_screenshot)
+            retained = []
+            for score in (1, 2):
+                await page.evaluate(
+                    """score => {
+                        document.querySelector('#state').textContent = `Score: ${score}`;
+                        document.body.style.background = score === 1 ? '#102030' : '#304050';
+                    }""",
+                    score,
+                )
+                evidence, errors = await session.capture_visual_evidence(tab)
+                assert errors == ()
+                assert len(evidence) == 1
+                retained.append(evidence[0])
+
+            directory = tmp_path / ".merlin" / "browser-evidence" / session.context_id
+            files_before = {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+                for path in directory.iterdir()
+            }
+            for score in (3, 4, 5):
+                await page.evaluate(
+                    "score => document.querySelector('#state').textContent = `Score: ${score}`",
+                    score,
+                )
+                evidence, errors = await session.capture_visual_evidence(tab)
+                assert evidence == ()
+                assert errors == ("visual_capture:context_budget_exhausted",)
+
+            latest = await session.snapshot(tab)
+            assert "Score: 5" in latest.text
+            assert screenshot_calls == 2
+            assert len(session._visual_evidence_seen) <= 8  # noqa: SLF001
+            assert len(session._visual_retained_files) == 2  # noqa: SLF001
+            assert session._visual_retained_bytes <= 20 * 1_024 * 1_024  # noqa: SLF001
+            assert files_before == {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+                for path in directory.iterdir()
+            }
+            assert directory.stat().st_mode & 0o777 == 0o700
+            for item in retained:
+                attachment = item["attachment"]
+                path = Path(attachment["path"])
+                payload = await asyncio.to_thread(path.read_bytes)
+                path_stat = await asyncio.to_thread(path.stat)
+                assert path_stat.st_mode & 0o777 == 0o600
+                assert attachment["byte_length"] == len(payload)
+                assert attachment["sha256"] == hashlib.sha256(payload).hexdigest()
+
+        assert files_before == {
+            path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+            for path in directory.iterdir()
+        }
+        async with await launch_isolated(bounds, owner()) as fresh_session:
+            fresh_tab = await fresh_session.new_tab(origin)
+            fresh_evidence, fresh_errors = await fresh_session.capture_visual_evidence(fresh_tab)
+
+    assert fresh_errors == ()
+    assert len(fresh_evidence) == 1
+    assert fresh_session.context_id != session.context_id
+
+
+@pytest.mark.asyncio
+async def test_visual_retention_byte_overflow_is_sticky(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 8)
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_IDENTITIES", 8)
+    async with web_fixture(b'<main id="state">Initial</main>') as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits capture quota
+            original_screenshot = page.screenshot
+            screenshot_calls = 0
+
+            async def count_screenshot(*args, **kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", count_screenshot)
+            first, first_errors = await session.capture_visual_evidence(tab)
+            assert len(first) == 1
+            assert first_errors == ()
+            retained_bytes = session._visual_retained_bytes  # noqa: SLF001
+            monkeypatch.setattr(
+                browser_core_module,
+                "_VISUAL_CONTEXT_MAX_BYTES",
+                retained_bytes + 1,
+            )
+            await page.evaluate(
+                "() => { document.querySelector('#state').textContent = 'Changed'; "
+                "document.body.style.background = '#506070'; }"
+            )
+            overflow, overflow_errors = await session.capture_visual_evidence(tab)
+            await page.evaluate(
+                "() => document.querySelector('#state').textContent = 'Changed again'"
+            )
+            exhausted, exhausted_errors = await session.capture_visual_evidence(tab)
+
+    assert overflow == ()
+    assert overflow_errors == ("viewport_capture:context_budget_exhausted",)
+    assert exhausted == ()
+    assert exhausted_errors == ("visual_capture:context_budget_exhausted",)
+    assert screenshot_calls == 2
+    assert len(session._visual_retained_files) == 1  # noqa: SLF001
+    assert session._visual_retained_bytes == retained_bytes  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_visual_budget_exhaustion_keeps_browser_recon_successful(
+    tmp_path, monkeypatch
+) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
+    async with web_fixture(b'<main id="state">Score: 0</main>') as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits successful recon
+            original_screenshot = page.screenshot
+            screenshot_calls = 0
+
+            async def count_screenshot(*args, **kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", count_screenshot)
+            recorder = Recorder()
+            snapshot_tool = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_snapshot"
+            )
+            context = ToolContext(
+                session_id="s1",
+                workspace_root="/tmp",
+                agent_id="worker-1",
+                state_action_kind="reconnaissance",
+                visual_evidence_enabled=True,
+            )
+            first = await snapshot_tool.invoke(context, {"tab_ref": tab})
+            await page.evaluate(
+                "() => document.querySelector('#state').textContent = 'Score: 100'"
+            )
+            saturated = await snapshot_tool.invoke(context, {"tab_ref": tab})
+
+    assert first.is_error is False
+    assert len(first.metadata["visual_evidence"]) == 1
+    assert saturated.is_error is False
+    assert "Score: 100" in saturated.content
+    assert saturated.metadata["visual_capture_uncertainty"] == [
+        "visual_capture:context_budget_exhausted"
+    ]
+    assert screenshot_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_visual_and_diagnostic_screenshots_share_context_budget(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 2)
+    async with web_fixture(b'<main id="state">Recon</main>') as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits shared quota
+            original_screenshot = page.screenshot
+            screenshot_calls = 0
+
+            async def count_screenshot(*args, **kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", count_screenshot)
+            visual, visual_errors = await session.capture_visual_evidence(tab)
+            await page.evaluate(
+                "() => { document.querySelector('#state').textContent = 'Failure'; "
+                "document.body.style.background = '#702030'; }"
+            )
+            snapshot, network, diagnostic = await session.capture_failure_diagnostics(
+                tab,
+                capture_screenshot=True,
+            )
+            later_snapshot, later_network, later_diagnostic = (
+                await session.capture_failure_diagnostics(tab, capture_screenshot=True)
+            )
+            later_visual, later_errors = await session.capture_visual_evidence(tab)
+
+    assert len(visual) == 1
+    assert visual_errors == ()
+    assert snapshot.kind == later_snapshot.kind == "snapshot"
+    assert network.kind == later_network.kind == "network"
+    assert diagnostic is not None
+    diagnostic_path = Path(diagnostic["path"])
+    diagnostic_payload = await asyncio.to_thread(diagnostic_path.read_bytes)
+    diagnostic_stat = await asyncio.to_thread(diagnostic_path.stat)
+    diagnostic_directory_stat = await asyncio.to_thread(diagnostic_path.parent.stat)
+    assert diagnostic_stat.st_mode & 0o777 == 0o600
+    assert diagnostic_directory_stat.st_mode & 0o777 == 0o700
+    assert diagnostic["byte_length"] == len(diagnostic_payload)
+    assert diagnostic["sha256"] == hashlib.sha256(diagnostic_payload).hexdigest()
+    assert later_diagnostic is None
+    assert later_visual == ()
+    assert later_errors == ("visual_capture:context_budget_exhausted",)
+    assert screenshot_calls == 2
+    assert len(session._visual_retained_files) == 2  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_concurrent_visual_paths_cannot_exceed_context_budget(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
+    async with web_fixture(b"<main>Concurrent capture</main>") as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits capture locking
+            original_screenshot = page.screenshot
+            screenshot_calls = 0
+
+            async def slow_screenshot(*args, **kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                await asyncio.sleep(0.05)
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", slow_screenshot)
+            visual_result, diagnostic_result = await asyncio.gather(
+                session.capture_visual_evidence(tab),
+                session.capture_failure_diagnostics(tab, capture_screenshot=True),
+            )
+
+    visual, _visual_errors = visual_result
+    _snapshot, _network, diagnostic = diagnostic_result
+    assert (bool(visual), diagnostic is not None) in {(True, False), (False, True)}
+    assert screenshot_calls == 1
+    assert len(session._visual_retained_files) == 1  # noqa: SLF001
+    assert len(session._visual_evidence_seen) == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_cancelled_visual_write_is_accounted_before_lock_release(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
+    original_write = browser_core_module._write_private_visual_file
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def delayed_write(path, payload):
+        write_started.set()
+        assert release_write.wait(timeout=5)
+        original_write(path, payload)
+
+    monkeypatch.setattr(browser_core_module, "_write_private_visual_file", delayed_write)
+    async with web_fixture(b"<main>Cancellation accounting</main>") as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        async with await launch_isolated(bounds, owner()) as session:
+            tab = await session.new_tab(origin)
+            capture = asyncio.create_task(session.capture_visual_evidence(tab))
+            assert await asyncio.to_thread(write_started.wait, 5)
+            capture.cancel()
+            await asyncio.sleep(0)
+            capture.cancel()
+            await asyncio.sleep(0)
+            assert capture.done() is False
+            release_write.set()
+            with pytest.raises(asyncio.CancelledError):
+                await capture
+
+            retained_files = dict(session._visual_retained_files)  # noqa: SLF001
+            retained_bytes = session._visual_retained_bytes  # noqa: SLF001
+            evidence, errors = await session.capture_visual_evidence(tab)
+            metadata = session.metadata(restart=True)
+
+        restarted = await restart_isolated(metadata, bounds, owner())
+        try:
+            restarted_tab = next(
+                tab.tab_ref for tab in restarted.metadata().tabs if tab.state == "open"
+            )
+            restarted_page = restarted._page(  # noqa: SLF001 - fixture audits restart quota
+                restarted_tab
+            )
+            restarted_screenshot_calls = 0
+
+            async def unexpected_screenshot(*_args, **_kwargs):
+                nonlocal restarted_screenshot_calls
+                restarted_screenshot_calls += 1
+                raise AssertionError("restarted saturated context must not capture")
+
+            monkeypatch.setattr(restarted_page, "screenshot", unexpected_screenshot)
+            restarted_evidence, restarted_errors = await restarted.capture_visual_evidence(
+                restarted_tab
+            )
+        finally:
+            await restarted.close()
+
+    assert len(retained_files) == 1
+    assert retained_bytes > 0
+    assert evidence == ()
+    assert errors == ("visual_capture:context_budget_exhausted",)
+    assert restarted_evidence == ()
+    assert restarted_errors == ("visual_capture:context_budget_exhausted",)
+    assert restarted_screenshot_calls == 0
+    assert len(list((tmp_path / ".merlin" / "browser-evidence").rglob("*.jpg"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_visual_retention_budget_survives_same_context_restart(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
+    async with web_fixture(b"<main>Restart budget</main>") as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        session = await launch_isolated(bounds, owner())
+        try:
+            tab = await session.new_tab(origin)
+            evidence, errors = await session.capture_visual_evidence(tab)
+            assert len(evidence) == 1
+            assert errors == ()
+            metadata = session.metadata(restart=True)
+        finally:
+            await session.close()
+
+        restarted = await restart_isolated(metadata, bounds, owner())
+        try:
+            restarted_tab = next(
+                tab.tab_ref for tab in restarted.metadata().tabs if tab.state == "open"
+            )
+            page = restarted._page(restarted_tab)  # noqa: SLF001 - fixture audits restart quota
+            screenshot_calls = 0
+
+            async def unexpected_screenshot(*_args, **_kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                raise AssertionError("saturated restarted context must not capture")
+
+            monkeypatch.setattr(page, "screenshot", unexpected_screenshot)
+            restarted_evidence, restarted_errors = await restarted.capture_visual_evidence(
+                restarted_tab
+            )
+        finally:
+            await restarted.close()
+
+    assert restarted_evidence == ()
+    assert restarted_errors == ("visual_capture:context_budget_exhausted",)
+    assert screenshot_calls == 0
+    assert restarted.context_id == metadata.context_id
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_screenshot_enforces_viewport_and_per_image_bounds(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture() as origin:
+        bounds = BrowserBounds(target_id="target", allowed_origins={origin})
+        async with await launch_isolated(bounds, owner()) as oversized_viewport:
+            tab = await oversized_viewport.new_tab(origin)
+            page = oversized_viewport._page(tab)  # noqa: SLF001 - fixture audits bounds
+            await page.set_viewport_size({"width": 2_049, "height": 720})
+            screenshot_calls = 0
+
+            async def unexpected_screenshot(*_args, **_kwargs):
+                nonlocal screenshot_calls
+                screenshot_calls += 1
+                raise AssertionError("oversized viewport must not capture")
+
+            monkeypatch.setattr(page, "screenshot", unexpected_screenshot)
+            snapshot, network, screenshot = await oversized_viewport.capture_failure_diagnostics(
+                tab,
+                capture_screenshot=True,
+            )
+
+        async with await launch_isolated(bounds, owner()) as oversized_image:
+            tab = await oversized_image.new_tab(origin)
+            page = oversized_image._page(tab)  # noqa: SLF001 - fixture audits bounds
+
+            async def return_oversized_image(*_args, **_kwargs):
+                return b"x" * (browser_core_module._VISUAL_MAX_BYTES + 1)
+
+            monkeypatch.setattr(page, "screenshot", return_oversized_image)
+            _, _, oversized_screenshot = await oversized_image.capture_failure_diagnostics(
+                tab,
+                capture_screenshot=True,
+            )
+
+    assert snapshot.kind == "snapshot"
+    assert network.kind == "network"
+    assert screenshot is None
+    assert screenshot_calls == 0
+    assert oversized_screenshot is None
+    assert not (tmp_path / ".merlin" / "browser-diagnostics").exists()
 
 
 @pytest.mark.asyncio
