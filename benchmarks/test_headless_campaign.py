@@ -223,6 +223,39 @@ async def test_report_pending_is_polled_until_ready() -> None:
     assert reports == [{"status": "ready", "output": "report.md"}]
 
 
+async def test_durable_report_shape_is_ready() -> None:
+    report = {
+        "run": "campaign/new",
+        "format": "durable-revision",
+        "output": "campaign/new:r1:abc123",
+        "status": "ready · objective_satisfied · cleanup completed",
+        "finding_count": 1,
+        "exchange_count": 2,
+        "report_state": "complete",
+        "stop_reason": "objective_satisfied",
+        "cleanup_status": "completed",
+        "coverage": [],
+        "limitations": [],
+        "target_progress": None,
+    }
+    client = FakeClient(reports=[[report]])
+
+    reports = await headless._wait_reports(client, 0.01, 0.001)
+
+    assert reports == [report]
+
+
+def test_legacy_durable_report_status_requires_the_exact_shape() -> None:
+    report = {
+        "format": "durable-revision",
+        "status": "ready · objective_satisfied · cleanup completed",
+    }
+
+    assert headless._report_is_ready(report) is True
+    assert headless._report_is_ready({**report, "status": f"{report['status']} · stale"}) is False
+    assert headless._report_is_ready({**report, "report_state": "pending"}) is False
+
+
 async def test_stream_end_without_review_is_a_failed_submit_and_owned_daemon_is_stopped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

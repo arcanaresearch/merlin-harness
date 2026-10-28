@@ -26,6 +26,8 @@ LIVE_FLAG = "MERLIN_RUN_LIVE_BENCHMARK"
 AUTHORIZED_ORIGIN = "MERLIN_LIVE_AUTHORIZED_ORIGIN"
 EXECUTABLE = "MERLIN_LIVE_RELEASE_BINARY"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "paused"})
+REPORT_STATES = frozenset({"complete", "provisional", "incomplete"})
+DURABLE_READY_STATUS = re.compile(r"ready · [^·\r\n]+ · cleanup [^·\r\n]+")
 
 
 class BenchmarkFailure(RuntimeError):
@@ -311,6 +313,19 @@ async def _wait_terminal(
     raise BenchmarkFailure(f"campaign {campaign_id} missed its terminal deadline")
 
 
+def _report_is_ready(report: Mapping[str, object]) -> bool:
+    durable = report.get("format") == "durable-revision"
+    report_state = report.get("report_state")
+    if durable and report_state not in (None, ""):
+        return isinstance(report_state, str) and report_state in REPORT_STATES
+    status = report.get("status")
+    if status == "ready":
+        return True
+    if not durable or not isinstance(status, str):
+        return False
+    return DURABLE_READY_STATUS.fullmatch(status) is not None
+
+
 async def _wait_reports(
     client: ControlClient, deadline_seconds: float, poll_interval: float
 ) -> list[dict[str, object]]:
@@ -321,7 +336,7 @@ async def _wait_reports(
         if not isinstance(plain, list) or not all(isinstance(item, dict) for item in plain):
             raise BenchmarkFailure("report inventory is not an array of objects")
         last = plain
-        if last and all(str(item.get("status")) == "ready" for item in last):
+        if last and all(_report_is_ready(item) for item in last):
             return last
         await asyncio.sleep(poll_interval)
     raise BenchmarkFailure(f"report remained pending until the deadline: {last!r}")
