@@ -437,7 +437,7 @@ class ProviderConfiguration:
                 raise ValueError("output token parameter is unsupported")
             endpoint["output_token_parameter"] = output_token_parameter
         if reasoning_parameter is not None:
-            if reasoning_parameter not in {"none", "thinking"}:
+            if reasoning_parameter not in {"none", "thinking", "reasoning_effort"}:
                 raise ValueError("reasoning parameter is unsupported")
             endpoint["reasoning_parameter"] = reasoning_parameter
         if requires_reasoning_content_for_tool_calls is not None:

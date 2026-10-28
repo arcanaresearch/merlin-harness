@@ -418,6 +418,17 @@ def test_provider_model_endpoint_protocol_controls_are_exact_and_backward_compat
     }
 
     paths.config.write_text(
+        "[provider.model_endpoints.'gpt-compatible']\n"
+        "base_url='https://proxy.example.com/v1'\n"
+        "reasoning_parameter='reasoning_effort'\n",
+        encoding="utf-8",
+    )
+    assert load_config(paths, {}).provider_model_endpoints["gpt-compatible"] == {
+        "base_url": "https://proxy.example.com/v1",
+        "reasoning_parameter": "reasoning_effort",
+    }
+
+    paths.config.write_text(
         "[provider.model_endpoints.'legacy']\nbase_url='https://legacy.test/v1'\n",
         encoding="utf-8",
     )

@@ -938,10 +938,14 @@ def _validate(values: Mapping[str, object]) -> None:
                     "'max_completion_tokens' or 'max_tokens'"
                 )
             reasoning_parameter = endpoint.get("reasoning_parameter")
-            if reasoning_parameter is not None and reasoning_parameter not in {"none", "thinking"}:
+            if reasoning_parameter is not None and reasoning_parameter not in {
+                "none",
+                "thinking",
+                "reasoning_effort",
+            }:
                 raise ValueError(
                     f"provider.model_endpoints.{endpoint_model}.reasoning_parameter must be "
-                    "'none' or 'thinking'"
+                    "'none', 'thinking', or 'reasoning_effort'"
                 )
             replay_requirement = endpoint.get("requires_reasoning_content_for_tool_calls")
             if replay_requirement is not None and not isinstance(replay_requirement, bool):

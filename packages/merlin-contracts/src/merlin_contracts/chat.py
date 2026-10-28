@@ -65,6 +65,8 @@ class ChatRequest(ContractModel):
 
     @model_validator(mode="after")
     def require_advertised_tool(self) -> "ChatRequest":
+        if self.reasoning_control == "required" and self.reasoning != "disabled":
+            raise ValueError("required reasoning control requires reasoning='disabled'")
         if self.required_tool_name is None:
             return self
         advertised = {
