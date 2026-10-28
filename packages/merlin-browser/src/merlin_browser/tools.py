@@ -1041,8 +1041,10 @@ class BrowserTool:
                         await self._recorder.append_observation(network)
                 except Exception as diagnostic_error:
                     diagnostics = {
-                        "capture_error": str(diagnostic_error).strip()
-                        or type(diagnostic_error).__name__
+                        "capture_error_type": (
+                            f"{type(diagnostic_error).__module__}."
+                            f"{type(diagnostic_error).__qualname__}"
+                        )
                     }
             if self._recorder is not None:
                 await self._recorder.save_metadata(session.metadata(restart=True))
@@ -1051,6 +1053,17 @@ class BrowserTool:
                 if isinstance(error, BrowserBoundaryError)
                 else "browser_action_failed"
             )
+            content_diagnostics = diagnostics
+            if diagnostics is not None and isinstance(diagnostics.get("screenshot"), Mapping):
+                screenshot = diagnostics["screenshot"]
+                content_diagnostics = {
+                    **diagnostics,
+                    "screenshot": {
+                        key: screenshot[key]
+                        for key in ("evidence_ref", "sha256", "media_type", "byte_length")
+                        if key in screenshot
+                    },
+                }
             detail = str(error).strip() or type(error).__name__
             if len(detail) > 2_000:
                 detail = detail[:1_997] + "..."
@@ -1059,8 +1072,8 @@ class BrowserTool:
                     f"{category}: {detail}\n"
                     + (
                         "Automatic failure diagnostics:\n"
-                        + json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
-                        if diagnostics is not None
+                        + json.dumps(content_diagnostics, sort_keys=True, separators=(",", ":"))
+                        if content_diagnostics is not None
                         else "No live tab was available for automatic diagnostics."
                     )
                     + "\nInspect the captured "

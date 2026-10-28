@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import os
+import struct
+import zlib
 
 import httpx
 import pytest
@@ -28,6 +32,25 @@ from merlin_providers import (
     ProviderQuotaSnapshot,
 )
 from merlin_providers.openai_compatible import _AdaptiveRequestGate, _admission_group
+
+
+def _write_viewport_png(path, *, width: int = 2_048, height: int = 768) -> None:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + bytes(index % 251 for index in range(width))
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * height, level=6))
+        + chunk(b"tEXt", b"diagnostic\x00" + b"v" * 300_000)
+        + chunk(b"IEND", b"")
+    )
 
 RECORDED_STREAM = "\n".join(  # noqa: FLY002 - readable recorded SSE fixture
     [
@@ -105,15 +128,15 @@ def test_provider_config_rejects_invalid_retry_bounds() -> None:
 
 
 def test_vision_payload_embeds_only_digest_verified_images(tmp_path) -> None:
-    image = tmp_path / "diagnostic.jpg"
-    image.write_bytes(b"jpeg evidence")
+    image = tmp_path / "diagnostic.png"
+    _write_viewport_png(image)
     digest = hashlib.sha256(image.read_bytes()).hexdigest()
     message = ChatMessage(
         role="user",
         content="Inspect this failure",
         image_attachments=[
             ImageAttachment(
-                media_type="image/jpeg",
+                media_type="image/png",
                 path=str(image),
                 sha256=digest,
                 byte_length=image.stat().st_size,
@@ -128,11 +151,157 @@ def test_vision_payload_embeds_only_digest_verified_images(tmp_path) -> None:
 
     content = payload["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "Inspect this failure"}
-    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    data_url = content[1]["image_url"]["url"]
+    assert data_url.startswith("data:image/png;base64,")
+    assert base64.b64decode(data_url.partition(",")[2]) == image.read_bytes()
 
-    image.write_bytes(b"tampered")
+    image.write_bytes(b"x" * image.stat().st_size)
     with pytest.raises(ProviderError, match="digest verification"):
         provider._payload(ChatRequest(model="vision-model", messages=[message]))
+
+
+def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) -> None:
+    image = tmp_path / "diagnostic.jpg"
+    image.write_bytes(b"one-shot jpeg evidence")
+    attachment = ImageAttachment(
+        media_type="image/jpeg",
+        path=str(image),
+        sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        byte_length=image.stat().st_size,
+    )
+    manifest = (
+        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
+        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    )
+    provider = OpenAICompatibleProvider(
+        ProviderConfig("https://models.example/v1", "", "vision-model", vision=True)
+    )
+
+    ephemeral = provider._payload(
+        ChatRequest(
+            model="vision-model",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=manifest,
+                    image_attachments=[attachment],
+                )
+            ],
+        )
+    )
+    persisted = provider._payload(
+        ChatRequest(
+            model="vision-model",
+            messages=[ChatMessage(role="user", content=manifest)],
+        )
+    )
+
+    assert ephemeral["messages"][0]["content"][1]["type"] == "image_url"
+    assert persisted["messages"][0]["content"] == manifest
+    assert "base64" not in json.dumps(persisted)
+
+
+def test_vision_serializer_rejects_size_mismatch_without_unbounded_read(tmp_path) -> None:
+    image = tmp_path / "oversized.jpg"
+    with image.open("wb") as stream:
+        stream.truncate(6_000_000)
+    attachment = ImageAttachment(
+        media_type="image/jpeg",
+        path=str(image),
+        sha256="0" * 64,
+        byte_length=1,
+    )
+    provider = OpenAICompatibleProvider(
+        ProviderConfig("https://models.example/v1", "", "vision-model", vision=True)
+    )
+
+    with pytest.raises(ProviderError, match="size or digest verification"):
+        provider._payload(
+            ChatRequest(
+                model="vision-model",
+                messages=[
+                    ChatMessage(
+                        role="user",
+                        content="inspect",
+                        image_attachments=[attachment],
+                    )
+                ],
+            )
+        )
+
+
+def test_vision_serializer_rejects_symlink_and_fifo_without_opening_them(tmp_path) -> None:
+    target = tmp_path / "target.jpg"
+    target.write_bytes(b"image")
+    link = tmp_path / "link.jpg"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    provider = OpenAICompatibleProvider(
+        ProviderConfig("https://models.example/v1", "", "vision-model", vision=True)
+    )
+
+    def payload(path) -> dict[str, object]:
+        attachment = ImageAttachment(
+            media_type="image/jpeg",
+            path=str(path),
+            sha256=hashlib.sha256(b"image").hexdigest(),
+            byte_length=5,
+        )
+        return provider._payload(
+            ChatRequest(
+                model="vision-model",
+                messages=[
+                    ChatMessage(
+                        role="user",
+                        content="inspect",
+                        image_attachments=[attachment],
+                    )
+                ],
+            )
+        )
+
+    with pytest.raises(ProviderError, match="regular file"):
+        payload(link)
+
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "image.fifo"
+        os.mkfifo(fifo)
+        with pytest.raises(ProviderError, match="regular file"):
+            payload(fifo)
+
+
+def test_vision_serializer_rejects_aggregate_declared_bytes_before_file_reads(tmp_path) -> None:
+    attachments = []
+    for index in range(3):
+        image = tmp_path / f"aggregate-{index}.jpg"
+        image.touch()
+        attachments.append(
+            ImageAttachment(
+                media_type="image/jpeg",
+                path=str(image),
+                sha256=f"{index + 1:064x}",
+                byte_length=2_000_000,
+            )
+        )
+    provider = OpenAICompatibleProvider(
+        ProviderConfig("https://models.example/v1", "", "vision-model", vision=True)
+    )
+
+    with pytest.raises(ProviderError, match="aggregate request byte limit"):
+        provider._payload(
+            ChatRequest(
+                model="vision-model",
+                messages=[
+                    ChatMessage(
+                        role="user",
+                        content="inspect",
+                        image_attachments=attachments,
+                    )
+                ],
+            )
+        )
 
 
 def test_non_vision_provider_rejects_image_attachments(tmp_path) -> None:
@@ -695,6 +864,58 @@ def test_retries_rate_limit_before_output_and_honors_retry_after() -> None:
 
     assert asyncio.run(run()) == [TextDelta(text="ok"), ModelCompleted(finish_reason="stop")]
     assert calls == 2
+
+
+def test_image_logical_request_keeps_transport_retry_bounded(tmp_path) -> None:
+    image = tmp_path / "diagnostic.jpg"
+    image.write_bytes(b"bounded retry evidence")
+    attachment = ImageAttachment(
+        media_type="image/jpeg",
+        path=str(image),
+        sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        byte_length=image.stat().st_size,
+    )
+    request_bodies: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        return httpx.Response(429, headers={"Retry-After": "0"}, text="busy")
+
+    async def run() -> list[object]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                ProviderConfig(
+                    "https://models.example/v1",
+                    "",
+                    "vision-model",
+                    vision=True,
+                    max_attempts=10,
+                    retry_base_seconds=0.001,
+                ),
+                client=client,
+            )
+            return [
+                event
+                async for event in provider.stream(
+                    ChatRequest(
+                        model="vision-model",
+                        messages=[
+                            ChatMessage(
+                                role="user",
+                                content="one logical inspection request",
+                                image_attachments=[attachment],
+                            )
+                        ],
+                    )
+                )
+            ]
+
+    events = asyncio.run(run())
+    assert len(events) == 1
+    assert isinstance(events[0], ModelError)
+    assert events[0].code == "rate_limited"
+    assert len(request_bodies) == 3
+    assert all("data:image/jpeg;base64," in json.dumps(body) for body in request_bodies)
 
 
 def test_provider_concurrency_cap_is_shared_across_requests() -> None:

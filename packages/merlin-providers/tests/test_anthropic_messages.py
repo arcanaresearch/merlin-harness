@@ -260,6 +260,54 @@ def test_vision_payload_embeds_only_digest_verified_user_images(tmp_path) -> Non
         )
 
 
+def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) -> None:
+    image = tmp_path / "diagnostic.png"
+    image.write_bytes(b"one-shot png evidence")
+    attachment = ImageAttachment(
+        media_type="image/png",
+        path=str(image),
+        sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        byte_length=image.stat().st_size,
+    )
+    manifest = (
+        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
+        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    )
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            "https://api.anthropic.test/v1",
+            "",
+            "claude-haiku-4-5",
+            vision=True,
+        )
+    )
+
+    ephemeral = provider._payload(
+        ChatRequest(
+            model="claude-haiku-4-5",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=manifest,
+                    image_attachments=[attachment],
+                )
+            ],
+        )
+    )
+    persisted = provider._payload(
+        ChatRequest(
+            model="claude-haiku-4-5",
+            messages=[ChatMessage(role="user", content=manifest)],
+        )
+    )
+
+    assert ephemeral["messages"][0]["content"][1]["type"] == "image"
+    assert persisted["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": manifest}]}
+    ]
+    assert "base64" not in json.dumps(persisted)
+
+
 def test_vision_payload_rejects_wrong_declared_length(tmp_path) -> None:
     image = tmp_path / "diagnostic.webp"
     image.write_bytes(b"webp evidence")

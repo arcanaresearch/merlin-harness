@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import struct
+import zlib
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
@@ -45,6 +47,9 @@ from merlin_agents.goat import (
 )
 from merlin_agents.hydra_select import HydraSelectState
 from merlin_agents.runtime import (
+    _VISUAL_ATTACHMENT_CONTEXT_TOKEN_ESTIMATE,
+    _VISUAL_EVIDENCE_MANIFEST_MARKER,
+    _VISUAL_REQUEST_BYTE_LIMIT,
     CAPABILITY_PROBE_MALFORMED_CALL_STRIKES,
     CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT,
     GOAT_PLANNER_NO_CALL_STRIKE_LIMIT,
@@ -54,6 +59,8 @@ from merlin_agents.runtime import (
     _hydra_select_contract,
     _merge_strategy_evaluation_uncertainties,
     _runtime_admitted_tool_names,
+    _visual_review_batch,
+    _VisualEvidenceCandidate,
 )
 from merlin_contracts import (
     HYDRA_SELECT_CATALOG_DIGEST,
@@ -62,6 +69,7 @@ from merlin_contracts import (
     ChatMessage,
     ChatRequest,
     DynamicToolOutput,
+    ImageAttachment,
     ModelCompleted,
     ModelError,
     ModelEvent,
@@ -85,6 +93,35 @@ from merlin_contracts.target_adapter_compiler import (
 )
 from merlin_contracts.target_capabilities import StateSelector
 from merlin_providers import ModelCapabilityRegistry, OperatorOverride, RouteIdentity
+
+
+def _write_viewport_png(
+    path,
+    *,
+    width: int = 2_048,
+    height: int = 1_440,
+    filler: bytes = b"v",
+) -> None:
+    """Write a valid viewport-sized PNG with a realistic bounded transport size."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + bytes(index % 251 for index in range(width))
+    pixels = row * height
+    image = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(pixels, level=6))
+        + chunk(b"tEXt", b"diagnostic\x00" + filler * 300_000)
+        + chunk(b"IEND", b"")
+    )
+    path.write_bytes(image)
 
 
 class Provider:
@@ -3366,6 +3403,7 @@ async def test_vision_worker_receives_browser_diagnostic_image(tmp_path) -> None
             [TextDelta(text='{"finding":"inspected"}'), ModelCompleted()],
         ],
         vision=True,
+        context_window_tokens=200_000,
     )
 
     class DiagnosticTools(Tools):
@@ -3522,6 +3560,602 @@ async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tm
         and "failed integrity validation" in item["reason"]
         for item in result.evaluation_uncertainties
     )
+
+
+async def test_visual_evidence_is_included_once_then_persists_as_text_manifest(tmp_path) -> None:
+    image = tmp_path / "content.png"
+    _write_viewport_png(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+                ToolSpec(name="read", description="Read", input_schema={"type": "object"}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name != "browser_snapshot":
+                return ToolResult(content="follow-up DOM evidence")
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "a" * 64,
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ],
+            [ToolCall(call_id="read-1", name="read", arguments={}), ModelCompleted()],
+            [TextDelta(text='{"finding":"visually attributed"}'), ModelCompleted()],
+        ],
+        vision=True,
+    )
+    tools = VisualTools()
+
+    result = await WorkerRuntime(provider, tools).run(
+        handoff(tools=("browser_snapshot", "read"))
+    )
+
+    assert result.status == "completed"
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in provider.requests
+    ] == [0, 1, 0]
+    assert tools.calls == ["browser_snapshot", "read"]
+    checkpoint_json = json.dumps(result.checkpoint, sort_keys=True)
+    assert str(image) not in checkpoint_json
+    assert digest in checkpoint_json
+    assert "sha256:" + "a" * 64 in checkpoint_json
+    assert "runtime.visual_review" in checkpoint_json
+    assert "attempted:one_logical_provider_request" in checkpoint_json
+    assert not any(
+        message.get("image_attachments")
+        for message in result.checkpoint["messages"]
+        if isinstance(message, Mapping)
+    )
+
+
+async def test_visual_evidence_context_keeps_prioritized_content_image(tmp_path) -> None:
+    viewport = tmp_path / "viewport.png"
+    content_paths = [tmp_path / f"content-{index}.png" for index in range(3)]
+    _write_viewport_png(viewport)
+    for index, path in enumerate(content_paths):
+        _write_viewport_png(path, filler=bytes((ord("c") + index,)))
+    viewport_digest = hashlib.sha256(viewport.read_bytes()).hexdigest()
+    content_digests = [hashlib.sha256(path.read_bytes()).hexdigest() for path in content_paths]
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="snapshot DOM and visual evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "1" * 64,
+                            "source_kind": "viewport",
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(viewport),
+                                "sha256": viewport_digest,
+                                "byte_length": viewport.stat().st_size,
+                            },
+                        },
+                        *(
+                            {
+                                "evidence_ref": f"sha256:{index + 2:064x}",
+                                "source_kind": "img",
+                                "attachment": {
+                                    "media_type": "image/png",
+                                    "path": str(path),
+                                    "sha256": digest,
+                                    "byte_length": path.stat().st_size,
+                                },
+                            }
+                            for index, (path, digest) in enumerate(
+                                zip(content_paths, content_digests, strict=True)
+                            )
+                        ),
+                    ]
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ],
+            [TextDelta(text='{"finding":"content image inspected"}'), ModelCompleted()],
+        ],
+        vision=True,
+        context_window_tokens=131_072,
+    )
+
+    result = await WorkerRuntime(provider, VisualTools()).run(
+        handoff(tools=("browser_snapshot",))
+    )
+
+    assert result.status == "completed"
+    visual_attachments = [
+        attachment
+        for message in provider.requests[1].messages
+        for attachment in message.image_attachments
+    ]
+    delivered_digests = [attachment.sha256 for attachment in visual_attachments]
+    assert delivered_digests
+    assert len(delivered_digests) < 4
+    assert delivered_digests == content_digests[: len(delivered_digests)]
+    assert viewport_digest not in delivered_digests
+    visual_message = next(
+        message for message in provider.requests[1].messages if message.image_attachments
+    )
+    assert f"skipped:context_bound:sha256:{viewport_digest}" in visual_message.content
+    assert all(digest in visual_message.content for digest in delivered_digests)
+    checkpoint = json.dumps(result.checkpoint, sort_keys=True)
+    assert f"context_bound:sha256:{viewport_digest}" in checkpoint
+    assert str(viewport) not in checkpoint
+    assert all(str(path) not in checkpoint for path in content_paths)
+
+
+async def test_visual_evidence_runtime_retry_is_text_only(tmp_path) -> None:
+    image = tmp_path / "content.jpg"
+    image.write_bytes(b"retry evidence")
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "b" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ],
+            [ModelError(message="transient logical request failure", retryable=True)],
+            [TextDelta(text='{"finding":"continued from text evidence"}'), ModelCompleted()],
+        ],
+        vision=True,
+    )
+
+    result = await WorkerRuntime(
+        provider,
+        VisualTools(),
+        provider_retry_backoff_seconds=0,
+    ).run(handoff(tools=("browser_snapshot",)))
+
+    assert result.status == "completed"
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in provider.requests
+    ] == [0, 1, 0]
+
+
+async def test_visual_evidence_budget_falls_back_without_a_second_reservation(tmp_path) -> None:
+    image = tmp_path / "content.png"
+    _write_viewport_png(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "d" * 64,
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    reservations: list[str] = []
+
+    async def reserve(_handoff, reservation_id, tokens, turns):
+        del _handoff, tokens, turns
+        reservations.append(reservation_id)
+        return 40_000
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ],
+            [TextDelta(text='{"finding":"text fallback"}'), ModelCompleted()],
+        ],
+        vision=True,
+        context_window_tokens=200_000,
+    )
+
+    result = await WorkerRuntime(
+        provider,
+        VisualTools(),
+        max_tokens=100_000,
+        budget_reserver=reserve,
+        budget_reservation_enabled=True,
+    ).run(handoff(tools=("browser_snapshot",)))
+
+    assert result.status == "completed"
+    assert len(reservations) == len(provider.requests) == 2
+    assert len(set(reservations)) == 2
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in provider.requests
+    ] == [0, 0]
+    assert "skipped:budget_bound" in json.dumps(result.checkpoint, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("exit_kind", "expected_reason"),
+    (("permission", "provider_permission_denied"), ("turn_limit", "model_turn_limit")),
+)
+async def test_visual_evidence_pre_request_exit_records_no_delivery_claim(
+    tmp_path, exit_kind, expected_reason
+) -> None:
+    image = tmp_path / "content.png"
+    _write_viewport_png(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "e" * 64,
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ]
+        ],
+        vision=True,
+    )
+    authorizations = 0
+
+    async def authorize(_handoff):
+        nonlocal authorizations
+        authorizations += 1
+        return authorizations == 1
+
+    runtime = WorkerRuntime(
+        provider,
+        VisualTools(),
+        authorize_provider=(authorize if exit_kind == "permission" else None),
+        max_model_turns=(1 if exit_kind == "turn_limit" else None),
+    )
+    result = await runtime.run(handoff(tools=("browser_snapshot",)))
+
+    assert result.status == "failed"
+    assert len(provider.requests) == 1
+    checkpoint = json.dumps(result.checkpoint, sort_keys=True)
+    assert f"skipped:{expected_reason}" in checkpoint
+    assert "attempted:one_logical_provider_request" not in checkpoint
+
+
+async def test_visual_attachment_rejection_falls_back_to_text_once(tmp_path) -> None:
+    image = tmp_path / "content.png"
+    _write_viewport_png(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "f" * 64,
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    class RejectingVisualProvider(Provider):
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={})
+                yield ModelCompleted()
+            elif any(message.image_attachments for message in request.messages):
+                yield ModelError(
+                    message="attachment changed",
+                    code="invalid_attachment",
+                    failure_kind=ProviderFailureKind.CONFIGURATION,
+                )
+            else:
+                yield TextDelta(text='{"finding":"DOM fallback"}')
+                yield ModelCompleted()
+
+    provider = RejectingVisualProvider([], vision=True)
+    result = await WorkerRuntime(provider, VisualTools(), max_model_turns=2).run(
+        handoff(tools=("browser_snapshot",))
+    )
+
+    assert result.status == "completed"
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in provider.requests
+    ] == [0, 1, 0]
+    checkpoint = json.dumps(result.checkpoint, sort_keys=True)
+    assert "skipped:attachment_rejected" in checkpoint
+    assert str(image) not in checkpoint
+
+
+async def test_visual_checkpoint_restart_cannot_resend_file_attachment(tmp_path) -> None:
+    image = tmp_path / "content.jpg"
+    image.write_bytes(b"crash evidence")
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    checkpoints: list[Mapping[str, object]] = []
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="snapshot DOM evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "c" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    class CrashingProvider(Provider):
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={})
+                yield ModelCompleted()
+                return
+            raise RuntimeError("daemon stopped after pre-provider checkpoint")
+            yield ModelCompleted()
+
+    async def save(checkpoint, consumed_ids):
+        del consumed_ids
+        checkpoints.append(checkpoint)
+
+    crashing = CrashingProvider([], vision=True)
+    with pytest.raises(RuntimeError, match="daemon stopped"):
+        await WorkerRuntime(
+            crashing,
+            VisualTools(),
+            checkpoint_writer=save,
+        ).run(handoff(tools=("browser_snapshot",)))
+
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in crashing.requests
+    ] == [0, 1]
+    assert checkpoints
+    restored_checkpoint = checkpoints[-1]
+    checkpoint_json = json.dumps(restored_checkpoint, sort_keys=True)
+    assert str(image) not in checkpoint_json
+    assert digest in checkpoint_json
+
+    restored = Provider(
+        [[TextDelta(text='{"finding":"restart used manifest"}'), ModelCompleted()]],
+        vision=True,
+    )
+    result = await WorkerRuntime(restored, VisualTools()).run(
+        handoff(tools=("browser_snapshot",)),
+        checkpoint=restored_checkpoint,
+    )
+
+    assert result.status == "completed"
+    assert not any(
+        message.image_attachments
+        for request in restored.requests
+        for message in request.messages
+    )
+
+
+def test_visual_review_batch_enforces_count_and_aggregate_byte_caps() -> None:
+    candidates = [
+        _VisualEvidenceCandidate(
+            attachment=ImageAttachment(
+                media_type="image/jpeg",
+                path=f"/evidence/{index}.jpg",
+                sha256=f"{index + 1:064x}",
+                byte_length=1_000_000,
+            ),
+            evidence_ref=f"sha256:{index + 101:064x}",
+            source="browser_snapshot.visual_evidence",
+        )
+        for index in range(6)
+    ]
+
+    count_limited = _visual_review_batch(candidates)
+
+    assert count_limited.accepted_count == 4
+    assert count_limited.accepted_bytes == 4_000_000
+    assert count_limited.skipped_count == 2
+    assert count_limited.request_message is not None
+    assert [item.sha256 for item in count_limited.request_message.image_attachments] == [
+        f"{index + 1:064x}" for index in range(4)
+    ]
+    assert "skipped_count_cap" in count_limited.history_message.content
+    assert "/evidence/" not in count_limited.history_message.content
+
+    max_sized = _visual_review_batch(
+        [
+            replace(
+                candidates[0],
+                attachment=candidates[0].attachment.model_copy(
+                    update={"byte_length": _VISUAL_REQUEST_BYTE_LIMIT}
+                ),
+            )
+        ]
+    )
+    assert max_sized.accepted_bytes == _VISUAL_REQUEST_BYTE_LIMIT
+
+    invalid_reference = _visual_review_batch(
+        [replace(candidates[0], evidence_ref="sha256:" + "a" * 64 + "-unbounded")]
+    )
+    assert "-unbounded" not in invalid_reference.history_message.content
+
+
+def test_request_input_bound_counts_bounded_image_token_estimate() -> None:
+    attachment = ImageAttachment(
+        media_type="image/jpeg",
+        path="/evidence/content.jpg",
+        sha256="1" * 64,
+        byte_length=300_000,
+    )
+    plain = ChatMessage(role="user", content="inspect")
+    visual = plain.model_copy(update={"image_attachments": [attachment]})
+
+    plain_bound = WorkerRuntime._request_input_token_upper_bound([plain], [])  # noqa: SLF001
+    visual_bound = WorkerRuntime._request_input_token_upper_bound([visual], [])  # noqa: SLF001
+
+    assert visual_bound - plain_bound >= _VISUAL_ATTACHMENT_CONTEXT_TOKEN_ESTIMATE
+    assert visual_bound - plain_bound < attachment.byte_length
+
+
+def test_checkpoint_and_restore_retire_legacy_visual_file_locators() -> None:
+    attachment = ImageAttachment(
+        media_type="image/jpeg",
+        path="/evidence/legacy.jpg",
+        sha256="2" * 64,
+        byte_length=128,
+    )
+    message = ChatMessage(
+        role="user",
+        content="legacy visual evidence sha256:" + "3" * 64,
+        image_attachments=[attachment],
+    )
+
+    checkpoint = WorkerRuntime._checkpoint_payload([message], {}, False)  # noqa: SLF001
+    restored = WorkerRuntime._restore_messages(handoff(), checkpoint)  # noqa: SLF001
+
+    assert not checkpoint["messages"][0]["image_attachments"]
+    assert "/evidence/legacy.jpg" not in json.dumps(checkpoint, sort_keys=True)
+    assert _VISUAL_EVIDENCE_MANIFEST_MARKER in checkpoint["messages"][0]["content"]
+    assert not restored[0].image_attachments
+    assert attachment.sha256 in restored[0].content
 
 
 @pytest.mark.parametrize(

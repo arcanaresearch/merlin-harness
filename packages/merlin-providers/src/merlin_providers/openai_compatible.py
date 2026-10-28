@@ -11,6 +11,7 @@ import json
 import os
 import random
 import re
+import stat
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -151,6 +152,10 @@ class ProviderConfig:
 
 class ProviderError(RuntimeError):
     pass
+
+
+_IMAGE_REQUEST_BYTE_LIMIT = 5_242_880
+_IMAGE_REQUEST_TRANSPORT_ATTEMPT_LIMIT = 3
 
 
 def _merge_streamed_scalar(current: str, incoming: str) -> str:
@@ -474,7 +479,15 @@ class OpenAICompatibleProvider:
         attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(self.config.effective_total_timeout):
-                for attempt in range(1, self.config.max_attempts + 1):
+                request_has_images = any(
+                    message.image_attachments for message in request.messages
+                )
+                max_attempts = (
+                    min(self.config.max_attempts, _IMAGE_REQUEST_TRANSPORT_ATTEMPT_LIMIT)
+                    if request_has_images
+                    else self.config.max_attempts
+                )
+                for attempt in range(1, max_attempts + 1):
                     retry: ModelError | None = None
                     attempt_emitted = False
                     attempt_started = time.monotonic()
@@ -486,7 +499,7 @@ class OpenAICompatibleProvider:
                             and event.retryable
                             and not emitted
                             and not attempt_emitted
-                            and attempt < self.config.max_attempts
+                            and attempt < max_attempts
                         ):
                             retry = event
                             break
@@ -1397,11 +1410,41 @@ def _plain(value: object) -> Any:
 
 def _verified_image_data(attachments: Any) -> list[tuple[str, str]]:
     """Return (media_type, base64) pairs for digest- and size-verified attachments."""
+    items = list(attachments)
+    declared_sizes: list[int] = []
+    for attachment in items:
+        declared_bytes = attachment.get("byte_length")
+        if type(declared_bytes) is not int or not (
+            0 < declared_bytes <= _IMAGE_REQUEST_BYTE_LIMIT
+        ):
+            raise ProviderError("image attachment has an invalid declared size")
+        declared_sizes.append(declared_bytes)
+    if sum(declared_sizes) > _IMAGE_REQUEST_BYTE_LIMIT:
+        raise ProviderError("image attachments exceed the aggregate request byte limit")
+
     verified: list[tuple[str, str]] = []
-    for attachment in attachments:
+    for attachment, declared_bytes in zip(items, declared_sizes, strict=True):
         path = Path(str(attachment["path"]))
-        data = path.read_bytes()
-        if len(data) != int(attachment["byte_length"]) or hashlib.sha256(data).hexdigest() != str(
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                raise ProviderError("image attachment must be a regular file")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as source:
+                opened = os.fstat(source.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ProviderError("image attachment must be a regular file")
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ProviderError("image attachment changed before verification")
+                if opened.st_size != declared_bytes:
+                    raise ProviderError("image attachment failed size or digest verification")
+                data = source.read(declared_bytes + 1)
+        except ProviderError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ProviderError("image attachment could not be read safely") from exc
+        if len(data) != declared_bytes or hashlib.sha256(data).hexdigest() != str(
             attachment["sha256"]
         ):
             raise ProviderError("image attachment failed size or digest verification")

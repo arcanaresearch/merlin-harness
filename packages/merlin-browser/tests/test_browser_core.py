@@ -12926,11 +12926,63 @@ async def test_failed_browser_action_captures_bounded_diagnostics(
                 assert await asyncio.to_thread(screenshot.is_file)
                 screenshot_stat = await asyncio.to_thread(screenshot.stat)
                 assert screenshot_stat.st_mode & 0o777 == 0o600
+                assert str(screenshot) not in result.content
+                assert '"path"' not in result.content
+                assert recorder.evidence[0][3]["sha256"] in result.content
+                assert recorder.evidence[0][3]["evidence_ref"] in result.content
             else:
                 assert '"screenshot"' not in result.content
                 assert recorder.evidence == []
                 assert "diagnostic_screenshot" not in result.metadata
                 assert not (tmp_path / ".merlin" / "browser-diagnostics").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_browser_diagnostic_error_does_not_persist_local_path(
+    tmp_path, monkeypatch
+) -> None:
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            button = next(item for item in snapshot.elements if item.role == "button")
+            private_path = tmp_path / "browser-diagnostics" / "secret.jpg"
+
+            async def stalled_action(*_args, **_kwargs):
+                await asyncio.Event().wait()
+
+            async def failed_diagnostics(*_args, **_kwargs):
+                raise OSError(f"cannot write {private_path}")
+
+            monkeypatch.setattr(session, "act", stalled_action)
+            monkeypatch.setattr(session, "capture_failure_diagnostics", failed_diagnostics)
+            click = next(
+                tool
+                for tool in browser_tools(lambda _: session)
+                if tool.name == "browser_click"
+            )
+
+            result = await click.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    visual_evidence_enabled=True,
+                ),
+                {
+                    "tab_ref": tab,
+                    "element_ref": button.ref,
+                    "step": 3,
+                    "timeout_ms": 100,
+                },
+            )
+
+            assert result.is_error
+            assert "capture_error_type" in result.content
+            assert "OSError" in result.content
+            assert str(private_path) not in result.content
 
 
 @pytest.mark.asyncio

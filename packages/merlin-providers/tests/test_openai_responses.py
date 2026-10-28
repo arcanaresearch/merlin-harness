@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 from merlin_contracts import (
     ChatMessage,
     ChatRequest,
+    ImageAttachment,
     ModelCompleted,
     ModelError,
     ModelUsage,
@@ -131,6 +133,54 @@ def test_payload_shapes_input_tools_and_reasoning() -> None:
         "output": "file body",
     }
     assert "previous_response_id" not in payload
+
+
+def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) -> None:
+    image = tmp_path / "diagnostic.webp"
+    image.write_bytes(b"one-shot webp evidence")
+    attachment = ImageAttachment(
+        media_type="image/webp",
+        path=str(image),
+        sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        byte_length=image.stat().st_size,
+    )
+    manifest = (
+        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
+        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    )
+    provider = OpenAIResponsesProvider(
+        OpenAIResponsesConfig(
+            "https://api.openai.test/v1",
+            "",
+            "gpt-5.4",
+            vision=True,
+        )
+    )
+
+    ephemeral = provider._payload(
+        ChatRequest(
+            model="gpt-5.4",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=manifest,
+                    image_attachments=[attachment],
+                )
+            ],
+        )
+    )
+    persisted = provider._payload(
+        ChatRequest(
+            model="gpt-5.4",
+            messages=[ChatMessage(role="user", content=manifest)],
+        )
+    )
+
+    assert ephemeral["input"][0]["content"][1]["type"] == "input_image"
+    assert persisted["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": manifest}]}
+    ]
+    assert "base64" not in json.dumps(persisted)
 
 
 def test_required_off_cannot_be_reenabled_by_responses_config() -> None:
