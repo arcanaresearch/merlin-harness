@@ -71,8 +71,16 @@ def _route_vision_enabled(
     transport: str,
     *,
     default_model: str,
+    capability_registry: object | None = None,
+    endpoint: str = "",
 ) -> bool:
-    """Return the effective image-input capability for one exact route."""
+    """Return the effective image-input capability for one exact route.
+
+    Exact operator configuration wins. Otherwise a non-assumed registry
+    modality may enable image input for transports that can serialize it.
+    Missing, stale-unresolvable, or assumed catalogue data fails closed for
+    attachments without affecting the model's text-only campaign work.
+    """
     if transport not in _IMAGE_INPUT_TRANSPORTS:
         return False
     configured = provider.get("model_capabilities", {})
@@ -83,7 +91,23 @@ def _route_vision_enabled(
                 return True
     # Backward compatibility for old configs: the fleet-wide flag described
     # only the then-default model and must never leak to another routed model.
-    return model == default_model and provider.get("vision") is True
+    if model == default_model and provider.get("vision") is True:
+        return True
+    resolve = getattr(capability_registry, "resolve_model", None)
+    if not callable(resolve):
+        return False
+    try:
+        modalities = resolve(
+            model,
+            transport=transport,
+            endpoint=endpoint,
+        ).modalities
+    except Exception:  # catalogue evidence is optional and must not block startup
+        return False
+    if bool(getattr(getattr(modalities, "provenance", None), "assumed", True)):
+        return False
+    values = getattr(modalities, "value", ()) or ()
+    return "image" in values
 
 
 def _capability_values_for_route(
@@ -4433,6 +4457,65 @@ def build_backend(
             comparison_receipt_requirement=required_comparison_pair,
             comparison_receipt_verifier=verify_comparison_receipt,
         )
+        # Resolve exact-route capability evidence before constructing concrete
+        # providers. Provider serializers enforce their own ``vision`` flag,
+        # so attaching the registry only to ModelRoutingProvider later would
+        # advertise images while the selected transport still rejected them.
+        configured_route_transports = dict(config.provider_model_transports)
+        for role_model in config.provider_role_models.values():
+            if role_model != model:
+                configured_route_transports.setdefault(role_model, "openai_compatible")
+        capability_snapshot = ModelCapabilityRegistry.snapshot_path(ConfigPaths.default().directory)
+        capability_overrides = overrides_from_provider_config(
+            {
+                **_capability_values_for_route(
+                    provider_values,
+                    model,
+                    "openai_compatible",
+                    default_model=model,
+                ),
+                "base_url": base_url,
+                "model": model,
+            }
+        )
+        for routed_model, transport in configured_route_transports.items():
+            endpoint_override = config.provider_model_endpoints.get(routed_model)
+            route_endpoint = (
+                ""
+                if transport in {"codex_app_server", "claude_cli", "kimi_acp"}
+                else str(
+                    endpoint_override.get("base_url", base_url)
+                    if endpoint_override is not None
+                    else base_url
+                )
+            )
+            capability_overrides += overrides_from_provider_config(
+                {
+                    **_capability_values_for_route(
+                        provider_values,
+                        routed_model,
+                        transport,
+                        default_model=model,
+                    ),
+                    "base_url": route_endpoint,
+                    "model": routed_model,
+                },
+                transport=transport,
+                endpoint=route_endpoint,
+            )
+        capability_registry = ModelCapabilityRegistry(
+            overrides=capability_overrides,
+            snapshot_claims=load_last_good_snapshot(capability_snapshot),
+            catalogue_hooks=(
+                openrouter_catalogue(
+                    cache_path=capability_snapshot.parent / "openrouter-models.json"
+                ),
+                models_dev_catalogue(cache_path=capability_snapshot.parent / "models-dev-api.json"),
+            ),
+        )
+        if capability_overrides:
+            capability_registry.save_snapshot(capability_snapshot)
+
         settings = KernelSettings(config, model)
         provider_runtime = config.provider_runtime
         provider_config = ProviderConfig(
@@ -4455,6 +4538,8 @@ def build_backend(
                 model,
                 "openai_compatible",
                 default_model=model,
+                capability_registry=capability_registry,
+                endpoint=base_url,
             ),
             context_window_tokens=provider_runtime.context_window_tokens,
             input_cost_per_million=provider_runtime.input_cost_per_million,
@@ -4471,19 +4556,26 @@ def build_backend(
         transport_state = ConfigPaths.default().directory / "provider-transports"
         transport_routes = {}
         model_efforts = config.provider_model_efforts
-        for routed_model, transport in config.provider_model_transports.items():
+        for routed_model, transport in configured_route_transports.items():
             route_effort = model_efforts.get(routed_model, provider_runtime.effort)
             if transport == "openai_compatible":
                 shared = asdict(provider_config)
                 shared["model"] = routed_model
+                endpoint_override = config.provider_model_endpoints.get(routed_model)
+                route_endpoint = str(
+                    endpoint_override.get("base_url", base_url)
+                    if endpoint_override is not None
+                    else base_url
+                )
                 shared["vision"] = _route_vision_enabled(
                     provider_values,
                     routed_model,
                     transport,
                     default_model=model,
+                    capability_registry=capability_registry,
+                    endpoint=route_endpoint,
                 )
                 shared["reasoning_effort"] = route_effort
-                endpoint_override = config.provider_model_endpoints.get(routed_model)
                 if endpoint_override is not None:
                     shared["base_url"] = endpoint_override["base_url"]
                     if endpoint_override.get("api_key"):
@@ -4546,14 +4638,21 @@ def build_backend(
                 # a route at a different provider endpoint/credential.
                 shared = asdict(provider_config)
                 shared["model"] = routed_model
+                endpoint_override = config.provider_model_endpoints.get(routed_model)
+                route_endpoint = str(
+                    endpoint_override.get("base_url", base_url)
+                    if endpoint_override is not None
+                    else base_url
+                )
                 shared["vision"] = _route_vision_enabled(
                     provider_values,
                     routed_model,
                     transport,
                     default_model=model,
+                    capability_registry=capability_registry,
+                    endpoint=route_endpoint,
                 )
                 shared["reasoning_effort"] = route_effort
-                endpoint_override = config.provider_model_endpoints.get(routed_model)
                 if endpoint_override is not None:
                     shared["base_url"] = endpoint_override["base_url"]
                     if endpoint_override.get("api_key"):
@@ -4572,6 +4671,7 @@ def build_backend(
             ModelRoutingProvider(
                 default_provider,
                 transport_routes,
+                capability_registry=capability_registry,
                 request_efforts=config.provider_request_efforts,
                 request_output_tokens=config.provider_request_output_tokens,
             )
@@ -5236,68 +5336,6 @@ def build_backend(
             input_rate, output_rate, _cache_read_rate = catalogue_pricing_for_model(selected_model)
             known = [rate for rate in (input_rate, output_rate) if rate is not None]
             return max(known) if known else None
-
-        # A1 registry wiring: tier-1 overrides come from the existing [provider]
-        # config surface; the last-good snapshot keeps known routes resolvable
-        # offline. The refreshed snapshot is only written when this startup
-        # resolved real overrides, so an unconfigured boot never clobbers it.
-        # Every configured route — the default route and each per-transport
-        # route — registers its own exact (transport, endpoint, model)
-        # override, so a model served by two transports resolves per-route.
-        capability_snapshot = ModelCapabilityRegistry.snapshot_path(ConfigPaths.default().directory)
-        capability_overrides = overrides_from_provider_config(
-            {
-                **_capability_values_for_route(
-                    provider_values,
-                    model,
-                    "openai_compatible",
-                    default_model=model,
-                ),
-                "base_url": base_url,
-                "model": model,
-            }
-        )
-        for routed_model, transport in config.provider_model_transports.items():
-            endpoint_override = config.provider_model_endpoints.get(routed_model)
-            route_endpoint = (
-                ""
-                if transport in {"codex_app_server", "claude_cli", "kimi_acp"}
-                else str(
-                    endpoint_override.get("base_url", base_url)
-                    if endpoint_override is not None
-                    else base_url
-                )
-            )
-            capability_overrides += overrides_from_provider_config(
-                {
-                    **_capability_values_for_route(
-                        provider_values,
-                        routed_model,
-                        transport,
-                        default_model=model,
-                    ),
-                    "base_url": route_endpoint,
-                    "model": routed_model,
-                },
-                transport=transport,
-                endpoint=route_endpoint,
-            )
-        capability_registry = ModelCapabilityRegistry(
-            overrides=capability_overrides,
-            snapshot_claims=load_last_good_snapshot(capability_snapshot),
-            catalogue_hooks=(
-                openrouter_catalogue(
-                    cache_path=capability_snapshot.parent / "openrouter-models.json"
-                ),
-                models_dev_catalogue(cache_path=capability_snapshot.parent / "models-dev-api.json"),
-            ),
-        )
-        if capability_overrides:
-            capability_registry.save_snapshot(capability_snapshot)
-        # Registry-back the routing provider's capabilities_for_model so
-        # unrouted models resolve per-model facts instead of staying unknown.
-        if isinstance(provider, ModelRoutingProvider):
-            provider.capability_registry = capability_registry
 
         def catalogue_pricing_for_model(
             selected_model: str,
