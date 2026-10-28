@@ -367,6 +367,19 @@ Every piece of evidence proves only what it records. A screenshot proves that so
 screen; it does not automatically prove which request caused it. A successful HTTP response proves
 that the server replied; it does not automatically prove the requested state change happened.
 
+### Screenshot retention and cleanup
+
+Rendered browser evidence and failure diagnostics share bounded per-context and daemon-wide file,
+byte, and identity budgets under `~/.merlin/browser-evidence` and
+`~/.merlin/browser-diagnostics`. When a limit is reached, Merlin records the saturation in its
+daemon log and continues DOM, text, and network reconnaissance without taking more screenshots.
+
+Merlin does not automatically delete these files because durable campaign records may still refer
+to them. To reclaim capacity, stop the Merlin daemon, archive or delete only evidence whose
+references are no longer needed, and then restart Merlin so it can perform a bounded, metadata-only
+rescan. Deleting files while the daemon is running does not refund the sticky quota and can break
+existing evidence references.
+
 ## How a result is decided
 
 Merlin prefers the simplest reliable check.

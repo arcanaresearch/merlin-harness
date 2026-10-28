@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import stat
 from collections import deque
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -55,6 +58,11 @@ _VISUAL_VIEWPORT_MAX_HEIGHT_PX = 1_440
 _VISUAL_CONTEXT_MAX_FILES = 16
 _VISUAL_CONTEXT_MAX_BYTES = 20 * 1_024 * 1_024
 _VISUAL_CONTEXT_MAX_IDENTITIES = 32
+_VISUAL_ROOT_MAX_FILES = _VISUAL_CONTEXT_MAX_FILES * 4
+_VISUAL_ROOT_MAX_BYTES = _VISUAL_CONTEXT_MAX_BYTES * 4
+_VISUAL_ROOT_MAX_IDENTITIES = _VISUAL_CONTEXT_MAX_IDENTITIES * 4
+_VISUAL_ROOT_SCAN_MAX_CONTEXTS = 256
+_VISUAL_ROOT_SCAN_MAX_ENTRIES = 512
 _SENSITIVE_FRAME_INSPECTION_LIMIT = 64
 _SENSITIVE_CONTROL_INSPECTION_LIMIT = 256
 _SENSITIVE_CONTROL_ATTRIBUTE_MAX_CHARS = 256
@@ -117,6 +125,26 @@ _SENSITIVE_CONTROL_COMPACT_PATTERNS = (
     "bankaccount",
     "accountnumber",
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _VisualRootRetention:
+    storage_root: Path
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    retained_files: dict[str, int] = field(default_factory=dict)
+    identities: set[str] = field(default_factory=set)
+    retained_bytes: int = 0
+    initialized: bool = False
+    exhausted: bool = False
+    exhaustion_reason: str | None = None
+
+
+# Merlin's process-lifetime daemon lock guarantees one writer process. This
+# registry serializes every BrowserSession inside that daemon. A filesystem scan
+# restores retained totals after a daemon restart.
+_VISUAL_ROOT_RETENTION_STATES: dict[str, _VisualRootRetention] = {}
 
 _ELEMENT_SURFACE_METADATA_SCRIPT = """
     (elements, limit) => {
@@ -465,18 +493,240 @@ async def _rendered_viewport_dimensions(page: Page) -> tuple[int, int]:
     return int(raw_viewport.get("width", 0)), int(raw_viewport.get("height", 0))
 
 
-def _write_private_visual_file(path: Path, payload: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _visual_identity_digest(*parts: str) -> str:
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def _visual_root_retention_state(storage_root: Path) -> _VisualRootRetention:
+    absolute_root = Path(os.path.abspath(os.fspath(storage_root)))
+    key = os.fspath(absolute_root)
+    state = _VISUAL_ROOT_RETENTION_STATES.get(key)
+    if state is None:
+        state = _VisualRootRetention(storage_root=absolute_root)
+        _VISUAL_ROOT_RETENTION_STATES[key] = state
+    return state
+
+
+def _exhaust_visual_root(state: _VisualRootRetention, reason: str) -> None:
+    if state.exhausted:
+        return
+    state.exhausted = True
+    state.exhaustion_reason = reason
+    _LOGGER.warning(
+        "browser screenshot retention saturated: reason=%s files=%d bytes=%d identities=%d; "
+        "DOM and network capture continue without screenshots. Retained evidence is never "
+        "deleted automatically; to reclaim capacity, stop Merlin, archive or remove %s and %s "
+        "only when their evidence references are no longer needed, then restart Merlin",
+        reason,
+        len(state.retained_files),
+        state.retained_bytes,
+        len(state.identities),
+        state.storage_root / "browser-evidence",
+        state.storage_root / "browser-diagnostics",
+    )
+
+
+def _visual_root_is_exhausted(state: _VisualRootRetention) -> bool:
+    if state.exhausted:
+        return True
+    if (
+        len(state.retained_files) >= _VISUAL_ROOT_MAX_FILES
+        or state.retained_bytes >= _VISUAL_ROOT_MAX_BYTES
+        or len(state.identities) >= _VISUAL_ROOT_MAX_IDENTITIES
+    ):
+        _exhaust_visual_root(state, "root_budget_exhausted")
+    return state.exhausted
+
+
+def _visual_root_would_exceed(
+    state: _VisualRootRetention,
+    *,
+    added_files: int,
+    added_bytes: int,
+    identity: str,
+) -> bool:
+    if _visual_root_is_exhausted(state):
+        return True
+    added_identities = int(identity not in state.identities)
+    if (
+        len(state.retained_files) + added_files > _VISUAL_ROOT_MAX_FILES
+        or state.retained_bytes + added_bytes > _VISUAL_ROOT_MAX_BYTES
+        or len(state.identities) + added_identities > _VISUAL_ROOT_MAX_IDENTITIES
+    ):
+        _exhaust_visual_root(state, "root_budget_exhausted")
+    return state.exhausted
+
+
+def _scan_visual_root(
+    storage_root: Path,
+) -> tuple[dict[str, int], int, set[str], str | None]:
+    """Stat a bounded evidence tree without reading retained target bytes."""
+    retained_files: dict[str, int] = {}
+    identities: set[str] = set()
+    retained_bytes = 0
+    inspected_entries = 0
+    context_directories = 0
     try:
+        storage_stat = os.lstat(storage_root)
+    except FileNotFoundError:
+        return retained_files, retained_bytes, identities, None
+    except OSError:
+        return retained_files, retained_bytes, identities, "root_scan_failed"
+    if stat.S_ISLNK(storage_stat.st_mode) or not stat.S_ISDIR(storage_stat.st_mode):
+        return retained_files, retained_bytes, identities, "unsafe_storage_root"
+
+    for directory_name in ("browser-evidence", "browser-diagnostics"):
+        root = storage_root / directory_name
+        try:
+            root_stat = os.lstat(root)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return retained_files, retained_bytes, identities, "root_scan_failed"
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return retained_files, retained_bytes, identities, "unsafe_retention_root"
+        try:
+            contexts = os.scandir(root)
+        except OSError:
+            return retained_files, retained_bytes, identities, "root_scan_failed"
+        with contexts:
+            for context_entry in contexts:
+                inspected_entries += 1
+                context_directories += 1
+                if (
+                    inspected_entries > _VISUAL_ROOT_SCAN_MAX_ENTRIES
+                    or context_directories > _VISUAL_ROOT_SCAN_MAX_CONTEXTS
+                ):
+                    return retained_files, retained_bytes, identities, "root_scan_bound_exhausted"
+                try:
+                    if context_entry.is_symlink() or not context_entry.is_dir(
+                        follow_symlinks=False
+                    ):
+                        return retained_files, retained_bytes, identities, "unsafe_context_entry"
+                    files = os.scandir(context_entry.path)
+                except OSError:
+                    return retained_files, retained_bytes, identities, "root_scan_failed"
+                with files:
+                    for entry in files:
+                        inspected_entries += 1
+                        if inspected_entries > _VISUAL_ROOT_SCAN_MAX_ENTRIES:
+                            return (
+                                retained_files,
+                                retained_bytes,
+                                identities,
+                                "root_scan_bound_exhausted",
+                            )
+                        try:
+                            if (
+                                entry.is_symlink()
+                                or not entry.name.casefold().endswith(".jpg")
+                                or not entry.is_file(follow_symlinks=False)
+                            ):
+                                return (
+                                    retained_files,
+                                    retained_bytes,
+                                    identities,
+                                    "unsafe_retention_entry",
+                                )
+                            entry_stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            return retained_files, retained_bytes, identities, "root_scan_failed"
+                        if (
+                            not stat.S_ISREG(entry_stat.st_mode)
+                            or entry_stat.st_nlink != 1
+                            or entry_stat.st_size <= 0
+                            or entry_stat.st_size > _VISUAL_MAX_BYTES
+                        ):
+                            return (
+                                retained_files,
+                                retained_bytes,
+                                identities,
+                                "unsafe_retention_entry",
+                            )
+                        path = Path(entry.path)
+                        path_key = os.fspath(path)
+                        retained_files[path_key] = entry_stat.st_size
+                        retained_bytes += entry_stat.st_size
+                        identities.add(
+                            hashlib.sha256(b"retained-file\0" + os.fsencode(path)).hexdigest()
+                        )
+                        if (
+                            len(retained_files) >= _VISUAL_ROOT_MAX_FILES
+                            or retained_bytes >= _VISUAL_ROOT_MAX_BYTES
+                            or len(identities) >= _VISUAL_ROOT_MAX_IDENTITIES
+                        ):
+                            return (
+                                retained_files,
+                                retained_bytes,
+                                identities,
+                                "root_budget_exhausted",
+                            )
+    return retained_files, retained_bytes, identities, None
+
+
+def _prepare_private_visual_directory(
+    storage_root: Path,
+    directory_name: str,
+    context_id: str,
+) -> Path:
+    if not context_id or context_id in {".", ".."} or Path(context_id).name != context_id:
+        raise OSError("visual retention context id is not a path component")
+    directory = storage_root / directory_name / context_id
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for candidate in (storage_root, storage_root / directory_name, directory):
+        candidate_stat = os.lstat(candidate)
+        if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISDIR(candidate_stat.st_mode):
+            raise OSError("visual retention directory is not a regular directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        directory_stat = os.fstat(descriptor)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError("visual retention directory changed during validation")
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+    return directory
+
+
+def _write_private_visual_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    opened_stat = os.fstat(descriptor)
+    try:
+        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+            raise OSError("visual evidence destination is not a private regular file")
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(payload)
-        os.chmod(path, 0o600)
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
-        path.unlink(missing_ok=True)
+        try:
+            current_stat = os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if (current_stat.st_dev, current_stat.st_ino) == (
+                opened_stat.st_dev,
+                opened_stat.st_ino,
+            ):
+                path.unlink(missing_ok=True)
         raise
+
+
+def _write_private_visual_capture(
+    storage_root: Path,
+    directory_name: str,
+    context_id: str,
+    digest: str,
+    payload: bytes,
+) -> Path:
+    directory = _prepare_private_visual_directory(storage_root, directory_name, context_id)
+    path = directory / f"{digest}.jpg"
+    _write_private_visual_file(path, payload)
+    return path
 
 
 def _json_string_paths(value: object, prefix: str = "") -> tuple[tuple[str, str], ...]:
@@ -616,16 +866,19 @@ class BrowserSession:
         self._active_submit: tuple[str, str, int, datetime] | None = None
         self._request_provenance: dict[int, dict[str, object]] = {}
         self._download_tasks: set[asyncio.Task[None]] = set()
-        # Screenshot retention is first-write-wins per logical context_id. Files are
-        # never evicted during the context lifetime; a sticky count/byte/identity
-        # limit stops later captures before Playwright or the filesystem is touched.
+        # Screenshot retention is first-write-wins per logical context_id and is also
+        # bounded across every context in the daemon. Files are retained because
+        # durable evidence can reference them; capacity is reclaimed only by offline
+        # operator cleanup followed by a daemon restart.
         self._visual_evidence_seen: set[tuple[str, str]] = set()
         self._visual_retained_files: dict[str, int] = {}
         self._visual_digest_paths: dict[str, Path] = {}
+        self._visual_trusted_digest_paths: set[str] = set()
         self._visual_retained_bytes = 0
         self._visual_retention_exhausted = False
         self._visual_retention_context_id: str | None = None
         self._visual_retention_lock = asyncio.Lock()
+        self._visual_root_retention: _VisualRootRetention | None = None
         context.on("page", self._register_popup)
         context.on("response", self._record_response)
 
@@ -1022,17 +1275,21 @@ class BrowserSession:
 
     @staticmethod
     def _scan_visual_retention(
+        storage_root: Path,
         context_id: str,
     ) -> tuple[dict[str, int], dict[str, Path], int, bool]:
         retained_files: dict[str, int] = {}
         digest_paths: dict[str, Path] = {}
         retained_bytes = 0
         roots = (
-            Path.home() / ".merlin" / "browser-evidence" / context_id,
-            Path.home() / ".merlin" / "browser-diagnostics" / context_id,
+            storage_root / "browser-evidence" / context_id,
+            storage_root / "browser-diagnostics" / context_id,
         )
         for root in roots:
             try:
+                root_stat = os.lstat(root)
+                if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+                    return retained_files, digest_paths, retained_bytes, True
                 entries = os.scandir(root)
             except FileNotFoundError:
                 continue
@@ -1041,14 +1298,24 @@ class BrowserSession:
             with entries:
                 for entry in entries:
                     try:
-                        if not entry.name.casefold().endswith(".jpg") or not entry.is_file(
-                            follow_symlinks=False
+                        if (
+                            entry.is_symlink()
+                            or not entry.name.casefold().endswith(".jpg")
+                            or not entry.is_file(follow_symlinks=False)
                         ):
-                            continue
-                        size = entry.stat(follow_symlinks=False).st_size
+                            return retained_files, digest_paths, retained_bytes, True
+                        entry_stat = entry.stat(follow_symlinks=False)
                     except OSError:
                         return retained_files, digest_paths, retained_bytes, True
+                    if (
+                        not stat.S_ISREG(entry_stat.st_mode)
+                        or entry_stat.st_nlink != 1
+                        or entry_stat.st_size <= 0
+                        or entry_stat.st_size > _VISUAL_MAX_BYTES
+                    ):
+                        return retained_files, digest_paths, retained_bytes, True
                     path = Path(entry.path)
+                    size = entry_stat.st_size
                     retained_files[str(path)] = size
                     retained_bytes += size
                     stem = path.stem.casefold()
@@ -1063,27 +1330,57 @@ class BrowserSession:
                         return retained_files, digest_paths, retained_bytes, True
         return retained_files, digest_paths, retained_bytes, False
 
+    def _visual_root_state(self) -> _VisualRootRetention:
+        if self._visual_root_retention is None:
+            self._visual_root_retention = _visual_root_retention_state(Path.home() / ".merlin")
+        return self._visual_root_retention
+
     async def _ensure_visual_retention(self) -> None:
+        root_state = self._visual_root_state()
+        if not root_state.initialized:
+            (
+                root_state.retained_files,
+                root_state.retained_bytes,
+                root_state.identities,
+                scan_failure,
+            ) = await asyncio.to_thread(_scan_visual_root, root_state.storage_root)
+            root_state.initialized = True
+            if scan_failure is not None:
+                _exhaust_visual_root(root_state, scan_failure)
         if self._visual_retention_context_id == self.context_id:
+            _visual_root_is_exhausted(root_state)
             return
         (
             self._visual_retained_files,
             self._visual_digest_paths,
             self._visual_retained_bytes,
             self._visual_retention_exhausted,
-        ) = await asyncio.to_thread(self._scan_visual_retention, self.context_id)
+        ) = await asyncio.to_thread(
+            self._scan_visual_retention,
+            root_state.storage_root,
+            self.context_id,
+        )
         self._visual_evidence_seen = set()
+        self._visual_trusted_digest_paths = set()
         self._visual_retention_context_id = self.context_id
+        _visual_root_is_exhausted(root_state)
+
+    def _visual_retention_rejection(self) -> str | None:
+        root_state = self._visual_root_retention
+        if root_state is not None and _visual_root_is_exhausted(root_state):
+            return "root_budget_exhausted"
+        if not self._visual_retention_exhausted:
+            self._visual_retention_exhausted = (
+                len(self._visual_retained_files) >= _VISUAL_CONTEXT_MAX_FILES
+                or self._visual_retained_bytes >= _VISUAL_CONTEXT_MAX_BYTES
+                or len(self._visual_evidence_seen) >= _VISUAL_CONTEXT_MAX_IDENTITIES
+            )
+        if self._visual_retention_exhausted:
+            return "context_budget_exhausted"
+        return None
 
     def _visual_retention_is_exhausted(self) -> bool:
-        if self._visual_retention_exhausted:
-            return True
-        self._visual_retention_exhausted = (
-            len(self._visual_retained_files) >= _VISUAL_CONTEXT_MAX_FILES
-            or self._visual_retained_bytes >= _VISUAL_CONTEXT_MAX_BYTES
-            or len(self._visual_evidence_seen) >= _VISUAL_CONTEXT_MAX_IDENTITIES
-        )
-        return self._visual_retention_exhausted
+        return self._visual_retention_rejection() is not None
 
     async def _retain_visual_capture(
         self,
@@ -1098,9 +1395,17 @@ class BrowserSession:
         identity = (identity_source, digest)
         if identity in self._visual_evidence_seen:
             return None, "duplicate"
-        if self._visual_retention_is_exhausted():
-            return None, "context_budget_exhausted"
+        rejection = self._visual_retention_rejection()
+        if rejection is not None:
+            return None, rejection
 
+        root_state = self._visual_root_state()
+        global_identity = _visual_identity_digest(
+            "capture",
+            self.context_id,
+            identity_source,
+            digest,
+        )
         path = self._visual_digest_paths.get(digest)
         if path is None:
             if (
@@ -1109,28 +1414,52 @@ class BrowserSession:
             ):
                 self._visual_retention_exhausted = True
                 return None, "context_budget_exhausted"
-            directory = Path.home() / ".merlin" / directory_name / self.context_id
-            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-            path = directory / f"{digest}.jpg"
+            if _visual_root_would_exceed(
+                root_state,
+                added_files=1,
+                added_bytes=len(payload),
+                identity=global_identity,
+            ):
+                return None, "root_budget_exhausted"
             cancelled: asyncio.CancelledError | None = None
-            write_task = asyncio.create_task(
-                asyncio.to_thread(_write_private_visual_file, path, payload)
+            write_future = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    _write_private_visual_capture,
+                    root_state.storage_root,
+                    directory_name,
+                    self.context_id,
+                    digest,
+                    payload,
+                ),
             )
             while True:
                 try:
-                    await asyncio.shield(write_task)
+                    path = await asyncio.shield(write_future)
                     break
                 except asyncio.CancelledError as error:
+                    if write_future.cancelled():
+                        self._visual_retention_exhausted = True
+                        _exhaust_visual_root(root_state, "write_cancelled")
+                        current_task = asyncio.current_task()
+                        if current_task is not None and current_task.cancelling():
+                            raise error from None
+                        return None, "root_budget_exhausted"
                     cancelled = cancelled or error
                     continue
                 except FileExistsError:
-                    self._visual_retention_exhausted = True
+                    _exhaust_visual_root(root_state, "write_collision")
                     if cancelled is not None:
                         raise cancelled from None
-                    return None, "context_budget_exhausted"
+                    return None, "root_budget_exhausted"
+                except OSError:
+                    _exhaust_visual_root(root_state, "unsafe_write_path")
+                    if cancelled is not None:
+                        raise cancelled from None
+                    return None, "root_budget_exhausted"
                 except BaseException:
                     self._visual_retention_exhausted = True
+                    _exhaust_visual_root(root_state, "write_failed")
                     if cancelled is not None:
                         raise cancelled from None
                     raise
@@ -1139,9 +1468,31 @@ class BrowserSession:
                 self._visual_retained_files[path_key] = len(payload)
                 self._visual_retained_bytes += len(payload)
             self._visual_digest_paths[digest] = path
+            self._visual_trusted_digest_paths.add(path_key)
+            if path_key not in root_state.retained_files:
+                root_state.retained_files[path_key] = len(payload)
+                root_state.retained_bytes += len(payload)
+            root_state.identities.add(global_identity)
+            self._visual_evidence_seen.add(identity)
             self._visual_retention_is_exhausted()
             if cancelled is not None:
                 raise cancelled
+        else:
+            if _visual_root_would_exceed(
+                root_state,
+                added_files=0,
+                added_bytes=0,
+                identity=global_identity,
+            ):
+                return None, "root_budget_exhausted"
+            root_state.identities.add(global_identity)
+            self._visual_evidence_seen.add(identity)
+            # A stat-only restart scan can account for a retained digest but cannot
+            # prove that the filename matches the file contents. Existing evidence
+            # remains retained, but it is not rebound to a new attachment.
+            if str(path) not in self._visual_trusted_digest_paths:
+                self._visual_retention_is_exhausted()
+                return None, "duplicate"
 
         self._visual_evidence_seen.add(identity)
         self._visual_retention_is_exhausted()
@@ -1161,11 +1512,14 @@ class BrowserSession:
         frame_ref: str | None = None,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
         """Capture one bounded viewport plus supplemental visible content images."""
-        async with self._visual_retention_lock:
-            await self._ensure_visual_retention()
-            if self._visual_retention_is_exhausted():
-                return (), ("visual_capture:context_budget_exhausted",)
-            return await self._capture_visual_evidence(tab_ref, frame_ref)
+        root_state = self._visual_root_state()
+        async with root_state.lock:
+            async with self._visual_retention_lock:
+                await self._ensure_visual_retention()
+                rejection = self._visual_retention_rejection()
+                if rejection is not None:
+                    return (), (f"visual_capture:{rejection}",)
+                return await self._capture_visual_evidence(tab_ref, frame_ref)
 
     async def _capture_visual_evidence(
         self,
@@ -1390,8 +1744,9 @@ class BrowserSession:
 
         capture_attempts = 0
         for locator, candidate in sorted(candidates, key=rank, reverse=True):
-            if self._visual_retention_is_exhausted():
-                errors.append("candidate_capture:context_budget_exhausted")
+            rejection = self._visual_retention_rejection()
+            if rejection is not None:
+                errors.append(f"candidate_capture:{rejection}")
                 break
             if len(evidence) >= _VISUAL_CANDIDATE_LIMIT:
                 break
@@ -1677,9 +2032,11 @@ class BrowserSession:
         )
         if not capture_screenshot:
             return snapshot, network, None
-        async with self._visual_retention_lock:
-            await self._ensure_visual_retention()
-            screenshot = await self._capture_failure_screenshot(page, tab_ref=tab_ref)
+        root_state = self._visual_root_state()
+        async with root_state.lock:
+            async with self._visual_retention_lock:
+                await self._ensure_visual_retention()
+                screenshot = await self._capture_failure_screenshot(page, tab_ref=tab_ref)
         if screenshot is None:
             return snapshot, network, None
         snapshot = snapshot.model_copy(
