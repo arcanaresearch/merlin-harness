@@ -336,6 +336,7 @@ def _submit_arguments(args: argparse.Namespace) -> list[str]:
         "--composition",
         args.composition,
         "--approve",
+        "--strict-objective",
     ]
     for name in ("turns", "tokens", "seconds", "cost_usd"):
         value = getattr(args, f"max_{name}")

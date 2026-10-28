@@ -1485,6 +1485,52 @@ def test_campaign_approve_accepts_same_origin_paraphrase(monkeypatch) -> None:
     assert client.execute_calls == [("campaign/paraphrased", "sha256:reviewed")]
 
 
+def test_campaign_strict_approval_rejects_same_origin_objective_drift(monkeypatch) -> None:
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=(
+            "Test the local game at http://localhost:3100 and play one ordinary turn.\n"
+            "Target: http://localhost:3100/api/trpc/run.turn"
+        ),
+        campaign_id="campaign/paraphrased",
+    )
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merlin",
+            "campaign",
+            "submit",
+            "--approve",
+            "--strict-objective",
+            "Use Merlin to assess http://localhost:3100. Learn the rules and establish a "
+            "normal-play baseline.",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="objective drifted"):
+        main()
+
+    assert client.cancel_calls == ["campaign/paraphrased"]
+    assert client.execute_calls == []
+
+
+def test_campaign_strict_objective_requires_noninteractive_approval(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["merlin", "campaign", "submit", "--strict-objective", "Assess target"],
+    )
+
+    with pytest.raises(SystemExit, match="requires --approve"):
+        main()
+
+
 @pytest.mark.asyncio
 async def test_campaign_approve_accepts_streamed_same_origin_paraphrase_without_retry(
     monkeypatch,
