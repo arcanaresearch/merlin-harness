@@ -442,9 +442,13 @@ What remains incomplete:
 
 Merlin is benchmarked as an adaptive attacker that finds real, executable vulnerabilities under
 a fixed budget — not as a single dataset or one ASR number. Local comparative reproductions now
-include RIFT-Bench and MUZZLE + The Zoo; the RIFT run compared the benchmark probe with Merlin on
-the same 22 runnable systems. Jailbreak Foundry and AgentHarm results measure victim susceptibility,
-not Merlin performance. AIRTBench and REDAgentBench remain deferred.
+include RIFT-Bench and MUZZLE + The Zoo. RIFT compared one probe with Merlin on flow 0 of one probe
+family across 22 runnable systems, with DeepSeek replacing Azure victim/judge deployments and with
+dependency/provider adaptations. MUZZLE and Merlin each ran one adapted Gitea scenario against the
+same `deepseek-chat` victim and judge, but used different attacker models and round counts.
+Jailbreak Foundry and AgentHarm results measure DeepSeek victim susceptibility, not Merlin
+performance. AIRTBench and REDAgentBench remain deferred; REDAgentBench/DianJin-RED benchmark data
+is CC BY-NC 4.0 plus applicable upstream terms.
 
 **These are local, non-official reproductions using DeepSeek and disclosed benchmark adaptations,
 not official leaderboard submissions.** Denominators and evaluation contracts differ by track.
