@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
+import json
 import os
+import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -19,7 +23,7 @@ SPEC.loader.exec_module(headless)
 
 def _args(**overrides: object) -> argparse.Namespace:
     values: dict[str, object] = {
-        "target": "https://benchmark.test",
+        "target_origin": "https://benchmark.test",
         "objective": "Assess https://benchmark.test exactly",
         "profile": "recommended",
         "composition": "autonomous",
@@ -44,7 +48,7 @@ def _authorize(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o700)
     monkeypatch.setenv(headless.LIVE_FLAG, "1")
-    monkeypatch.setenv(headless.AUTHORIZED_TARGET, "https://benchmark.test")
+    monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://benchmark.test")
     monkeypatch.setenv(headless.EXECUTABLE, str(binary))
     return binary
 
@@ -118,26 +122,26 @@ def _status(**changes: object) -> dict[str, object]:
     return value
 
 
-def test_requires_exact_live_flag_target_and_absolute_executable(
+def test_requires_exact_live_flag_normalized_origin_and_absolute_executable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     binary = _authorize(monkeypatch, tmp_path)
-    assert headless.authorized_executable("https://benchmark.test") == binary.resolve()
-    monkeypatch.setenv(headless.AUTHORIZED_TARGET, "https://other.test")
-    with pytest.raises(headless.BenchmarkFailure, match="exactly equal"):
+    assert headless.authorized_executable("https://BENCHMARK.test:443/") == binary.resolve()
+    monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://other.test")
+    with pytest.raises(headless.BenchmarkFailure, match="normalized origin"):
         headless.authorized_executable("https://benchmark.test")
-    monkeypatch.setenv(headless.AUTHORIZED_TARGET, "https://benchmark.test")
+    monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://benchmark.test")
     monkeypatch.setenv(headless.EXECUTABLE, "relative-merlin")
     with pytest.raises(headless.BenchmarkFailure, match="absolute executable"):
         headless.authorized_executable("https://benchmark.test")
 
 
-def test_objective_is_bound_to_only_the_exact_authorized_target() -> None:
-    headless._validate_objective_target(
+def test_objective_is_bound_to_only_the_authorized_origin() -> None:
+    headless._validate_objective_origin(
         "https://benchmark.test", "Assess https://benchmark.test/path"
     )
     with pytest.raises(headless.BenchmarkFailure, match="every URL"):
-        headless._validate_objective_target(
+        headless._validate_objective_origin(
             "https://benchmark.test",
             "Assess https://benchmark.test and https://other.test",
         )
@@ -316,7 +320,161 @@ async def test_public_submit_path_and_owned_restart_are_used(
     assert status_calls == 2
     assert first.shutdown_calls == 1
     assert second.shutdown_calls == 1
+    assert first.lease_calls == 1
+    assert second.lease_calls == 1
     assert second.resume_prompts == ["/resume session/new"]
+
+
+async def test_primary_and_cleanup_failures_are_both_reported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _authorize(monkeypatch, tmp_path)
+
+    class CleanupFailClient(FakeClient):
+        async def acquire_foreground_lease(self) -> None:
+            raise RuntimeError("cleanup lease failed")
+
+    async def launcher(_binary: Path, *arguments: str, timeout_seconds: float) -> str:
+        del timeout_seconds
+        if arguments == ("status",):
+            return "stopped\n"
+        if arguments == ("start",):
+            return ""
+        raise headless.BenchmarkFailure("preparation stream ended without review")
+
+    with pytest.raises(headless.BenchmarkCleanupFailure) as raised:
+        await headless.run(
+            _args(), launcher=launcher, client_factory=lambda **_kwargs: CleanupFailClient()
+        )
+    assert "without review" in str(raised.value)
+    assert "cleanup lease failed" in str(raised.value)
+    assert isinstance(raised.value.primary, headless.BenchmarkFailure)
+    assert isinstance(raised.value.cleanup, RuntimeError)
+
+
+async def test_runner_and_real_cli_do_not_collide_on_foreground_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exercise the real socket server, LocalControlClient, and CLI subprocess."""
+    from merlin_tui.backend import ReportView, StreamEvent
+    from merlin_tui.local_control import LocalControlClient, LocalControlTuning, serve
+
+    socket_path = Path(f"/tmp/merlin-headless-{uuid4().hex[:12]}.sock")
+    objective = "Assess https://benchmark.test exactly"
+
+    class Backend:
+        def __init__(self) -> None:
+            self.campaigns: list[dict[str, object]] = []
+            self.executed = False
+
+        async def recover_background(self) -> None:
+            return None
+
+        async def stream(self, prompt: str):
+            if prompt.startswith("/new") or prompt.startswith("/resume"):
+                yield StreamEvent("session", "session/new")
+                return
+            inventory_row = _row(status="prepared")
+            self.campaigns = [inventory_row]
+            review = {**inventory_row, "campaign_id": inventory_row["id"]}
+            yield StreamEvent("campaign_review", json.dumps(review))
+
+        async def interrupt(self) -> None:
+            return None
+
+        async def list_campaigns(self) -> list[dict[str, object]]:
+            return self.campaigns
+
+        async def list_active_schedules(self) -> tuple[()]:
+            return ()
+
+        async def execute_campaign(
+            self, campaign_id: str, manifest_digest: str
+        ) -> dict[str, object]:
+            assert (campaign_id, manifest_digest) == ("campaign/new", "sha256:one")
+            self.executed = True
+            return {"campaign_id": campaign_id, "status": "executing"}
+
+        async def campaign_status(self, campaign_id: str) -> dict[str, object]:
+            assert campaign_id == "campaign/new"
+            return _status(
+                status="executing" if self.executed else "prepared",
+                specialist_composition="autonomous",
+                budget={"limits": {"turns": 8}},
+            )
+
+        async def list_reports(self, *, session_only: bool = False) -> tuple[ReportView, ...]:
+            del session_only
+            return (ReportView("session/new", "markdown", "report.md", "ready", 0),)
+
+        async def detach(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    backend = Backend()
+    daemon = asyncio.create_task(
+        serve(
+            socket_path,
+            backend_factory=lambda **_kwargs: backend,
+            tuning=LocalControlTuning(
+                request_timeout_seconds=5,
+                max_stream_events=256,
+            ),
+        )
+    )
+    for _ in range(100):
+        if await asyncio.to_thread(socket_path.exists):
+            break
+        if daemon.done():
+            await daemon
+        await asyncio.sleep(0.01)
+    assert await asyncio.to_thread(socket_path.exists)
+
+    async def lifecycle_launcher(_binary: Path, *arguments: str, timeout_seconds: float) -> str:
+        del _binary, timeout_seconds
+        assert arguments in {("status",), ("start",)}
+        return "stopped\n" if arguments == ("status",) else ""
+
+    owner = await headless._start_owned(
+        Path(sys.executable),
+        lifecycle_launcher,
+        lambda **kwargs: LocalControlClient(socket_path=socket_path, **kwargs),
+        1,
+    )
+    assert owner._lease_id is None
+
+    environment = dict(os.environ)
+    environment["MERLIN_SOCKET_PATH"] = str(socket_path)
+    argv = [
+        "campaign",
+        "submit",
+        "--profile",
+        "recommended",
+        "--composition",
+        "autonomous",
+        "--approve",
+        "--max-turns",
+        "8",
+        objective,
+    ]
+    program = f"import sys; from merlin_tui.cli import main; sys.argv=['merlin', *{argv!r}]; main()"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        program,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=environment,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+    assert process.returncode == 0, (stdout.decode(), stderr.decode())
+    assert b"Campaign started: campaign/new" in stdout
+
+    await headless._claim_owned_lease(owner, 2)
+    await owner.shutdown()
+    await asyncio.wait_for(daemon, 2)
 
 
 def test_release_artifacts_exclude_benchmark_driver(tmp_path: Path) -> None:

@@ -23,13 +23,25 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 LIVE_FLAG = "MERLIN_RUN_LIVE_BENCHMARK"
-AUTHORIZED_TARGET = "MERLIN_LIVE_AUTHORIZED_TARGET"
+AUTHORIZED_ORIGIN = "MERLIN_LIVE_AUTHORIZED_ORIGIN"
 EXECUTABLE = "MERLIN_LIVE_RELEASE_BINARY"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "paused"})
 
 
 class BenchmarkFailure(RuntimeError):
     """The benchmark could not prove a required safety or result invariant."""
+
+
+class BenchmarkCleanupFailure(BenchmarkFailure):
+    """A benchmark failure was followed by a cleanup failure."""
+
+    def __init__(self, primary: Exception, cleanup: Exception) -> None:
+        self.primary = primary
+        self.cleanup = cleanup
+        super().__init__(
+            f"benchmark failed: {type(primary).__name__}: {primary}; "
+            f"cleanup also failed: {type(cleanup).__name__}: {cleanup}"
+        )
 
 
 class ControlClient(Protocol):
@@ -55,13 +67,43 @@ def _plain(value: object) -> object:
     return value
 
 
-def authorized_executable(target: str) -> Path:
-    """Require explicit live authorization for this exact target and binary."""
+def _normalized_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise BenchmarkFailure(
+            "benchmark origin must be an HTTP(S) origin without path or userinfo"
+        )
+    scheme = parsed.scheme.casefold()
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise BenchmarkFailure("benchmark origin has an invalid port") from error
+    default_port = 443 if scheme == "https" else 80
+    port_suffix = "" if port in {None, default_port} else f":{port}"
+    return f"{scheme}://{parsed.hostname.casefold()}{port_suffix}"
+
+
+def authorized_executable(origin: str) -> Path:
+    """Require explicit live authorization for this normalized origin and binary."""
     if os.environ.get(LIVE_FLAG) != "1":
         raise BenchmarkFailure(f"set {LIVE_FLAG}=1 for a live benchmark")
-    if os.environ.get(AUTHORIZED_TARGET) != target:
+    requested_origin = _normalized_origin(origin)
+    raw_authorized_origin = os.environ.get(AUTHORIZED_ORIGIN, "")
+    try:
+        authorized_origin = _normalized_origin(raw_authorized_origin)
+    except BenchmarkFailure:
+        authorized_origin = ""
+    if authorized_origin != requested_origin:
         raise BenchmarkFailure(
-            f"{AUTHORIZED_TARGET} must exactly equal the requested target {target!r}"
+            f"{AUTHORIZED_ORIGIN} must authorize the normalized origin {requested_origin!r}"
         )
     raw = os.environ.get(EXECUTABLE)
     if not raw:
@@ -72,19 +114,19 @@ def authorized_executable(target: str) -> Path:
     return binary.resolve()
 
 
-def _validate_objective_target(target: str, objective: str) -> None:
-    """Bind every URL in the live objective to the exactly authorized origin."""
-    authorized = urlsplit(target)
-    if authorized.scheme not in {"http", "https"} or not authorized.netloc:
-        raise BenchmarkFailure("the authorized benchmark target must be an HTTP(S) URL")
+def _validate_objective_origin(origin: str, objective: str) -> None:
+    """Bind every URL in the live objective to the authorized origin."""
+    authorized_origin = _normalized_origin(origin)
     urls = [urlsplit(value.rstrip(".,;:)]}")) for value in re.findall(r"https?://\S+", objective)]
     if not urls:
-        raise BenchmarkFailure("the benchmark objective must name the authorized target URL")
-    authorized_origin = (authorized.scheme.casefold(), authorized.netloc.casefold())
-    observed = {(value.scheme.casefold(), value.netloc.casefold()) for value in urls}
+        raise BenchmarkFailure("the benchmark objective must name the authorized origin")
+    try:
+        observed = {_normalized_origin(f"{value.scheme}://{value.netloc}") for value in urls}
+    except BenchmarkFailure as error:
+        raise BenchmarkFailure("the benchmark objective contains an invalid target URL") from error
     if observed != {authorized_origin}:
         raise BenchmarkFailure(
-            "every URL in the benchmark objective must use the exactly authorized target origin"
+            "every URL in the benchmark objective must use the authorized benchmark origin"
         )
 
 
@@ -131,9 +173,22 @@ async def _start_owned(
             "a Merlin daemon is already running; refusing to replace or stop an unrelated owner"
         )
     await launcher(binary, "start", timeout_seconds=command_deadline)
-    owner = client_factory(owns_daemon=True)
-    await owner.acquire_foreground_lease()
-    return owner
+    # Do not claim the exclusive foreground lease here. The public campaign
+    # submit CLI claims it while binding review and execution to one session.
+    return client_factory(owns_daemon=True)
+
+
+async def _claim_owned_lease(client: ControlClient, deadline_seconds: float) -> None:
+    """Claim the CLI's released lease, allowing only its bounded EOF handoff race."""
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        try:
+            await client.acquire_foreground_lease()
+            return
+        except RuntimeError as error:
+            if "already has a foreground owner" not in str(error) or time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(0.05)
 
 
 async def _restart_owned(
@@ -296,10 +351,12 @@ async def run(
     launcher: Launcher = _launcher,
     client_factory: ClientFactory = _default_client_factory,
 ) -> dict[str, object]:
-    _validate_objective_target(args.target, args.objective)
-    binary = authorized_executable(args.target)
+    _validate_objective_origin(args.target_origin, args.objective)
+    binary = authorized_executable(args.target_origin)
     owner: ControlClient | None = None
-    completed = False
+    owner_has_lease = False
+    result: dict[str, object] | None = None
+    primary_error: Exception | None = None
     try:
         owner = await _start_owned(binary, launcher, client_factory, args.command_timeout)
         before = _campaign_rows(await owner.list_campaigns())
@@ -308,6 +365,10 @@ async def run(
             *_submit_arguments(args),
             timeout_seconds=args.approval_timeout,
         )
+        # The CLI process has exited and released its exclusive lease. Claim it
+        # now so all monitoring, restart, and cleanup belongs to this runner.
+        await _claim_owned_lease(owner, args.command_timeout)
+        owner_has_lease = True
         row = _new_campaign(before, _campaign_rows(await owner.list_campaigns()))
         campaign_id = str(row.get("id") or "")
         status = _plain(await owner.campaign_status(campaign_id))
@@ -335,33 +396,45 @@ async def run(
             owner = await _restart_owned(
                 binary, owner, launcher, client_factory, args.command_timeout
             )
+            owner_has_lease = True
             await _resume(owner, session_id)
             durable = _plain(await owner.campaign_status(campaign_id))
             if not isinstance(durable, dict) or durable.get("status") != "completed":
                 raise BenchmarkFailure("completed campaign did not survive owned daemon restart")
             reports = await _wait_reports(owner, args.report_timeout, args.poll_interval)
             terminal = durable
-        completed = True
-        return {
+        result = {
             "campaign_id": campaign_id,
             "session_id": session_id,
-            "target": args.target,
+            "target_origin": _normalized_origin(args.target_origin),
             "objective": args.objective,
             "terminal": terminal,
             "reports": reports,
         }
+    except Exception as error:
+        primary_error = error
     finally:
+        cleanup_error: Exception | None = None
         if owner is not None:
             try:
+                if not owner_has_lease:
+                    await _claim_owned_lease(owner, args.command_timeout)
                 await owner.shutdown()
-            except Exception:
-                if completed:
-                    raise
+            except Exception as error:
+                cleanup_error = error
+        if primary_error is not None and cleanup_error is not None:
+            raise BenchmarkCleanupFailure(primary_error, cleanup_error) from primary_error
+        if primary_error is not None:
+            raise primary_error
+        if cleanup_error is not None:
+            raise BenchmarkFailure(f"benchmark cleanup failed: {cleanup_error}") from cleanup_error
+    assert result is not None
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True)
+    parser.add_argument("--target-origin", required=True)
     parser.add_argument("--objective", required=True)
     parser.add_argument("--profile", default="recommended")
     parser.add_argument("--composition", default="autonomous")
