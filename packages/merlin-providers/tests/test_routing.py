@@ -397,6 +397,28 @@ def test_capabilities_for_model_config_override_wins() -> None:
     assert capabilities.context_window_tokens == 64_000
 
 
+def test_capabilities_for_model_gates_vision_by_exact_transport_support() -> None:
+    default = Provider("default")
+    unsupported = Provider("anthropic")
+    unsupported.capabilities = ProviderCapabilities(
+        model="vision-model",
+        vision=True,
+        context_window_tokens=131_072,
+    )
+    unsupported.route_identity = RouteIdentity(
+        transport="anthropic_messages",
+        endpoint="https://api.example/v1",
+        model="vision-model",
+    )
+    provider = ModelRoutingProvider(default, {"vision-model": unsupported})
+
+    capabilities = provider.capabilities_for_model("vision-model")
+    assert capabilities is not None
+    assert capabilities.model == "vision-model"
+    assert capabilities.vision is False
+    assert capabilities.context_window_tokens == 131_072
+
+
 def test_capabilities_for_model_unknown_model_warns_and_stays_unknown(
     caplog: LogCaptureFixture,
 ) -> None:

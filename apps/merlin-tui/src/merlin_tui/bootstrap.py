@@ -62,6 +62,61 @@ from .lead_review import (
 )
 from .review_batch import AsyncReviewMicrobatcher
 
+_IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "openai_responses"})
+
+
+def _route_vision_enabled(
+    provider: Mapping[str, object],
+    model: str,
+    transport: str,
+    *,
+    default_model: str,
+) -> bool:
+    """Return the effective image-input capability for one exact route."""
+    if transport not in _IMAGE_INPUT_TRANSPORTS:
+        return False
+    configured = provider.get("model_capabilities", {})
+    if isinstance(configured, Mapping):
+        capabilities = configured.get(model, ())
+        if isinstance(capabilities, Sequence) and not isinstance(capabilities, str):
+            if "vision" in capabilities:
+                return True
+    # Backward compatibility for old configs: the fleet-wide flag described
+    # only the then-default model and must never leak to another routed model.
+    return model == default_model and provider.get("vision") is True
+
+
+def _capability_values_for_route(
+    provider: Mapping[str, object],
+    model: str,
+    transport: str,
+    *,
+    default_model: str,
+) -> dict[str, object]:
+    """Project model capabilities onto one transport-aware route identity."""
+    values = dict(provider)
+    configured = provider.get("model_capabilities", {})
+    capabilities: list[str] = []
+    if isinstance(configured, Mapping):
+        exact = configured.get(model, ())
+        if isinstance(exact, Sequence) and not isinstance(exact, str):
+            capabilities = list(dict.fromkeys(str(capability) for capability in exact))
+    vision = _route_vision_enabled(
+        provider,
+        model,
+        transport,
+        default_model=default_model,
+    )
+    if not vision:
+        capabilities = [capability for capability in capabilities if capability != "vision"]
+    if capabilities:
+        values["model_capabilities"] = {model: capabilities}
+    else:
+        values.pop("model_capabilities", None)
+    values["vision"] = vision
+    return values
+
+
 # Advertised languages describe expected behavior; they are not a security-test
 # allowlist. The frontier leads with the forty most-spoken languages (ordered
 # by speaker population, so cell-capped profiles take the largest first) and
@@ -4395,7 +4450,12 @@ def build_backend(
             max_tool_calls=provider_runtime.max_tool_calls,
             max_tool_argument_bytes=provider_runtime.max_tool_argument_bytes,
             max_tool_argument_depth=provider_runtime.max_tool_argument_depth,
-            vision=provider_runtime.vision,
+            vision=_route_vision_enabled(
+                provider_values,
+                model,
+                "openai_compatible",
+                default_model=model,
+            ),
             context_window_tokens=provider_runtime.context_window_tokens,
             input_cost_per_million=provider_runtime.input_cost_per_million,
             output_cost_per_million=provider_runtime.output_cost_per_million,
@@ -4416,6 +4476,12 @@ def build_backend(
             if transport == "openai_compatible":
                 shared = asdict(provider_config)
                 shared["model"] = routed_model
+                shared["vision"] = _route_vision_enabled(
+                    provider_values,
+                    routed_model,
+                    transport,
+                    default_model=model,
+                )
                 shared["reasoning_effort"] = route_effort
                 endpoint_override = config.provider_model_endpoints.get(routed_model)
                 if endpoint_override is not None:
@@ -4480,6 +4546,12 @@ def build_backend(
                 # a route at a different provider endpoint/credential.
                 shared = asdict(provider_config)
                 shared["model"] = routed_model
+                shared["vision"] = _route_vision_enabled(
+                    provider_values,
+                    routed_model,
+                    transport,
+                    default_model=model,
+                )
                 shared["reasoning_effort"] = route_effort
                 endpoint_override = config.provider_model_endpoints.get(routed_model)
                 if endpoint_override is not None:
@@ -5174,15 +5246,41 @@ def build_backend(
         # override, so a model served by two transports resolves per-route.
         capability_snapshot = ModelCapabilityRegistry.snapshot_path(ConfigPaths.default().directory)
         capability_overrides = overrides_from_provider_config(
-            {**provider_values, "base_url": base_url, "model": model}
+            {
+                **_capability_values_for_route(
+                    provider_values,
+                    model,
+                    "openai_compatible",
+                    default_model=model,
+                ),
+                "base_url": base_url,
+                "model": model,
+            }
         )
         for routed_model, transport in config.provider_model_transports.items():
+            endpoint_override = config.provider_model_endpoints.get(routed_model)
+            route_endpoint = (
+                ""
+                if transport in {"codex_app_server", "claude_cli", "kimi_acp"}
+                else str(
+                    endpoint_override.get("base_url", base_url)
+                    if endpoint_override is not None
+                    else base_url
+                )
+            )
             capability_overrides += overrides_from_provider_config(
-                {**provider_values, "base_url": base_url, "model": routed_model},
+                {
+                    **_capability_values_for_route(
+                        provider_values,
+                        routed_model,
+                        transport,
+                        default_model=model,
+                    ),
+                    "base_url": route_endpoint,
+                    "model": routed_model,
+                },
                 transport=transport,
-                endpoint=(
-                    "" if transport in {"codex_app_server", "claude_cli", "kimi_acp"} else base_url
-                ),
+                endpoint=route_endpoint,
             )
         capability_registry = ModelCapabilityRegistry(
             overrides=capability_overrides,

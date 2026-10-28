@@ -30,7 +30,7 @@ def test_provider_configuration_uses_owner_only_files(tmp_path: Path) -> None:
     assert load_config(paths, environ={}).values["provider"] == {
         "base_url": "https://example.test/v1",
         "model": "model-a",
-        "vision": True,
+        "model_capabilities": {"model-a": ["vision"]},
         "context_window_tokens": 131_072,
         "output_token_parameter": "max_tokens",
         "reasoning_parameter": "thinking",
@@ -97,7 +97,64 @@ def test_model_change_resets_unverified_vision_capability(tmp_path: Path) -> Non
     assert load_config(paths, environ={}).values["provider"] == {
         "base_url": "https://example.test/v1",
         "model": "vision-b",
-        "vision": False,
+        "model_capabilities": {"vision-a": ["vision"]},
+    }
+
+
+def test_model_routing_persists_exact_discovered_vision_without_cross_model_leakage(
+    tmp_path: Path,
+) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save("https://example.test/v1", "text-worker", "secret")
+
+    configuration.save_model_routing(
+        "text-worker",
+        "openai_compatible",
+        heterogeneous=True,
+        lead_model="text-lead",
+        recon_model="vision-recon",
+        recon_transport="openai_compatible",
+        model_vision={
+            "text-worker": False,
+            "text-lead": None,
+            "vision-recon": True,
+        },
+    )
+
+    reloaded = load_config(paths, environ={})
+    provider = reloaded.values["provider"]
+    assert provider["model_capabilities"] == {"vision-recon": ["vision"]}
+    assert reloaded.provider_model_capabilities == {"vision-recon": ("vision",)}
+    assert "vision" not in provider
+
+
+def test_model_routing_preserves_explicit_capabilities_and_unknown_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save("https://example.test/v1", "worker", "secret")
+    values = load_config(paths, environ={}).values
+    values["provider"]["model_capabilities"] = {
+        "vision-recon": ["tools", "vision"],
+        "worker": ["reasoning"],
+    }
+    configuration._write_config(values)
+
+    configuration.save_model_routing(
+        "worker",
+        "openai_compatible",
+        heterogeneous=False,
+        recon_model="vision-recon",
+        recon_transport="openai_compatible",
+        model_vision={"worker": None, "vision-recon": False},
+    )
+
+    capabilities = load_config(paths, environ={}).provider_model_capabilities
+    assert capabilities == {
+        "vision-recon": ("tools", "vision"),
+        "worker": ("reasoning",),
     }
 
 
@@ -126,6 +183,23 @@ def test_model_route_allows_codex_worker_transport(tmp_path: Path) -> None:
     provider = load_config(paths, environ={}).values["provider"]
     assert provider["model"] == "codex-worker"
     assert provider["model_transports"] == {"codex-worker": "codex_app_server"}
+
+
+def test_model_route_keeps_distinct_openai_vision_role_explicit(tmp_path: Path) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save(
+        "https://example.test/v1", "vision-role", "secret", vision=True
+    )
+    configuration.save_model("text-worker")
+
+    configuration.save_model_route("vision-role", "openai_compatible", lead_only=True)
+
+    provider = load_config(paths, environ={}).values["provider"]
+    assert provider["model"] == "text-worker"
+    assert provider["role_models"] == {"lead": "vision-role", "recon": "vision-role"}
+    assert provider["model_transports"] == {"vision-role": "openai_compatible"}
+    assert provider["model_capabilities"] == {"vision-role": ["vision"]}
 
 
 def test_model_routing_is_atomic_and_homogeneous_mode_removes_lead_override(

@@ -698,6 +698,7 @@ class KernelBackend:
         adversarial_explorer_transport: str,
         role_efforts: Mapping[str, str],
         judgments_jev_enabled: bool | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
     ) -> str:
         await asyncio.to_thread(
             self._configuration.save_model_routing,
@@ -713,6 +714,7 @@ class KernelBackend:
             adversarial_explorer_model=adversarial_explorer_model,
             adversarial_explorer_transport=adversarial_explorer_transport,
             role_efforts=role_efforts,
+            model_vision=model_vision,
             judgments_jev_enabled=judgments_jev_enabled,
         )
         mode = "heterogeneous Lead/worker" if heterogeneous else "homogeneous"

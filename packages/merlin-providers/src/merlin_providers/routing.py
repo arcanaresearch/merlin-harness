@@ -12,6 +12,7 @@ from merlin_contracts import ChatRequest, DynamicToolHandler, ModelEvent, Provid
 from .capabilities import RouteIdentity
 
 logger = logging.getLogger(__name__)
+_IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "open_ai_compatible", "openai_responses"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,23 @@ class _SharedProviderCapabilities:
     model: str
     vision: bool | None = None
     context_window_tokens: int | None = None
+
+
+def _with_route_capabilities(
+    capabilities: object | None,
+    model: str,
+    *,
+    vision: bool | None,
+    context_window_tokens: int | None,
+) -> _SharedProviderCapabilities:
+    return _SharedProviderCapabilities(
+        streaming=bool(getattr(capabilities, "streaming", False)),
+        tools=bool(getattr(capabilities, "tools", False)),
+        usage_in_stream=bool(getattr(capabilities, "usage_in_stream", False)),
+        model=model,
+        vision=vision,
+        context_window_tokens=context_window_tokens,
+    )
 
 
 def _validate_explicit_route_model(provider: Provider, model: str) -> None:
@@ -158,16 +176,39 @@ class ModelRoutingProvider:
         tier-7 assumption stays an explicit unknown (``context_window_tokens``
         is ``None``) and is logged — never silently sized.
         """
+        identity = self.route_identity_for_model(model)
+        transport = str(getattr(identity, "transport", "openai_compatible"))
+        configured_vision = getattr(capabilities, "vision", None)
+        effective_vision = (
+            False
+            if transport not in _IMAGE_INPUT_TRANSPORTS
+            else configured_vision
+            if isinstance(configured_vision, bool)
+            else None
+        )
         window = getattr(capabilities, "context_window_tokens", None)
         if isinstance(window, int) and not isinstance(window, bool):
-            return capabilities
+            if effective_vision == configured_vision:
+                return capabilities
+            return _with_route_capabilities(
+                capabilities,
+                model,
+                vision=effective_vision,
+                context_window_tokens=window,
+            )
         resolve = getattr(self.capability_registry, "resolve_model", None)
         if not callable(resolve):
+            if effective_vision != configured_vision:
+                return _with_route_capabilities(
+                    capabilities,
+                    model,
+                    vision=effective_vision,
+                    context_window_tokens=None,
+                )
             return capabilities
-        identity = self.route_identity_for_model(model)
         resolved = resolve(
             model,
-            transport=str(getattr(identity, "transport", "openai_compatible")),
+            transport=transport,
             endpoint=str(getattr(identity, "endpoint", "")),
         )
         field = resolved.context_window_tokens
@@ -181,14 +222,25 @@ class ModelRoutingProvider:
                 getattr(identity, "transport", ""),
                 getattr(identity, "endpoint", ""),
             )
+            if effective_vision != configured_vision:
+                return _with_route_capabilities(
+                    capabilities,
+                    model,
+                    vision=effective_vision,
+                    context_window_tokens=None,
+                )
             return capabilities
         modalities = getattr(resolved.modalities, "value", None) or ()
-        vision = True if "image" in modalities else getattr(capabilities, "vision", None)
-        return _SharedProviderCapabilities(
-            streaming=bool(getattr(capabilities, "streaming", False)),
-            tools=bool(getattr(capabilities, "tools", False)),
-            usage_in_stream=bool(getattr(capabilities, "usage_in_stream", False)),
-            model=model,
+        vision = (
+            effective_vision
+            if effective_vision is not None
+            else True
+            if "image" in modalities
+            else None
+        )
+        return _with_route_capabilities(
+            capabilities,
+            model,
             vision=vision,
             context_window_tokens=value,
         )

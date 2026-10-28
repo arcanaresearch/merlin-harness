@@ -35,6 +35,48 @@ def _validate_effort(effort: str) -> None:
         raise ValueError("effort must be default, minimal, low, medium, high, or xhigh")
 
 
+def _model_capabilities(provider: Mapping[str, object]) -> dict[str, list[str]]:
+    configured = provider.get("model_capabilities", {})
+    if not isinstance(configured, Mapping):
+        return {}
+    return {
+        str(model): list(dict.fromkeys(str(capability) for capability in capabilities))
+        for model, capabilities in configured.items()
+        if isinstance(capabilities, Sequence) and not isinstance(capabilities, str)
+    }
+
+
+def _set_model_vision(
+    provider: dict[str, object], model: str, enabled: bool, *, preserve_existing: bool = False
+) -> None:
+    """Persist vision on one exact model without disturbing its other capabilities."""
+    model = model.strip()
+    if not model:
+        return
+    capabilities = _model_capabilities(provider)
+    current = capabilities.get(model, [])
+    if enabled:
+        if "vision" not in current:
+            current.append("vision")
+    elif not (preserve_existing and "vision" in current):
+        current = [capability for capability in current if capability != "vision"]
+    if current:
+        capabilities[model] = current
+    else:
+        capabilities.pop(model, None)
+    if capabilities:
+        provider["model_capabilities"] = capabilities
+    else:
+        provider.pop("model_capabilities", None)
+
+
+def _migrate_legacy_vision(provider: dict[str, object], model: str) -> None:
+    """Scope the legacy fleet-wide flag to the model it originally described."""
+    legacy = provider.pop("vision", None)
+    if legacy is True:
+        _set_model_vision(provider, model, True)
+
+
 def _is_local_base_url(base_url: str) -> bool:
     return urlsplit(base_url.strip()).hostname in {"localhost", "127.0.0.1", "::1"}
 
@@ -119,6 +161,8 @@ class ProviderConfiguration:
         values = dict(current)
         provider = values.get("provider", {})
         provider_values = dict(provider) if isinstance(provider, Mapping) else {}
+        previous_model = str(provider_values.get("model", ""))
+        _migrate_legacy_vision(provider_values, previous_model)
         provider_values.update(base_url=base_url.strip(), model=model.strip())
         if effort is not None:
             _validate_effort(effort)
@@ -128,7 +172,7 @@ class ProviderConfiguration:
         if reasoning_parameter is not None:
             provider_values["reasoning_parameter"] = reasoning_parameter
         if vision is not None:
-            provider_values["vision"] = vision
+            _set_model_vision(provider_values, model, vision)
         if context_window_tokens is None:
             provider_values.pop("context_window_tokens", None)
         elif context_window_tokens is not _UNSET:
@@ -150,11 +194,10 @@ class ProviderConfiguration:
         base_url = provider.get("base_url") if isinstance(provider, Mapping) else None
         if not isinstance(base_url, str):
             raise ValueError("configure a provider with /setup first")
-        # Vision support belongs to the exact model route. A model-only switch
-        # must fail closed until /setup explicitly confirms the new capabilities.
         values = dict(config.values)
         provider_values = dict(provider)
-        provider_values.update(base_url=base_url, model=model.strip(), vision=False)
+        _migrate_legacy_vision(provider_values, str(provider_values.get("model", "")))
+        provider_values.update(base_url=base_url, model=model.strip())
         provider_values.pop("context_window_tokens", None)
         values["provider"] = provider_values
         self._write_config(values)
@@ -173,6 +216,7 @@ class ProviderConfiguration:
             raise ValueError("configure a provider with /setup first")
         values = dict(config.values)
         provider_values = dict(provider)
+        _migrate_legacy_vision(provider_values, str(provider_values.get("model", "")))
         if lead_only:
             role_models = provider_values.get("role_models", {})
             role_values = dict(role_models) if isinstance(role_models, Mapping) else {}
@@ -180,14 +224,14 @@ class ProviderConfiguration:
             role_values["recon"] = model
             provider_values["role_models"] = role_values
         else:
-            provider_values.update(model=model, vision=False)
+            provider_values.update(model=model)
             provider_values.pop("context_window_tokens", None)
         routes = provider_values.get("model_transports", {})
         route_values = dict(routes) if isinstance(routes, Mapping) else {}
-        if transport == "openai_compatible":
-            route_values.pop(model, None)
-        else:
-            route_values[model] = transport
+        # Keep even the default transport explicit. A distinct role model needs
+        # its own provider instance so exact per-model capabilities cannot fall
+        # back to the worker provider's configuration.
+        route_values[model] = transport
         provider_values["model_transports"] = route_values
         values["provider"] = provider_values
         self._refuse_keyless_routes(provider_values)
@@ -208,6 +252,7 @@ class ProviderConfiguration:
         adversarial_explorer_model: str = "",
         adversarial_explorer_transport: str = "openai_compatible",
         role_efforts: Mapping[str, str] | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
         judgments_url: str = "",
         judgments_token: str = "",
         judgments_jev_token: str = "",
@@ -264,11 +309,12 @@ class ProviderConfiguration:
         values = dict(config.values)
         provider_values = dict(provider)
         previous_models = {str(provider_values.get("model", ""))}
+        _migrate_legacy_vision(provider_values, str(provider_values.get("model", "")))
         previous_roles = provider_values.get("role_models", {})
         if isinstance(previous_roles, Mapping):
             previous_models.update(str(model) for model in previous_roles.values())
 
-        provider_values.update(model=worker_model, vision=False)
+        provider_values.update(model=worker_model)
         provider_values.pop("context_window_tokens", None)
         role_values = dict(previous_roles) if isinstance(previous_roles, Mapping) else {}
         if heterogeneous:
@@ -325,6 +371,24 @@ class ProviderConfiguration:
             # Keep the explicit default transport too: a per-model endpoint may
             # require a distinct OpenAI-compatible URL and reasoning protocol.
             route_values[routed_model] = transport
+        if model_vision is not None:
+            invalid = [
+                model
+                for model, vision in model_vision.items()
+                if not isinstance(model, str)
+                or (vision is not None and not isinstance(vision, bool))
+            ]
+            if invalid:
+                raise ValueError("model vision entries must map model IDs to true, false, or null")
+            for routed_model in resolved:
+                discovered_vision = model_vision.get(routed_model)
+                if discovered_vision is not None:
+                    _set_model_vision(
+                        provider_values,
+                        routed_model,
+                        discovered_vision,
+                        preserve_existing=True,
+                    )
         if route_values:
             provider_values["model_transports"] = route_values
         else:

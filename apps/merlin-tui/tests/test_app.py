@@ -2749,6 +2749,42 @@ async def test_setup_discovers_current_models_and_applies_reported_capabilities(
 
 
 @pytest.mark.asyncio
+async def test_model_routing_screen_keeps_exact_discovered_vision(monkeypatch) -> None:
+    from merlin_config import Config
+    from merlin_tui.provider_catalog import ModelCandidate, ModelDiscovery
+
+    config = Config(
+        values={
+            "provider": {
+                "base_url": "https://example.test/v1",
+                "model": "text-worker",
+            }
+        }
+    )
+    monkeypatch.setattr("merlin_config.load_config", lambda: config)
+    monkeypatch.setattr("merlin_config.CredentialStore.load", lambda _self: {})
+
+    async def discover(_provider, _api_key):
+        return {
+            "openai_compatible": ModelDiscovery(
+                (
+                    ModelCandidate("text-worker", vision=False),
+                    ModelCandidate("vision-recon", vision=True),
+                )
+            ),
+            "openai_responses": ModelDiscovery(
+                (ModelCandidate("vision-recon", vision=None),)
+            ),
+        }
+
+    monkeypatch.setattr("merlin_tui.provider_catalog.discover_routing_models", discover)
+
+    screen = await app_module._configured_model_screen("text-worker")
+
+    assert screen.model_vision == {"text-worker": False, "vision-recon": True}
+
+
+@pytest.mark.asyncio
 async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -> None:
     class RouteBackend(DemoBackend):
         configured = None
@@ -2769,6 +2805,7 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
             adversarial_explorer_transport,
             role_efforts,
             judgments_jev_enabled=None,
+            model_vision=None,
         ):
             self.configured = (
                 worker_model,
@@ -2783,6 +2820,7 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
                 adversarial_explorer_model,
                 adversarial_explorer_transport,
                 role_efforts,
+                model_vision,
                 judgments_jev_enabled,
             )
             return "route saved"
@@ -2811,6 +2849,7 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
                     "anthropic_messages": ("validator-model",),
                     "gemini": ("explorer-model",),
                 },
+                model_vision={"recon-model": True},
             )
         ),
     )
@@ -2860,6 +2899,7 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
                 "validator": "default",
                 "adversarial-explorer": "default",
             },
+            {"recon-model": True},
             False,
         )
         assert backend.applied is True

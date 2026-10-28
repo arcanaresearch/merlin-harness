@@ -359,6 +359,7 @@ class ChatBackend(Protocol):
         adversarial_explorer_transport: str,
         role_efforts: Mapping[str, str],
         judgments_jev_enabled: bool | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
     ) -> str: ...
 
     async def get_runtime_status(self) -> object: ...
@@ -564,10 +565,11 @@ class DemoBackend:
         adversarial_explorer_transport: str,
         role_efforts: Mapping[str, str],
         judgments_jev_enabled: bool | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
     ) -> str:
         del worker_transport, lead_model, lead_transport, recon_model, recon_transport
         del validator_model, validator_transport, adversarial_explorer_model
-        del adversarial_explorer_transport, role_efforts, judgments_jev_enabled
+        del adversarial_explorer_transport, role_efforts, model_vision, judgments_jev_enabled
         mode = "heterogeneous" if heterogeneous else "homogeneous"
         return f"Saved {mode} model routing with {worker_model} for workers."
 
@@ -999,6 +1001,7 @@ class FailureBackend:
         adversarial_explorer_transport: str,
         role_efforts: Mapping[str, str],
         judgments_jev_enabled: bool | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
     ) -> str:
         from .configuration import ProviderConfiguration
 
@@ -1015,6 +1018,7 @@ class FailureBackend:
             adversarial_explorer_model=adversarial_explorer_model,
             adversarial_explorer_transport=adversarial_explorer_transport,
             role_efforts=role_efforts,
+            model_vision=model_vision,
             judgments_jev_enabled=judgments_jev_enabled,
         )
         mode = "heterogeneous Lead/worker" if heterogeneous else "homogeneous"

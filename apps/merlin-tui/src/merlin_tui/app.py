@@ -831,6 +831,7 @@ class ModelSetup:
     adversarial_explorer_model: str
     adversarial_explorer_transport: str
     role_efforts: Mapping[str, str]
+    model_vision: Mapping[str, bool | None]
     judgments_jev_enabled: bool = True
 
 
@@ -847,6 +848,7 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
         current: str = "",
         *,
         models_by_transport: Mapping[str, Iterable[str]] | None = None,
+        model_vision: Mapping[str, bool | None] | None = None,
         current_lead: str = "",
         current_recon: str = "",
         current_validator: str = "",
@@ -874,6 +876,7 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
         self.role_efforts = {role: str(effort) for role, effort in (role_efforts or {}).items()}
         self.judgments_jev_enabled = judgments_jev_enabled
         self.judgments_jev_token_configured = judgments_jev_token_configured
+        self.model_vision = dict(model_vision or {})
         self.models_by_transport = {
             transport: tuple(dict.fromkeys(model.strip() for model in models if model.strip()))
             for transport, models in (models_by_transport or {}).items()
@@ -1189,6 +1192,7 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
                 self._selected_model("adversarial-explorer"),
                 str(explorer_transport),
                 role_efforts,
+                self.model_vision,
                 judgments_jev_enabled,
             )
         )
@@ -1226,6 +1230,21 @@ async def _configured_model_screen(current: str) -> ModelScreen:
             transport: tuple(candidate.id for candidate in result.models)
             for transport, result in discovered.items()
         }
+        model_vision: dict[str, bool | None] = {}
+        conflicting_vision: set[str] = set()
+        for result in discovered.values():
+            for candidate in result.models:
+                if candidate.id in conflicting_vision:
+                    continue
+                if candidate.id not in model_vision:
+                    model_vision[candidate.id] = candidate.vision
+                elif model_vision[candidate.id] is None:
+                    model_vision[candidate.id] = candidate.vision
+                elif candidate.vision is None:
+                    continue
+                elif model_vision[candidate.id] != candidate.vision:
+                    model_vision[candidate.id] = None
+                    conflicting_vision.add(candidate.id)
         for model in (worker, *roles.values(), *config.provider_model_transports.keys()):
             transport = config.provider_model_transports.get(model, "openai_compatible")
             models_by_transport[transport] = tuple(
@@ -1240,6 +1259,7 @@ async def _configured_model_screen(current: str) -> ModelScreen:
         return ModelScreen(
             worker,
             models_by_transport=models_by_transport,
+            model_vision=model_vision,
             current_lead=lead,
             current_recon=recon,
             current_validator=validator,
@@ -6561,6 +6581,7 @@ class MerlinApp(App[None]):
                 setup.adversarial_explorer_model,
                 setup.adversarial_explorer_transport,
                 setup.role_efforts,
+                model_vision=setup.model_vision,
                 judgments_jev_enabled=setup.judgments_jev_enabled,
             )
             apply_saved = getattr(self.backend, "apply_saved_model_routing", None)
