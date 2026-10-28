@@ -121,6 +121,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKDIR = ROOT / "target" / "headless-packaged-uat"
 
 LANES = ("api", "api-restart", "browser", "hybrid", "recon-reuse")
+UAT_LEASE_SECONDS = 1.0
 
 
 def _digest(value: object) -> str:
@@ -520,7 +521,7 @@ async def run_api_lane(workdir: Path, target: FixtureTargetServer) -> dict[str, 
                     scheduler,
                     model="model",
                     workspace_root=str(workdir),
-                    lease_seconds=0.1,
+                    lease_seconds=UAT_LEASE_SECONDS,
                     campaign_cleanup=api_target.cleanup_assignment,
                 )
                 live = await service.submit(
@@ -657,7 +658,7 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
                     scheduler,
                     model="model",
                     workspace_root=str(workdir),
-                    lease_seconds=0.1,
+                    lease_seconds=UAT_LEASE_SECONDS,
                 )
                 live = await service.submit(
                     str(session.id),
@@ -745,7 +746,7 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
                     scheduler,
                     model="model",
                     workspace_root=str(workdir),
-                    lease_seconds=0.1,
+                    lease_seconds=UAT_LEASE_SECONDS,
                     campaign_cleanup=api_target.cleanup_assignment,
                 )
                 staged = await replacement.reopen(schedule_id, resume_execution=False)

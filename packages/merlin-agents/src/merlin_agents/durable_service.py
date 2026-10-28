@@ -4016,7 +4016,7 @@ class DurableAgentService:
                             control.cancel()
 
                 async def keep_lease_alive() -> None:
-                    interval = max(0.25, self._lease_seconds / 3)
+                    interval = max(0.01, min(0.25, self._lease_seconds / 3))
                     while True:
                         await asyncio.sleep(interval)
                         try:
@@ -4047,7 +4047,7 @@ class DurableAgentService:
                 worker_loop = asyncio.get_running_loop()
 
                 def keep_lease_alive_sync() -> None:
-                    interval = max(0.25, self._lease_seconds / 3)
+                    interval = max(0.01, min(0.25, self._lease_seconds / 3))
                     while not keeper_stop.wait(interval):
                         try:
                             self._store.heartbeat(
