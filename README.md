@@ -434,16 +434,22 @@ What remains incomplete:
 - Generated custom Python or Playwright code has no approved sandboxed runtime.
 - Not every arm-generation helper is wired into live campaign scheduling.
 - Fresh isolated-session reproduction is not available for every target and finding.
-- Merlin has not been benchmarked against other scanners on comparable targets.
+- Comparative coverage is still narrow: current head-to-head evidence comes from local,
+  non-official reproductions rather than official leaderboard submissions.
 - Packaged support currently targets macOS 14 on Apple silicon.
 
 ## Benchmarking
 
 Merlin is benchmarked as an adaptive attacker that finds real, executable vulnerabilities under
-a fixed budget — not as a single dataset or one ASR number. The recommended stack (hidden
-executable suite, MUZZLE + The Zoo, AIRTBench, RIFT-Bench, Jailbreak Foundry, AgentHarm /
-AgentDojo regression tracks, REDAgentBench as an execution substrate) and the current, honest
-benchmark status live in [docs/benchmarks.md](docs/benchmarks.md).
+a fixed budget — not as a single dataset or one ASR number. Local comparative reproductions now
+include RIFT-Bench and MUZZLE + The Zoo; the RIFT run compared the benchmark probe with Merlin on
+the same 22 runnable systems. Jailbreak Foundry and AgentHarm results measure victim susceptibility,
+not Merlin performance. AIRTBench and REDAgentBench remain deferred.
+
+**These are local, non-official reproductions using DeepSeek and disclosed benchmark adaptations,
+not official leaderboard submissions.** Denominators and evaluation contracts differ by track.
+See [the benchmark results and methodology boundaries](docs/benchmarks.md); raw benchmark and
+vendor outputs are not included in the release.
 
 ## Security and responsible use
 
