@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from enum import StrEnum
@@ -35,6 +36,14 @@ from .target_capabilities import (
 COMPILED_TARGET_ADAPTER_VERSION = "merlin.compiled-target-adapter.v1"
 ADAPTER_COMPILATION_VERSION = "merlin.target-adapter-compilation.v1"
 BROWSER_STEP_SOURCE_INDEX_KEY = "__merlin_source_index"
+BROWSER_TEXT_CAPTURE_MAX_LENGTH = 512
+BROWSER_STATE_OBSERVATION_LIMIT = 32
+BROWSER_STATE_NAME_MAX_LENGTH = 64
+BROWSER_STATE_SCALAR_LIMIT = 32
+BROWSER_STATE_SCALAR_STRING_MAX_LENGTH = 512
+BROWSER_STATE_EVIDENCE_LIMIT = 32
+BROWSER_STATE_EVIDENCE_MAX_LENGTH = 512
+BROWSER_ADVISORY_PREVIEW_MAX_LENGTH = 2_048
 
 
 class CompiledAdapterKind(StrEnum):
@@ -162,10 +171,144 @@ class BrowserStep(AdapterContract):
     idempotency_key: str | None = None
 
 
+class BrowserTextCapture(AdapterContract):
+    """Exact rendered-text template used to bind one typed scalar value."""
+
+    template: str = Field(min_length=1, max_length=BROWSER_TEXT_CAPTURE_MAX_LENGTH)
+    occurrence: Literal["unique", "first", "last"] = "unique"
+
+    @model_validator(mode="after")
+    def validate_template(self) -> Self:
+        if self.template.count("{value}") != 1:
+            raise ValueError("template must contain exactly one {value} placeholder")
+        prefix, suffix = self.template.split("{value}", 1)
+        if not prefix and not suffix:
+            raise ValueError("template must include literal text around {value}")
+        return self
+
+
+class BrowserRenderedStateObservation(AdapterContract):
+    """Reviewed typed state rendered in the browser's attributable page text."""
+
+    name: str = Field(
+        min_length=1,
+        max_length=BROWSER_STATE_NAME_MAX_LENGTH,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    role: Literal[
+        "progress_ordinal",
+        "score",
+        "budget_remaining",
+        "custom",
+    ]
+    value_type: Literal["integer", "number", "string", "boolean"]
+    capture: BrowserTextCapture
+    preferred_direction: Literal["increase", "decrease"] | None = None
+    success_values: tuple[bool | int | float | str, ...] = Field(
+        default=(),
+        max_length=BROWSER_STATE_SCALAR_LIMIT,
+    )
+    failure_values: tuple[bool | int | float | str, ...] = Field(
+        default=(),
+        max_length=BROWSER_STATE_SCALAR_LIMIT,
+    )
+    evidence_refs: tuple[str, ...] = Field(
+        default=(),
+        max_length=BROWSER_STATE_EVIDENCE_LIMIT,
+    )
+    minimum_value: int | float | None = None
+    maximum_value: int | float | None = None
+    monotonicity: Literal["nondecreasing", "nonincreasing"] | None = None
+    trust_class: Literal["target_reported"] = "target_reported"
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_coerced_bounds(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            for field in ("minimum_value", "maximum_value"):
+                bound = value.get(field)
+                if bound is not None and type(bound) not in {int, float}:
+                    raise ValueError("numeric bounds must be JSON numbers")
+        return value
+
+    @model_validator(mode="after")
+    def validate_semantics(self) -> Self:
+        if self.preferred_direction is not None and self.value_type not in {
+            "integer",
+            "number",
+        }:
+            raise ValueError("preferred_direction requires an integer or number value_type")
+        if (self.success_values or self.failure_values) and self.role != "custom":
+            raise ValueError("success_values and failure_values require a custom role")
+        if set(self.success_values) & set(self.failure_values):
+            raise ValueError("success_values and failure_values must not overlap")
+        for value in (*self.success_values, *self.failure_values):
+            if not self._value_matches_type(value):
+                raise ValueError("success_values and failure_values must match value_type")
+            if isinstance(value, str) and len(value) > BROWSER_STATE_SCALAR_STRING_MAX_LENGTH:
+                raise ValueError("string state values exceed the maximum length")
+        if any(
+            not value or len(value) > BROWSER_STATE_EVIDENCE_MAX_LENGTH
+            for value in self.evidence_refs
+        ):
+            raise ValueError("evidence_refs must be non-empty bounded strings")
+        if self.minimum_value is not None or self.maximum_value is not None:
+            if self.value_type not in {"integer", "number"}:
+                raise ValueError("numeric bounds require an integer or number value_type")
+            if isinstance(self.minimum_value, bool) or isinstance(self.maximum_value, bool):
+                raise ValueError("numeric bounds cannot be booleans")
+            if any(
+                isinstance(value, float) and not math.isfinite(value)
+                for value in (self.minimum_value, self.maximum_value)
+                if value is not None
+            ):
+                raise ValueError("numeric bounds must be finite")
+        if (
+            self.minimum_value is not None
+            and self.maximum_value is not None
+            and self.minimum_value > self.maximum_value
+        ):
+            raise ValueError("minimum_value must not exceed maximum_value")
+        if self.monotonicity is not None and self.value_type not in {"integer", "number"}:
+            raise ValueError("monotonicity requires an integer or number value_type")
+        return self
+
+    def _value_matches_type(self, value: object) -> bool:
+        if self.value_type == "boolean":
+            return type(value) is bool
+        if self.value_type == "integer":
+            return type(value) is int
+        if self.value_type == "number":
+            if type(value) is int:
+                return True
+            return type(value) is float and math.isfinite(value)
+        return isinstance(value, str)
+
+
 class BrowserInteraction(AdapterContract):
     input_locator: object | None = None
     submit_action: object | None = None
     frame_context: object | None = None
+    response_witness: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=BROWSER_TEXT_CAPTURE_MAX_LENGTH,
+        exclude_if=lambda value: value is None,
+    )
+    state_observations: tuple[BrowserRenderedStateObservation, ...] = Field(
+        default=(),
+        max_length=BROWSER_STATE_OBSERVATION_LIMIT,
+        exclude_if=lambda value: not value,
+    )
+
+    @model_validator(mode="after")
+    def validate_rendered_state_names(self) -> Self:
+        names = [item.name for item in self.state_observations]
+        if len(names) != len(set(names)):
+            raise ValueError("browser rendered state observation names must be unique")
+        if self.response_witness is not None and not self.response_witness.strip():
+            raise ValueError("response_witness must contain visible text")
+        return self
 
 
 class ProviderChat(AdapterContract):
@@ -1317,6 +1460,139 @@ def _compile_browser_steps(
     return tuple(compiled), normalized_interaction
 
 
+def _bounded_browser_advisory_value(value: object) -> object:
+    """Keep malformed model-authored declarations bounded in durable advisories."""
+
+    try:
+        serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, default=repr)
+    except (TypeError, ValueError):
+        serialized = repr(value)
+    if len(serialized) <= BROWSER_ADVISORY_PREVIEW_MAX_LENGTH:
+        return value
+    return {
+        "truncated": True,
+        "original_chars": len(serialized),
+        "sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+        "preview": serialized[:BROWSER_ADVISORY_PREVIEW_MAX_LENGTH],
+    }
+
+
+def _compile_browser_response_witness(
+    interaction: Mapping[str, object],
+    *,
+    advisories: list[AdapterAdvisory],
+) -> str | None:
+    probe = interaction.get("probe")
+    if not isinstance(probe, Mapping) or "response_witness" not in probe:
+        return None
+    witness = probe.get("response_witness")
+    if (
+        isinstance(witness, str)
+        and witness.strip()
+        and len(witness) <= BROWSER_TEXT_CAPTURE_MAX_LENGTH
+    ):
+        return witness
+    _unsupported_step(
+        advisories,
+        path="interaction_contract.probe.response_witness",
+        message=(
+            "The response witness is not non-empty exact visible text and was omitted; "
+            "browser delivery remains executable with an uncertain response boundary."
+        ),
+        value=_bounded_browser_advisory_value(witness),
+    )
+    return None
+
+
+def _compile_browser_state_observations(
+    interaction: Mapping[str, object],
+    *,
+    advisories: list[AdapterAdvisory],
+) -> tuple[BrowserRenderedStateObservation, ...]:
+    declared = interaction.get("state_observations")
+    if declared is None:
+        return ()
+    if not isinstance(declared, (list, tuple)):
+        _unsupported_step(
+            advisories,
+            path="interaction_contract.state_observations",
+            message=(
+                "Rendered state observations must be a list and were omitted; browser "
+                "delivery remains executable."
+            ),
+            value=_bounded_browser_advisory_value(declared),
+        )
+        return ()
+    compiled: list[BrowserRenderedStateObservation] = []
+    seen_names: set[str] = set()
+    if len(declared) > BROWSER_STATE_OBSERVATION_LIMIT:
+        _unsupported_step(
+            advisories,
+            path="interaction_contract.state_observations",
+            message=(
+                f"Only the first {BROWSER_STATE_OBSERVATION_LIMIT} rendered state declarations "
+                "were retained; browser delivery remains executable."
+            ),
+            value=len(declared),
+        )
+    for index, item in enumerate(declared[:BROWSER_STATE_OBSERVATION_LIMIT]):
+        path = f"interaction_contract.state_observations[{index}]"
+        candidate = dict(item) if isinstance(item, Mapping) else item
+        if isinstance(candidate, dict) and candidate.get("role") == "terminal_status":
+            _unsupported_step(
+                advisories,
+                path=f"{path}.role",
+                message=(
+                    "Rendered page text cannot establish whole-target terminal authority; "
+                    "terminal_status was downgraded to advisory custom state."
+                ),
+                value="terminal_status",
+            )
+            candidate["role"] = "custom"
+            candidate.pop("success_values", None)
+            candidate.pop("failure_values", None)
+        if isinstance(candidate, dict) and candidate.get("trust_class") not in {
+            None,
+            "target_reported",
+        }:
+            _unsupported_step(
+                advisories,
+                path=f"{path}.trust_class",
+                message=(
+                    "Rendered target DOM cannot establish host or independent authority; "
+                    "trust_class was downgraded to target_reported."
+                ),
+                value=_bounded_browser_advisory_value(candidate.get("trust_class")),
+            )
+            candidate["trust_class"] = "target_reported"
+        try:
+            observation = BrowserRenderedStateObservation.model_validate(candidate)
+        except ValidationError:
+            _unsupported_step(
+                advisories,
+                path=path,
+                message=(
+                    "The rendered state declaration is malformed and was omitted; browser "
+                    "delivery remains executable."
+                ),
+                value=_bounded_browser_advisory_value(item),
+            )
+            continue
+        if observation.name in seen_names:
+            _unsupported_step(
+                advisories,
+                path=f"{path}.name",
+                message=(
+                    "The rendered state declaration repeats an existing name and was omitted."
+                ),
+                value=observation.name,
+            )
+            continue
+        seen_names.add(observation.name)
+        compiled.append(observation)
+    return tuple(compiled)
+
+
 def _content_injection(raw: Mapping[str, object]) -> ContentInjection | None:
     """Parse the reviewed content-planting declaration."""
     declared = raw.get("content_injection")
@@ -1564,6 +1840,14 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
                 input_locator=contract.get("input_locator"),
                 submit_action=contract.get("submit_action"),
                 frame_context=contract.get("frame_context"),
+                response_witness=_compile_browser_response_witness(
+                    contract,
+                    advisories=advisories,
+                ),
+                state_observations=_compile_browser_state_observations(
+                    contract,
+                    advisories=advisories,
+                ),
             ),
             request_constraints=request_constraints,
             state_capabilities=state_capabilities,

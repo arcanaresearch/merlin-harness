@@ -9641,6 +9641,579 @@ def test_api_handoff_schema_documents_structured_and_legacy_locator_forms() -> N
     assert step_locator == interaction["input_locator"]
 
 
+def test_api_handoff_schema_documents_exact_dynamic_rendered_state_templates() -> None:
+    schema = ApiReconHandoffTool(object(), object()).describe().input_schema
+    interaction = schema["properties"]["reusable_adapter"]["properties"]["interaction_contract"][
+        "properties"
+    ]
+    state = interaction["state_observations"]
+    item = state["items"]
+    capture = item["properties"]["capture"]
+
+    assert {"name", "role", "value_type", "capture"} <= set(item["required"])
+    assert item["properties"]["name"]["pattern"] == "^[a-z][a-z0-9_]*$"
+    assert item["properties"]["name"]["maxLength"] == 64
+    assert "terminal_status" not in item["properties"]["role"]["enum"]
+    assert item["properties"]["success_values"]["maxItems"] == 32
+    assert item["properties"]["success_values"]["items"]["maxLength"] == 512
+    assert item["properties"]["failure_values"]["maxItems"] == 32
+    assert item["properties"]["evidence_refs"]["maxItems"] == 32
+    assert item["properties"]["evidence_refs"]["items"]["maxLength"] == 512
+    assert item["allOf"][0]["then"]["properties"] == {
+        "success_values": {"maxItems": 0},
+        "failure_values": {"maxItems": 0},
+    }
+    assert item["allOf"][1]["then"]["properties"] == {
+        "minimum_value": {"type": "null"},
+        "maximum_value": {"type": "null"},
+        "monotonicity": {"type": "null"},
+        "preferred_direction": {"type": "null"},
+    }
+    assert state["maxItems"] == 32
+    assert capture["required"] == ["template"]
+    assert capture["additionalProperties"] is False
+    assert capture["properties"]["template"]["maxLength"] == 512
+    assert "exactly one {value}" in capture["properties"]["template"]["description"]
+    assert (
+        "regular expressions are not accepted" in capture["properties"]["template"]["description"]
+    )
+    assert "Level {value}" in state["description"]
+    witness = interaction["probe"]["properties"]["response_witness"]
+    assert witness["maxLength"] == 512
+    assert "invariant marker" in witness["description"]
+
+
+def test_target_ui_transition_ignores_progress_and_numeric_control_churn() -> None:
+    from merlin_browser.tools import (
+        _browser_rendered_state_observations,
+        _browser_target_ui_transition,
+    )
+    from merlin_contracts.target_adapter_compiler import BrowserChat, compile_target_adapter
+
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button Send"},
+        },
+    ]
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = "textbox Message"
+    contract["submit_action"] = "button Send"
+    contract["state_observations"] = [
+        {
+            "name": "level",
+            "role": "progress_ordinal",
+            "value_type": "integer",
+            "capture": {"template": "Level {value}"},
+        },
+        {
+            "name": "current_score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "{value}/100"},
+        },
+    ]
+    compiled = compile_target_adapter(adapter).executable
+    assert isinstance(compiled, BrowserChat)
+
+    common = {
+        "context_id": "context",
+        "target_id": "target",
+        "origin": "https://target.test",
+        "owner": owner(),
+        "tab_ref": "tab",
+        "kind": "snapshot",
+    }
+
+    def elements(counter: str) -> tuple[ElementRef, ...]:
+        return (
+            ElementRef(
+                ref="message",
+                tab_ref="tab",
+                frame_ref="main",
+                role="textbox",
+                name="Message",
+            ),
+            ElementRef(
+                ref="send",
+                tab_ref="tab",
+                frame_ref="main",
+                role="button",
+                name="Send",
+            ),
+            ElementRef(
+                ref="history",
+                tab_ref="tab",
+                frame_ref="main",
+                role="button",
+                name=counter,
+                disabled=counter == "8",
+            ),
+        )
+
+    before = BrowserObservation(**common, text="Level 1\n0/100", elements=elements("8"))
+    after = BrowserObservation(
+        **common,
+        text="Level 2\n100/100",
+        elements=tuple(reversed(elements("9"))),
+    )
+    observations, uncertainties = _browser_rendered_state_observations(
+        compiled,
+        before.text,
+        after.text,
+    )
+
+    transition = _browser_target_ui_transition(
+        before,
+        after,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=observations,
+    )
+
+    assert uncertainties == []
+    assert transition["material"] is False
+    assert transition["adapter_stale"] is False
+    assert transition["before_digest"] == transition["after_digest"]
+    assert transition["added_controls"] == []
+    assert transition["removed_controls"] == []
+    assert transition["changed_dimensions"] == []
+    assert {item["name"] for item in transition["reviewed_state_changes"]} == {
+        "level",
+        "current_score",
+    }
+
+    duplicate_send = ElementRef(
+        ref="send-duplicate",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Send",
+    )
+    duplicate = after.model_copy(update={"elements": (*after.elements, duplicate_send)})
+    duplicate_transition = _browser_target_ui_transition(
+        before,
+        duplicate,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=observations,
+    )
+
+    assert duplicate_transition["material"] is True
+    assert duplicate_transition["before_digest"] != duplicate_transition["after_digest"]
+    assert [item["name"] for item in duplicate_transition["added_controls"]] == ["Send"]
+
+    disabled_submit = after.model_copy(
+        update={
+            "elements": tuple(
+                item.model_copy(update={"disabled": True}) if item.name == "Send" else item
+                for item in after.elements
+            )
+        }
+    )
+    disabled_transition = _browser_target_ui_transition(
+        before,
+        disabled_submit,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=observations,
+    )
+
+    assert disabled_transition["material"] is True
+    assert disabled_transition["adapter_stale"] is True
+    assert disabled_transition["before_digest"] != disabled_transition["after_digest"]
+    assert "reviewed_controls" in disabled_transition["changed_dimensions"]
+
+    read_only_input = after.model_copy(
+        update={
+            "elements": tuple(
+                item.model_copy(update={"read_only": True})
+                if item.name == "Message"
+                else item
+                for item in after.elements
+            )
+        }
+    )
+    read_only_transition = _browser_target_ui_transition(
+        before,
+        read_only_input,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=observations,
+    )
+
+    assert read_only_transition["material"] is True
+    assert read_only_transition["adapter_stale"] is True
+    assert read_only_transition["before_digest"] != read_only_transition["after_digest"]
+
+    copy_control = ElementRef(
+        ref="copy-1",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Copy response",
+    )
+    repeated_copy = copy_control.model_copy(update={"ref": "copy-2"})
+    transcript_growth = _browser_target_ui_transition(
+        before.model_copy(update={"elements": (*before.elements, copy_control)}),
+        after.model_copy(update={"elements": (*after.elements, copy_control, repeated_copy)}),
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=observations,
+    )
+
+    assert transcript_growth["material"] is False
+    assert transcript_growth["adapter_stale"] is False
+    assert transcript_growth["before_digest"] == transcript_growth["after_digest"]
+    assert transcript_growth["added_controls"] == []
+
+
+def test_rendered_state_occurrence_is_selected_before_type_validation() -> None:
+    from merlin_browser.tools import _browser_rendered_value
+    from merlin_contracts.target_adapter_compiler import BrowserTextCapture
+
+    unique = BrowserTextCapture(template="Score: {value}")
+    first = BrowserTextCapture(template="Score: {value}", occurrence="first")
+    last = BrowserTextCapture(template="Score: {value}", occurrence="last")
+
+    leading_invalid = "Score: unavailable\nScore: 100"
+    value, error = _browser_rendered_value(leading_invalid, unique, "integer")
+    assert value is None
+    assert error == "template resolved more than once; exactly one was required"
+    assert _browser_rendered_value(leading_invalid, first, "integer") == (
+        None,
+        "selected template occurrence did not resolve to a typed scalar",
+    )
+    assert _browser_rendered_value(leading_invalid, last, "integer") == (100, None)
+
+    trailing_invalid = "Score: 100\nScore: unavailable"
+    assert _browser_rendered_value(trailing_invalid, first, "integer") == (100, None)
+    assert _browser_rendered_value(trailing_invalid, last, "integer") == (
+        None,
+        "selected template occurrence did not resolve to a typed scalar",
+    )
+
+    truncated = (
+        "Status: retained head\n"
+        "...[snapshot truncated; original_chars=12000; sha256:abc]...\n"
+        "retained tail Footer"
+    )
+    bounded_string = BrowserTextCapture(template="Status: {value} Footer")
+    assert _browser_rendered_value(truncated, bounded_string, "string") == (
+        None,
+        "rendered snapshot text is truncated",
+    )
+
+    oversized_string = BrowserTextCapture(template="Value: {value}")
+    assert _browser_rendered_value(
+        "Value: " + "x" * 200_000,
+        oversized_string,
+        "string",
+    ) == (
+        None,
+        "selected template occurrence did not resolve to a typed scalar",
+    )
+    assert _browser_rendered_value(
+        "Value: " + "9" * 5_000,
+        oversized_string,
+        "integer",
+    ) == (
+        None,
+        "selected template occurrence did not resolve to a typed scalar",
+    )
+
+
+def test_rendered_state_literal_scan_bounds_repeated_prefix_work() -> None:
+    from merlin_browser.tools import _browser_literal_capture_candidates
+
+    class CountingText(str):
+        find_calls = 0
+        rfind_calls = 0
+
+        def find(self, *args, **kwargs):
+            self.find_calls += 1
+            return super().find(*args, **kwargs)
+
+        def rfind(self, *args, **kwargs):
+            self.rfind_calls += 1
+            return super().rfind(*args, **kwargs)
+
+    repeated_prefix = CountingText("a" * 262_144)
+    assert (
+        _browser_literal_capture_candidates(
+            repeated_prefix,
+            prefix="a",
+            suffix="z",
+            value_type="string",
+            occurrence="last",
+        )
+        == []
+    )
+
+    shared_suffix = CountingText(repeated_prefix + "z")
+    assert len(
+        _browser_literal_capture_candidates(
+            shared_suffix,
+            prefix="a",
+            suffix="z",
+            value_type="string",
+            occurrence="unique",
+        )
+    ) == 2
+    assert len(
+        _browser_literal_capture_candidates(
+            shared_suffix,
+            prefix="a",
+            suffix="z",
+            value_type="string",
+            occurrence="first",
+        )
+    ) == 1
+    shared_suffix.find_calls = 0
+    shared_suffix.rfind_calls = 0
+    assert _browser_literal_capture_candidates(
+        shared_suffix,
+        prefix="a",
+        suffix="z",
+        value_type="string",
+        occurrence="last",
+    ) == [""]
+    assert shared_suffix.rfind_calls == 2
+    assert shared_suffix.find_calls <= 1
+
+
+def test_response_witness_text_requires_a_nonempty_reviewed_witness() -> None:
+    from merlin_browser.tools import _response_witness_text
+
+    assert _response_witness_text("arbitrary visible text", "") is None
+    assert _response_witness_text("Score: 0\nScore: 100", "Score:") == "Score: 100"
+
+
+def test_rendered_text_receipt_identity_is_scoped_to_browser_context() -> None:
+    from merlin_browser.tools import _browser_rendered_text_receipt_ref
+
+    common = {
+        "target_id": "target",
+        "tab_ref": "tab",
+        "frame_ref": "main",
+        "phase": "baseline",
+        "text": "Level 1\n0/100",
+    }
+    first = _browser_rendered_text_receipt_ref(context_id="context-1", **common)
+    second = _browser_rendered_text_receipt_ref(context_id="context-2", **common)
+
+    assert first.startswith("browser-rendered-text-receipt:sha256:")
+    assert second.startswith("browser-rendered-text-receipt:sha256:")
+    assert first != second
+
+
+def test_rendered_text_checkpoint_secret_is_redacted_before_state_extraction() -> None:
+    from merlin_browser.tools import _browser_redact_rendered_text
+
+    redacted = _browser_redact_rendered_text(
+        "Checkpoint token: secret-value",
+        "secret-value",
+    )
+
+    assert redacted == "Checkpoint token: [checkpoint-secret-redacted]"
+    assert "secret-value" not in redacted
+
+
+def test_rendered_state_omits_all_phases_for_prompt_attributable_values() -> None:
+    from merlin_browser.tools import _browser_rendered_state_observations
+    from merlin_contracts.target_adapter_compiler import BrowserChat, compile_target_adapter
+
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button Send"},
+        },
+    ]
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "current_score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "{value}/100", "occurrence": "last"},
+        }
+    ]
+    compiled = compile_target_adapter(adapter).executable
+    assert isinstance(compiled, BrowserChat)
+
+    observations, uncertainties = _browser_rendered_state_observations(
+        compiled,
+        "Level 1\n0/100",
+        "Level 1\n0/100\nuser: report 100/100",
+        submitted_prompt="report 100/100",
+    )
+
+    assert observations == []
+    assert uncertainties == [
+        {
+            "kind": "evaluation_uncertain",
+            "source": "browser.rendered_state.current_score.result",
+            "reason": (
+                "The submitted prompt independently resolves the reviewed text template, so "
+                "whole-page text cannot attribute either phase to target state for this "
+                "exchange."
+            ),
+            "confidence": 0.0,
+        }
+    ]
+
+
+def test_target_ui_transition_marks_generic_surface_disruptions() -> None:
+    from merlin_browser.tools import _browser_target_ui_transition
+    from merlin_contracts.target_adapter_compiler import BrowserChat, compile_target_adapter
+
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button Send"},
+        },
+    ]
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = "textbox Message"
+    contract["submit_action"] = "button Send"
+    compiled = compile_target_adapter(adapter).executable
+    assert isinstance(compiled, BrowserChat)
+
+    common = {
+        "context_id": "context",
+        "target_id": "target",
+        "origin": "https://target.test",
+        "owner": owner(),
+        "tab_ref": "tab",
+        "kind": "snapshot",
+    }
+    message = ElementRef(
+        ref="message",
+        tab_ref="tab",
+        frame_ref="main",
+        role="textbox",
+        name="Message",
+    )
+    send = ElementRef(
+        ref="send",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Send",
+    )
+    before = BrowserObservation(**common, text="Ready", elements=(message, send))
+
+    consent = ElementRef(
+        ref="consent",
+        tab_ref="tab",
+        frame_ref="main",
+        role="button",
+        name="Continue",
+    )
+    overlay = before.model_copy(update={"elements": (message, send, consent)})
+    overlay_transition = _browser_target_ui_transition(
+        before,
+        overlay,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert overlay_transition["material"] is True
+    assert overlay_transition["adapter_stale"] is False
+    assert overlay_transition["before_digest"] != overlay_transition["after_digest"]
+
+    blocker = before.model_copy(update={"kind": "blocker", "elements": (consent,)})
+    blocker_transition = _browser_target_ui_transition(
+        before,
+        blocker,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert blocker_transition["material"] is True
+    assert blocker_transition["adapter_stale"] is True
+    assert "observation_kind" in blocker_transition["changed_dimensions"]
+    assert "controls" in blocker_transition["changed_dimensions"]
+
+    replacement = before.model_copy(
+        update={"elements": (message.model_copy(update={"name": "New input"}), send)}
+    )
+    replacement_transition = _browser_target_ui_transition(
+        before,
+        replacement,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert replacement_transition["material"] is True
+    assert replacement_transition["adapter_stale"] is True
+    assert replacement_transition["before_digest"] != replacement_transition["after_digest"]
+
+    navigated_transition = _browser_target_ui_transition(
+        before,
+        before,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/login",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert navigated_transition["material"] is True
+    assert navigated_transition["adapter_stale"] is True
+    assert navigated_transition["changed_dimensions"] == ["url"]
+
+    equivalent_names = before.model_copy(
+        update={
+            "elements": (
+                message.model_copy(update={"name": "  MESSAGE "}),
+                send.model_copy(update={"name": " send  "}),
+            )
+        }
+    )
+    equivalent_transition = _browser_target_ui_transition(
+        before,
+        equivalent_names,
+        before_url="https://target.test/chat",
+        after_url="https://target.test/chat",
+        adapter=compiled,
+        state_observations=(),
+    )
+    assert equivalent_transition["material"] is False
+    assert equivalent_transition["adapter_stale"] is False
+    assert equivalent_transition["before_digest"] == equivalent_transition["after_digest"]
+
+
 @pytest.mark.asyncio
 async def test_api_handoff_normalizes_advisory_metadata_without_blocking_transport() -> None:
     class Recorder:
@@ -10534,6 +11107,11 @@ async def test_browser_checkpoint_requires_sealed_gate_then_restores_under_fresh
 
     def checkpoint_adapter(endpoint: str) -> dict[str, object]:
         adapter = reviewed_browser_adapter(endpoint)
+        contract = adapter["interaction_contract"]
+        assert isinstance(contract, dict)
+        probe = contract["probe"]
+        assert isinstance(probe, dict)
+        probe["response_witness"] = "Gate complete"
         adapter["browser_steps"] = [
             {
                 "step_id": "restore",
@@ -12466,6 +13044,55 @@ def test_api_handoff_normalizes_legacy_compiled_adapter_defaults() -> None:
     assert handoff.compiled_adapter == canonical_serialized
 
 
+def test_api_handoff_upgrades_legacy_browser_text_contract_identity() -> None:
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+        read_target_adapter,
+    )
+
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button Send"},
+        },
+    ]
+    compilation = compile_target_adapter(adapter)
+    legacy_payload = compilation.model_dump(mode="json")
+    legacy_payload["executable"]["interaction"].pop("response_witness")
+    legacy_serialized = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    legacy_compilation = read_target_adapter(legacy_payload)
+    canonical_serialized = json.dumps(
+        compilation.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    handoff = ApiReconHandoff(
+        id="handoff-legacy-browser-text-contract",
+        context_id="context-1",
+        target_id="target",
+        owner=owner(),
+        method="POST",
+        url="https://target.test/chat",
+        request_evidence_ref="evidence://request",
+        response_evidence_ref="evidence://response",
+        adapter=json.dumps(adapter, sort_keys=True, separators=(",", ":")),
+        compiled_adapter=legacy_serialized,
+        compiled_adapter_digest=compiled_target_adapter_digest(legacy_compilation),
+    )
+
+    assert handoff.compiled_adapter == canonical_serialized
+    assert handoff.compiled_adapter_digest == compiled_target_adapter_digest(compilation)
+
+
 @pytest.mark.asyncio
 async def test_compiled_chat_exchange_records_adaptive_exchange_with_typed_oracle() -> None:
     import hashlib
@@ -12582,6 +13209,8 @@ async def test_compiled_chat_exchange_records_adaptive_exchange_with_typed_oracl
             }
             assert observation["observation_digest"] == digest_of(unsigned)
             assert exchange["oracle_observation"] is observation
+            assert result.metadata["target_ui_transition"]["material"] is False
+            assert "preferred_next_tool" not in result.metadata
 
 
 @pytest.mark.asyncio
@@ -12661,6 +13290,937 @@ async def test_compiled_chat_exchange_waits_for_complete_multi_message_boundary(
             assert exchange["fill_to_submit_ms"] < 500
             assert exchange["submit_action_ms"] >= 0
             assert exchange["response_wait_ms"] >= 250
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_returns_bounded_surface_drift_before_target_call() -> None:
+    changed = b"""
+    <div>Level 2</div>
+    <div>Choose how to continue</div>
+    <textarea aria-label="New Message"></textarea>
+    <button aria-label="Next Level">Next Level</button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            raise AssertionError("surface drift must be observed before any target action")
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(changed) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello"},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "target_tab_unavailable"
+            assert result.metadata["retryable"] is True
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["reobserve_required"] is True
+            assert result.metadata["preferred_next_tool"] == "browser_snapshot"
+            transition = result.metadata["target_ui_transition"]
+            assert transition["material"] is True
+            assert transition["reobservation_recommended"] is True
+            assert transition["adapter_stale"] is True
+            assert transition["before_digest"].startswith("sha256:")
+            assert transition["after_digest"].startswith("sha256:")
+            assert "controls" in transition["changed_dimensions"]
+            (snapshot,) = transition["surface_snapshots"]
+            assert "Choose how to continue" in snapshot["visible_text"]
+            assert {item["name"] for item in snapshot["controls"]} >= {
+                "New Message",
+                "Next Level",
+            }
+            assert json.loads(result.content)["target_ui_transition"] == transition
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_modal_state() -> None:
+    chat = b"""
+    <div id="level">Level 1</div>
+    <div>Target score: 75</div>
+    <div id="current-score">0/100</div>
+    <div id="history">Attack history: 8</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('status').textContent='sending';
+      setTimeout(() => {
+        document.getElementById('reply').insertAdjacentHTML(
+          'beforeend', '<div>Score: 100</div>'
+        );
+      }, 800);
+      setTimeout(() => {
+        document.getElementById('current-score').textContent='100/100';
+        document.getElementById('history').textContent='Attack history: 9';
+        document.getElementById('modal').hidden=false;
+      }, 1050);
+    ">Send</button>
+    <div id="status"></div>
+    <div id="reply"><div>Score: 0</div></div>
+    <div id="modal" hidden>
+      <div>Level passed</div>
+      <button aria-label="Keep Playing">Keep Playing</button>
+      <button aria-label="Try Another App">Try Another App</button>
+      <button aria-label="Next Level" onclick="
+        document.getElementById('level').textContent='Level 2';
+        document.getElementById('current-score').textContent='0/100';
+        document.getElementById('history').textContent='Attack history: 0';
+        document.getElementById('reply').innerHTML='';
+        document.getElementById('modal').hidden=true;
+      ">Next Level</button>
+    </div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+            contract["state_observations"] = [
+                {
+                    "name": "level",
+                    "role": "progress_ordinal",
+                    "value_type": "integer",
+                    "capture": {"template": "Level {value}", "occurrence": "first"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 1,
+                },
+                {
+                    "name": "target_score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "Target score: {value}"},
+                    "minimum_value": 0,
+                },
+                {
+                    "name": "current_score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "{value}/100", "occurrence": "last"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 0,
+                    "maximum_value": 100,
+                },
+                {
+                    "name": "reply_score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "Score: {value}", "occurrence": "last"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 0,
+                    "maximum_value": 100,
+                },
+                {
+                    "name": "attack_history_count",
+                    "role": "custom",
+                    "value_type": "integer",
+                    "capture": {"template": "Attack history: {value}"},
+                    "minimum_value": 0,
+                },
+            ]
+            broker = ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            )
+
+            first = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert first.is_error is False
+            assert first.metadata["response_boundary_complete"] is True
+            assert first.metadata["attempt_disposition"] == "valid"
+            assert "target_state_transition" not in first.metadata
+            final_snapshot = json.loads(first.content)
+            final_controls = {(item["role"], item["name"]) for item in final_snapshot["elements"]}
+            assert {
+                ("button", "Keep Playing"),
+                ("button", "Try Another App"),
+                ("button", "Next Level"),
+            } <= final_controls
+            exchange = first.metadata["target_exchanges"][0]
+            assert exchange["state_observations"] == first.metadata["state_observations"]
+            assert "target_state_transition" not in exchange
+            result_values = {
+                item["name"]: item["selected_value"]
+                for item in first.metadata["state_observations"]
+                if item["phase"] == "result"
+            }
+            assert all(
+                any(
+                    ref.startswith("browser-rendered-text-receipt:sha256:")
+                    for ref in item["evidence_refs"]
+                )
+                for item in first.metadata["state_observations"]
+            )
+            assert result_values == {
+                "level": 1,
+                "target_score": 75,
+                "current_score": 100,
+                "reply_score": 100,
+                "attack_history_count": 9,
+            }
+            ui_transition = first.metadata["target_ui_transition"]
+            assert ui_transition["material"] is True
+            assert ui_transition["adapter_stale"] is False
+            assert ui_transition["reobservation_recommended"] is True
+            assert ui_transition["changed_dimensions"] == ["controls"]
+            assert {item["name"] for item in ui_transition["added_controls"]} >= {
+                "Keep Playing",
+                "Try Another App",
+                "Next Level",
+            }
+            assert "Level passed" in ui_transition["added_visible_text"]
+            assert {item["name"] for item in ui_transition["reviewed_state_changes"]} == {
+                "current_score",
+                "reply_score",
+                "attack_history_count",
+            }
+            assert first.metadata["preferred_next_tool"] == "browser_snapshot"
+
+            next_level = next(
+                item for item in final_snapshot["elements"] if item["name"] == "Next Level"
+            )
+            advanced = await broker.invoke(
+                "browser_click",
+                ToolContext(session_id="s1", workspace_root="/tmp"),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": next_level["frame_ref"],
+                    "element_ref": next_level["ref"],
+                },
+            )
+            assert advanced.is_error is False
+
+            second = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "level two", "timeout_ms": 3_000},
+            )
+
+            assert second.is_error is False
+            level_results = [
+                item["selected_value"]
+                for item in second.metadata["state_observations"]
+                if item["name"] == "level" and item["phase"] == "result"
+            ]
+            assert level_results == [2]
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_keeps_prompt_witness_collision_uncertain() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='Score: 100';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+
+            async def unavailable_occurrence_count(*_args, **_kwargs):
+                raise BrowserBoundaryError("frame detached")
+
+            session.text_occurrences = unavailable_occurrence_count  # type: ignore[method-assign]
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "Please explain Score:", "timeout_ms": 4_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_observed"] is False
+            assert result.metadata["response_boundary_complete"] is False
+            assert result.metadata["attempt_disposition"] == "uncertain"
+            assert result.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+            assert any(
+                item["source"] == "browser.response_witness"
+                for item in result.metadata["evaluation_uncertainties"]
+            )
+            assert any(
+                item["source"] == "browser.response_witness.count"
+                for item in result.metadata["evaluation_uncertainties"]
+            )
+
+
+@pytest.mark.asyncio
+async def test_response_witness_uses_full_dom_count_beyond_snapshot_text_bound() -> None:
+    initial = "a" * 9_000 + " Score: 0"
+    appended = "b" * 9_000 + " Score: 100"
+    chat = f"""
+    <div>Level 1</div>
+    <div>Blob: {"z" * 9_000}</div>
+    <div id="transcript">{initial}</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('transcript').insertAdjacentText(
+        'beforeend', '{appended}'
+      );
+    ">Send</button>
+    """.encode()
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+            contract["state_observations"] = [
+                {
+                    "name": "level",
+                    "role": "progress_ordinal",
+                    "value_type": "integer",
+                    "capture": {"template": "Level {value}"},
+                },
+                {
+                    "name": "current_score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "Score: {value}", "occurrence": "last"},
+                },
+                {
+                    "name": "oversized_text",
+                    "role": "custom",
+                    "value_type": "string",
+                    "capture": {"template": "Blob: {value}"},
+                },
+            ]
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert result.is_error is False
+            assert "snapshot truncated; original_chars=" in result.content
+            assert result.metadata["response_boundary_observed"] is True
+            assert result.metadata["response_boundary_complete"] is True
+            assert result.metadata["attempt_disposition"] == "valid"
+            by_phase = {
+                (item["name"], item["phase"]): item["selected_value"]
+                for item in result.metadata["state_observations"]
+            }
+            assert by_phase == {
+                ("level", "baseline"): 1,
+                ("level", "result"): 1,
+                ("current_score", "baseline"): 0,
+                ("current_score", "result"): 100,
+            }
+            assert any(
+                item["source"].startswith("browser.rendered_state.oversized_text.")
+                for item in result.metadata["evaluation_uncertainties"]
+            )
+
+
+@pytest.mark.asyncio
+async def test_response_settling_includes_delayed_control_only_transition() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      setTimeout(() => {
+        document.getElementById('reply').textContent='Score: 100';
+      }, 100);
+      setTimeout(() => {
+        document.getElementById('continue').hidden=false;
+      }, 400);
+    ">Send</button>
+    <div id="reply"></div>
+    <button id="continue" aria-label="Continue" hidden></button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_complete"] is True
+            controls = {
+                (item["role"], item["name"])
+                for item in json.loads(result.content)["elements"]
+            }
+            assert ("button", "Continue") in controls
+            transition = result.metadata["target_ui_transition"]
+            assert transition["material"] is True
+            assert {item["name"] for item in transition["added_controls"]} == {"Continue"}
+
+
+@pytest.mark.asyncio
+async def test_rendered_state_respects_password_snapshot_redaction_boundary() -> None:
+    from merlin_browser.tools import _browser_rendered_state_observations
+    from merlin_contracts.target_adapter_compiler import BrowserChat, compile_target_adapter
+
+    chat = b"""
+    <div>Secret: topsecret</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <input type="password" aria-label="Password" />
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='Score: 100';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+            contract["state_observations"] = [
+                {
+                    "name": "secret_text",
+                    "role": "custom",
+                    "value_type": "string",
+                    "capture": {"template": "Secret: {value}"},
+                }
+            ]
+            compiled = compile_target_adapter(adapter).executable
+            assert isinstance(compiled, BrowserChat)
+            snapshot = await session.snapshot(next(iter(session.metadata().tabs)).tab_ref)
+
+            with pytest.raises(BrowserBoundaryError, match="redaction boundary"):
+                await session.bounded_rendered_text(snapshot.tab_ref)
+            observations, uncertainties = _browser_rendered_state_observations(
+                compiled,
+                snapshot.text,
+                snapshot.text,
+            )
+
+            assert snapshot.redaction_status == "redacted"
+            assert "topsecret" not in snapshot.model_dump_json()
+            assert observations == []
+            assert {
+                item["source"] for item in uncertainties
+            } == {
+                "browser.rendered_state.secret_text.baseline",
+                "browser.rendered_state.secret_text.result",
+            }
+
+
+@pytest.mark.asyncio
+async def test_rendered_state_receipt_failure_does_not_block_delivery() -> None:
+    chat = b"""
+    <div>Level 1</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='Score: 100';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, _context_id, _evidence_ref, kind, _payload):
+            if kind == "browser_rendered_text_receipt":
+                raise RuntimeError("receipt store unavailable")
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+            contract["state_observations"] = [
+                {
+                    "name": "level",
+                    "role": "progress_ordinal",
+                    "value_type": "integer",
+                    "capture": {"template": "Level {value}"},
+                }
+            ]
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_complete"] is True
+            assert result.metadata["attempt_disposition"] == "valid"
+            assert result.metadata.get("state_observations", []) == []
+            assert {
+                item["source"]
+                for item in result.metadata["evaluation_uncertainties"]
+                if item["source"].endswith(".evidence")
+            } == {
+                "browser.rendered_state.baseline.evidence",
+                "browser.rendered_state.result.evidence",
+            }
+
+
+@pytest.mark.asyncio
+async def test_response_witness_baseline_is_captured_after_setup_steps() -> None:
+    chat = b"""
+    <button aria-label="Load history" onclick="
+      document.getElementById('history').textContent='Score: 0';
+    ">Load history</button>
+    <div id="history"></div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "load-history",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Load history"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 1_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_observed"] is False
+            assert result.metadata["response_boundary_complete"] is False
+            assert result.metadata["attempt_disposition"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_invalid_declared_witness_stays_uncertain_but_legacy_fallback_remains_valid() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='assistant reply';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async def run(response_witness: str | None):
+        async with web_fixture(chat) as origin:
+            async with await launch_isolated(
+                BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+            ) as session:
+                await session.new_tab(origin)
+                adapter = reviewed_browser_adapter(origin)
+                adapter["browser_steps"] = [
+                    {
+                        "step_id": "fill",
+                        "tool": "browser_fill",
+                        "arguments": {"locator": "textbox Message"},
+                    },
+                    {
+                        "step_id": "submit",
+                        "tool": "browser_click",
+                        "arguments": {"locator": "button Send"},
+                    },
+                ]
+                contract = adapter["interaction_contract"]
+                assert isinstance(contract, dict)
+                probe = contract["probe"]
+                assert isinstance(probe, dict)
+                if response_witness is None:
+                    probe.pop("response_witness")
+                else:
+                    probe["response_witness"] = response_witness
+                return await ToolBroker(
+                    browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                    confirmer=allow,
+                ).invoke(
+                    "browser_chat_exchange",
+                    ToolContext(
+                        session_id="s1",
+                        workspace_root="/tmp",
+                        campaign_id="campaign:test",
+                    ),
+                    {"prompt": "hello", "timeout_ms": 4_000},
+                )
+
+    invalid = await run("w" * 513)
+    assert invalid.is_error is False
+    assert invalid.metadata["response_boundary_observed"] is False
+    assert invalid.metadata["response_boundary_complete"] is False
+    assert invalid.metadata["attempt_disposition"] == "uncertain"
+    assert invalid.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+    assert any(
+        item["source"] == "browser.response_witness"
+        for item in invalid.metadata["evaluation_uncertainties"]
+    )
+
+    legacy = await run(None)
+    assert legacy.is_error is False
+    assert legacy.metadata["response_boundary_observed"] is True
+    assert legacy.metadata["response_boundary_complete"] is True
+    assert legacy.metadata["attempt_disposition"] == "valid"
+
+
+@pytest.mark.asyncio
+async def test_legacy_response_fallback_does_not_accept_prompt_echo_alone() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('transcript').textContent=
+        document.querySelector('textarea').value;
+    ">Send</button>
+    <div id="transcript"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+
+            async def unavailable_occurrence_count(*_args, **_kwargs):
+                raise BrowserBoundaryError("frame detached")
+
+            session.text_occurrences = unavailable_occurrence_count  # type: ignore[method-assign]
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe.pop("response_witness")
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "echo me", "timeout_ms": 4_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_observed"] is False
+            assert result.metadata["response_boundary_complete"] is False
+            assert result.metadata["attempt_disposition"] == "uncertain"
+            assert result.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+            assert any(
+                item["source"] == "browser.legacy_prompt_echo.count"
+                for item in result.metadata["evaluation_uncertainties"]
+            )
 
 
 @pytest.mark.asyncio

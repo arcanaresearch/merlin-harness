@@ -28,6 +28,41 @@ def _contains_secret_key(value: object) -> bool:
     return False
 
 
+def _legacy_browser_text_contract_can_upgrade(
+    persisted: object,
+    persisted_compilation: object,
+    compatibility_compilation: object,
+) -> bool:
+    if not isinstance(persisted, Mapping):
+        return False
+    persisted_executable = persisted.get("executable", persisted)
+    if not isinstance(persisted_executable, Mapping):
+        return False
+    persisted_interaction = persisted_executable.get("interaction")
+    if not isinstance(persisted_interaction, Mapping):
+        return False
+    if any(
+        field in persisted_interaction for field in ("response_witness", "state_observations")
+    ):
+        return False
+
+    old_executable = getattr(persisted_compilation, "executable", None)
+    new_executable = getattr(compatibility_compilation, "executable", None)
+    if getattr(old_executable, "kind", None) != "browser_chat" or getattr(
+        new_executable, "kind", None
+    ) != "browser_chat":
+        return False
+    old_payload = old_executable.model_dump(mode="json")
+    new_payload = new_executable.model_dump(mode="json")
+    for payload in (old_payload, new_payload):
+        interaction = payload.get("interaction")
+        if not isinstance(interaction, dict):
+            return False
+        interaction.pop("response_witness", None)
+        interaction.pop("state_observations", None)
+    return old_payload == new_payload
+
+
 API_FIRST_RECONNAISSANCE_GUIDANCE = (
     "Inspect attributable network evidence first. Prefer a bounded, reproducible API adapter "
     "when it preserves the same target behavior; retain DOM interaction only when no equivalent "
@@ -189,8 +224,9 @@ class ApiReconHandoff(BrowserModel):
             raise ValueError("compiled adapter serialization and digest must be stored together")
         if self.compiled_adapter is not None:
             try:
+                persisted_compiled = json.loads(self.compiled_adapter)
                 compilation = read_target_adapter(self.compiled_adapter)
-            except ValueError as error:
+            except (json.JSONDecodeError, ValueError) as error:
                 raise ValueError("compiled adapter must be a valid canonical contract") from error
             canonical = json.dumps(
                 compilation.model_dump(mode="json"),
@@ -213,11 +249,24 @@ class ApiReconHandoff(BrowserModel):
             if legacy is None:
                 raise ValueError("compiled adapter requires its v1 compatibility projection")
             try:
-                legacy_digest = compiled_target_adapter_digest(read_target_adapter(legacy))
+                compatibility_compilation = read_target_adapter(legacy)
+                legacy_digest = compiled_target_adapter_digest(compatibility_compilation)
             except ValueError as error:
                 raise ValueError("v1 compatibility adapter is not executable") from error
             if legacy_digest != observed_digest:
-                raise ValueError("compiled adapter and v1 compatibility projection disagree")
+                if not _legacy_browser_text_contract_can_upgrade(
+                    persisted_compiled,
+                    compilation,
+                    compatibility_compilation,
+                ):
+                    raise ValueError("compiled adapter and v1 compatibility projection disagree")
+                upgraded = json.dumps(
+                    compatibility_compilation.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                object.__setattr__(self, "compiled_adapter", upgraded)
+                object.__setattr__(self, "compiled_adapter_digest", legacy_digest)
         if self.reusable_site_facts is not None:
             try:
                 site_facts = json.loads(self.reusable_site_facts)

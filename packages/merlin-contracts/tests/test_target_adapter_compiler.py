@@ -653,6 +653,366 @@ def test_browser_compiles_actor_input_and_typed_actions() -> None:
     assert [item.path for item in compiled.advisories] == ["interaction_contract.success_indicator"]
 
 
+def test_browser_seals_response_witness_and_rendered_state_templates() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["probe"] = {"response_witness": "Score:"}
+    contract["state_observations"] = [
+        {
+            "name": "level",
+            "role": "progress_ordinal",
+            "value_type": "integer",
+            "capture": {"template": "Level {value}"},
+            "preferred_direction": "increase",
+            "minimum_value": 1,
+            "trust_class": "target_reported",
+        },
+        {
+            "name": "current_score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "{value}/100", "occurrence": "last"},
+            "preferred_direction": "increase",
+            "minimum_value": 0,
+            "maximum_value": 100,
+        },
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.response_witness == "Score:"
+    assert [item.name for item in compiled.executable.interaction.state_observations] == [
+        "level",
+        "current_score",
+    ]
+    changed = deepcopy(raw)
+    changed_contract = changed["interaction_contract"]
+    assert isinstance(changed_contract, dict)
+    changed_contract["probe"] = {"response_witness": "Reply:"}
+    assert compiled_target_adapter_digest(compiled) != compiled_target_adapter_digest(
+        compile_target_adapter(changed)
+    )
+
+
+def test_browser_malformed_rendered_state_is_advisory_and_legacy_shape_is_unchanged() -> None:
+    legacy = compile_target_adapter(_browser_adapter())
+    assert isinstance(legacy.executable, BrowserChat)
+    interaction_payload = legacy.executable.interaction.model_dump(mode="json")
+    assert "response_witness" not in interaction_payload
+    assert "state_observations" not in interaction_payload
+
+    malformed = _browser_adapter()
+    contract = malformed["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: 0"},
+        }
+    ]
+
+    compiled = compile_target_adapter(malformed)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.state_observations == ()
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path == "interaction_contract.state_observations[0]"
+        for item in compiled.advisories
+    )
+    assert compiled_target_adapter_digest(compiled) == compiled_target_adapter_digest(legacy)
+
+
+def test_browser_oversized_text_contracts_are_bounded_advisories() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["probe"] = {"response_witness": "w" * 4_096}
+    contract["state_observations"] = [
+        {
+            "name": "oversized",
+            "role": "custom",
+            "value_type": "integer",
+            "capture": {"template": "x" * 512 + "{value}"},
+        },
+        *(
+            {
+                "name": f"state_{index}",
+                "role": "custom",
+                "value_type": "integer",
+                "capture": {"template": f"State {index}: {{value}}"},
+            }
+            for index in range(32)
+        ),
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.response_witness is None
+    assert len(compiled.executable.interaction.state_observations) == 31
+    paths = {item.path for item in compiled.advisories}
+    assert "interaction_contract.probe.response_witness" in paths
+    assert "interaction_contract.state_observations" in paths
+    assert "interaction_contract.state_observations[0]" in paths
+    witness_advisory = next(
+        item
+        for item in compiled.advisories
+        if item.path == "interaction_contract.probe.response_witness"
+    )
+    assert isinstance(witness_advisory.value, dict)
+    assert witness_advisory.value["truncated"] is True
+    assert len(witness_advisory.value["preview"]) == 2_048
+
+
+def test_browser_response_witness_preserves_exact_bounded_text() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["probe"] = {"response_witness": " Score: "}
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.response_witness == " Score: "
+
+    oversized = _browser_adapter()
+    oversized_contract = oversized["interaction_contract"]
+    assert isinstance(oversized_contract, dict)
+    oversized_contract["probe"] = {"response_witness": " " * 600 + "Score:"}
+    oversized_compiled = compile_target_adapter(oversized)
+    assert isinstance(oversized_compiled.executable, BrowserChat)
+    assert oversized_compiled.executable.interaction.response_witness is None
+
+
+def test_browser_rendered_state_auxiliary_values_are_bounded() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "n" * 65,
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+        },
+        {
+            "name": "too_many_values",
+            "role": "custom",
+            "value_type": "integer",
+            "capture": {"template": "State: {value}"},
+            "success_values": list(range(33)),
+        },
+        {
+            "name": "long_value",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "success_values": ["x" * 513],
+        },
+        {
+            "name": "too_many_refs",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "evidence_refs": [f"evidence:{index}" for index in range(33)],
+        },
+        {
+            "name": "long_ref",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "evidence_refs": ["e" * 513],
+        },
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.state_observations == ()
+    assert sum(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path.startswith("interaction_contract.state_observations[")
+        for item in compiled.advisories
+    ) >= 5
+
+
+def test_browser_rendered_state_cannot_elevate_target_dom_authority() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: {value}"},
+            "trust_class": "host_observed",
+        }
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    (observation,) = compiled.executable.interaction.state_observations
+    assert observation.trust_class == "target_reported"
+    assert any(
+        item.path == "interaction_contract.state_observations[0].trust_class"
+        and item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        for item in compiled.advisories
+    )
+
+
+def test_browser_rendered_terminal_state_is_downgraded_to_advisory_custom_state() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "level_status",
+            "role": "terminal_status",
+            "value_type": "string",
+            "capture": {"template": "Status: {value}"},
+            "success_values": ["passed"],
+        }
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    (observation,) = compiled.executable.interaction.state_observations
+    assert observation.role == "custom"
+    assert observation.success_values == ()
+    assert any(
+        item.path == "interaction_contract.state_observations[0].role"
+        and item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        for item in compiled.advisories
+    )
+
+
+def test_browser_rendered_state_rejects_malformed_semantics_nonblocking() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["state_observations"] = [
+        {
+            "name": "score_success",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: {value}"},
+            "success_values": [100],
+        },
+        {
+            "name": "overlap",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "success_values": ["done"],
+            "failure_values": ["done"],
+        },
+        {
+            "name": "string_bounds",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "minimum_value": 0,
+        },
+        {
+            "name": "string_monotonicity",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "monotonicity": "nondecreasing",
+        },
+        {
+            "name": "string_direction",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+            "preferred_direction": "increase",
+        },
+        {
+            "name": "wrong_value_type",
+            "role": "custom",
+            "value_type": "integer",
+            "capture": {"template": "State: {value}"},
+            "success_values": ["100"],
+        },
+        {
+            "name": "nonfinite_value",
+            "role": "custom",
+            "value_type": "number",
+            "capture": {"template": "State: {value}"},
+            "success_values": [float("inf")],
+        },
+        {
+            "name": "nonfinite_bound",
+            "role": "score",
+            "value_type": "number",
+            "capture": {"template": "Score: {value}"},
+            "minimum_value": float("-inf"),
+        },
+        {
+            "name": "boolean_bound",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: {value}"},
+            "minimum_value": True,
+        },
+        {
+            "name": "coerced_bound",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: {value}"},
+            "minimum_value": "5",
+        },
+        {
+            "name": "Bad Name",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State: {value}"},
+        },
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.state_observations == ()
+    assert {
+        item.path
+        for item in compiled.advisories
+        if item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+    } >= {
+        f"interaction_contract.state_observations[{index}]" for index in range(11)
+    }
+
+
+def test_browser_rendered_state_accepts_finite_arbitrary_precision_integer_number() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    huge_integer = 10**1_000
+    contract["state_observations"] = [
+        {
+            "name": "large_counter",
+            "role": "custom",
+            "value_type": "number",
+            "capture": {"template": "Counter: {value}"},
+            "success_values": [huge_integer],
+        }
+    ]
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    (observation,) = compiled.executable.interaction.state_observations
+    assert observation.success_values == (huge_integer,)
+
+
 def test_structured_browser_locators_compile_to_canonical_role_name_identity() -> None:
     structured = _browser_adapter()
     steps = structured["browser_steps"]

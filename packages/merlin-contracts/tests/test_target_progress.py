@@ -79,6 +79,30 @@ def test_target_progress_projects_current_partition_and_transition() -> None:
     assert snapshot["latest_transition"]["outcome"] == "progress"
 
 
+def test_target_progress_deduplicates_promoted_browser_observations() -> None:
+    level = _observation("level", "progress_ordinal", "result", 2)
+    effect = _effect("call/browser", [level])
+    metadata = dict(effect.result_metadata)
+    metadata["target_exchanges"] = [
+        {
+            "interaction": True,
+            "state_observations": [level],
+            "target_state_transition": metadata["target_state_transition"],
+        }
+    ]
+    effect = effect.model_copy(update={"result_metadata": metadata})
+
+    snapshot = project_target_progress(
+        [effect],
+        campaign_id="campaign/1",
+        target_id="target/1",
+        now=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+    )
+
+    assert snapshot["target_exchange_count"] == 1
+    assert [(item["name"], item["value"]) for item in snapshot["current_state"]] == [("level", 2)]
+
+
 def test_target_progress_is_explicit_when_state_contract_has_no_observations() -> None:
     effect = _effect("call/1", [])
 

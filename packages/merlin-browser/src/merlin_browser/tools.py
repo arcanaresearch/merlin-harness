@@ -8,7 +8,7 @@ import posixpath
 import re
 import secrets
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -36,11 +36,19 @@ from merlin_contracts.state_isolation import StateIsolationPlan, resolve_state_i
 from merlin_contracts.state_scope import MissingEvidenceReason, StateScopeActionKind
 from merlin_contracts.state_scope_runtime import StateScopeLifecycle
 from merlin_contracts.target_adapter_compiler import (
+    BROWSER_STATE_EVIDENCE_LIMIT,
+    BROWSER_STATE_EVIDENCE_MAX_LENGTH,
+    BROWSER_STATE_NAME_MAX_LENGTH,
+    BROWSER_STATE_OBSERVATION_LIMIT,
+    BROWSER_STATE_SCALAR_LIMIT,
+    BROWSER_STATE_SCALAR_STRING_MAX_LENGTH,
     BROWSER_STEP_SOURCE_INDEX_KEY,
+    BROWSER_TEXT_CAPTURE_MAX_LENGTH,
     AdapterCompilation,
     AdapterCompileError,
     AdapterCompileFailureKind,
     BrowserChat,
+    BrowserTextCapture,
     compile_target_adapter,
     compiled_target_adapter_digest,
     read_target_adapter,
@@ -1731,10 +1739,12 @@ class ApiReconHandoffTool:
                         "response_witness": {
                             "type": "string",
                             "minLength": 1,
+                            "maxLength": BROWSER_TEXT_CAPTURE_MAX_LENGTH,
                             "description": (
                                 "Exact case-sensitive visible text whose occurrence count "
-                                "increases "
-                                "only when a new target response is rendered"
+                                "increases only when a new target response is rendered. Use "
+                                "an invariant marker such as 'Score:', not a value such as "
+                                "'Score: 0' that can change between replies."
                             ),
                         },
                     },
@@ -1745,6 +1755,137 @@ class ApiReconHandoffTool:
                         "response_witness",
                     ],
                     "additionalProperties": False,
+                },
+                "state_observations": {
+                    "type": "array",
+                    "maxItems": BROWSER_STATE_OBSERVATION_LIMIT,
+                    "description": (
+                        "Optional typed state read from exact visible-text templates before and "
+                        "after each exchange. Templates are dynamic: use 'Level {value}', never "
+                        "a hard-coded level value. Interpretation is advisory and never blocks "
+                        "an authorized target call."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "maxLength": BROWSER_STATE_NAME_MAX_LENGTH,
+                                "pattern": "^[a-z][a-z0-9_]*$",
+                            },
+                            "role": {
+                                "enum": [
+                                    "progress_ordinal",
+                                    "score",
+                                    "budget_remaining",
+                                    "custom",
+                                ]
+                            },
+                            "value_type": {"enum": ["integer", "number", "string", "boolean"]},
+                            "capture": {
+                                "type": "object",
+                                "properties": {
+                                    "template": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": BROWSER_TEXT_CAPTURE_MAX_LENGTH,
+                                        "description": (
+                                            "Exact case-sensitive visible text with exactly one "
+                                            "{value} placeholder and literal context; regular "
+                                            "expressions are not accepted."
+                                        ),
+                                    },
+                                    "occurrence": {"enum": ["unique", "first", "last"]},
+                                },
+                                "required": ["template"],
+                                "additionalProperties": False,
+                            },
+                            "preferred_direction": {"enum": ["increase", "decrease", None]},
+                            "success_values": {
+                                "type": "array",
+                                "maxItems": BROWSER_STATE_SCALAR_LIMIT,
+                                "items": {
+                                    "type": ["boolean", "integer", "number", "string"],
+                                    "maxLength": BROWSER_STATE_SCALAR_STRING_MAX_LENGTH,
+                                },
+                                "description": (
+                                    "Advisory custom-state success values only; values must not "
+                                    "overlap failure_values."
+                                ),
+                            },
+                            "failure_values": {
+                                "type": "array",
+                                "maxItems": BROWSER_STATE_SCALAR_LIMIT,
+                                "items": {
+                                    "type": ["boolean", "integer", "number", "string"],
+                                    "maxLength": BROWSER_STATE_SCALAR_STRING_MAX_LENGTH,
+                                },
+                                "description": (
+                                    "Advisory custom-state failure values only; values must not "
+                                    "overlap success_values."
+                                ),
+                            },
+                            "evidence_refs": {
+                                "type": "array",
+                                "maxItems": BROWSER_STATE_EVIDENCE_LIMIT,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": BROWSER_STATE_EVIDENCE_MAX_LENGTH,
+                                },
+                            },
+                            "minimum_value": {"type": ["integer", "number", "null"]},
+                            "maximum_value": {"type": ["integer", "number", "null"]},
+                            "monotonicity": {"enum": ["nondecreasing", "nonincreasing", None]},
+                            "trust_class": {
+                                "enum": ["target_reported"],
+                                "description": (
+                                    "Rendered target DOM is always target-reported evidence; "
+                                    "higher authority requires a separate reviewed source."
+                                ),
+                            },
+                        },
+                        "required": ["name", "role", "value_type", "capture"],
+                        "allOf": [
+                            {
+                                "if": {
+                                    "properties": {
+                                        "role": {
+                                            "enum": [
+                                                "progress_ordinal",
+                                                "score",
+                                                "budget_remaining",
+                                            ]
+                                        }
+                                    },
+                                    "required": ["role"],
+                                },
+                                "then": {
+                                    "properties": {
+                                        "success_values": {"maxItems": 0},
+                                        "failure_values": {"maxItems": 0},
+                                    }
+                                },
+                            },
+                            {
+                                "if": {
+                                    "properties": {
+                                        "value_type": {"enum": ["string", "boolean"]}
+                                    },
+                                    "required": ["value_type"],
+                                },
+                                "then": {
+                                    "properties": {
+                                        "minimum_value": {"type": "null"},
+                                        "maximum_value": {"type": "null"},
+                                        "monotonicity": {"type": "null"},
+                                        "preferred_direction": {"type": "null"},
+                                    }
+                                },
+                            },
+                        ],
+                        "additionalProperties": False,
+                    },
                 },
                 "lifecycle": {
                     "type": "object",
@@ -2666,6 +2807,30 @@ def _browser_evidence_ref(kind: str, value: object) -> str:
     return f"browser-{kind}:sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _browser_rendered_text_evidence_ref(phase: str, text: str) -> str:
+    return f"browser-rendered-text:{phase}:sha256:{hashlib.sha256(text.encode()).hexdigest()}"
+
+
+def _browser_rendered_text_receipt_ref(
+    *,
+    context_id: str,
+    target_id: str,
+    tab_ref: str,
+    frame_ref: str,
+    phase: str,
+    text: str,
+) -> str:
+    identity = {
+        "context_id": context_id,
+        "target_id": target_id,
+        "tab_ref": tab_ref,
+        "frame_ref": frame_ref,
+        "phase": phase,
+        "text_digest": "sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+    }
+    return "browser-rendered-text-receipt:" + _digest_json(identity)
+
+
 def _browser_target_authority(endpoint: str) -> str:
     parsed = urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -2854,9 +3019,28 @@ def _browser_state_transition(
     step_documents: Mapping[str, object],
 ) -> dict[str, object]:
     """Evaluate reviewed browser state from exact host-captured step snapshots."""
+    observations = _browser_capability_state_observations(adapter, step_documents)
+    if not observations:
+        return {}
+    capabilities = adapter.state_capabilities
+    return evaluate_state_transition(
+        observations,
+        (
+            [item.model_dump(mode="json") for item in capabilities.corroboration_rules]
+            if capabilities is not None
+            else ()
+        ),
+    )
+
+
+def _browser_capability_state_observations(
+    adapter: BrowserChat,
+    step_documents: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Bind shared state-capability selectors to browser step documents."""
     capabilities = adapter.state_capabilities
     if capabilities is None or capabilities.identity is None:
-        return {}
+        return []
     binding_context = {
         "compiled_adapter_digest": compiled_target_adapter_digest(adapter),
     }
@@ -2948,10 +3132,638 @@ def _browser_state_transition(
                 ),
             )
         )
-    return evaluate_state_transition(
-        observations,
-        [item.model_dump(mode="json") for item in capabilities.corroboration_rules],
+    return observations
+
+
+def _browser_rendered_value(
+    text: str,
+    capture: BrowserTextCapture,
+    value_type: str,
+) -> tuple[object | None, str | None]:
+    """Extract one typed scalar through literal delimiters; no pattern language is accepted."""
+
+    if "...[snapshot truncated; original_chars=" in text:
+        return None, "rendered snapshot text is truncated"
+    prefix, suffix = capture.template.split("{value}", 1)
+    candidates = _browser_literal_capture_candidates(
+        text,
+        prefix=prefix,
+        suffix=suffix,
+        value_type=value_type,
+        occurrence=capture.occurrence,
     )
+    if not candidates:
+        return None, "template did not resolve"
+    if capture.occurrence == "unique":
+        if len(candidates) != 1:
+            return None, "template resolved more than once; exactly one was required"
+        selected = candidates[0]
+    elif capture.occurrence == "first":
+        selected = candidates[0]
+    else:
+        selected = candidates[-1]
+    value = _browser_typed_scalar(selected, value_type)
+    if value is None:
+        return None, "selected template occurrence did not resolve to a typed scalar"
+    return value, None
+
+
+def _browser_literal_capture_candidates(
+    text: str,
+    *,
+    prefix: str,
+    suffix: str,
+    value_type: str,
+    occurrence: str,
+) -> list[str]:
+    """Retain only the literal matches needed by the reviewed occurrence policy."""
+
+    if occurrence not in {"unique", "first", "last"}:
+        raise ValueError(f"unsupported capture occurrence: {occurrence!r}")
+
+    capture_limit = _browser_scalar_capture_limit(value_type)
+    if occurrence == "last":
+        if prefix:
+            if not suffix:
+                prefix_at = text.rfind(prefix)
+                if prefix_at < 0:
+                    return []
+                return [_browser_scalar_after(text, prefix_at + len(prefix), value_type)]
+            last_suffix_at = text.rfind(suffix)
+            if last_suffix_at < 0:
+                return []
+            prefix_at = text.rfind(prefix, 0, last_suffix_at)
+            if prefix_at < 0:
+                return []
+            value_at = prefix_at + len(prefix)
+            suffix_at = text.find(suffix, value_at)
+            return [text[value_at : min(suffix_at, value_at + capture_limit + 1)]]
+        suffix_at = text.rfind(suffix)
+        if suffix_at < 0:
+            return []
+        return [_browser_scalar_before(text, suffix_at, value_type)]
+
+    locations: list[tuple[int, int | None]] = []
+
+    def retain(location: tuple[int, int | None]) -> bool:
+        locations.append(location)
+        return occurrence == "first" or len(locations) >= 2
+
+    if prefix:
+        search_at = 0
+        suffix_at = -1
+        while True:
+            prefix_at = text.find(prefix, search_at)
+            if prefix_at < 0:
+                break
+            value_at = prefix_at + len(prefix)
+            if suffix:
+                if suffix_at < value_at:
+                    suffix_at = text.find(suffix, value_at)
+                if suffix_at < 0:
+                    # A suffix missing after this prefix is also missing after every
+                    # later prefix, so further scans cannot produce another match.
+                    break
+                location = (value_at, suffix_at)
+            else:
+                location = (value_at, None)
+            if retain(location):
+                break
+            search_at = prefix_at + max(1, len(prefix))
+        return [
+            (
+                text[value_at : min(suffix_at, value_at + capture_limit + 1)]
+                if suffix_at is not None
+                else _browser_scalar_after(text, value_at, value_type)
+            )
+            for value_at, suffix_at in locations
+        ]
+
+    search_at = 0
+    while True:
+        suffix_at = text.find(suffix, search_at)
+        if suffix_at < 0:
+            break
+        if retain((suffix_at, None)):
+            break
+        search_at = suffix_at + max(1, len(suffix))
+    return [_browser_scalar_before(text, suffix_at, value_type) for suffix_at, _ in locations]
+
+
+def _browser_scalar_after(text: str, start: int, value_type: str) -> str:
+    capture_limit = _browser_scalar_capture_limit(value_type)
+    if value_type == "string":
+        end = min(len(text), start + capture_limit + 1)
+        for delimiter in ("\n", "\r"):
+            candidate = text.find(delimiter, start)
+            if candidate >= 0:
+                end = min(end, candidate)
+        return text[start:end]
+    allowed = _browser_scalar_characters(value_type)
+    end = start
+    while end < len(text) and end <= start + capture_limit and text[end] in allowed:
+        end += 1
+    return text[start:end]
+
+
+def _browser_scalar_before(text: str, end: int, value_type: str) -> str:
+    capture_limit = _browser_scalar_capture_limit(value_type)
+    if value_type == "string":
+        start = max(text.rfind("\n", 0, end), text.rfind("\r", 0, end)) + 1
+        start = max(start, end - capture_limit - 1)
+        return text[start:end]
+    allowed = _browser_scalar_characters(value_type)
+    start = end
+    while start > 0 and start >= end - capture_limit and text[start - 1] in allowed:
+        start -= 1
+    return text[start:end]
+
+
+def _browser_scalar_capture_limit(value_type: str) -> int:
+    return BROWSER_STATE_SCALAR_STRING_MAX_LENGTH if value_type == "string" else 128
+
+
+def _browser_scalar_characters(value_type: str) -> frozenset[str]:
+    if value_type in {"integer", "number"}:
+        return frozenset("+-0123456789.")
+    return frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _browser_typed_scalar(raw: str, value_type: str) -> object | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > _browser_scalar_capture_limit(value_type):
+        return None
+    if value_type == "string":
+        return value
+    if value_type == "boolean":
+        return {"true": True, "false": False}.get(value.casefold())
+    signless = value[1:] if value[:1] in {"+", "-"} else value
+    if value_type == "integer":
+        if not signless.isdigit():
+            return None
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
+    if signless.count(".") > 1:
+        return None
+    whole, separator, fraction = signless.partition(".")
+    if not whole.isdigit() or (separator and not fraction.isdigit()):
+        return None
+    try:
+        number = float(value) if separator else int(value)
+    except (ValueError, OverflowError):
+        return None
+    return number if not isinstance(number, float) or math.isfinite(number) else None
+
+
+def _browser_rendered_state_observations(
+    adapter: BrowserChat,
+    before_text: str,
+    after_text: str,
+    *,
+    submitted_prompt: str = "",
+    phase_evidence_refs: Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    observations: list[dict[str, object]] = []
+    uncertainties: list[dict[str, object]] = []
+    if phase_evidence_refs is not None and any(
+        phase not in phase_evidence_refs for phase in ("baseline", "result")
+    ):
+        # A partial exchange cannot safely project its baseline as the current
+        # post-effect value. The caller already records the receipt-store failure
+        # as nonblocking evaluation uncertainty, so omit both phases here.
+        return observations, uncertainties
+    adapter_digest = compiled_target_adapter_digest(adapter)
+    for definition in adapter.interaction.state_observations:
+        prompt_prefix, prompt_suffix = definition.capture.template.split("{value}", 1)
+        prompt_conflicts = bool(
+            submitted_prompt
+            and _browser_literal_capture_candidates(
+                submitted_prompt,
+                prefix=prompt_prefix,
+                suffix=prompt_suffix,
+                value_type=definition.value_type,
+                occurrence="first",
+            )
+        )
+        if prompt_conflicts:
+            uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": f"browser.rendered_state.{definition.name}.result",
+                    "reason": (
+                        "The submitted prompt independently resolves the reviewed text "
+                        "template, so whole-page text cannot attribute either phase to "
+                        "target state for this exchange."
+                    ),
+                    "confidence": 0.0,
+                }
+            )
+            continue
+        for phase, text in (("baseline", before_text), ("result", after_text)):
+            rendered_text_evidence_ref = _browser_rendered_text_evidence_ref(phase, text)
+            phase_evidence_ref = (
+                phase_evidence_refs.get(phase) if phase_evidence_refs is not None else None
+            )
+            emitted_evidence_ref = (
+                rendered_text_evidence_ref
+                if phase_evidence_refs is None
+                else phase_evidence_ref
+            )
+            phase_text_digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+            value, error = _browser_rendered_value(
+                text,
+                definition.capture,
+                definition.value_type,
+            )
+            if error is not None:
+                uncertainties.append(
+                    {
+                        "kind": "evaluation_uncertain",
+                        "source": f"browser.rendered_state.{definition.name}.{phase}",
+                        "reason": error,
+                        "confidence": 0.0,
+                    }
+                )
+                continue
+            observations.append(
+                build_state_observation(
+                    name=definition.name,
+                    role=definition.role,
+                    phase=phase,
+                    step_id=f"browser-chat:{phase}",
+                    evaluation_root="rendered_text",
+                    pointer="/text",
+                    binding_context={
+                        "compiled_adapter_digest": adapter_digest,
+                        "capture_template": definition.capture.template,
+                        "capture_occurrence": definition.capture.occurrence,
+                        "phase_text_digest": phase_text_digest,
+                        **(
+                            {"phase_evidence_ref": phase_evidence_ref}
+                            if phase_evidence_ref is not None
+                            else {}
+                        ),
+                    },
+                    selected_value=value,
+                    preferred_direction=definition.preferred_direction,
+                    success_values=definition.success_values,
+                    failure_values=definition.failure_values,
+                    evidence_refs=(
+                        *definition.evidence_refs,
+                        *((emitted_evidence_ref,) if emitted_evidence_ref is not None else ()),
+                    ),
+                    value_type=definition.value_type,
+                    minimum_value=definition.minimum_value,
+                    maximum_value=definition.maximum_value,
+                    monotonicity=definition.monotonicity,
+                    trust_class="target_reported",
+                )
+            )
+    return observations, uncertainties
+
+
+def _browser_redact_rendered_text(text: str, secret: str | None) -> str:
+    if not secret:
+        return text
+    return text.replace(secret, "[checkpoint-secret-redacted]")
+
+
+def _browser_reviewed_control_states(
+    observation: BrowserObservation,
+    adapter: BrowserChat,
+) -> list[dict[str, object]]:
+    states: list[dict[str, object]] = []
+    for name, locator, role in (
+        ("input", adapter.interaction.input_locator, "textbox"),
+        ("submit", adapter.interaction.submit_action, "button"),
+    ):
+        matches = _matching_reviewed_elements(observation, locator, default_role=role)
+        state: dict[str, object] = {"name": name, "match_count": len(matches)}
+        if len(matches) == 1:
+            element = matches[0]
+            state.update(
+                {
+                    "role": element.role,
+                    "accessible_name": _normalized_accessible_name(element.name),
+                    "frame_ref": element.frame_ref,
+                    "disabled": element.disabled,
+                    "read_only": element.read_only,
+                }
+            )
+        states.append(state)
+    return states
+
+
+def _browser_surface_snapshot(
+    observation: BrowserObservation,
+    *,
+    url: str,
+    adapter: BrowserChat,
+    text_limit: int = 2_000,
+    control_limit: int = 40,
+) -> dict[str, object]:
+    """Return a bounded stable-surface receipt plus enough visible text for repair."""
+
+    controls = [
+        {
+            "role": element.role,
+            "name": element.name,
+            "frame_ref": element.frame_ref,
+            **({"input_type": element.input_type} if element.input_type is not None else {}),
+            **({"max_length": element.max_length} if element.max_length is not None else {}),
+            **({"disabled": True} if element.disabled else {}),
+            **({"read_only": True} if element.read_only else {}),
+        }
+        for element in observation.elements[:control_limit]
+    ]
+    current_state: list[dict[str, object]] = []
+    for definition in adapter.interaction.state_observations:
+        value, error = _browser_rendered_value(
+            observation.text,
+            definition.capture,
+            definition.value_type,
+        )
+        if error is None:
+            current_state.append(
+                {
+                    "name": definition.name,
+                    "role": definition.role,
+                    "value": value,
+                    "value_type": definition.value_type,
+                }
+            )
+    reviewed_refs = {
+        item.ref
+        for locator, role in (
+            (adapter.interaction.input_locator, "textbox"),
+            (adapter.interaction.submit_action, "button"),
+        )
+        for item in _matching_reviewed_elements(observation, locator, default_role=role)
+    }
+    stable_controls: list[dict[str, object]] = []
+    seen_unreviewed: set[str] = set()
+    for element in observation.elements:
+        stable_control: dict[str, object] = {
+            "role": element.role.casefold(),
+            "name": _browser_stable_control_name(element.name),
+            "frame_ref": element.frame_ref,
+            **(
+                {"input_type": element.input_type}
+                if element.input_type is not None
+                else {}
+            ),
+            **(
+                {"max_length": element.max_length}
+                if element.max_length is not None
+                else {}
+            ),
+        }
+        stable_key = json.dumps(stable_control, sort_keys=True, separators=(",", ":"))
+        if element.ref not in reviewed_refs and stable_key in seen_unreviewed:
+            continue
+        if element.ref not in reviewed_refs:
+            seen_unreviewed.add(stable_key)
+        stable_controls.append(stable_control)
+    stable_controls.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    stable_surface = {
+        "url": url,
+        "origin": observation.origin,
+        "observation_kind": observation.kind,
+        "frame_refs": sorted({item["frame_ref"] for item in controls}),
+        "controls": stable_controls,
+        "reviewed_control_states": _browser_reviewed_control_states(observation, adapter),
+    }
+    encoded_surface = json.dumps(
+        stable_surface,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    encoded_text = observation.text.encode()
+    return {
+        "schema": "merlin.browser-surface-snapshot.v1",
+        "context_id": observation.context_id,
+        "tab_ref": observation.tab_ref,
+        "url": url,
+        "origin": observation.origin,
+        "observation_kind": observation.kind,
+        "frame_refs": stable_surface["frame_refs"],
+        "controls": controls,
+        "reviewed_control_states": stable_surface["reviewed_control_states"],
+        "reviewed_state": current_state,
+        "surface_fingerprint": "sha256:" + hashlib.sha256(encoded_surface).hexdigest(),
+        "visible_text": observation.text[:text_limit],
+        "visible_text_truncated": len(observation.text) > text_limit,
+        "visible_text_digest": "sha256:" + hashlib.sha256(encoded_text).hexdigest(),
+        "control_count": len(observation.elements),
+        "controls_truncated": len(observation.elements) > control_limit,
+    }
+
+
+def _browser_stable_control_name(value: str) -> str:
+    """Normalize volatile bounded counters without hiding the control's semantic label."""
+
+    normalized = " ".join(value.split()).casefold()
+    return re.sub(r"\d+", "{number}", normalized)
+
+
+def _browser_response_snapshot_signature(
+    observation: BrowserObservation,
+    url: str,
+) -> tuple[object, ...]:
+    """Bound response settling to text-independent browser structure as well as text."""
+
+    controls = sorted(
+        (
+            (
+                element.role.casefold(),
+                _normalized_accessible_name(element.name),
+                element.frame_ref,
+                element.input_type,
+                element.max_length,
+                element.disabled,
+                element.read_only,
+            )
+            for element in observation.elements
+        ),
+        key=repr,
+    )
+    return (url, observation.kind, observation.frame_ref, tuple(controls))
+
+
+def _browser_target_ui_transition(
+    before: BrowserObservation,
+    after: BrowserObservation,
+    *,
+    before_url: str,
+    after_url: str,
+    adapter: BrowserChat,
+    state_observations: Sequence[Mapping[str, object]],
+    control_limit: int = 20,
+    text_line_limit: int = 20,
+) -> dict[str, object]:
+    """Compare stable surface structure without treating transcript growth as UI drift."""
+
+    before_surface = _browser_surface_snapshot(before, url=before_url, adapter=adapter)
+    after_surface = _browser_surface_snapshot(after, url=after_url, adapter=adapter)
+
+    def control_key(element: ElementRef) -> tuple[object, ...]:
+        return (
+            element.role.casefold(),
+            _browser_stable_control_name(element.name),
+            element.frame_ref,
+            element.input_type,
+            element.max_length,
+        )
+
+    def control_value(element: ElementRef) -> dict[str, object]:
+        return {
+            "role": element.role,
+            "name": element.name,
+            "frame_ref": element.frame_ref,
+            **({"input_type": element.input_type} if element.input_type is not None else {}),
+            **({"max_length": element.max_length} if element.max_length is not None else {}),
+            **({"disabled": True} if element.disabled else {}),
+            **({"read_only": True} if element.read_only else {}),
+        }
+
+    before_counts = Counter(control_key(item) for item in before.elements)
+    after_counts = Counter(control_key(item) for item in after.elements)
+    before_controls = {control_key(item): control_value(item) for item in before.elements}
+    after_controls = {control_key(item): control_value(item) for item in after.elements}
+    reviewed_control_keys = {
+        control_key(item)
+        for observation in (before, after)
+        for locator, role in (
+            (adapter.interaction.input_locator, "textbox"),
+            (adapter.interaction.submit_action, "button"),
+        )
+        for item in _matching_reviewed_elements(observation, locator, default_role=role)
+    }
+
+    def material_count_delta(key: tuple[object, ...]) -> int:
+        before_count = before_counts[key]
+        after_count = after_counts[key]
+        if key not in reviewed_control_keys and before_count > 0 and after_count > 0:
+            return 0
+        return after_count - before_count
+
+    added_controls = [
+        after_controls[key]
+        for key in sorted(after_counts.keys(), key=repr)
+        for _ in range(max(0, material_count_delta(key)))
+    ]
+    removed_controls = [
+        before_controls[key]
+        for key in sorted(before_counts.keys(), key=repr)
+        for _ in range(max(0, -material_count_delta(key)))
+    ]
+    before_frames = {item.frame_ref for item in before.elements}
+    after_frames = {item.frame_ref for item in after.elements}
+
+    by_name: dict[str, dict[str, object]] = {}
+    for item in state_observations:
+        name = item.get("name")
+        phase = item.get("phase")
+        if isinstance(name, str) and phase in {"baseline", "result"}:
+            by_name.setdefault(name, {})[str(phase)] = item.get("selected_value")
+    reviewed_state_changes = [
+        {
+            "name": name,
+            "before": phases.get("baseline"),
+            "after": phases.get("result"),
+        }
+        for name, phases in sorted(by_name.items())
+        if "baseline" in phases and "result" in phases and phases["baseline"] != phases["result"]
+    ]
+    url_change = {"before": before_url, "after": after_url} if before_url != after_url else None
+    frame_change = (
+        {
+            "added": sorted(after_frames - before_frames),
+            "removed": sorted(before_frames - after_frames),
+        }
+        if before_frames != after_frames
+        else None
+    )
+    observation_kind_change = (
+        {"before": before.kind, "after": after.kind} if before.kind != after.kind else None
+    )
+    before_reviewed_controls = _browser_reviewed_control_states(before, adapter)
+    after_reviewed_controls = _browser_reviewed_control_states(after, adapter)
+    reviewed_control_state_changes = [
+        {"name": after_state["name"], "before": before_state, "after": after_state}
+        for before_state, after_state in zip(
+            before_reviewed_controls,
+            after_reviewed_controls,
+            strict=True,
+        )
+        if before_state != after_state
+    ]
+    material = bool(
+        url_change
+        or frame_change
+        or observation_kind_change
+        or added_controls
+        or removed_controls
+        or reviewed_control_state_changes
+    )
+    adapter_stale = bool(url_change) or after.kind == "blocker" or any(
+        state.get("match_count") != 1
+        or state.get("disabled") is True
+        or state.get("read_only") is True
+        for state in after_reviewed_controls
+    )
+    changed_dimensions = [
+        name
+        for name, changed in (
+            ("url", url_change is not None),
+            ("frames", frame_change is not None),
+            ("observation_kind", observation_kind_change is not None),
+            ("controls", bool(added_controls or removed_controls)),
+            ("reviewed_controls", bool(reviewed_control_state_changes)),
+        )
+        if changed
+    ]
+    before_lines = {line.strip() for line in before.text.splitlines() if line.strip()}
+    added_visible_text = [
+        line[:200]
+        for line in after.text.splitlines()
+        if line.strip() and line.strip() not in before_lines
+    ][:text_line_limit]
+    before_digest = str(before_surface["surface_fingerprint"])
+    after_digest = str(after_surface["surface_fingerprint"])
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": material,
+        "adapter_stale": adapter_stale,
+        "before_digest": before_digest,
+        "after_digest": after_digest,
+        "transition_digest": _digest_json([before_digest, after_digest]),
+        "changed_dimensions": changed_dimensions,
+        "url_change": url_change,
+        # BrowserObservation does not currently carry a document title. Keep the
+        # normalized field explicit instead of guessing from visible text.
+        "title_change": None,
+        "frame_change": frame_change,
+        "observation_kind_change": observation_kind_change,
+        "added_controls": added_controls[:control_limit],
+        "removed_controls": removed_controls[:control_limit],
+        "controls_truncated": (
+            len(added_controls) > control_limit or len(removed_controls) > control_limit
+        ),
+        "reviewed_state_changes": reviewed_state_changes[:control_limit],
+        "reviewed_control_state_changes": reviewed_control_state_changes,
+        "added_visible_text": added_visible_text if material else [],
+        "evidence_refs": [
+            _browser_evidence_ref("before", before),
+            _browser_evidence_ref("after", after),
+        ],
+        "reobservation_recommended": material,
+    }
 
 
 def _browser_isolation_baseline(
@@ -3312,10 +4124,12 @@ class BrowserChatExchangeTool:
         ]
         open_tab_urls = {tab.tab_ref: tab.url for tab in open_tabs}
         endpoint_identity = _browser_endpoint_identity(executable_adapter.endpoint)
+        observed_tabs: list[tuple[object, BrowserObservation]] = []
         compatible_tabs: list[tuple[str, BrowserObservation]] = []
         for tab in open_tabs:
             observation = await session.snapshot(tab.tab_ref)
             await self._recorder.append_observation(observation)
+            observed_tabs.append((tab, observation))
             if all(
                 _resolve_reviewed_element(
                     observation,
@@ -3394,13 +4208,129 @@ class BrowserChatExchangeTool:
                 else "ambiguous_target_tabs"
             )
             await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
+            surface_snapshots = [
+                _browser_surface_snapshot(
+                    observation,
+                    url=str(getattr(tab, "url", "")),
+                    adapter=executable_adapter,
+                )
+                for tab, observation in observed_tabs
+            ]
+            reviewed_surface = {
+                "url": executable_adapter.endpoint,
+                "controls": [
+                    executable_adapter.interaction.input_locator,
+                    executable_adapter.interaction.submit_action,
+                ],
+            }
+            reviewed_surface_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        reviewed_surface,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+            )
+            observed_surface_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        sorted(str(item["surface_fingerprint"]) for item in surface_snapshots),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
+            expected_controls = [
+                {"role": identity[0], "name": identity[1]}
+                for locator, role in (
+                    (executable_adapter.interaction.input_locator, "textbox"),
+                    (executable_adapter.interaction.submit_action, "button"),
+                )
+                for identity in _reviewed_locator_identities(locator, default_role=role)[-1:]
+            ]
+            observed_controls = [
+                control
+                for snapshot in surface_snapshots
+                for control in snapshot["controls"]
+                if isinstance(control, Mapping)
+            ]
+            observed_identities = {
+                (str(item.get("role") or ""), str(item.get("name") or ""))
+                for item in observed_controls
+            }
+            removed_controls = [
+                item
+                for item in expected_controls
+                if (str(item["role"]), str(item["name"])) not in observed_identities
+            ]
+            expected_identities = {
+                (str(item["role"]), str(item["name"])) for item in expected_controls
+            }
+            added_controls = [
+                dict(item)
+                for item in observed_controls
+                if (str(item.get("role") or ""), str(item.get("name") or ""))
+                not in expected_identities
+            ][:20]
+            observed_url = str(surface_snapshots[0].get("url") or "") if surface_snapshots else ""
+            url_change = (
+                {"before": executable_adapter.endpoint, "after": observed_url}
+                if observed_url and observed_url != executable_adapter.endpoint
+                else None
+            )
+            ui_transition = {
+                "schema": "merlin.target-ui-transition.v1",
+                "material": True,
+                "adapter_stale": True,
+                "reason": (
+                    "reviewed_controls_missing"
+                    if not compatible_tabs
+                    else "multiple_matching_surfaces"
+                ),
+                "before_digest": reviewed_surface_digest,
+                "after_digest": observed_surface_digest,
+                "transition_digest": _digest_json(
+                    [reviewed_surface_digest, observed_surface_digest]
+                ),
+                "changed_dimensions": [
+                    *(["url"] if url_change is not None else []),
+                    "controls",
+                ],
+                "url_change": url_change,
+                "title_change": None,
+                "frame_change": None,
+                "added_controls": added_controls,
+                "removed_controls": removed_controls,
+                "controls_truncated": len(observed_controls) > 20,
+                "reviewed_state_changes": [],
+                "matching_tab_count": len(compatible_tabs),
+                "reobservation_recommended": True,
+                "evidence_refs": [
+                    _browser_evidence_ref("surface-drift", observation)
+                    for _, observation in observed_tabs[:4]
+                ],
+                "surface_snapshots": surface_snapshots[:4],
+                "surface_snapshots_truncated": len(surface_snapshots) > 4,
+            }
             return ToolResult(
-                content=(
-                    "compiled browser flow found no open target tab matching the reviewed "
-                    "interaction contract"
-                    if compatible_tab_count == 0
-                    else "compiled browser flow found multiple open target tabs matching "
-                    "the reviewed interaction contract"
+                content=json.dumps(
+                    {
+                        "error": (
+                            "compiled browser flow found no open target tab matching the "
+                            "reviewed interaction contract"
+                            if compatible_tab_count == 0
+                            else "compiled browser flow found multiple open target tabs matching "
+                            "the reviewed interaction contract"
+                        ),
+                        "target_ui_transition": ui_transition,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
                 ),
                 is_error=True,
                 metadata={
@@ -3412,10 +4342,14 @@ class BrowserChatExchangeTool:
                     "compatible_tab_count": compatible_tab_count,
                     "reviewed_tab_affinity": reviewed_affinity_status,
                     "reobserve_required": True,
+                    "target_ui_transition": ui_transition,
+                    "preferred_next_tool": "browser_snapshot",
+                    "preferred_next_tool_mode": "strict",
                 },
             )
         tab_ref, current = compatible_tabs[0]
         adapter_identity_metadata["tab_resolution"] = tab_resolution
+        before_url = next(tab.url for tab in open_tabs if tab.tab_ref == tab_ref)
         before_ref = _browser_evidence_ref("before", current)
         try:
             await state_scope.lifecycle.ensure_authoritative_before((before_ref,))
@@ -3507,13 +4441,38 @@ class BrowserChatExchangeTool:
                 metadata=adapter_identity_metadata,
             )
         timeout_ms = int(arguments.get("timeout_ms", 30_000))
+        response_witness = executable_adapter.interaction.response_witness or ""
         probe = contract.get("probe") if isinstance(contract, Mapping) else None
-        response_witness = (
-            str(probe.get("response_witness", "")).strip() if isinstance(probe, Mapping) else ""
-        )
+        response_witness_declared = isinstance(probe, Mapping) and "response_witness" in probe
+        response_witness_invalid = response_witness_declared and not response_witness
+        legacy_response_fallback = not response_witness_declared
         response_frame = (
             _string(contract.get("frame_context")) if isinstance(contract, Mapping) else None
         )
+        response_witness_count_before: int | None = 0 if not response_witness else None
+        legacy_prompt_count_before: int | None = None if legacy_response_fallback else 0
+        response_count_unavailable = False
+        response_count_uncertainties: list[dict[str, object]] = []
+
+        async def safe_text_occurrences(value: str, *, source: str) -> int | None:
+            nonlocal response_count_unavailable
+            try:
+                return await session.text_occurrences(tab_ref, value, response_frame)
+            except Exception:
+                response_count_unavailable = True
+                if not any(item["source"] == source for item in response_count_uncertainties):
+                    response_count_uncertainties.append(
+                        {
+                            "kind": "evaluation_uncertain",
+                            "source": source,
+                            "reason": (
+                                "The optional full-DOM occurrence count was unavailable; target "
+                                "delivery and bounded evidence capture continue."
+                            ),
+                            "confidence": 0.0,
+                        }
+                    )
+                return None
         checkpoint_receipt: dict[str, object] | None = None
         restore_claimed = False
         restore_secret: str | None = None
@@ -3675,10 +4634,33 @@ class BrowserChatExchangeTool:
         checkpoint_step_documents: dict[str, object] = {}
         capability_step_ids = _browser_capability_step_ids(executable_adapter)
         isolation_bound = False
+        rendered_state_text_before: str | None = None
+        rendered_state_evidence_refs: dict[str, str] = {}
+        rendered_state_capture_uncertainties: list[dict[str, object]] = []
         exchange_started = time.monotonic()
         fill_completed: float | None = None
         submit_started: float | None = None
         submit_completed: float | None = None
+        last_input_fill_index = max(
+            index
+            for index, (name, _, _, _) in enumerate(executable)
+            if name == "browser_fill"
+        )
+        submit_step_indices = [
+            index
+            for index, (name, _, _, role) in enumerate(executable)
+            if index > last_input_fill_index
+            and name in {"browser_click", "browser_press"}
+            and role != "cleanup"
+        ]
+        if not submit_step_indices:
+            submit_step_indices = [
+                index
+                for index, (name, _, _, _) in enumerate(executable)
+                if index > last_input_fill_index
+                and name in {"browser_click", "browser_press"}
+            ]
+        submit_step_index = max(submit_step_indices)
         for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
             if role == "interaction" and isolation_plan.isolated and not isolation_bound:
                 equivalence_key, isolation_error = _browser_isolation_baseline(
@@ -3735,6 +4717,88 @@ class BrowserChatExchangeTool:
                         is_error=True,
                         metadata={**adapter_identity_metadata, "retryable": False},
                     )
+            if (
+                response_witness
+                and response_witness_count_before is None
+                and step - 1 == submit_step_index
+            ):
+                response_witness_count_before = await safe_text_occurrences(
+                    response_witness,
+                    source="browser.response_witness.count",
+                )
+            if (
+                legacy_response_fallback
+                and legacy_prompt_count_before is None
+                and step - 1 == submit_step_index
+            ):
+                legacy_prompt_count_before = await safe_text_occurrences(
+                    prompt,
+                    source="browser.legacy_prompt_echo.count",
+                )
+            if (
+                executable_adapter.interaction.state_observations
+                and rendered_state_text_before is None
+                and step - 1 == submit_step_index
+            ):
+                try:
+                    rendered_state_text_before = await session.bounded_rendered_text(
+                        tab_ref,
+                        response_frame,
+                    )
+                except Exception:
+                    rendered_state_text_before = current.text
+                    rendered_state_capture_uncertainties.append(
+                        {
+                            "kind": "evaluation_uncertain",
+                            "source": "browser.rendered_state.baseline.capture",
+                            "reason": (
+                                "The optional bounded rendered-text baseline was unavailable; "
+                                "browser delivery remains authorized."
+                            ),
+                            "confidence": 0.0,
+                        }
+                    )
+                rendered_state_text_before = _browser_redact_rendered_text(
+                    rendered_state_text_before,
+                    restore_secret,
+                )
+                baseline_evidence_ref = _browser_rendered_text_receipt_ref(
+                    context_id=session.context_id,
+                    target_id=session.bounds.target_id,
+                    tab_ref=tab_ref,
+                    frame_ref=response_frame or "main",
+                    phase="baseline",
+                    text=rendered_state_text_before,
+                )
+                try:
+                    await self._recorder.record_evidence(
+                        session.context_id,
+                        baseline_evidence_ref,
+                        "browser_rendered_text_receipt",
+                        {
+                            "schema": "merlin.browser-rendered-text-receipt.v1",
+                            "phase": "baseline",
+                            "text_digest": "sha256:"
+                            + hashlib.sha256(rendered_state_text_before.encode()).hexdigest(),
+                            "text_length": len(rendered_state_text_before),
+                            "tab_ref": tab_ref,
+                            "frame_ref": response_frame or "main",
+                        },
+                    )
+                except Exception:
+                    rendered_state_capture_uncertainties.append(
+                        {
+                            "kind": "evaluation_uncertain",
+                            "source": "browser.rendered_state.baseline.evidence",
+                            "reason": (
+                                "The optional rendered-text baseline receipt was not stored; "
+                                "browser delivery remains authorized."
+                            ),
+                            "confidence": 0.0,
+                        }
+                    )
+                else:
+                    rendered_state_evidence_refs["baseline"] = baseline_evidence_ref
             if name in {"browser_click", "browser_press"}:
                 await state_scope.acknowledge_resources(resource_reservations)
                 resources_acknowledged = True
@@ -3854,27 +4918,107 @@ class BrowserChatExchangeTool:
         submitted = await session.snapshot(tab_ref, response_frame, step=len(executable) + 1)
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
         after = submitted
-        response_boundary_observed = submitted.text != current.text or bool(
-            response_witness
-            and submitted.text.count(response_witness) > current.text.count(response_witness)
+        submitted_url = next(
+            (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
+            before_url,
         )
+        after_observed_url = submitted_url
+        after_signature = _browser_response_snapshot_signature(after, after_observed_url)
+        response_witness_conflicted = bool(response_witness and response_witness in prompt)
+        response_boundary_unprovable = (
+            response_witness_conflicted
+            or response_witness_invalid
+            or response_count_unavailable
+        )
+        legacy_prompt_echo_only = False
+        if response_boundary_unprovable:
+            response_boundary_observed = False
+        elif response_witness:
+            submitted_witness_count = await safe_text_occurrences(
+                response_witness,
+                source="browser.response_witness.count",
+            )
+            response_boundary_observed = (
+                response_witness_count_before is not None
+                and submitted_witness_count is not None
+                and submitted_witness_count
+                > response_witness_count_before
+            )
+            response_boundary_unprovable = response_count_unavailable
+        else:
+            submitted_prompt_count = await safe_text_occurrences(
+                prompt,
+                source="browser.legacy_prompt_echo.count",
+            )
+            legacy_prompt_echo_only = bool(
+                legacy_response_fallback
+                and legacy_prompt_count_before is not None
+                and submitted_prompt_count is not None
+                and submitted_prompt_count
+                > legacy_prompt_count_before
+            )
+            response_boundary_observed = (
+                submitted.text != current.text
+                and not legacy_prompt_echo_only
+                and not response_count_unavailable
+            )
+            response_boundary_unprovable = response_count_unavailable
         response_boundary_complete = False
         last_response_change = asyncio.get_running_loop().time()
         response_settle_seconds = min(0.6, max(0.2, timeout_ms / 4_000))
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.2)
             candidate = await session.snapshot(tab_ref, response_frame, step=len(executable) + 2)
-            if candidate.text != after.text:
-                after = candidate
-                response_boundary_observed = True
+            candidate_url = next(
+                (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
+                after_observed_url,
+            )
+            candidate_signature = _browser_response_snapshot_signature(candidate, candidate_url)
+            witness_just_observed = False
+            if (
+                response_witness
+                and not response_witness_conflicted
+                and response_witness_count_before is not None
+            ):
+                candidate_witness_count = await safe_text_occurrences(
+                    response_witness,
+                    source="browser.response_witness.count",
+                )
+                witnessed = bool(
+                    candidate_witness_count is not None
+                    and candidate_witness_count > response_witness_count_before
+                )
+                response_boundary_unprovable = (
+                    response_boundary_unprovable or response_count_unavailable
+                )
+                witness_just_observed = witnessed and not response_boundary_observed
+                response_boundary_observed = response_boundary_observed or witnessed
+            if witness_just_observed:
                 last_response_change = asyncio.get_running_loop().time()
+            if candidate.text != after.text or candidate_signature != after_signature:
+                after = candidate
+                after_observed_url = candidate_url
+                after_signature = candidate_signature
+                if (
+                    not response_witness
+                    and not response_witness_invalid
+                    and not response_count_unavailable
+                ):
+                    response_boundary_observed = True
+                    legacy_prompt_echo_only = False
+                if response_boundary_observed or response_boundary_unprovable:
+                    last_response_change = asyncio.get_running_loop().time()
                 continue
             if (
-                response_boundary_observed
+                (
+                    response_boundary_observed
+                    or response_boundary_unprovable
+                    or legacy_prompt_echo_only
+                )
                 and asyncio.get_running_loop().time() - last_response_change
                 >= response_settle_seconds
             ):
-                response_boundary_complete = True
+                response_boundary_complete = response_boundary_observed
                 break
         response_completed = time.monotonic()
         public_after = after
@@ -3886,8 +5030,21 @@ class BrowserChatExchangeTool:
                     checkpoint_secret,
                 )
             )
+        final_step_document = after.model_dump(mode="json")
+        for compiled_step in executable_adapter.steps:
+            if (
+                compiled_step.role.value == "interaction"
+                and compiled_step.step_id is not None
+                and compiled_step.step_id in capability_step_ids
+            ):
+                checkpoint_step_documents[compiled_step.step_id] = final_step_document
         await self._recorder.append_observation(public_after)
-        await self._recorder.save_metadata(session.metadata(restart=True))
+        final_browser_metadata = session.metadata(restart=True)
+        await self._recorder.save_metadata(final_browser_metadata)
+        after_url = next(
+            (tab.url for tab in final_browser_metadata.tabs if tab.tab_ref == tab_ref),
+            before_url,
+        )
         after_ref = _browser_evidence_ref("after", public_after)
         exchange_completed = time.monotonic()
         submit_timing = _browser_submit_timing(
@@ -3909,6 +5066,31 @@ class BrowserChatExchangeTool:
             **submit_timing,
         }
         evaluation_uncertainties: list[dict[str, object]] = []
+        evaluation_uncertainties.extend(response_count_uncertainties)
+        if response_witness_invalid:
+            evaluation_uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "browser.response_witness",
+                    "reason": (
+                        "The declared reviewed response witness did not compile, so arbitrary "
+                        "visible-text changes cannot prove a target reply."
+                    ),
+                    "confidence": 0.0,
+                }
+            )
+        if response_witness_conflicted:
+            evaluation_uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "browser.response_witness",
+                    "reason": (
+                        "The submitted prompt contains the reviewed response witness, so an "
+                        "unscoped visible-text count increase cannot prove a target reply."
+                    ),
+                    "confidence": 0.0,
+                }
+            )
         if not response_boundary_complete:
             evaluation_uncertainties.append(
                 {
@@ -3921,6 +5103,77 @@ class BrowserChatExchangeTool:
                     "confidence": 0.0,
                 }
             )
+        rendered_state_text_after = public_after.text
+        if executable_adapter.interaction.state_observations:
+            try:
+                rendered_state_text_after = await session.bounded_rendered_text(
+                    tab_ref,
+                    response_frame,
+                )
+            except Exception:
+                rendered_state_capture_uncertainties.append(
+                    {
+                        "kind": "evaluation_uncertain",
+                        "source": "browser.rendered_state.result.capture",
+                        "reason": (
+                            "The optional bounded rendered-text result was unavailable; browser "
+                            "delivery remains authorized."
+                        ),
+                        "confidence": 0.0,
+                    }
+                )
+            rendered_state_text_after = _browser_redact_rendered_text(
+                rendered_state_text_after,
+                checkpoint_secret,
+            )
+            result_evidence_ref = _browser_rendered_text_receipt_ref(
+                context_id=session.context_id,
+                target_id=session.bounds.target_id,
+                tab_ref=tab_ref,
+                frame_ref=response_frame or "main",
+                phase="result",
+                text=rendered_state_text_after,
+            )
+            try:
+                await self._recorder.record_evidence(
+                    session.context_id,
+                    result_evidence_ref,
+                    "browser_rendered_text_receipt",
+                    {
+                        "schema": "merlin.browser-rendered-text-receipt.v1",
+                        "phase": "result",
+                        "text_digest": "sha256:"
+                        + hashlib.sha256(rendered_state_text_after.encode()).hexdigest(),
+                        "text_length": len(rendered_state_text_after),
+                        "tab_ref": tab_ref,
+                        "frame_ref": response_frame or "main",
+                    },
+                )
+            except Exception:
+                rendered_state_capture_uncertainties.append(
+                    {
+                        "kind": "evaluation_uncertain",
+                        "source": "browser.rendered_state.result.evidence",
+                        "reason": (
+                            "The optional rendered-text result receipt was not stored; browser "
+                            "delivery remains authorized."
+                        ),
+                        "confidence": 0.0,
+                    }
+                )
+            else:
+                rendered_state_evidence_refs["result"] = result_evidence_ref
+        rendered_state_observations, rendered_state_uncertainties = (
+            _browser_rendered_state_observations(
+                executable_adapter,
+                rendered_state_text_before or current.text,
+                rendered_state_text_after,
+                submitted_prompt=prompt,
+                phase_evidence_refs=rendered_state_evidence_refs,
+            )
+        )
+        evaluation_uncertainties.extend(rendered_state_capture_uncertainties)
+        evaluation_uncertainties.extend(rendered_state_uncertainties)
         predicates, predicate_error = _browser_oracle_predicates(
             contract if isinstance(contract, Mapping) else {}
         )
@@ -3963,12 +5216,39 @@ class BrowserChatExchangeTool:
             executable_adapter,
             checkpoint_step_documents,
         )
+        capability_state_observations = _browser_capability_state_observations(
+            executable_adapter,
+            checkpoint_step_documents,
+        )
+        state_observations = [
+            *capability_state_observations,
+            *rendered_state_observations,
+        ]
         state_transition = _browser_state_transition(
             executable_adapter,
             checkpoint_step_documents,
         )
+        state_metadata: dict[str, object] = {}
+        if state_observations:
+            exchange["state_observations"] = state_observations
+            state_metadata["state_observations"] = state_observations
         if state_transition:
             exchange["target_state_transition"] = state_transition
+            state_metadata["target_state_transition"] = state_transition
+            state_metadata["state_identity_match"] = state_transition.get("identity_match")
+        target_ui_transition = _browser_target_ui_transition(
+            current,
+            public_after,
+            before_url=before_url,
+            after_url=after_url,
+            adapter=executable_adapter,
+            state_observations=state_observations,
+        )
+        exchange["target_ui_transition"] = target_ui_transition
+        state_metadata["target_ui_transition"] = target_ui_transition
+        if target_ui_transition["reobservation_recommended"] is True:
+            state_metadata["preferred_next_tool"] = "browser_snapshot"
+            state_metadata["preferred_next_tool_mode"] = "strict"
         if isolation_plan.isolated and state_transition.get("identity_match") is not True:
             await release_unacknowledged_restore()
             state_scope.isolation_disposition = "contaminated"
@@ -3985,12 +5265,12 @@ class BrowserChatExchangeTool:
                 is_error=True,
                 metadata={
                     **adapter_identity_metadata,
+                    **state_metadata,
                     "failure_code": "physical_state_contaminated",
                     "attempt_disposition": "contaminated",
                     "retryable": True,
                     "target_effect_attempted": True,
                     "target_call_budget_charge": 1,
-                    "target_state_transition": state_transition,
                     "target_exchanges": [exchange],
                 },
             )
@@ -4017,6 +5297,7 @@ class BrowserChatExchangeTool:
                     is_error=True,
                     metadata={
                         **adapter_identity_metadata,
+                        **state_metadata,
                         "failure_code": "checkpoint_success_unproven",
                         "retryable": True,
                         "target_effect_attempted": True,
@@ -4039,6 +5320,7 @@ class BrowserChatExchangeTool:
                         is_error=True,
                         metadata={
                             **adapter_identity_metadata,
+                            **state_metadata,
                             "failure_code": "checkpoint_capture_missing",
                             "retryable": True,
                         },
@@ -4113,6 +5395,7 @@ class BrowserChatExchangeTool:
             content=public_after.model_dump_json(),
             metadata={
                 **adapter_identity_metadata,
+                **state_metadata,
                 "compiled_flow": "merlin.browser-flow.v1",
                 "steps_completed": len(results),
                 "input_value_verified": True,
@@ -4124,6 +5407,14 @@ class BrowserChatExchangeTool:
                 "target": session.bounds.target_id,
                 "target_session_id": f"browser:{session.context_id}",
                 "target_exchanges": [exchange],
+                **(
+                    {
+                        "evaluation_uncertain": True,
+                        "evaluation_uncertainties": evaluation_uncertainties,
+                    }
+                    if evaluation_uncertainties
+                    else {}
+                ),
                 **(
                     {"objective_phase_checkpoint": checkpoint_receipt}
                     if checkpoint_receipt is not None
@@ -9969,6 +11260,8 @@ def _browser_oracle_observation(
 
 def _response_witness_text(text: str, witness: str) -> str | None:
     """Return the latest visible response line proven by the reviewed witness."""
+    if not witness:
+        return None
     return next(
         (line.strip() for line in reversed(text.splitlines()) if witness in line),
         None,

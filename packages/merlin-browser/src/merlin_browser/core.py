@@ -893,7 +893,54 @@ class BrowserSession:
         page = self._page(tab_ref)
         await self._enforce_page(page)
         frame, _ = self._frame(page, frame_ref)
-        return (await frame.locator("body").inner_text(timeout=2_000)).count(value)
+        result = await frame.locator("body").evaluate(
+            """(body, needle) => {
+                if (!needle) return 0;
+                const text = body.innerText;
+                let count = 0;
+                let offset = 0;
+                while ((offset = text.indexOf(needle, offset)) !== -1) {
+                    count += 1;
+                    offset += needle.length;
+                }
+                return count;
+            }""",
+            value,
+        )
+        if type(result) is not int or result < 0:
+            raise BrowserBoundaryError("reviewed response witness count is invalid")
+        return result
+
+    async def bounded_rendered_text(
+        self,
+        tab_ref: str,
+        frame_ref: str | None = None,
+        *,
+        max_chars: int = 262_144,
+    ) -> str:
+        """Read exact rendered text for reviewed extraction without persisting an unbounded DOM."""
+
+        page = self._page(tab_ref)
+        await self._enforce_page(page)
+        frame, _ = self._frame(page, frame_ref)
+        if await frame.locator('input[type="password"]').count() > 0:
+            raise BrowserBoundaryError(
+                "reviewed rendered text is unavailable across the snapshot redaction boundary"
+            )
+        result = await frame.locator("body").evaluate(
+            """(body, limit) => {
+                const text = body.innerText;
+                return text.length <= limit ? {text} : {length: text.length};
+            }""",
+            max_chars,
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+            observed = result.get("length") if isinstance(result, dict) else None
+            raise BrowserBoundaryError(
+                "reviewed rendered text exceeds the bounded extraction limit"
+                + (f" ({observed} characters)" if isinstance(observed, int) else "")
+            )
+        return result["text"]
 
     async def wait_for_text_increase(
         self,
