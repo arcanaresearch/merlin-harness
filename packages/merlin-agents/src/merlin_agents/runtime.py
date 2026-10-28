@@ -1110,9 +1110,16 @@ def _controller_tool_arguments(
     target_tool: str, logical: Mapping[str, object]
 ) -> dict[str, object]:
     """Render interface-neutral controller arguments for the reviewed target tool."""
-    if target_tool not in {"browser_chat_exchange", "target_chat"}:
-        return dict(logical)
-    return {("prompt" if key == "input" else key): value for key, value in logical.items()}
+    if target_tool == "target_chat":
+        return {"prompt": logical["input"]} if "input" in logical else {}
+    if target_tool == "browser_chat_exchange":
+        supported = {"input", "timeout_ms", "strategy_plan", "strategy_turn_index"}
+        return {
+            ("prompt" if key == "input" else key): value
+            for key, value in logical.items()
+            if key in supported
+        }
+    return dict(logical)
 
 
 def _initial_hydra_messages(
@@ -1787,10 +1794,10 @@ class WorkerRuntime:
                     f"{strategy_execution_reason}"
                 ),
                 error_code="adaptive_strategy_unavailable",
-                retry_class="fresh_worker",
+                retry_class="terminal",
                 infrastructure_failure_category="adaptive_strategy_unavailable",
                 evaluation_uncertainties=(uncertainty,),
-                retry_failure_kind=RetryFailureKind.WORKER_INTERRUPTED,
+                retry_failure_kind=RetryFailureKind.CONFIGURATION,
             )
         if (
             adaptive_strategy

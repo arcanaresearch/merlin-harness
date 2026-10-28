@@ -1204,6 +1204,82 @@ async def test_submit_persists_distinct_composition_instances_that_share_profile
     assert [_assignment(item).id for item in documents] == ["task/one", "task/two"]
 
 
+async def test_unavailable_adaptive_strategy_is_terminal_after_one_durable_attempt() -> None:
+    class ForbiddenProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, _request):
+            self.calls += 1
+            raise AssertionError("unavailable strategy must not call the provider")
+            yield
+
+    class ForbiddenTargetTools(Tools):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="target_request",
+                    description="reviewed target exchange",
+                    input_schema={"type": "object"},
+                    interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                ),
+            )
+
+        def effect(self, name):
+            assert name == "target_request"
+            return "target_network"
+
+        async def invoke(self, name, _context, _arguments):
+            self.calls += 1
+            raise AssertionError(f"unavailable strategy must not call {name}")
+
+    store = Store()
+    provider = ForbiddenProvider()
+    tools = ForbiddenTargetTools()
+    assignment = WorkerAssignment(
+        id="campaign/unavailable/goat",
+        objective="Run the unavailable reviewed strategy.",
+        profile_id="injection",
+        target_profile_id="target",
+        technique_ids=("technique/goat",),
+        guidance_ids=(),
+        tool_ids=("target_request",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=8, max_tokens=10_000, max_seconds=30),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        strategy_id="goat",
+        semantic_technique_id="semantic:goat",
+        strategy_contract=(
+            ("strategy_execution_mode", "unavailable"),
+            ("strategy_execution_reason", "reviewed GOAT contract is absent"),
+        ),
+    )
+    service = DurableAgentService(provider, tools, store, model="test")
+
+    live = await service.submit("session", (assignment,), max_workers=1, minimum_workers=1)
+    assert live.execution is not None
+    await live.execution
+
+    attempts = [
+        item
+        for item in store.attempts.values()
+        if item.node_id == "worker:campaign/unavailable/goat"
+    ]
+    assert provider.calls == 0
+    assert tools.calls == 0
+    assert len(attempts) == 1
+    assert attempts[0].state == "failed"
+    assert attempts[0].failure_kind == RetryFailureKind.CONFIGURATION.value
+    assert store.nodes[live.id]["worker:campaign/unavailable/goat"]["state"] == "failed"
+    assert (await service.list_schedule_tasks(live.id))[0].status == "failed"
+
+
 async def test_completed_degraded_execution_persists_structured_uncertainty() -> None:
     class DegradedProvider:
         def __init__(self) -> None:

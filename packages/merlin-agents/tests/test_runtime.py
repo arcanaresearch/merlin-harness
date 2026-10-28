@@ -532,6 +532,77 @@ async def test_objective_phase_gate_executes_sealed_actions_without_provider_inf
     assert len(result.checkpoint["target_evidence"]) == 2
 
 
+@pytest.mark.parametrize(
+    ("interface", "target_tool"),
+    (
+        ("browser", "browser_chat_exchange"),
+        ("open_ai_compatible", "target_chat"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_objective_phase_gate_uses_schema_valid_prompt_arguments(
+    interface: str, target_tool: str
+) -> None:
+    base = reviewed_handoff(interface=interface, tools=(target_tool,))
+    gate = {
+        "id": "baseline",
+        "actions": [{"id": "message", "step_id": "message", "input_text": "hello exactly"}],
+    }
+    assignment = replace(
+        base.assignment,
+        id="campaign/00000000-0000-0000-0000-000000000001/objective-gate/0-baseline",
+        strategy_id="objective-phase-gate/v1",
+        strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
+        max_target_exchanges=1,
+    )
+    assert base.worker_context is not None
+    reviewed = replace(
+        base,
+        assignment=assignment,
+        worker_context=replace(base.worker_context, assignment_id=assignment.id),
+    )
+
+    class PromptGateTools(Tools):
+        def __init__(self) -> None:
+            super().__init__(effect="target_network")
+            self.arguments: list[Mapping[str, object]] = []
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name=target_tool,
+                    description="Target",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"prompt": {"type": "string", "minLength": 1}},
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert name == target_tool
+            assert arguments == {"prompt": "hello exactly"}
+            self.calls.append(name)
+            self.arguments.append(dict(arguments))
+            return ToolResult(
+                content="target reply",
+                metadata={
+                    "target_session_id": "target:gate-session",
+                },
+            )
+
+    provider = Provider([])
+    tools = PromptGateTools()
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert result.status == "completed"
+    assert provider.requests == []
+    assert tools.calls == [target_tool]
+    assert tools.arguments == [{"prompt": "hello exactly"}]
+
+
 @pytest.mark.asyncio
 async def test_objective_phase_gate_preserves_delivery_failure_for_fresh_retry() -> None:
     base = reviewed_handoff(interface="http_api", tools=("target_request",))
@@ -579,7 +650,7 @@ async def test_objective_phase_gate_preserves_delivery_failure_for_fresh_retry()
 
 
 @pytest.mark.asyncio
-async def test_unavailable_adaptive_strategy_is_retryable_without_provider_or_target_effect() -> (
+async def test_unavailable_adaptive_strategy_is_terminal_without_provider_or_target_effect() -> (
     None
 ):
     base = reviewed_handoff(interface="http_api", tools=("target_request",))
@@ -600,8 +671,8 @@ async def test_unavailable_adaptive_strategy_is_retryable_without_provider_or_ta
 
     assert result.status == "failed"
     assert result.error_code == "adaptive_strategy_unavailable"
-    assert result.retry_class == "fresh_worker"
-    assert result.retry_failure_kind is RetryFailureKind.WORKER_INTERRUPTED
+    assert result.retry_class == "terminal"
+    assert result.retry_failure_kind is RetryFailureKind.CONFIGURATION
     assert result.infrastructure_failure_category == "adaptive_strategy_unavailable"
     assert result.structured == {
         "attempted_techniques": [],
