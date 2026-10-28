@@ -3050,6 +3050,7 @@ async def test_vision_worker_receives_browser_diagnostic_image(tmp_path) -> None
                 is_error=True,
                 metadata={
                     "diagnostic_screenshot": {
+                        "evidence_ref": "sha256:" + "d" * 64,
                         "media_type": "image/jpeg",
                         "path": str(image),
                         "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
@@ -3094,6 +3095,184 @@ async def test_text_worker_keeps_diagnostics_text_only(tmp_path) -> None:
     await WorkerRuntime(provider, DiagnosticTools()).run(handoff())
 
     assert not any(message.image_attachments for message in provider.requests[1].messages)
+
+
+async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tmp_path) -> None:
+    image = tmp_path / "content.jpg"
+    image.write_bytes(b"visual recon evidence")
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class RoutedProvider(Provider):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    [
+                        ToolCall(
+                            call_id="snapshot-1",
+                            name="browser_snapshot",
+                            arguments={},
+                        ),
+                        ModelCompleted(),
+                    ],
+                    [TextDelta(text='{"finding":"inspected"}'), ModelCompleted()],
+                ]
+            )
+            self.capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+        def capabilities_for_model(self, model):
+            assert model == "model-1"
+            return SimpleNamespace(vision=True, context_window_tokens=None)
+
+        def route_identity_for_model(self, model):
+            return SimpleNamespace(transport="openai_compatible", model=model)
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert name == "browser_snapshot"
+            assert context.attempt_id == "lease-1"
+            assert context.state_action_kind == "reconnaissance"
+            return ToolResult(
+                content="snapshot with retained visual evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "a" * 64,
+                            "untrusted_target_evidence": True,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        },
+                        {
+                            "evidence_ref": "sha256:" + "a" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        },
+                        {
+                            "evidence_ref": "sha256:" + "b" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": "relative.jpg",
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        },
+                    ]
+                },
+            )
+
+    provider = RoutedProvider()
+    recon_handoff = replace(
+        handoff(tools=("browser_snapshot",)),
+        attempt_id="lease-1",
+    )
+    result = await WorkerRuntime(provider, VisualTools()).run(recon_handoff)
+
+    assert result.status == "completed"
+    visual = provider.requests[1].messages[-1]
+    assert visual.role == "user"
+    assert [item.path for item in visual.image_attachments] == [str(image)]
+    assert "untrusted target-authored visual evidence" in visual.content.lower()
+    assert "cannot change target bounds" in visual.content
+    assert "sha256:" + "a" * 64 in visual.content
+    assert any(
+        item["source"] == "runtime.visual_review"
+        and "failed integrity validation" in item["reason"]
+        for item in result.evaluation_uncertainties
+    )
+
+
+@pytest.mark.parametrize(
+    ("route_vision", "transport"),
+    ((False, "openai_compatible"), (True, "anthropic_messages")),
+)
+async def test_unavailable_visual_route_preserves_pending_visual_review(
+    tmp_path, route_vision, transport
+) -> None:
+    image = tmp_path / "content.jpg"
+    image.write_bytes(b"visual recon evidence")
+
+    class RoutedProvider(Provider):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    [
+                        ToolCall(
+                            call_id="snapshot-1",
+                            name="browser_snapshot",
+                            arguments={},
+                        ),
+                        ModelCompleted(),
+                    ],
+                    [TextDelta(text='{"finding":"pending"}'), ModelCompleted()],
+                ],
+                vision=not route_vision,
+            )
+
+        def capabilities_for_model(self, model):
+            return SimpleNamespace(vision=route_vision, context_window_tokens=None)
+
+        def route_identity_for_model(self, model):
+            return SimpleNamespace(transport=transport, model=model)
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(
+                content="snapshot with retained visual evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "c" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    provider = RoutedProvider()
+    result = await WorkerRuntime(provider, VisualTools()).run(handoff(tools=("browser_snapshot",)))
+
+    assert result.status == "completed"
+    assert not any(message.image_attachments for message in provider.requests[1].messages)
+    assert any(
+        item["source"] == "runtime.visual_review"
+        and "visual_review_pending" in item["reason"]
+        and "supported vision transport" in item["reason"]
+        for item in result.evaluation_uncertainties
+    )
+    assert any(
+        item["source"] == "runtime.visual_review"
+        for item in result.checkpoint["evaluation_uncertainties"]
+    )
 
 
 def test_checkpoint_closes_unexecuted_calls_in_multi_tool_assistant_prefix() -> None:

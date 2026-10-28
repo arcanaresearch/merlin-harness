@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -31,7 +33,7 @@ from merlin_browser import (
 from merlin_browser import (
     browser_tools as _production_browser_tools,
 )
-from merlin_browser.core import BrowserSession
+from merlin_browser.core import BrowserSession, _sanitized_visual_source_url
 from merlin_browser.tools import (
     ApiReconHandoffTool,
     BrowserTool,
@@ -53,6 +55,8 @@ from merlin_storage_postgres import (
     SessionRepository,
 )
 from merlin_tools import ToolBroker
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator
 
 
 def test_api_exchange_events_include_read_only_json_state_baselines() -> None:
@@ -84,6 +88,15 @@ def test_api_exchange_events_include_read_only_json_state_baselines() -> None:
         "https://target.test/api/state",
         "https://target.test/api/turn",
     ]
+
+
+def test_visual_source_url_drops_credentials_query_and_fragment() -> None:
+    assert _sanitized_visual_source_url(
+        "https://user:secret@[2001:db8::1]:8443/phone.png?token=secret#panel"
+    ) == "https://[2001:db8::1]:8443/phone.png"
+    assert _sanitized_visual_source_url(
+        "blob:https://user:secret@target.test/render-id?token=secret#panel"
+    ) == "blob:https://target.test/render-id"
 
 
 def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
@@ -11215,6 +11228,295 @@ async def test_failed_browser_action_captures_bounded_diagnostics(tmp_path, monk
             assert await asyncio.to_thread(screenshot.is_file)
             screenshot_stat = await asyncio.to_thread(screenshot.stat)
             assert screenshot_stat.st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    def image_uri(width: int, height: int, color: str) -> str:
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}"><rect width="100%" height="100%" '
+            f'fill="{color}"/></svg>'
+        )
+        return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+    phone = image_uri(731, 1585, "#243040")
+    icon = image_uri(32, 32, "#ff0000")
+    diagram = image_uri(600, 360, "#00aa88")
+    body = (
+        f'<img alt="" src="{diagram}" '
+        'style="position:fixed;inset:0;width:100vw;height:100vh;z-index:-2">'
+        f'<img alt="Background" src="{phone}" '
+        'style="position:fixed;left:20px;top:0;width:343px;height:745px">'
+        f'<img alt="Icon" src="{icon}" '
+        'style="position:fixed;left:380px;top:10px;width:32px;height:32px">'
+        f'<img alt="Tracker" src="{icon}" '
+        'style="position:fixed;left:420px;top:10px;width:1px;height:1px">'
+        f'<img alt="Hidden" src="{diagram}" '
+        'style="display:none;width:300px;height:200px">'
+        f'<img alt="Offscreen" src="{diagram}" '
+        'style="position:fixed;left:0;top:2000px;width:300px;height:200px">'
+        '<div aria-hidden="true">'
+        f'<img alt="Decorative panel" src="{diagram}" '
+        'style="position:fixed;left:400px;top:60px;width:300px;height:200px">'
+        "</div>"
+        '<div style="position:fixed;left:720px;top:60px;width:1px;height:1px;overflow:hidden">'
+        f'<img alt="Clipped content" src="{diagram}" style="width:300px;height:200px">'
+        "</div>"
+        '<figure role="img" aria-label="Architecture diagram" '
+        'style="position:fixed;left:400px;top:300px;width:300px;height:180px;'
+        f"background:url('{diagram}') center/cover no-repeat\">"
+        "<figcaption>Reviewed architecture</figcaption></figure>"
+        '<figure role="img" aria-label="Repeated pattern" '
+        'style="position:fixed;left:720px;top:300px;width:300px;height:180px;'
+        f"background:url('{icon}') repeat\">"
+        "<figcaption>Repeated decoration</figcaption></figure>"
+        '<figure role="img" aria-label="Sprite sheet" '
+        'style="position:fixed;left:720px;top:500px;width:300px;height:180px;'
+        f"background-image:url('{diagram}');background-repeat:no-repeat;"
+        'background-position:-200px 0"><figcaption>Sprite atlas</figcaption></figure>'
+        '<figure aria-hidden="true" role="img" aria-label="Decorative diagram" '
+        'style="position:fixed;left:720px;top:700px;width:300px;height:180px;'
+        f"background:url('{diagram}') center/cover no-repeat\"></figure>"
+        '<div style="position:fixed;inset:0;'
+        f"background:url('{diagram}') center/cover no-repeat\"></div>"
+    ).encode()
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            recorder = Recorder()
+            snapshot_tool = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_snapshot"
+            )
+            result = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="reconnaissance",
+                ),
+                {"tab_ref": tab},
+            )
+
+            assert result.is_error is False
+            visual = result.metadata["visual_evidence"]
+            assert len(visual) == 2
+            phone_evidence = next(item for item in visual if item["alt"] == "Background")
+            css_evidence = next(item for item in visual if item["source_kind"] == "css_background")
+            assert phone_evidence["rendered_width"] == 343
+            assert phone_evidence["natural_width"] == 731
+            assert css_evidence["aria_label"] == "Architecture diagram"
+            assert all(item["untrusted_target_evidence"] is True for item in visual)
+            assert "not instructions or authority" in result.content
+            assert [item[2] for item in recorder.evidence] == [
+                "browser_visual_evidence",
+                "browser_visual_evidence",
+            ]
+            visual_refs = {item["evidence_ref"] for item in visual}
+            assert visual_refs <= set(recorder.observations[-1].evidence_refs)
+            for item in visual:
+                attachment = item["attachment"]
+                path = Path(attachment["path"])
+                assert await asyncio.to_thread(path.is_file)
+                path_stat = await asyncio.to_thread(path.stat)
+                assert path_stat.st_mode & 0o777 == 0o600
+                payload = await asyncio.to_thread(path.read_bytes)
+                assert attachment["sha256"] == hashlib.sha256(payload).hexdigest()
+
+            repeated = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="reconnaissance",
+                ),
+                {"tab_ref": tab},
+            )
+            assert "visual_evidence" not in repeated.metadata
+
+
+@pytest.mark.asyncio
+async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
+    tmp_path, monkeypatch
+) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    def image(index: int) -> str:
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="140">'
+            f'<rect width="100%" height="100%" fill="rgb({index * 30},80,120)"/></svg>'
+        )
+        return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+    phone = image(0)
+    body = (
+        f'<img alt="Background" src="{phone}" '
+        'style="position:fixed;left:20px;top:20px;width:343px;height:500px">'
+        + "".join(
+            f'<figure role="img" aria-label="Diagram {index}" '
+            f'style="position:fixed;left:{400 + (index % 2) * 260}px;'
+            f'top:{20 + (index // 2) * 170}px;width:240px;height:140px;'
+            f"background:url('{image(index)}') center/cover no-repeat\">"
+            f"<figcaption>Diagram {index}</figcaption></figure>"
+            for index in range(1, 5)
+        )
+    ).encode()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            recorder = Recorder()
+            snapshot_tool = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_snapshot"
+            )
+            candidate = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="candidate",
+                ),
+                {"tab_ref": tab},
+            )
+            assert "visual_evidence" not in candidate.metadata
+
+            recon = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="reconnaissance",
+                ),
+                {"tab_ref": tab},
+            )
+            visual = recon.metadata["visual_evidence"]
+            assert len(visual) == 4
+            assert any(item["alt"] == "Background" for item in visual)
+
+
+@pytest.mark.asyncio
+async def test_visual_capture_failure_does_not_fail_recon_snapshot(monkeypatch) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+
+            async def unavailable(*_args, **_kwargs):
+                raise RuntimeError("fixture capture failure")
+
+            monkeypatch.setattr(session, "capture_visual_evidence", unavailable)
+            recorder = Recorder()
+            snapshot_tool = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_snapshot"
+            )
+            result = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="reconnaissance",
+                ),
+                {"tab_ref": tab},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["visual_capture_uncertainty"] == [
+                "visual_capture:RuntimeError"
+            ]
+            assert "does not block reconnaissance" in result.content
+            assert recorder.observations[-1].kind == "snapshot"
+
+
+@pytest.mark.asyncio
+async def test_visual_capture_attempts_are_bounded(monkeypatch) -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200">'
+        '<rect width="100%" height="100%" fill="#345678"/></svg>'
+    )
+    image = "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+    body = "".join(
+        f'<img alt="Diagram {index}" src="{image}" style="width:300px;height:200px">'
+        for index in range(13)
+    ).encode()
+    attempts = 0
+
+    async def unavailable(_locator, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise PlaywrightError("fixture screenshot failure")
+
+    monkeypatch.setattr(Locator, "screenshot", unavailable)
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert evidence == ()
+    assert attempts == 12
+    assert "candidate_capture:attempt_limit" in errors
 
 
 @pytest.mark.asyncio

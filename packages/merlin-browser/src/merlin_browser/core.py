@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from playwright.async_api import (
@@ -43,6 +43,126 @@ from .models import (
 
 _NETWORK_JSON_BYTES = 32 * 1024
 _SECRET_JSON_KEYS = ("authorization", "cookie", "credential", "password", "secret", "token")
+_VISUAL_CANDIDATE_LIMIT = 4
+_VISUAL_INSPECTION_LIMIT = 100
+_VISUAL_CAPTURE_ATTEMPT_LIMIT = 12
+_VISUAL_CAPTURE_TIMEOUT_MS = 1_500
+_VISUAL_MIN_AXIS_PX = 96
+_VISUAL_MIN_AREA_PX = 24_000
+_VISUAL_MAX_BYTES = 5_242_880
+
+
+def _sanitized_visual_source_url(value: str) -> str:
+    """Keep visual attribution without persisting URL credentials or inline image bytes."""
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.casefold()
+
+    def sanitized_network_url(parts: object) -> str:
+        hostname = str(getattr(parts, "hostname", "") or "")
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        try:
+            port = getattr(parts, "port", None)
+        except ValueError:
+            port = None
+        netloc = f"{hostname}:{port}" if port is not None else hostname
+        return urlunsplit(
+            (
+                str(getattr(parts, "scheme", "")),
+                netloc,
+                str(getattr(parts, "path", "")),
+                "",
+                "",
+            )
+        )
+
+    if scheme in {"http", "https"}:
+        return sanitized_network_url(parsed)[:2_048]
+    if scheme == "blob":
+        inner = urlsplit(value.removeprefix(f"{parsed.scheme}:"))
+        if inner.scheme.casefold() in {"http", "https"}:
+            return ("blob:" + sanitized_network_url(inner))[:2_048]
+        return "blob:sha256:" + hashlib.sha256(value.encode()).hexdigest()
+    if parsed.scheme.casefold() == "data":
+        return "data:sha256:" + hashlib.sha256(value.encode()).hexdigest()
+    return value.split("?", 1)[0].split("#", 1)[0][:2_048]
+
+
+def _useful_visual_label(value: object) -> bool:
+    label = " ".join(str(value or "").split()).casefold()
+    return bool(label) and label not in {
+        "background",
+        "decoration",
+        "decorative",
+        "hero",
+        "image",
+    }
+
+
+def _bounded_visual_metadata(value: object) -> str:
+    return " ".join(str(value or "").split())[:512]
+
+
+def _has_negative_pixel_offset(value: object) -> bool:
+    for token in str(value or "").replace(",", " ").split():
+        if not token.casefold().endswith("px"):
+            continue
+        try:
+            if float(token[:-2]) < 0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
+    if not candidate.get("visible") or not candidate.get("loaded"):
+        return False
+    visible_width = float(candidate.get("visible_width") or 0)
+    visible_height = float(candidate.get("visible_height") or 0)
+    visible_area = float(candidate.get("visible_area") or 0)
+    if (
+        visible_width < _VISUAL_MIN_AXIS_PX
+        or visible_height < _VISUAL_MIN_AXIS_PX
+        or visible_area < _VISUAL_MIN_AREA_PX
+    ):
+        return False
+    role = str(candidate.get("role", "")).casefold()
+    tag = str(candidate.get("tag", "")).casefold()
+    useful_label = any(
+        _useful_visual_label(candidate.get(field))
+        for field in ("alt", "aria_label", "title", "caption")
+    )
+    in_figure = bool(candidate.get("in_figure"))
+    viewport_coverage = float(candidate.get("viewport_coverage") or 0)
+    if candidate.get("source_kind") != "css_background":
+        explicitly_decorative = bool(candidate.get("aria_hidden")) or role in {
+            "none",
+            "presentation",
+        }
+        if explicitly_decorative and not (
+            in_figure and _useful_visual_label(candidate.get("caption"))
+        ):
+            return False
+        semantic = in_figure or role == "img" or useful_label
+        return viewport_coverage < 0.7 or semantic
+    explicitly_decorative = bool(candidate.get("aria_hidden")) or role in {
+        "none",
+        "presentation",
+    }
+    if explicitly_decorative and not (
+        tag == "figure" and _useful_visual_label(candidate.get("caption"))
+    ):
+        return False
+    if str(candidate.get("background_repeat", "")).casefold() != "no-repeat":
+        return False
+    if _has_negative_pixel_offset(candidate.get("background_position")):
+        return False
+    if role != "img" and tag != "figure":
+        return False
+    if not useful_label:
+        return False
+    return viewport_coverage < 0.7 or (useful_label and (role == "img" or tag == "figure"))
 
 
 def _json_string_paths(value: object, prefix: str = "") -> tuple[tuple[str, str], ...]:
@@ -182,6 +302,7 @@ class BrowserSession:
         self._active_submit: tuple[str, str, int, datetime] | None = None
         self._request_provenance: dict[int, dict[str, object]] = {}
         self._download_tasks: set[asyncio.Task[None]] = set()
+        self._visual_evidence_seen: set[tuple[str, str]] = set()
         context.on("page", self._register_popup)
         context.on("response", self._record_response)
 
@@ -526,6 +647,199 @@ class BrowserSession:
             redacted=redacted,
             step=step,
         )
+
+    async def capture_visual_evidence(
+        self,
+        tab_ref: str,
+        frame_ref: str | None = None,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
+        """Capture bounded, visible content images without changing snapshot semantics."""
+        page = self._page(tab_ref)
+        await self._enforce_page(page)
+        frame, resolved_frame_ref = self._frame(page, frame_ref)
+        candidate_script = """
+            (element, sourceKind) => {
+                const rect = element.getBoundingClientRect();
+                const viewportWidth = Math.max(
+                    window.innerWidth || 0,
+                    document.documentElement.clientWidth || 0
+                );
+                const viewportHeight = Math.max(
+                    window.innerHeight || 0,
+                    document.documentElement.clientHeight || 0
+                );
+                let clipLeft = Math.max(rect.left, 0);
+                let clipRight = Math.min(rect.right, viewportWidth);
+                let clipTop = Math.max(rect.top, 0);
+                let clipBottom = Math.min(rect.bottom, viewportHeight);
+                let visible = rect.width > 0 && rect.height > 0;
+                let ariaHidden = false;
+                for (let node = element; node && visible; node = node.parentElement) {
+                    const computed = getComputedStyle(node);
+                    ariaHidden = ariaHidden || node.getAttribute("aria-hidden") === "true";
+                    visible = computed.display !== "none"
+                        && computed.visibility !== "hidden"
+                        && computed.visibility !== "collapse"
+                        && Number(computed.opacity || 1) > 0.05;
+                    if (node !== element) {
+                        const ancestorRect = node.getBoundingClientRect();
+                        if (["auto", "clip", "hidden", "scroll"].includes(computed.overflowX)) {
+                            clipLeft = Math.max(clipLeft, ancestorRect.left);
+                            clipRight = Math.min(clipRight, ancestorRect.right);
+                        }
+                        if (["auto", "clip", "hidden", "scroll"].includes(computed.overflowY)) {
+                            clipTop = Math.max(clipTop, ancestorRect.top);
+                            clipBottom = Math.min(clipBottom, ancestorRect.bottom);
+                        }
+                    }
+                }
+                const visibleWidth = Math.max(0, clipRight - clipLeft);
+                const visibleHeight = Math.max(0, clipBottom - clipTop);
+                const style = getComputedStyle(element);
+                const figure = element.closest("figure");
+                const captionNode = figure && figure.querySelector("figcaption");
+                const tag = element.tagName.toLowerCase();
+                let sourceUrl = "";
+                let loaded = true;
+                let naturalWidth = 0;
+                let naturalHeight = 0;
+                if (sourceKind === "img") {
+                    sourceUrl = element.currentSrc || element.src || "";
+                    naturalWidth = Number(element.naturalWidth || 0);
+                    naturalHeight = Number(element.naturalHeight || 0);
+                    loaded = Boolean(element.complete && naturalWidth && naturalHeight);
+                } else {
+                    const match = style.backgroundImage.match(
+                        /^url\\((["']?)(.*?)\\1\\)$/
+                    );
+                    sourceUrl = match ? match[2] : "";
+                    loaded = Boolean(sourceUrl);
+                }
+                const visibleArea = visibleWidth * visibleHeight;
+                const viewportArea = Math.max(1, viewportWidth * viewportHeight);
+                return {
+                    source_kind: sourceKind,
+                    source_url: sourceUrl,
+                    loaded,
+                    visible: visible && visibleWidth > 0 && visibleHeight > 0,
+                    tag,
+                    role: element.getAttribute("role") || "",
+                    aria_hidden: ariaHidden,
+                    in_figure: Boolean(figure),
+                    alt: element.getAttribute("alt") || "",
+                    aria_label: element.getAttribute("aria-label") || "",
+                    title: element.getAttribute("title") || "",
+                    caption: captionNode ? (captionNode.innerText || "").trim() : "",
+                    rendered_width: rect.width,
+                    rendered_height: rect.height,
+                    visible_width: visibleWidth,
+                    visible_height: visibleHeight,
+                    visible_area: visibleArea,
+                    viewport_coverage: visibleArea / viewportArea,
+                    natural_width: naturalWidth,
+                    natural_height: naturalHeight,
+                    background_repeat: style.backgroundRepeat,
+                    background_position: style.backgroundPosition,
+                };
+            }
+        """
+        candidates: list[tuple[Locator, dict[str, object]]] = []
+        errors: list[str] = []
+        sources = (
+            ("img", frame.locator("img")),
+            ("css_background", frame.locator('figure, [role="img"]')),
+        )
+        for source_kind, locators in sources:
+            count = min(await locators.count(), _VISUAL_INSPECTION_LIMIT)
+            for index in range(count):
+                locator = locators.nth(index)
+                try:
+                    raw_candidate = await locator.evaluate(candidate_script, source_kind)
+                except PlaywrightError as error:
+                    errors.append(f"candidate_inspection:{type(error).__name__}")
+                    continue
+                if not isinstance(raw_candidate, dict):
+                    continue
+                candidate = {str(key): value for key, value in raw_candidate.items()}
+                if _visual_candidate_admitted(candidate):
+                    candidates.append((locator, candidate))
+
+        def rank(item: tuple[Locator, dict[str, object]]) -> tuple[int, int, float]:
+            candidate = item[1]
+            strong_semantics = int(
+                str(candidate.get("tag", "")).casefold() == "figure"
+                or _useful_visual_label(candidate.get("caption"))
+            )
+            normal_image = int(candidate.get("source_kind") == "img")
+            return normal_image, strong_semantics, float(candidate.get("visible_area") or 0)
+
+        evidence: list[dict[str, object]] = []
+        capture_attempts = 0
+        for locator, candidate in sorted(candidates, key=rank, reverse=True):
+            if len(evidence) >= _VISUAL_CANDIDATE_LIMIT:
+                break
+            if capture_attempts >= _VISUAL_CAPTURE_ATTEMPT_LIMIT:
+                errors.append("candidate_capture:attempt_limit")
+                break
+            capture_attempts += 1
+            source_url = _sanitized_visual_source_url(str(candidate.get("source_url", "")))
+            try:
+                screenshot = await locator.screenshot(
+                    type="jpeg",
+                    quality=72,
+                    animations="disabled",
+                    timeout=_VISUAL_CAPTURE_TIMEOUT_MS,
+                )
+            except PlaywrightError as error:
+                errors.append(f"candidate_capture:{type(error).__name__}")
+                continue
+            payload = bytes(screenshot)
+            if not payload or len(payload) > _VISUAL_MAX_BYTES:
+                errors.append("candidate_capture:attachment_size_out_of_bounds")
+                continue
+            digest = hashlib.sha256(payload).hexdigest()
+            identity = (source_url, digest)
+            if identity in self._visual_evidence_seen:
+                continue
+            directory = Path.home() / ".merlin" / "browser-evidence" / self.context_id
+            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+            path = directory / f"{digest}.jpg"
+            if not await asyncio.to_thread(path.exists):
+                await asyncio.to_thread(path.write_bytes, payload)
+            os.chmod(path, 0o600)
+            self._visual_evidence_seen.add(identity)
+            evidence_digest = hashlib.sha256(f"{source_url}\0{digest}".encode()).hexdigest()
+
+            evidence.append(
+                {
+                    "evidence_ref": f"sha256:{evidence_digest}",
+                    "source_url": source_url,
+                    "source_kind": str(candidate.get("source_kind", "img")),
+                    "tab_ref": tab_ref,
+                    "frame_ref": resolved_frame_ref,
+                    "role": _bounded_visual_metadata(candidate.get("role")),
+                    "alt": _bounded_visual_metadata(candidate.get("alt")),
+                    "aria_label": _bounded_visual_metadata(candidate.get("aria_label")),
+                    "title": _bounded_visual_metadata(candidate.get("title")),
+                    "caption": _bounded_visual_metadata(candidate.get("caption")),
+                    "rendered_width": round(float(candidate.get("rendered_width") or 0), 2),
+                    "rendered_height": round(float(candidate.get("rendered_height") or 0), 2),
+                    "visible_width": round(float(candidate.get("visible_width") or 0), 2),
+                    "visible_height": round(float(candidate.get("visible_height") or 0), 2),
+                    "viewport_coverage": round(float(candidate.get("viewport_coverage") or 0), 4),
+                    "natural_width": int(float(candidate.get("natural_width") or 0)),
+                    "natural_height": int(float(candidate.get("natural_height") or 0)),
+                    "untrusted_target_evidence": True,
+                    "attachment": {
+                        "media_type": "image/jpeg",
+                        "path": str(path),
+                        "sha256": digest,
+                        "byte_length": len(payload),
+                    },
+                }
+            )
+        return tuple(evidence), tuple(dict.fromkeys(errors))
 
     async def fill_requires_redaction(self, tab_ref: str, element_ref: str | None) -> bool:
         """Fail closed unless the fill target is positively a non-sensitive control.
