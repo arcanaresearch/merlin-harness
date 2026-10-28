@@ -74,6 +74,18 @@ def test_tool_context_distinguishes_scheduler_and_technique_attempts() -> None:
     assert context.technique_attempt_id == "technique-attempt-1"
 
 
+def test_tool_context_visual_evidence_is_opt_in() -> None:
+    context = ToolContext(session_id="session-1", workspace_root="/workspace")
+    enabled = ToolContext(
+        session_id="session-1",
+        workspace_root="/workspace",
+        visual_evidence_enabled=True,
+    )
+
+    assert context.visual_evidence_enabled is False
+    assert enabled.visual_evidence_enabled is True
+
+
 def test_terminal_attempt_records_auditable_retryable_disposition() -> None:
     attempt = TechniqueAttempt(
         id="00000000-0000-0000-0000-000000000003",

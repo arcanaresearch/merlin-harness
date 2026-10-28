@@ -50,6 +50,13 @@ _VISUAL_CAPTURE_TIMEOUT_MS = 1_500
 _VISUAL_MIN_AXIS_PX = 96
 _VISUAL_MIN_AREA_PX = 24_000
 _VISUAL_MAX_BYTES = 5_242_880
+_VISUAL_VIEWPORT_MAX_WIDTH_PX = 2_048
+_VISUAL_VIEWPORT_MAX_HEIGHT_PX = 1_440
+_SENSITIVE_RENDERED_CONTROL_SELECTOR = (
+    'input[type="password" i], '
+    'input[autocomplete~="current-password" i], '
+    'input[autocomplete~="new-password" i]'
+)
 
 _ELEMENT_SURFACE_METADATA_SCRIPT = """
     (elements, limit) => {
@@ -312,6 +319,14 @@ def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
     if not useful_label:
         return False
     return viewport_coverage < 0.7 or (useful_label and (role == "img" or tag == "figure"))
+
+
+async def _page_contains_sensitive_rendered_control(page: Page) -> bool:
+    """Fail closed when any attached frame contains a rendered credential control."""
+    for candidate_frame in page.frames:
+        if await candidate_frame.locator(_SENSITIVE_RENDERED_CONTROL_SELECTOR).count():
+            return True
+    return False
 
 
 def _json_string_paths(value: object, prefix: str = "") -> tuple[tuple[str, str], ...]:
@@ -851,21 +866,130 @@ class BrowserSession:
         tab_ref: str,
         frame_ref: str | None = None,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
-        """Capture bounded, visible content images without changing snapshot semantics."""
+        """Capture one bounded viewport plus supplemental visible content images."""
         page = self._page(tab_ref)
         await self._enforce_page(page)
         frame, resolved_frame_ref = self._frame(page, frame_ref)
+        evidence: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        async def retain_capture(
+            payload: bytes,
+            *,
+            source_kind: str,
+            source_url: str,
+            evidence_frame_ref: str | None = resolved_frame_ref,
+        ) -> dict[str, object] | None:
+            if not payload or len(payload) > _VISUAL_MAX_BYTES:
+                capture_kind = (
+                    "viewport_capture" if source_kind == "viewport" else "candidate_capture"
+                )
+                errors.append(f"{capture_kind}:attachment_size_out_of_bounds")
+                return None
+            digest = hashlib.sha256(payload).hexdigest()
+            identity_source = f"viewport:{source_url}" if source_kind == "viewport" else source_url
+            identity = (identity_source, digest)
+            if identity in self._visual_evidence_seen:
+                return None
+            directory = Path.home() / ".merlin" / "browser-evidence" / self.context_id
+            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+            path = directory / f"{digest}.jpg"
+            if not await asyncio.to_thread(path.exists):
+                await asyncio.to_thread(path.write_bytes, payload)
+            os.chmod(path, 0o600)
+            self._visual_evidence_seen.add(identity)
+            evidence_digest = hashlib.sha256(f"{identity_source}\0{digest}".encode()).hexdigest()
+            return {
+                "evidence_ref": f"sha256:{evidence_digest}",
+                "source_url": source_url,
+                "source_kind": source_kind,
+                "tab_ref": tab_ref,
+                "frame_ref": evidence_frame_ref,
+                "untrusted_target_evidence": True,
+                "attachment": {
+                    "media_type": "image/jpeg",
+                    "path": str(path),
+                    "sha256": digest,
+                    "byte_length": len(payload),
+                },
+            }
+
+        sensitive_control = False
+        try:
+            sensitive_control = await _page_contains_sensitive_rendered_control(page)
+        except PlaywrightError as error:
+            sensitive_control = True
+            errors.append(f"viewport_inspection:{type(error).__name__}")
+        if sensitive_control:
+            errors.append("viewport_capture:sensitive_form_redacted")
+            return (), tuple(dict.fromkeys(errors))
+        else:
+            viewport_width = 0
+            viewport_height = 0
+            viewport_within_bounds = False
+            try:
+                raw_viewport = await page.evaluate(
+                    """() => ({
+                        width: window.innerWidth > 0
+                            ? window.innerWidth
+                            : document.documentElement.clientWidth || 0,
+                        height: window.innerHeight > 0
+                            ? window.innerHeight
+                            : document.documentElement.clientHeight || 0,
+                    })"""
+                )
+                viewport_width = int(
+                    raw_viewport.get("width", 0) if isinstance(raw_viewport, dict) else 0
+                )
+                viewport_height = int(
+                    raw_viewport.get("height", 0) if isinstance(raw_viewport, dict) else 0
+                )
+                viewport_within_bounds = (
+                    0 < viewport_width <= _VISUAL_VIEWPORT_MAX_WIDTH_PX
+                    and 0 < viewport_height <= _VISUAL_VIEWPORT_MAX_HEIGHT_PX
+                )
+                if not viewport_within_bounds:
+                    errors.append("viewport_capture:viewport_size_out_of_bounds")
+                else:
+                    screenshot = await page.screenshot(
+                        type="jpeg",
+                        quality=68,
+                        animations="allow",
+                        caret="initial",
+                        full_page=False,
+                        scale="css",
+                        timeout=_VISUAL_CAPTURE_TIMEOUT_MS,
+                    )
+                    retained = await retain_capture(
+                        bytes(screenshot),
+                        source_kind="viewport",
+                        source_url=_sanitized_visual_source_url(page.url),
+                        evidence_frame_ref=None,
+                    )
+                    if retained is not None:
+                        evidence.append(
+                            {
+                                **retained,
+                                "viewport_width": viewport_width,
+                                "viewport_height": viewport_height,
+                                "full_page": False,
+                                "requested_frame_ref": resolved_frame_ref,
+                            }
+                        )
+            except PlaywrightError as error:
+                errors.append(f"viewport_capture:{type(error).__name__}")
+        if not viewport_within_bounds:
+            return tuple(evidence), tuple(dict.fromkeys(errors))
         candidate_script = """
             (element, sourceKind) => {
                 const rect = element.getBoundingClientRect();
-                const viewportWidth = Math.max(
-                    window.innerWidth || 0,
-                    document.documentElement.clientWidth || 0
-                );
-                const viewportHeight = Math.max(
-                    window.innerHeight || 0,
-                    document.documentElement.clientHeight || 0
-                );
+                const viewportWidth = window.innerWidth > 0
+                    ? window.innerWidth
+                    : document.documentElement.clientWidth || 0;
+                const viewportHeight = window.innerHeight > 0
+                    ? window.innerHeight
+                    : document.documentElement.clientHeight || 0;
                 let clipLeft = Math.max(rect.left, 0);
                 let clipRight = Math.min(rect.right, viewportWidth);
                 let clipTop = Math.max(rect.top, 0);
@@ -928,6 +1052,8 @@ class BrowserSession:
                     aria_label: element.getAttribute("aria-label") || "",
                     title: element.getAttribute("title") || "",
                     caption: captionNode ? (captionNode.innerText || "").trim() : "",
+                    visible_offset_x: clipLeft - rect.left,
+                    visible_offset_y: clipTop - rect.top,
                     rendered_width: rect.width,
                     rendered_height: rect.height,
                     visible_width: visibleWidth,
@@ -942,7 +1068,6 @@ class BrowserSession:
             }
         """
         candidates: list[tuple[Locator, dict[str, object]]] = []
-        errors: list[str] = []
         sources = (
             ("img", frame.locator("img")),
             ("css_background", frame.locator('figure, [role="img"]')),
@@ -971,7 +1096,6 @@ class BrowserSession:
             normal_image = int(candidate.get("source_kind") == "img")
             return normal_image, strong_semantics, float(candidate.get("visible_area") or 0)
 
-        evidence: list[dict[str, object]] = []
         capture_attempts = 0
         for locator, candidate in sorted(candidates, key=rank, reverse=True):
             if len(evidence) >= _VISUAL_CANDIDATE_LIMIT:
@@ -982,40 +1106,60 @@ class BrowserSession:
             capture_attempts += 1
             source_url = _sanitized_visual_source_url(str(candidate.get("source_url", "")))
             try:
-                screenshot = await locator.screenshot(
+                bounding_box = await locator.bounding_box()
+                if bounding_box is None:
+                    errors.append("candidate_capture:bounding_box_unavailable")
+                    continue
+                viewport_x = max(
+                    0.0,
+                    float(bounding_box["x"])
+                    + float(candidate.get("visible_offset_x") or 0),
+                )
+                viewport_y = max(
+                    0.0,
+                    float(bounding_box["y"])
+                    + float(candidate.get("visible_offset_y") or 0),
+                )
+                clip_width = min(
+                    float(candidate.get("visible_width") or 0),
+                    max(0.0, viewport_width - viewport_x),
+                )
+                clip_height = min(
+                    float(candidate.get("visible_height") or 0),
+                    max(0.0, viewport_height - viewport_y),
+                )
+                if clip_width <= 0 or clip_height <= 0:
+                    errors.append("candidate_capture:clip_out_of_viewport")
+                    continue
+                screenshot = await page.screenshot(
                     type="jpeg",
                     quality=72,
-                    animations="disabled",
+                    animations="allow",
+                    caret="initial",
+                    full_page=False,
+                    scale="css",
+                    clip={
+                        "x": viewport_x,
+                        "y": viewport_y,
+                        "width": clip_width,
+                        "height": clip_height,
+                    },
                     timeout=_VISUAL_CAPTURE_TIMEOUT_MS,
                 )
             except PlaywrightError as error:
                 errors.append(f"candidate_capture:{type(error).__name__}")
                 continue
             payload = bytes(screenshot)
-            if not payload or len(payload) > _VISUAL_MAX_BYTES:
-                errors.append("candidate_capture:attachment_size_out_of_bounds")
+            retained = await retain_capture(
+                payload,
+                source_kind=str(candidate.get("source_kind", "img")),
+                source_url=source_url,
+            )
+            if retained is None:
                 continue
-            digest = hashlib.sha256(payload).hexdigest()
-            identity = (source_url, digest)
-            if identity in self._visual_evidence_seen:
-                continue
-            directory = Path.home() / ".merlin" / "browser-evidence" / self.context_id
-            await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-            path = directory / f"{digest}.jpg"
-            if not await asyncio.to_thread(path.exists):
-                await asyncio.to_thread(path.write_bytes, payload)
-            os.chmod(path, 0o600)
-            self._visual_evidence_seen.add(identity)
-            evidence_digest = hashlib.sha256(f"{source_url}\0{digest}".encode()).hexdigest()
-
             evidence.append(
                 {
-                    "evidence_ref": f"sha256:{evidence_digest}",
-                    "source_url": source_url,
-                    "source_kind": str(candidate.get("source_kind", "img")),
-                    "tab_ref": tab_ref,
-                    "frame_ref": resolved_frame_ref,
+                    **retained,
                     "role": _bounded_visual_metadata(candidate.get("role")),
                     "alt": _bounded_visual_metadata(candidate.get("alt")),
                     "aria_label": _bounded_visual_metadata(candidate.get("aria_label")),
@@ -1028,13 +1172,6 @@ class BrowserSession:
                     "viewport_coverage": round(float(candidate.get("viewport_coverage") or 0), 4),
                     "natural_width": int(float(candidate.get("natural_width") or 0)),
                     "natural_height": int(float(candidate.get("natural_height") or 0)),
-                    "untrusted_target_evidence": True,
-                    "attachment": {
-                        "media_type": "image/jpeg",
-                        "path": str(path),
-                        "sha256": digest,
-                        "byte_length": len(payload),
-                    },
                 }
             )
         return tuple(evidence), tuple(dict.fromkeys(errors))
@@ -1162,9 +1299,14 @@ class BrowserSession:
             await asyncio.sleep(0.1)
 
     async def capture_failure_diagnostics(
-        self, tab_ref: str, frame_ref: str | None = None, *, step: int = 0
-    ) -> tuple[BrowserObservation, BrowserObservation, dict[str, object]]:
-        """Capture bounded visual, DOM, and redacted network state after a failed action."""
+        self,
+        tab_ref: str,
+        frame_ref: str | None = None,
+        *,
+        step: int = 0,
+        capture_screenshot: bool = False,
+    ) -> tuple[BrowserObservation, BrowserObservation, dict[str, object] | None]:
+        """Capture bounded DOM/network diagnostics and an authorized screenshot."""
         page = self._page(tab_ref)
         snapshot = await self.snapshot(tab_ref, frame_ref, step=step)
         events = [
@@ -1176,6 +1318,14 @@ class BrowserSession:
             text=json.dumps(events, sort_keys=True, separators=(",", ":")),
             step=step,
         )
+        if not capture_screenshot:
+            return snapshot, network, None
+        try:
+            sensitive_control = await _page_contains_sensitive_rendered_control(page)
+        except PlaywrightError:
+            sensitive_control = True
+        if sensitive_control:
+            return snapshot, network, None
         directory = Path.home() / ".merlin" / "browser-diagnostics" / self.context_id
         await asyncio.to_thread(directory.mkdir, mode=0o700, parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
@@ -1185,7 +1335,8 @@ class BrowserSession:
             type="jpeg",
             quality=60,
             full_page=False,
-            animations="disabled",
+            animations="allow",
+            caret="initial",
             timeout=5_000,
         )
         os.chmod(path, 0o600)

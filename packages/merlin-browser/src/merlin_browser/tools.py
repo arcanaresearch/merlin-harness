@@ -978,6 +978,7 @@ class BrowserTool:
                 kind == "snapshot"
                 and observation.kind == "snapshot"
                 and _browser_action_kind(context, kind) == StateScopeActionKind.RECONNAISSANCE
+                and context.visual_evidence_enabled
             ):
                 try:
                     visual_evidence, visual_capture_errors = await session.capture_visual_evidence(
@@ -1020,19 +1021,22 @@ class BrowserTool:
                         diagnostic_tab,
                         action.frame_ref,
                         step=action.step,
+                        capture_screenshot=context.visual_evidence_enabled,
                     )
                     diagnostics = {
                         "snapshot": snapshot.model_dump(mode="json"),
                         "network": network.model_dump(mode="json"),
-                        "screenshot": screenshot,
                     }
+                    if screenshot is not None:
+                        diagnostics["screenshot"] = screenshot
                     if self._recorder is not None:
-                        await self._recorder.record_evidence(
-                            action.context_id,
-                            str(screenshot["evidence_ref"]),
-                            "browser_failure_screenshot",
-                            screenshot,
-                        )
+                        if screenshot is not None:
+                            await self._recorder.record_evidence(
+                                action.context_id,
+                                str(screenshot["evidence_ref"]),
+                                "browser_failure_screenshot",
+                                screenshot,
+                            )
                         await self._recorder.append_observation(snapshot)
                         await self._recorder.append_observation(network)
                 except Exception as diagnostic_error:
@@ -1059,7 +1063,13 @@ class BrowserTool:
                         if diagnostics is not None
                         else "No live tab was available for automatic diagnostics."
                     )
-                    + "\nInspect the captured screenshot, DOM snapshot, frames, disabled "
+                    + "\nInspect the captured "
+                    + (
+                        "screenshot, "
+                        if diagnostics is not None and "screenshot" in diagnostics
+                        else ""
+                    )
+                    + "DOM snapshot, frames, disabled "
                     "controls, and redacted network events before changing strategy."
                 ),
                 is_error=True,

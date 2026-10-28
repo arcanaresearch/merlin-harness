@@ -3465,12 +3465,14 @@ async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tm
             assert name == "browser_snapshot"
             assert context.attempt_id == "lease-1"
             assert context.state_action_kind == "reconnaissance"
+            assert context.visual_evidence_enabled is True
             return ToolResult(
                 content="snapshot with retained visual evidence",
                 metadata={
                     "visual_evidence": [
                         {
                             "evidence_ref": "sha256:" + "a" * 64,
+                            "source_kind": "viewport",
                             "untrusted_target_evidence": True,
                             "attachment": {
                                 "media_type": "image/jpeg",
@@ -3566,6 +3568,7 @@ async def test_unavailable_visual_route_preserves_pending_visual_review(
             )
 
         async def invoke(self, name, context, arguments):
+            assert context.visual_evidence_enabled is False
             return ToolResult(
                 content="snapshot with retained visual evidence",
                 metadata={

@@ -55,6 +55,7 @@ class ToolContext(BaseModel):
     state_action_kind: (
         Literal["reconnaissance", "baseline", "candidate", "validation", "cleanup"] | None
     ) = None
+    visual_evidence_enabled: bool = False
     transform_bindings: tuple[tuple[str, str, str], ...] = ()
     planned_language: str = "und"
     requested_language: str = "und"

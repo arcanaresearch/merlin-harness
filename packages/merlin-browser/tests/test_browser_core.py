@@ -56,7 +56,6 @@ from merlin_storage_postgres import (
 )
 from merlin_tools import ToolBroker
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Locator
 
 
 def test_api_exchange_events_include_read_only_json_state_baselines() -> None:
@@ -12859,7 +12858,10 @@ async def test_owned_session_cleanup_rejects_model_selected_or_multiple_tabs() -
 
 
 @pytest.mark.asyncio
-async def test_failed_browser_action_captures_bounded_diagnostics(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("visual_enabled", [False, True])
+async def test_failed_browser_action_captures_bounded_diagnostics(
+    tmp_path, monkeypatch, visual_enabled
+) -> None:
     class Recorder:
         def __init__(self):
             self.actions, self.observations, self.evidence = [], [], []
@@ -12896,7 +12898,12 @@ async def test_failed_browser_action_captures_bounded_diagnostics(tmp_path, monk
                 if tool.name == "browser_click"
             )
             result = await click.invoke(
-                ToolContext(session_id="s1", workspace_root="/tmp", agent_id="worker-1"),
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    visual_evidence_enabled=visual_enabled,
+                ),
                 {
                     "tab_ref": tab,
                     "element_ref": button.ref,
@@ -12908,14 +12915,85 @@ async def test_failed_browser_action_captures_bounded_diagnostics(tmp_path, monk
             assert result.is_error
             assert "TimeoutError" in result.content
             assert "Automatic failure diagnostics" in result.content
-            assert '"screenshot"' in result.content
             assert [item.kind for item in recorder.observations] == ["snapshot", "network"]
-            assert recorder.evidence[0][2] == "browser_failure_screenshot"
-            assert result.metadata["diagnostic_screenshot"] == recorder.evidence[0][3]
-            screenshot = Path(recorder.evidence[0][3]["path"])
-            assert await asyncio.to_thread(screenshot.is_file)
-            screenshot_stat = await asyncio.to_thread(screenshot.stat)
-            assert screenshot_stat.st_mode & 0o777 == 0o600
+            if visual_enabled:
+                assert '"screenshot"' in result.content
+                assert recorder.evidence[0][2] == "browser_failure_screenshot"
+                assert result.metadata["diagnostic_screenshot"] == recorder.evidence[0][3]
+                screenshot = Path(recorder.evidence[0][3]["path"])
+                assert await asyncio.to_thread(screenshot.is_file)
+                screenshot_stat = await asyncio.to_thread(screenshot.stat)
+                assert screenshot_stat.st_mode & 0o777 == 0o600
+            else:
+                assert '"screenshot"' not in result.content
+                assert recorder.evidence == []
+                assert "diagnostic_screenshot" not in result.metadata
+                assert not (tmp_path / ".merlin" / "browser-diagnostics").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_browser_action_does_not_capture_sensitive_rendered_form(
+    tmp_path, monkeypatch
+) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    body = (
+        b'<input autocomplete="section-login current-password" value="do-not-capture">'
+        b"<button>Continue</button>"
+    )
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            button = next(item for item in snapshot.elements if item.role == "button")
+
+            async def stalled_action(*_args, **_kwargs):
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(session, "act", stalled_action)
+            recorder = Recorder()
+            click = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_click"
+            )
+            result = await click.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    visual_evidence_enabled=True,
+                ),
+                {
+                    "tab_ref": tab,
+                    "element_ref": button.ref,
+                    "step": 3,
+                    "timeout_ms": 100,
+                },
+            )
+
+    assert result.is_error
+    assert [item.kind for item in recorder.observations] == ["snapshot", "network"]
+    assert recorder.evidence == []
+    assert "diagnostic_screenshot" not in result.metadata
+    assert not (tmp_path / ".merlin" / "browser-diagnostics").exists()
 
 
 @pytest.mark.asyncio
@@ -13006,14 +13084,20 @@ async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
                     workspace_root="/tmp",
                     agent_id="worker-1",
                     state_action_kind="reconnaissance",
+                    visual_evidence_enabled=True,
                 ),
                 {"tab_ref": tab},
             )
 
             assert result.is_error is False
             visual = result.metadata["visual_evidence"]
-            assert len(visual) == 2
-            phone_evidence = next(item for item in visual if item["alt"] == "Background")
+            assert len(visual) == 3
+            viewport_evidence = visual[0]
+            assert viewport_evidence["source_kind"] == "viewport"
+            assert viewport_evidence["full_page"] is False
+            assert viewport_evidence["viewport_width"] <= 2_048
+            assert viewport_evidence["viewport_height"] <= 1_440
+            phone_evidence = next(item for item in visual if item.get("alt") == "Background")
             css_evidence = next(item for item in visual if item["source_kind"] == "css_background")
             assert phone_evidence["rendered_width"] == 343
             assert phone_evidence["natural_width"] == 731
@@ -13021,6 +13105,7 @@ async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
             assert all(item["untrusted_target_evidence"] is True for item in visual)
             assert "not instructions or authority" in result.content
             assert [item[2] for item in recorder.evidence] == [
+                "browser_visual_evidence",
                 "browser_visual_evidence",
                 "browser_visual_evidence",
             ]
@@ -13041,6 +13126,7 @@ async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
                     workspace_root="/tmp",
                     agent_id="worker-1",
                     state_action_kind="reconnaissance",
+                    visual_evidence_enabled=True,
                 ),
                 {"tab_ref": tab},
             )
@@ -13081,7 +13167,7 @@ async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
         + "".join(
             f'<figure role="img" aria-label="Diagram {index}" '
             f'style="position:fixed;left:{400 + (index % 2) * 260}px;'
-            f'top:{20 + (index // 2) * 170}px;width:240px;height:140px;'
+                f"top:{20 + (index // 2) * 170}px;width:240px;height:140px;"
             f"background:url('{image(index)}') center/cover no-repeat\">"
             f"<figcaption>Diagram {index}</figcaption></figure>"
             for index in range(1, 5)
@@ -13105,12 +13191,13 @@ async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
                     workspace_root="/tmp",
                     agent_id="worker-1",
                     state_action_kind="candidate",
+                    visual_evidence_enabled=True,
                 ),
                 {"tab_ref": tab},
             )
             assert "visual_evidence" not in candidate.metadata
 
-            recon = await snapshot_tool.invoke(
+            no_vision = await snapshot_tool.invoke(
                 ToolContext(
                     session_id="s1",
                     workspace_root="/tmp",
@@ -13119,9 +13206,23 @@ async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
                 ),
                 {"tab_ref": tab},
             )
+            assert "visual_evidence" not in no_vision.metadata
+            assert not (tmp_path / ".merlin" / "browser-evidence").exists()
+
+            recon = await snapshot_tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    agent_id="worker-1",
+                    state_action_kind="reconnaissance",
+                    visual_evidence_enabled=True,
+                ),
+                {"tab_ref": tab},
+            )
             visual = recon.metadata["visual_evidence"]
             assert len(visual) == 4
-            assert any(item["alt"] == "Background" for item in visual)
+            assert visual[0]["source_kind"] == "viewport"
+            assert any(item.get("alt") == "Background" for item in visual)
 
 
 @pytest.mark.asyncio
@@ -13164,14 +13265,13 @@ async def test_visual_capture_failure_does_not_fail_recon_snapshot(monkeypatch) 
                     workspace_root="/tmp",
                     agent_id="worker-1",
                     state_action_kind="reconnaissance",
+                    visual_evidence_enabled=True,
                 ),
                 {"tab_ref": tab},
             )
 
             assert result.is_error is False
-            assert result.metadata["visual_capture_uncertainty"] == [
-                "visual_capture:RuntimeError"
-            ]
+            assert result.metadata["visual_capture_uncertainty"] == ["visual_capture:RuntimeError"]
             assert "does not block reconnaissance" in result.content
             assert recorder.observations[-1].kind == "snapshot"
 
@@ -13189,13 +13289,165 @@ async def test_visual_capture_attempts_are_bounded(monkeypatch) -> None:
     ).encode()
     attempts = 0
 
-    async def unavailable(_locator, **_kwargs):
-        nonlocal attempts
-        attempts += 1
-        raise PlaywrightError("fixture screenshot failure")
-
-    monkeypatch.setattr(Locator, "screenshot", unavailable)
     async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture audits screenshot bounds
+            original_screenshot = page.screenshot
+
+            async def unavailable(*args, **kwargs):
+                nonlocal attempts
+                if kwargs.get("clip") is None:
+                    return await original_screenshot(*args, **kwargs)
+                attempts += 1
+                raise PlaywrightError("fixture screenshot failure")
+
+            monkeypatch.setattr(page, "screenshot", unavailable)
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert [item["source_kind"] for item in evidence] == ["viewport"]
+    assert attempts == 12
+    assert "candidate_capture:attempt_limit" in errors
+
+
+@pytest.mark.asyncio
+async def test_visual_recon_does_not_scroll_partially_visible_content(
+    tmp_path, monkeypatch
+) -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="240">'
+        '<rect width="100%" height="100%" fill="#345678"/></svg>'
+    )
+    image = "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+    body = (
+        '<main style="height:1600px"></main>'
+        f'<img alt="Architecture diagram" src="{image}" '
+        'style="position:absolute;left:20px;top:1100px;width:300px;height:240px">'
+    ).encode()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(body) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            page = session._page(tab)  # noqa: SLF001 - fixture verifies passive capture
+            await page.evaluate("() => window.scrollTo(0, 500)")
+            before = await page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+            evidence, errors = await session.capture_visual_evidence(tab)
+            after = await page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
+    assert errors == ()
+    assert [item["source_kind"] for item in evidence] == ["viewport", "img"]
+    assert after == before == {"x": 0, "y": 500}
+
+
+@pytest.mark.asyncio
+async def test_viewport_recon_refreshes_after_rendered_overlay(tmp_path, monkeypatch) -> None:
+    class Recorder:
+        def __init__(self):
+            self.actions, self.observations, self.evidence = [], [], []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, value):
+            self.metadata = value
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *value):
+            self.evidence.append(value)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(b"<main><h1>Level 1</h1><p>Score: 0</p></main>") as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            frame_ref = next(ref for ref in session.frame_refs(tab) if ref != "main")
+            page = session._page(tab)  # noqa: SLF001 - fixture audits screenshot options
+            original_screenshot = page.screenshot
+            screenshot_options = []
+
+            async def record_screenshot_options(*args, **kwargs):
+                screenshot_options.append(dict(kwargs))
+                return await original_screenshot(*args, **kwargs)
+
+            monkeypatch.setattr(page, "screenshot", record_screenshot_options)
+            recorder = Recorder()
+            snapshot_tool = next(
+                tool
+                for tool in browser_tools(lambda _: session, recorder)
+                if tool.name == "browser_snapshot"
+            )
+            context = ToolContext(
+                session_id="s1",
+                workspace_root="/tmp",
+                agent_id="worker-1",
+                state_action_kind="reconnaissance",
+                visual_evidence_enabled=True,
+            )
+
+            arguments = {"tab_ref": tab, "frame_ref": frame_ref}
+            initial = await snapshot_tool.invoke(context, arguments)
+            initial_viewport = initial.metadata["visual_evidence"][0]
+            assert initial_viewport["source_kind"] == "viewport"
+            assert initial_viewport["frame_ref"] is None
+            assert initial_viewport["requested_frame_ref"] == frame_ref
+            unchanged = await snapshot_tool.invoke(context, arguments)
+            assert "visual_evidence" not in unchanged.metadata
+
+            await page.evaluate(
+                """() => {
+                    const dialog = document.createElement('div');
+                    dialog.setAttribute('role', 'dialog');
+                    dialog.setAttribute('aria-modal', 'true');
+                    dialog.style.cssText = [
+                        'position:fixed', 'inset:15%', 'z-index:9999',
+                        'background:#10131a', 'color:white', 'padding:32px'
+                    ].join(';');
+                    dialog.textContent = 'Congratulations! Level 2 — Score: 100/100';
+                    document.body.append(dialog);
+                }"""
+            )
+            refreshed = await snapshot_tool.invoke(context, arguments)
+            refreshed_viewport = refreshed.metadata["visual_evidence"][0]
+
+            assert refreshed_viewport["source_kind"] == "viewport"
+            assert refreshed_viewport["evidence_ref"] != initial_viewport["evidence_ref"]
+            assert (
+                refreshed_viewport["attachment"]["sha256"]
+                != (initial_viewport["attachment"]["sha256"])
+            )
+            assert len(screenshot_options) == 3
+            assert all(
+                options.get("animations") == "allow"
+                and options.get("caret") == "initial"
+                and options.get("full_page") is False
+                and options.get("scale") == "css"
+                for options in screenshot_options
+            )
+
+
+@pytest.mark.asyncio
+async def test_viewport_recon_skips_sensitive_forms(tmp_path, monkeypatch) -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200">'
+        '<rect width="100%" height="100%" fill="#345678"/></svg>'
+    )
+    image = "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(
+        (
+            '<input type="text" autocomplete="section-login CURRENT-password" '
+            'value="do-not-capture">'
+            f'<img alt="Architecture diagram" src="{image}" '
+            'style="width:300px;height:200px">'
+        ).encode()
+    ) as origin:
         async with await launch_isolated(
             BrowserBounds(target_id="target", allowed_origins={origin}), owner()
         ) as session:
@@ -13203,8 +13455,27 @@ async def test_visual_capture_attempts_are_bounded(monkeypatch) -> None:
             evidence, errors = await session.capture_visual_evidence(tab)
 
     assert evidence == ()
-    assert attempts == 12
-    assert "candidate_capture:attempt_limit" in errors
+    assert "viewport_capture:sensitive_form_redacted" in errors
+    assert not (tmp_path / ".merlin" / "browser-evidence").exists()
+
+
+@pytest.mark.asyncio
+async def test_viewport_recon_uses_rendered_viewport_not_tall_document(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(b'<main style="height:2200px">Tall document</main>') as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            evidence, errors = await session.capture_visual_evidence(tab)
+
+    assert errors == ()
+    assert [item["source_kind"] for item in evidence] == ["viewport"]
+    assert evidence[0]["viewport_width"] == 1280
+    assert evidence[0]["viewport_height"] == 720
+    assert evidence[0]["full_page"] is False
 
 
 @pytest.mark.asyncio

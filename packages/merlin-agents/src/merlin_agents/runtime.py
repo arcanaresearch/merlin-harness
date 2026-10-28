@@ -2540,6 +2540,9 @@ class WorkerRuntime:
                 evaluation_uncertainties.append(fact)
 
         visual_model = handoff.assignment.provider_model or handoff.model
+        visual_evidence_enabled = reconnaissance_worker and self._provider_supports_vision(
+            visual_model
+        )
 
         def process_visual_review(
             call_name: str,
@@ -4062,6 +4065,7 @@ class WorkerRuntime:
                                 state_action_kind=(
                                     "reconnaissance" if reconnaissance_worker else None
                                 ),
+                                visual_evidence_enabled=visual_evidence_enabled,
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -4260,6 +4264,7 @@ class WorkerRuntime:
                     target_effects_blocked=handoff.target_effects_blocked,
                     effect_attempt_lineage=handoff.effect_attempt_lineage,
                     state_action_kind="reconnaissance" if reconnaissance_worker else None,
+                    visual_evidence_enabled=visual_evidence_enabled,
                     transform_bindings=handoff.assignment.transform_bindings,
                     planned_language=handoff.assignment.planned_language,
                     requested_language=handoff.assignment.requested_language,
@@ -5019,6 +5024,7 @@ class WorkerRuntime:
                                 state_action_kind=(
                                     "reconnaissance" if reconnaissance_worker else None
                                 ),
+                                visual_evidence_enabled=visual_evidence_enabled,
                                 transform_bindings=handoff.assignment.transform_bindings,
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
@@ -6111,6 +6117,7 @@ class WorkerRuntime:
                                     state_action_kind=(
                                         "reconnaissance" if reconnaissance_worker else None
                                     ),
+                                    visual_evidence_enabled=visual_evidence_enabled,
                                     transform_bindings=handoff.assignment.transform_bindings,
                                     planned_language=handoff.assignment.planned_language,
                                     requested_language=handoff.assignment.requested_language,
