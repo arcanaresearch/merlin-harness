@@ -9967,6 +9967,385 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
 
 
 @pytest.mark.asyncio
+async def test_compiled_chat_exchange_uses_reviewed_affinity_among_identical_tabs() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent=
+        'assistant:'+document.querySelector('textarea').value;
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+            self.affinity_calls = []
+            self.reviewed_tab_ref = ""
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def reviewed_tab_affinity(self, handoff_id, target_id):
+            self.affinity_calls.append((handoff_id, target_id))
+            return {
+                "context_id": session.context_id,
+                "target_id": target_id,
+                "tab_ref": self.reviewed_tab_ref,
+            }
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tabs = [await session.new_tab(origin) for _ in range(4)]
+            adapter = reviewed_browser_adapter(origin)
+            adapter["recon_handoff_id"] = "handoff:reviewed-tab"
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "interaction": False,
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "interaction": True,
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+            recorder.reviewed_tab_ref = tabs[1]
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False
+            assert recorder.affinity_calls == [("handoff:reviewed-tab", "target")]
+            assert {item.tab_ref for item in recorder.observations[:4]} == set(tabs)
+            assert [item.kind for item in recorder.actions] == ["fill", "click"]
+            assert {item.tab_ref for item in recorder.actions} == {tabs[1]}
+            action_gap_ms = (
+                recorder.actions[1].created_at - recorder.actions[0].created_at
+            ).total_seconds() * 1000
+            assert action_gap_ms < 500
+            assert result.metadata["tab_resolution"] == "reviewed_handoff_affinity"
+            assert 0 <= result.metadata["fill_to_submit_ms"] < 500
+            assert result.metadata["submit_action_ms"] >= 0
+            assert result.metadata["response_wait_ms"] >= 0
+            exchange = result.metadata["target_exchanges"][0]
+            assert exchange["fill_to_submit_ms"] == result.metadata["fill_to_submit_ms"]
+            assert exchange["submit_action_ms"] == result.metadata["submit_action_ms"]
+            assert exchange["response_wait_ms"] == result.metadata["response_wait_ms"]
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_fails_closed_after_snapshotting_ambiguous_tabs() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+            self.affinity_calls = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def reviewed_tab_affinity(self, handoff_id, target_id):
+            self.affinity_calls.append((handoff_id, target_id))
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tabs = [await session.new_tab(origin) for _ in range(4)]
+            adapter = reviewed_browser_adapter(origin)
+            adapter["recon_handoff_id"] = "handoff:missing-affinity"
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "interaction": False,
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "interaction": True,
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "ambiguous_target_tabs"
+            assert result.metadata["compatible_tab_count"] == 4
+            assert result.metadata["reviewed_tab_affinity"] == "not_available"
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert recorder.affinity_calls == [("handoff:missing-affinity", "target")]
+            assert {item.tab_ref for item in recorder.observations} == set(tabs)
+            assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_rejects_stale_cross_endpoint_affinity() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='assistant:sent';
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+            self.reviewed_tab_ref = ""
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def reviewed_tab_affinity(self, _handoff_id, target_id):
+            return {
+                "context_id": session.context_id,
+                "target_id": target_id,
+                "tab_ref": self.reviewed_tab_ref,
+            }
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            exact_tab = await session.new_tab(origin)
+            stale_tab = await session.new_tab(f"{origin}/lookalike")
+            adapter = reviewed_browser_adapter(origin)
+            adapter["recon_handoff_id"] = "handoff:stale-cross-endpoint"
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+            recorder.reviewed_tab_ref = stale_tab
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["tab_resolution"] == "unique_exact_endpoint_tab"
+            assert {item.tab_ref for item in recorder.actions} == {exact_tab}
+            assert stale_tab != exact_tab
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_classifies_zero_compatible_tabs_for_reobservation() -> (
+    None
+):
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture() as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(f"{origin}/api/message")
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "target_tab_unavailable"
+            assert result.metadata["compatible_tab_count"] == 0
+            assert result.metadata["reobserve_required"] is True
+            assert [item.tab_ref for item in recorder.observations] == [tab]
+            assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_releases_scope_when_affinity_lookup_fails() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def reviewed_tab_affinity(self, _handoff_id, _target_id):
+            raise RuntimeError("storage unavailable")
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tabs = [await session.new_tab(origin) for _ in range(2)]
+            adapter = reviewed_browser_adapter(origin)
+            adapter["recon_handoff_id"] = "handoff:resolver-failure"
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+            state_scope_store = _StateScopeFixtureStore()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: adapter,
+                    state_scope_store,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "reviewed_tab_affinity_unavailable"
+            assert result.metadata["target_effect_attempted"] is False
+            assert set(item.tab_ref for item in recorder.observations) == set(tabs)
+            assert recorder.actions == []
+            assert state_scope_store.events == ["created", "claimed", "paused", "released"]
+
+
+@pytest.mark.asyncio
 async def test_reviewed_clone_isolation_rekeys_cross_campaign_browser_scopes() -> None:
     chat = b"""
     <input aria-label="Clone state">
@@ -12279,6 +12658,9 @@ async def test_compiled_chat_exchange_waits_for_complete_multi_message_boundary(
             assert exchange["response_boundary_complete"] is True
             assert "assistant:hello assistant:follow-up" in exchange["response"]
             assert exchange.get("evaluation_uncertain") is not True
+            assert exchange["fill_to_submit_ms"] < 500
+            assert exchange["submit_action_ms"] >= 0
+            assert exchange["response_wait_ms"] >= 250
 
 
 @pytest.mark.asyncio

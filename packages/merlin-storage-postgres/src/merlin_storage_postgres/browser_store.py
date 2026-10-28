@@ -300,6 +300,57 @@ class BrowserRepository:
         return {item["evidence_ref"] for item in evidence} == requested
 
 
+def _reviewed_tab_affinity(
+    connection: Any, handoff_id: str, target_id: str
+) -> dict[str, str] | None:
+    """Resolve one tab only when both sealed handoff evidence anchors agree."""
+    row = connection.execute(
+        """SELECT handoff.context_id, handoff.target_id,
+                  request_evidence.payload->>'tab_ref' AS tab_ref
+             FROM merlin_storage.browser_recon_handoffs AS handoff
+             JOIN merlin_storage.browser_contexts AS context
+               ON context.context_id = handoff.context_id
+              AND context.target_id = handoff.target_id
+             JOIN merlin_storage.browser_evidence AS request_evidence
+               ON request_evidence.evidence_ref = handoff.request_evidence_ref
+              AND request_evidence.context_id = handoff.context_id
+              AND request_evidence.kind = 'browser_action'
+             JOIN merlin_storage.browser_evidence AS response_evidence
+               ON response_evidence.evidence_ref = handoff.response_evidence_ref
+              AND response_evidence.context_id = handoff.context_id
+              AND response_evidence.kind = 'browser_action'
+            WHERE handoff.handoff_id = %s
+              AND handoff.target_id = %s
+              AND request_evidence.payload @> jsonb_build_object(
+                    'context_id', handoff.context_id,
+                    'target_id', handoff.target_id
+                  )
+              AND response_evidence.payload @> jsonb_build_object(
+                    'context_id', handoff.context_id,
+                    'target_id', handoff.target_id
+                  )
+              AND jsonb_typeof(request_evidence.payload->'tab_ref') = 'string'
+              AND jsonb_typeof(response_evidence.payload->'tab_ref') = 'string'
+              AND btrim(request_evidence.payload->>'tab_ref') <> ''
+              AND request_evidence.payload->>'tab_ref'
+                    = response_evidence.payload->>'tab_ref'
+              AND request_evidence.payload #>> '{owner,session_id}'
+                    = context.session_id::text
+              AND response_evidence.payload #>> '{owner,session_id}'
+                    = context.session_id::text
+              AND handoff.document #>> '{owner,session_id}'
+                    = context.session_id::text""",
+        (handoff_id, target_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "context_id": str(row["context_id"]),
+        "target_id": str(row["target_id"]),
+        "tab_ref": str(row["tab_ref"]),
+    }
+
+
 class PostgresBrowserStore:
     def __init__(self, connection: Any) -> None:
         self._repository = BrowserRepository(connection)
@@ -352,6 +403,14 @@ class PostgresBrowserStore:
             handoff_id,
             target_id,
             evidence_refs,
+        )
+
+    async def reviewed_tab_affinity(self, handoff_id: str, target_id: str) -> dict[str, str] | None:
+        return await self._call(
+            _reviewed_tab_affinity,
+            self._repository.connection,
+            handoff_id,
+            target_id,
         )
 
 

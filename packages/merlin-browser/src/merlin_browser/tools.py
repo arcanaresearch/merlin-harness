@@ -2988,6 +2988,43 @@ def _browser_isolation_baseline(
     return "physical-state:sha256:" + hashlib.sha256(encoded).hexdigest(), None
 
 
+def _browser_submit_timing(
+    *,
+    fill_completed: float | None,
+    submit_started: float | None,
+    submit_completed: float | None,
+    response_completed: float | None,
+) -> dict[str, int | None]:
+    return {
+        "fill_to_submit_ms": (
+            max(0, int((submit_started - fill_completed) * 1_000))
+            if fill_completed is not None and submit_started is not None
+            else None
+        ),
+        "submit_action_ms": (
+            max(0, int((submit_completed - submit_started) * 1_000))
+            if submit_started is not None and submit_completed is not None
+            else None
+        ),
+        "response_wait_ms": (
+            max(0, int((response_completed - submit_completed) * 1_000))
+            if submit_completed is not None and response_completed is not None
+            else None
+        ),
+    }
+
+
+def _browser_endpoint_identity(value: str) -> tuple[str, str, str, str, str]:
+    parts = urlsplit(value)
+    return (
+        parts.scheme.casefold(),
+        parts.netloc.casefold(),
+        parts.path or "/",
+        parts.query,
+        parts.fragment,
+    )
+
+
 class BrowserChatExchangeTool:
     """Execute the reviewed fill/submit browser flow without another model turn."""
 
@@ -3273,6 +3310,8 @@ class BrowserChatExchangeTool:
             and (parts := urlsplit(tab.url)).scheme.casefold() in {"http", "https"}
             and f"{parts.scheme.casefold()}://{parts.netloc.casefold()}" == endpoint_origin
         ]
+        open_tab_urls = {tab.tab_ref: tab.url for tab in open_tabs}
+        endpoint_identity = _browser_endpoint_identity(executable_adapter.endpoint)
         compatible_tabs: list[tuple[str, BrowserObservation]] = []
         for tab in open_tabs:
             observation = await session.snapshot(tab.tab_ref)
@@ -3289,26 +3328,94 @@ class BrowserChatExchangeTool:
                 for compiled_step in executable_adapter.steps
             ):
                 compatible_tabs.append((tab.tab_ref, observation))
+        tab_resolution = "unique_compatible_tab"
+        reviewed_affinity_status = "not_available"
+        if len(compatible_tabs) > 1:
+            handoff_id = adapter.get("recon_handoff_id")
+            affinity_resolver = getattr(self._recorder, "reviewed_tab_affinity", None)
+            if isinstance(handoff_id, str) and handoff_id and callable(affinity_resolver):
+                try:
+                    affinity_value = affinity_resolver(handoff_id, session_target_id)
+                    affinity = (
+                        await affinity_value if isawaitable(affinity_value) else affinity_value
+                    )
+                except asyncio.CancelledError:
+                    await state_scope.pause(MissingEvidenceReason.CAPTURE_INCOMPLETE)
+                    raise
+                except Exception:
+                    await state_scope.pause(MissingEvidenceReason.CAPTURE_INCOMPLETE)
+                    return ToolResult(
+                        content=(
+                            "reviewed browser tab affinity is temporarily unavailable; "
+                            "the target was not called"
+                        ),
+                        is_error=True,
+                        metadata={
+                            **adapter_identity_metadata,
+                            "failure_code": "reviewed_tab_affinity_unavailable",
+                            "retryable": True,
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                            "reobserve_required": True,
+                        },
+                    )
+                if (
+                    isinstance(affinity, Mapping)
+                    and affinity.get("context_id") == session.context_id
+                    and affinity.get("target_id") == session_target_id
+                    and isinstance(affinity.get("tab_ref"), str)
+                ):
+                    reviewed_tabs = [
+                        item
+                        for item in compatible_tabs
+                        if item[0] == affinity["tab_ref"]
+                        and _browser_endpoint_identity(open_tab_urls[item[0]])
+                        == endpoint_identity
+                    ]
+                    reviewed_affinity_status = "stale"
+                    if len(reviewed_tabs) == 1:
+                        compatible_tabs = reviewed_tabs
+                        reviewed_affinity_status = "matched"
+                        tab_resolution = "reviewed_handoff_affinity"
         if len(compatible_tabs) > 1:
             exact_endpoint_tabs = [
                 item
                 for item in compatible_tabs
-                if next(tab.url for tab in open_tabs if tab.tab_ref == item[0])
-                == executable_adapter.endpoint
+                if _browser_endpoint_identity(open_tab_urls[item[0]]) == endpoint_identity
             ]
             if len(exact_endpoint_tabs) == 1:
                 compatible_tabs = exact_endpoint_tabs
+                tab_resolution = "unique_exact_endpoint_tab"
         if len(compatible_tabs) != 1:
+            compatible_tab_count = len(compatible_tabs)
+            failure_code = (
+                "target_tab_unavailable"
+                if compatible_tab_count == 0
+                else "ambiguous_target_tabs"
+            )
             await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
             return ToolResult(
                 content=(
-                    "compiled browser flow requires exactly one open target tab matching "
+                    "compiled browser flow found no open target tab matching the reviewed "
+                    "interaction contract"
+                    if compatible_tab_count == 0
+                    else "compiled browser flow found multiple open target tabs matching "
                     "the reviewed interaction contract"
                 ),
                 is_error=True,
-                metadata=adapter_identity_metadata,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": failure_code,
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "compatible_tab_count": compatible_tab_count,
+                    "reviewed_tab_affinity": reviewed_affinity_status,
+                    "reobserve_required": True,
+                },
             )
         tab_ref, current = compatible_tabs[0]
+        adapter_identity_metadata["tab_resolution"] = tab_resolution
         before_ref = _browser_evidence_ref("before", current)
         try:
             await state_scope.lifecycle.ensure_authoritative_before((before_ref,))
@@ -3569,6 +3676,9 @@ class BrowserChatExchangeTool:
         capability_step_ids = _browser_capability_step_ids(executable_adapter)
         isolation_bound = False
         exchange_started = time.monotonic()
+        fill_completed: float | None = None
+        submit_started: float | None = None
+        submit_completed: float | None = None
         for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
             if role == "interaction" and isolation_plan.isolated and not isolation_bound:
                 equivalence_key, isolation_error = _browser_isolation_baseline(
@@ -3630,9 +3740,13 @@ class BrowserChatExchangeTool:
                 resources_acknowledged = True
             step_arguments["step"] = step
             step_arguments["timeout_ms"] = timeout_ms
+            if name in {"browser_click", "browser_press"}:
+                submit_started = time.monotonic()
             result = await BrowserTool(name, self._resolver, self._recorder, self._failures).invoke(
                 context, step_arguments
             )
+            if name in {"browser_click", "browser_press"}:
+                submit_completed = time.monotonic()
             results.append(result)
             if result.is_error:
                 if resources_acknowledged:
@@ -3650,9 +3764,17 @@ class BrowserChatExchangeTool:
                         "metadata": {
                             **result.metadata,
                             **adapter_identity_metadata,
+                            **_browser_submit_timing(
+                                fill_completed=fill_completed,
+                                submit_started=submit_started,
+                                submit_completed=submit_completed,
+                                response_completed=None,
+                            ),
                         }
                     }
                 )
+            if name == "browser_fill":
+                fill_completed = time.monotonic()
             if step_id is not None and step_id in capability_step_ids:
                 state_observation = await session.snapshot(tab_ref, response_frame, step=step)
                 step_document = state_observation.model_dump(mode="json")
@@ -3754,6 +3876,7 @@ class BrowserChatExchangeTool:
             ):
                 response_boundary_complete = True
                 break
+        response_completed = time.monotonic()
         public_after = after
         checkpoint_secret = captured_checkpoint_secret or restore_secret
         if checkpoint_secret is not None:
@@ -3766,6 +3889,13 @@ class BrowserChatExchangeTool:
         await self._recorder.append_observation(public_after)
         await self._recorder.save_metadata(session.metadata(restart=True))
         after_ref = _browser_evidence_ref("after", public_after)
+        exchange_completed = time.monotonic()
+        submit_timing = _browser_submit_timing(
+            fill_completed=fill_completed,
+            submit_started=submit_started,
+            submit_completed=submit_completed,
+            response_completed=response_completed,
+        )
         exchange: dict[str, object] = {
             "id": "chat-exchange",
             "interaction": True,
@@ -3775,7 +3905,8 @@ class BrowserChatExchangeTool:
             "outcome": "acknowledged",
             "response_boundary_observed": response_boundary_observed,
             "response_boundary_complete": response_boundary_complete,
-            "latency_ms": max(0, int((time.monotonic() - exchange_started) * 1_000)),
+            "latency_ms": max(0, int((exchange_completed - exchange_started) * 1_000)),
+            **submit_timing,
         }
         evaluation_uncertainties: list[dict[str, object]] = []
         if not response_boundary_complete:
@@ -3988,6 +4119,7 @@ class BrowserChatExchangeTool:
                 "response_witness": response_witness,
                 "response_boundary_observed": response_boundary_observed,
                 "response_boundary_complete": response_boundary_complete,
+                **submit_timing,
                 "attempt_disposition": "valid" if response_boundary_complete else "uncertain",
                 "target": session.bounds.target_id,
                 "target_session_id": f"browser:{session.context_id}",

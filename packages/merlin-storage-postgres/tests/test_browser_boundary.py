@@ -247,6 +247,158 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
             assert asyncio.run(store.list_handoffs(handoff.target_id)) == ()
 
 
+def test_reviewed_tab_affinity_requires_matching_sealed_actions_across_restart(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "postgres-reviewed-tab-affinity"
+    target_id = "target-reviewed-tab"
+    context_id = "context-reviewed-tab"
+    valid_handoff_id = "handoff:reviewed-tab"
+    mismatched_tab_handoff_id = "handoff:mismatched-tabs"
+    mismatched_owner_handoff_id = "handoff:mismatched-owner"
+    mismatched_handoff_owner_id = "handoff:mismatched-handoff-owner"
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session_id = str(SessionRepository(connection).create("reviewed tab affinity").id)
+            owner = BrowserOwner(
+                session_id=session_id,
+                worker_id="worker:recon",
+                technique_id="api-first",
+            )
+            now = datetime.now(UTC)
+            metadata = BrowserMetadata(
+                context_id=context_id,
+                mode="isolated",
+                target_id=target_id,
+                owner=owner,
+                allowed_origins=frozenset({"https://target.test"}),
+                tabs=(
+                    TabMetadata(
+                        tab_ref="tab-reviewed",
+                        url="https://target.test/chat",
+                    ),
+                ),
+                state="active",
+                created_at=now,
+                updated_at=now,
+            )
+            store = PostgresBrowserStore(connection)
+            asyncio.run(store.save_metadata(metadata))
+
+            def record_handoff_actions(
+                handoff_id: str,
+                *,
+                request_tab_ref: str,
+                response_tab_ref: str,
+                evidence_owner: BrowserOwner = owner,
+                handoff_owner: BrowserOwner = owner,
+            ) -> None:
+                request_ref = f"{handoff_id}:request"
+                response_ref = f"{handoff_id}:response"
+                request = BrowserAction(
+                    context_id=context_id,
+                    target_id=target_id,
+                    owner=evidence_owner,
+                    kind="fill",
+                    tab_ref=request_tab_ref,
+                    element_ref="textbox:message",
+                    value="[redacted]",
+                    redaction_status="redacted",
+                    step=1,
+                )
+                response = BrowserAction(
+                    context_id=context_id,
+                    target_id=target_id,
+                    owner=evidence_owner,
+                    kind="network_events",
+                    tab_ref=response_tab_ref,
+                    step=2,
+                )
+                asyncio.run(
+                    store.record_evidence(
+                        context_id,
+                        request_ref,
+                        "browser_action",
+                        request.model_dump(mode="json"),
+                    )
+                )
+                asyncio.run(
+                    store.record_evidence(
+                        context_id,
+                        response_ref,
+                        "browser_action",
+                        response.model_dump(mode="json"),
+                    )
+                )
+                asyncio.run(
+                    store.record_handoff(
+                        ApiReconHandoff(
+                            id=handoff_id,
+                            context_id=context_id,
+                            target_id=target_id,
+                            owner=handoff_owner,
+                            method="POST",
+                            url="https://target.test/chat",
+                            request_evidence_ref=request_ref,
+                            response_evidence_ref=response_ref,
+                            adapter='{"interface":"http_api"}',
+                        )
+                    )
+                )
+
+            record_handoff_actions(
+                valid_handoff_id,
+                request_tab_ref="tab-reviewed",
+                response_tab_ref="tab-reviewed",
+            )
+            record_handoff_actions(
+                mismatched_tab_handoff_id,
+                request_tab_ref="tab-reviewed",
+                response_tab_ref="tab-other",
+            )
+            record_handoff_actions(
+                mismatched_owner_handoff_id,
+                request_tab_ref="tab-reviewed",
+                response_tab_ref="tab-reviewed",
+                evidence_owner=owner.model_copy(update={"session_id": "session-forged"}),
+            )
+            record_handoff_actions(
+                mismatched_handoff_owner_id,
+                request_tab_ref="tab-reviewed",
+                response_tab_ref="tab-reviewed",
+                handoff_owner=owner.model_copy(update={"session_id": "session-forged"}),
+            )
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as restarted:
+        with restarted.connect() as connection:
+            MigrationRunner(connection).apply()
+            store = PostgresBrowserStore(connection)
+            assert asyncio.run(store.reviewed_tab_affinity(valid_handoff_id, target_id)) == {
+                "context_id": context_id,
+                "target_id": target_id,
+                "tab_ref": "tab-reviewed",
+            }
+            assert (
+                asyncio.run(store.reviewed_tab_affinity(valid_handoff_id, "target-forged")) is None
+            )
+            assert (
+                asyncio.run(store.reviewed_tab_affinity(mismatched_tab_handoff_id, target_id))
+                is None
+            )
+            assert (
+                asyncio.run(store.reviewed_tab_affinity(mismatched_owner_handoff_id, target_id))
+                is None
+            )
+            assert (
+                asyncio.run(
+                    store.reviewed_tab_affinity(mismatched_handoff_owner_id, target_id)
+                )
+                is None
+            )
+
+
 async def _journey(connection, session_id: str) -> None:
     store = PostgresBrowserStore(connection)
     owner = BrowserOwner(
