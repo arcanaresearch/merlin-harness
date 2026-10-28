@@ -193,6 +193,24 @@ def test_payload_shapes_system_messages_tools_and_thinking() -> None:
     assert "temperature" not in payload
 
 
+def test_required_off_cannot_be_reenabled_by_anthropic_config() -> None:
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            "https://api.test/v1", "", "claude", reasoning_effort="high"
+        )
+    )
+    payload = provider._payload(
+        ChatRequest(
+            model="claude",
+            messages=[],
+            workload="worker",
+            reasoning="disabled",
+            reasoning_control="required",
+        )
+    )
+    assert "thinking" not in payload
+
+
 def test_payload_keeps_dynamic_compaction_outside_stable_cache_block() -> None:
     provider = AnthropicMessagesProvider(
         AnthropicMessagesConfig("https://api.anthropic.test/v1", "", "claude-sonnet-4-6")

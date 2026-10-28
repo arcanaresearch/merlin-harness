@@ -170,7 +170,11 @@ class AgentOrchestrator:
             ChatMessage(role="user", content=f"Operator message: {message}")
             for message in task.operator_messages
         )
-        return ChatRequest(model=self._model, messages=messages)
+        return ChatRequest(
+            model=self._model,
+            messages=messages,
+            workload="lead" if task.role is AgentRole.LEAD else "worker",
+        )
 
     def _get(self, task_id: str) -> AgentTask:
         try:

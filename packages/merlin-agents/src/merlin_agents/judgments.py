@@ -165,6 +165,7 @@ class ChatRefusalJudge:
                     ],
                     temperature=0.0,
                     max_output_tokens=16,
+                    workload="judge",
                 )
             ):
                 if isinstance(event, TextDelta):

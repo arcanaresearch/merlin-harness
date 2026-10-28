@@ -355,6 +355,7 @@ async def _request_structured_json(
     messages: Sequence[ChatMessage],
     expected_container: str,
     max_attempts: int,
+    workload: str = "structured_generation",
     budget_id: str | None = None,
     usage_sink: Callable[[ModelUsage], None] | None = None,
     execution_contract: GeneratorExecutionContract | None = None,
@@ -395,6 +396,7 @@ async def _request_structured_json(
                 max_output_tokens=output_limit,
                 budget_id=budget_id,
                 reasoning="disabled",
+                workload=workload,  # validated by ChatRequest's workload contract
             )
         )
 
@@ -3077,7 +3079,7 @@ def _transform_payload_receipt_chain(
     for effect in eligible:
         exchanges = effect.result_metadata.get("target_exchanges")
         if (
-            effect.tool_name in {"target_chat", "target_request"}
+            effect.tool_name in {"target_chat", "target_request", "target_inject"}
             and bound(effect)
             and (
                 effect.result_metadata.get("target") == target_id
@@ -4098,7 +4100,11 @@ def build_backend(
         configure_telemetry,
         emit_finding_verdict,
     )
-    from merlin_assessments import AssessmentService, ReviewedApiTargetTool
+    from merlin_assessments import (
+        AssessmentService,
+        ReviewedApiTargetTool,
+        ReviewedTargetInjectTool,
+    )
     from merlin_browser import BrowserBounds, BrowserService
     from merlin_config import (
         ConfigPaths,
@@ -4491,8 +4497,15 @@ def build_backend(
                 else:
                     transport_routes[routed_model] = GeminiProvider(GeminiConfig(**shared))
         provider = (
-            ModelRoutingProvider(default_provider, transport_routes)
+            ModelRoutingProvider(
+                default_provider,
+                transport_routes,
+                request_efforts=config.provider_request_efforts,
+                request_output_tokens=config.provider_request_output_tokens,
+            )
             if transport_routes
+            or config.provider_request_efforts
+            or config.provider_request_output_tokens
             else default_provider
         )
 
@@ -4871,9 +4884,7 @@ def build_backend(
             if selected is None:
                 raise ValueError("natural target resolution did not select a browser target")
             origin = _browser_origin(str(selected["base_url"]))
-            persistent = _target_requires_persistent_browser(
-                selected, origin, persistent_origins
-            )
+            persistent = _target_requires_persistent_browser(selected, origin, persistent_origins)
             return BrowserBounds(
                 target_id=str(selected["id"]),
                 allowed_origins={origin},
@@ -4919,6 +4930,7 @@ def build_backend(
             timeout_seconds=config.runtime.tool_action_timeout_seconds,
         )
         tool_broker.register(api_target)
+        tool_broker.register(ReviewedTargetInjectTool(api_target))
         tool_broker.register(KnowledgeSearchTool())
         _register_browser_tools(
             tool_broker,
@@ -5856,6 +5868,7 @@ def build_backend(
                         # attempt at the operator-selected setting, then make daemon
                         # retries a compact provider-native final-answer request.
                         reasoning="disabled" if attempt > 0 else None,
+                        workload="lead",
                     )
                 ):
                     if isinstance(event, (TextDelta, ReasoningDelta)):
@@ -6565,6 +6578,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=selected_model,
+                    workload="lead",
                     messages=(
                         ChatMessage(
                             role="system",
@@ -6719,6 +6733,7 @@ def build_backend(
                 provider=provider,
                 capability_registry=capability_registry,
                 selected_model=selected_model,
+                workload="lead",
                 messages=(
                     ChatMessage(
                         role="system",
@@ -6796,6 +6811,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=selected_model,
+                    workload="judge" if "critic" in role else "planner",
                     messages=(
                         ChatMessage(role="system", content=instruction),
                         ChatMessage(
@@ -7547,9 +7563,7 @@ def build_backend(
             browser_profile = None
             if target_is_browser:
                 reviewed_origin = _browser_origin(reviewed_endpoint)
-                if _target_requires_persistent_browser(
-                    target, reviewed_origin, persistent_origins
-                ):
+                if _target_requires_persistent_browser(target, reviewed_origin, persistent_origins):
                     browser_profile = "shared_persistent_authenticated"
             reviewed_concurrency = _verified_session_concurrency(
                 reviewed_adapter.get("session_cardinality"),
@@ -9326,9 +9340,9 @@ def build_backend(
                 for step in receipt.get("steps", ())
                 if isinstance(step, Mapping) and step.get("effect_id")
             }
-            for effect in await effect_store.list_for_session(
-                manifest.session_id, tool_name="target_request"
-            ):
+            for effect in await effect_store.list_for_session(manifest.session_id):
+                if effect.tool_name not in {"target_request", "target_inject"}:
+                    continue
                 if effect.result_metadata.get("campaign_id") != campaign_id:
                     continue
                 rows = effect.result_metadata.get("target_exchanges", ())
@@ -9339,7 +9353,9 @@ def build_backend(
                         continue
                     request = row.get("request")
                     if request is None:
-                        request = effect.arguments_payload.get("input")
+                        request = effect.arguments_payload.get(
+                            "input", effect.arguments_payload.get("content")
+                        )
                     if request is None:
                         strategy_plan = effect.arguments_payload.get("strategy_plan")
                         if isinstance(strategy_plan, Mapping):
@@ -10209,6 +10225,7 @@ def build_backend(
                         ),
                         max_output_tokens=4_096,
                         budget_id=manifest.id,
+                        workload="automation",
                     )
                 ):
                     if isinstance(event, TextDelta):
@@ -10451,6 +10468,7 @@ def build_backend(
                 provider=provider,
                 capability_registry=capability_registry,
                 selected_model=arm_generation_model,
+                workload="arm_generation",
                 messages=(
                     ChatMessage(
                         role="system",
@@ -10661,6 +10679,7 @@ def build_backend(
                     provider=provider,
                     capability_registry=capability_registry,
                     selected_model=lead_model,
+                    workload="phase_gate",
                     messages=tuple(audit_messages),
                     expected_container="object",
                     max_attempts=config.provider_runtime.worker_retry_attempts,

@@ -41,3 +41,5 @@ jobs:
           apps/merlin-tui/tests/test_install_release_script.py
       - name: Run critical runtime release gate
         run: make critical-runtime-test
+      - name: Run benchmark tooling tests
+        run: make benchmark-tooling-test

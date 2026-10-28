@@ -517,7 +517,7 @@ def _run_first_setup(
 
 async def _ensure_daemon_with_splash() -> None:
     from .app import WORDMARK
-    from .local_control import _arm_unclaimed_shutdown, ensure_daemon
+    from .local_control import IncompatibleDaemonError, _arm_unclaimed_shutdown, ensure_daemon
 
     frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     status = Text("Preparing Merlin…", style="dim")
@@ -539,6 +539,8 @@ async def _ensure_daemon_with_splash() -> None:
             started_daemon = await ensure_daemon(progress=progress)
             if started_daemon:
                 await _arm_unclaimed_shutdown()
+        except IncompatibleDaemonError:
+            raise
         except RuntimeError:
             from .local_control import _SOCKET, _daemon_lock_released, _ping
 
@@ -837,6 +839,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
     profile = "recommended"
     composition = "opinionated"
     approve = False
+    strict_objective = False
     limits: dict[str, int | float] = {}
     objective_parts = []
     index = 0
@@ -849,6 +852,9 @@ async def _submit_campaign(arguments: list[str]) -> None:
             index += 2
         elif arguments[index] == "--approve":
             approve = True
+            index += 1
+        elif arguments[index] == "--strict-objective":
+            strict_objective = True
             index += 1
         elif arguments[index] in {
             "--max-turns",
@@ -883,10 +889,12 @@ async def _submit_campaign(arguments: list[str]) -> None:
         raise SystemExit(
             "usage: merlin campaign submit "
             "[--profile recommended|exhaustive|exploration|quickscan] "
-            "[--composition opinionated|autonomous] [--approve] "
+            "[--composition opinionated|autonomous] [--approve] [--strict-objective] "
             "[--max-turns N] [--max-tokens N] [--max-seconds N] "
             "[--max-cost-usd USD] OBJECTIVE"
         )
+    if strict_objective and not approve:
+        raise SystemExit("--strict-objective requires --approve")
     objective = " ".join(objective_parts)
     # A submitted campaign is a new reviewed workflow. Reusing whatever
     # conversation happened to be active can leak stale permission failures,
@@ -1064,8 +1072,12 @@ async def _submit_campaign(arguments: list[str]) -> None:
                                 await asyncio.gather(campaign_poll, return_exceptions=True)
                             campaign_poll = None
                         streamed_objective = str(streamed_review["objective"])
-                        if not _prepared_objective_preserves_operator_scope(
-                            objective, streamed_objective
+                        if (
+                            streamed_objective != objective
+                            if strict_objective
+                            else not _prepared_objective_preserves_operator_scope(
+                                objective, streamed_objective
+                            )
                         ):
                             drifted_id = str(streamed_review["campaign_id"])
                             await campaign_client.cancel_campaign(drifted_id)
@@ -1138,8 +1150,12 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     candidate = candidates[0]
                     campaign_id = candidate.get("id")
                     candidate_objective = str(candidate.get("objective") or "")
-                    if not _prepared_objective_preserves_operator_scope(
-                        objective, candidate_objective
+                    if (
+                        candidate_objective != objective
+                        if strict_objective
+                        else not _prepared_objective_preserves_operator_scope(
+                            objective, candidate_objective
+                        )
                     ):
                         if isinstance(campaign_id, str) and campaign_id:
                             await campaign_client.cancel_campaign(campaign_id)
@@ -1166,6 +1182,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     durable_review = {
                         "campaign_id": campaign_id,
                         "manifest_digest": list_digest,
+                        "objective": candidate_objective,
                         "profile": profile,
                         "review": {"budget": budget},
                         **(
@@ -1233,6 +1250,11 @@ async def _submit_campaign(arguments: list[str]) -> None:
         raise SystemExit("campaign was not durably prepared; refusing approval" + note)
     campaign_active = False
     try:
+        if strict_objective and durable_review.get("objective") != objective:
+            raise SystemExit(
+                "prepared campaign objective does not exactly match the operator objective; "
+                "refusing strict non-interactive approval"
+            )
         if (
             streamed_review is not None
             and "campaign_id" in streamed_review

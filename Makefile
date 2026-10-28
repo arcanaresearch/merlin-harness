@@ -1,4 +1,4 @@
-.PHONY: release release-patch release-minor release-major release-bump release-smoke install-release version-check version-set critical-runtime-test lint format-check format wheels
+.PHONY: release release-patch release-minor release-major release-bump release-smoke install-release version-check version-set critical-runtime-test benchmark-tooling-test lint format-check format wheels
 
 version-check:
 	uv run python scripts/check-versions.py
@@ -20,6 +20,9 @@ critical-runtime-test:
 		packages/merlin-agents/tests/test_durable_service.py::test_pause_resume_with_dead_driver_lease_redrives_schedule \
 		packages/merlin-browser/tests/test_browser_core.py::test_browser_release_is_campaign_scoped_for_shared_authenticated_session \
 		packages/merlin-assessments/tests/test_headless_packaged_uat.py
+
+benchmark-tooling-test:
+	uv run pytest -q benchmarks/test_headless_campaign.py
 
 release-patch:
 	@$(MAKE) release-bump PART=patch

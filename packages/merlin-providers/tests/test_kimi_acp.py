@@ -28,6 +28,32 @@ def _write_server(path: Path, body: str) -> tuple[str, ...]:
     return (sys.executable, "-u", str(path))
 
 
+def test_kimi_preserves_legacy_advisory_off_and_rejects_required_off(tmp_path: Path) -> None:
+    provider = KimiAcpProvider(
+        KimiAcpConfig(command=("does-not-exist",), model="kimi", state_directory=tmp_path)
+    )
+
+    async def collect(request: ChatRequest) -> list[object]:
+        return [event async for event in provider.stream(request)]
+
+    advisory = asyncio.run(collect(ChatRequest(model="kimi", messages=[], reasoning="disabled")))
+    required = asyncio.run(
+        collect(
+            ChatRequest(
+                model="kimi",
+                messages=[],
+                workload="structured_generation",
+                reasoning="disabled",
+                reasoning_control="required",
+            )
+        )
+    )
+    assert isinstance(advisory[0], ModelError)
+    assert advisory[0].code != "unsupported_request_control"
+    assert isinstance(required[0], ModelError)
+    assert required[0].code == "unsupported_request_control"
+
+
 def test_kimi_acp_streams_messages_and_reuses_session(tmp_path: Path) -> None:
     command = _write_server(
         tmp_path / "kimi.py",

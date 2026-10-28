@@ -1,6 +1,6 @@
 """Bounded orchestration for attacker-to-target assessment conversations."""
 
-from .api_target import ReviewedApiTargetTool
+from .api_target import ReviewedApiTargetTool, ReviewedTargetInjectTool
 from .fixture_target import (
     DEFAULT_SCENARIOS,
     OBJECTIVE,
@@ -41,6 +41,7 @@ __all__ = [
     "ObservedCaseReceipt",
     "REPLY_WITNESS",
     "ReviewedApiTargetTool",
+    "ReviewedTargetInjectTool",
     "WIN_MARKER",
     "AssessmentService",
     "SelectedTargetTool",

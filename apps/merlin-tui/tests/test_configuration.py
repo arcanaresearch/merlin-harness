@@ -246,6 +246,17 @@ def test_model_endpoint_persists_deepseek_native_protocol_controls(tmp_path: Pat
         is False
     )
 
+    configuration.save_model_endpoint(
+        "gpt-compatible",
+        "https://gpt-compatible.test/v1",
+        reasoning_parameter="reasoning_effort",
+    )
+    provider = load_config(paths, environ={}).values["provider"]
+    assert provider["model_endpoints"]["gpt-compatible"] == {
+        "base_url": "https://gpt-compatible.test/v1",
+        "reasoning_parameter": "reasoning_effort",
+    }
+
 
 def test_missing_route_credentials_flags_only_unresolvable_routes() -> None:
     credentials = {"api_key": "secret"}

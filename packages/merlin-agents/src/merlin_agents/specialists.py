@@ -483,6 +483,21 @@ class AssignmentTechnique:
 
 @dataclass(frozen=True, slots=True)
 class AssignmentContext:
+    @staticmethod
+    def request_workload(profile_id: str) -> str:
+        """Return the explicit provider-control workload for an owning worker call site."""
+        if profile_id == "lead":
+            return "lead"
+        if profile_id in {"recon", "adversarial-researcher"}:
+            return "recon"
+        if profile_id in {"experiment-planner"}:
+            return "planner"
+        if profile_id in {"novelty-critic"}:
+            return "judge"
+        if profile_id in {"independent-validator", "remediation-specialist"}:
+            return "validator"
+        return "worker"
+
     """Operator-selected, non-secret inputs bound before swarm admission."""
 
     target_profile_id: str

@@ -1134,6 +1134,7 @@ class Kernel:
                     ),
                     reasoning=request_recovery_reasoning,
                     max_output_tokens=output_token_limit,
+                    workload="kernel",
                 )
                 used_tool = False
                 tool_calls: list[ToolCall] = []

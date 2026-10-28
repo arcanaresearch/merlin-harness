@@ -67,6 +67,67 @@ def test_model_routing_is_exact_and_defaults_safely() -> None:
     asyncio.run(scenario())
 
 
+def test_explicit_workload_controls_resolve_before_transport() -> None:
+    default = Provider("default")
+    default.route_identity = RouteIdentity(
+        transport="openai_compatible", endpoint="https://api.example/v1", model="model"
+    )
+    routing = ModelRoutingProvider(
+        default,
+        {},
+        request_efforts={"worker": "off", "lead": "high"},
+        request_output_tokens={"worker": 1024},
+    )
+    disabled = routing.resolve_request(
+        ChatRequest(
+            model="model",
+            messages=[],
+            workload="worker",
+            reasoning="enabled",
+            reasoning_effort="xhigh",
+            max_output_tokens=4096,
+        )
+    )
+    assert disabled.reasoning == "disabled"
+    assert disabled.reasoning_effort is None
+    assert disabled.reasoning_control == "required"
+    assert disabled.max_output_tokens == 1024
+
+    lead = routing.resolve_request(ChatRequest(model="model", messages=[], workload="lead"))
+    assert lead.reasoning_effort == "high"
+    assert routing.output_limit_capability("model") == "native"
+
+
+def test_output_limit_capability_distinguishes_native_truncation_and_unsupported() -> None:
+    default = Provider("default")
+    default.route_identity = RouteIdentity(transport="codex_app_server", endpoint="", model="codex")
+    claude = Provider("claude")
+    claude.route_identity = RouteIdentity(transport="claude_cli", endpoint="", model="claude")
+    native = Provider("native")
+    native.route_identity = RouteIdentity(
+        transport="anthropic_messages", endpoint="https://api.example", model="native"
+    )
+    routing = ModelRoutingProvider(default, {"claude": claude, "native": native})
+
+    assert routing.output_limit_capability("native") == "native"
+    assert routing.output_limit_capability("claude") == "truncation"
+    assert routing.output_limit_capability("codex") == "unsupported"
+
+    bounded = ModelRoutingProvider(
+        default,
+        {"claude": claude, "native": native},
+        request_output_tokens={"worker": 1_024},
+    )
+    native_request = bounded.resolve_request(
+        ChatRequest(model="native", messages=[], workload="worker", max_output_tokens=2_048)
+    )
+    assert native_request.max_output_tokens == 1_024
+    with pytest.raises(ValueError, match="cannot enforce request output limits before generation"):
+        bounded.resolve_request(
+            ChatRequest(model="claude", messages=[], workload="worker", max_output_tokens=2_048)
+        )
+
+
 def test_route_identity_for_model_returns_exact_routed_identity() -> None:
     default = Provider("default")
     default.route_identity = RouteIdentity(

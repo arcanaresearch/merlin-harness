@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from jsonschema import SchemaError, ValidationError, validate
 from merlin_contracts import (
+    LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     CapabilityGrant,
     ChatMessage,
     ChatRequest,
@@ -85,7 +86,7 @@ from .mailbox import (
 from .memory import PortableMemoryRecord
 from .repeat_planning import repeat_plan_audit
 from .scheduler import RetryFailureKind
-from .specialists import WorkerAssignment, WorkerProfile
+from .specialists import AssignmentContext, WorkerAssignment, WorkerProfile
 from .strategy_controller import EvaluationUncertainty, StrategyProposal, propose_strategy_action
 from .strategy_plugin import (
     CrescendoStrategyAdapter,
@@ -262,6 +263,10 @@ CAPABILITY_PROBE_MALFORMED_CALL_STRIKES = 2
 # target call for the same conversation step. A schema-valid model finalization
 # is accepted at the limit; anything else fails the attempt instead of looping.
 GOAT_PLANNER_NO_CALL_STRIKE_LIMIT = 4
+# Bound each GOAT planning request so a stalled planner cannot consume the
+# worker's full remaining output budget before the existing bounded retry path
+# replaces the worker. This is a runtime request limit, not GOAT provenance.
+GOAT_PLANNER_OUTPUT_TOKEN_CAP = 4_096
 # Bound consecutive Crescendo planner turns that emit prose instead of the
 # reviewed target call for the same stage. Without this guard a provider can
 # repeat acknowledgements such as "Holding." indefinitely while the wave waits
@@ -1030,9 +1035,10 @@ def _project_target_result_content(
     return projection
 
 
-_BUILTIN_TARGET_EXCHANGE_TOOLS = frozenset(
+_PRIMARY_TARGET_EXCHANGE_TOOLS = frozenset(
     {"target_chat", "target_request", "browser_chat_exchange"}
 )
+_BUILTIN_TARGET_EXCHANGE_TOOLS = LEGACY_TARGET_EXCHANGE_TOOL_IDS
 
 _REFUSAL_MARKER = re.compile(
     r"(i can'?t|i cannot|i can’t|can'?t assist|cannot assist|unable to (?:help|assist)|"
@@ -1071,7 +1077,7 @@ def _runtime_admitted_tool_names(handoff: WorkerHandoff) -> tuple[str, ...]:
     if canonical is None:
         return admitted
     return tuple(
-        name for name in admitted if name not in _BUILTIN_TARGET_EXCHANGE_TOOLS or name == canonical
+        name for name in admitted if name not in _PRIMARY_TARGET_EXCHANGE_TOOLS or name == canonical
     )
 
 
@@ -1085,7 +1091,7 @@ def _controller_target_tool(
         # Role metadata is advisory for compatibility with older/third-party tool
         # registries. The reviewed interface and admitted name are authoritative.
         return canonical if canonical in admitted else None
-    admitted_builtin = admitted & _BUILTIN_TARGET_EXCHANGE_TOOLS
+    admitted_builtin = admitted & _PRIMARY_TARGET_EXCHANGE_TOOLS
     if len(admitted_builtin) == 1:
         return next(iter(admitted_builtin))
     return None
@@ -1860,7 +1866,7 @@ class WorkerRuntime:
         raw_admitted_names = tuple(dict.fromkeys(handoff.assignment.tool_ids))
         admitted_names = _runtime_admitted_tool_names(handoff)
         canonical_target_tool = _canonical_target_tool(handoff)
-        raw_target_names = frozenset(raw_admitted_names) & _BUILTIN_TARGET_EXCHANGE_TOOLS
+        raw_target_names = frozenset(raw_admitted_names) & _PRIMARY_TARGET_EXCHANGE_TOOLS
         selected_target_tool = _controller_target_tool(handoff, tuple(specs.values()))
         canonical_tool_missing_from_broker = (
             canonical_target_tool is not None
@@ -3778,6 +3784,29 @@ class WorkerRuntime:
                 if model_output_limit is None
                 else min(remaining_tokens, model_output_limit)
             )
+            goat_planning_turn = (
+                goat_state is not None
+                and strategy_proposal("goat", goat_state).action == "continue"
+                and not finalization_only
+            )
+            if goat_planning_turn:
+                output_limit = min(
+                    output_limit if output_limit is not None else GOAT_PLANNER_OUTPUT_TOKEN_CAP,
+                    GOAT_PLANNER_OUTPUT_TOKEN_CAP,
+                )
+            request_workload = AssignmentContext.request_workload(handoff.assignment.profile_id)
+            effective_request = ChatRequest(
+                model=handoff.model,
+                messages=[],
+                reasoning="disabled" if finalization_only else None,
+                max_output_tokens=output_limit,
+                budget_id=handoff.assignment.id,
+                workload=request_workload,
+            )
+            resolve_request = getattr(self._provider, "resolve_request", None)
+            if callable(resolve_request):
+                effective_request = resolve_request(effective_request)
+            output_limit = effective_request.max_output_tokens
             baseline_target_first = (
                 (
                     handoff.assignment.execution_stage in {"control", "direct", "replay"}
@@ -3936,6 +3965,13 @@ class WorkerRuntime:
                     )
                 if output_limit is not None:
                     output_limit = granted - input_bound
+                    if goat_planning_turn:
+                        output_limit = min(output_limit, GOAT_PLANNER_OUTPUT_TOKEN_CAP)
+                    if effective_request.max_output_tokens is not None:
+                        output_limit = min(
+                            output_limit,
+                            effective_request.max_output_tokens,
+                        )
                 reservation_active = True
             request = ChatRequest(
                 model=handoff.model,
@@ -3944,9 +3980,12 @@ class WorkerRuntime:
                 # A finalization turn only re-renders known evidence as compact
                 # JSON; reasoning tokens would burn the output budget that
                 # already proved too small, so ask the provider to skip them.
-                reasoning="disabled" if finalization_only else None,
+                reasoning=effective_request.reasoning,
+                reasoning_effort=effective_request.reasoning_effort,
+                reasoning_control=effective_request.reasoning_control,
                 max_output_tokens=output_limit,
                 budget_id=handoff.assignment.id,
+                workload=request_workload,
             )
             terminal_prompt_digest = self._provider_request_digest(request)
             await write_checkpoint(
@@ -4262,9 +4301,10 @@ class WorkerRuntime:
                 )
                 call_fingerprint = self._action_fingerprint(call.name, call.arguments)
                 call_semantic = self._semantic_action_signature(call.name, call.arguments)
+                is_target_exchange_call = call.name in _BUILTIN_TARGET_EXCHANGE_TOOLS
                 target_stall = (
                     self._target_request_stall(action_history, call_fingerprint)
-                    if call.name == target_tool
+                    if is_target_exchange_call
                     else None
                 )
                 if target_stall == "adapter":
@@ -4380,9 +4420,9 @@ class WorkerRuntime:
                         self._cancelled(handoff, content_so_far, reasoning_so_far)
                     ) from None
                 session_isolation_failure = (
-                    session_isolation_failure_result(result) if call.name == target_tool else None
+                    session_isolation_failure_result(result) if is_target_exchange_call else None
                 )
-                if call.name == target_tool:
+                if is_target_exchange_call:
                     identity_error = target_adapter_identity_error(result)
                     if identity_error is not None:
                         raise _DynamicToolTerminated(
@@ -4395,7 +4435,7 @@ class WorkerRuntime:
                         )
                 probe_server_failure = (
                     _capability_probe_http_transport_failure(result, allow_status_only=probe_worker)
-                    if call.name == target_tool
+                    if is_target_exchange_call
                     else None
                 )
                 if probe_server_failure is not None:
@@ -4410,7 +4450,7 @@ class WorkerRuntime:
                     "call_semantic": call_semantic,
                     "result_semantic": self._semantic_text_signature(result.content),
                 }
-                if call.name == target_tool or _target_interaction_count(result):
+                if is_target_exchange_call or _target_interaction_count(result):
                     repeat_audit = repeat_plan_audit(
                         handoff.worker_context.guidance if handoff.worker_context else (),
                         _controller_logical_arguments(target_tool, call.arguments),
@@ -4426,7 +4466,7 @@ class WorkerRuntime:
                     call, result, action_history, history_entry
                 )
                 target_interactions = _target_interaction_count(result)
-                if call.name == target_tool or target_interactions:
+                if is_target_exchange_call or target_interactions:
                     evidence_result = (
                         result.model_copy(update={"is_error": True})
                         if probe_server_failure is not None and not probe_worker
@@ -4442,9 +4482,9 @@ class WorkerRuntime:
                 action_history.append(history_entry)
                 action_count += 1
                 target_decision: WorkerResult | None = session_isolation_failure
-                if call.name == target_tool and target_decision is None:
+                if is_target_exchange_call and target_decision is None:
                     target_decision = target_delivery_rejection_failure_result(result)
-                if call.name == target_tool and target_decision is None:
+                if is_target_exchange_call and target_decision is None:
                     try:
                         target_session_id, target_session_generation = self._merge_target_session(
                             target_session_id, target_session_generation, result
@@ -4471,7 +4511,7 @@ class WorkerRuntime:
                     probe_transport_receipt_appended = False
                 if (
                     target_decision is None
-                    and call.name == target_tool
+                    and is_target_exchange_call
                     and probe_server_failure is None
                 ):
                     try:
@@ -4485,10 +4525,10 @@ class WorkerRuntime:
                         )
                 repeated_target = (
                     self._target_request_stall(action_history, call_fingerprint)
-                    if call.name == target_tool
+                    if is_target_exchange_call
                     else None
                 )
-                if target_decision is None and call.name == target_tool:
+                if target_decision is None and is_target_exchange_call:
                     if self._target_adapter_failure_kind(result) == "immediate":
                         target_decision = target_adapter_quarantined(
                             call.name,
@@ -5312,9 +5352,10 @@ class WorkerRuntime:
                     )
                     call_fingerprint = self._action_fingerprint(call.name, call.arguments)
                     call_semantic = self._semantic_action_signature(call.name, call.arguments)
+                    is_target_exchange_call = call.name in _BUILTIN_TARGET_EXCHANGE_TOOLS
                     target_stall = (
                         self._target_request_stall(action_history, call_fingerprint)
-                        if call.name == target_tool
+                        if is_target_exchange_call
                         else None
                     )
                     if target_stall == "adapter":
@@ -5421,10 +5462,10 @@ class WorkerRuntime:
                         return self._cancelled(handoff, content, "".join(reasoning))
                     session_isolation_failure = (
                         session_isolation_failure_result(result)
-                        if call.name == target_tool
+                        if is_target_exchange_call
                         else None
                     )
-                    if call.name == target_tool:
+                    if is_target_exchange_call:
                         identity_error = target_adapter_identity_error(result)
                         if identity_error is not None:
                             return target_adapter_quarantined(
@@ -5437,7 +5478,7 @@ class WorkerRuntime:
                         _capability_probe_http_transport_failure(
                             result, allow_status_only=probe_worker
                         )
-                        if call.name == target_tool
+                        if is_target_exchange_call
                         else None
                     )
                     if probe_server_failure is not None:
@@ -5452,7 +5493,7 @@ class WorkerRuntime:
                         "call_semantic": call_semantic,
                         "result_semantic": self._semantic_text_signature(result.content),
                     }
-                    if call.name == target_tool or _target_interaction_count(result):
+                    if is_target_exchange_call or _target_interaction_count(result):
                         repeat_audit = repeat_plan_audit(
                             handoff.worker_context.guidance if handoff.worker_context else (),
                             _controller_logical_arguments(target_tool, call.arguments),
@@ -5468,7 +5509,7 @@ class WorkerRuntime:
                         call, result, action_history, history_entry
                     )
                     target_interactions = _target_interaction_count(result)
-                    if call.name == target_tool or target_interactions:
+                    if is_target_exchange_call or target_interactions:
                         evidence_result = (
                             result.model_copy(update={"is_error": True})
                             if probe_server_failure is not None and not probe_worker
@@ -5486,9 +5527,9 @@ class WorkerRuntime:
                     action_history.append(history_entry)
                     action_count += 1
                     target_decision: WorkerResult | None = session_isolation_failure
-                    if call.name == target_tool and target_decision is None:
+                    if is_target_exchange_call and target_decision is None:
                         target_decision = target_delivery_rejection_failure_result(result)
-                    if call.name == target_tool and target_decision is None:
+                    if is_target_exchange_call and target_decision is None:
                         try:
                             target_session_id, target_session_generation = (
                                 self._merge_target_session(
@@ -5517,7 +5558,7 @@ class WorkerRuntime:
                         probe_transport_receipt_appended = False
                     if (
                         target_decision is None
-                        and call.name == target_tool
+                        and is_target_exchange_call
                         and probe_server_failure is None
                     ):
                         try:
@@ -5531,10 +5572,10 @@ class WorkerRuntime:
                             )
                     repeated_target = (
                         self._target_request_stall(action_history, call_fingerprint)
-                        if call.name == target_tool
+                        if is_target_exchange_call
                         else None
                     )
-                    if target_decision is None and call.name == target_tool:
+                    if target_decision is None and is_target_exchange_call:
                         if self._target_adapter_failure_kind(result) == "immediate":
                             target_decision = target_adapter_quarantined(
                                 call.name,
@@ -6716,8 +6757,21 @@ class WorkerRuntime:
 
     @staticmethod
     def _provider_request_digest(request: ChatRequest) -> str:
+        # v1 deliberately excludes fields introduced after durable checkpoints shipped.
+        # Once a workload control is present, v2 binds the exact effective request.
+        if (
+            request.workload is None
+            and request.reasoning_effort is None
+            and request.reasoning_control is None
+        ):
+            dumped = request.model_dump(
+                mode="json",
+                exclude={"workload", "reasoning_effort", "reasoning_control"},
+            )
+        else:
+            dumped = request.model_dump(mode="json")
         payload = json.dumps(
-            request.model_dump(mode="json"),
+            dumped,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,

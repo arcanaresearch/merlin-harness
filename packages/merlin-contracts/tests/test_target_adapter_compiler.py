@@ -1173,3 +1173,133 @@ def test_existing_v1_digest_reader_remains_frozen() -> None:
     assert executable_adapter_digest(adapter) == (
         "sha256:6d52c30812ba937fabdae547f217060b107ff0fdc4530516e6503022b83201eb"
     )
+
+
+def _injection_adapter() -> dict[str, object]:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        2,
+        {
+            "step_id": "plant-comment",
+            "endpoint": "/comments",
+            "method": "POST",
+            "request_template": {"body": "{{input}}", "channel": "issue-1"},
+            "interaction": True,
+            "captures": {},
+            "repeat": 1,
+            "idempotency_key": None,
+        },
+    )
+    raw["content_injection"] = {"step_id": "plant-comment", "content_pointer": "/body"}
+    return raw
+
+
+def test_content_injection_compiles_into_executable_identity() -> None:
+    compiled = compile_target_adapter(_injection_adapter())
+
+    assert isinstance(compiled.executable, HttpApi)
+    injection = compiled.executable.content_injection
+    assert injection is not None
+    assert injection.step_id == "plant-comment"
+    assert injection.content_pointer == "/body"
+    plant = next(step for step in compiled.executable.steps if step.step_id == "plant-comment")
+    assert plant.request_template == {"body": "{{input}}", "channel": "issue-1"}
+
+    plain = compile_target_adapter(_http_adapter())
+    assert plain.executable.content_injection is None
+    assert compiled_target_adapter_digest(compiled) != compiled_target_adapter_digest(plain)
+
+
+def test_content_injection_survives_compiled_envelope_roundtrip() -> None:
+    compiled = compile_target_adapter(_injection_adapter())
+    reread = read_target_adapter(compiled.model_dump(mode="json"))
+
+    assert isinstance(reread.executable, HttpApi)
+    assert reread.executable.content_injection == compiled.executable.content_injection
+    assert compiled_target_adapter_digest(reread) == compiled_target_adapter_digest(compiled)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"step_id": "missing-step"}, "references an unknown adapter step"),
+        ({"content_pointer": "/missing"}, "destination does not exist"),
+        ({"content_pointer": "/channel"}, "exact canonical input placeholder"),
+        ({"extra_key": "reviewed"}, "Extra inputs are not permitted"),
+        ("not-an-object", "must be an object when provided"),
+    ],
+)
+def test_content_injection_rejects_contract_violations(mutation: object, expected: str) -> None:
+    raw = _injection_adapter()
+    if mutation == "not-an-object":
+        raw["content_injection"] = "reviewed-write"
+    else:
+        assert isinstance(mutation, dict)
+        raw["content_injection"] = {**raw["content_injection"], **mutation}  # type: ignore[dict-item]
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+
+    assert caught.value.kind is AdapterCompileFailureKind.CONTRACT_VALIDATION
+    assert expected in str(caught.value)
+
+
+def test_content_injection_requires_an_interaction_step() -> None:
+    raw = _http_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        1,
+        {
+            "step_id": "plant-label",
+            "endpoint": "/labels",
+            "method": "POST",
+            "request_template": {"body": "{{input}}"},
+            "interaction": False,
+            "captures": {},
+        },
+    )
+    raw["content_injection"] = {"step_id": "plant-label", "content_pointer": "/body"}
+
+    with pytest.raises(AdapterCompileError, match="must reference an interaction step"):
+        compile_target_adapter(raw)
+
+
+@pytest.mark.parametrize("pointer", ["body", "//body", "/items/00", "/body~2value"])
+def test_content_injection_rejects_noncanonical_json_pointers(pointer: str) -> None:
+    raw = _injection_adapter()
+    raw["content_injection"] = {"step_id": "plant-comment", "content_pointer": pointer}
+
+    with pytest.raises(AdapterCompileError):
+        compile_target_adapter(raw)
+
+
+def test_content_injection_rejects_multiple_input_placeholders() -> None:
+    raw = _injection_adapter()
+    steps = raw["api_steps"]
+    assert isinstance(steps, list)
+    plant = next(step for step in steps if step["step_id"] == "plant-comment")
+    plant["request_template"]["duplicate"] = "{{input}}"
+
+    with pytest.raises(AdapterCompileError, match="exactly one canonical input placeholder"):
+        compile_target_adapter(raw)
+
+
+def test_compiled_envelope_cannot_bypass_content_injection_invariant() -> None:
+    compiled = compile_target_adapter(_injection_adapter()).model_dump(mode="json")
+    compiled["executable"]["steps"][2]["request_template"]["body"] = "fixed"
+
+    with pytest.raises(AdapterCompileError, match="exact canonical input placeholder"):
+        read_target_adapter(compiled)
+
+
+@pytest.mark.parametrize("interface", ["api", "open_ai_compatible", "browser"])
+def test_content_injection_rejected_for_non_http_interfaces(interface: str) -> None:
+    raw = _http_adapter()
+    raw["interface"] = interface
+    raw["content_injection"] = {"step_id": "message", "content_pointer": "/prompt"}
+
+    with pytest.raises(AdapterCompileError, match="only for http_api"):
+        compile_target_adapter(raw)

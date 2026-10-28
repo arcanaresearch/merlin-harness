@@ -68,14 +68,64 @@ class ModelRoutingProvider:
         default: Provider,
         routes: Mapping[str, Provider],
         capability_registry: object | None = None,
+        *,
+        request_efforts: Mapping[str, str] | None = None,
+        request_output_tokens: Mapping[str, int] | None = None,
     ) -> None:
         if any(not model.strip() for model in routes):
             raise ValueError("provider route model names must not be empty")
         self.default = default
         self.routes = dict(routes)
         self.capability_registry = capability_registry
+        self.request_efforts = dict(request_efforts or {})
+        self.request_output_tokens = dict(request_output_tokens or {})
+
+    def request_output_limit(self, workload: str | None) -> int | None:
+        return self.request_output_tokens.get(workload) if workload is not None else None
+
+    def output_limit_capability(self, model: str) -> str:
+        """Describe enforcement honestly: provider-native, local truncation, or unsupported."""
+        identity = self.route_identity_for_model(model)
+        transport = str(getattr(identity, "transport", "openai_compatible"))
+        if transport in {
+            "openai_compatible",
+            "open_ai_compatible",
+            "openai_responses",
+            "anthropic_messages",
+            "gemini",
+        }:
+            return "native"
+        if transport in {"claude_cli", "kimi_acp"}:
+            return "truncation"
+        return "unsupported"
+
+    def resolve_request(self, request: ChatRequest) -> ChatRequest:
+        """Resolve workload controls once; callers may then budget, digest, and transport it."""
+        if request.workload is None:
+            return request
+        updates: dict[str, object] = {}
+        limit = self.request_output_limit(request.workload)
+        if limit is not None and self.output_limit_capability(request.model) != "native":
+            raise ValueError(
+                f"transport for model {request.model!r} cannot enforce request output limits "
+                "before generation"
+            )
+        if limit is not None and (
+            request.max_output_tokens is None or request.max_output_tokens > limit
+        ):
+            updates["max_output_tokens"] = limit
+        effort = self.request_efforts.get(request.workload)
+        if effort == "off":
+            # Disabled is authoritative and no fallback effort survives it.
+            updates["reasoning"] = "disabled"
+            updates["reasoning_effort"] = None
+            updates["reasoning_control"] = "required"
+        elif effort not in {None, "default"} and request.reasoning != "disabled":
+            updates["reasoning_effort"] = effort
+        return request.model_copy(update=updates) if updates else request
 
     def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+        request = self.resolve_request(request)
         provider = self.routes.get(request.model, self.default)
         if request.model in self.routes:
             _validate_explicit_route_model(provider, request.model)
@@ -172,6 +222,7 @@ class ModelRoutingProvider:
     def stream_with_tools(
         self, request: ChatRequest, handler: DynamicToolHandler
     ) -> AsyncIterator[ModelEvent]:
+        request = self.resolve_request(request)
         provider = self.routes.get(request.model, self.default)
         if request.model in self.routes:
             _validate_explicit_route_model(provider, request.model)

@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 from .request_bindings import (
     RequestValueGenerator,
     validate_capture_binding,
+    validate_input_binding,
     validate_request_bindings,
 )
 from .target_capabilities import (
@@ -137,6 +138,19 @@ class HttpApiStep(AdapterContract):
         return self
 
 
+class ContentInjection(AdapterContract):
+    """Reviewed surface where attacker-provided content is planted.
+
+    ``step_id`` names an executable interaction step and ``content_pointer``
+    locates the exact request-template slot that receives the content. The
+    compiler requires that slot to hold the canonical ``{{input}}`` binding so
+    the reviewed write target cannot drift from the reviewed declaration.
+    """
+
+    step_id: str = Field(min_length=1)
+    content_pointer: str = Field(min_length=1)
+
+
 class BrowserStep(AdapterContract):
     kind: Literal["browser"] = "browser"
     role: AdapterStepRole
@@ -200,6 +214,9 @@ class HttpApi(AdapterContract):
     delivery_resolution: DeliveryResolution = DeliveryResolution.UNSPECIFIED
     cleanup_lifecycle: CleanupLifecycle = CleanupLifecycle.UNKNOWN
     steps: tuple[HttpApiStep, ...] = Field(min_length=1)
+    content_injection: ContentInjection | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     request_constraints: tuple[RequestConstraint, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
@@ -223,6 +240,8 @@ class HttpApi(AdapterContract):
                 if step.step_id is not None
             },
         )
+        if self.content_injection is not None:
+            _validate_content_injection(self.content_injection, self.steps)
         return self
 
 
@@ -1298,6 +1317,51 @@ def _compile_browser_steps(
     return tuple(compiled), normalized_interaction
 
 
+def _content_injection(raw: Mapping[str, object]) -> ContentInjection | None:
+    """Parse the reviewed content-planting declaration."""
+    declared = raw.get("content_injection")
+    if declared is None:
+        return None
+    if not isinstance(declared, Mapping):
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "content_injection",
+            "content_injection must be an object when provided",
+        )
+    try:
+        surface = ContentInjection.model_validate(declared)
+    except ValidationError as error:
+        raise _validation_failure(
+            error, prefix="content_injection contract validation failed"
+        ) from error
+    return surface
+
+
+def _validate_content_injection(surface: ContentInjection, steps: tuple[HttpApiStep, ...]) -> None:
+    by_id = {step.step_id: step for step in steps if step.step_id is not None}
+    step = by_id.get(surface.step_id)
+    if step is None:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "content_injection.step_id",
+            "content_injection.step_id references an unknown adapter step",
+        )
+    if step.role is not AdapterStepRole.INTERACTION:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "content_injection.step_id",
+            "content_injection.step_id must reference an interaction step",
+        )
+    try:
+        validate_input_binding(step.request_template, surface.content_pointer)
+    except ValueError as error:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "content_injection.content_pointer",
+            str(error),
+        ) from error
+
+
 def _validation_failure(error: ValidationError, *, prefix: str) -> AdapterCompileError:
     details = error.errors(include_url=False, include_context=False, include_input=False)
     rendered: list[str] = []
@@ -1350,6 +1414,12 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             "interface",
             "adapter interface must be api, open_ai_compatible, http_api, or browser",
         )
+    if raw.get("content_injection") is not None and kind is not CompiledAdapterKind.HTTP_API:
+        raise AdapterCompileError(
+            AdapterCompileFailureKind.CONTRACT_VALIDATION,
+            "content_injection",
+            "content_injection is supported only for http_api interfaces",
+        )
     endpoint = _absolute_http_url(raw.get("endpoint"), path="endpoint")
     authorized_origins = _authorized_origins(raw, endpoint=endpoint)
     credential = raw.get("credential_handle")
@@ -1368,7 +1438,11 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
         if raw_state_capabilities is not None
         else None
     )
-    include_step_ids = bool(request_constraints or state_capabilities is not None)
+    include_step_ids = bool(
+        request_constraints
+        or state_capabilities is not None
+        or raw.get("content_injection") is not None
+    )
 
     if kind is CompiledAdapterKind.PROVIDER_CHAT:
         _validate_capability_step_ids(
@@ -1418,6 +1492,7 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             advisories=advisories,
             include_step_ids=include_step_ids,
         )
+        content_injection = _content_injection(raw)
         _validate_capability_step_ids(
             request_constraints,
             state_capabilities,
@@ -1444,6 +1519,7 @@ def compile_target_adapter(value: Mapping[str, object]) -> AdapterCompilation:
             delivery_resolution=delivery_resolution,
             cleanup_lifecycle=cleanup_lifecycle,
             steps=steps,
+            content_injection=content_injection,
             request_constraints=request_constraints,
             state_capabilities=state_capabilities,
         )

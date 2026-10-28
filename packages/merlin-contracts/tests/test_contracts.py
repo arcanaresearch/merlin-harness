@@ -137,6 +137,26 @@ def test_chat_request_requires_an_advertised_tool() -> None:
         )
 
 
+def test_chat_request_requires_disabled_reasoning_for_required_control() -> None:
+    request = ChatRequest(
+        model="model",
+        messages=[],
+        reasoning="disabled",
+        reasoning_control="required",
+    )
+    assert request.reasoning_control == "required"
+
+    with pytest.raises(ValidationError, match="requires reasoning='disabled'"):
+        ChatRequest(model="model", messages=[], reasoning_control="required")
+    with pytest.raises(ValidationError, match="requires reasoning='disabled'"):
+        ChatRequest(
+            model="model",
+            messages=[],
+            reasoning="enabled",
+            reasoning_control="required",
+        )
+
+
 def test_model_event_is_discriminated() -> None:
     event = TypeAdapter(ModelEvent).validate_python({"type": "text_delta", "text": "hello"})
 

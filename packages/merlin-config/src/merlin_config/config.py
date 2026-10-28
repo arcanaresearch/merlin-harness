@@ -56,6 +56,22 @@ _RELOAD_SAFE = {
     ("provider", "context_window_tokens"),
     ("provider", "model_capabilities"),
 }
+_PROVIDER_REQUEST_WORKLOADS = {
+    "lead",
+    "worker",
+    "recon",
+    "validator",
+    "planner",
+    "judge",
+    "assessment_attacker",
+    "assessment_target",
+    "structured_generation",
+    "automation",
+    "arm_generation",
+    "phase_gate",
+    "kernel",
+    "provider_evaluation",
+}
 _PROVIDER_PROFILE_ROUTES = {
     "auth-session",
     "injection",
@@ -257,6 +273,24 @@ class Config:
         efforts = value.get("model_efforts", {})
         assert isinstance(efforts, Mapping)
         return MappingProxyType({str(model): str(effort) for model, effort in efforts.items()})
+
+    @property
+    def provider_request_efforts(self) -> Mapping[str, str]:
+        value = self.values.get("provider", {})
+        assert isinstance(value, Mapping)
+        efforts = value.get("request_efforts", {})
+        assert isinstance(efforts, Mapping)
+        return MappingProxyType(
+            {str(workload): str(effort) for workload, effort in efforts.items()}
+        )
+
+    @property
+    def provider_request_output_tokens(self) -> Mapping[str, int]:
+        value = self.values.get("provider", {})
+        assert isinstance(value, Mapping)
+        limits = value.get("request_output_tokens", {})
+        assert isinstance(limits, Mapping)
+        return MappingProxyType({str(workload): int(limit) for workload, limit in limits.items()})
 
     @property
     def provider_model_transports(self) -> Mapping[str, str]:
@@ -754,6 +788,8 @@ def _validate(values: Mapping[str, object]) -> None:
             "effort",
             "role_models",
             "model_efforts",
+            "request_efforts",
+            "request_output_tokens",
             "model_transports",
             "model_endpoints",
             "model_pricing",
@@ -774,8 +810,14 @@ def _validate(values: Mapping[str, object]) -> None:
             raise ValueError(
                 "provider.output_token_parameter must be 'max_completion_tokens' or 'max_tokens'"
             )
-        if provider.get("reasoning_parameter", "none") not in {"none", "thinking"}:
-            raise ValueError("provider.reasoning_parameter must be 'none' or 'thinking'")
+        if provider.get("reasoning_parameter", "none") not in {
+            "none",
+            "thinking",
+            "reasoning_effort",
+        }:
+            raise ValueError(
+                "provider.reasoning_parameter must be 'none', 'thinking', or 'reasoning_effort'"
+            )
         replay_requirement = provider.get("requires_reasoning_content_for_tool_calls")
         if replay_requirement is not None and not isinstance(replay_requirement, bool):
             raise TypeError("provider.requires_reasoning_content_for_tool_calls must be a boolean")
@@ -811,6 +853,32 @@ def _validate(values: Mapping[str, object]) -> None:
                 raise ValueError(
                     f"provider.model_efforts.{model} must be default, minimal, low, "
                     "medium, high, or xhigh"
+                )
+        request_efforts = provider.get("request_efforts", {})
+        if not isinstance(request_efforts, Mapping):
+            raise TypeError("provider.request_efforts must be a table")
+        unknown_workloads = set(request_efforts) - _PROVIDER_REQUEST_WORKLOADS
+        if unknown_workloads:
+            raise ValueError(
+                "unknown provider request workload(s): " + ", ".join(sorted(unknown_workloads))
+            )
+        for workload, effort in request_efforts.items():
+            if effort not in allowed_efforts | {"off"}:
+                raise ValueError(f"provider.request_efforts.{workload} has an unsupported effort")
+        request_output_tokens = provider.get("request_output_tokens", {})
+        if not isinstance(request_output_tokens, Mapping):
+            raise TypeError("provider.request_output_tokens must be a table")
+        unknown_workloads = set(request_output_tokens) - _PROVIDER_REQUEST_WORKLOADS
+        if unknown_workloads:
+            raise ValueError(
+                "unknown provider request workload(s): " + ", ".join(sorted(unknown_workloads))
+            )
+        for workload, limit in request_output_tokens.items():
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError(f"provider.request_output_tokens.{workload} must be an integer")
+            if not 1 <= limit <= 1_000_000:
+                raise ValueError(
+                    f"provider.request_output_tokens.{workload} must be between 1 and 1000000"
                 )
         model_transports = provider.get("model_transports", {})
         if not isinstance(model_transports, Mapping):
@@ -870,10 +938,14 @@ def _validate(values: Mapping[str, object]) -> None:
                     "'max_completion_tokens' or 'max_tokens'"
                 )
             reasoning_parameter = endpoint.get("reasoning_parameter")
-            if reasoning_parameter is not None and reasoning_parameter not in {"none", "thinking"}:
+            if reasoning_parameter is not None and reasoning_parameter not in {
+                "none",
+                "thinking",
+                "reasoning_effort",
+            }:
                 raise ValueError(
                     f"provider.model_endpoints.{endpoint_model}.reasoning_parameter must be "
-                    "'none' or 'thinking'"
+                    "'none', 'thinking', or 'reasoning_effort'"
                 )
             replay_requirement = endpoint.get("requires_reasoning_content_for_tool_calls")
             if replay_requirement is not None and not isinstance(replay_requirement, bool):

@@ -41,9 +41,32 @@ class ChatRequest(ContractModel):
     reasoning: Literal["enabled", "disabled"] | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     budget_id: str | None = None
+    workload: (
+        Literal[
+            "lead",
+            "worker",
+            "recon",
+            "validator",
+            "planner",
+            "judge",
+            "assessment_attacker",
+            "assessment_target",
+            "structured_generation",
+            "automation",
+            "arm_generation",
+            "phase_gate",
+            "kernel",
+            "provider_evaluation",
+        ]
+        | None
+    ) = None
+    reasoning_effort: Literal["default", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    reasoning_control: Literal["required"] | None = None
 
     @model_validator(mode="after")
     def require_advertised_tool(self) -> "ChatRequest":
+        if self.reasoning_control == "required" and self.reasoning != "disabled":
+            raise ValueError("required reasoning control requires reasoning='disabled'")
         if self.required_tool_name is None:
             return self
         advertised = {

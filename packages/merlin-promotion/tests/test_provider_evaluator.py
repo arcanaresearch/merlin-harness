@@ -139,6 +139,7 @@ async def test_provider_evaluator_runs_exact_route_and_deterministic_oracle(tmp_
     assert requests[0].model == "model-1"
     assert requests[0].tools == []
     assert requests[0].max_output_tokens == 32
+    assert requests[0].workload == "provider_evaluation"
 
 
 @pytest.mark.asyncio

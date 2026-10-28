@@ -4,7 +4,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 LEGACY_TARGET_EXCHANGE_TOOL_IDS = frozenset(
-    {"target_chat", "target_request", "browser_chat_exchange"}
+    {"target_chat", "target_request", "target_inject", "browser_chat_exchange"}
 )
 
 
@@ -52,9 +52,9 @@ class ToolContext(BaseModel):
     expected_target_sequence: tuple[tuple[str, str], ...] = ()
     target_effects_blocked: bool = False
     effect_attempt_lineage: tuple[str, ...] = ()
-    state_action_kind: Literal[
-        "reconnaissance", "baseline", "candidate", "validation", "cleanup"
-    ] | None = None
+    state_action_kind: (
+        Literal["reconnaissance", "baseline", "candidate", "validation", "cleanup"] | None
+    ) = None
     transform_bindings: tuple[tuple[str, str, str], ...] = ()
     planned_language: str = "und"
     requested_language: str = "und"

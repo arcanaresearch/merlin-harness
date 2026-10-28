@@ -434,16 +434,27 @@ What remains incomplete:
 - Generated custom Python or Playwright code has no approved sandboxed runtime.
 - Not every arm-generation helper is wired into live campaign scheduling.
 - Fresh isolated-session reproduction is not available for every target and finding.
-- Merlin has not been benchmarked against other scanners on comparable targets.
+- Comparative coverage is still narrow: current head-to-head evidence comes from local,
+  non-official reproductions rather than official leaderboard submissions.
 - Packaged support currently targets macOS 14 on Apple silicon.
 
 ## Benchmarking
 
 Merlin is benchmarked as an adaptive attacker that finds real, executable vulnerabilities under
-a fixed budget — not as a single dataset or one ASR number. The recommended stack (hidden
-executable suite, MUZZLE + The Zoo, AIRTBench, RIFT-Bench, Jailbreak Foundry, AgentHarm /
-AgentDojo regression tracks, REDAgentBench as an execution substrate) and the current, honest
-benchmark status live in [docs/benchmarks.md](docs/benchmarks.md).
+a fixed budget — not as a single dataset or one ASR number. Local comparative reproductions now
+include RIFT-Bench and MUZZLE + The Zoo. RIFT compared one probe with Merlin on flow 0 of one probe
+family across 22 runnable systems, with DeepSeek replacing Azure victim/judge deployments and with
+dependency/provider adaptations. MUZZLE and Merlin each ran one adapted Gitea scenario against the
+same `deepseek-chat` victim and the same MUZZLE ground-truth judge, but used different attacker
+models and round counts.
+Jailbreak Foundry and AgentHarm results measure DeepSeek victim susceptibility, not Merlin
+performance. AIRTBench and REDAgentBench remain deferred; REDAgentBench/DianJin-RED benchmark data
+is CC BY-NC 4.0 plus applicable upstream terms.
+
+**These are local, non-official reproductions using DeepSeek and disclosed benchmark adaptations,
+not official leaderboard submissions.** Denominators and evaluation contracts differ by track.
+See [the benchmark results and methodology boundaries](docs/benchmarks.md); raw benchmark and
+vendor outputs are not included in the release.
 
 ## Security and responsible use
 

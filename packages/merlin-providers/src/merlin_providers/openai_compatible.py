@@ -93,7 +93,7 @@ class ProviderConfig:
     context_window_tokens: int | None = None
     default_max_output_tokens: int = 16_384
     output_token_parameter: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
-    reasoning_parameter: Literal["none", "thinking"] = "none"
+    reasoning_parameter: Literal["none", "thinking", "reasoning_effort"] = "none"
     reasoning_effort: Literal["default", "minimal", "low", "medium", "high", "xhigh"] = "default"
     requires_reasoning_content_for_tool_calls: bool | None = None
     required_capabilities: frozenset[Literal["streaming", "tools", "usage_in_stream"]] = frozenset(
@@ -1181,6 +1181,21 @@ class OpenAICompatibleProvider:
         return refused
 
     def _payload(self, request: ChatRequest) -> dict[str, Any]:
+        if (
+            request.reasoning == "disabled"
+            and request.reasoning_control == "required"
+            and self.config.reasoning_parameter != "thinking"
+        ):
+            raise ProviderError(
+                "this OpenAI-compatible transport cannot authoritatively disable reasoning"
+            )
+        if (
+            request.reasoning_effort not in {None, "default"}
+            and self.config.reasoning_parameter != "reasoning_effort"
+        ):
+            raise ProviderError(
+                "this OpenAI-compatible transport does not expose request reasoning effort"
+            )
         if any(message.image_attachments for message in request.messages) and not (
             self._capabilities.vision
         ):
@@ -1200,6 +1215,8 @@ class OpenAICompatibleProvider:
             }
         if request.temperature is not None:
             payload["temperature"] = request.temperature
+        if request.reasoning_effort not in {None, "default"}:
+            payload["reasoning_effort"] = request.reasoning_effort
         if self.config.reasoning_parameter == "thinking":
             reasoning, _ = self._effective_reasoning(request)
             if reasoning is not None:

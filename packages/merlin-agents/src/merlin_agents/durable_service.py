@@ -285,7 +285,10 @@ def _uses_target_session(assignment: WorkerAssignment) -> bool:
     return (
         assignment.target_session_policy == "same-reviewed-session"
         or any("browser" in tool for tool in assignment.tool_ids)
-        or any(tool in {"target_chat", "target_request"} for tool in assignment.tool_ids)
+        or any(
+            tool in {"target_chat", "target_request", "target_inject"}
+            for tool in assignment.tool_ids
+        )
     )
 
 
@@ -1639,10 +1642,7 @@ class DurableAgentService:
             call_id: receipt
             for call_id, receipt in target_evidence_receipts.items()
             if call_id in target_call_ids
-            and (
-                receipt.get("acknowledged") is True
-                or call_id in durably_acknowledged_receipt_ids
-            )
+            and (receipt.get("acknowledged") is True or call_id in durably_acknowledged_receipt_ids)
         }
         completed_target_call_ids = target_call_ids & completed_call_ids
         if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("target_evidence"), list):
@@ -1824,16 +1824,12 @@ class DurableAgentService:
             for attempt in attempts
         )
 
-    async def target_progress(
-        self, campaign_id: str, target_id: str
-    ) -> Mapping[str, object]:
+    async def target_progress(self, campaign_id: str, target_id: str) -> Mapping[str, object]:
         """Project campaign target state from committed effects without model interpretation."""
         evidence_limit = 512
         loader = getattr(self._tools, "list_effects_for_campaign", None)
         effects = (
-            tuple(await loader(campaign_id, limit=evidence_limit + 1))
-            if callable(loader)
-            else ()
+            tuple(await loader(campaign_id, limit=evidence_limit + 1)) if callable(loader) else ()
         )
         history_truncated = len(effects) > evidence_limit
         if history_truncated:
@@ -5845,6 +5841,7 @@ class DurableAgentService:
                 ),
                 ChatMessage(role="user", content=objective),
             ],
+            workload="planner",
         )
         parts: list[str] = []
         async for event in self._provider.stream(request):
@@ -7189,8 +7186,7 @@ def _validated_target_evidence_receipts(
             not isinstance(call_id, str)
             or not call_id
             or item.get("reference") != f"target-call:{call_id}"
-            or item.get("tool_name")
-            not in {"target_chat", "target_request", "browser_chat_exchange"}
+            or item.get("tool_name") not in LEGACY_TARGET_EXCHANGE_TOOL_IDS
             or item.get("assignment_id") != task.id
             or item.get("campaign_id") != expected_campaign_id
             or item.get("attempt_id") not in valid_attempt_ids

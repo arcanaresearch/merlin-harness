@@ -41,6 +41,8 @@ _FINISH_REASON_MAP = {
     "OTHER": "stop",
 }
 
+_REASONING_OFF_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
+
 # JSON-Schema keywords Gemini function declarations understand; everything else
 # is stripped during schema projection.
 _SCHEMA_KEYS = {
@@ -120,8 +122,21 @@ class GeminiProvider(OpenAICompatibleProvider):
         }
         if request.temperature is not None:
             generation_config["temperature"] = request.temperature
-        if request.reasoning == "enabled" or self.config.reasoning_effort != "default":
-            effort = self.config.reasoning_effort
+        effort = request.reasoning_effort or self.config.reasoning_effort
+        required_off = request.reasoning == "disabled" and request.reasoning_control == "required"
+        if required_off:
+            model = (request.model or self.config.model).strip().casefold()
+            if model not in _REASONING_OFF_MODELS:
+                raise ProviderError(
+                    f"model {model!r} does not have verified support for disabling thinking"
+                )
+            generation_config["thinkingConfig"] = {
+                "includeThoughts": False,
+                "thinkingBudget": 0,
+            }
+        elif request.reasoning != "disabled" and (
+            request.reasoning == "enabled" or effort != "default"
+        ):
             thinking: dict[str, Any] = {"includeThoughts": True}
             if "gemini-3" in (request.model or self.config.model).lower():
                 thinking["thinkingLevel"] = {
