@@ -63,6 +63,125 @@ def _legacy_browser_text_contract_can_upgrade(
     return old_payload == new_payload
 
 
+def _validate_target_surface_generation_receipt(
+    receipt: Mapping[str, object],
+    *,
+    session_id: str,
+    context_id: str,
+    target_id: str,
+    request_evidence_ref: str,
+    response_evidence_ref: str,
+    compiled_adapter_digest: str | None,
+) -> None:
+    fields = {
+        "schema",
+        "campaign_id",
+        "session_id",
+        "target_id",
+        "generation_id",
+        "event_set_digest",
+        "assignment_id",
+        "attempt_id",
+        "call_id",
+        "context_id",
+        "tab_ref",
+        "observed_at",
+        "request_evidence_ref",
+        "response_evidence_ref",
+        "surface_observation_digest",
+        "current_surface_digest",
+        "compiled_adapter_digest",
+        "evidence_ref",
+        "receipt_sha256",
+    }
+    limits = {
+        "campaign_id": 256,
+        "session_id": 256,
+        "target_id": 256,
+        "generation_id": 71,
+        "event_set_digest": 71,
+        "assignment_id": 512,
+        "attempt_id": 256,
+        "call_id": 256,
+        "context_id": 256,
+        "tab_ref": 256,
+        "observed_at": 64,
+        "request_evidence_ref": 512,
+        "response_evidence_ref": 512,
+        "surface_observation_digest": 71,
+        "current_surface_digest": 71,
+        "compiled_adapter_digest": 71,
+        "evidence_ref": 128,
+        "receipt_sha256": 64,
+    }
+    if (
+        set(receipt) != fields
+        or receipt.get("schema") != "merlin.target-surface-generation.v1"
+        or any(
+            not isinstance(receipt.get(name), str)
+            or not receipt[name]
+            or len(str(receipt[name])) > limit
+            for name, limit in limits.items()
+        )
+    ):
+        raise ValueError("target surface generation receipt fields are unsupported")
+    for name in (
+        "generation_id",
+        "event_set_digest",
+        "surface_observation_digest",
+        "current_surface_digest",
+        "compiled_adapter_digest",
+    ):
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt[name])) is None:
+            raise ValueError("target surface generation receipt digest is invalid")
+    try:
+        observed_at = datetime.fromisoformat(str(receipt["observed_at"]).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("target surface generation receipt timestamp is invalid") from error
+    if observed_at.tzinfo is None:
+        raise ValueError("target surface generation receipt timestamp must include a timezone")
+    body = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"evidence_ref", "receipt_sha256"}
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    surface = {
+        "schema": "merlin.target-surface-generation-surface.v1",
+        "session_id": receipt["session_id"],
+        "context_id": receipt["context_id"],
+        "target_id": receipt["target_id"],
+        "tab_ref": receipt["tab_ref"],
+        "observed_at": receipt["observed_at"],
+        "request_evidence_ref": receipt["request_evidence_ref"],
+        "response_evidence_ref": receipt["response_evidence_ref"],
+        "surface_observation_digest": receipt["surface_observation_digest"],
+        "compiled_adapter_digest": receipt["compiled_adapter_digest"],
+    }
+    surface_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    if (
+        receipt["session_id"] != session_id
+        or receipt["context_id"] != context_id
+        or receipt["target_id"] != target_id
+        or receipt["request_evidence_ref"] != request_evidence_ref
+        or receipt["response_evidence_ref"] != response_evidence_ref
+        or receipt["compiled_adapter_digest"] != compiled_adapter_digest
+        or receipt["current_surface_digest"] != surface_digest
+        or receipt["receipt_sha256"] != receipt_sha256
+        or receipt["evidence_ref"]
+        != f"target-surface-generation:sha256:{receipt_sha256}"
+    ):
+        raise ValueError("target surface generation receipt does not match handoff")
+
+
 API_FIRST_RECONNAISSANCE_GUIDANCE = (
     "Inspect attributable network evidence first. Prefer a bounded, reproducible API adapter "
     "when it preserves the same target behavior; retain DOM interaction only when no equivalent "
@@ -314,6 +433,17 @@ class ApiReconHandoff(BrowserModel):
             "digest",
         }
         for observation in self.recon_observations:
+            if observation.get("schema") == "merlin.target-surface-generation.v1":
+                _validate_target_surface_generation_receipt(
+                    observation,
+                    session_id=self.owner.session_id,
+                    context_id=self.context_id,
+                    target_id=self.target_id,
+                    request_evidence_ref=self.request_evidence_ref,
+                    response_evidence_ref=self.response_evidence_ref,
+                    compiled_adapter_digest=self.compiled_adapter_digest,
+                )
+                continue
             if set(observation) != allowed_recon_observation_fields:
                 raise ValueError("recon observation fields are incomplete or unsupported")
             if observation.get("schema") != "merlin.browser.recon-observation.v1":

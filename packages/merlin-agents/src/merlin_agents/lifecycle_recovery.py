@@ -29,6 +29,7 @@ SchedulerRecoveryAction = Literal[
     "paused",
     "persist_successor_schedule",
     "persist_wave_binding",
+    "recover_target_reobservation",
     "resume_active",
     "settle_terminal_batch",
 ]
@@ -47,6 +48,17 @@ class DurableLifecycleStore(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class TargetReobservationRecoveryState:
+    phase: Literal["reobserve", "review"]
+    generation_id: str
+    event_set_digest: str
+    source_wave: int
+    schedule_id: str | None
+    settlement_id: str | None
+    lead_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignLifecycleDecision:
     campaign_id: str
     execution_format: str
@@ -62,6 +74,7 @@ class CampaignLifecycleDecision:
     recovery_state_digest: str
     recovery_decision_digest: str
     target_call_count: int
+    target_reobservation_recovery_state: TargetReobservationRecoveryState | None
     recovery_fence_digest: str | None = None
 
     @property
@@ -184,6 +197,7 @@ def _campaign_decision(value: object) -> CampaignLifecycleDecision:
         "paused",
         "persist_successor_schedule",
         "persist_wave_binding",
+        "recover_target_reobservation",
         "resume_active",
         "settle_terminal_batch",
     }:
@@ -225,6 +239,9 @@ def _campaign_decision(value: object) -> CampaignLifecycleDecision:
             value.get("recovery_decision_digest"), "recovery_decision_digest"
         ),
         target_call_count=_count(value.get("target_call_count"), "target_call_count"),
+        target_reobservation_recovery_state=_target_reobservation_recovery_state(
+            value.get("target_reobservation_recovery_state")
+        ),
         recovery_fence_digest=(
             None
             if value.get("recovery_fence_digest") is None
@@ -233,10 +250,64 @@ def _campaign_decision(value: object) -> CampaignLifecycleDecision:
     )
 
 
+def _target_reobservation_recovery_state(
+    value: object,
+) -> TargetReobservationRecoveryState | None:
+    if value is None:
+        return None
+    fields = {
+        "schema",
+        "phase",
+        "generation_id",
+        "event_set_digest",
+        "source_wave",
+        "schedule_id",
+        "settlement_id",
+        "lead_decision_id",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("durable target re-observation recovery state is malformed")
+    if value.get("schema") != "merlin.target-reobservation-recovery-state.v1":
+        raise ValueError("durable target re-observation recovery schema is unsupported")
+    phase = _nonempty(value.get("phase"), "target_reobservation.phase")
+    if phase not in {"reobserve", "review"}:
+        raise ValueError("durable target re-observation recovery phase is invalid")
+    schedule_id = _optional_nonempty(
+        value.get("schedule_id"), "target_reobservation.schedule_id"
+    )
+    settlement_id = _optional_nonempty(
+        value.get("settlement_id"), "target_reobservation.settlement_id"
+    )
+    lead_decision_id = _optional_nonempty(
+        value.get("lead_decision_id"), "target_reobservation.lead_decision_id"
+    )
+    if phase == "reobserve" and (settlement_id is not None or lead_decision_id is not None):
+        raise ValueError("re-observation phase cannot carry review settlement state")
+    if phase == "review" and (schedule_id is None or settlement_id is None):
+        raise ValueError("review phase requires its settled re-observation identity")
+    return TargetReobservationRecoveryState(
+        phase=cast(Literal["reobserve", "review"], phase),
+        generation_id=_qualified_digest(
+            value.get("generation_id"), "target_reobservation.generation_id"
+        ),
+        event_set_digest=_qualified_digest(
+            value.get("event_set_digest"), "target_reobservation.event_set_digest"
+        ),
+        source_wave=_count(value.get("source_wave"), "target_reobservation.source_wave"),
+        schedule_id=schedule_id,
+        settlement_id=settlement_id,
+        lead_decision_id=lead_decision_id,
+    )
+
+
 def _nonempty(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"durable lifecycle {name} must be a non-empty string")
     return value.strip()
+
+
+def _optional_nonempty(value: object, name: str) -> str | None:
+    return None if value is None else _nonempty(value, name)
 
 
 def _count(value: object, name: str) -> int:

@@ -65,6 +65,8 @@ class ToolContext(BaseModel):
     objective_phase_checkpoint_intent: Literal["capture", "restore"] | None = None
     objective_phase_checkpoint_reference: dict[str, object] | None = None
     objective_phase_gate_contract: dict[str, object] | None = None
+    target_reobservation_generation_id: str | None = None
+    target_reobservation_event_set_digest: str | None = None
 
 
 class ToolResult(BaseModel):

@@ -45,13 +45,22 @@ async def test_recorded_recovery_actions_match_legacy_boundaries(
     import merlin_agents.campaign_service as module
 
     calls = []
-    batch = None if batch_state is None else {
-        "id": "batch", "wave": 1, "state": batch_state,
-        "schedule_id": "schedule" if batch_state == "scheduled" else None,
-    }
-    wave = 0 if action in {
-        "persist_successor_schedule", "bind_successor_schedule", "persist_wave_binding"
-    } else 1
+    batch = (
+        None
+        if batch_state is None
+        else {
+            "id": "batch",
+            "wave": 1,
+            "state": batch_state,
+            "schedule_id": "schedule" if batch_state == "scheduled" else None,
+        }
+    )
+    wave = (
+        0
+        if action
+        in {"persist_successor_schedule", "bind_successor_schedule", "persist_wave_binding"}
+        else 1
+    )
     waves = [{"wave": wave, "status": wave_status, "schedule_id": "schedule"}]
     live = SimpleNamespace(id="schedule", assignments=(), execution=None)
 
@@ -119,18 +128,30 @@ async def test_recorded_recovery_actions_match_legacy_boundaries(
         raise AssertionError("production must not recompute legacy recovery")
 
     monkeypatch.setattr(service, "_recover_owned", forbidden)
-    report = lifecycle_recovery_report({
-        "schema": LIFECYCLE_RECOVERY_SCHEMA, "reconciled_at": datetime.now(UTC),
-        "expired_global_leases": 0, "due_quota_wakes": 0,
-        "campaigns": [{
-            **_RECOVERY_FIELDS, "campaign_id": "campaign/test",
-            "execution_format": STATE_SCOPE_SCHEMA_VERSION, "status": "executing",
-            "decision": "resume", "wake_at": None, "open_state_scopes": 0,
-            "acknowledged_state_scopes": 0, "cleanup_obligations": 0,
-            "recovery_action": action, "scheduler_action": action,
-            "recovery_fence_digest": "sha256:" + "c" * 64,
-        }],
-    })
+    report = lifecycle_recovery_report(
+        {
+            "schema": LIFECYCLE_RECOVERY_SCHEMA,
+            "reconciled_at": datetime.now(UTC),
+            "expired_global_leases": 0,
+            "due_quota_wakes": 0,
+            "campaigns": [
+                {
+                    **_RECOVERY_FIELDS,
+                    "campaign_id": "campaign/test",
+                    "execution_format": STATE_SCOPE_SCHEMA_VERSION,
+                    "status": "executing",
+                    "decision": "resume",
+                    "wake_at": None,
+                    "open_state_scopes": 0,
+                    "acknowledged_state_scopes": 0,
+                    "cleanup_obligations": 0,
+                    "recovery_action": action,
+                    "scheduler_action": action,
+                    "recovery_fence_digest": "sha256:" + "c" * 64,
+                }
+            ],
+        }
+    )
     assert await service.recover(lifecycle_report=report) == 1
     await asyncio.gather(*service._supervisors.values())
     assert calls == [legacy]
@@ -310,5 +331,115 @@ def test_lifecycle_recovery_rejects_duplicate_campaign_decisions() -> None:
                 "expired_global_leases": 0,
                 "due_quota_wakes": 0,
                 "campaigns": [campaign, campaign],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {
+            "schema": "merlin.target-reobservation-recovery-state.v1",
+            "phase": "reobserve",
+            "generation_id": "sha256:" + "1" * 64,
+            "event_set_digest": "sha256:" + "2" * 64,
+            "source_wave": 1,
+            "schedule_id": None,
+            "settlement_id": None,
+            "lead_decision_id": None,
+        },
+        {
+            "schema": "merlin.target-reobservation-recovery-state.v1",
+            "phase": "review",
+            "generation_id": "sha256:" + "1" * 64,
+            "event_set_digest": "sha256:" + "2" * 64,
+            "source_wave": 1,
+            "schedule_id": "schedule/refresh",
+            "settlement_id": "settlement/refresh",
+            "lead_decision_id": "lead/review",
+        },
+    ],
+)
+def test_lifecycle_recovery_parses_typed_target_reobservation_state(state) -> None:
+    report = lifecycle_recovery_report(
+        {
+            "schema": LIFECYCLE_RECOVERY_SCHEMA,
+            "reconciled_at": datetime.now(UTC),
+            "expired_global_leases": 0,
+            "due_quota_wakes": 0,
+            "campaigns": [
+                {
+                    "campaign_id": "campaign/reobserve",
+                    "execution_format": STATE_SCOPE_SCHEMA_VERSION,
+                    "status": "executing",
+                    "decision": "resume",
+                    "wake_at": None,
+                    "open_state_scopes": 0,
+                    "acknowledged_state_scopes": 0,
+                    "cleanup_obligations": 0,
+                    **_RECOVERY_FIELDS,
+                    "recovery_action": "recover_target_reobservation",
+                    "scheduler_action": "recover_target_reobservation",
+                    "target_reobservation_recovery_state": state,
+                }
+            ],
+        }
+    )
+
+    parsed = report.campaigns[0].target_reobservation_recovery_state
+    assert parsed is not None
+    assert parsed.phase == state["phase"]
+    assert parsed.generation_id == state["generation_id"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {
+            "schema": "merlin.target-reobservation-recovery-state.v1",
+            "phase": "reobserve",
+            "generation_id": "sha256:" + "1" * 64,
+            "event_set_digest": "sha256:" + "2" * 64,
+            "source_wave": 1,
+            "schedule_id": None,
+            "settlement_id": "settlement/not-allowed",
+            "lead_decision_id": None,
+        },
+        {
+            "schema": "merlin.target-reobservation-recovery-state.v1",
+            "phase": "review",
+            "generation_id": "sha256:" + "1" * 64,
+            "event_set_digest": "sha256:" + "2" * 64,
+            "source_wave": 1,
+            "schedule_id": None,
+            "settlement_id": "settlement/missing-schedule",
+            "lead_decision_id": None,
+        },
+    ],
+)
+def test_lifecycle_recovery_rejects_inconsistent_target_reobservation_state(state) -> None:
+    with pytest.raises(ValueError, match="re-observation|review phase"):
+        lifecycle_recovery_report(
+            {
+                "schema": LIFECYCLE_RECOVERY_SCHEMA,
+                "reconciled_at": datetime.now(UTC),
+                "expired_global_leases": 0,
+                "due_quota_wakes": 0,
+                "campaigns": [
+                    {
+                        "campaign_id": "campaign/reobserve",
+                        "execution_format": STATE_SCOPE_SCHEMA_VERSION,
+                        "status": "executing",
+                        "decision": "resume",
+                        "wake_at": None,
+                        "open_state_scopes": 0,
+                        "acknowledged_state_scopes": 0,
+                        "cleanup_obligations": 0,
+                        **_RECOVERY_FIELDS,
+                        "recovery_action": "recover_target_reobservation",
+                        "scheduler_action": "recover_target_reobservation",
+                        "target_reobservation_recovery_state": state,
+                    }
+                ],
             }
         )

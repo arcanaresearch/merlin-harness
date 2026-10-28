@@ -7,6 +7,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from merlin_agents.target_reobservation import (
+    extract_target_reobservation_obligations,
+    target_reobservation_generation,
+    target_reobservation_schedule_id,
+)
 from merlin_storage_postgres.campaign_store import CampaignStore
 from merlin_storage_postgres.campaign_transition_store import CampaignTransitionRepository
 from merlin_storage_postgres.database import Database, DatabaseConfig
@@ -31,6 +36,134 @@ def _isolated_pg0_port(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_pg0(*args, port=port, **kwargs)
 
     monkeypatch.setattr(pg0, "Pg0", construct_pg0)
+
+
+def _qualified_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _signed_transition_receipt(
+    *, campaign_id: str, session_id: str, target_id: str, task_id: str, call_id: str
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "call_id": call_id,
+        "reference": f"target-call:{call_id}",
+        "assignment_id": task_id,
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "attempt_id": f"attempt/{call_id}",
+        "technique_attempt_id": f"technique-attempt/{call_id}",
+        "target_id": target_id,
+        "target_session_id": f"target-session/{target_id}",
+        "tool_name": "browser_chat_exchange",
+        "is_error": False,
+        "acknowledged": True,
+        "target_effect_attempted": True,
+        "interaction_count": 1,
+        "limit_interaction_count": 1,
+        "target_call_budget_charge": 1,
+        "attempt_disposition": "valid",
+        "request_sha256": "1" * 64,
+        "content_sha256": "2" * 64,
+        "metadata_sha256": "3" * 64,
+        "target_ui_transition": {
+            "schema": "merlin.target-ui-transition.v1",
+            "material": True,
+            "adapter_stale": False,
+            "before_digest": "sha256:" + "4" * 64,
+            "after_digest": "sha256:" + "5" * 64,
+            "changed_dimensions": ["controls"],
+            "added_controls": [
+                {
+                    "role": "button",
+                    "name": "Continue",
+                    "frame_ref": "main",
+                    "disabled": False,
+                }
+            ],
+            "removed_controls": [],
+            "controls_truncated": False,
+            "evidence_refs": [f"browser-snapshot:{call_id}"],
+            "reobservation_recommended": True,
+        },
+    }
+    return {
+        **body,
+        "receipt_sha256": _qualified_digest(body).removeprefix("sha256:"),
+    }
+
+
+def _journal_target_reobservation_start(
+    campaigns: CampaignStore,
+    *,
+    campaign_id: str,
+    session_id: str,
+    target_id: str,
+    source_schedule_id: str,
+    start_schedule_id: str | None = None,
+) -> tuple[str, str]:
+    task_id = f"{campaign_id}/source-task"
+    call_id = f"{campaign_id}/target-call"
+    receipt = _signed_transition_receipt(
+        campaign_id=campaign_id,
+        session_id=session_id,
+        target_id=target_id,
+        task_id=task_id,
+        call_id=call_id,
+    )
+    obligations = extract_target_reobservation_obligations(
+        campaign_id=campaign_id,
+        session_id=session_id,
+        target_id=target_id,
+        source_schedule_id=source_schedule_id,
+        source_wave=0,
+        task_ids=(task_id,),
+        evidence={task_id: {"target_evidence_receipts": {call_id: receipt}}},
+    )
+    assert len(obligations) == 1
+    obligation = obligations[0]
+    observed = campaigns.append_lead(
+        campaign_id,
+        0,
+        obligation.observed_payload(campaign_id, target_id),
+    )
+    generation = target_reobservation_generation(
+        obligations,
+        {obligation.event_digest: int(observed["sequence"])},
+    )
+    assert generation is not None
+    expected_schedule_id = target_reobservation_schedule_id(
+        campaign_id,
+        generation.generation_id,
+        1,
+    )
+    campaigns.append_lead(
+        campaign_id,
+        0,
+        {
+            "kind": "target_reobservation_started",
+            "schema": "merlin.target-reobservation-started.v1",
+            "wave_kind": "objective_prerequisite",
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "target_id": target_id,
+            "generation_id": generation.generation_id,
+            "obligation_id": generation.obligation_id,
+            "event_digests": generation.event_digests,
+            "event_set_digest": _qualified_digest({"event_digests": generation.event_digests}),
+            "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+            "source_wave": generation.source_wave,
+            "attempt": 1,
+            "schedule_id": start_schedule_id or expected_schedule_id,
+        },
+    )
+    return generation.generation_id, expected_schedule_id
 
 
 @pytest.mark.asyncio
@@ -68,9 +201,12 @@ async def test_operator_pause_commits_before_local_cancel(tmp_path: Path) -> Non
         await service.pause(campaign_id, command_id="operator/pause")
         await service.pause(campaign_id, command_id="operator/pause")
         assert calls == ["supervisor", "local", "local"]
-        assert connection.execute(
-            "SELECT count(*) AS n FROM merlin_storage.campaign_events"
-        ).fetchone()["n"] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) AS n FROM merlin_storage.campaign_events"
+            ).fetchone()["n"]
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -82,7 +218,14 @@ async def test_resume_commit_survives_local_crash(tmp_path: Path, monkeypatch) -
     with _campaign_runtime(tmp_path) as (connection, campaign_id, schedule_id):
         transitions = CampaignTransitionRepository(connection, DurableSchedulerStore(connection))
         transitions.pause(campaign_id, cause="operator", command_id="pause")
-        monkeypatch.setattr(module, "_manifest", lambda value: SimpleNamespace())
+        monkeypatch.setattr(
+            module,
+            "_manifest",
+            lambda value: SimpleNamespace(
+                session_id="session/transition",
+                target=SimpleNamespace(id="target/transition"),
+            ),
+        )
         monkeypatch.setattr(module, "_reviewed_adapter_value", lambda value: None)
         # The fixture needs no execution manifest: the injected crash occurs
         # immediately after the durable transition, before recovery reads it.
@@ -140,9 +283,12 @@ def test_terminal_rejects_live_schedule_and_cancellation_is_atomic(tmp_path: Pat
         cancelled = transitions.terminal(
             campaign_id, status="cancelled", reason="operator_stopped", command_id="cancel"
         )
-        assert transitions.terminal(
-            campaign_id, status="cancelled", reason="operator_stopped", command_id="cancel"
-        ) == cancelled
+        assert (
+            transitions.terminal(
+                campaign_id, status="cancelled", reason="operator_stopped", command_id="cancel"
+            )
+            == cancelled
+        )
         assert CampaignStore(connection).get(campaign_id)["status"] == "cancelled"
         assert CampaignStore(connection).list_waves(campaign_id)[0]["status"] == "cancelled"
         assert scheduler.load_schedule(schedule_id)["status"] == "cancelled"
@@ -155,19 +301,23 @@ def test_recovery_claim_cas_expiry_and_stale_plan(tmp_path: Path) -> None:
 
     with _campaign_runtime(tmp_path) as (connection, campaign_id, schedule_id):
         report = StateScopeRepository(connection).reconcile_durable_lifecycle(
-            claimant_id="test", readable_formats=STATE_SCOPE_MIGRATION.readable_versions,
-            writable_format=STATE_SCOPE_SCHEMA_VERSION, lease_seconds=30,
+            claimant_id="test",
+            readable_formats=STATE_SCOPE_MIGRATION.readable_versions,
+            writable_format=STATE_SCOPE_SCHEMA_VERSION,
+            lease_seconds=30,
         )
         decision = report["campaigns"][0]
         repository = CampaignRecoveryRepository(connection)
         args = dict(
             state_digest=decision["recovery_state_digest"],
             decision_digest=decision["recovery_decision_digest"],
-            fence_digest=decision["recovery_fence_digest"], claimant_id="daemon/one",
+            fence_digest=decision["recovery_fence_digest"],
+            claimant_id="daemon/one",
         )
-        assert repository.claim(
-            campaign_id, **{**args, "decision_digest": "sha256:" + "0" * 64}
-        ) is None
+        assert (
+            repository.claim(campaign_id, **{**args, "decision_digest": "sha256:" + "0" * 64})
+            is None
+        )
         first = repository.claim(campaign_id, **args)
         assert first is not None
         assert repository.claim(campaign_id, **{**args, "claimant_id": "daemon/two"}) is None
@@ -185,8 +335,10 @@ def test_recovery_claim_cas_expiry_and_stale_plan(tmp_path: Path) -> None:
         assert repository.claim(campaign_id, **args) is None
         # Re-observation creates an applicable plan for a replacement daemon.
         StateScopeRepository(connection).reconcile_durable_lifecycle(
-            claimant_id="test", readable_formats=STATE_SCOPE_MIGRATION.readable_versions,
-            writable_format=STATE_SCOPE_SCHEMA_VERSION, lease_seconds=30,
+            claimant_id="test",
+            readable_formats=STATE_SCOPE_MIGRATION.readable_versions,
+            writable_format=STATE_SCOPE_SCHEMA_VERSION,
+            lease_seconds=30,
         )
         DurableSchedulerStore(connection).pause_schedule(schedule_id, reason="concurrent operator")
         assert repository.claim(campaign_id, **args) is None
@@ -353,3 +505,174 @@ def test_campaign_events_are_append_only(tmp_path: Path) -> None:
                    WHERE campaign_id = %s""",
                 (campaign_id,),
             )
+
+
+def test_forged_cross_campaign_auxiliary_schedule_has_no_lifecycle_authority(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-forged-auxiliary")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("forged auxiliary ownership")
+            session_id = str(session.id)
+            scheduler = DurableSchedulerStore(connection)
+            campaigns = CampaignStore(connection)
+            schedule_a = scheduler.create_schedule(
+                session_id,
+                {"nodes": ["worker-a"]},
+                {},
+                ["worker-a"],
+                ready_nodes=["worker-a"],
+            )
+            schedule_b = scheduler.create_schedule(
+                session_id,
+                {"nodes": ["worker-b"]},
+                {},
+                ["worker-b"],
+                ready_nodes=["worker-b"],
+            )
+            campaign_a = "campaign/authority-a"
+            campaign_b = "campaign/authority-b"
+            campaigns.prepare(
+                campaign_a,
+                session_id,
+                {"target": {"id": "target-a"}},
+                "sha256:authority-a",
+            )
+            campaigns.prepare(
+                campaign_b,
+                session_id,
+                {"target": {"id": "target-b"}},
+                "sha256:authority-b",
+            )
+            campaigns.begin_execution(campaign_a, "sha256:authority-a", schedule_a)
+            campaigns.begin_execution(campaign_b, "sha256:authority-b", schedule_b)
+            _generation_id, expected_auxiliary = _journal_target_reobservation_start(
+                campaigns,
+                campaign_id=campaign_a,
+                session_id=session_id,
+                target_id="target-a",
+                source_schedule_id=schedule_a,
+                start_schedule_id=schedule_b,
+            )
+            assert schedule_b != expected_auxiliary
+
+            transitions = CampaignTransitionRepository(connection, scheduler)
+            paused = transitions.pause(
+                campaign_a,
+                cause="operator",
+                command_id="authority-a/pause",
+            )
+            assert paused.schedule_ids == (schedule_a,)
+            assert scheduler.load_schedule(schedule_a)["status"] == "paused"
+            assert scheduler.load_schedule(schedule_b)["status"] == "running"
+
+            resumed = transitions.resume(
+                campaign_a,
+                cause="operator",
+                command_id="authority-a/resume",
+            )
+            assert resumed.schedule_ids == (schedule_a,)
+            assert scheduler.load_schedule(schedule_a)["status"] == "running"
+            assert scheduler.load_schedule(schedule_b)["status"] == "running"
+
+            cancelled = transitions.terminal(
+                campaign_a,
+                status="cancelled",
+                reason="operator_stopped",
+                command_id="authority-a/cancel",
+            )
+            assert cancelled.schedule_ids == (schedule_a,)
+            assert scheduler.load_schedule(schedule_a)["status"] == "cancelled"
+            assert scheduler.load_schedule(schedule_b)["status"] == "running"
+            assert not any(
+                row["id"] == campaign_a and row["schedule_id"] == schedule_b
+                for row in campaigns.list_terminal_active_schedules()
+            )
+
+
+def test_auxiliary_only_schedule_participates_in_pause_resume_and_cancel(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-valid-auxiliary")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("valid auxiliary ownership")
+            session_id = str(session.id)
+            scheduler = DurableSchedulerStore(connection)
+            campaigns = CampaignStore(connection)
+            source_schedule = scheduler.create_schedule(
+                session_id,
+                {"nodes": ["reducer"]},
+                {},
+                ["reducer"],
+                ready_nodes=["reducer"],
+            )
+            campaign_id = "campaign/valid-auxiliary"
+            campaigns.prepare(
+                campaign_id,
+                session_id,
+                {"target": {"id": "target-valid"}},
+                "sha256:valid-auxiliary",
+            )
+            campaigns.begin_execution(
+                campaign_id,
+                "sha256:valid-auxiliary",
+                source_schedule,
+            )
+            _generation_id, auxiliary_schedule = _journal_target_reobservation_start(
+                campaigns,
+                campaign_id=campaign_id,
+                session_id=session_id,
+                target_id="target-valid",
+                source_schedule_id=source_schedule,
+            )
+            scheduler.create_schedule(
+                session_id,
+                {"nodes": ["refresh"]},
+                {},
+                ["refresh"],
+                ready_nodes=["refresh"],
+                schedule_id=auxiliary_schedule,
+            )
+            connection.execute(
+                """UPDATE merlin_storage.scheduler_nodes SET state = 'completed'
+                   WHERE schedule_id = %s AND node_id = 'reducer'""",
+                (source_schedule,),
+            )
+            scheduler.complete_schedule(source_schedule)
+            campaigns.finish_wave(
+                campaign_id,
+                0,
+                "completed",
+                {"completed": 1, "failed": 0},
+            )
+
+            transitions = CampaignTransitionRepository(connection, scheduler)
+            paused = transitions.pause(
+                campaign_id,
+                cause="operator",
+                command_id="valid-auxiliary/pause",
+            )
+            assert paused.schedule_ids == (auxiliary_schedule,)
+            assert scheduler.load_schedule(source_schedule)["status"] == "completed"
+            assert scheduler.load_schedule(auxiliary_schedule)["status"] == "paused"
+
+            resumed = transitions.resume(
+                campaign_id,
+                cause="operator",
+                command_id="valid-auxiliary/resume",
+            )
+            assert resumed.schedule_ids == (auxiliary_schedule,)
+            assert scheduler.load_schedule(auxiliary_schedule)["status"] == "running"
+
+            cancelled = transitions.terminal(
+                campaign_id,
+                status="cancelled",
+                reason="operator_stopped",
+                command_id="valid-auxiliary/cancel",
+            )
+            assert set(cancelled.schedule_ids) == {source_schedule, auxiliary_schedule}
+            assert scheduler.load_schedule(source_schedule)["status"] == "completed"
+            assert scheduler.load_schedule(auxiliary_schedule)["status"] == "cancelled"
+            assert campaigns.get(campaign_id)["status"] == "cancelled"

@@ -8884,48 +8884,71 @@ def _dom_fallback_session(
 
         async def snapshot(self, _tab):
             inputs = [
-                SimpleNamespace(
-                    role="textbox", name=input_name, ref="tab-1:message", frame_ref="main"
+                ElementRef(
+                    role="textbox",
+                    name=input_name,
+                    ref="tab-1:message",
+                    tab_ref="tab-1",
+                    frame_ref="main",
                 )
             ]
             if duplicate_input:
                 inputs.append(
-                    SimpleNamespace(
+                    ElementRef(
                         role="textbox",
                         name=input_name,
                         ref="tab-1:message-duplicate",
+                        tab_ref="tab-1",
                         frame_ref="main",
                     )
                 )
             inputs.extend(
-                SimpleNamespace(
+                ElementRef(
                     role="textbox",
                     name=name,
                     ref=f"tab-1:message-extra-{index}",
+                    tab_ref="tab-1",
                     frame_ref="main",
                 )
                 for index, name in enumerate(extra_input_names)
             )
-            return SimpleNamespace(
-                elements=[
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.test",
+                owner=self.owner,
+                tab_ref="tab-1",
+                kind="snapshot",
+                observed_at=datetime(2026, 10, 28, 12, tzinfo=UTC),
+                elements=(
                     *inputs,
-                    SimpleNamespace(
+                    ElementRef(
                         role="button",
                         name=submit_name,
                         ref="tab-1:send",
+                        tab_ref="tab-1",
                         frame_ref="main",
                     ),
-                ]
+                ),
             )
 
     return Session
 
 
 class _NativeReceiptRecorder:
-    handoff = None
+    def __init__(self) -> None:
+        self.handoff = None
+        self.evidence: list[tuple[str, str, str, object]] = []
+        self.observations: list[BrowserObservation] = []
+
+    async def append_observation(self, observation):
+        self.observations.append(observation)
 
     async def record_handoff(self, value):
         self.handoff = value
+
+    async def record_evidence(self, context_id, evidence_ref, kind, payload):
+        self.evidence.append((context_id, evidence_ref, kind, payload))
 
     def reviewed_native_input_receipt(self, context_id, _event, input_pointer):
         return {
@@ -9011,6 +9034,72 @@ async def test_dom_fallback_without_probe_linked_evidence_still_seals_dom() -> N
     assert handoff.adapter is None
     assert handoff.dom_fallback_reason == "browser write path never settles after submit"
     assert result.metadata["api_candidate_observed"].endswith("/api/bank/message")
+
+
+@pytest.mark.asyncio
+async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None:
+    recorder = _NativeReceiptRecorder()
+    tool = ApiReconHandoffTool(
+        lambda _: _dom_fallback_session(
+            {
+                "method": "GET",
+                "url": "https://target.test/events",
+                "status": 200,
+                "resource_type": "eventsource",
+            }
+        )(),
+        recorder,
+    )
+    generation_id = "sha256:" + "1" * 64
+    event_set_digest = "sha256:" + "2" * 64
+
+    result = await tool.invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="record-current-surface",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-current-surface",
+            campaign_id="campaign/c1",
+            target_id="target",
+            target_reobservation_generation_id=generation_id,
+            target_reobservation_event_set_digest=event_set_digest,
+        ),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "browser-snapshot:sha256:" + "a" * 64,
+            "response_evidence_ref": "browser-snapshot:sha256:" + "b" * 64,
+            "dom_fallback_reason": "the observed message transport is SSE without JSON API",
+            "reusable_adapter": reviewed_browser_adapter("https://target.test/chat"),
+        },
+    )
+
+    assert result.is_error is False, result.content
+    handoff = recorder.handoff
+    assert handoff is not None
+    assert handoff.adapter is None
+    receipt = handoff.recon_observations[0]
+    assert receipt["schema"] == "merlin.target-surface-generation.v1"
+    assert receipt["generation_id"] == generation_id
+    assert receipt["event_set_digest"] == event_set_digest
+    assert receipt["session_id"] == "s1"
+    assert receipt["tab_ref"] == "tab-1"
+    assert receipt["observed_at"] == "2026-10-28T12:00:00+00:00"
+    assert receipt["compiled_adapter_digest"] == handoff.compiled_adapter_digest
+    assert result.metadata["target_surface_generation_evidence_ref"] == receipt[
+        "evidence_ref"
+    ]
+    assert len(recorder.observations) == 1
+    assert {
+        (evidence_ref, kind) for _context_id, evidence_ref, kind, _payload in recorder.evidence
+    } == {
+        (
+            "target-surface-snapshot:" + receipt["current_surface_digest"],
+            "target_surface_snapshot",
+        ),
+        (receipt["evidence_ref"], "target_surface_generation"),
+    }
 
 
 @pytest.mark.parametrize(

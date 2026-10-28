@@ -10171,6 +10171,12 @@ def build_backend(
         async def resolve_reviewed_adapter(
             session_id: str, adapter: Mapping[str, Any]
         ) -> Mapping[str, Any]:
+            expected_target_id = adapter.get("expected_target_id")
+            if expected_target_id is not None and (
+                not isinstance(expected_target_id, str) or not expected_target_id
+            ):
+                raise ValueError("expected reviewed target identity is invalid")
+            adapter = {key: value for key, value in adapter.items() if key != "expected_target_id"}
             revalidated_after_restart = False
             if not _has_durable_handoff(adapter):
                 candidate = _compile_current_reviewed_adapter_state(adapter)
@@ -10180,6 +10186,8 @@ def build_backend(
                 handoff = await browser_store.load_handoff(handoff_id)
                 if handoff is None:
                     raise ValueError("reviewed reconnaissance handoff is unavailable")
+                if expected_target_id is not None and handoff.target_id != expected_target_id:
+                    raise ValueError("reviewed reconnaissance handoff belongs to another target")
                 if not _handoff_context_is_current(browser, handoff):
                     revalidated_after_restart = await _revalidate_handoff_cross_session(
                         browser, session_id, handoff

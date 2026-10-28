@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Literal
 
+from merlin_agents.target_reobservation import (
+    TargetReobservationProjection,
+    project_target_reobservations,
+)
 from psycopg.types.json import Jsonb
 
 from .scheduler_store import DurableSchedulerStore
@@ -41,6 +45,14 @@ def _digest(value: object) -> str:
     return sha256(encoded).hexdigest()
 
 
+def _campaign_target_id(campaign: Mapping[str, object]) -> str | None:
+    envelope = campaign.get("manifest")
+    reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+    target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+    target_id = target.get("id") if isinstance(target, Mapping) else None
+    return target_id if isinstance(target_id, str) and target_id else None
+
+
 class CampaignTransitionRepository:
     """Atomic campaign/wave/scheduler pause and resume transitions.
 
@@ -69,6 +81,36 @@ class CampaignTransitionRepository:
         self.scheduler = scheduler
         self._lock = connection_lock
         self._after_scheduler_transition = after_scheduler_transition
+
+    def _target_reobservation_projection_locked(
+        self, campaign_id: str, campaign: Mapping[str, object]
+    ) -> TargetReobservationProjection:
+        rows = self.connection.execute(
+            """SELECT sequence, decision_id, payload
+               FROM merlin_storage.campaign_lead_journal
+               WHERE campaign_id = %s
+                 AND (
+                   payload->>'kind' IN (
+                     'target_surface_transition_observed',
+                     'target_reobservation_started',
+                     'target_reobservation_blocked',
+                     'target_reobservation_retry_authorized',
+                     'target_reobservation_settled'
+                   )
+                   OR payload ? 'target_reobservation_generations'
+                 )
+               ORDER BY sequence FOR UPDATE""",
+            (campaign_id,),
+        ).fetchall()
+        target_id = _campaign_target_id(campaign)
+        if target_id is None:
+            return project_target_reobservations(())
+        return project_target_reobservations(
+            tuple(dict(item) for item in rows),
+            campaign_id=campaign_id,
+            session_id=str(campaign["session_id"]),
+            target_id=target_id,
+        )
 
     def pause(
         self,
@@ -136,7 +178,8 @@ class CampaignTransitionRepository:
 
         with self._lock, self.connection.transaction():
             campaign = self.connection.execute(
-                """SELECT status, lifecycle_pause_reason, event_count, last_event_digest
+                """SELECT status, session_id, manifest, lifecycle_pause_reason,
+                          event_count, last_event_digest
                    FROM merlin_storage.assessment_campaigns
                    WHERE id = %s FOR UPDATE""",
                 (campaign_id,),
@@ -174,7 +217,15 @@ class CampaignTransitionRepository:
                    ORDER BY wave FOR UPDATE""",
                 (campaign_id, expected_wave_status),
             ).fetchall()
-            schedule_ids = tuple(str(wave["schedule_id"]) for wave in waves)
+            reobservation = self._target_reobservation_projection_locked(campaign_id, campaign)
+            auxiliary_ids = {
+                schedule_id
+                for generation_id in reobservation.generations
+                if (schedule_id := reobservation.active_schedule(generation_id)) is not None
+            }
+            schedule_ids = tuple(
+                sorted({str(wave["schedule_id"]) for wave in waves} | auxiliary_ids)
+            )
             schedule_rows = self.connection.execute(
                 """SELECT id, status FROM merlin_storage.scheduler_schedules
                    WHERE id = ANY(%s::uuid[]) ORDER BY id FOR UPDATE""",
@@ -260,12 +311,19 @@ class CampaignTransitionRepository:
                 )
             if campaign["status"] not in {"prepared", "executing", "paused"}:
                 raise ValueError("campaign is already terminal")
+            reobservation = self._target_reobservation_projection_locked(campaign_id, campaign)
+            if status != "cancelled" and (reobservation.pending or reobservation.review_pending):
+                raise ValueError("terminal campaign still has a target re-observation obligation")
             waves = self.connection.execute(
                 """SELECT wave, schedule_id, status FROM merlin_storage.campaign_waves
                    WHERE campaign_id = %s
                    ORDER BY wave FOR UPDATE""",
                 (campaign_id,),
             ).fetchall()
+            wave_schedule_ids = {str(wave["schedule_id"]) for wave in waves}
+            auxiliary_schedule_ids = {
+                schedule_id for values in reobservation.starts.values() for schedule_id in values
+            }
             for wave in waves:
                 schedule = self.scheduler.load_schedule(str(wave["schedule_id"]))
                 if schedule is None:
@@ -287,7 +345,8 @@ class CampaignTransitionRepository:
                         checkpoint=schedule["checkpoint"],
                     )
                 if wave["status"] in {"running", "paused"} or schedule["status"] in {
-                    "running", "paused"
+                    "running",
+                    "paused",
                 }:
                     self.connection.execute(
                         """UPDATE merlin_storage.campaign_waves SET status = %s, updated_at = now()
@@ -298,6 +357,28 @@ class CampaignTransitionRepository:
                             wave["wave"],
                         ),
                     )
+            for schedule_id in sorted(auxiliary_schedule_ids - wave_schedule_ids):
+                schedule = self.scheduler.load_schedule(schedule_id)
+                if schedule is None:
+                    raise ValueError("target re-observation has no scheduler")
+                if schedule["status"] in {"running", "paused"}:
+                    if status != "cancelled":
+                        raise ValueError(
+                            "terminal campaign still has an active target re-observation"
+                        )
+                    document = schedule["graph"]
+                    spec = document.get("admitted", {}).get("spec", {})
+                    cleanup = [
+                        str(node["id"])
+                        for node in spec.get("nodes", [])
+                        if node.get("kind") == "cleanup"
+                    ]
+                    self.scheduler.cancel_schedule(
+                        schedule_id,
+                        reason=reason,
+                        cleanup_node_ids=cleanup,
+                        checkpoint=schedule["checkpoint"],
+                    )
             if self._after_scheduler_transition is not None:
                 self._after_scheduler_transition("campaign_terminal")
             CampaignStore(self.connection).finish(campaign_id, status, stop_reason=reason)
@@ -307,7 +388,7 @@ class CampaignTransitionRepository:
                 "operator",
                 command_id,
                 request,
-                tuple(str(wave["schedule_id"]) for wave in waves),
+                tuple(sorted(wave_schedule_ids | auxiliary_schedule_ids)),
                 int(campaign["event_count"]),
                 str(campaign["last_event_digest"]),
             )

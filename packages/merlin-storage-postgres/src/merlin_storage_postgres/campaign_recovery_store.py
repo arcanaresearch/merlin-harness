@@ -1,13 +1,42 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
+from merlin_agents.target_reobservation import target_reobservation_schedule_ids
+
 
 def recovery_fence(connection: Any, campaign_id: str) -> str:
     """Fingerprint durable inputs; claim validation never reclassifies an action."""
+    journal_rows = connection.execute(
+        """SELECT sequence, decision_id, payload
+           FROM merlin_storage.campaign_lead_journal
+           WHERE campaign_id = %s
+           ORDER BY sequence""",
+        (campaign_id,),
+    ).fetchall()
+    campaign = connection.execute(
+        """SELECT session_id, manifest FROM merlin_storage.assessment_campaigns
+           WHERE id = %s""",
+        (campaign_id,),
+    ).fetchone()
+    envelope = campaign.get("manifest") if isinstance(campaign, Mapping) else None
+    reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+    target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+    target_id = target.get("id") if isinstance(target, Mapping) else None
+    validated_schedule_ids = (
+        target_reobservation_schedule_ids(
+            tuple(dict(item) for item in journal_rows),
+            campaign_id=campaign_id,
+            session_id=str(campaign["session_id"]),
+            target_id=target_id,
+        )
+        if isinstance(campaign, Mapping) and isinstance(target_id, str) and target_id
+        else ()
+    )
     snapshot = connection.execute(
         """SELECT jsonb_build_object(
           'campaign', (SELECT to_jsonb(c) FROM merlin_storage.assessment_campaigns c
@@ -30,9 +59,44 @@ def recovery_fence(connection: Any, campaign_id: str) -> str:
           'reservations', (SELECT jsonb_agg(to_jsonb(r) ORDER BY r.id)
                            FROM merlin_storage.resource_reservations r
                            JOIN merlin_storage.state_scopes s ON s.id = r.scope_id
-                           WHERE s.campaign_id = %(id)s)
+                           WHERE s.campaign_id = %(id)s),
+          'target_reobservation', (
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'sequence', j.sequence,
+                'decision_id', j.decision_id,
+                'kind', j.payload->>'kind',
+                'event_digest', j.payload->>'event_digest',
+                'generation_id', j.payload->>'generation_id',
+                'event_set_digest', j.payload->>'event_set_digest',
+                'settlement_id', j.payload->>'settlement_id',
+                'schedule_id', j.payload->>'schedule_id',
+                'generations', j.payload->'target_reobservation_generations'
+              ) ORDER BY j.sequence
+            )
+            FROM merlin_storage.campaign_lead_journal j
+            WHERE j.campaign_id = %(id)s
+              AND (
+                j.payload->>'kind' IN (
+                  'target_surface_transition_observed',
+                  'target_reobservation_started',
+                  'target_reobservation_blocked',
+                  'target_reobservation_retry_authorized',
+                  'target_reobservation_settled'
+                )
+                OR j.payload ? 'target_reobservation_generations'
+              )
+          ),
+          'target_reobservation_schedules', (
+            SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id)
+            FROM merlin_storage.scheduler_schedules s
+            WHERE s.id = ANY(%(target_reobservation_schedule_ids)s::uuid[])
+          )
         ) AS snapshot""",
-        {"id": campaign_id},
+        {
+            "id": campaign_id,
+            "target_reobservation_schedule_ids": list(validated_schedule_ids),
+        },
     ).fetchone()["snapshot"]
     encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode()
     return "sha256:" + sha256(encoded).hexdigest()
@@ -63,7 +127,8 @@ class CampaignRecoveryRepository:
             live_claim = self.connection.execute(
                 """SELECT 1 FROM merlin_storage.campaign_recovery
                    WHERE campaign_id = %s AND application_state = 'claimed'
-                     AND claim_expires_at > now()""", (campaign_id,),
+                     AND claim_expires_at > now()""",
+                (campaign_id,),
             ).fetchone()
             if live_claim is not None:
                 return None
@@ -103,13 +168,16 @@ class CampaignRecoveryRepository:
         if lease_seconds < 1:
             raise ValueError("recovery claim lease must be positive")
         with self._lock, self.connection.transaction():
-            return self.connection.execute(
-                """UPDATE merlin_storage.campaign_recovery
+            return (
+                self.connection.execute(
+                    """UPDATE merlin_storage.campaign_recovery
                    SET claim_expires_at = now() + make_interval(secs => %s)
                    WHERE campaign_id = %s AND claim_id = %s AND application_state = 'claimed'
                      AND claim_expires_at > now() RETURNING campaign_id""",
-                (lease_seconds, campaign_id, claim_id),
-            ).fetchone() is not None
+                    (lease_seconds, campaign_id, claim_id),
+                ).fetchone()
+                is not None
+            )
 
     def apply(self, campaign_id: str, *, claim_id: str, error: str | None = None) -> None:
         with self._lock, self.connection.transaction():

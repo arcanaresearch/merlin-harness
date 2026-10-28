@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from merlin_agents.target_reobservation import project_target_reobservations
 from merlin_contracts.state_scope import (
     LEGACY_ATTEMPT_SCHEMA_VERSION,
     STATE_SCOPE_SCHEMA_VERSION,
@@ -17,7 +18,7 @@ from merlin_contracts.state_scope import (
 )
 from psycopg.types.json import Jsonb
 
-_RECOVERY_POLICY_VERSION = "merlin.campaign-recovery-policy.v2"
+_RECOVERY_POLICY_VERSION = "merlin.campaign-recovery-policy.v3"
 
 
 class _StateScopeLeaseUnavailable(RuntimeError):
@@ -128,6 +129,35 @@ def _scheduler_recovery_action(
     if queued and campaign_status == "executing":
         return "claim_successor"
     return "paused" if campaign_status == "paused" else "idle"
+
+
+def _target_reobservation_recovery_action(
+    campaign_status: str,
+    scheduler_action: str,
+    projection: Mapping[str, object],
+) -> str:
+    """Put the durable target-surface barrier before the next scheduler wave."""
+
+    if campaign_status != "executing" or scheduler_action not in {
+        "bind_successor_schedule",
+        "claim_successor",
+        "idle",
+        "persist_successor_schedule",
+        "persist_wave_binding",
+        "resume_active",
+    }:
+        return scheduler_action
+    if projection.get("recovery_state") is not None:
+        return "recover_target_reobservation"
+    return scheduler_action
+
+
+def _campaign_target_id(campaign: Mapping[str, object]) -> str | None:
+    envelope = campaign.get("manifest")
+    reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+    target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+    target_id = target.get("id") if isinstance(target, Mapping) else None
+    return target_id if isinstance(target_id, str) and target_id else None
 
 
 class StateScopeRepository:
@@ -1339,7 +1369,8 @@ class StateScopeRepository:
                     )
                 )
             campaigns = self.connection.execute(
-                """SELECT id, status, execution_format, lifecycle_pause_reason
+                """SELECT id, session_id, manifest, status, execution_format,
+                          lifecycle_pause_reason
                    FROM merlin_storage.assessment_campaigns
                    WHERE status IN ('prepared', 'executing', 'paused') ORDER BY id FOR UPDATE"""
             ).fetchall()
@@ -1513,6 +1544,94 @@ class StateScopeRepository:
                 frontier_counts.update(
                     {str(item["state"]): int(item["count"]) for item in frontier_rows}
                 )
+                reobservation_rows = self.connection.execute(
+                    """SELECT sequence, decision_id, payload
+                       FROM merlin_storage.campaign_lead_journal
+                       WHERE campaign_id = %s
+                         AND (
+                           payload->>'kind' IN (
+                             'target_surface_transition_observed',
+                             'target_reobservation_started',
+                             'target_reobservation_blocked',
+                             'target_reobservation_retry_authorized',
+                             'target_reobservation_settled'
+                           )
+                           OR payload ? 'target_reobservation_generations'
+                         )
+                       ORDER BY sequence FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchall()
+                target_id = _campaign_target_id(campaign)
+                reobservation = (
+                    project_target_reobservations(
+                        tuple(dict(item) for item in reobservation_rows),
+                        campaign_id=campaign_id,
+                        session_id=str(campaign["session_id"]),
+                        target_id=target_id,
+                    )
+                    if target_id is not None
+                    else project_target_reobservations(())
+                )
+                reobservation_schedule_ids = tuple(
+                    sorted({item for values in reobservation.starts.values() for item in values})
+                )
+                reobservation_schedule_rows = (
+                    self.connection.execute(
+                        """SELECT id, status FROM merlin_storage.scheduler_schedules
+                           WHERE id = ANY(%s::uuid[]) ORDER BY id FOR UPDATE""",
+                        (list(reobservation_schedule_ids),),
+                    ).fetchall()
+                    if reobservation_schedule_ids
+                    else ()
+                )
+                pending_event_ids = tuple(item.event_digest for item in reobservation.pending)
+                latest_wave_number = None if latest_wave is None else int(latest_wave["wave"])
+                reobservation_recovery_state = reobservation.recovery_state(
+                    latest_wave=latest_wave_number
+                )
+                pending_review_bindings = reobservation.lead_review_bindings()
+                active_reobservation_ids = tuple(
+                    sorted(
+                        {
+                            schedule_id
+                            for generation_id in reobservation.generations
+                            if (schedule_id := reobservation.active_schedule(generation_id))
+                            is not None
+                        }
+                    )
+                )
+                target_reobservation = {
+                    "pending": {
+                        "count": len(pending_event_ids),
+                        "digest": _digest({"event_digests": pending_event_ids}),
+                        "event_digests": pending_event_ids[-16:],
+                    },
+                    "review_pending": {
+                        "count": len(pending_review_bindings),
+                        "digest": _digest({"bindings": pending_review_bindings}),
+                        "bindings": pending_review_bindings[-16:],
+                    },
+                    "schedules": {
+                        "count": len(reobservation_schedule_rows),
+                        "digest": _digest(
+                            {
+                                "schedules": tuple(
+                                    (str(item["id"]), str(item["status"]))
+                                    for item in reobservation_schedule_rows
+                                )
+                            }
+                        ),
+                        "statuses": tuple(
+                            {
+                                "schedule_id": str(item["id"]),
+                                "status": str(item["status"]),
+                            }
+                            for item in reobservation_schedule_rows[-16:]
+                        ),
+                    },
+                    "active_schedule_ids": active_reobservation_ids[-16:],
+                    "recovery_state": reobservation_recovery_state,
+                }
                 reservation_counts = self.connection.execute(
                     """SELECT reservation.state, count(*) AS count
                        FROM merlin_storage.resource_reservations AS reservation
@@ -1574,6 +1693,11 @@ class StateScopeRepository:
                     batch_projection,
                     frontier_counts,
                 )
+                scheduler_action = _target_reobservation_recovery_action(
+                    resulting_status,
+                    scheduler_action,
+                    target_reobservation,
+                )
                 recovery_action = "pause_lifecycle" if decision != "resume" else scheduler_action
                 topology = {
                     # The derived action policy evolves independently from the durable
@@ -1597,6 +1721,7 @@ class StateScopeRepository:
                         "unattributed_transitions": int(lane_counts["unattributed_count"] or 0),
                     },
                     "resource_reservations": reservations,
+                    "target_reobservation": target_reobservation,
                     "frontier_transition": (
                         None
                         if transition is None
@@ -1671,6 +1796,7 @@ class StateScopeRepository:
                         "recovery_fence_digest": fence_digest,
                         "recovery_decision_digest": recovery_decision_digest,
                         "target_call_count": int(counts["target_call_count"] or 0),
+                        "target_reobservation_recovery_state": (reobservation_recovery_state),
                         "state_lanes_requiring_reobservation": int(
                             lane_counts["reobservation_count"] or 0
                         ),
@@ -1679,6 +1805,7 @@ class StateScopeRepository:
                         ),
                         "settled_acknowledged_state_scopes": recovered_acknowledged,
                         "resource_reservations": reservations,
+                        "target_reobservation": target_reobservation,
                         "latest_wave": wave_projection,
                         "active_frontier_batch": batch_projection,
                         "frontier_counts": frontier_counts,

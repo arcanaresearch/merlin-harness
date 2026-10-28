@@ -96,6 +96,7 @@ from .campaign import (
     ObjectiveGateRetryReason,
     ObjectivePhaseGate,
     ReviewedTargetAdapter,
+    WorkerContext,
     _reviewed_adapter_digest,
     _reviewed_adapter_value,
     _reviewed_compiled_adapter,
@@ -127,6 +128,7 @@ from .campaign import (
     select_profile_techniques,
     validator_output_schema,
 )
+from .campaign import _digest as _campaign_digest
 from .capability_probe_execution import (
     CapabilityProbeExecution,
     ProbeTransportBinding,
@@ -225,6 +227,14 @@ from .specialists import (
     retire_dynamic_specialist,
 )
 from .target_progress_attribution import merge_target_progress_attributions
+from .target_reobservation import (
+    TargetReobservationGeneration,
+    TargetReobservationProjection,
+    extract_target_reobservation_obligations,
+    normalize_target_surface_generation_receipt,
+    project_target_reobservations,
+    target_reobservation_schedule_id,
+)
 from .technique_history import (
     LANGUAGE_DEFERRAL_OUTCOME,
     entries_for_completion,
@@ -271,6 +281,44 @@ def _bounded_frontier_projection(values: Sequence[object]) -> dict[str, object]:
         "sample": canonical[:FRONTIER_PROJECTION_SAMPLE_LIMIT],
         "omitted": max(0, len(canonical) - FRONTIER_PROJECTION_SAMPLE_LIMIT),
     }
+
+
+def _target_reobservation_review_bindings(
+    tasks: Sequence[AgentTask],
+) -> tuple[Mapping[str, str], ...]:
+    """Return only settled transition identities actually presented to the Lead."""
+
+    task = next(
+        (item for item in tasks if item.id.endswith("/lead-control/target_surface_get")),
+        None,
+    )
+    if task is None or not isinstance(task.result, str):
+        return ()
+    try:
+        projection = json.loads(task.result)
+    except (TypeError, ValueError):
+        return ()
+    refreshed = projection.get("refreshed") if isinstance(projection, Mapping) else None
+    if not isinstance(refreshed, list) or len(refreshed) > 16:
+        return ()
+    bindings: dict[str, Mapping[str, str]] = {}
+    for item in refreshed:
+        if not isinstance(item, Mapping):
+            continue
+        generation_id = item.get("generation_id")
+        settlement_id = item.get("settlement_id")
+        if (
+            isinstance(generation_id, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", generation_id)
+            and isinstance(settlement_id, str)
+            and settlement_id
+            == "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+        ):
+            bindings[generation_id] = {
+                "generation_id": generation_id,
+                "settlement_id": settlement_id,
+            }
+    return tuple(bindings[key] for key in sorted(bindings))
 
 
 def _frontier_overflow_fields(name: str, projection: Mapping[str, object]) -> dict[str, object]:
@@ -1844,6 +1892,38 @@ class _FrontierScheduleBlocked(Exception):
 
 class _CampaignRecoveryIncompatible(ValueError):
     """A sealed campaign cannot be interpreted without rewriting its history."""
+
+
+class _TargetReobservationBlocked(Exception):
+    """A passive target refresh needs an explicit operator/external-state retry."""
+
+
+class _TargetReobservationReviewRequired(Exception):
+    """A refreshed target generation must return to the Lead before target work."""
+
+
+_TARGET_REOBSERVATION_STRATEGY = "target-reobservation/v1"
+_TARGET_REOBSERVATION_TOOLS = (
+    "browser_snapshot",
+    "browser_wait_for_text",
+    "browser_network_events",
+    "browser_recall_reconnaissance",
+    "browser_record_api_handoff",
+    "browser_compile_api_handoff",
+)
+_TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_snapshot", "browser_record_api_handoff"})
+_TARGET_REOBSERVATION_INSTRUCTIONS = (
+    "Re-observe the already-open reviewed target after an authenticated material UI transition. "
+    "Use only passive snapshots, bounded waits, network inspection, durable reconnaissance "
+    "recall, and handoff tools. Record the durable DOM fallback on every target; compile an API "
+    "handoff only when attributable JSON traffic supports it. Do not navigate, open a tab, click, "
+    "fill, press, "
+    "select, check, hover, upload, submit, send a chat exchange, or execute an attack. Do not "
+    "choose behavior from labels. Inspect the current shared tab, refresh the interaction "
+    "contract and executable handoff from observed state, and return the durable handoff id plus "
+    "the exact target-surface-generation and request/response evidence references emitted by the "
+    "handoff tool. Merlin derives the sealed snapshot reference from the authenticated receipt."
+)
 
 
 @dataclass(slots=True)
@@ -5330,6 +5410,34 @@ class CampaignService:
             # follow-up evidence is read, so reconstructing a schedule id from the
             # mutable wave counter can address a schedule that does not exist yet.
             source_schedule_id = live.id
+            source_evidence = await self._source_evidence(source_schedule_id, tasks)
+            source_transition_obligations = extract_target_reobservation_obligations(
+                campaign_id=campaign_id,
+                session_id=manifest.session_id,
+                target_id=manifest.target.id,
+                source_schedule_id=source_schedule_id,
+                source_wave=initial_wave,
+                task_ids=tuple(task.id for task in tasks),
+                evidence=source_evidence,
+            )
+            noncredit_transition_task_ids = frozenset(
+                item.source_task_id
+                for item in source_transition_obligations
+                if item.receipt_projection == "target_ui_transition_receipts"
+            )
+            if callable(getattr(self._store, "commit_lead_decision", None)):
+                # Authenticate and journal a material target transition before
+                # fallible lesson, budget, selector, or frontier reducers run.
+                # Once this barrier exists, generic supervision failure must not
+                # clean up the changed surface before passive re-observation.
+                await self._record_target_surface_transitions(
+                    manifest,
+                    campaign_id,
+                    initial_wave,
+                    source_schedule_id,
+                    tasks,
+                    source_evidence,
+                )
             crescendo_assignments = tuple(
                 item for item in live_assignments if item.strategy_id == "crescendo"
             )
@@ -5397,9 +5505,8 @@ class CampaignService:
             # successful sibling work into a campaign-wide infrastructure failure.
             wave_status = "completed" if summary["completed"] > 0 or budget_capped else "failed"
             campaign_failed = wave_status != "completed" and initial_wave <= 1
-            if campaign_failed and live.execution is not None and not live.execution.done():
-                await self._agents.cancel_schedule(live.id, reason="campaign-wave-failed")
             transition_batch = await self._frontier_batch_for_schedule(campaign_id, str(live.id))
+            surface_reobservation: TargetReobservationProjection | None = None
             async with self._frontier_transition(
                 campaign_id, required=transition_batch is not None
             ) as transition_lease:
@@ -5412,7 +5519,7 @@ class CampaignService:
                     # Another local or remote supervisor settled this exact
                     # schedule while we waited for the transition lease.
                     return
-                frontier_evidence = await self._source_evidence(source_schedule_id, tasks)
+                frontier_evidence = source_evidence
                 await self._record_target_state_attributions(
                     manifest,
                     campaign_id,
@@ -5420,7 +5527,23 @@ class CampaignService:
                     source_schedule_id,
                     tasks,
                     evidence=frontier_evidence,
+                    record_surface_transitions=False,
                 )
+                surface_reobservation = await self._target_reobservation_projection(campaign_id)
+                surface_barrier_active = bool(
+                    surface_reobservation.pending or surface_reobservation.review_pending
+                )
+                if surface_barrier_active:
+                    # A signed surface disruption is operational state, not a failed
+                    # attack or campaign verdict. Keep the failed task/wave explicit,
+                    # but refresh and return through Lead review before any successor
+                    # target work or terminal decision.
+                    campaign_failed = False
+                elif campaign_failed and live.execution is not None and not live.execution.done():
+                    # Authenticate transition evidence before cancelling the terminal
+                    # schedule: cancellation may run cleanup against the just-changed
+                    # target surface that the passive refresh must preserve and inspect.
+                    await self._agents.cancel_schedule(live.id, reason="campaign-wave-failed")
                 if transition_batch is not None:
                     # ARM learning is part of the frontier transition, not
                     # post-settlement reporting.  Persist the canonical,
@@ -5449,7 +5572,12 @@ class CampaignService:
                         )
                 # Wave-0 specialists run in this wave alongside the structural lanes;
                 # retire terminal ones exactly like follow-up-wave specialists.
-                await self._retire_terminal_dynamic_specialists(campaign_id, initial_wave, tasks)
+                await self._retire_terminal_dynamic_specialists(
+                    campaign_id,
+                    initial_wave,
+                    tasks,
+                    (noncredit_transition_task_ids if surface_barrier_active else frozenset()),
+                )
                 frontier_counts = await self._settle_execution_frontier_batch(
                     campaign_id,
                     live,
@@ -5465,8 +5593,11 @@ class CampaignService:
                 await self._apply_incremental_review_priorities(
                     campaign_id, initial_wave, live_assessment
                 )
-                if await self._pause_repeated_frontier_infrastructure(
-                    campaign_id, initial_wave, frontier_counts
+                if (
+                    not surface_barrier_active
+                    and await self._pause_repeated_frontier_infrastructure(
+                        campaign_id, initial_wave, frontier_counts
+                    )
                 ):
                     return
                 frontier_retry_available = bool(
@@ -5490,6 +5621,7 @@ class CampaignService:
                     and not budget_capped
                     and not service_objective_state.get("violations")
                     and not quickscan_frontier_limit_reached
+                    and not surface_barrier_active
                 )
                 if (
                     quickscan_frontier_limit_reached
@@ -5516,6 +5648,7 @@ class CampaignService:
                     frontier_counts is not None
                     and frontier_counts.get("queued", 0) > 0
                     and service_objective_state.get("violations")
+                    and not surface_barrier_active
                 ):
                     await asyncio.to_thread(
                         self._store.append_lead,
@@ -5540,6 +5673,7 @@ class CampaignService:
                     and not continue_frontier
                     and not budget_capped
                     and not quickscan_frontier_limit_reached
+                    and not surface_barrier_active
                 ):
                     await asyncio.to_thread(
                         self._store.append_lead,
@@ -5645,6 +5779,11 @@ class CampaignService:
                             )
                         )
                         return
+            if surface_reobservation is not None and surface_reobservation.pending:
+                await self._ensure_target_reobserved(campaign_id, manifest, context)
+                raise _TargetReobservationReviewRequired
+            if surface_reobservation is not None and surface_reobservation.review_pending:
+                campaign_failed = False
             assessment = live_assessment or await self._assess_and_journal(
                 campaign_id, manifest, initial_wave, tasks
             )
@@ -6418,7 +6557,25 @@ class CampaignService:
                 )
                 seen.update(_resolved_candidate_keys(tasks, wave_evidence, technique_attempts))
                 if dynamic:
-                    await self._retire_terminal_dynamic_specialists(campaign_id, wave, tasks)
+                    transition_obligations = extract_target_reobservation_obligations(
+                        campaign_id=campaign_id,
+                        session_id=manifest.session_id,
+                        target_id=manifest.target.id,
+                        source_schedule_id=source_schedule_id,
+                        source_wave=wave,
+                        task_ids=tuple(task.id for task in tasks),
+                        evidence=wave_evidence,
+                    )
+                    await self._retire_terminal_dynamic_specialists(
+                        campaign_id,
+                        wave,
+                        tasks,
+                        frozenset(
+                            item.source_task_id
+                            for item in transition_obligations
+                            if item.receipt_projection == "target_ui_transition_receipts"
+                        ),
+                    )
                 admitted_hypotheses.update(_resolved_hypothesis_ids(tasks, wave_evidence))
                 budget_capped = await self._campaign_budget_capped(campaign_id)
                 campaign_failed = (
@@ -6862,6 +7019,14 @@ class CampaignService:
             terminalized = await self._finish_campaign(campaign_id, "cancelled", "operator_stopped")
             if terminalized is not False:
                 await self._generate_report(campaign_id, manifest, wave, "operator_stopped")
+        except _TargetReobservationReviewRequired:
+            if registered_owner:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+            return
+        except _TargetReobservationBlocked:
+            return
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -6914,6 +7079,39 @@ class CampaignService:
                     "failed",
                     "cancelled",
                 }
+
+            # A material transition can be the last durable result before any
+            # later lesson, selector, frontier, or Lead reducer raises. Re-read
+            # and journal that authenticated receipt before the generic failure
+            # path is allowed to cancel/clean up the changed target surface.
+            try:
+                surface_reobservation = await self._target_reobservation_projection(campaign_id)
+                if not (surface_reobservation.pending or surface_reobservation.review_pending):
+                    exception_tasks = tuple(await self._agents.list_schedule_tasks(live.id))
+                    exception_evidence = await self._source_evidence(live.id, exception_tasks)
+                    if callable(getattr(self._store, "commit_lead_decision", None)):
+                        await self._record_target_surface_transitions(
+                            manifest,
+                            campaign_id,
+                            initial_wave,
+                            live.id,
+                            exception_tasks,
+                            exception_evidence,
+                        )
+                    surface_reobservation = await self._target_reobservation_projection(campaign_id)
+            except Exception:
+                # Authentication/projection failure is not evidence that a
+                # transition happened. Preserve the original supervision error
+                # and its existing conservative failure handling below.
+                surface_reobservation = None
+            if surface_reobservation is not None and (
+                surface_reobservation.pending or surface_reobservation.review_pending
+            ):
+                if registered_owner:
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+                return
 
             if getattr(error, "cleanup_unresolved", False) is True:
                 # Target cleanup is a completion prerequisite, not an attack
@@ -7629,13 +7827,25 @@ class CampaignService:
                 await self._persist_dynamic_retirement(campaign_id, wave, retired)
 
     async def _retire_terminal_dynamic_specialists(
-        self, campaign_id: str, wave: int, tasks: tuple[AgentTask, ...]
+        self,
+        campaign_id: str,
+        wave: int,
+        tasks: tuple[AgentTask, ...],
+        protected_task_ids: frozenset[str] | None = None,
     ) -> None:
         """Remove terminal specialists from active routing while preserving attribution."""
+        if protected_task_ids is None:
+            projection = await self._target_reobservation_projection(campaign_id)
+            protected_task_ids = frozenset(
+                item.source_task_id
+                for item in projection.pending
+                if item.receipt_projection == "target_ui_transition_receipts"
+            )
         outcomes = {
             task.id: task.status
             for task in tasks
             if task.status in {"completed", "failed", "quarantined", "cancelled"}
+            and task.id not in (protected_task_ids or ())
         }
         if not outcomes:
             return
@@ -8680,7 +8890,25 @@ class CampaignService:
             )
             seen.update(_resolved_candidate_keys(tasks, wave_evidence, technique_attempts))
             if dynamic:
-                await self._retire_terminal_dynamic_specialists(campaign_id, wave, tasks)
+                transition_obligations = extract_target_reobservation_obligations(
+                    campaign_id=campaign_id,
+                    session_id=manifest.session_id,
+                    target_id=manifest.target.id,
+                    source_schedule_id=source_schedule_id,
+                    source_wave=wave,
+                    task_ids=tuple(task.id for task in tasks),
+                    evidence=wave_evidence,
+                )
+                await self._retire_terminal_dynamic_specialists(
+                    campaign_id,
+                    wave,
+                    tasks,
+                    frozenset(
+                        item.source_task_id
+                        for item in transition_obligations
+                        if item.receipt_projection == "target_ui_transition_receipts"
+                    ),
+                )
             if await self._campaign_budget_capped(campaign_id):
                 break
             admitted.update(_resolved_hypothesis_ids(tasks, wave_evidence))
@@ -10192,6 +10420,29 @@ class CampaignService:
         return digest, resumable_incomplete
 
     async def _finish_campaign(self, campaign_id: str, status: str, reason: str) -> bool:
+        if status in {"completed", "failed"}:
+            projection = await self._target_reobservation_projection(campaign_id)
+            if projection.pending:
+                row = await asyncio.to_thread(self._store.get, campaign_id)
+                envelope = row.get("manifest") if isinstance(row, Mapping) else None
+                if not isinstance(envelope, Mapping):
+                    raise RuntimeError(
+                        "campaign context is unavailable for required target re-observation"
+                    )
+                try:
+                    await self._ensure_target_reobserved(
+                        campaign_id,
+                        _manifest(envelope["manifest"]),
+                        _assignment_context(envelope["assignment_context"]),
+                    )
+                except _TargetReobservationBlocked:
+                    return False
+                projection = await self._target_reobservation_projection(campaign_id)
+            if projection.review_pending:
+                current = asyncio.current_task()
+                if current is not None and self._supervisors.get(campaign_id) is current:
+                    current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+                return False
         # Production stores expose the full projection/decision surface.  Tiny legacy
         # protocol fakes retain terminal compatibility, but cannot claim a completion
         # receipt or generate a production report.
@@ -11910,6 +12161,77 @@ class CampaignService:
             )
         await self._record_browser_recon_observations(manifest)
 
+    async def _target_reobservation_projection(
+        self, campaign_id: str
+    ) -> TargetReobservationProjection:
+        loader = getattr(self._store, "list_lead", None)
+        identity_loader = getattr(self._store, "get", None)
+        if not callable(loader) or not callable(identity_loader):
+            return project_target_reobservations(())
+        row = await asyncio.to_thread(identity_loader, campaign_id)
+        envelope = row.get("manifest") if isinstance(row, Mapping) else None
+        reviewed = envelope.get("manifest") if isinstance(envelope, Mapping) else None
+        if not isinstance(reviewed, Mapping):
+            return project_target_reobservations(())
+        try:
+            manifest = _manifest(reviewed)
+        except (KeyError, TypeError, ValueError):
+            return project_target_reobservations(())
+        session_id = getattr(manifest, "session_id", None)
+        target_id = getattr(getattr(manifest, "target", None), "id", None)
+        if not isinstance(session_id, str) or not isinstance(target_id, str):
+            return project_target_reobservations(())
+        rows = await asyncio.to_thread(loader, campaign_id)
+        return project_target_reobservations(
+            tuple(rows),
+            campaign_id=campaign_id,
+            session_id=session_id,
+            target_id=target_id,
+        )
+
+    async def _commit_target_reobservation_event(
+        self,
+        campaign_id: str,
+        wave: int,
+        decision_id: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        await asyncio.to_thread(
+            self._store.commit_lead_decision,
+            campaign_id,
+            wave,
+            decision_id,
+            payload,
+            (),
+        )
+
+    async def _record_target_surface_transitions(
+        self,
+        manifest: CampaignManifest,
+        campaign_id: str,
+        wave: int,
+        schedule_id: str,
+        tasks: Sequence[AgentTask],
+        evidence: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        obligations = extract_target_reobservation_obligations(
+            campaign_id=campaign_id,
+            session_id=manifest.session_id,
+            target_id=manifest.target.id,
+            source_schedule_id=schedule_id,
+            source_wave=wave,
+            task_ids=tuple(task.id for task in tasks),
+            evidence=evidence,
+        )
+        for obligation in obligations:
+            await self._commit_target_reobservation_event(
+                campaign_id,
+                wave,
+                "target-surface-transition-observed/"
+                + obligation.event_digest.removeprefix("sha256:"),
+                obligation.observed_payload(campaign_id, manifest.target.id),
+            )
+
     async def _record_target_state_attributions(
         self,
         manifest: CampaignManifest,
@@ -11919,6 +12241,7 @@ class CampaignService:
         tasks: Sequence[AgentTask],
         *,
         evidence: Mapping[str, Mapping[str, object]] | None = None,
+        record_surface_transitions: bool = True,
     ) -> None:
         """Project authoritative target transitions into campaign progress.
 
@@ -11938,6 +12261,15 @@ class CampaignService:
             return
         if evidence is None:
             evidence = await self._source_evidence(schedule_id, tasks)
+        if callable(commit_lead) and record_surface_transitions:
+            await self._record_target_surface_transitions(
+                manifest,
+                campaign_id,
+                wave,
+                schedule_id,
+                tasks,
+                evidence,
+            )
         await self._record_authoritative_selector_denominators(
             manifest,
             campaign_id,
@@ -13581,6 +13913,523 @@ class CampaignService:
             for assignment in assignments
         )
 
+    @staticmethod
+    def _target_reobservation_compilation(
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        generation: TargetReobservationGeneration,
+    ) -> CampaignCompilation:
+        parent = compile_recon_campaign(manifest, context).assignments[0]
+        tools = tuple(tool for tool in _TARGET_REOBSERVATION_TOOLS if tool in manifest.tool_ids)
+        missing = sorted(_TARGET_REOBSERVATION_REQUIRED_TOOLS - set(tools))
+        if missing:
+            raise RuntimeError(
+                "target re-observation cannot refresh the durable adapter; missing tools: "
+                + ", ".join(missing)
+            )
+        contract = {
+            "schema": "merlin.target-reobservation.v1",
+            "obligation_id": generation.obligation_id,
+            "generation_id": generation.generation_id,
+            "event_digests": json.dumps(generation.event_digests, separators=(",", ":")),
+            "event_set_digest": _campaign_digest({"event_digests": generation.event_digests}),
+            "observation_cutoff_sequence": str(generation.observation_cutoff_sequence),
+        }
+        assignment = replace(
+            parent,
+            id=(
+                f"{manifest.id}/target-reobservation/"
+                f"{generation.generation_id.removeprefix('sha256:')}/recon"
+            ),
+            objective=(
+                "Passively refresh the reviewed target interaction handoff after the "
+                "authenticated surface transition in the strategy contract. Do not advance "
+                "the target or test an attack."
+            ),
+            technique_ids=(),
+            tool_ids=tools,
+            output_schema=json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "recon_handoff_id": {"type": "string", "minLength": 1},
+                        "evidence_refs": {
+                            "type": "array",
+                            "minItems": 3,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                    },
+                    "required": ["recon_handoff_id", "evidence_refs"],
+                    "additionalProperties": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            strategy_id=_TARGET_REOBSERVATION_STRATEGY,
+            strategy_contract=tuple(sorted(contract.items())),
+            max_target_exchanges=None,
+        )
+        profile = replace(
+            CORE_PROFILES_BY_ID["recon"],
+            version=CORE_PROFILES_BY_ID["recon"].version + 1,
+            summary="passively refresh a reviewed target adapter",
+            instructions=_TARGET_REOBSERVATION_INSTRUCTIONS,
+        )
+        return CampaignCompilation(
+            (assignment,),
+            (
+                compile_worker_context(
+                    manifest,
+                    assignment,
+                    profile,
+                    capability_grant=profile_grant("recon", target_scope=manifest.target.id),
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _target_reobservation_schedule_id(
+        campaign_id: str, generation_id: str, attempt: int
+    ) -> str:
+        return target_reobservation_schedule_id(campaign_id, generation_id, attempt)
+
+    async def _resolve_target_reobservation_handoff(
+        self, manifest: CampaignManifest, handoff_id: str
+    ) -> tuple[ContextDocument, str, str, str]:
+        resolved = await self.resolve_reviewed_adapter(
+            manifest.session_id,
+            {
+                "recon_handoff_id": handoff_id,
+                "expected_target_id": manifest.target.id,
+            },
+        )
+        original = next(
+            (
+                document
+                for document in manifest.catalogue
+                if document.id == "target:reviewed-interaction-contract"
+            ),
+            None,
+        )
+        if not isinstance(resolved, Mapping) or original is None:
+            raise ValueError("target re-observation returned no reviewed interaction contract")
+        header, separator, _payload = original.content.partition("\n")
+        if not separator:
+            raise ValueError("reviewed interaction contract payload is missing")
+        document = ContextDocument.create(
+            original.id,
+            header + "\n" + json.dumps(dict(resolved), sort_keys=True, separators=(",", ":")),
+        )
+        rebound_manifest = replace(
+            manifest,
+            catalogue=tuple(
+                document if item.id == document.id else item for item in manifest.catalogue
+            ),
+        )
+        compiled = _reviewed_compiled_adapter(rebound_manifest)
+        if compiled is None:
+            raise ValueError("target re-observation did not seal an executable adapter")
+        return document, compiled[0], compiled[1], _reviewed_adapter_digest(rebound_manifest)
+
+    async def _settle_target_reobservation_attempt(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        generation: TargetReobservationGeneration,
+        attempt: int,
+        schedule_id: str,
+        live: Any,
+    ) -> None:
+        if live.execution is not None:
+            await self._await_wave_budget(campaign_id, manifest, generation.source_wave, live)
+        await self._await_live_wave_drivers(live)
+        tasks = tuple(await self._agents.list_schedule_tasks(schedule_id))
+        evidence = await self._source_evidence(schedule_id, tasks)
+        task = tasks[0] if len(tasks) == 1 else None
+        committed = evidence.get(task.id) if task is not None else None
+        structured = committed.get("structured_result") if isinstance(committed, Mapping) else None
+        result_reference = committed.get("reference") if isinstance(committed, Mapping) else None
+        result_digest = committed.get("digest") if isinstance(committed, Mapping) else None
+        result_attempt_id = committed.get("attempt_id") if isinstance(committed, Mapping) else None
+        blocker: str | None = None
+        handoff_id: str | None = None
+        compiled_digest: str | None = None
+        reviewed_digest: str | None = None
+        surface_receipt: Mapping[str, object] | None = None
+        if task is None or task.status != "completed":
+            blocker = "target re-observation worker did not complete"
+        elif not isinstance(committed, Mapping) or not isinstance(structured, Mapping):
+            blocker = "target re-observation has no committed structured result"
+        elif (
+            not isinstance(result_reference, str)
+            or not result_reference
+            or not isinstance(result_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+        ):
+            blocker = "target re-observation result has no authenticated evidence identity"
+        elif (
+            not isinstance(structured.get("recon_handoff_id"), str)
+            or not structured["recon_handoff_id"].strip()
+        ):
+            blocker = "target re-observation did not return a durable handoff"
+        elif not isinstance(result_attempt_id, str) or not result_attempt_id:
+            blocker = "target re-observation result has no scheduler attempt identity"
+        else:
+            handoff_id = str(structured["recon_handoff_id"])
+            try:
+                (
+                    _,
+                    _,
+                    compiled_digest,
+                    reviewed_digest,
+                ) = await self._resolve_target_reobservation_handoff(manifest, handoff_id)
+            except (KeyError, TypeError, ValueError) as error:
+                blocker = f"target re-observation handoff validation failed: {error}"
+            if blocker is None:
+                reader = self._recon_observation_reader
+                if reader is None:
+                    blocker = "target re-observation surface receipt reader is unavailable"
+                else:
+                    receipts = await reader(
+                        manifest.session_id,
+                        handoff_id,
+                        manifest.target.id,
+                    )
+                    expected_assignment_id = (
+                        f"{manifest.id}/target-reobservation/"
+                        f"{generation.generation_id.removeprefix('sha256:')}/recon"
+                    )
+                    expected_event_set = _campaign_digest(
+                        {"event_digests": generation.event_digests}
+                    )
+                    candidates = tuple(
+                        receipt
+                        for item in receipts
+                        if (receipt := normalize_target_surface_generation_receipt(item))
+                        is not None
+                        and receipt.get("campaign_id") == campaign_id
+                        and receipt.get("session_id") == manifest.session_id
+                        and receipt.get("target_id") == manifest.target.id
+                        and receipt.get("generation_id") == generation.generation_id
+                        and receipt.get("event_set_digest") == expected_event_set
+                        and receipt.get("assignment_id") == expected_assignment_id
+                        and receipt.get("attempt_id") == result_attempt_id
+                        and receipt.get("compiled_adapter_digest") == compiled_digest
+                    )
+                    if len(candidates) != 1:
+                        blocker = (
+                            "target re-observation handoff lacks one exact daemon-sealed "
+                            "surface generation receipt"
+                        )
+                    else:
+                        surface_receipt = candidates[0]
+                        returned_refs = structured.get("evidence_refs")
+                        cited_refs = (
+                            {str(item) for item in returned_refs}
+                            if isinstance(returned_refs, (list, tuple))
+                            else set()
+                        )
+                        cited_refs.add(
+                            "target-surface-snapshot:"
+                            + str(surface_receipt["current_surface_digest"])
+                        )
+                        required_refs = {
+                            str(surface_receipt["evidence_ref"]),
+                            "target-surface-snapshot:"
+                            + str(surface_receipt["current_surface_digest"]),
+                            str(surface_receipt["request_evidence_ref"]),
+                            str(surface_receipt["response_evidence_ref"]),
+                        }
+                        if (
+                            not isinstance(returned_refs, (list, tuple))
+                            or not required_refs <= cited_refs
+                        ):
+                            blocker = (
+                                "target re-observation output does not cite its sealed "
+                                "surface evidence"
+                            )
+        usage_reader = getattr(self._agents, "schedule_usage", None)
+        usage = await usage_reader(schedule_id) if callable(usage_reader) else {}
+        common: dict[str, object] = {
+            "campaign_id": campaign_id,
+            "session_id": manifest.session_id,
+            "target_id": manifest.target.id,
+            "generation_id": generation.generation_id,
+            "obligation_id": generation.obligation_id,
+            "event_digests": generation.event_digests,
+            "event_count": len(generation.event_digests),
+            "event_set_digest": _campaign_digest({"event_digests": generation.event_digests}),
+            "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+            "source_wave": generation.source_wave,
+            "attempt": attempt,
+            "schedule_id": schedule_id,
+            "usage": dict(usage),
+        }
+        if blocker is not None:
+            await self._commit_target_reobservation_event(
+                campaign_id,
+                generation.source_wave,
+                "target-reobservation-blocked/"
+                + generation.generation_id.removeprefix("sha256:")
+                + f"/{attempt}",
+                {
+                    "kind": "target_reobservation_blocked",
+                    "schema": "merlin.target-reobservation-blocked.v1",
+                    **common,
+                    "blocker": blocker,
+                },
+            )
+            try:
+                await asyncio.to_thread(self._store.pause, campaign_id)
+            except ValueError:
+                pass
+            raise _TargetReobservationBlocked(blocker)
+        assert (
+            handoff_id is not None
+            and compiled_digest is not None
+            and reviewed_digest is not None
+            and surface_receipt is not None
+        )
+        settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+            "sha256:"
+        )
+        await self._commit_target_reobservation_event(
+            campaign_id,
+            generation.source_wave,
+            settlement_id,
+            {
+                "kind": "target_reobservation_settled",
+                "schema": "merlin.target-reobservation-settlement.v1",
+                **common,
+                "settlement_id": settlement_id,
+                "status": "refreshed",
+                "current_surface_digest": surface_receipt["current_surface_digest"],
+                "surface_evidence_refs": (
+                    surface_receipt["request_evidence_ref"],
+                    surface_receipt["response_evidence_ref"],
+                    "target-surface-snapshot:" + str(surface_receipt["current_surface_digest"]),
+                    surface_receipt["evidence_ref"],
+                ),
+                "surface_evidence_digest": _campaign_digest(
+                    {
+                        "evidence_refs": sorted(
+                            (
+                                str(surface_receipt["request_evidence_ref"]),
+                                str(surface_receipt["response_evidence_ref"]),
+                                "target-surface-snapshot:"
+                                + str(surface_receipt["current_surface_digest"]),
+                                str(surface_receipt["evidence_ref"]),
+                            )
+                        )
+                    }
+                ),
+                "recon_handoff_id": handoff_id,
+                "compiled_adapter_digest": compiled_digest,
+                "reviewed_adapter_digest": reviewed_digest,
+                "result_reference": result_reference,
+                "result_digest": result_digest,
+            },
+        )
+
+    async def _ensure_target_reobserved(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+    ) -> None:
+        while True:
+            projection = await self._target_reobservation_projection(campaign_id)
+            if projection.overflow is not None:
+                blocker = (
+                    "target re-observation event set exceeds the bounded passive refresh limit"
+                )
+                try:
+                    await asyncio.to_thread(self._store.pause, campaign_id)
+                except ValueError:
+                    row = await asyncio.to_thread(self._store.get, campaign_id)
+                    if not isinstance(row, Mapping) or row.get("status") != "paused":
+                        raise
+                raise _TargetReobservationBlocked(blocker)
+            generation = projection.current_generation
+            if generation is None:
+                return
+            schedule_id = projection.active_schedule(generation.generation_id)
+            if schedule_id is None:
+                if not projection.eligible(generation.generation_id):
+                    raise _TargetReobservationBlocked(
+                        "target re-observation is waiting for explicit operator resume"
+                    )
+                attempt = len(projection.starts.get(generation.generation_id, ())) + 1
+                schedule_id = self._target_reobservation_schedule_id(
+                    campaign_id, generation.generation_id, attempt
+                )
+                await self._commit_target_reobservation_event(
+                    campaign_id,
+                    generation.source_wave,
+                    "target-reobservation-started/"
+                    + generation.generation_id.removeprefix("sha256:")
+                    + f"/{attempt}",
+                    {
+                        "kind": "target_reobservation_started",
+                        "schema": "merlin.target-reobservation-started.v1",
+                        "wave_kind": "objective_prerequisite",
+                        "campaign_id": campaign_id,
+                        "session_id": manifest.session_id,
+                        "target_id": manifest.target.id,
+                        "generation_id": generation.generation_id,
+                        "obligation_id": generation.obligation_id,
+                        "event_digests": generation.event_digests,
+                        "event_set_digest": _campaign_digest(
+                            {"event_digests": generation.event_digests}
+                        ),
+                        "observation_cutoff_sequence": (generation.observation_cutoff_sequence),
+                        "source_wave": generation.source_wave,
+                        "attempt": attempt,
+                        "schedule_id": schedule_id,
+                    },
+                )
+            else:
+                attempt = tuple(projection.starts[generation.generation_id]).index(schedule_id) + 1
+            compilation = self._target_reobservation_compilation(manifest, context, generation)
+            contexts = {item.assignment_id: item for item in compilation.worker_contexts}
+            status_reader = getattr(self._agents, "schedule_status", None)
+            schedule_status = await status_reader(schedule_id) if callable(status_reader) else None
+            if schedule_status is None:
+                live = await self._agents.submit(
+                    manifest.session_id,
+                    compilation.assignments,
+                    max_workers=1,
+                    worker_contexts=contexts,
+                    start_immediately=False,
+                    minimum_workers=1,
+                    schedule_id=schedule_id,
+                    grants=_schedule_grant_universe(compilation.assignments),
+                )
+                if live.assignments != compilation.assignments or live.worker_contexts != contexts:
+                    await self._agents.stop_local_schedule(live.id)
+                    reject = getattr(self._agents, "reject_persisted_schedule", None)
+                    if callable(reject):
+                        await reject(
+                            live.id,
+                            reason="deterministic re-observation schedule conflicts with journal",
+                        )
+                    raise RuntimeError(
+                        "deterministic target re-observation schedule identity conflicts"
+                    )
+            else:
+                live = (
+                    await self._agents.resume_schedule(schedule_id)
+                    if schedule_status == "paused"
+                    else await self._agents.reopen(schedule_id, resume_execution=False)
+                )
+            tasks = tuple(await self._agents.list_schedule_tasks(schedule_id))
+            if live.execution is None and (
+                not tasks
+                or any(
+                    task.status not in {"completed", "failed", "quarantined", "cancelled"}
+                    for task in tasks
+                )
+            ):
+                self._agents.start_execution(live, max_workers=1)
+            await self._settle_target_reobservation_attempt(
+                campaign_id,
+                manifest,
+                generation,
+                attempt,
+                schedule_id,
+                live,
+            )
+
+    async def _rebind_compilation_to_target_reobservation(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        compilation: CampaignCompilation,
+    ) -> CampaignCompilation:
+        target_tools = frozenset(self._target_exchange_tool_ids(compilation.assignments))
+        if not target_tools:
+            return compilation
+        settled = (await self._target_reobservation_projection(campaign_id)).latest_refreshed
+        if settled is None:
+            return compilation
+        handoff_id = settled.get("recon_handoff_id")
+        surface_digest = settled.get("current_surface_digest")
+        if not isinstance(handoff_id, str) or not isinstance(surface_digest, str):
+            raise RuntimeError("settled target re-observation adapter identity is incomplete")
+        (
+            guidance_document,
+            compiled_adapter,
+            compiled_digest,
+            reviewed_digest,
+        ) = await self._resolve_target_reobservation_handoff(manifest, handoff_id)
+        if (
+            compiled_digest != settled.get("compiled_adapter_digest")
+            or reviewed_digest != settled.get("reviewed_adapter_digest")
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", surface_digest) is None
+        ):
+            raise RuntimeError("target re-observation adapter identity changed after settlement")
+        rebound: dict[str, WorkerAssignment] = {}
+        assignments: list[WorkerAssignment] = []
+        for assignment in compilation.assignments:
+            if not target_tools.intersection(assignment.tool_ids):
+                assignments.append(assignment)
+                continue
+            contract = dict(assignment.strategy_contract)
+            contract.pop("compiled_adapter_compatibility", None)
+            contract.update(
+                {
+                    "reviewed_adapter_digest": reviewed_digest,
+                    "compiled_adapter": compiled_adapter,
+                    "compiled_adapter_digest": compiled_digest,
+                    "initial_state_equivalence_digest": surface_digest,
+                }
+            )
+            updated = replace(
+                assignment,
+                reviewed_adapter_digest=reviewed_digest,
+                strategy_contract=tuple(sorted(contract.items())),
+            )
+            assignments.append(updated)
+            rebound[updated.id] = updated
+        contexts: list[WorkerContext] = []
+        for worker_context in compilation.worker_contexts:
+            assignment = rebound.get(worker_context.assignment_id)
+            if assignment is None:
+                contexts.append(worker_context)
+                continue
+            if sum(item.id == guidance_document.id for item in worker_context.guidance) != 1:
+                raise RuntimeError(
+                    "target re-observation cannot rebind missing or duplicate adapter guidance"
+                )
+            guidance = tuple(
+                guidance_document if item.id == guidance_document.id else item
+                for item in worker_context.guidance
+            )
+            values = {
+                "assignment_id": worker_context.assignment_id,
+                "profile": asdict(worker_context.profile),
+                "guidance": [asdict(item) for item in guidance],
+                "skills": [asdict(item) for item in worker_context.skills],
+                "tool_ids": worker_context.tool_ids,
+                "target": asdict(worker_context.target),
+                "authority_ids": worker_context.authority_ids,
+                "strategy_id": assignment.strategy_id,
+                "strategy_contract": assignment.strategy_contract,
+            }
+            updated_context = replace(
+                worker_context,
+                guidance=guidance,
+                strategy_id=assignment.strategy_id,
+                strategy_contract=assignment.strategy_contract,
+                digest=_campaign_digest(values),
+            )
+            updated_context.validate()
+            contexts.append(updated_context)
+        if not set(rebound) <= {item.assignment_id for item in contexts}:
+            raise RuntimeError("target re-observation cannot rebind a worker without context")
+        return CampaignCompilation(tuple(assignments), tuple(contexts))
+
     async def _start_wave(
         self,
         campaign_id: str,
@@ -13601,6 +14450,19 @@ class CampaignService:
             and inherited_transition[0] == campaign_id
         ):
             transition_lease = inherited_transition[1]
+        target_tools = self._target_exchange_tool_ids(compiled.assignments)
+        if target_tools:
+            row = await asyncio.to_thread(self._store.get, campaign_id)
+            envelope = row.get("manifest") if isinstance(row, Mapping) else None
+            if not isinstance(envelope, Mapping):
+                raise RuntimeError("campaign assignment context is unavailable for re-observation")
+            await self._ensure_target_reobserved(
+                campaign_id,
+                manifest,
+                _assignment_context(envelope["assignment_context"]),
+            )
+            if (await self._target_reobservation_projection(campaign_id)).review_pending:
+                raise _TargetReobservationReviewRequired
         # A campaign may reuse reconnaissance, capability probes, or dynamic
         # specialists compiled before the reviewed target adapter was resealed.
         # Those parents retain useful technique history, but their historical
@@ -13621,18 +14483,44 @@ class CampaignService:
             scenario_fingerprint_for(manifest.target, manifest.catalogue),
             self._target_exchange_tool_ids(compiled.assignments),
         )
+        scheduled = CampaignCompilation(assignments, compiled.worker_contexts)
+        compiled = (
+            scheduled
+            if kind == "validation"
+            else await self._rebind_compilation_to_target_reobservation(
+                campaign_id,
+                manifest,
+                scheduled,
+            )
+        )
+        adapter_rebound = compiled is not scheduled
+        assignments = compiled.assignments
+        worker_contexts = {item.assignment_id: item for item in compiled.worker_contexts}
         live = await self._agents.submit(
             manifest.session_id,
             assignments,
             max_workers=_reviewed_worker_concurrency(
                 manifest, self._max_worker_concurrency, len(assignments)
             ),
-            worker_contexts={item.assignment_id: item for item in compiled.worker_contexts},
+            worker_contexts=worker_contexts,
             start_immediately=False,
             minimum_workers=1,
             schedule_id=self._campaign_wave_schedule_id(campaign_id, wave),
             grants=_schedule_grant_universe(assignments),
         )
+        if adapter_rebound and (
+            live.assignments != assignments or live.worker_contexts != worker_contexts
+        ):
+            await self._agents.stop_local_schedule(live.id)
+            reject = getattr(self._agents, "reject_persisted_schedule", None)
+            if callable(reject):
+                await reject(
+                    live.id,
+                    reason="deterministic schedule conflicts with refreshed target adapter",
+                )
+            raise RuntimeError(
+                "deterministic schedule identity conflicts with refreshed target adapter"
+            )
         if frontier_batch_id is not None:
             lease_kwargs = {} if transition_lease is None else dict(transition_lease.store_kwargs)
             binder = (
@@ -15182,9 +16070,15 @@ class CampaignService:
 
         coordination_tasks = coordination_projection(pending)
         model_control_tasks = control_plane_tasks
+        presented_reobservation_events = _target_reobservation_review_bindings(model_control_tasks)
 
         async def refresh_prompt_tasks() -> tuple[AgentTask, ...]:
+            nonlocal model_control_tasks, presented_reobservation_events
             refreshed_controls = await self._lead_control_plane_tasks(manifest, tasks)
+            model_control_tasks = refreshed_controls
+            presented_reobservation_events = _target_reobservation_review_bindings(
+                refreshed_controls
+            )
             pending_loader = getattr(self._store, "list_pending_worker_messages", None)
             newly_pending = (
                 await asyncio.to_thread(pending_loader, manifest.id)
@@ -15467,6 +16361,10 @@ class CampaignService:
                         ],
                         "usage": dict(verified.usage),
                     }
+                    if presented_reobservation_events:
+                        payload["target_reobservation_generations"] = list(
+                            presented_reobservation_events
+                        )
                     source_ids = tuple(sorted(str(row["id"]) for row in pending))
                     identity_body = json.dumps(
                         {
@@ -15786,6 +16684,14 @@ class CampaignService:
                 "omitted_directive_count": max(0, len(directives) - history_limit),
             },
         }
+        target_surface = project_target_reobservations(
+            tuple(lead_rows),
+            campaign_id=manifest.id,
+            session_id=manifest.session_id,
+            target_id=manifest.target.id,
+        ).lead_projection(latest_wave=(int(waves[-1]["wave"]) if waves else None))
+        if target_surface["pending"] or target_surface["refreshed"]:
+            projection["target_surface_get"] = target_surface
         if _specialist_composition(manifest) == "autonomous":
             wave0_records = tuple(
                 record
@@ -16926,6 +17832,13 @@ class CampaignService:
             )
             self._recovery_active = True
         try:
+            terminal_schedules = getattr(self._store, "list_terminal_active_schedules", None)
+            if terminal_schedules is not None:
+                for row in await asyncio.to_thread(terminal_schedules):
+                    await self._agents.cancel_schedule(
+                        str(row["schedule_id"]),
+                        reason=(f"terminal campaign recovery: {row.get('status') or 'terminal'}"),
+                    )
             if self._recovery_repository is not None:
                 if lifecycle_report is None:
                     if self._lifecycle_recovery is None:
@@ -16938,9 +17851,7 @@ class CampaignService:
                     lifecycle_report = await self._lifecycle_recovery.reconcile(
                         exclude_campaign_ids=live_campaign_ids
                     )
-                recovered = await self._apply_lifecycle_report(
-                    lifecycle_report, resume_execution
-                )
+                recovered = await self._apply_lifecycle_report(lifecycle_report, resume_execution)
                 return recovered + await self._recover_retryable_reports()
             return await self._recover_owned(resume_execution=resume_execution)
         finally:
@@ -17007,6 +17918,7 @@ class CampaignService:
                     self._recovery_repository.apply, decision.campaign_id, claim_id=claim_id
                 )
             except _CampaignRecoveryIncompatible as error:
+                await self._stop_target_reobservation_schedules(decision.campaign_id, pause=True)
                 await asyncio.to_thread(
                     self._recovery_repository.reject_incompatible,
                     decision.campaign_id,
@@ -17047,14 +17959,109 @@ class CampaignService:
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         action = decision.recovery_action
         batch = await asyncio.to_thread(self._store.load_active_frontier_batch, campaign_id)
-        if action == "claim_successor":
+        if action == "recover_target_reobservation":
+            if not waves:
+                raise _CampaignRecoveryIncompatible(
+                    "target re-observation recovery has no source wave"
+                )
+            projection = await self._target_reobservation_projection(campaign_id)
+            claimed = decision.target_reobservation_recovery_state
+            current = projection.recovery_state(latest_wave=int(waves[-1]["wave"]))
+            claimed_value = (
+                None
+                if claimed is None
+                else {
+                    "schema": "merlin.target-reobservation-recovery-state.v1",
+                    "phase": claimed.phase,
+                    "generation_id": claimed.generation_id,
+                    "event_set_digest": claimed.event_set_digest,
+                    "source_wave": claimed.source_wave,
+                    "schedule_id": claimed.schedule_id,
+                    "settlement_id": claimed.settlement_id,
+                    "lead_decision_id": claimed.lead_decision_id,
+                }
+            )
+            if current != claimed_value:
+                raise _CampaignRecoveryIncompatible(
+                    "target re-observation state changed after durable recovery classification"
+                )
+            if claimed is not None and claimed.phase == "reobserve":
+                try:
+                    await self._ensure_target_reobserved(
+                        campaign_id,
+                        manifest,
+                        context,
+                    )
+                except _TargetReobservationBlocked:
+                    # A blocked journal row can commit immediately before the
+                    # worker that normally pauses the campaign crashes. Recovery
+                    # must close that gap durably; returning while still executing
+                    # would make the blocked auxiliary schedule look idle forever.
+                    try:
+                        await asyncio.to_thread(self._store.pause, campaign_id)
+                    except ValueError:
+                        paused_row = await asyncio.to_thread(self._store.get, campaign_id)
+                        if (
+                            not isinstance(paused_row, Mapping)
+                            or paused_row.get("status") != "paused"
+                        ):
+                            raise
+                    return 1
+                projection = await self._target_reobservation_projection(campaign_id)
+            current = projection.recovery_state(latest_wave=int(waves[-1]["wave"]))
+            if current is None or current.get("phase") != "review":
+                raise _CampaignRecoveryIncompatible(
+                    "target re-observation recovery has no pending Lead review"
+                )
+            latest = waves[-1]
+            try:
+                live = await self._agents.reopen(str(latest["schedule_id"]), resume_execution=False)
+            except ValueError as error:
+                raise _CampaignRecoveryIncompatible(
+                    f"target re-observation source wave is incompatible: {error}"
+                ) from error
+            assignments = tuple(getattr(live, "assignments", ()))
+            requires_continuation_review = bool(assignments) and (
+                all(item.strategy_id == "objective-phase-gate/v1" for item in assignments)
+                or all(item.profile_id == "recon" for item in assignments)
+            )
+            if requires_continuation_review:
+                if self._lead_runner is None:
+                    raise _CampaignRecoveryIncompatible(
+                        "target re-observation continuation requires a Campaign Lead"
+                    )
+                tasks = tuple(await self._agents.list_schedule_tasks(str(latest["schedule_id"])))
+                await self._run_lead_with_policy(manifest, tasks)
+                reviewed = await self._target_reobservation_projection(campaign_id)
+                generation_id = str(current["generation_id"])
+                if generation_id not in reviewed.reviewed:
+                    raise _CampaignRecoveryIncompatible(
+                        "Campaign Lead did not consume the refreshed target surface"
+                    )
+            if assignments and all(
+                item.strategy_id == "objective-navigation/v1" for item in assignments
+            ):
+                if len(waves) < 2:
+                    raise _CampaignRecoveryIncompatible(
+                        "objective navigation recovery has no preceding continuation wave"
+                    )
+                latest = waves[-2]
+                try:
+                    live = await self._agents.reopen(
+                        str(latest["schedule_id"]), resume_execution=False
+                    )
+                except ValueError as error:
+                    raise _CampaignRecoveryIncompatible(
+                        f"objective navigation continuation is incompatible: {error}"
+                    ) from error
+            wave = int(latest["wave"])
+            wave_running = False
+        elif action == "claim_successor":
             successor = await self._recover_settled_frontier_successor(
                 campaign_id, manifest, context, waves
             )
             if successor is None:
-                raise _CampaignRecoveryIncompatible(
-                    "claimed recovery could not install successor"
-                )
+                raise _CampaignRecoveryIncompatible("claimed recovery could not install successor")
             live, wave = successor
             wave_running = True
         elif action in {
@@ -17091,9 +18098,7 @@ class CampaignService:
             wave = int(latest["wave"])
             wave_running = True
         else:
-            raise _CampaignRecoveryIncompatible(
-                f"unsupported recorded recovery action: {action}"
-            )
+            raise _CampaignRecoveryIncompatible(f"unsupported recorded recovery action: {action}")
         self._supervisors[campaign_id] = asyncio.create_task(
             self._supervise(
                 campaign_id,
@@ -17107,16 +18112,6 @@ class CampaignService:
         return 1
 
     async def _recover_owned(self, *, resume_execution: bool = True) -> int:
-        # A process/database failure can terminalize the campaign row before
-        # its scheduler cancellation commits. Fence those workers before the
-        # generic scheduler recovery is allowed to reopen active schedules.
-        terminal_schedules = getattr(self._store, "list_terminal_active_schedules", None)
-        if terminal_schedules is not None:
-            for row in await asyncio.to_thread(terminal_schedules):
-                await self._agents.cancel_schedule(
-                    str(row["schedule_id"]),
-                    reason=(f"terminal campaign recovery: {row.get('status') or 'terminal'}"),
-                )
         rows = await asyncio.to_thread(self._store.list_executing)
         recovered = 0
         for row in rows:
@@ -17504,6 +18499,7 @@ class CampaignService:
             else None
         )
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+        await self._stop_target_reobservation_schedules(campaign_id, pause=True)
         frontier_loader = getattr(self._store, "load_active_frontier_batch", None)
         active = (
             await asyncio.to_thread(frontier_loader, campaign_id)
@@ -19674,6 +20670,57 @@ class CampaignService:
             "durable progress; do not infer progress from chat history."
         )
 
+    async def _authorize_target_reobservation_retry(
+        self, campaign_id: str, command_id: str
+    ) -> bool:
+        projection = await self._target_reobservation_projection(campaign_id)
+        generation = projection.current_generation
+        if generation is None:
+            return False
+        starts = projection.starts.get(generation.generation_id, ())
+        if not starts or projection.active_schedule(generation.generation_id) is not None:
+            return False
+        if not projection.eligible(generation.generation_id):
+            await self._commit_target_reobservation_event(
+                campaign_id,
+                generation.source_wave,
+                "target-reobservation-retry-authorized/"
+                + generation.generation_id.removeprefix("sha256:")
+                + "/"
+                + hashlib.sha256(command_id.encode()).hexdigest(),
+                {
+                    "kind": "target_reobservation_retry_authorized",
+                    "schema": "merlin.target-reobservation-retry-authorized.v1",
+                    "campaign_id": generation.campaign_id,
+                    "session_id": generation.session_id,
+                    "target_id": generation.target_id,
+                    "generation_id": generation.generation_id,
+                    "obligation_id": generation.obligation_id,
+                    "event_set_digest": _campaign_digest(
+                        {"event_digests": generation.event_digests}
+                    ),
+                    "authorized_after_attempt": len(starts),
+                    "command_id": command_id,
+                },
+            )
+        return True
+
+    async def _stop_target_reobservation_schedules(self, campaign_id: str, *, pause: bool) -> None:
+        projection = await self._target_reobservation_projection(campaign_id)
+        schedules = (
+            projection.active_schedule(generation_id) for generation_id in projection.generations
+        )
+        for schedule_id in (item for item in schedules if item is not None):
+            try:
+                if pause:
+                    await self._agents.pause_schedule(schedule_id, reason="operator-campaign-pause")
+                else:
+                    await self._agents.cancel_schedule(
+                        schedule_id, reason="operator-campaign-cancel"
+                    )
+            except (KeyError, ValueError):
+                continue
+
     async def cancel(self, session_id: str, campaign_id: str = "*") -> int:
         del session_id
         if campaign_id == "*":
@@ -19702,6 +20749,7 @@ class CampaignService:
                 for schedule_id in transition.schedule_ids:
                     await self._agents.stop_local_schedule(schedule_id)
                     await self._agents.reopen(schedule_id)
+            await self._stop_target_reobservation_schedules(identifier, pause=False)
             supervisor = self._supervisors.pop(identifier, None)
             if supervisor is not None:
                 supervisor.cancel()
@@ -19854,10 +20902,12 @@ class CampaignService:
                 command_id=command_id or str(uuid4()),
             )
             await self._stop_supervisor(campaign_id)
+            await self._stop_target_reobservation_schedules(campaign_id, pause=True)
             for schedule_id in transition.schedule_ids:
                 await self._agents.stop_local_schedule(schedule_id)
             return {"campaign_id": campaign_id, "status": "paused"}
         await self._stop_supervisor(campaign_id)
+        await self._stop_target_reobservation_schedules(campaign_id, pause=True)
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
         running = [wave for wave in waves if str(wave["status"]) == "running"]
         for wave in running:
@@ -19879,6 +20929,7 @@ class CampaignService:
         row = await asyncio.to_thread(self._store.get, campaign_id)
         if row is None:
             raise ValueError("campaign is unknown")
+        resume_command_id = command_id or str(uuid4())
         if str(row["status"]) == "failed" and str(row.get("stop_reason")) == "failed":
             status = await self.status(campaign_id)
             saturation = status.get("saturation")
@@ -19969,6 +21020,9 @@ class CampaignService:
             return {"campaign_id": campaign_id, "status": "executing"}
         if self._lifecycle_transitions is None and str(row["status"]) != "paused":
             raise ValueError("campaign is unknown, not paused, or not retryable")
+        reobservation_retry = await self._authorize_target_reobservation_retry(
+            campaign_id, resume_command_id
+        )
         if self._lifecycle_transitions is not None:
             envelope = row["manifest"]
             manifest = _manifest(envelope["manifest"])
@@ -19979,7 +21033,7 @@ class CampaignService:
                 self._lifecycle_transitions.resume,
                 campaign_id,
                 cause="operator",
-                command_id=command_id or str(uuid4()),
+                command_id=resume_command_id,
             )
             await self._stop_supervisor(campaign_id)
             for schedule_id in transition.schedule_ids:
@@ -20057,7 +21111,9 @@ class CampaignService:
                 if callable(frontier_counter)
                 else None
             )
-            if isinstance(frontier_counts, Mapping) and int(frontier_counts.get("queued", 0)) > 0:
+            if reobservation_retry or (
+                isinstance(frontier_counts, Mapping) and int(frontier_counts.get("queued", 0)) > 0
+            ):
                 await asyncio.to_thread(self._store.resume, campaign_id)
                 await self._stop_supervisor(campaign_id)
                 if await self.recover() < 1:
@@ -20070,8 +21126,16 @@ class CampaignService:
                     int(latest["wave"]),
                     {
                         "state": "executing",
-                        "reason": "operator-frontier-retry-continuation",
-                        "queued": frontier_counts.get("queued", 0),
+                        "reason": (
+                            "operator-target-reobservation-retry"
+                            if reobservation_retry
+                            else "operator-frontier-retry-continuation"
+                        ),
+                        "queued": (
+                            frontier_counts.get("queued", 0)
+                            if isinstance(frontier_counts, Mapping)
+                            else 0
+                        ),
                     },
                 )
                 return {"campaign_id": campaign_id, "status": "executing"}

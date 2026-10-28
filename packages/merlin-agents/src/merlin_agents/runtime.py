@@ -942,6 +942,40 @@ def _objective_phase_checkpoint_context(
     }
 
 
+def _target_reobservation_tool_context(
+    strategy_id: str,
+    strategy_contract: Mapping[str, str],
+) -> dict[str, object]:
+    """Project only the sealed generation identity into browser tools."""
+
+    schema = strategy_contract.get("schema")
+    reobservation_fields_present = all(
+        field in strategy_contract for field in ("generation_id", "event_set_digest")
+    )
+    if strategy_id != "target-reobservation/v1":
+        if schema == "merlin.target-reobservation.v1" or reobservation_fields_present:
+            raise ValueError(
+                "target re-observation contract requires the target-reobservation strategy"
+            )
+        return {}
+    if schema != "merlin.target-reobservation.v1":
+        raise ValueError("target re-observation strategy requires its sealed contract schema")
+    generation_id = strategy_contract.get("generation_id")
+    event_set_digest = strategy_contract.get("event_set_digest")
+    digest_pattern = r"sha256:[0-9a-f]{64}"
+    if (
+        not isinstance(generation_id, str)
+        or re.fullmatch(digest_pattern, generation_id) is None
+        or not isinstance(event_set_digest, str)
+        or re.fullmatch(digest_pattern, event_set_digest) is None
+    ):
+        raise ValueError("target re-observation contract has invalid generation identity")
+    return {
+        "target_reobservation_generation_id": generation_id,
+        "target_reobservation_event_set_digest": event_set_digest,
+    }
+
+
 def _crescendo_contract(assignment: WorkerAssignment) -> CrescendoContract | None:
     if assignment.strategy_id != "crescendo":
         return None
@@ -2106,7 +2140,12 @@ class WorkerRuntime:
             return restored_surface_result
         strategy_values = dict(handoff.assignment.strategy_contract)
         try:
-            objective_checkpoint_context = _objective_phase_checkpoint_context(strategy_values)
+            objective_checkpoint_context = {
+                **_objective_phase_checkpoint_context(strategy_values),
+                **_target_reobservation_tool_context(
+                    handoff.assignment.strategy_id, strategy_values
+                ),
+            }
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             return self._failed(
                 handoff,

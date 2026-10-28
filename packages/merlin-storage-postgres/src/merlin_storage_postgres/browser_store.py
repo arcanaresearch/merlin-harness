@@ -172,6 +172,18 @@ class BrowserRepository:
             for observation in handoff.recon_observations
             for reference in observation.get("evidence_refs", ())
         }
+        recon_evidence_refs.update(
+            str(observation["evidence_ref"])
+            for observation in handoff.recon_observations
+            if observation.get("schema") == "merlin.target-surface-generation.v1"
+            and isinstance(observation.get("evidence_ref"), str)
+        )
+        recon_evidence_refs.update(
+            "target-surface-snapshot:" + str(observation["current_surface_digest"])
+            for observation in handoff.recon_observations
+            if observation.get("schema") == "merlin.target-surface-generation.v1"
+            and isinstance(observation.get("current_surface_digest"), str)
+        )
         required_evidence_refs = {
             handoff.request_evidence_ref,
             handoff.response_evidence_ref,

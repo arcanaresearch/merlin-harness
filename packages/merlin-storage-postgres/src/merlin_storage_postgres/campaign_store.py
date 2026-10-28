@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from merlin_agents import ExplorationCriticDecision
+from merlin_agents.target_reobservation import target_reobservation_schedule_ids
 from merlin_contracts import CampaignObservation, CampaignTerminalReason
 from merlin_contracts.campaign_lifecycle import require_campaign_terminal_reason
 from merlin_contracts.state_scope import OpaqueIdentityReference
@@ -1864,15 +1865,65 @@ class CampaignStore:
     def list_terminal_active_schedules(self) -> list[dict[str, Any]]:
         """Find terminal campaigns whose worker schedule was not fenced atomically."""
         rows = self.connection.execute(
-            """SELECT campaign.*
+            """WITH owned_schedule AS (
+                 SELECT id AS campaign_id, schedule_id
+                 FROM merlin_storage.assessment_campaigns
+                 UNION
+                 SELECT campaign_id, schedule_id
+                 FROM merlin_storage.campaign_waves
+               )
+               SELECT campaign.*, owned.schedule_id AS orphan_schedule_id
                FROM merlin_storage.assessment_campaigns AS campaign
+               JOIN owned_schedule AS owned ON owned.campaign_id = campaign.id
                JOIN merlin_storage.scheduler_schedules AS schedule
-                 ON schedule.id = campaign.schedule_id
+                 ON schedule.id = owned.schedule_id
                WHERE campaign.status IN ('completed', 'cancelled', 'failed')
                  AND schedule.status IN ('running', 'paused')
-               ORDER BY campaign.updated_at, campaign.id"""
+               ORDER BY campaign.updated_at, campaign.id, owned.schedule_id"""
         ).fetchall()
-        return [self._row(row) for row in rows]
+        result = [{**self._row(row), "schedule_id": str(row["orphan_schedule_id"])} for row in rows]
+        terminal = self.connection.execute(
+            """SELECT * FROM merlin_storage.assessment_campaigns
+               WHERE status IN ('completed', 'cancelled', 'failed')
+               ORDER BY updated_at, id"""
+        ).fetchall()
+        owned = {(str(item["id"]), str(item["schedule_id"])) for item in result}
+        for campaign in terminal:
+            campaign_id = str(campaign["id"])
+            envelope = campaign.get("manifest")
+            reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+            target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+            target_id = target.get("id") if isinstance(target, Mapping) else None
+            if not isinstance(target_id, str) or not target_id:
+                continue
+            journal = self.connection.execute(
+                """SELECT sequence, decision_id, payload
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s
+                   ORDER BY sequence""",
+                (campaign_id,),
+            ).fetchall()
+            for schedule_id in target_reobservation_schedule_ids(
+                tuple(dict(item) for item in journal),
+                campaign_id=campaign_id,
+                session_id=str(campaign["session_id"]),
+                target_id=target_id,
+            ):
+                if (campaign_id, schedule_id) in owned:
+                    continue
+                schedule = self.connection.execute(
+                    """SELECT status FROM merlin_storage.scheduler_schedules
+                       WHERE id = %s""",
+                    (schedule_id,),
+                ).fetchone()
+                if schedule is None or schedule["status"] not in {"running", "paused"}:
+                    continue
+                result.append({**self._row(campaign), "schedule_id": schedule_id})
+                owned.add((campaign_id, schedule_id))
+        return sorted(
+            result,
+            key=lambda item: (item["updated_at"], item["id"], item["schedule_id"]),
+        )
 
     def list_report_retryable(self) -> list[dict[str, Any]]:
         """Return reportable terminal campaigns with no durable report revision.

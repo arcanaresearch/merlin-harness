@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import signal
 import socket
 import subprocess
@@ -9,6 +11,12 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+from merlin_agents.target_reobservation import (
+    TargetReobservationObligation,
+    normalize_target_ui_transition,
+    target_reobservation_generation,
+    target_reobservation_schedule_id,
+)
 
 sys.path.insert(0, str(Path(__file__).with_name("fixtures")))
 
@@ -123,6 +131,232 @@ def test_active_api_session_is_not_an_unfinished_cleanup_obligation(
             assert recovery["status"] == "prepared"
 
 
+def test_auxiliary_target_reobservation_stays_live_until_lead_effect(
+    tmp_path: Path,
+) -> None:
+    def digest(value: object) -> str:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def insert_schedule(connection, schedule_id: str, session_id: str, status: str) -> None:
+        connection.execute(
+            """INSERT INTO merlin_storage.scheduler_schedules
+                   (id, session_id, graph, graph_digest, checkpoint,
+                    checkpoint_digest, last_event_digest, status)
+               VALUES (%s, %s, '{}'::jsonb, %s, '{}'::jsonb, %s, %s, %s)""",
+            (schedule_id, session_id, "1" * 64, "2" * 64, "3" * 64, status),
+        )
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-reobserve-lifecycle")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target re-observation lifecycle")
+            session_id = str(session.id)
+            campaign_id = "campaign/reobserve-lifecycle"
+            target_id = "target/reobserve-lifecycle"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                session_id,
+                {
+                    "manifest": {
+                        "id": campaign_id,
+                        "session_id": session_id,
+                        "target": {"id": target_id},
+                    },
+                    "assignment_context": {},
+                },
+                "sha256:" + "a" * 64,
+            )
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'executing' WHERE id = %s""",
+                (campaign_id,),
+            )
+
+            normalized = normalize_target_ui_transition(
+                {
+                    "schema": "merlin.target-ui-transition.v1",
+                    "material": True,
+                    "adapter_stale": False,
+                    "before_digest": "sha256:" + "b" * 64,
+                    "after_digest": "sha256:" + "c" * 64,
+                    "changed_dimensions": ["controls"],
+                    "added_controls": [
+                        {
+                            "role": "button",
+                            "name": "Continue",
+                            "frame_ref": "main",
+                            "disabled": False,
+                        }
+                    ],
+                    "removed_controls": [],
+                    "controls_truncated": False,
+                    "evidence_refs": ["browser-snapshot:post-effect"],
+                    "reobservation_recommended": True,
+                }
+            )
+            assert normalized is not None
+            transition, transition_digest = normalized
+            receipt_sha256 = "d" * 64
+            event_digest = digest(
+                [
+                    campaign_id,
+                    "task/source",
+                    "call/source",
+                    receipt_sha256,
+                    transition_digest,
+                ]
+            )
+            obligation = TargetReobservationObligation(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                target_id=target_id,
+                event_digest=event_digest,
+                transition_digest=transition_digest,
+                source_schedule_id="schedule/source",
+                source_wave=1,
+                source_task_id="task/source",
+                target_call_id="call/source",
+                receipt_sha256=receipt_sha256,
+                receipt_projection="target_evidence_receipts",
+                transition=transition,
+            )
+            observed = campaigns.append_lead(
+                campaign_id,
+                1,
+                obligation.observed_payload(campaign_id, target_id),
+            )
+            generation = target_reobservation_generation(
+                (obligation,), {event_digest: int(observed["sequence"])}
+            )
+            assert generation is not None
+            schedule_id = target_reobservation_schedule_id(campaign_id, generation.generation_id, 1)
+            insert_schedule(connection, schedule_id, session_id, "running")
+            event_set_digest = digest({"event_digests": generation.event_digests})
+            campaigns.append_lead(
+                campaign_id,
+                1,
+                {
+                    "kind": "target_reobservation_started",
+                    "schema": "merlin.target-reobservation-started.v1",
+                    "wave_kind": "objective_prerequisite",
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "target_id": target_id,
+                    "generation_id": generation.generation_id,
+                    "obligation_id": generation.obligation_id,
+                    "event_digests": generation.event_digests,
+                    "event_set_digest": event_set_digest,
+                    "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+                    "source_wave": generation.source_wave,
+                    "attempt": 1,
+                    "schedule_id": schedule_id,
+                },
+            )
+
+            repository = StateScopeRepository(connection)
+            reobserving = _campaign_recovery(
+                _reconcile(repository, "daemon/reobserve"), campaign_id
+            )
+            assert reobserving["recovery_action"] == "recover_target_reobservation"
+            assert reobserving["target_reobservation_recovery_state"] == {
+                "schema": "merlin.target-reobservation-recovery-state.v1",
+                "phase": "reobserve",
+                "generation_id": generation.generation_id,
+                "event_set_digest": event_set_digest,
+                "source_wave": 1,
+                "schedule_id": schedule_id,
+                "settlement_id": None,
+                "lead_decision_id": None,
+            }
+
+            settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+                "sha256:"
+            )
+            surface_evidence_refs = (
+                "browser-request:refresh",
+                "browser-response:refresh",
+                "target-surface-snapshot:sha256:" + "e" * 64,
+                "target-surface-generation:sha256:" + "f" * 64,
+            )
+            campaigns.append_lead(
+                campaign_id,
+                1,
+                {
+                    "kind": "target_reobservation_settled",
+                    "schema": "merlin.target-reobservation-settlement.v1",
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "target_id": target_id,
+                    "generation_id": generation.generation_id,
+                    "obligation_id": generation.obligation_id,
+                    "event_digests": generation.event_digests,
+                    "event_count": 1,
+                    "event_set_digest": event_set_digest,
+                    "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+                    "source_wave": 1,
+                    "attempt": 1,
+                    "schedule_id": schedule_id,
+                    "usage": {},
+                    "settlement_id": settlement_id,
+                    "status": "refreshed",
+                    "current_surface_digest": "sha256:" + "e" * 64,
+                    "surface_evidence_refs": surface_evidence_refs,
+                    "surface_evidence_digest": digest(
+                        {"evidence_refs": sorted(surface_evidence_refs)}
+                    ),
+                    "recon_handoff_id": "handoff/refreshed",
+                    "compiled_adapter_digest": "sha256:" + "1" * 64,
+                    "reviewed_adapter_digest": "sha256:" + "2" * 64,
+                    "result_reference": "result/refreshed",
+                    "result_digest": "sha256:" + "3" * 64,
+                },
+            )
+            reviewing = _campaign_recovery(_reconcile(repository, "daemon/review"), campaign_id)
+            assert reviewing["recovery_action"] == "recover_target_reobservation"
+            assert reviewing["target_reobservation_recovery_state"]["phase"] == "review"
+            assert reviewing["target_reobservation_recovery_state"]["lead_decision_id"] is None
+
+            lead_decision_id = (
+                "lead-decision:" + hashlib.sha256(b"reviewed-refreshed-surface").hexdigest()
+            )
+            campaigns.commit_lead_decision(
+                campaign_id,
+                1,
+                lead_decision_id,
+                {
+                    "summary": "Reviewed the refreshed target surface.",
+                    "target_reobservation_generations": [
+                        {
+                            "generation_id": generation.generation_id,
+                            "settlement_id": settlement_id,
+                        }
+                    ],
+                },
+                (),
+            )
+            reviewed = _campaign_recovery(_reconcile(repository, "daemon/reviewed"), campaign_id)
+            assert reviewed["recovery_action"] == "recover_target_reobservation"
+            assert reviewed["target_reobservation_recovery_state"]["phase"] == "review"
+            assert (
+                reviewed["target_reobservation_recovery_state"]["lead_decision_id"]
+                == lead_decision_id
+            )
+
+            continuation_schedule = str(
+                uuid5(NAMESPACE_URL, f"merlin.campaign-wave.v1\n{campaign_id}\n2")
+            )
+            insert_schedule(connection, continuation_schedule, session_id, "completed")
+            campaigns.add_wave(campaign_id, 2, "frontier", continuation_schedule)
+            campaigns.finish_wave(campaign_id, 2, "completed", {"status": "completed"})
+            continued = _campaign_recovery(_reconcile(repository, "daemon/continued"), campaign_id)
+            assert continued["target_reobservation_recovery_state"] is None
+            assert continued["recovery_action"] != "recover_target_reobservation"
+
+
 def test_restart_releases_target_execution_lease_for_terminal_scheduler_attempt(
     tmp_path: Path,
 ) -> None:
@@ -197,9 +431,7 @@ def test_restart_releases_target_execution_lease_for_terminal_scheduler_attempt(
             report = _reconcile(sessions, "daemon/restarted")
 
             assert report["expired_global_leases"] == 2
-            assert not sessions.validate_target_execution(
-                claim_id, "target-execution:interrupted"
-            )
+            assert not sessions.validate_target_execution(claim_id, "target-execution:interrupted")
             assert not sessions.validate_state_scope_lease(
                 state_claim_id, "target-execution:interrupted"
             )

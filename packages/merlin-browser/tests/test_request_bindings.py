@@ -1,10 +1,17 @@
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from merlin_browser.models import BrowserAction, BrowserObservation, BrowserOwner, ElementRef
+from merlin_browser.models import (
+    ApiReconHandoff,
+    BrowserAction,
+    BrowserObservation,
+    BrowserOwner,
+    ElementRef,
+)
 from merlin_browser.tools import (
     CompiledApiReconHandoffTool,
     _observed_request_bindings,
@@ -142,6 +149,296 @@ async def test_recon_compiles_declared_or_observed_nested_request_binding(mode):
         assert step["request_bindings"] == {"/box/0/opaque": "uuid4"}
     assert step["request_template"]["session"] == "reviewed-session"
     assert step["request_template"]["text"] == "{{input}}"
+
+
+@pytest.mark.asyncio
+async def test_reobservation_compile_seals_exact_surface_generation_receipt() -> None:
+    captured = exchange("harmless probe", str(uuid4()), "reviewed-session")
+    captured.update(
+        {
+            "tab_ref": "tab-current",
+            "observed_at": "2026-10-28T12:00:00+00:00",
+        }
+    )
+
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="tärgét")
+        owner = BrowserOwner(session_id="s1", worker_id="a1", technique_id="recon")
+
+        def api_exchange_events(self):
+            return (captured,)
+
+        def metadata(self):
+            return SimpleNamespace(tabs=[SimpleNamespace(tab_ref="tab-current", state="open")])
+
+        async def snapshot(self, tab_ref):
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.test",
+                owner=self.owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                text="current pass-modal surface",
+                observed_at=datetime(2026, 10, 28, 12, 0, 1, tzinfo=UTC),
+            )
+
+    class Recorder:
+        evidence = []
+        handoffs = []
+        observations = []
+
+        async def append_observation(self, observation):
+            self.observations.append(observation)
+
+        async def record_evidence(self, context_id, evidence_ref, kind, payload):
+            self.evidence.append((context_id, evidence_ref, kind, payload))
+
+        async def record_handoff(self, value):
+            self.handoffs.append(value)
+
+        async def reviewed_native_input_receipt(self, context_id, event, input_pointer):
+            return {
+                "context_id": context_id,
+                "target_id": "tärgét",
+                "input_pointer": input_pointer,
+                "evidence_ref": "native-request:sha256:" + "a" * 64,
+            }
+
+    recorder = Recorder()
+    tool = CompiledApiReconHandoffTool(lambda _: Session(), recorder)
+    generation_id = "sha256:" + "1" * 64
+    event_set_digest = "sha256:" + "2" * 64
+    context = ToolContext(
+        session_id="s1",
+        workspace_root="/tmp",
+        call_id="compile-current-surface",
+        agent_id="campaign/c1/target-reobservation/generation/recon",
+        attempt_id="attempt-current-surface",
+        campaign_id="campaign/c1",
+        target_id="tärgét",
+        target_reobservation_generation_id=generation_id,
+        target_reobservation_event_set_digest=event_set_digest,
+    )
+    arguments = {
+        "method": "POST",
+        "url": captured["url"],
+        "input_pointer": "/text",
+        "response_selector": "/reply",
+        "authentication": "none",
+        "session_constraint": "reviewed-session",
+    }
+
+    result = await tool.invoke(context, arguments)
+
+    assert not result.is_error, result.content
+    handoff = recorder.handoffs[-1]
+    receipt = next(
+        item
+        for item in handoff.recon_observations
+        if item.get("schema") == "merlin.target-surface-generation.v1"
+    )
+    assert receipt["campaign_id"] == "campaign/c1"
+    assert receipt["session_id"] == "s1"
+    assert receipt["target_id"] == "tärgét"
+    assert receipt["generation_id"] == generation_id
+    assert receipt["event_set_digest"] == event_set_digest
+    assert receipt["assignment_id"] == context.agent_id
+    assert receipt["attempt_id"] == context.attempt_id
+    assert receipt["call_id"] == context.call_id
+    assert receipt["context_id"] == "browser-context"
+    assert receipt["tab_ref"] == "tab-current"
+    assert receipt["observed_at"] == "2026-10-28T12:00:01+00:00"
+    assert receipt["surface_observation_digest"].startswith("sha256:")
+    body = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"evidence_ref", "receipt_sha256"}
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    assert receipt["receipt_sha256"] == receipt_sha256
+    assert receipt["evidence_ref"] == (
+        f"target-surface-generation:sha256:{receipt_sha256}"
+    )
+    assert result.metadata["target_surface_generation_evidence_ref"] == receipt["evidence_ref"]
+    assert any(
+        evidence_ref == receipt["evidence_ref"]
+        and kind == "target_surface_generation"
+        and payload == receipt
+        for _context_id, evidence_ref, kind, payload in recorder.evidence
+    )
+    surface_ref = "target-surface-snapshot:" + receipt["current_surface_digest"]
+    assert any(
+        evidence_ref == surface_ref
+        and kind == "target_surface_snapshot"
+        and payload["surface_observation_digest"] == receipt["surface_observation_digest"]
+        for _context_id, evidence_ref, kind, payload in recorder.evidence
+    )
+    assert len(recorder.observations) == 1
+    from merlin_agents.target_reobservation import (
+        normalize_target_surface_generation_receipt,
+    )
+
+    assert normalize_target_surface_generation_receipt(receipt) == receipt
+
+    second = await tool.invoke(
+        context.model_copy(
+            update={"target_reobservation_generation_id": "sha256:" + "3" * 64}
+        ),
+        arguments,
+    )
+    assert not second.is_error, second.content
+    assert recorder.handoffs[-1].id != handoff.id
+
+    malformed = handoff.model_dump(mode="json")
+    malformed["recon_observations"][-1]["model_authored_extra"] = "untrusted"
+    with pytest.raises(ValueError, match="receipt fields are unsupported"):
+        ApiReconHandoff.model_validate(malformed)
+
+
+@pytest.mark.asyncio
+async def test_reobservation_compile_rejects_partial_generation_identity() -> None:
+    captured = exchange("harmless probe", str(uuid4()), "reviewed-session")
+    captured.update(
+        {
+            "tab_ref": "tab-current",
+            "observed_at": "2026-10-28T12:00:00+00:00",
+        }
+    )
+
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(target_id="target")
+        owner = BrowserOwner(session_id="s1", worker_id="a1", technique_id="recon")
+
+        def api_exchange_events(self):
+            return (captured,)
+
+        def metadata(self):
+            return SimpleNamespace(tabs=[SimpleNamespace(tab_ref="tab-current", state="open")])
+
+        async def snapshot(self, tab_ref):
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.test",
+                owner=self.owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                observed_at=datetime(2026, 10, 28, 12, tzinfo=UTC),
+            )
+
+    class Recorder:
+        async def record_handoff(self, value):
+            raise AssertionError(f"unexpected handoff: {value}")
+
+        async def reviewed_native_input_receipt(self, context_id, event, input_pointer):
+            return {
+                "context_id": context_id,
+                "target_id": "target",
+                "input_pointer": input_pointer,
+                "evidence_ref": "native-request:sha256:" + "a" * 64,
+            }
+
+    result = await CompiledApiReconHandoffTool(lambda _: Session(), Recorder()).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+        ),
+        {
+            "method": "POST",
+            "url": captured["url"],
+            "input_pointer": "/text",
+            "response_selector": "/reply",
+            "authentication": "none",
+            "session_constraint": "reviewed-session",
+        },
+    )
+
+    assert result.is_error
+    assert result.metadata["failure_code"] == "target_surface_generation_receipt_invalid"
+
+    missing_store = await CompiledApiReconHandoffTool(
+        lambda _: Session(), Recorder()
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="compile-current-surface",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-current-surface",
+            campaign_id="campaign/c1",
+            target_id="target",
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "2" * 64,
+        ),
+        {
+            "method": "POST",
+            "url": captured["url"],
+            "input_pointer": "/text",
+            "response_selector": "/reply",
+            "authentication": "none",
+            "session_constraint": "reviewed-session",
+        },
+    )
+
+    assert missing_store.is_error
+    assert missing_store.metadata["failure_code"] == (
+        "target_surface_generation_receipt_invalid"
+    )
+    assert "durable observation and evidence storage" in missing_store.content
+
+    class HistoricalOnlySession(Session):
+        def metadata(self):
+            return SimpleNamespace(tabs=[])
+
+        async def snapshot(self, tab_ref):
+            raise AssertionError(f"unexpected snapshot of closed tab: {tab_ref}")
+
+    class DurableRecorder(Recorder):
+        async def append_observation(self, observation):
+            raise AssertionError(f"unexpected historical observation: {observation}")
+
+        async def record_evidence(self, context_id, evidence_ref, kind, payload):
+            raise AssertionError(
+                f"unexpected historical evidence: {context_id} {evidence_ref} {kind} {payload}"
+            )
+
+    historical_only = await CompiledApiReconHandoffTool(
+        lambda _: HistoricalOnlySession(), DurableRecorder()
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="compile-current-surface",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-current-surface",
+            campaign_id="campaign/c1",
+            target_id="target",
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "2" * 64,
+        ),
+        {
+            "method": "POST",
+            "url": captured["url"],
+            "input_pointer": "/text",
+            "response_selector": "/reply",
+            "authentication": "none",
+            "session_constraint": "reviewed-session",
+        },
+    )
+
+    assert historical_only.is_error
+    assert historical_only.metadata["failure_code"] == (
+        "target_surface_generation_receipt_invalid"
+    )
+    assert "exactly one current reviewed browser tab" in historical_only.content
 
 
 @pytest.mark.asyncio

@@ -918,6 +918,23 @@ async def test_prepare_records_unresolved_cleanup_advisory_for_every_ownership(
                         for item in uncertainties
                     )
 
+            compatible = await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
+                session_id,
+                {"recon_handoff_id": "handoff:cleanup-owned"},
+            )
+            assert compatible["recon_handoff_id"] == "handoff:cleanup-owned"
+            with pytest.raises(
+                ValueError,
+                match="reviewed reconnaissance handoff belongs to another target",
+            ):
+                await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
+                    session_id,
+                    {
+                        "recon_handoff_id": "handoff:cleanup-owned",
+                        "expected_target_id": "different-target",
+                    },
+                )
+
             resolved = await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
                 session_id,
                 {

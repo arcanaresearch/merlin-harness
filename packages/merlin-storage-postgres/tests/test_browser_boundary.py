@@ -21,6 +21,10 @@ from merlin_browser import (
     restart_isolated,
 )
 from merlin_contracts import ToolContext
+from merlin_contracts.target_adapter_compiler import (
+    compile_target_adapter,
+    compiled_target_adapter_digest,
+)
 from merlin_permissions import (
     PermissionDecision,
     PermissionEngine,
@@ -245,6 +249,185 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
             )
             connection.commit()
             assert asyncio.run(store.list_handoffs(handoff.target_id)) == ()
+
+
+def test_surface_generation_evidence_is_context_bound_across_restart(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "postgres-surface-generation"
+    handoff_id = "handoff:surface-generation"
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session_id = str(SessionRepository(connection).create("surface generation").id)
+            owner = BrowserOwner(
+                session_id=session_id,
+                worker_id="worker:reobserve",
+                technique_id="recon",
+            )
+            now = datetime.now(UTC)
+
+            def metadata(context_id: str) -> BrowserMetadata:
+                return BrowserMetadata(
+                    context_id=context_id,
+                    mode="isolated",
+                    target_id="target-1",
+                    owner=owner,
+                    allowed_origins=frozenset({"https://target.test"}),
+                    tabs=(TabMetadata(tab_ref="tab-1", url="https://target.test/chat"),),
+                    state="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+
+            adapter_value = {
+                "interface": "http_api",
+                "endpoint": "https://target.test/chat",
+                "api_steps": [
+                    {
+                        "step_id": "message",
+                        "endpoint": "https://target.test/chat",
+                        "method": "POST",
+                        "request_template": {"message": "{{input}}"},
+                        "cleanup": False,
+                        "interaction": True,
+                        "captures": {},
+                        "repeat": 1,
+                    }
+                ],
+            }
+            compilation = compile_target_adapter(adapter_value)
+            adapter = json.dumps(adapter_value, sort_keys=True, separators=(",", ":"))
+            compiled_adapter = json.dumps(
+                compilation.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            compiled_digest = compiled_target_adapter_digest(compilation)
+            request_ref = "browser-api-request:sha256:" + "a" * 64
+            response_ref = "browser-api-response:sha256:" + "b" * 64
+            observation_digest = "sha256:" + "c" * 64
+            surface = {
+                "schema": "merlin.target-surface-generation-surface.v1",
+                "session_id": session_id,
+                "context_id": "context-1",
+                "target_id": "target-1",
+                "tab_ref": "tab-1",
+                "observed_at": now.isoformat(),
+                "request_evidence_ref": request_ref,
+                "response_evidence_ref": response_ref,
+                "surface_observation_digest": observation_digest,
+                "compiled_adapter_digest": compiled_digest,
+            }
+            current_surface_digest = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    surface,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            receipt_body = {
+                "schema": "merlin.target-surface-generation.v1",
+                "campaign_id": "campaign/c1",
+                "session_id": session_id,
+                "target_id": "target-1",
+                "generation_id": "sha256:" + "d" * 64,
+                "event_set_digest": "sha256:" + "e" * 64,
+                "assignment_id": "campaign/c1/target-reobservation/generation/recon",
+                "attempt_id": "attempt-1",
+                "call_id": "compile-current-surface",
+                "context_id": "context-1",
+                "tab_ref": "tab-1",
+                "observed_at": now.isoformat(),
+                "request_evidence_ref": request_ref,
+                "response_evidence_ref": response_ref,
+                "surface_observation_digest": observation_digest,
+                "current_surface_digest": current_surface_digest,
+                "compiled_adapter_digest": compiled_digest,
+            }
+            receipt_sha256 = hashlib.sha256(
+                json.dumps(
+                    receipt_body,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            receipt = {
+                **receipt_body,
+                "evidence_ref": "target-surface-generation:sha256:" + receipt_sha256,
+                "receipt_sha256": receipt_sha256,
+            }
+            surface_ref = "target-surface-snapshot:" + current_surface_digest
+            handoff = ApiReconHandoff(
+                id=handoff_id,
+                context_id="context-1",
+                target_id="target-1",
+                owner=owner,
+                method="POST",
+                url="https://target.test/chat",
+                request_evidence_ref=request_ref,
+                response_evidence_ref=response_ref,
+                adapter=adapter,
+                compiled_adapter=compiled_adapter,
+                compiled_adapter_digest=compiled_digest,
+                recon_observations=(receipt,),
+            )
+            store = PostgresBrowserStore(connection)
+            asyncio.run(store.save_metadata(metadata("context-1")))
+            asyncio.run(store.save_metadata(metadata("context-wrong")))
+            for evidence_ref, kind in (
+                (request_ref, "browser_api_exchange"),
+                (response_ref, "browser_api_exchange"),
+            ):
+                asyncio.run(
+                    store.record_evidence("context-1", evidence_ref, kind, {"status": 200})
+                )
+
+            with pytest.raises(ValueError, match="missing or belongs to another context"):
+                asyncio.run(store.record_handoff(handoff))
+
+            asyncio.run(
+                store.record_evidence(
+                    "context-wrong", surface_ref, "target_surface_snapshot", surface
+                )
+            )
+            asyncio.run(
+                store.record_evidence(
+                    "context-wrong",
+                    receipt["evidence_ref"],
+                    "target_surface_generation",
+                    receipt,
+                )
+            )
+            with pytest.raises(ValueError, match="missing or belongs to another context"):
+                asyncio.run(store.record_handoff(handoff))
+
+            connection.execute(
+                "DELETE FROM merlin_storage.browser_evidence WHERE evidence_ref = ANY(%s)",
+                ([surface_ref, receipt["evidence_ref"]],),
+            )
+            connection.commit()
+            asyncio.run(
+                store.record_evidence("context-1", surface_ref, "target_surface_snapshot", surface)
+            )
+            asyncio.run(
+                store.record_evidence(
+                    "context-1",
+                    receipt["evidence_ref"],
+                    "target_surface_generation",
+                    receipt,
+                )
+            )
+            asyncio.run(store.record_handoff(handoff))
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as restarted:
+        with restarted.connect() as connection:
+            MigrationRunner(connection).apply()
+            recalled = asyncio.run(PostgresBrowserStore(connection).load_handoff(handoff_id))
+            assert recalled is not None
+            assert recalled.recon_observations == (receipt,)
 
 
 def test_reviewed_tab_affinity_requires_matching_sealed_actions_across_restart(

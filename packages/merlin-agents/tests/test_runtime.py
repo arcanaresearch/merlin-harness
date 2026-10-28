@@ -292,6 +292,126 @@ def test_worker_handoff_normalizes_scheduler_attempt_identity() -> None:
     assert isinstance(restored.attempt_id, str)
 
 
+async def test_reobservation_generation_identity_reaches_tool_context() -> None:
+    generation_id = "sha256:" + "1" * 64
+    event_set_digest = "sha256:" + "2" * 64
+    base = handoff()
+    sealed = replace(
+        base,
+        attempt_id="attempt-current-surface",
+        assignment=replace(
+            base.assignment,
+            id="campaign/c1/target-reobservation/generation/recon",
+            strategy_id="target-reobservation/v1",
+            strategy_contract=tuple(
+                sorted(
+                    {
+                        "schema": "merlin.target-reobservation.v1",
+                        "generation_id": generation_id,
+                        "event_set_digest": event_set_digest,
+                    }.items()
+                )
+            ),
+        ),
+    )
+
+    class ContextTools(Tools):
+        contexts: list[object]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.contexts = []
+
+        async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
+            self.contexts.append(context)
+            return await super().invoke(name, context, arguments)
+
+    tools = ContextTools()
+    provider = Provider(
+        [
+            [ToolCall(call_id="read-current", name="read", arguments={}), ModelCompleted()],
+            [TextDelta(text='{"finding":"current surface compiled"}'), ModelCompleted()],
+        ]
+    )
+
+    result = await WorkerRuntime(provider, tools).run(sealed)
+
+    assert result.status == "completed", result.error
+    assert len(tools.contexts) == 1
+    context = tools.contexts[0]
+    assert context.target_reobservation_generation_id == generation_id
+    assert context.target_reobservation_event_set_digest == event_set_digest
+
+
+async def test_reobservation_rejects_malformed_generation_contract_before_tools() -> None:
+    base = handoff()
+    sealed = replace(
+        base,
+        assignment=replace(
+            base.assignment,
+            strategy_id="target-reobservation/v1",
+            strategy_contract=(
+                ("schema", "merlin.target-reobservation.v1"),
+                ("generation_id", "not-a-digest"),
+                ("event_set_digest", "sha256:" + "2" * 64),
+            ),
+        ),
+    )
+    tools = Tools()
+    provider = Provider([])
+
+    result = await WorkerRuntime(provider, tools).run(sealed)
+
+    assert result.status == "failed"
+    assert "invalid generation identity" in str(result.error)
+    assert tools.calls == []
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    ("strategy_id", "strategy_contract", "error"),
+    (
+        (
+            "reconnaissance",
+            (
+                ("schema", "merlin.target-reobservation.v1"),
+                ("generation_id", "sha256:" + "1" * 64),
+                ("event_set_digest", "sha256:" + "2" * 64),
+            ),
+            "requires the target-reobservation strategy",
+        ),
+        (
+            "target-reobservation/v1",
+            (),
+            "requires its sealed contract schema",
+        ),
+    ),
+)
+async def test_reobservation_context_requires_exact_strategy_authority(
+    strategy_id: str,
+    strategy_contract: tuple[tuple[str, str], ...],
+    error: str,
+) -> None:
+    base = handoff()
+    sealed = replace(
+        base,
+        assignment=replace(
+            base.assignment,
+            strategy_id=strategy_id,
+            strategy_contract=strategy_contract,
+        ),
+    )
+    tools = Tools()
+    provider = Provider([])
+
+    result = await WorkerRuntime(provider, tools).run(sealed)
+
+    assert result.status == "failed"
+    assert error in str(result.error)
+    assert tools.calls == []
+    assert provider.requests == []
+
+
 @pytest.mark.parametrize(
     ("interface", "expected"),
     (

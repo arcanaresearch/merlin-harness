@@ -1298,6 +1298,7 @@ class _DerivedApiHandoff:
     request_evidence: dict[str, object]
     response_evidence_ref: str
     response_evidence: dict[str, object]
+    tab_ref: str
     setup_evidence: tuple[tuple[str, dict[str, object]], ...]
     creation_transition_evidence: tuple[tuple[str, dict[str, object]], ...]
     terminal_evidence: tuple[tuple[str, dict[str, object]], ...]
@@ -2184,6 +2185,7 @@ class ApiReconHandoffTool:
                 },
             )
         derived_handoff: _DerivedApiHandoff | None = None
+        surface_observation: BrowserObservation | None = None
         if fallback is not None:
             assert reusable_adapter is not None
             assert reusable_adapter_value is not None
@@ -2211,6 +2213,7 @@ class ApiReconHandoffTool:
                     metadata={"effect": self.effect},
                 )
             current = await session.snapshot(open_tabs[0])
+            surface_observation = current
             input_matches = _matching_reviewed_elements(
                 current,
                 reviewed_contract["input_locator"],
@@ -2480,6 +2483,33 @@ class ApiReconHandoffTool:
             compiled_adapter = derived_handoff.compiled_adapter
             compiled_adapter_digest = derived_handoff.compiled_adapter_digest
         try:
+            surface_generation_receipt = await _seal_target_surface_generation(
+                context,
+                session,
+                self._recorder,
+                request_evidence_ref=str(arguments["request_evidence_ref"]),
+                response_evidence_ref=str(arguments["response_evidence_ref"]),
+                compiled_adapter_digest=compiled_adapter_digest,
+                observation=surface_observation,
+                preferred_tab_ref=(
+                    derived_handoff.tab_ref if derived_handoff is not None else None
+                ),
+            )
+        except ValueError as error:
+            return ToolResult(
+                content=str(error),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "target_surface_generation_receipt_invalid",
+                    "retryable": False,
+                },
+            )
+        if surface_generation_receipt is not None:
+            identity = "|".join(
+                (identity, str(surface_generation_receipt["evidence_ref"]))
+            )
+        try:
             handoff = ApiReconHandoff(
                 id=f"handoff:{uuid5(NAMESPACE_URL, identity)}",
                 context_id=session.context_id,
@@ -2496,11 +2526,20 @@ class ApiReconHandoffTool:
                 compiled_adapter_digest=compiled_adapter_digest,
                 reusable_site_facts=reusable_site_facts,
                 recon_scope=recon_scope,
+                recon_observations=(
+                    (surface_generation_receipt,)
+                    if surface_generation_receipt is not None
+                    else ()
+                ),
             )
             await self._recorder.record_handoff(handoff)
         except ValueError as error:
             return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
         metadata: dict[str, object] = {"effect": self.effect, "target": handoff.target_id}
+        if surface_generation_receipt is not None:
+            metadata["target_surface_generation_evidence_ref"] = (
+                surface_generation_receipt["evidence_ref"]
+            )
         if handoff_uncertainties:
             metadata["evaluation_uncertainties"] = handoff_uncertainties
         if derived_handoff is not None:
@@ -5807,6 +5846,171 @@ def _captured_api_evidence(
     return f"browser-api-{part}:sha256:{reference_digest}", payload
 
 
+async def _seal_target_surface_generation(
+    context: ToolContext,
+    session: BrowserSession,
+    recorder: BrowserRecorder,
+    *,
+    request_evidence_ref: str,
+    response_evidence_ref: str,
+    compiled_adapter_digest: str,
+    observation: BrowserObservation | None = None,
+    preferred_tab_ref: str | None = None,
+) -> dict[str, object] | None:
+    """Capture and seal one current passive adapter generation."""
+
+    generation_id = context.target_reobservation_generation_id
+    event_set_digest = context.target_reobservation_event_set_digest
+    if generation_id is None and event_set_digest is None:
+        return None
+    digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+    if (
+        not isinstance(generation_id, str)
+        or digest_pattern.fullmatch(generation_id) is None
+        or not isinstance(event_set_digest, str)
+        or digest_pattern.fullmatch(event_set_digest) is None
+    ):
+        raise ValueError("target re-observation tool context has invalid generation identity")
+    if observation is None:
+        open_tabs = [tab.tab_ref for tab in session.metadata().tabs if tab.state == "open"]
+        tab_ref = (
+            preferred_tab_ref
+            if preferred_tab_ref is not None and preferred_tab_ref in open_tabs
+            else open_tabs[0]
+            if len(open_tabs) == 1
+            else None
+        )
+        if tab_ref is None:
+            raise ValueError(
+                "target re-observation requires exactly one current reviewed browser tab"
+            )
+        observation = await session.snapshot(tab_ref)
+    if (
+        not isinstance(observation, BrowserObservation)
+        or observation.kind != "snapshot"
+        or observation.context_id != session.context_id
+        or observation.target_id != session.bounds.target_id
+        or observation.owner.session_id != context.session_id
+        or observation.tab_ref == "unknown"
+        or observation.observed_at.tzinfo is None
+    ):
+        raise ValueError("target re-observation snapshot conflicts with browser evidence")
+    append_observation = getattr(recorder, "append_observation", None)
+    record_evidence = getattr(recorder, "record_evidence", None)
+    if not callable(append_observation) or not callable(record_evidence):
+        raise ValueError(
+            "target surface generation receipt requires durable observation and evidence storage"
+        )
+    appended = append_observation(observation)
+    if isawaitable(appended):
+        await appended
+    observation_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            observation.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    observed_at = observation.observed_at.isoformat()
+    required = {
+        "campaign_id": context.campaign_id,
+        "session_id": context.session_id,
+        "target_id": context.target_id,
+        "generation_id": generation_id,
+        "event_set_digest": event_set_digest,
+        "assignment_id": context.agent_id,
+        "attempt_id": context.attempt_id,
+        "call_id": context.call_id,
+        "context_id": session.context_id,
+        "tab_ref": observation.tab_ref,
+        "observed_at": observed_at,
+        "request_evidence_ref": request_evidence_ref,
+        "response_evidence_ref": response_evidence_ref,
+        "surface_observation_digest": observation_digest,
+        "compiled_adapter_digest": compiled_adapter_digest,
+    }
+    limits = {
+        "campaign_id": 256,
+        "session_id": 256,
+        "target_id": 256,
+        "generation_id": 71,
+        "event_set_digest": 71,
+        "assignment_id": 512,
+        "attempt_id": 256,
+        "call_id": 256,
+        "context_id": 256,
+        "tab_ref": 256,
+        "observed_at": 64,
+        "request_evidence_ref": 512,
+        "response_evidence_ref": 512,
+        "surface_observation_digest": 71,
+        "compiled_adapter_digest": 71,
+    }
+    if any(
+        not isinstance(value, str) or not value or len(value) > limits[name]
+        for name, value in required.items()
+    ):
+        raise ValueError("target re-observation tool context is incomplete or out of bounds")
+    if (
+        digest_pattern.fullmatch(observation_digest) is None
+        or digest_pattern.fullmatch(compiled_adapter_digest) is None
+        or context.target_id != session.bounds.target_id
+        or context.session_id != session.owner.session_id
+    ):
+        raise ValueError("target re-observation tool context conflicts with browser evidence")
+    surface = {
+        "schema": "merlin.target-surface-generation-surface.v1",
+        "session_id": context.session_id,
+        "context_id": session.context_id,
+        "target_id": session.bounds.target_id,
+        "tab_ref": observation.tab_ref,
+        "observed_at": observed_at,
+        "request_evidence_ref": request_evidence_ref,
+        "response_evidence_ref": response_evidence_ref,
+        "surface_observation_digest": observation_digest,
+        "compiled_adapter_digest": compiled_adapter_digest,
+    }
+    current_surface_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    body: dict[str, object] = {
+        "schema": "merlin.target-surface-generation.v1",
+        **required,
+        "current_surface_digest": current_surface_digest,
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    receipt = {
+        **body,
+        "evidence_ref": f"target-surface-generation:sha256:{receipt_sha256}",
+        "receipt_sha256": receipt_sha256,
+    }
+    surface_evidence_ref = f"target-surface-snapshot:{current_surface_digest}"
+    stored_surface = record_evidence(
+        session.context_id,
+        surface_evidence_ref,
+        "target_surface_snapshot",
+        surface,
+    )
+    if isawaitable(stored_surface):
+        await stored_surface
+    stored_receipt = record_evidence(
+        session.context_id,
+        str(receipt["evidence_ref"]),
+        "target_surface_generation",
+        receipt,
+    )
+    if isawaitable(stored_receipt):
+        await stored_receipt
+    return receipt
+
+
 def _browser_action_evidence(action: BrowserAction) -> tuple[str, dict[str, object]]:
     """Return the exact evidence identity emitted by BrowserSession for an action."""
     reference = BrowserSession._evidence(action)  # noqa: SLF001
@@ -6993,6 +7197,26 @@ class CompiledApiReconHandoffTool:
         request_evidence_ref = derived.request_evidence_ref
         response_evidence_ref = derived.response_evidence_ref
         adapter_json = json.dumps(adapter, sort_keys=True, separators=(",", ":"))
+        try:
+            surface_generation_receipt = await _seal_target_surface_generation(
+                context,
+                session,
+                self._recorder,
+                request_evidence_ref=derived.request_evidence_ref,
+                response_evidence_ref=derived.response_evidence_ref,
+                compiled_adapter_digest=derived.compiled_adapter_digest,
+                preferred_tab_ref=derived.tab_ref,
+            )
+        except ValueError as error:
+            return ToolResult(
+                content=str(error),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "target_surface_generation_receipt_invalid",
+                    "retryable": False,
+                },
+            )
         supplied_scope = arguments.get("recon_scope")
         if isinstance(supplied_scope, Mapping):
             recon_scope = {
@@ -7027,15 +7251,19 @@ class CompiledApiReconHandoffTool:
             sort_keys=True,
             separators=(",", ":"),
         )
-        identity = "|".join(
-            (
-                method,
-                url,
-                request_evidence_ref,
-                response_evidence_ref,
-                adapter_json,
-            )
+        identity_parts = (
+            method,
+            url,
+            request_evidence_ref,
+            response_evidence_ref,
+            adapter_json,
         )
+        if surface_generation_receipt is not None:
+            identity_parts = (
+                *identity_parts,
+                str(surface_generation_receipt["evidence_ref"]),
+            )
+        identity = "|".join(identity_parts)
         handoff = ApiReconHandoff(
             id=f"handoff:{uuid5(NAMESPACE_URL, identity)}",
             context_id=session.context_id,
@@ -7055,7 +7283,10 @@ class CompiledApiReconHandoffTool:
             compiled_adapter_digest=derived.compiled_adapter_digest,
             reusable_site_facts=reusable_site_facts,
             recon_scope=recon_scope,
-            recon_observations=derived.recon_observations,
+            recon_observations=(
+                *derived.recon_observations,
+                *((surface_generation_receipt,) if surface_generation_receipt is not None else ()),
+            ),
         )
         record_evidence = getattr(self._recorder, "record_evidence", None)
         if callable(record_evidence):
@@ -7076,7 +7307,9 @@ class CompiledApiReconHandoffTool:
                     session.context_id,
                     evidence_ref,
                     (
-                        "browser_action"
+                        "target_surface_generation"
+                        if evidence_ref.startswith("target-surface-generation:sha256:")
+                        else "browser_action"
                         if evidence_ref.startswith("browser-action:sha256:")
                         else "browser_api_exchange"
                     ),
@@ -7102,6 +7335,15 @@ class CompiledApiReconHandoffTool:
                 "effect": self.effect,
                 "target": handoff.target_id,
                 "compiled_adapter": True,
+                **(
+                    {
+                        "target_surface_generation_evidence_ref": (
+                            surface_generation_receipt["evidence_ref"]
+                        )
+                    }
+                    if surface_generation_receipt is not None
+                    else {}
+                ),
                 # Cleanup discovery remains advisory: the handoff is sealed and
                 # executable either way. When this context provably owns a fresh
                 # disposable session, direct reconnaissance to its visible exit so
@@ -9898,6 +10140,7 @@ class CompiledApiReconHandoffTool:
             request_evidence=request_evidence,
             response_evidence_ref=response_evidence_ref,
             response_evidence=response_evidence,
+            tab_ref=str(event.get("tab_ref") or event.get("_observation_tab_ref") or ""),
             setup_evidence=setup_evidence,
             creation_transition_evidence=creation_transition_evidence,
             terminal_evidence=terminal_evidence,
