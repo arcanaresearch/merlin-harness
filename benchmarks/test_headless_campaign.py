@@ -389,11 +389,15 @@ async def test_runner_and_real_cli_do_not_collide_on_foreground_lease(
         async def list_active_schedules(self) -> tuple[()]:
             return ()
 
+        async def has_active_background_work(self) -> bool:
+            return any(row.get("status") == "executing" for row in self.campaigns)
+
         async def execute_campaign(
             self, campaign_id: str, manifest_digest: str
         ) -> dict[str, object]:
             assert (campaign_id, manifest_digest) == ("campaign/new", "sha256:one")
             self.executed = True
+            self.campaigns[0]["status"] = "executing"
             return {"campaign_id": campaign_id, "status": "executing"}
 
         async def campaign_status(self, campaign_id: str) -> dict[str, object]:
