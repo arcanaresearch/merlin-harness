@@ -517,7 +517,7 @@ def _run_first_setup(
 
 async def _ensure_daemon_with_splash() -> None:
     from .app import WORDMARK
-    from .local_control import _arm_unclaimed_shutdown, ensure_daemon
+    from .local_control import IncompatibleDaemonError, _arm_unclaimed_shutdown, ensure_daemon
 
     frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     status = Text("Preparing Merlin…", style="dim")
@@ -539,6 +539,8 @@ async def _ensure_daemon_with_splash() -> None:
             started_daemon = await ensure_daemon(progress=progress)
             if started_daemon:
                 await _arm_unclaimed_shutdown()
+        except IncompatibleDaemonError:
+            raise
         except RuntimeError:
             from .local_control import _SOCKET, _daemon_lock_released, _ping
 

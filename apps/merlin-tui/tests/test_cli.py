@@ -2394,3 +2394,21 @@ async def test_interactive_daemon_start_arms_unclaimed_shutdown(monkeypatch) -> 
     await _ensure_daemon_with_splash()
 
     assert calls == ["ensure", "arm"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_daemon_start_does_not_swallow_incompatible_daemon(
+    monkeypatch,
+) -> None:
+    from merlin_tui.local_control import IncompatibleDaemonError
+
+    async def ensure_daemon(*, progress):
+        del progress
+        raise IncompatibleDaemonError("restart explicitly")
+
+    monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", ensure_daemon)
+
+    from merlin_tui.cli import _ensure_daemon_with_splash
+
+    with pytest.raises(IncompatibleDaemonError, match="restart explicitly"):
+        await _ensure_daemon_with_splash()

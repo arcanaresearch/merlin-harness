@@ -5,6 +5,7 @@ import base64
 import contextvars
 import errno
 import fcntl
+import importlib.metadata
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,6 +147,45 @@ _FOREGROUND_LEASE_TIMEOUT_SECONDS = 60.0
 _FOREGROUND_ATTACH_GRACE_SECONDS = 10.0
 _DAEMON_HEARTBEAT_SECONDS = 5.0
 _PROCESS_LIFETIME_LOCKS: list[BinaryIO] = []
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeIdentity:
+    protocol: str
+    distribution_version: str
+    executable: str
+    module_root: str
+    mode: str
+
+
+class DaemonCompatibility(StrEnum):
+    UNREACHABLE = "unreachable"
+    COMPATIBLE = "compatible"
+    INCOMPATIBLE = "incompatible"
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonCompatibilityProbe:
+    status: DaemonCompatibility
+    identity: RuntimeIdentity | None = None
+    reason: str | None = None
+
+
+class IncompatibleDaemonError(RuntimeError):
+    """A reachable daemon belongs to a different Merlin runtime."""
+
+
+def _capture_runtime_identity() -> RuntimeIdentity:
+    return RuntimeIdentity(
+        protocol=PROTOCOL_VERSION,
+        distribution_version=importlib.metadata.version("merlin-tui"),
+        executable=str(Path(sys.executable).resolve()),
+        module_root=str(Path(__file__).resolve().parent),
+        mode="frozen" if getattr(sys, "frozen", False) else "source",
+    )
+
+
+_RUNTIME_IDENTITY = _capture_runtime_identity()
 _ALLOWED = {
     "configure_provider",
     "configure_model_endpoint",
@@ -583,6 +623,7 @@ async def serve(
 ) -> None:
     from .bootstrap import build_backend
 
+    runtime_identity = _RUNTIME_IDENTITY
     tuning = tuning or _DEFAULT_LOCAL_CONTROL_TUNING
     await asyncio.to_thread(socket_path.parent.mkdir, mode=0o700, parents=True, exist_ok=True)
     if socket_path.parent == _SOCKET.parent:
@@ -962,7 +1003,12 @@ async def serve(
                 method = request.get("method")
                 if method == "ping":
                     await channel.send(
-                        {"type": "result", "value": "pong", "protocol": PROTOCOL_VERSION}
+                        {
+                            "type": "result",
+                            "value": "pong",
+                            "protocol": PROTOCOL_VERSION,
+                            "runtime_identity": asdict(runtime_identity),
+                        }
                     )
                     return
                 if method in {"shutdown", "shutdown_clean"}:
@@ -1829,8 +1875,11 @@ async def ensure_daemon(
         startup_seconds = _configured_daemon_timeout("daemon_startup_seconds", 180)
     started = asyncio.get_running_loop().time()
     deadline = started + startup_seconds
-    if await _ping(socket_path):
+    probe = await _probe_daemon_compatibility(socket_path)
+    if probe.status is DaemonCompatibility.COMPATIBLE:
         return False
+    if probe.status is DaemonCompatibility.INCOMPATIBLE:
+        raise _incompatible_daemon_error(socket_path, probe)
     while not await asyncio.to_thread(_daemon_lock_released, socket_path):
         now = asyncio.get_running_loop().time()
         if now >= deadline:
@@ -1841,8 +1890,11 @@ async def ensure_daemon(
         if progress is not None:
             progress(now - started)
         await asyncio.sleep(min(0.05, max(0, deadline - now)))
-        if await _ping(socket_path):
+        probe = await _probe_daemon_compatibility(socket_path)
+        if probe.status is DaemonCompatibility.COMPATIBLE:
             return False
+        if probe.status is DaemonCompatibility.INCOMPATIBLE:
+            raise _incompatible_daemon_error(socket_path, probe)
     process = await asyncio.to_thread(_spawn_daemon)
     exited_at: float | None = None
     exit_code: int | None = None
@@ -1850,10 +1902,13 @@ async def ensure_daemon(
         if progress is not None:
             progress(now - started)
         await asyncio.sleep(0.05)
-        if await _ping(socket_path):
+        probe = await _probe_daemon_compatibility(socket_path)
+        if probe.status is DaemonCompatibility.COMPATIBLE:
             # A competing starter can win the daemon lock while our child exits.
             # Only the process whose child is still alive owns orderly cleanup.
             return process.poll() is None
+        if probe.status is DaemonCompatibility.INCOMPATIBLE:
+            raise _incompatible_daemon_error(socket_path, probe)
         return_code = process.poll()
         if return_code is not None:
             if exited_at is None:
@@ -1904,18 +1959,69 @@ def _daemon_command() -> list[str]:
 
 
 async def _ping(socket_path: Path) -> bool:
+    return (await _probe_daemon_compatibility(socket_path)).status is not (
+        DaemonCompatibility.UNREACHABLE
+    )
+
+
+async def _probe_daemon_compatibility(socket_path: Path) -> DaemonCompatibilityProbe:
     writer: asyncio.StreamWriter | None = None
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path, limit=_MAX_FRAME_BYTES + 1)
         channel = _Channel(reader, writer)
         await channel.send({"method": "ping"})
         response = await asyncio.wait_for(channel.receive(), timeout=5.0)
-        return response.get("value") == "pong" and response.get("protocol") == PROTOCOL_VERSION
-    except (OSError, TimeoutError, ConnectionError, ValueError):
-        return False
+        if response.get("value") != "pong":
+            return DaemonCompatibilityProbe(
+                DaemonCompatibility.INCOMPATIBLE, reason="invalid ping response"
+            )
+        raw_identity = response.get("runtime_identity")
+        if not isinstance(raw_identity, Mapping):
+            return DaemonCompatibilityProbe(
+                DaemonCompatibility.INCOMPATIBLE, reason="missing runtime identity"
+            )
+        fields = (
+            raw_identity.get("protocol"),
+            raw_identity.get("distribution_version"),
+            raw_identity.get("executable"),
+            raw_identity.get("module_root"),
+            raw_identity.get("mode"),
+        )
+        if not all(isinstance(value, str) for value in fields) or fields[4] not in {
+            "source",
+            "frozen",
+        }:
+            return DaemonCompatibilityProbe(
+                DaemonCompatibility.INCOMPATIBLE, reason="invalid runtime identity"
+            )
+        identity = RuntimeIdentity(*fields)
+        if identity != _RUNTIME_IDENTITY:
+            return DaemonCompatibilityProbe(
+                DaemonCompatibility.INCOMPATIBLE,
+                identity=identity,
+                reason="runtime identity mismatch",
+            )
+        return DaemonCompatibilityProbe(DaemonCompatibility.COMPATIBLE, identity=identity)
+    except ValueError:
+        return DaemonCompatibilityProbe(
+            DaemonCompatibility.INCOMPATIBLE, reason="invalid ping response"
+        )
+    except (OSError, TimeoutError, ConnectionError):
+        return DaemonCompatibilityProbe(DaemonCompatibility.UNREACHABLE)
     finally:
         if writer is not None:
             await _close_writer(writer)
+
+
+def _incompatible_daemon_error(
+    socket_path: Path, probe: DaemonCompatibilityProbe
+) -> IncompatibleDaemonError:
+    detail = probe.reason or "unknown incompatibility"
+    return IncompatibleDaemonError(
+        "The running Merlin daemon is incompatible with this client "
+        f"({detail}; socket: {socket_path}). Run `merlin restart` from the Merlin "
+        "installation or checkout you want to use. The existing daemon was left running."
+    )
 
 
 def _daemon_lock_released(socket_path: Path) -> bool:

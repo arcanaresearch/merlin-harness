@@ -12,15 +12,22 @@ from merlin_config import Config
 from merlin_contracts import ToolContext, ToolSpec
 from merlin_tui.backend import StreamEvent
 from merlin_tui.local_control import (
+    _RUNTIME_IDENTITY,
     PROTOCOL_VERSION,
+    DaemonCompatibility,
+    DaemonCompatibilityProbe,
+    IncompatibleDaemonError,
     LocalControlClient,
     LocalControlTuning,
+    RuntimeIdentity,
     _acquire_daemon_lock,
+    _capture_runtime_identity,
     _close_writer,
     _configured_daemon_timeout,
     _daemon_command,
     _daemon_lock_released,
     _default_socket_path,
+    _probe_daemon_compatibility,
     ensure_daemon,
     serve,
     stop_daemon,
@@ -743,9 +750,9 @@ async def test_ensure_daemon_fails_fast_when_spawned_process_exits(monkeypatch) 
             return 7
 
     async def never_ready(_socket_path):
-        return False
+        return DaemonCompatibilityProbe(DaemonCompatibility.UNREACHABLE)
 
-    monkeypatch.setattr("merlin_tui.local_control._ping", never_ready)
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", never_ready)
     monkeypatch.setattr("merlin_tui.local_control._spawn_daemon", lambda: ExitedProcess())
     monkeypatch.setattr(
         "merlin_tui.local_control._daemon_failure_detail",
@@ -758,16 +765,16 @@ async def test_ensure_daemon_fails_fast_when_spawned_process_exits(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_ensure_daemon_reports_whether_this_client_started_it(monkeypatch) -> None:
-    ready = iter((False, True))
+    ready = iter((DaemonCompatibility.UNREACHABLE, DaemonCompatibility.COMPATIBLE))
 
-    async def ping(_path: Path) -> bool:
-        return next(ready)
+    async def probe(_path: Path) -> DaemonCompatibilityProbe:
+        return DaemonCompatibilityProbe(next(ready))
 
     class Process:
         def poll(self):
             return None
 
-    monkeypatch.setattr("merlin_tui.local_control._ping", ping)
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", probe)
     monkeypatch.setattr("merlin_tui.local_control._spawn_daemon", Process)
 
     assert await ensure_daemon(Path("/tmp/merlin-owned-daemon.sock"), startup_seconds=1)
@@ -1485,6 +1492,13 @@ async def test_foreground_lease_is_exclusive_and_only_owner_can_stop_daemon() ->
         "type": "result",
         "value": "pong",
         "protocol": PROTOCOL_VERSION,
+        "runtime_identity": {
+            "protocol": _RUNTIME_IDENTITY.protocol,
+            "distribution_version": _RUNTIME_IDENTITY.distribution_version,
+            "executable": _RUNTIME_IDENTITY.executable,
+            "module_root": _RUNTIME_IDENTITY.module_root,
+            "mode": _RUNTIME_IDENTITY.mode,
+        },
     }
 
     await owner.shutdown()
@@ -2359,13 +2373,13 @@ async def test_replace_foreground_recovers_when_old_session_already_exited(monke
 async def test_unresponsive_locked_daemon_does_not_spawn_competing_process(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    async def unreachable(path: Path) -> bool:
-        return False
+    async def unreachable(path: Path) -> DaemonCompatibilityProbe:
+        return DaemonCompatibilityProbe(DaemonCompatibility.UNREACHABLE)
 
     def unexpected_spawn():
         pytest.fail("A competing daemon must not be spawned while the lifetime lock is held")
 
-    monkeypatch.setattr("merlin_tui.local_control._ping", unreachable)
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", unreachable)
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", lambda path: False)
     monkeypatch.setattr("merlin_tui.local_control._spawn_daemon", unexpected_spawn)
 
@@ -2562,15 +2576,16 @@ async def test_ensure_daemon_waits_for_existing_starter_without_spawning(monkeyp
     pings = 0
     progress = []
 
-    async def ping(path):
+    async def probe(path):
         nonlocal pings
         pings += 1
-        return pings >= 3
+        status = DaemonCompatibility.COMPATIBLE if pings >= 3 else DaemonCompatibility.UNREACHABLE
+        return DaemonCompatibilityProbe(status)
 
     def unexpected_spawn():
         raise AssertionError("existing starter must retain exclusive daemon ownership")
 
-    monkeypatch.setattr("merlin_tui.local_control._ping", ping)
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", probe)
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", lambda path: False)
     monkeypatch.setattr("merlin_tui.local_control._spawn_daemon", unexpected_spawn)
     result = await ensure_daemon(
@@ -2590,8 +2605,9 @@ async def test_ensure_daemon_waits_for_shutdown_lock_release_before_starting(mon
         lock_checks += 1
         return lock_checks >= 3
 
-    async def ping(path):
-        return spawned
+    async def probe(path):
+        status = DaemonCompatibility.COMPATIBLE if spawned else DaemonCompatibility.UNREACHABLE
+        return DaemonCompatibilityProbe(status)
 
     class Process:
         def poll(self):
@@ -2603,7 +2619,7 @@ async def test_ensure_daemon_waits_for_shutdown_lock_release_before_starting(mon
         spawned = True
         return Process()
 
-    monkeypatch.setattr("merlin_tui.local_control._ping", ping)
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", probe)
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", released)
     monkeypatch.setattr("merlin_tui.local_control._spawn_daemon", spawn)
     assert await ensure_daemon(tmp_path / "closing.sock", startup_seconds=1)
@@ -3184,6 +3200,198 @@ async def test_ping_accepts_slow_live_daemon_response() -> None:
         await server.wait_closed()
         await asyncio.gather(*peers)
         await asyncio.to_thread(path.unlink, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_compatibility_probe_accepts_matching_runtime_identity(
+    event_socket_dir: Path,
+) -> None:
+    socket_path = event_socket_dir / "matching.sock"
+
+    async def peer(reader, writer):
+        assert json.loads(await reader.readline()) == {"method": "ping"}
+        writer.write(
+            json.dumps(
+                {
+                    "type": "result",
+                    "value": "pong",
+                    "protocol": PROTOCOL_VERSION,
+                    "runtime_identity": {
+                        "protocol": _RUNTIME_IDENTITY.protocol,
+                        "distribution_version": _RUNTIME_IDENTITY.distribution_version,
+                        "executable": _RUNTIME_IDENTITY.executable,
+                        "module_root": _RUNTIME_IDENTITY.module_root,
+                        "mode": _RUNTIME_IDENTITY.mode,
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        await _close_writer(writer)
+
+    async with await asyncio.start_unix_server(peer, socket_path):
+        probe = await _probe_daemon_compatibility(socket_path)
+    assert probe == DaemonCompatibilityProbe(
+        DaemonCompatibility.COMPATIBLE, identity=_RUNTIME_IDENTITY
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_identity", [None, {"protocol": PROTOCOL_VERSION}])
+async def test_compatibility_probe_rejects_legacy_or_incomplete_identity(
+    event_socket_dir: Path, runtime_identity: object
+) -> None:
+    socket_path = event_socket_dir / "legacy.sock"
+
+    async def peer(reader, writer):
+        await reader.readline()
+        response = {"type": "result", "value": "pong", "protocol": PROTOCOL_VERSION}
+        if runtime_identity is not None:
+            response["runtime_identity"] = runtime_identity
+        writer.write(json.dumps(response).encode() + b"\n")
+        await writer.drain()
+        await _close_writer(writer)
+
+    async with await asyncio.start_unix_server(peer, socket_path):
+        probe = await _probe_daemon_compatibility(socket_path)
+    assert probe.status is DaemonCompatibility.INCOMPATIBLE
+
+
+@pytest.mark.asyncio
+async def test_ensure_daemon_rejects_mismatch_without_competing_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mismatched = RuntimeIdentity(
+        protocol=PROTOCOL_VERSION,
+        distribution_version=_RUNTIME_IDENTITY.distribution_version,
+        executable=_RUNTIME_IDENTITY.executable,
+        module_root=str(tmp_path / "other-worktree" / "merlin_tui"),
+        mode="source",
+    )
+
+    async def incompatible(path: Path) -> DaemonCompatibilityProbe:
+        return DaemonCompatibilityProbe(
+            DaemonCompatibility.INCOMPATIBLE,
+            identity=mismatched,
+            reason="runtime identity mismatch",
+        )
+
+    monkeypatch.setattr("merlin_tui.local_control._probe_daemon_compatibility", incompatible)
+    monkeypatch.setattr(
+        "merlin_tui.local_control._spawn_daemon",
+        lambda: pytest.fail("incompatible reachable daemon must never trigger a competing spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"merlin restart.*left running"):
+        await ensure_daemon(tmp_path / "shared.sock", startup_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_ensure_daemon_rejects_malformed_reachable_peer_without_spawning(
+    monkeypatch: pytest.MonkeyPatch, event_socket_dir: Path
+) -> None:
+    socket_path = event_socket_dir / "malformed.sock"
+
+    async def peer(reader, writer):
+        await reader.readline()
+        writer.write(b"not-json\n")
+        await writer.drain()
+        await _close_writer(writer)
+
+    monkeypatch.setattr(
+        "merlin_tui.local_control._spawn_daemon",
+        lambda: pytest.fail("malformed reachable peer must not trigger a competing spawn"),
+    )
+    async with await asyncio.start_unix_server(peer, socket_path):
+        with pytest.raises(IncompatibleDaemonError, match="invalid ping response"):
+            await ensure_daemon(socket_path, startup_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_isolated_cross_worktree_fixture_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolated_home = Path(tempfile.mkdtemp(prefix="merlin-cross-home-", dir="/tmp"))
+    isolated_config = isolated_home / ".merlin"
+    isolated_config.mkdir()
+    socket_path = isolated_home / "daemon.sock"
+    other_root = tmp_path / "other-checkout" / "merlin_tui"
+    fixture = """
+import asyncio, json, os
+
+async def handle(reader, writer):
+    await reader.readline()
+    response = {
+        "type": "result", "value": "pong", "protocol": os.environ["PROTOCOL"],
+        "runtime_identity": {
+            "protocol": os.environ["PROTOCOL"],
+            "distribution_version": os.environ["VERSION"],
+            "executable": os.environ["EXECUTABLE"],
+            "module_root": os.environ["OTHER_ROOT"],
+            "mode": "source",
+        },
+    }
+    writer.write((json.dumps(response) + "\\n").encode())
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+async def main():
+    server = await asyncio.start_unix_server(handle, os.environ["MERLIN_SOCKET_PATH"])
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+"""
+    environment = {
+        **os.environ,
+        "HOME": str(isolated_home),
+        "MERLIN_CONFIG_DIR": str(isolated_config),
+        "MERLIN_SOCKET_PATH": str(socket_path),
+        "PROTOCOL": PROTOCOL_VERSION,
+        "VERSION": _RUNTIME_IDENTITY.distribution_version,
+        "EXECUTABLE": _RUNTIME_IDENTITY.executable,
+        "OTHER_ROOT": str(other_root),
+    }
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", fixture, env=environment)
+    try:
+        for _ in range(100):
+            if socket_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert socket_path.exists()
+        monkeypatch.setattr(
+            "merlin_tui.local_control._spawn_daemon",
+            lambda: pytest.fail("cross-worktree mismatch must not spawn another daemon"),
+        )
+        with pytest.raises(RuntimeError, match="incompatible.*merlin restart"):
+            await ensure_daemon(socket_path, startup_seconds=1)
+        assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=5)
+        await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+        await asyncio.to_thread(isolated_config.rmdir)
+        await asyncio.to_thread(isolated_home.rmdir)
+
+
+def test_packaged_runtime_identity_is_resolved_and_typed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executable = tmp_path / "release" / "merlin-runtime"
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("sys.executable", str(executable))
+
+    identity = _capture_runtime_identity()
+
+    assert identity.mode == "frozen"
+    assert identity.executable == str(executable.resolve())
+    assert identity.module_root == str(
+        Path(sys.modules["merlin_tui.local_control"].__file__).resolve().parent
+    )
+    assert identity.distribution_version == _RUNTIME_IDENTITY.distribution_version
 
 
 @pytest.mark.asyncio
