@@ -1189,11 +1189,13 @@ class OpenAICompatibleProvider:
             raise ProviderError(
                 "this OpenAI-compatible transport cannot authoritatively disable reasoning"
             )
-        if request.reasoning_effort not in {None, "default"}:
-            if self.config.reasoning_parameter != "reasoning_effort":
-                raise ProviderError(
-                    "this OpenAI-compatible transport does not expose request reasoning effort"
-                )
+        if (
+            request.reasoning_effort not in {None, "default"}
+            and self.config.reasoning_parameter != "reasoning_effort"
+        ):
+            raise ProviderError(
+                "this OpenAI-compatible transport does not expose request reasoning effort"
+            )
         if any(message.image_attachments for message in request.messages) and not (
             self._capabilities.vision
         ):
