@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from itertools import groupby
 
@@ -88,11 +89,17 @@ class CurrentAttempt:
     lifecycle: AttemptLifecycle
     owner: str | None = None
     lease_generation: int | None = None
+    failure_kind: str | None = None
+    infrastructure_failure_category: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_blank(attempt_id=self.attempt_id)
         if self.owner is not None:
             _require_non_blank(owner=self.owner)
+        if self.failure_kind is not None:
+            _require_non_blank(failure_kind=self.failure_kind)
+        if self.infrastructure_failure_category is not None:
+            _require_non_blank(infrastructure_failure_category=self.infrastructure_failure_category)
         if self.lease_generation is not None and self.lease_generation < 1:
             raise ValueError("lease generation must be positive")
 
@@ -150,6 +157,8 @@ class SwarmProjectionRecord:
     activity: tuple[str, ...] = ()
     failure_reason: str | None = None
     output: tuple[str, ...] = ()
+    schedule_updated_at: datetime | None = None
+    campaign_wave: int | None = None
 
     def __post_init__(self) -> None:
         _validate_scope(self.session_id, self.campaign_id, self.scope_provenance)
@@ -185,6 +194,8 @@ class AssignmentSnapshot:
     activity: tuple[str, ...] = ()
     failure_reason: str | None = None
     output: tuple[str, ...] = ()
+    schedule_updated_at: datetime | None = None
+    campaign_wave: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +293,8 @@ def _project_assignments(
                 activity=first.activity,
                 failure_reason=first.failure_reason,
                 output=first.output,
+                schedule_updated_at=first.schedule_updated_at,
+                campaign_wave=first.campaign_wave,
             )
         )
     return tuple(assignments)

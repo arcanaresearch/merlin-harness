@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Protocol
 
 
@@ -102,6 +103,10 @@ class AgentView:
     evaluation_confidence: float | None = None
     evaluation_reasons: tuple[str, ...] = ()
     output: tuple[str, ...] = ()
+    failure_kind: str | None = None
+    infrastructure_failure_category: str | None = None
+    schedule_updated_at: datetime | None = None
+    campaign_wave: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

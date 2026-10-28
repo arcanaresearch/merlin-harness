@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 from merlin_agents.swarm_snapshot import (
@@ -51,6 +52,8 @@ def _record(
         current_attempt=CurrentAttempt(
             attempt_id="attempt/current",
             lifecycle=AttemptLifecycle.FINALIZING,
+            failure_kind="configuration",
+            infrastructure_failure_category="adaptive_strategy_unavailable",
         ),
         candidate_evaluation=CandidateEvaluationState(
             state=CandidateEvaluation.EVALUATION_UNCERTAIN,
@@ -61,6 +64,8 @@ def _record(
             result_id="result/previous",
             summary="Previous attempt reached the target and preserved its reply.",
         ),
+        schedule_updated_at=datetime(2026, 10, 28, 11, tzinfo=UTC),
+        campaign_wave=3,
     )
 
 
@@ -109,10 +114,17 @@ def test_preserves_node_attempt_evaluation_and_success_as_separate_facts() -> No
     assert assignment.lifecycle is NodeLifecycle.RUNNING
     assert assignment.current_attempt is not None
     assert assignment.current_attempt.lifecycle is AttemptLifecycle.FINALIZING
+    assert assignment.current_attempt.failure_kind == "configuration"
+    assert (
+        assignment.current_attempt.infrastructure_failure_category
+        == "adaptive_strategy_unavailable"
+    )
     assert assignment.candidate_evaluation.state is CandidateEvaluation.EVALUATION_UNCERTAIN
     assert assignment.successful_result is not None
     assert assignment.successful_result.result_id == "result/previous"
     assert assignment.provider_model == "worker-model"
+    assert assignment.schedule_updated_at == datetime(2026, 10, 28, 11, tzinfo=UTC)
+    assert assignment.campaign_wave == 3
 
 
 def test_exact_candidate_axes_keep_target_scenario_language_and_mutation_distinct() -> None:

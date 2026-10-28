@@ -1833,13 +1833,13 @@ class ActiveWorkScreen(OverviewScreen):
 
 def _worker_activity(agent: AgentView) -> str:
     """Summarize recorded activity without claiming unobserved model progress."""
-    state = _agent_display_state(agent.latest_event)
+    state = _agent_outcome_state(agent)
+    if _agent_display_state(agent.latest_event) == "failed" and any(
+        "retry scheduled" in row for row in agent.activity
+    ):
+        return "Retry scheduled"
     if state == "failed":
-        return (
-            "Retry scheduled"
-            if any("retry scheduled" in row for row in agent.activity)
-            else "Failed"
-        )
+        return "Failed"
     if state != "working":
         return {
             "queued": "Waiting for admission",
@@ -2026,9 +2026,7 @@ class AgentsOverviewScreen(ModalScreen[None]):
                 f"Current/latest task: {_workspace_task_label(current)}\n\nTask history\n"
             )
             for task in rows:
-                text += (
-                    f"{_agent_display_state(task.latest_event)} · {_workspace_task_label(task)}\n"
-                )
+                text += f"{_agent_outcome_state(task)} · {_workspace_task_label(task)}\n"
                 if task.result:
                     text += f"  Result: {task.result}\n"
             text += "\nLatest recorded output\n" + "\n\n".join(current.output)
@@ -2685,7 +2683,23 @@ class AgentScreen(ModalScreen[None]):
 
     @staticmethod
     def _key(agent: AgentView) -> str:
-        return agent.assignment_id or agent.name
+        if agent.assignment_id is None:
+            return agent.name
+        if agent.assignment_id.startswith(_CAMPAIGN_LEAD_PREFIX):
+            return agent.assignment_id
+        candidate_identity = (
+            agent.target_adapter,
+            agent.target_generation,
+            agent.scenario_fingerprint,
+            agent.technique,
+            agent.controller_id,
+            agent.payload_family,
+            agent.requested_language,
+            agent.mutation_id,
+        )
+        if not any(candidate_identity):
+            return agent.assignment_id
+        return agent.assignment_id + "::" + json.dumps(candidate_identity, separators=(",", ":"))
 
     def _move_agent(self, offset: int) -> None:
         keys = tuple(self._key(agent) for agent in self._agents)
@@ -2897,7 +2911,7 @@ class AgentScreen(ModalScreen[None]):
             else:
                 agent = by_key[key]
                 is_lead = agent.profile == "Campaign Lead"
-                state = _agent_display_state(agent.latest_event)
+                state = _agent_outcome_state(agent)
                 glyph, style = _agent_state_chip(state)
                 stage = agent.execution_stage or _agent_stage(agent)
                 worker_number = sum(
@@ -2932,6 +2946,11 @@ class AgentScreen(ModalScreen[None]):
                     content.append(
                         "Failure: " + (agent.result or "No reason recorded") + "\n\n",
                         style="#ff8290",
+                    )
+                elif state in _OPERATIONAL_AGENT_STATES:
+                    content.append(
+                        "Operational condition: " + (agent.result or "No reason recorded") + "\n\n",
+                        style="yellow",
                     )
                 if self._expanded:
                     content.append(
@@ -2983,7 +3002,7 @@ class AgentScreen(ModalScreen[None]):
 
     def _picker_label(self, agent: AgentView, index: int) -> Text:
         key = self._key(agent)
-        state = _agent_display_state(agent.latest_event)
+        state = _agent_outcome_state(agent)
         glyph, style = _agent_state_chip(state)
         sidebar_width = self.query_one("#agent-sidebar").size.width
         if sidebar_width < 24:
@@ -7356,6 +7375,46 @@ def _agent_display_state(state: str) -> str:
     return normalized.replace("_", " ") or "unknown"
 
 
+_TYPED_OPERATIONAL_FAILURE_LABELS = {
+    "authorization": "authorization blocked",
+    "scope": "scope blocked",
+    "budget": "budget exhausted",
+    "configuration": "configuration issue",
+    "state_integrity": "state integrity blocked",
+    "unknown": "operational failure",
+}
+_OPERATIONAL_AGENT_STATE_ORDER = (
+    "prerequisite blocked",
+    "unavailable",
+    "authorization blocked",
+    "scope blocked",
+    "budget exhausted",
+    "configuration issue",
+    "state integrity blocked",
+    "infrastructure",
+    "operational failure",
+)
+_OPERATIONAL_AGENT_STATES = frozenset(_OPERATIONAL_AGENT_STATE_ORDER)
+
+
+def _agent_outcome_state(agent: AgentView) -> str:
+    """Separate operational failures from genuine untyped task failures."""
+    state = _agent_display_state(agent.latest_event)
+    if state != "failed":
+        return state
+    if agent.controller_id == "objective-phase-gate/v1":
+        return "prerequisite blocked"
+    category = (agent.infrastructure_failure_category or "").strip().casefold()
+    if category == "adaptive_strategy_unavailable":
+        return "unavailable"
+    failure_kind = (agent.failure_kind or "").strip().casefold()
+    if failure_kind in _TYPED_OPERATIONAL_FAILURE_LABELS:
+        return _TYPED_OPERATIONAL_FAILURE_LABELS[failure_kind]
+    if category or failure_kind:
+        return "infrastructure"
+    return state
+
+
 def _ordered_agents(agents: tuple[AgentView, ...]) -> tuple[AgentView, ...]:
     priority = {"working": 0, "queued": 1, "uncertain": 2, "done": 3}
     return tuple(
@@ -7408,7 +7467,61 @@ def _agents_for_campaigns(
             for campaign_parts in (value.split("/"),)
         )
 
-    return tuple(agent for agent in agents if belongs_to_campaign(agent))
+    visible = tuple(agent for agent in agents if belongs_to_campaign(agent))
+    deduplicated: list[AgentView] = []
+    positions: dict[tuple[str, ...], int] = {}
+    state_priority = {
+        "working": 5,
+        "queued": 4,
+        "needs review": 3,
+        "completed": 2,
+        "failed": 1,
+    }
+    for agent in visible:
+        if agent.campaign_id is None or agent.assignment_id is None:
+            deduplicated.append(agent)
+            continue
+        identity = (
+            agent.campaign_id,
+            agent.assignment_id,
+            agent.target_adapter,
+            agent.target_generation,
+            agent.scenario_fingerprint,
+            agent.technique,
+            agent.controller_id,
+            agent.payload_family,
+            agent.requested_language,
+            agent.mutation_id,
+        )
+        position = positions.get(identity)
+        if position is None:
+            positions[identity] = len(deduplicated)
+            deduplicated.append(agent)
+            continue
+        current = deduplicated[position]
+        agent_recency = (
+            agent.schedule_updated_at.timestamp()
+            if agent.schedule_updated_at is not None
+            else float("-inf")
+        )
+        current_recency = (
+            current.schedule_updated_at.timestamp()
+            if current.schedule_updated_at is not None
+            else float("-inf")
+        )
+        agent_rank = (
+            agent.campaign_wave if agent.campaign_wave is not None else -1,
+            agent_recency,
+            state_priority.get(_agent_display_state(agent.latest_event), 0),
+        )
+        current_rank = (
+            current.campaign_wave if current.campaign_wave is not None else -1,
+            current_recency,
+            state_priority.get(_agent_display_state(current.latest_event), 0),
+        )
+        if agent_rank > current_rank:
+            deduplicated[position] = agent
+    return tuple(deduplicated)
 
 
 def _agent_display_name(agent: AgentView) -> str:
@@ -7442,8 +7555,15 @@ def _specialist_group_keys(agents: tuple[AgentView, ...]) -> tuple[str, ...]:
 
 
 def _specialist_group_state(assignments: tuple[AgentView, ...]) -> str:
-    states = tuple(_agent_display_state(agent.latest_event) for agent in assignments)
-    for state in ("working", "needs review", "quarantined", "interrupted", "failed"):
+    states = tuple(_agent_outcome_state(agent) for agent in assignments)
+    for state in (
+        "working",
+        "needs review",
+        "quarantined",
+        "interrupted",
+        "failed",
+        *_OPERATIONAL_AGENT_STATE_ORDER,
+    ):
         if state in states:
             return state
     if "queued" in states:
@@ -7773,7 +7893,7 @@ def _render_review_progress(progress: Mapping[str, object]) -> Text:
     kind = kind.replace("_", " ").replace("-", " ").strip().capitalize()
     blocking = progress.get("blocking") is True
     advisory = progress.get("advisory") is True or not blocking
-    disposition = "BLOCKING" if blocking else "ADVISORY" if advisory else "REVIEW"
+    disposition = "NEXT-WAVE GATE" if blocking else "ADVISORY" if advisory else "REVIEW"
     rendered.append("│  Review: ", style="dim")
     rendered.append(kind, style="bold")
     rendered.append(f" · {disposition}", style="bold yellow" if blocking else "cyan")
@@ -7814,7 +7934,7 @@ def _render_live_swarm(
     outcomes: dict[str, int] = {}
     for agent in ordered:
         counts[_agent_state_group(agent.latest_event)] += 1
-        state = _agent_display_state(agent.latest_event)
+        state = _agent_outcome_state(agent)
         outcomes[state] = outcomes.get(state, 0) + 1
     total = len(ordered)
     finished = counts["done"]
@@ -7887,14 +8007,14 @@ def _render_live_swarm(
     )
     visible = (working + terminal)[:4]
     for agent in visible:
-        state = _agent_display_state(agent.latest_event)
+        state = _agent_outcome_state(agent)
         glyph, style = _agent_state_chip(state)
         number = ordered.index(agent) + 1
         rendered.append(f"├─ {number:02d} {glyph} {state} · ", style=style)
         rendered.append(_short_activity(_agent_assignment_label(agent), 76), style="bold")
         rendered.append("\n")
         latest = agent.output[-1] if agent.output else agent.activity[-1] if agent.activity else ""
-        if not latest and state == "failed":
+        if not latest and _agent_display_state(agent.latest_event) == "failed":
             latest = agent.result or "No failure reason recorded"
         elif not latest:
             latest = "Waiting for a worker activity update"
@@ -7910,6 +8030,7 @@ def _render_live_swarm(
         (state, count)
         for state in (
             "failed",
+            *_OPERATIONAL_AGENT_STATE_ORDER,
             "cancelled",
             "quarantined",
             "interrupted",
@@ -7921,8 +8042,8 @@ def _render_live_swarm(
         rendered.append("└─ /agents for full activity", style="dim")
     for offset, (state, count) in enumerate(terminal_lines):
         prefix = "└─" if offset == len(terminal_lines) - 1 else "├─"
-        marker = "✓" if state == "completed" else "!"
-        style = "green" if state == "completed" else "yellow"
+        marker = "✓" if state == "completed" else "✕" if state == "failed" else "!"
+        style = "green" if state == "completed" else "red" if state == "failed" else "yellow"
         rendered.append(f"{prefix} {marker} {count} {state}", style=style)
         if offset != len(terminal_lines) - 1:
             rendered.append("\n")
@@ -7932,6 +8053,8 @@ def _render_live_swarm(
 
 def _agent_state_chip(state: str) -> tuple[str, str]:
     """Glyph and style for an agent or group display state."""
+    if state in _OPERATIONAL_AGENT_STATES:
+        return "!", "yellow"
     return {
         "working": ("●", "green"),
         "queued": ("○", "dim"),
@@ -7963,9 +8086,11 @@ def _render_agent_inspector(agent: AgentView, index: int, total: int) -> Text:
     rendered.append(
         f"Agent {index + 1:02d} of {total} · {total} tasks · {_agent_stage(agent)}\n", style="bold"
     )
-    state = _agent_display_state(agent.latest_event)
+    state = _agent_outcome_state(agent)
     glyph, style = _agent_state_chip(state)
-    retrying = state == "failed" and any("retry scheduled" in line for line in agent.activity)
+    retrying = _agent_display_state(agent.latest_event) == "failed" and any(
+        "retry scheduled" in line for line in agent.activity
+    )
     rendered.append(
         f"{glyph} {state}" + (" · retry scheduled" if retrying else "") + "\n", style=style
     )
@@ -7977,7 +8102,11 @@ def _render_agent_inspector(agent: AgentView, index: int, total: int) -> Text:
     rendered.append(f"Model: {agent.provider} · {agent.elapsed}\n", style="dim")
     rendered.append("\nCurrent activity\n", style="bold")
     for line in agent.activity:
-        if state == "failed" and agent.result and agent.result in line:
+        if (
+            _agent_display_state(agent.latest_event) == "failed"
+            and agent.result
+            and agent.result in line
+        ):
             continue
         rendered.append(f"  {line}\n")
     if not agent.activity:
@@ -7986,11 +8115,16 @@ def _render_agent_inspector(agent: AgentView, index: int, total: int) -> Text:
         rendered.append(
             f"\nFailure: {agent.result or 'No reason was recorded.'}\n", style="#ff8290"
         )
+    elif state in _OPERATIONAL_AGENT_STATES:
+        rendered.append(
+            f"\nOperational condition: {agent.result or 'No reason was recorded.'}\n",
+            style="yellow",
+        )
     rendered.append("\nWorker output\n", style="bold cyan")
     if agent.output:
         for line in agent.output:
             rendered.append(line + "\n\n")
-    elif agent.result and state != "failed":
+    elif agent.result and _agent_display_state(agent.latest_event) != "failed":
         rendered.append(agent.result + "\n")
     else:
         rendered.append("No worker output has been recorded yet.\n", style="dim")
@@ -8016,11 +8150,17 @@ def _render_agent_group_detail(selected: tuple[AgentView, ...]) -> Text:
         suffix += " · temporary group"
     rendered.append(f"{suffix}\n", style="dim")
     rendered.append(f"{'─' * 60}\n", style="dim")
-    priority = {"working": 0, "failed": 1, "interrupted": 2, "queued": 3}
-    for agent in sorted(
-        selected, key=lambda item: priority.get(_agent_display_state(item.latest_event), 4)
-    ):
-        agent_state = _agent_display_state(agent.latest_event)
+    priority = dict.fromkeys(_OPERATIONAL_AGENT_STATES, 1)
+    priority.update(
+        {
+            "working": 0,
+            "failed": 1,
+            "interrupted": 2,
+            "queued": 3,
+        }
+    )
+    for agent in sorted(selected, key=lambda item: priority.get(_agent_outcome_state(item), 4)):
+        agent_state = _agent_outcome_state(agent)
         agent_glyph, agent_style = _agent_state_chip(agent_state)
         rendered.append("\n")
         rendered.append(_agent_stage(agent), style="bold")
@@ -8041,6 +8181,9 @@ def _render_agent_group_detail(selected: tuple[AgentView, ...]) -> Text:
             rendered.append(
                 f"{agent.result or 'No failure reason was recorded.'}\n", style="#ff8290"
             )
+        elif agent_state in _OPERATIONAL_AGENT_STATES:
+            rendered.append("Operational condition: ", style="bold yellow")
+            rendered.append(f"{agent.result or 'No reason was recorded.'}\n", style="yellow")
         elif agent.result and agent_state == "completed":
             rendered.append(f"Outcome: {_short_activity(agent.result, 240)}\n", style="green")
     rendered.append("\nEsc: back to swarm · drawer refreshes every 2 seconds", style="dim")
@@ -8069,7 +8212,7 @@ def _render_agents(
     outcomes: dict[str, int] = {}
     for agent in agents:
         groups[_agent_state_group(agent.latest_event)] += 1
-        state = _agent_display_state(agent.latest_event)
+        state = _agent_outcome_state(agent)
         outcomes[state] = outcomes.get(state, 0) + 1
     chips: list[tuple[str, str, str]] = [
         ("●", f"{groups['working']} working", "green"),
@@ -8079,12 +8222,14 @@ def _render_agents(
         chips.append(("✓", f"{outcomes['completed']} done", "green"))
     if groups["uncertain"]:
         chips.append(("⚠", f"{groups['uncertain']} needs review", "yellow"))
-    for state, glyph, style in (
+    outcome_chips = (
         ("failed", "✕", "#ff8290"),
+        *((state, "!", "yellow") for state in _OPERATIONAL_AGENT_STATE_ORDER),
         ("cancelled", "✕", "dim"),
         ("quarantined", "⚠", "yellow"),
         ("interrupted", "◌", "yellow"),
-    ):
+    )
+    for state, glyph, style in outcome_chips:
         if outcomes.get(state):
             chips.append((glyph, f"{outcomes[state]} {state}", style))
     rendered = Text()
@@ -8129,11 +8274,12 @@ def _render_agents(
         active = tuple(
             agent
             for agent in assignments
-            if _agent_display_state(agent.latest_event) in {"working", "failed", "interrupted"}
+            if _agent_outcome_state(agent)
+            in {"working", "failed", "interrupted", *_OPERATIONAL_AGENT_STATES}
         )
         shown = active[:3] or assignments[:3]
         for agent in shown:
-            agent_state = _agent_display_state(agent.latest_event)
+            agent_state = _agent_outcome_state(agent)
             rendered.append(f"    {_agent_stage(agent)} · {agent_state}\n")
             rendered.append(f"    {_agent_assignment_label(agent)}\n")
             if agent.technique and "/" not in agent.technique:
@@ -8141,6 +8287,11 @@ def _render_agents(
             if agent_state == "failed":
                 rendered.append(
                     f"    Failure: {agent.result or 'No reason recorded'}\n", style="#ff8290"
+                )
+            elif agent_state in _OPERATIONAL_AGENT_STATES:
+                rendered.append(
+                    f"    Operational condition: {agent.result or 'No reason recorded'}\n",
+                    style="yellow",
                 )
             elif agent.activity:
                 rendered.append(

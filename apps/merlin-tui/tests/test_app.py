@@ -2,6 +2,7 @@ import asyncio
 import json
 import shlex
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -4055,6 +4056,133 @@ def test_agents_for_campaigns_does_not_attach_unscoped_legacy_rows_to_campaign()
     assert app_module._agents_for_campaigns((unscoped,), (campaign,)) == ()  # noqa: SLF001
 
 
+@pytest.mark.parametrize("winner_state", ["running", "completed"])
+def test_agents_for_campaigns_deduplicates_logical_assignment_across_waves(
+    winner_state: str,
+) -> None:
+    campaign = CampaignView(
+        "campaign/one", "session-demo", "current", "recommended", "executing", "digest"
+    )
+    failed = AgentView(
+        "structural/execute",
+        "lead",
+        "Open the canonical target",
+        "demo",
+        "1m",
+        "failed",
+        campaign_id=campaign.id,
+        assignment_id="phase-gate/canonical-open-target",
+        target_adapter="browser",
+        target_generation="generation/one",
+        scenario_fingerprint="sha256:scenario",
+        technique="phase-gate/canonical-open-target",
+        controller_id="objective-phase-gate/v1",
+        payload_family="baseline",
+        requested_language="en",
+        mutation_id="none",
+        failure_kind="configuration",
+        schedule_updated_at=datetime(2026, 10, 28, 10, tzinfo=UTC),
+        campaign_wave=0,
+    )
+    winner = replace(
+        failed,
+        latest_event=winner_state,
+        result="Canonical target opened" if winner_state == "completed" else None,
+        budgets="schedule=wave-two",
+        failure_kind=None,
+        schedule_updated_at=datetime(2026, 10, 28, 11, tzinfo=UTC),
+        campaign_wave=1,
+    )
+
+    visible = app_module._agents_for_campaigns(  # noqa: SLF001
+        (failed, winner), (campaign,)
+    )
+
+    assert visible == (winner,)
+
+
+def test_agents_for_campaigns_uses_authoritative_wave_and_recency_for_failed_duplicates() -> None:
+    campaign = CampaignView(
+        "campaign/one", "session-demo", "current", "recommended", "executing", "digest"
+    )
+    older_typed = AgentView(
+        "specialist/execute",
+        "lead",
+        "Try candidate",
+        "demo",
+        "1m",
+        "failed",
+        result="Provider connection closed",
+        campaign_id=campaign.id,
+        assignment_id="assignment/one",
+        target_adapter="browser",
+        target_generation="generation/one",
+        scenario_fingerprint="sha256:scenario",
+        technique="technique/first",
+        controller_id="pair",
+        payload_family="baseline",
+        requested_language="en",
+        mutation_id="none",
+        failure_kind="provider_transient",
+        schedule_updated_at=datetime(2026, 10, 28, 12, tzinfo=UTC),
+        campaign_wave=0,
+    )
+    newer_untyped = replace(
+        older_typed,
+        result="Target rejected the attack",
+        failure_kind=None,
+        schedule_updated_at=datetime(2026, 10, 28, 11, tzinfo=UTC),
+        campaign_wave=1,
+    )
+
+    visible = app_module._agents_for_campaigns(  # noqa: SLF001
+        (older_typed, newer_untyped), (campaign,)
+    )
+
+    assert visible == (newer_untyped,)
+    assert app_module._agent_outcome_state(visible[0]) == "failed"  # noqa: SLF001
+
+    older_without_wave = replace(
+        older_typed,
+        schedule_updated_at=datetime(2026, 10, 28, 10, tzinfo=UTC),
+        campaign_wave=None,
+    )
+    newer_without_wave = replace(newer_untyped, campaign_wave=None)
+    visible_without_wave = app_module._agents_for_campaigns(  # noqa: SLF001
+        (older_without_wave, newer_without_wave), (campaign,)
+    )
+    assert visible_without_wave == (newer_without_wave,)
+
+
+def test_agents_for_campaigns_preserves_distinct_candidates_for_one_assignment() -> None:
+    campaign = CampaignView(
+        "campaign/one", "session-demo", "current", "recommended", "executing", "digest"
+    )
+    first = AgentView(
+        "specialist/execute",
+        "lead",
+        "Try candidate",
+        "demo",
+        "1m",
+        "completed",
+        campaign_id=campaign.id,
+        assignment_id="assignment/one",
+        target_adapter="browser",
+        target_generation="generation/one",
+        scenario_fingerprint="sha256:scenario",
+        technique="technique/first",
+        controller_id="pair",
+        payload_family="baseline",
+        requested_language="en",
+        mutation_id="none",
+    )
+    second = replace(first, technique="technique/second")
+
+    visible = app_module._agents_for_campaigns((first, second), (campaign,))  # noqa: SLF001
+
+    assert visible == (first, second)
+
+
 def test_current_campaigns_selects_only_one_active_campaign() -> None:
     campaigns = (
         CampaignView("campaign/one", "session", "one", "recommended", "executing", "a"),
@@ -4122,6 +4250,87 @@ def test_live_swarm_keeps_evaluation_uncertainty_out_of_lifecycle_progress() -> 
     assert "└─ ✓ 1 completed" in rendered
     assert "! 1 needs review" not in rendered
     assert rendered.count("└─") == 1
+
+
+def test_live_swarm_separates_operational_failures_from_target_failures() -> None:
+    common = {
+        "owner": "lead",
+        "provider": "demo",
+        "elapsed": "1m",
+        "latest_event": "failed",
+    }
+    agents = (
+        AgentView(
+            name="prerequisite",
+            task="Open target",
+            controller_id="objective-phase-gate/v1",
+            result="Target could not be opened",
+            **common,
+        ),
+        AgentView(
+            name="unavailable",
+            task="Run GOAT",
+            infrastructure_failure_category="adaptive_strategy_unavailable",
+            result="GOAT contract is unavailable",
+            **common,
+        ),
+        AgentView(
+            name="infrastructure",
+            task="Call provider",
+            failure_kind="provider_transient",
+            result="Provider connection closed",
+            **common,
+        ),
+        AgentView(
+            name="target-failure",
+            task="Execute target test",
+            result="Target rejected the attack",
+            **common,
+        ),
+    )
+
+    rendered = app_module._render_live_swarm(agents, (), 0).plain  # noqa: SLF001
+
+    assert "✕ 1 failed" in rendered
+    assert "! 1 prerequisite blocked" in rendered
+    assert "! 1 unavailable" in rendered
+    assert "! 1 infrastructure" in rendered
+    assert app_module._agent_state_chip("failed") == ("✕", "red")  # noqa: SLF001
+    assert app_module._agent_state_chip("unavailable") == ("!", "yellow")  # noqa: SLF001
+
+    agents_rendered = app_module._render_agents(agents).plain  # noqa: SLF001
+    assert "✕ 1 failed" in agents_rendered
+    assert "! 1 prerequisite blocked" in agents_rendered
+    assert "! 1 unavailable" in agents_rendered
+    assert "! 1 infrastructure" in agents_rendered
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "label"),
+    [
+        ("authorization", "authorization blocked"),
+        ("scope", "scope blocked"),
+        ("budget", "budget exhausted"),
+        ("configuration", "configuration issue"),
+        ("state_integrity", "state integrity blocked"),
+        ("unknown", "operational failure"),
+    ],
+)
+def test_typed_non_infrastructure_failures_keep_accurate_operational_labels(
+    failure_kind: str, label: str
+) -> None:
+    agent = AgentView(
+        "worker",
+        "lead",
+        "Run task",
+        "demo",
+        "1m",
+        "failed",
+        failure_kind=failure_kind,
+    )
+
+    assert app_module._agent_outcome_state(agent) == label  # noqa: SLF001
+    assert app_module._agent_state_chip(label) == ("!", "yellow")  # noqa: SLF001
 
 
 def test_live_swarm_labels_paused_campaign_without_claiming_working() -> None:
@@ -5158,6 +5367,59 @@ async def test_agent_workspace_panes_unread_transcript_and_failure_are_session_s
         assert not app._exit  # noqa: SLF001
 
 
+@pytest.mark.asyncio
+async def test_agent_workspace_preserves_distinct_candidates_for_one_assignment() -> None:
+    class CandidateBackend(DemoBackend):
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/candidates",
+                    "session-demo",
+                    "Candidate assessment",
+                    "recommended",
+                    "executing",
+                    "digest",
+                ),
+            )
+
+        async def list_agents(self):
+            common = {
+                "name": "specialist/execute",
+                "owner": "lead",
+                "task": "Try candidate",
+                "provider": "demo",
+                "elapsed": "1m",
+                "latest_event": "completed",
+                "campaign_id": "campaign/candidates",
+                "assignment_id": "assignment/shared",
+                "target_adapter": "browser",
+                "target_generation": "generation/one",
+                "scenario_fingerprint": "sha256:scenario",
+                "controller_id": "pair",
+                "payload_family": "baseline",
+                "requested_language": "en",
+                "mutation_id": "none",
+            }
+            return (
+                AgentView(technique="technique/first", **common),
+                AgentView(technique="technique/second", **common),
+            )
+
+    backend = CandidateBackend()
+    app = build_app(backend)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = app_module.AgentScreen(backend, "session-demo")
+        await app.push_screen(screen)
+        await pilot.pause()
+
+        workers = tuple(agent for agent in screen._agents if agent.profile != "Campaign Lead")
+        assert {agent.technique for agent in workers} == {
+            "technique/first",
+            "technique/second",
+        }
+        assert len({screen._key(agent) for agent in workers}) == 2
+
+
 def test_readable_log_summarizes_embedded_browser_failure_diagnostics() -> None:
     row = (
         "tool: browser_boundary: tab limit reached\n"
@@ -6182,6 +6444,21 @@ async def test_agents_overview_groups_by_identity_and_returns_to_tasks() -> None
                 for i in range(3)
             ) + (
                 AgentView(
+                    name="worker-auth",
+                    owner="owner-auth",
+                    task="Authorization prerequisite",
+                    provider="test-model",
+                    elapsed="1m",
+                    latest_event="failed",
+                    result="Credential was not authorized",
+                    session_id="session-demo",
+                    identity_provenance="durable",
+                    specialist_instance_id="specialist/shared",
+                    profile="Response reviewer",
+                    assignment_id="task-auth",
+                    failure_kind="authorization",
+                ),
+                AgentView(
                     name="PRIVATE",
                     owner="private",
                     task="PRIVATE",
@@ -6206,6 +6483,8 @@ async def test_agents_overview_groups_by_identity_and_returns_to_tasks() -> None
         assert all(f"Task {i}" in view.text for i in range(3))
         assert "Current/latest task: Task 1" in view.text
         assert "test-model" in view.text and "Output 1" in view.text
+        assert "authorization blocked · Authorization prerequisite" in view.text
+        assert "failed · Authorization prerequisite" not in view.text
         assert "PRIVATE" not in view.text
         await pilot.press("escape")
         await pilot.pause()
@@ -6946,7 +7225,7 @@ def test_live_swarm_explains_blocking_review_without_changing_target_progress():
 
     rendered = app_module._render_live_swarm((), (campaign,), 0).plain
 
-    assert "Review: Wave results · BLOCKING · 2m 12s" in rendered
+    assert "Review: Wave results · NEXT-WAVE GATE · 2m 12s" in rendered
     assert "Activity: Comparing target-state transitions with required objectives" in rendered
     assert "Progress: 3/5 review chunks complete" in rendered
     assert "Waiting: The next wave needs the reviewed objective and strategy decision." in rendered

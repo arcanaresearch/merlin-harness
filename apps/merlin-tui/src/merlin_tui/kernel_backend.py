@@ -916,6 +916,18 @@ class KernelBackend:
                 payload_family=assignment.candidate.payload_family,
                 requested_language=assignment.candidate.requested_language,
                 mutation_id=assignment.candidate.mutation_id,
+                failure_kind=(
+                    assignment.current_attempt.failure_kind
+                    if assignment.current_attempt is not None
+                    else None
+                ),
+                infrastructure_failure_category=(
+                    assignment.current_attempt.infrastructure_failure_category
+                    if assignment.current_attempt is not None
+                    else None
+                ),
+                schedule_updated_at=assignment.schedule_updated_at,
+                campaign_wave=assignment.campaign_wave,
                 evaluation_state=assignment.candidate_evaluation.state.value,
                 evaluation_confidence=(assignment.candidate_evaluation.evaluation_confidence),
                 evaluation_reasons=assignment.candidate_evaluation.evaluation_reasons,

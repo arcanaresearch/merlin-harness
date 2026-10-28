@@ -340,6 +340,7 @@ def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
                 lease.generation,
                 result={
                     "content": "Partial capability result",
+                    "infrastructure_failure_category": "adaptive_strategy_unavailable",
                     "worker_checkpoint": {
                         "messages": [
                             {"role": "system", "content": "Private worker instructions"},
@@ -354,6 +355,14 @@ def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
                     },
                 },
             )
+            scheduler.settle_attempt(
+                lease.id,
+                lease.generation,
+                "failed",
+                reason="The requested adaptive controller is unavailable",
+                checkpoint={},
+                failure_kind="configuration",
+            )
 
             rows = scheduler.list_swarm_snapshot_rows(
                 str(first_session.id), campaign_id="campaign/first"
@@ -362,6 +371,9 @@ def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
             assert len(rows) == 2
             assert {row["session_id"] for row in rows} == {str(first_session.id)}
             assert {row["campaign_id"] for row in rows} == {"campaign/first"}
+            assert {
+                row["assignment"]["id"]: row["campaign_wave"] for row in rows
+            } == {"task-first": 0, "task-followup": 1}
             assert {row["assignment"]["id"] for row in rows} == {
                 "task-first",
                 "task-followup",
@@ -372,14 +384,23 @@ def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
             assert all(row["successful_result_id"] is None for row in rows)
             assert all(row["durable_specialist_id"] is None for row in rows)
             current = next(row for row in rows if row["assignment"]["id"] == "task-first")
+            assert isinstance(current["schedule_updated_at"], datetime)
             assert current["current_result_content"] == "Partial capability result"
+            assert current["current_attempt_failure_kind"] == "configuration"
+            assert (
+                current["current_infrastructure_failure_category"]
+                == "adaptive_strategy_unavailable"
+            )
             assert [message["content"] for message in current["recent_output"]] == [
                 "Recorded output 3",
                 "Recorded output 4",
                 "Recorded output 5",
                 "Target response",
             ]
-            assert current["recent_activity"][-1]["type"] == "checkpointed"
+            assert [event["type"] for event in current["recent_activity"]][-2:] == [
+                "checkpointed",
+                "failed",
+            ]
 
 
 def test_pg0_target_adapter_circuit_survives_restart_and_allows_one_half_open_probe(

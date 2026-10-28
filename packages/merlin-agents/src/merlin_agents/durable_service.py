@@ -6645,6 +6645,8 @@ def _project_durable_swarm_rows(
                 activity=_snapshot_activity(row),
                 output=_snapshot_output(row),
                 failure_reason=_optional_text(row.get("current_attempt_error")),
+                schedule_updated_at=_optional_datetime(row.get("schedule_updated_at")),
+                campaign_wave=_optional_nonnegative_int(row.get("campaign_wave")),
             )
         )
     return project_swarm_snapshots(records)
@@ -6749,6 +6751,10 @@ def _snapshot_current_attempt(row: Mapping[str, object]) -> CurrentAttempt | Non
         attempt_id=attempt_id,
         lifecycle=state,
         owner=_optional_text(row.get("current_attempt_owner")),
+        failure_kind=_optional_text(row.get("current_attempt_failure_kind")),
+        infrastructure_failure_category=_optional_text(
+            row.get("current_infrastructure_failure_category")
+        ),
         lease_generation=(
             int(generation)
             if isinstance(generation, int) and not isinstance(generation, bool) and generation > 0
@@ -6869,6 +6875,14 @@ def _projection_text(value: Mapping[str, object], key: str, *, fallback: str) ->
 
 def _optional_text(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    return value if isinstance(value, datetime) else None
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _worker_context(value: dict[str, object]) -> WorkerContext:

@@ -517,7 +517,9 @@ class DurableSchedulerStore:
                SELECT schedule.id AS schedule_id,
                       schedule.session_id,
                       schedule.status AS schedule_status,
+                      schedule.updated_at AS schedule_updated_at,
                       campaign.id AS campaign_id,
+                      campaign.wave AS campaign_wave,
                       dynamic_specialist.id AS durable_specialist_id,
                       COALESCE(
                           dynamic_specialist.record ->> 'label',
@@ -532,9 +534,12 @@ class DurableSchedulerStore:
                       current_attempt.owner AS current_attempt_owner,
                       current_attempt.generation AS current_attempt_generation,
                       current_attempt.error AS current_attempt_error,
+                      current_attempt.failure_kind AS current_attempt_failure_kind,
                       recent_activity.events AS recent_activity,
                       recent_output.messages AS recent_output,
                       current_result.payload ->> 'content' AS current_result_content,
+                      current_result.payload ->> 'infrastructure_failure_category'
+                          AS current_infrastructure_failure_category,
                       technique.state AS evaluation_state,
                       technique.terminal_reason AS evaluation_reason,
                       technique.strategy_state AS evaluation_detail,
@@ -560,10 +565,11 @@ class DurableSchedulerStore:
                  ON node.schedule_id = schedule.id
                 AND node.node_id = 'worker:' || (assignment.value ->> 'id')
                LEFT JOIN LATERAL (
-                   SELECT scoped_campaign.id
+                   SELECT scoped_campaign.id, COALESCE(wave.wave, 0) AS wave
                    FROM merlin_storage.assessment_campaigns AS scoped_campaign
                    LEFT JOIN merlin_storage.campaign_waves AS wave
                      ON wave.campaign_id = scoped_campaign.id
+                    AND wave.schedule_id = schedule.id
                    WHERE scoped_campaign.session_id = schedule.session_id
                      AND (
                          scoped_campaign.schedule_id = schedule.id
@@ -577,7 +583,7 @@ class DurableSchedulerStore:
                 AND dynamic_specialist.id = assignment.value ->> 'profile_id'
                LEFT JOIN LATERAL (
                    SELECT attempt.id, attempt.state, attempt.owner,
-                          attempt.generation, attempt.error
+                          attempt.generation, attempt.error, attempt.failure_kind
                    FROM merlin_storage.scheduler_attempts AS attempt
                    WHERE attempt.schedule_id = schedule.id
                      AND attempt.node_id = node.node_id

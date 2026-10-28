@@ -1741,6 +1741,8 @@ async def test_snapshot_views_keep_objective_live_activity_and_failure_reason() 
                 "campaign_id": "campaign/one",
                 "schedule_id": "schedule/one",
                 "schedule_status": "running",
+                "schedule_updated_at": datetime(2026, 10, 28, 11, tzinfo=UTC),
+                "campaign_wave": 2,
                 "assignment": {
                     "id": "probe/memory",
                     "objective": "Test whether target memory persists",
@@ -1750,6 +1752,8 @@ async def test_snapshot_views_keep_objective_live_activity_and_failure_reason() 
                 "current_attempt_id": "attempt/one",
                 "current_attempt_state": "failed",
                 "current_attempt_error": "Target timed out while reading the second response",
+                "current_attempt_failure_kind": "configuration",
+                "current_infrastructure_failure_category": "adaptive_strategy_unavailable",
                 "recent_output": [
                     {"role": "assistant", "content": "Testing recall across turns"},
                     {"role": "tool", "content": "Target replied: I do not remember"},
@@ -1773,6 +1777,10 @@ async def test_snapshot_views_keep_objective_live_activity_and_failure_reason() 
     assert "waiting for target response" in view.activity[-1]
     assert "3 actions" in view.activity[-1]
     assert view.result == "Target timed out while reading the second response"
+    assert view.failure_kind == "configuration"
+    assert view.infrastructure_failure_category == "adaptive_strategy_unavailable"
+    assert view.schedule_updated_at == datetime(2026, 10, 28, 11, tzinfo=UTC)
+    assert view.campaign_wave == 2
     assert "assistant: Testing recall across turns" in view.output
     assert "tool: Target replied: I do not remember" in view.output
     assert view.output[-1] == "Result: The target did not retain the supplied instruction"
