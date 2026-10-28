@@ -262,6 +262,10 @@ CAPABILITY_PROBE_MALFORMED_CALL_STRIKES = 2
 # target call for the same conversation step. A schema-valid model finalization
 # is accepted at the limit; anything else fails the attempt instead of looping.
 GOAT_PLANNER_NO_CALL_STRIKE_LIMIT = 4
+# Bound each GOAT planning request so a stalled planner cannot consume the
+# worker's full remaining output budget before the existing bounded retry path
+# replaces the worker. This is a runtime request limit, not GOAT provenance.
+GOAT_PLANNER_OUTPUT_TOKEN_CAP = 4_096
 # Bound consecutive Crescendo planner turns that emit prose instead of the
 # reviewed target call for the same stage. Without this guard a provider can
 # repeat acknowledgements such as "Holding." indefinitely while the wave waits
@@ -3778,6 +3782,16 @@ class WorkerRuntime:
                 if model_output_limit is None
                 else min(remaining_tokens, model_output_limit)
             )
+            goat_planning_turn = (
+                goat_state is not None
+                and strategy_proposal("goat", goat_state).action == "continue"
+                and not finalization_only
+            )
+            if goat_planning_turn:
+                output_limit = min(
+                    output_limit if output_limit is not None else GOAT_PLANNER_OUTPUT_TOKEN_CAP,
+                    GOAT_PLANNER_OUTPUT_TOKEN_CAP,
+                )
             request_workload = AssignmentContext.request_workload(handoff.assignment.profile_id)
             effective_request = ChatRequest(
                 model=handoff.model,
@@ -3949,6 +3963,13 @@ class WorkerRuntime:
                     )
                 if output_limit is not None:
                     output_limit = granted - input_bound
+                    if goat_planning_turn:
+                        output_limit = min(output_limit, GOAT_PLANNER_OUTPUT_TOKEN_CAP)
+                    if effective_request.max_output_tokens is not None:
+                        output_limit = min(
+                            output_limit,
+                            effective_request.max_output_tokens,
+                        )
                 reservation_active = True
             request = ChatRequest(
                 model=handoff.model,

@@ -47,6 +47,7 @@ from merlin_agents.runtime import (
     CAPABILITY_PROBE_MALFORMED_CALL_STRIKES,
     CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT,
     GOAT_PLANNER_NO_CALL_STRIKE_LIMIT,
+    GOAT_PLANNER_OUTPUT_TOKEN_CAP,
     _controller_target_tool,
     _goat_contract,
     _hydra_select_contract,
@@ -1580,9 +1581,157 @@ async def test_goat_planner_prose_loop_without_valid_result_fails_bounded() -> N
 
     assert result.status == "failed"
     assert "no reviewed target call" in (result.error or "")
+    assert result.retry_class == "fresh_worker"
+    assert result.infrastructure_failure_category == "provider_format_invalid"
     assert result.retry_failure_kind is RetryFailureKind.WORKER_INTERRUPTED
     assert tools.calls == ["target_request"]
     assert len(provider.requests) == 1 + GOAT_PLANNER_NO_CALL_STRIKE_LIMIT
+
+
+async def test_goat_planner_cap_is_projected_reserved_requested_and_digested() -> None:
+    provider = Provider(
+        [
+            [_goat_call(0), ModelCompleted(finish_reason="tool_calls")],
+            [_goat_call(1), ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+    projected_limits: list[int | None] = []
+    reservations: list[int] = []
+
+    async def reserve(_handoff, _reservation_id, tokens, _turns):
+        reservations.append(tokens)
+        return tokens
+
+    runtime = WorkerRuntime(
+        provider,
+        GoatTargetTools(),
+        max_tokens=20_000,
+        budget_reserver=reserve,
+        budget_reservation_enabled=True,
+    )
+    original = runtime._project_for_context  # noqa: SLF001
+
+    def capture(messages, tools, model=None, output_tokens=None, **kwargs):
+        projected_limits.append(output_tokens)
+        return original(messages, tools, model, output_tokens, **kwargs)
+
+    runtime._project_for_context = capture  # type: ignore[method-assign]  # noqa: SLF001
+
+    result = await runtime.run(_goat_plugin_handoff())
+
+    assert result.status == "completed"
+    assert projected_limits == [GOAT_PLANNER_OUTPUT_TOKEN_CAP] * 2
+    assert reservations == [GOAT_PLANNER_OUTPUT_TOKEN_CAP] * 2
+    assert all(
+        request.max_output_tokens is not None
+        and 0 < request.max_output_tokens <= GOAT_PLANNER_OUTPUT_TOKEN_CAP
+        for request in provider.requests
+    )
+    assert result.checkpoint is not None
+    assert result.checkpoint["terminal_prompt_digest"] == WorkerRuntime._provider_request_digest(  # noqa: SLF001
+        provider.requests[-1]
+    )
+
+
+@pytest.mark.parametrize(
+    ("route_cap", "expected_limit"),
+    [(None, 4_096), (2_048, 2_048), (8_192, 4_096)],
+)
+async def test_goat_planner_combines_route_and_planning_caps(
+    route_cap: int | None, expected_limit: int
+) -> None:
+    class RoutedProvider(Provider):
+        def resolve_request(self, request: ChatRequest) -> ChatRequest:
+            updates: dict[str, object] = {"reasoning_effort": "high"}
+            if route_cap is not None and (
+                request.max_output_tokens is None or request.max_output_tokens > route_cap
+            ):
+                updates["max_output_tokens"] = route_cap
+            return request.model_copy(update=updates)
+
+    provider = RoutedProvider(
+        [
+            [_goat_call(0), ModelCompleted(finish_reason="tool_calls")],
+            [_goat_call(1), ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+
+    result = await WorkerRuntime(provider, GoatTargetTools(), max_tokens=20_000).run(
+        _goat_plugin_handoff()
+    )
+
+    assert result.status == "completed"
+    assert [request.max_output_tokens for request in provider.requests] == [
+        expected_limit,
+        expected_limit,
+    ]
+    assert all(request.workload == "recon" for request in provider.requests)
+    assert all(request.reasoning_effort == "high" for request in provider.requests)
+    assert all(request.reasoning_control is None for request in provider.requests)
+
+
+async def test_goat_planner_reapplies_caps_after_smaller_reservation() -> None:
+    provider = Provider(
+        [
+            [_goat_call(0), ModelCompleted(finish_reason="tool_calls")],
+            [_goat_call(1), ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+
+    async def reserve(_handoff, _reservation_id, _tokens, _turns):
+        return 1_280
+
+    runtime = WorkerRuntime(
+        provider,
+        GoatTargetTools(),
+        max_tokens=20_000,
+        budget_reserver=reserve,
+        budget_reservation_enabled=True,
+    )
+    runtime._request_input_token_upper_bound = lambda *_args, **_kwargs: 256  # type: ignore[method-assign]  # noqa: SLF001,E501
+
+    result = await runtime.run(_goat_plugin_handoff())
+
+    assert result.status == "completed"
+    assert [request.max_output_tokens for request in provider.requests] == [1_024, 1_024]
+
+
+async def test_goat_planner_digest_binds_exact_final_controlled_request() -> None:
+    class ControlledProvider(Provider):
+        def resolve_request(self, request: ChatRequest) -> ChatRequest:
+            return request.model_copy(
+                update={
+                    "max_output_tokens": 2_048,
+                    "reasoning": "disabled",
+                    "reasoning_effort": None,
+                    "reasoning_control": "required",
+                }
+            )
+
+    provider = ControlledProvider(
+        [
+            [_goat_call(0), ModelCompleted(finish_reason="tool_calls")],
+            [_goat_call(1), ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+
+    result = await WorkerRuntime(provider, GoatTargetTools(), max_tokens=20_000).run(
+        _goat_plugin_handoff()
+    )
+
+    final_request = provider.requests[-1]
+    assert final_request.workload == "recon"
+    assert final_request.reasoning == "disabled"
+    assert final_request.reasoning_effort is None
+    assert final_request.reasoning_control == "required"
+    assert result.checkpoint is not None
+    assert result.checkpoint["terminal_prompt_digest"] == WorkerRuntime._provider_request_digest(  # noqa: SLF001
+        final_request
+    )
+    changed_control = final_request.model_copy(update={"reasoning_control": None})
+    assert result.checkpoint["terminal_prompt_digest"] != WorkerRuntime._provider_request_digest(  # noqa: SLF001
+        changed_control
+    )
 
 
 async def test_goat_resumed_attempt_reaches_target_within_few_inferences() -> None:
