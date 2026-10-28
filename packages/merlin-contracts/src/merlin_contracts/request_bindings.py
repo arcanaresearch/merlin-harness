@@ -17,6 +17,17 @@ def validate_capture_binding(template: object, pointer: object, binding_name: st
         raise ValueError("checkpoint restore binding must address its exact capture placeholder")
 
 
+def validate_input_binding(template: object, pointer: object) -> None:
+    """Require one canonical input placeholder at one exact request destination."""
+    parent, key = _destination(template, pointer)
+    if parent[key] != "{{input}}":
+        raise ValueError("content injection must address its exact canonical input placeholder")
+    if _count_value(template, "{{input}}") != 1:
+        raise ValueError(
+            "content injection request must contain exactly one canonical input placeholder"
+        )
+
+
 def validate_request_bindings(
     template: object, bindings: object
 ) -> dict[str, RequestValueGenerator]:
@@ -72,3 +83,11 @@ def _destination(value: object, pointer: object) -> tuple[dict | list, str | int
             return current, key
         current = current[key]
     raise ValueError("request binding destination does not exist")
+
+
+def _count_value(value: object, expected: object) -> int:
+    if isinstance(value, Mapping):
+        return sum(_count_value(item, expected) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_value(item, expected) for item in value)
+    return int(value == expected)

@@ -4100,7 +4100,11 @@ def build_backend(
         configure_telemetry,
         emit_finding_verdict,
     )
-    from merlin_assessments import AssessmentService, ReviewedApiTargetTool
+    from merlin_assessments import (
+        AssessmentService,
+        ReviewedApiTargetTool,
+        ReviewedTargetInjectTool,
+    )
     from merlin_browser import BrowserBounds, BrowserService
     from merlin_config import (
         ConfigPaths,
@@ -4880,9 +4884,7 @@ def build_backend(
             if selected is None:
                 raise ValueError("natural target resolution did not select a browser target")
             origin = _browser_origin(str(selected["base_url"]))
-            persistent = _target_requires_persistent_browser(
-                selected, origin, persistent_origins
-            )
+            persistent = _target_requires_persistent_browser(selected, origin, persistent_origins)
             return BrowserBounds(
                 target_id=str(selected["id"]),
                 allowed_origins={origin},
@@ -4928,6 +4930,7 @@ def build_backend(
             timeout_seconds=config.runtime.tool_action_timeout_seconds,
         )
         tool_broker.register(api_target)
+        tool_broker.register(ReviewedTargetInjectTool(api_target))
         tool_broker.register(KnowledgeSearchTool())
         _register_browser_tools(
             tool_broker,
@@ -7560,9 +7563,7 @@ def build_backend(
             browser_profile = None
             if target_is_browser:
                 reviewed_origin = _browser_origin(reviewed_endpoint)
-                if _target_requires_persistent_browser(
-                    target, reviewed_origin, persistent_origins
-                ):
+                if _target_requires_persistent_browser(target, reviewed_origin, persistent_origins):
                     browser_profile = "shared_persistent_authenticated"
             reviewed_concurrency = _verified_session_concurrency(
                 reviewed_adapter.get("session_cardinality"),

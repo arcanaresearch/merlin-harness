@@ -747,9 +747,7 @@ def test_execution_agenda_separates_explorer_catalogue_work_from_discovery() -> 
             manifest(),
             objective="Attempt prompt injection and authority spoofing.",
         ),
-        compile_objective_contract(
-            "Attempt prompt injection and authority spoofing."
-        ),
+        compile_objective_contract("Attempt prompt injection and authority spoofing."),
     )
     oracle = "sha256:" + "8" * 64
     techniques = expand_language_techniques(
@@ -1712,8 +1710,7 @@ def test_objective_contract_is_digest_bound_round_trips_and_survives_resealing()
     restored.validate()
     assert restored.objective_contract == contract.model_dump(mode="json")
     assert (
-        manifest_with_target_brief(prepared, None).objective_contract
-        == prepared.objective_contract
+        manifest_with_target_brief(prepared, None).objective_contract == prepared.objective_contract
     )
     assert (
         manifest_with_objective_phase_gates(prepared, (objective_gate(),)).objective_contract
@@ -1750,9 +1747,7 @@ def test_objective_navigation_is_isolated_from_attack_coverage() -> None:
     assert assignment.strategy_id == "objective-navigation/v1"
     assert assignment.profile_id == "recon"
     assert assignment.technique_ids == ()
-    assert "Do not execute, select, score, or claim any attack technique" in (
-        assignment.objective
-    )
+    assert "Do not execute, select, score, or claim any attack technique" in (assignment.objective)
     assert {item.id for item in contract.objectives} <= {
         item["id"] for item in json.loads(assignment.objective.split("Sealed objectives:\n", 1)[1])
     }
@@ -2620,6 +2615,7 @@ def test_http_api_target_scope_admits_only_reviewed_request_actor() -> None:
     tools = (
         "target_chat",
         "target_request",
+        "target_inject",
         "knowledge_search",
         "campaign_share",
     )
@@ -2627,7 +2623,17 @@ def test_http_api_target_scope_admits_only_reviewed_request_actor() -> None:
     projected = project_by_effects(tools, profile_grant("injection"), target_interface="http_api")
 
     assert "target_request" in projected
+    assert "target_inject" in projected
     assert "target_chat" not in projected
+
+    for interface in ("browser", "open_ai_compatible", "api"):
+        narrowed = project_by_effects(
+            ("target_inject", "knowledge_search"),
+            profile_grant("injection"),
+            target_interface=interface,
+        )
+        assert "target_inject" not in narrowed
+        assert "knowledge_search" in narrowed
 
 
 def test_http_api_target_with_ambient_browser_auth_uses_only_reviewed_request_actor() -> None:

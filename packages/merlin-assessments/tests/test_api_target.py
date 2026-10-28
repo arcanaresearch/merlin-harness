@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +19,11 @@ from merlin_agents.specialists import (
     WorkerAssignment,
     WorkerProfile,
 )
-from merlin_assessments import ReviewedApiTargetTool, StatefulTargetFixtureServer
+from merlin_assessments import (
+    ReviewedApiTargetTool,
+    ReviewedTargetInjectTool,
+    StatefulTargetFixtureServer,
+)
 from merlin_assessments.api_target import (
     _attempt_disposition,
     _augment_target_state_metadata,
@@ -31,6 +36,7 @@ from merlin_assessments.api_target import (
     _target_parallel_capacity,
     _target_state_transition,
     _TargetCleanupUnverified,
+    _terminal_effect_digest,
 )
 from merlin_config import ConfigPaths, CredentialCheckpointVault
 from merlin_contracts import (
@@ -39,6 +45,7 @@ from merlin_contracts import (
     StateEnumerationDeclaration,
     StateEnumerationShape,
     ToolContext,
+    ToolInteractionRole,
     executable_adapter_digest,
 )
 from merlin_contracts.target_adapter_compiler import (
@@ -55,6 +62,7 @@ from merlin_storage_postgres import (
     SessionRepository,
     load_migrations,
 )
+from merlin_tools import ToolBroker
 
 
 def _adapter() -> dict[str, object]:
@@ -236,10 +244,7 @@ async def test_reviewed_api_tool_executes_selected_setup_step_without_interactio
     assert result.metadata["limit_interaction_count"] == 0
     assert result.metadata["current_target_exchanges"][0]["id"] == "start"
     observations = result.metadata["state_observations"]
-    assert {
-        (item["name"], item["phase"])
-        for item in observations
-    } == {
+    assert {(item["name"], item["phase"]) for item in observations} == {
         ("physical_state_identity", "baseline"),
         ("physical_state_identity", "result"),
         ("session_id", "baseline"),
@@ -4064,9 +4069,7 @@ async def test_reused_assignment_reobserves_passive_state_baseline(
                 first = await tool.invoke(context, {"input": "first"})
                 second = await tool.invoke(context, {"input": "second"})
 
-    assert first.metadata["state_identity_match"] is True, first.metadata[
-        "target_state_transition"
-    ]
+    assert first.metadata["state_identity_match"] is True, first.metadata["target_state_transition"]
     assert second.metadata["state_identity_match"] is True
     assert second.metadata["target_state_transition"]["observations"][0]["before_value"] == 20
     assert second.metadata["target_state_transition"]["observations"][0]["after_value"] == 30
@@ -4932,3 +4935,560 @@ async def test_objective_checkpoint_capture_and_restore_stay_inside_fenced_tool_
         "restored",
         "state",
     ]
+
+
+def _inject_adapter() -> dict[str, object]:
+    adapter = _adapter()
+    steps = adapter["api_steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        2,
+        {
+            "step_id": "plant",
+            "endpoint": "plant",
+            "method": "POST",
+            "request_template": {
+                "sessionId": "{{capture:session_id}}",
+                "comment": "{{input}}",
+            },
+            "response_selector": "/commentId",
+            "success_witness": "non-empty commentId",
+            "cleanup": False,
+            "interaction": True,
+            "captures": {},
+            "idempotency_key": None,
+            "replay_after_ambiguous_result": False,
+            "expected_status": 200,
+            "repeat": 1,
+        },
+    )
+    adapter["content_injection"] = {"step_id": "plant", "content_pointer": "/comment"}
+    return adapter
+
+
+def _injection_only_adapter() -> dict[str, object]:
+    adapter = _inject_adapter()
+    steps = adapter["api_steps"]
+    assert isinstance(steps, list)
+    adapter["api_steps"] = [step for step in steps if step["step_id"] != "message"]
+    return adapter
+
+
+def test_reviewed_target_inject_spec_is_a_reviewed_target_exchange() -> None:
+    engine = ReviewedApiTargetTool(  # type: ignore[arg-type]
+        SimpleNamespace(), lambda _campaign_id: None, {}
+    )
+    spec = ReviewedTargetInjectTool(engine).describe()
+
+    assert spec.name == "target_inject"
+    assert spec.interaction_role is ToolInteractionRole.TARGET_EXCHANGE
+    assert spec.target_delivery_from_reviewed_adapter is True
+    assert spec.input_schema["required"] == ["content"]
+    assert spec.input_schema["properties"]["content"]["minLength"] == 1
+    assert ReviewedTargetInjectTool(engine).effect == "target_network"
+
+
+def test_reviewed_target_tools_share_engine_lock_and_lifecycle() -> None:
+    engine = ReviewedApiTargetTool(  # type: ignore[arg-type]
+        SimpleNamespace(), lambda _campaign_id: None, {}
+    )
+    inject = ReviewedTargetInjectTool(engine)
+
+    assert inject._engine is engine
+    assert inject._engine._locks is engine._locks
+    assert inject._engine._sessions is engine._sessions
+
+
+def test_terminal_replay_identity_binds_operation_and_selected_step() -> None:
+    adapter = SimpleNamespace(compiled_digest="sha256:adapter")
+    request = _terminal_effect_digest(
+        adapter, "same-content", operation="target_request", selected_step_id="message"
+    )
+    inject = _terminal_effect_digest(
+        adapter, "same-content", operation="target_inject", selected_step_id="plant"
+    )
+    other_step = _terminal_effect_digest(
+        adapter, "same-content", operation="target_request", selected_step_id="other"
+    )
+
+    assert len({request, inject, other_step}) == 3
+
+
+@pytest.mark.asyncio
+async def test_reviewed_target_inject_rejects_blank_content_before_any_target_work() -> None:
+    class NoSessionActions:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"session action {name} occurred before content validation")
+
+    tool = ReviewedTargetInjectTool(
+        ReviewedApiTargetTool(  # type: ignore[arg-type]
+            NoSessionActions(), lambda _campaign_id: _inject_adapter(), {}
+        )
+    )
+    result = await tool.invoke(_context("campaign/inject-blank-content"), {"content": "   "})
+
+    assert result.is_error is True
+    assert result.content == "content must be a non-empty string"
+
+
+@pytest.mark.asyncio
+async def test_reviewed_target_inject_requires_a_declared_surface() -> None:
+    class NoSessionActions:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"session action {name} occurred before surface resolution")
+
+    adapter = _adapter()
+    tool = ReviewedTargetInjectTool(
+        ReviewedApiTargetTool(  # type: ignore[arg-type]
+            NoSessionActions(), lambda _campaign_id: adapter, {"target-token": "opaque-secret"}
+        )
+    )
+    result = await tool.invoke(
+        _sealed_context("campaign/inject-no-surface", adapter),
+        {"content": "planted"},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "content_injection_unavailable"
+    assert result.metadata["infrastructure_failure_category"] == "configuration"
+
+
+@pytest.mark.asyncio
+async def test_target_request_cannot_execute_the_reviewed_injection_surface_by_step_id() -> None:
+    class NoSessionActions:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"session action {name} occurred before surface gate")
+
+    adapter = _inject_adapter()
+    result = await ReviewedApiTargetTool(  # type: ignore[arg-type]
+        NoSessionActions(),
+        lambda _campaign_id: adapter,
+        {"target-token": "opaque-secret"},
+    ).invoke(
+        _sealed_context("campaign/inject-step-gate", adapter),
+        {"input": "planted via step_id", "step_id": "plant"},
+    )
+
+    assert result.is_error is True
+    assert "reserved for the reviewed content injection surface" in result.content
+    assert result.metadata["infrastructure_failure_category"] == "configuration"
+
+
+@pytest.mark.asyncio
+async def test_injection_only_adapter_rejects_target_request_before_setup_or_session_effect() -> (
+    None
+):
+    class NoSessionActions:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"session action {name} occurred before ordinary-surface gate")
+
+    def no_http(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"HTTP setup effect occurred at {request.url}")
+
+    adapter = _injection_only_adapter()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(no_http)) as client:
+        result = await ReviewedApiTargetTool(  # type: ignore[arg-type]
+            NoSessionActions(),
+            lambda _campaign_id: adapter,
+            {"target-token": "opaque-secret"},
+            client=client,
+        ).invoke(
+            _sealed_context("campaign/injection-only-request", adapter),
+            {"input": "must not start a session"},
+        )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_request_unavailable"
+    assert result.metadata["target_effect_attempted"] is False
+    assert result.metadata["target_call_budget_charge"] == 0
+    assert result.metadata["limit_interaction_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_injection_only_adapter_allows_explicit_selected_setup_gate(tmp_path: Path) -> None:
+    adapter = _injection_only_adapter()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "selected-gate-session"})
+        raise AssertionError(f"selected setup gate reached unexpected path {request.url.path}")
+
+    campaign_id = "campaign/injection-only-selected-setup"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"input": "verify selected setup", "step_id": "start"},
+                )
+
+    assert result.is_error is False
+    assert calls == ["/api/scanner/start"]
+    assert result.metadata["limit_interaction_count"] == 0
+    assert result.metadata["target_call_budget_charge"] == 1
+    assert result.metadata["current_target_exchanges"][0]["id"] == "start"
+
+
+@pytest.mark.asyncio
+async def test_reviewed_target_inject_writes_only_the_reviewed_surface(
+    tmp_path: Path,
+) -> None:
+    adapter = _inject_adapter()
+    seen: list[tuple[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: object = json.loads(request.content) if request.content else None
+        seen.append((request.url.path, body))
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "plant-session"})
+        if request.url.path.endswith("/plant"):
+            return httpx.Response(200, json={"commentId": "comment-7"})
+        raise AssertionError(f"unexpected target path {request.url.path}")
+
+    campaign_id = "campaign/target-inject-surface"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                engine = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                result = await ReviewedTargetInjectTool(engine).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"content": "planted payload"},
+                )
+
+    assert result.is_error is False
+    assert json.loads(result.content) == "comment-7"
+    assert result.metadata["attempt_disposition"] == "valid"
+    assert result.metadata["acknowledged_capability_evidence"] is True
+    assert result.metadata["content_injection_step_id"] == "plant"
+    assert result.metadata["content_injection_pointer"] == "/comment"
+    plant_exchange = next(
+        item for item in result.metadata["target_exchanges"] if item["id"] == "plant"
+    )
+    assert plant_exchange["content_injection_pointer"] == "/comment"
+    assert result.metadata["injection_content_digest"] == (
+        "sha256:" + hashlib.sha256(b"planted payload").hexdigest()
+    )
+    assert result.metadata["limit_interaction_count"] == 1
+    assert result.metadata["target_call_budget_charge"] == 2
+    planted = [body for path, body in seen if path.endswith("/plant")]
+    assert planted == [{"sessionId": "plant-session", "comment": "planted payload"}]
+    assert not any(path.endswith("/message") for path, _body in seen)
+
+
+@pytest.mark.asyncio
+async def test_plain_target_request_never_writes_the_reviewed_injection_surface(
+    tmp_path: Path,
+) -> None:
+    adapter = _inject_adapter()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "chat-session"})
+        if request.url.path.endswith("/message"):
+            return httpx.Response(200, json={"reply": "chat reply"})
+        raise AssertionError(f"unexpected target path {request.url.path}")
+
+    campaign_id = "campaign/target-inject-never-implicit"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"input": "chat probe"},
+                )
+
+    assert result.is_error is False
+    assert json.loads(result.content) == "chat reply"
+    assert result.metadata["attempt_disposition"] == "valid"
+    assert not any(path.endswith("/plant") for path in seen)
+
+
+@pytest.mark.asyncio
+async def test_injection_only_constraint_does_not_block_ordinary_target_request(
+    tmp_path: Path,
+) -> None:
+    adapter = _inject_adapter()
+    adapter["request_constraints"] = [
+        {
+            "step_id": "plant",
+            "evaluation_root": "request_body",
+            "path": "/comment",
+            "kind": "string_length",
+            "maximum": 3,
+            "unit": "unicode_characters",
+            "source": "server_validation_response",
+            "evidence_refs": ["exchange/plant-limit"],
+            "evidence_bindings": [{"evidence_ref": "exchange/plant-limit", "observed_maximum": 3}],
+        }
+    ]
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "ordinary-session"})
+        if request.url.path.endswith("/message"):
+            return httpx.Response(200, json={"reply": "ordinary reply"})
+        raise AssertionError(f"unexpected target path {request.url.path}")
+
+    campaign_id = "campaign/injection-constraint-does-not-block-request"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                ).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"input": "ordinary content longer than injection limit"},
+                )
+
+    assert result.is_error is False
+    assert json.loads(result.content) == "ordinary reply"
+    assert any(path.endswith("/message") for path in seen)
+    assert not any(path.endswith("/plant") for path in seen)
+
+
+@pytest.mark.asyncio
+async def test_normal_step_constraint_does_not_block_target_inject(tmp_path: Path) -> None:
+    adapter = _inject_adapter()
+    adapter["request_constraints"] = [
+        {
+            "step_id": "message",
+            "evaluation_root": "request_body",
+            "path": "/userMessage",
+            "kind": "string_length",
+            "maximum": 3,
+            "unit": "unicode_characters",
+            "source": "server_validation_response",
+            "evidence_refs": ["exchange/message-limit"],
+            "evidence_bindings": [
+                {"evidence_ref": "exchange/message-limit", "observed_maximum": 3}
+            ],
+        }
+    ]
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "inject-session"})
+        if request.url.path.endswith("/plant"):
+            return httpx.Response(200, json={"commentId": "comment-constraint"})
+        raise AssertionError(f"unexpected target path {request.url.path}")
+
+    campaign_id = "campaign/request-constraint-does-not-block-injection"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                engine = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                result = await ReviewedTargetInjectTool(engine).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"content": "injected content longer than normal limit"},
+                )
+
+    assert result.is_error is False
+    assert json.loads(result.content) == "comment-constraint"
+    assert any(path.endswith("/plant") for path in seen)
+    assert not any(path.endswith("/message") for path in seen)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_target_request_and_inject_share_one_serial_lock(tmp_path: Path) -> None:
+    adapter = _inject_adapter()
+    active = 0
+    max_active = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            if request.url.path.endswith("/start"):
+                return httpx.Response(200, json={"sessionId": "shared-session"})
+            if request.url.path.endswith("/message"):
+                return httpx.Response(200, json={"reply": "ordinary"})
+            if request.url.path.endswith("/plant"):
+                return httpx.Response(200, json={"commentId": "planted"})
+            raise AssertionError(f"unexpected target path {request.url.path}")
+        finally:
+            active -= 1
+
+    campaign_id = "campaign/concurrent-request-inject"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                engine = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                inject = ReviewedTargetInjectTool(engine)
+                context = _sealed_context(campaign_id, adapter)
+                ordinary, planted = await asyncio.gather(
+                    engine.invoke(context, {"input": "ordinary"}),
+                    inject.invoke(context, {"content": "planted"}),
+                )
+
+    assert ordinary.is_error is False
+    assert planted.is_error is False
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_broker_denial_prevents_injection_setup_and_http_effect() -> None:
+    class NoSessionActions:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"session action {name} occurred after broker denial")
+
+    async def deny(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    engine = ReviewedApiTargetTool(  # type: ignore[arg-type]
+        NoSessionActions(),
+        lambda _campaign_id: (_ for _ in ()).throw(
+            AssertionError("adapter resolution occurred after broker denial")
+        ),
+        {},
+    )
+    broker = ToolBroker((ReviewedTargetInjectTool(engine),), confirmer=deny)
+    result = await broker.invoke(
+        "target_inject",
+        _context("campaign/broker-denied-injection"),
+        {"content": "must not execute"},
+    )
+
+    assert result.is_error is True
+    assert "denied" in result.content.casefold()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_injection_cleanup_is_exactly_once(tmp_path: Path) -> None:
+    adapter = _inject_adapter()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        step = request.url.path.rsplit("/", 1)[-1]
+        calls.append(step)
+        if step == "start":
+            return httpx.Response(200, json={"sessionId": "ambiguous-inject-session"})
+        if step == "plant":
+            raise httpx.ReadError("response lost after injection may have applied", request=request)
+        if step == "abandon":
+            return httpx.Response(200, json={"closed": True})
+        raise AssertionError(f"unexpected target step {step}")
+
+    campaign_id = "campaign/ambiguous-injection-cleanup"
+    assignment_id = f"{campaign_id}/injection"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                engine = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                result = await ReviewedTargetInjectTool(engine).invoke(
+                    _sealed_context(campaign_id, adapter),
+                    {"content": "possibly applied"},
+                )
+                await engine.cleanup_assignment(assignment_id)
+                await engine.cleanup_assignment(assignment_id)
+
+    assert result.is_error is True
+    assert calls == ["start", "plant", "abandon"]
+
+
+@pytest.mark.asyncio
+async def test_injection_cleanup_quarantines_after_adapter_rotation(tmp_path: Path) -> None:
+    original = _inject_adapter()
+    current = {"adapter": original}
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        step = request.url.path.rsplit("/", 1)[-1]
+        calls.append(step)
+        if step == "start":
+            return httpx.Response(200, json={"sessionId": "rotated-inject-session"})
+        if step == "plant":
+            return httpx.Response(200, json={"commentId": "rotated-comment"})
+        return httpx.Response(200, json={"closed": True})
+
+    campaign_id = "campaign/injection-cleanup-adapter-rotation"
+    assignment_id = f"{campaign_id}/injection"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                engine = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: current["adapter"],
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                result = await ReviewedTargetInjectTool(engine).invoke(
+                    _sealed_context(campaign_id, original),
+                    {"content": "planted before rotation"},
+                )
+                rotated = json.loads(json.dumps(original))
+                rotated["api_steps"] = rotated["api_steps"][:-1]
+                current["adapter"] = rotated
+                with pytest.raises(
+                    RuntimeError,
+                    match="created with a different reviewed adapter",
+                ):
+                    await engine.cleanup_assignment(assignment_id)
+            state = sessions.load(
+                campaign_id,
+                target_id="target-refund",
+                session_scope_id=assignment_id,
+            )
+
+    assert result.is_error is False
+    assert calls == ["start", "plant"]
+    assert state is not None and state.state == "ambiguous"
+    assert state.remote_session_id == "rotated-inject-session"

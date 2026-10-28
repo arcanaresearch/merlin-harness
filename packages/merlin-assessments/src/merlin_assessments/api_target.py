@@ -328,6 +328,8 @@ class _ApiAdapter:
     cleanup_lifecycle: str
     fresh_setup_response: _FreshSetupResponsePredicate | None
     session_expired_signal: _SessionExpiredSignal | None = None
+    injection_step_id: str | None = None
+    injection_content_pointer: str | None = None
     request_constraints: tuple[RequestConstraint, ...] = ()
     state_capabilities: StateCapabilities | None = None
 
@@ -420,7 +422,13 @@ class ReviewedApiTargetTool:
             target_delivery_from_reviewed_adapter=True,
         )
 
-    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+    async def invoke(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        *,
+        _injection_authorized: bool = False,
+    ) -> ToolResult:
         text = arguments.get("input")
         if not isinstance(text, str) or not text.strip():
             return ToolResult(content="input must be a non-empty string", is_error=True)
@@ -467,6 +475,37 @@ class ReviewedApiTargetTool:
                     metadata={"infrastructure_failure_category": "configuration"},
                 )
             )
+        if (
+            requested_step_id is not None
+            and requested_step_id == adapter.injection_step_id
+            and not _injection_authorized
+        ):
+            return resolved(
+                ToolResult(
+                    content=(
+                        f"reviewed adapter step {requested_step_id!r} is reserved for the "
+                        "reviewed content injection surface"
+                    ),
+                    is_error=True,
+                    metadata={"infrastructure_failure_category": "configuration"},
+                )
+            )
+        if requested_step_id is None and not _injection_authorized and not any(
+            step.interaction and step.id != adapter.injection_step_id for step in adapter.steps
+        ):
+            return resolved(
+                ToolResult(
+                    content="reviewed adapter has no ordinary target_request interaction",
+                    is_error=True,
+                    metadata={
+                        "failure_code": "target_request_unavailable",
+                        "infrastructure_failure_category": "configuration",
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                        "limit_interaction_count": 0,
+                    },
+                )
+            )
 
         legacy_failure = await self._reconcile_legacy_sessions(
             context.campaign_id,
@@ -481,7 +520,12 @@ class ReviewedApiTargetTool:
         )
         lock = self._locks.setdefault((context.campaign_id, lock_scope), asyncio.Lock())
         async with lock:
-            effect_digest = _terminal_effect_digest(adapter, text)
+            effect_digest = _terminal_effect_digest(
+                adapter,
+                text,
+                operation="target_inject" if _injection_authorized else "target_request",
+                selected_step_id=requested_step_id,
+            )
             state = await asyncio.to_thread(
                 self._sessions.load,
                 context.campaign_id,
@@ -1146,6 +1190,7 @@ class ReviewedApiTargetTool:
             adapter,
             variables,
             text,
+            selected_step_id=requested_step_id,
             durable_constraints=durable_constraints,
         )
         isolation_failure = None
@@ -1365,6 +1410,11 @@ class ReviewedApiTargetTool:
         for step in adapter.steps:
             if not step.interaction:
                 continue
+            if step.id == adapter.injection_step_id and selected_step is None:
+                # The reviewed content-planting surface executes only through the
+                # reviewed injection tool; an ordinary target exchange never
+                # writes attacker content into it implicitly.
+                continue
             if selected_step is not None and step.id != selected_step.id:
                 continue
             repeat_index = 0
@@ -1472,9 +1522,7 @@ class ReviewedApiTargetTool:
                 elif (
                     _has_reviewed_physical_identity(adapter)
                     and state.remote_session_id is None
-                    and not any(
-                        item.get("physical_state_claimed") is True for item in exchanges
-                    )
+                    and not any(item.get("physical_state_claimed") is True for item in exchanges)
                 ):
                     exchange["attempt_disposition"] = "contaminated"
                     exchange["retryable"] = True
@@ -1541,9 +1589,7 @@ class ReviewedApiTargetTool:
                     continue
                 observations = _mapping_list(exchange.get("state_observations"))
                 result_names = {
-                    str(item.get("name"))
-                    for item in observations
-                    if item.get("phase") == "result"
+                    str(item.get("name")) for item in observations if item.get("phase") == "result"
                 }
                 projected_results: list[dict[str, object]] = []
                 for observation in observations:
@@ -3259,6 +3305,12 @@ class ReviewedApiTargetTool:
         if not steps:
             raise ValueError("reviewed API adapter lifecycle is unavailable")
         fresh_setup_response = _fresh_setup_response_predicate(raw, executable.endpoint, steps)
+        injection = executable.content_injection
+        injection_step_id = None
+        if injection is not None:
+            if not any(step.id == injection.step_id and step.interaction for step in steps):
+                raise ValueError("reviewed API adapter content injection surface is unavailable")
+            injection_step_id = injection.step_id
         return _ApiAdapter(
             target_id=target_id,
             endpoint=executable.endpoint,
@@ -3275,8 +3327,121 @@ class ReviewedApiTargetTool:
             cleanup_lifecycle=executable.cleanup_lifecycle.value,
             fresh_setup_response=fresh_setup_response,
             session_expired_signal=_session_expired_signal(raw),
+            injection_step_id=injection_step_id,
+            injection_content_pointer=(
+                injection.content_pointer if injection is not None else None
+            ),
             request_constraints=executable.request_constraints,
             state_capabilities=executable.state_capabilities,
+        )
+
+    def reviewed_injection_surface(
+        self, campaign_id: str, target_id: str
+    ) -> tuple[str, str] | None:
+        """Resolve the reviewed adapter's declared content-planting step.
+
+        Returns ``None`` when the campaign's reviewed HTTP API adapter does not
+        declare a content injection surface. Raises ``ValueError`` when the
+        adapter itself is missing or not executable, mirroring ``_adapter``.
+        """
+        adapter = self._adapter(campaign_id, target_id)
+        if adapter.injection_step_id is None or adapter.injection_content_pointer is None:
+            return None
+        return adapter.injection_step_id, adapter.injection_content_pointer
+
+
+class ReviewedTargetInjectTool:
+    """Write attacker-provided content into the reviewed target's declared surface.
+
+    The reviewed HTTP API adapter declares the exact injection step and the
+    request-template slot that receives the content. This tool executes only
+    that reviewed write path and reuses the durable session, evidence, and
+    effect bookkeeping of :class:`ReviewedApiTargetTool`.
+    """
+
+    effect = "target_network"
+
+    def __init__(
+        self,
+        engine: ReviewedApiTargetTool,
+    ) -> None:
+        self._engine = engine
+
+    def describe(self) -> ToolSpec:
+        return ToolSpec(
+            name="target_inject",
+            description=(
+                "Write attacker-provided content into the campaign's reviewed target surface. "
+                "The reviewed HTTP API adapter declares the exact write step and content "
+                "location; Merlin owns session start, captured values, and final cleanup."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"content": {"type": "string", "minLength": 1}},
+                "required": ["content"],
+                "additionalProperties": False,
+            },
+            interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            target_delivery_from_reviewed_adapter=True,
+        )
+
+    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+        content = arguments.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return ToolResult(content="content must be a non-empty string", is_error=True)
+        if context.campaign_id is None or context.target_id is None:
+            return ToolResult(
+                content="target_inject requires campaign target context", is_error=True
+            )
+        if context.agent_id is None:
+            return ToolResult(
+                content="target_inject requires a stable assignment scope", is_error=True
+            )
+        try:
+            surface = self._engine.reviewed_injection_surface(
+                context.campaign_id,
+                context.target_id,
+            )
+        except ValueError as error:
+            return ToolResult(content=str(error), is_error=True)
+        if surface is None:
+            return ToolResult(
+                content="the reviewed target adapter declares no content injection surface",
+                is_error=True,
+                metadata={
+                    "failure_code": "content_injection_unavailable",
+                    "infrastructure_failure_category": "configuration",
+                },
+            )
+        injection_step_id, content_pointer = surface
+        result = await self._engine.invoke(
+            context,
+            {"input": content, "step_id": injection_step_id},
+            _injection_authorized=True,
+        )
+        metadata = dict(result.metadata)
+        exchanges = metadata.get("target_exchanges")
+        if isinstance(exchanges, list):
+            metadata["target_exchanges"] = [
+                dict(exchange)
+                | (
+                    {"content_injection_pointer": content_pointer}
+                    if isinstance(exchange, Mapping) and exchange.get("id") == injection_step_id
+                    else {}
+                )
+                for exchange in exchanges
+            ]
+        return result.model_copy(
+            update={
+                "metadata": metadata
+                | {
+                    "content_injection_step_id": injection_step_id,
+                    "content_injection_pointer": content_pointer,
+                    "injection_content_digest": (
+                        "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    ),
+                }
+            }
         )
 
 
@@ -3727,6 +3892,7 @@ def _preflight_interaction_constraints(
     variables: Mapping[str, object],
     input_text: str,
     *,
+    selected_step_id: str | None,
     durable_constraints: Sequence[Mapping[str, object]] = (),
 ) -> None:
     preflight_variables = dict(variables)
@@ -3735,6 +3901,10 @@ def _preflight_interaction_constraints(
             preflight_variables.setdefault(capture_name, "")
     for step in adapter.steps:
         if not step.interaction:
+            continue
+        if selected_step_id is not None and step.id != selected_step_id:
+            continue
+        if selected_step_id is None and step.id == adapter.injection_step_id:
             continue
         request = _render(step.request, preflight_variables, input_text)
         observations = _request_constraint_observations(adapter, step, request)
@@ -4173,11 +4343,18 @@ def _terminal_exchanges(variables: Mapping[str, object]) -> list[dict[str, objec
     return [dict(item) for item in value if isinstance(item, Mapping)]
 
 
-def _terminal_effect_digest(adapter: _ApiAdapter, input_text: str) -> str:
+def _terminal_effect_digest(
+    adapter: _ApiAdapter,
+    input_text: str,
+    *,
+    operation: str,
+    selected_step_id: str | None,
+) -> str:
     return _digest_json(
         {
             "compiled_adapter_digest": adapter.compiled_digest,
-            "interaction_steps": [step.id for step in adapter.steps if step.interaction],
+            "operation": operation,
+            "selected_step_id": selected_step_id,
             "input_digest": _digest_json(input_text),
         }
     )

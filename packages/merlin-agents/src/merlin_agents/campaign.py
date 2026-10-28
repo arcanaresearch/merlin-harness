@@ -1825,13 +1825,9 @@ def compile_objective_navigation_campaign(
         target_interface=manifest.target.interface,
         api_credential=manifest.target.credential_handle is not None,
     )
-    if not {"target_request", "target_chat", "browser_chat_exchange"}.intersection(
-        projected_tools
-    ):
+    if not {"target_request", "target_chat", "browser_chat_exchange"}.intersection(projected_tools):
         raise ValueError("objective navigation requires a projected target interaction tool")
-    objective_contract = tuple(
-        objective.model_dump(mode="json") for objective in objectives
-    )
+    objective_contract = tuple(objective.model_dump(mode="json") for objective in objectives)
     objective_digest = hashlib.sha256(
         json.dumps(objective_contract, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -1868,9 +1864,7 @@ def compile_objective_navigation_campaign(
                             "type": "object",
                             "properties": {
                                 "objective_id": {"type": "string"},
-                                "status": {
-                                    "enum": ["satisfied", "active", "blocked"]
-                                },
+                                "status": {"enum": ["satisfied", "active", "blocked"]},
                                 "evidence_refs": {
                                     "type": "array",
                                     "items": {"type": "string"},
@@ -3931,6 +3925,7 @@ _DECLARED_TOOL_EFFECTS: dict[str, str] = {
     "assessment_cancel": "workspace_write",
     "target_chat": "target_network",
     "target_request": "target_network",
+    "target_inject": "target_network",
     "browser_open_tab": "target_read",
     "browser_navigate": "target_read",
     "browser_snapshot": "target_read",
@@ -4020,8 +4015,12 @@ def grant_active(grant: CapabilityGrant) -> bool:
 
 
 def _target_scope_admits(name: str, *, target_interface: str, api_credential: bool) -> bool:
-    if name not in {"target_chat", "target_request"}:
+    if name not in {"target_chat", "target_request", "target_inject"}:
         return True
+    if name == "target_inject":
+        # Content planting executes only through the reviewed HTTP API adapter's
+        # declared write surface; no other interface can attest the write target.
+        return target_interface == "http_api"
     if target_interface == "browser":
         # A browser-reviewed target has no API credential contract. Every specialist that
         # may interact with it must go through the recon-gated, serialized browser actor;
