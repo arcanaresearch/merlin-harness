@@ -63,6 +63,29 @@ from .lead_review import (
 from .review_batch import AsyncReviewMicrobatcher
 
 _IMAGE_INPUT_TRANSPORTS = frozenset({"openai_compatible", "openai_responses", "anthropic_messages"})
+_DEFAULT_MODEL_ONLY_PROVIDER_FIELDS = frozenset(
+    {
+        "context_window_tokens",
+        "input_cost_per_million",
+        "output_cost_per_million",
+        "cache_read_input_cost_per_million",
+    }
+)
+
+
+def _configured_route_vision(
+    provider: Mapping[str, object], model: str, *, default_model: str
+) -> bool | None:
+    """Return an exact operator override, preserving false separately from absence."""
+    configured = provider.get("model_capabilities", {})
+    if isinstance(configured, Mapping) and model in configured:
+        capabilities = configured[model]
+        if isinstance(capabilities, Sequence) and not isinstance(capabilities, str):
+            return "vision" in capabilities
+    legacy = provider.get("vision")
+    if model == default_model and isinstance(legacy, bool):
+        return legacy
+    return None
 
 
 def _route_vision_enabled(
@@ -83,16 +106,9 @@ def _route_vision_enabled(
     """
     if transport not in _IMAGE_INPUT_TRANSPORTS:
         return False
-    configured = provider.get("model_capabilities", {})
-    if isinstance(configured, Mapping):
-        capabilities = configured.get(model, ())
-        if isinstance(capabilities, Sequence) and not isinstance(capabilities, str):
-            if "vision" in capabilities:
-                return True
-    # Backward compatibility for old configs: the fleet-wide flag described
-    # only the then-default model and must never leak to another routed model.
-    if model == default_model and provider.get("vision") is True:
-        return True
+    configured_vision = _configured_route_vision(provider, model, default_model=default_model)
+    if configured_vision is not None:
+        return configured_vision
     resolve = getattr(capability_registry, "resolve_model", None)
     if not callable(resolve):
         return False
@@ -119,26 +135,108 @@ def _capability_values_for_route(
 ) -> dict[str, object]:
     """Project model capabilities onto one transport-aware route identity."""
     values = dict(provider)
+    if model != default_model:
+        for field in _DEFAULT_MODEL_ONLY_PROVIDER_FIELDS:
+            values.pop(field, None)
     configured = provider.get("model_capabilities", {})
     capabilities: list[str] = []
-    if isinstance(configured, Mapping):
-        exact = configured.get(model, ())
+    exact_configured = isinstance(configured, Mapping) and model in configured
+    if exact_configured:
+        exact = configured[model]
         if isinstance(exact, Sequence) and not isinstance(exact, str):
             capabilities = list(dict.fromkeys(str(capability) for capability in exact))
-    vision = _route_vision_enabled(
-        provider,
-        model,
-        transport,
-        default_model=default_model,
-    )
-    if not vision:
+        else:
+            exact_configured = False
+    vision = _configured_route_vision(provider, model, default_model=default_model)
+    if vision is not None and transport not in _IMAGE_INPUT_TRANSPORTS:
+        vision = False
+    if vision is False:
         capabilities = [capability for capability in capabilities if capability != "vision"]
-    if capabilities:
+    if exact_configured:
         values["model_capabilities"] = {model: capabilities}
     else:
         values.pop("model_capabilities", None)
-    values["vision"] = vision
+    if vision is None:
+        values.pop("vision", None)
+    else:
+        values["vision"] = vision
     return values
+
+
+def _resolved_route_provider_metadata(
+    capability_registry: object,
+    model: str,
+    transport: str,
+    endpoint: str,
+    *,
+    operator_pricing: tuple[float, float] | None = None,
+    operator_cache_read_pricing: float | None = None,
+) -> dict[str, int | float | None]:
+    """Resolve exact non-default context and pricing without fleet inheritance."""
+
+    def known_value(field: object) -> object | None:
+        provenance = getattr(field, "provenance", None)
+        if bool(getattr(provenance, "assumed", True)):
+            return None
+        return getattr(field, "value", None)
+
+    resolved = None
+    resolve = getattr(capability_registry, "resolve_model", None)
+    if callable(resolve):
+        try:
+            resolved = resolve(model, transport=transport, endpoint=endpoint)
+        except Exception:  # optional metadata must never block provider startup
+            resolved = None
+
+    context = known_value(getattr(resolved, "context_window_tokens", None))
+    context_window_tokens = (
+        int(context)
+        if isinstance(context, (int, float)) and not isinstance(context, bool) and context >= 1_024
+        else None
+    )
+
+    if operator_pricing is not None:
+        input_cost, output_cost = operator_pricing
+        cache_read_cost = operator_cache_read_pricing
+    else:
+        rate_fields = (
+            "input_price_per_token_usd",
+            "output_price_per_token_usd",
+            "cache_read_input_price_per_token_usd",
+        )
+        rates = [known_value(getattr(resolved, field, None)) for field in rate_fields]
+        input_cost, output_cost, cache_read_cost = (
+            float(rate) * 1_000_000
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate >= 0
+            else None
+            for rate in rates
+        )
+
+    return {
+        "context_window_tokens": context_window_tokens,
+        "input_cost_per_million": input_cost,
+        "output_cost_per_million": output_cost,
+        "cache_read_input_cost_per_million": cache_read_cost,
+    }
+
+
+def _route_cache_read_pricing_entries(
+    candidates: set[str],
+    operator_pricing: Mapping[str, tuple[float, float]],
+    operator_cache_read_pricing: Mapping[str, float | None],
+    catalogue_pricing: Callable[[str], tuple[float | None, float | None, float | None]],
+) -> tuple[tuple[str, float | None], ...]:
+    """Resolve cache pricing without overriding an operator's unknown-rate choice."""
+    operator_priced = set(operator_pricing)
+    rates: dict[str, float | None] = {}
+    for candidate in sorted(candidates):
+        if not candidate or candidate in operator_priced:
+            continue
+        catalogue_rate = catalogue_pricing(candidate)[2]
+        if catalogue_rate is not None:
+            rates[candidate] = catalogue_rate * 1_000_000
+    rates.update(operator_cache_read_pricing)
+    return tuple(sorted(rates.items()))
 
 
 # Advertised languages describe expected behavior; they are not a security-test
@@ -4465,6 +4563,10 @@ def build_backend(
         for role_model in config.provider_role_models.values():
             if role_model != model:
                 configured_route_transports.setdefault(role_model, "openai_compatible")
+        for escalation_models in config.provider_escalation_models.values():
+            for escalation_model in escalation_models:
+                if escalation_model != model:
+                    configured_route_transports.setdefault(escalation_model, "openai_compatible")
         capability_snapshot = ModelCapabilityRegistry.snapshot_path(ConfigPaths.default().directory)
         capability_overrides = overrides_from_provider_config(
             {
@@ -4567,6 +4669,19 @@ def build_backend(
                     if endpoint_override is not None
                     else base_url
                 )
+                if routed_model != model:
+                    shared.update(
+                        _resolved_route_provider_metadata(
+                            capability_registry,
+                            routed_model,
+                            transport,
+                            route_endpoint,
+                            operator_pricing=config.provider_model_pricing.get(routed_model),
+                            operator_cache_read_pricing=(
+                                config.provider_model_cache_read_pricing.get(routed_model)
+                            ),
+                        )
+                    )
                 shared["vision"] = _route_vision_enabled(
                     provider_values,
                     routed_model,
@@ -4644,6 +4759,19 @@ def build_backend(
                     if endpoint_override is not None
                     else base_url
                 )
+                if routed_model != model:
+                    shared.update(
+                        _resolved_route_provider_metadata(
+                            capability_registry,
+                            routed_model,
+                            transport,
+                            route_endpoint,
+                            operator_pricing=config.provider_model_pricing.get(routed_model),
+                            operator_cache_read_pricing=(
+                                config.provider_model_cache_read_pricing.get(routed_model)
+                            ),
+                        )
+                    )
                 shared["vision"] = _route_vision_enabled(
                     provider_values,
                     routed_model,
@@ -5331,7 +5459,7 @@ def build_backend(
             rates = config.provider_model_pricing.get(selected_model)
             if rates is not None:
                 return max(rates) / 1_000_000
-            if default_cost_rate is not None:
+            if selected_model == model and default_cost_rate is not None:
                 return default_cost_rate
             input_rate, output_rate, _cache_read_rate = catalogue_pricing_for_model(selected_model)
             known = [rate for rate in (input_rate, output_rate) if rate is not None]
@@ -5417,17 +5545,12 @@ def build_backend(
                     for route in routes
                 ),
             }
-            rates: dict[str, float] = {}
-            for candidate in sorted(candidates):
-                if not candidate:
-                    continue
-                catalogue_rate = catalogue_pricing_for_model(candidate)[2]
-                if catalogue_rate is not None:
-                    rates[candidate] = catalogue_rate * 1_000_000
-            for routed_model, rate in config.provider_model_cache_read_pricing.items():
-                if rate is not None:
-                    rates[routed_model] = rate
-            return tuple(sorted(rates.items()))
+            return _route_cache_read_pricing_entries(
+                candidates,
+                config.provider_model_pricing,
+                config.provider_model_cache_read_pricing,
+                catalogue_pricing_for_model,
+            )
 
         def estimate_usage_cost_usd(
             selected_model: str, usage: Mapping[str, object]

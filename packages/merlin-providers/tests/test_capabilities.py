@@ -198,7 +198,7 @@ def test_overrides_from_provider_config_consumes_existing_surfaces() -> None:
         "base_url": "https://api.example/v1",
         "context_window_tokens": 65_536,
         "vision": True,
-        "model_capabilities": {"acme-1": ["tools", "reasoning", "prompt_cache"]},
+        "model_capabilities": {"acme-1": ["tools", "reasoning", "prompt_cache", "vision"]},
         "model_pricing": {
             "acme-1": {"input_cost_per_million": 1.0, "output_cost_per_million": 2.0}
         },
@@ -219,6 +219,41 @@ def test_overrides_from_provider_config_consumes_existing_surfaces() -> None:
         "output_price_per_token_usd": 2.0 / 1_000_000,
     }
     assert overrides_from_provider_config({}) == ()
+
+
+def test_exact_empty_and_legacy_false_override_catalog_vision() -> None:
+    route = RouteIdentity(
+        transport="openai_compatible",
+        endpoint="https://api.example/v1",
+        model="catalog-vision",
+    )
+    exact = overrides_from_provider_config(
+        {
+            "model": route.model,
+            "base_url": route.endpoint,
+            "vision": True,
+            "model_capabilities": {route.model: []},
+        }
+    )
+    legacy_false = overrides_from_provider_config(
+        {
+            "model": route.model,
+            "base_url": route.endpoint,
+            "vision": False,
+        }
+    )
+
+    assert exact[0].values["modalities"] == ("text",)
+    assert legacy_false[0].values["modalities"] == ("text",)
+    for overrides in (exact, legacy_false):
+        resolved = ModelCapabilityRegistry(
+            overrides=overrides,
+            builtin_catalog={route.model: {"modalities": ("text", "image")}},
+        ).resolve(route)
+        assert resolved.modalities.value == ("text",)
+        assert resolved.modalities.provenance.tier is SourceTier.OPERATOR_OVERRIDE
+
+    assert overrides_from_provider_config({"model": route.model, "base_url": route.endpoint}) == ()
 
 
 def test_snapshot_round_trips_known_routes(tmp_path: Path) -> None:
@@ -246,35 +281,73 @@ def test_secondary_catalogue_absence_is_not_evidence_of_nonsupport() -> None:
 
 
 def test_snapshot_load_round_trip_restores_known_routes_offline(tmp_path: Path) -> None:
-    override = OperatorOverride(route=ROUTE, values={"context_window_tokens": 32_768})
-    path = ModelCapabilityRegistry.snapshot_path(tmp_path)
-    _registry(overrides=[override]).save_snapshot(path)
+    class Catalogue:
+        def lookup(self, route: RouteIdentity) -> CapabilityClaim | None:
+            if route != ROUTE:
+                return None
+            return CapabilityClaim(
+                tier=SourceTier.SECONDARY_CATALOGUE,
+                source="catalogue",
+                values={"context_window_tokens": 32_768},
+                retrieved_at="2026-09-04T00:00:00+00:00",
+                raw_model_id=route.model,
+            )
 
-    # Offline startup: no overrides, only the last-good snapshot as evidence.
+    path = ModelCapabilityRegistry.snapshot_path(tmp_path)
+    _registry(
+        overrides=[OperatorOverride(route=ROUTE, values={"supports_tools": True})],
+        catalogue_hooks=[Catalogue()],
+    ).save_snapshot(path)
+
+    # Offline startup restores catalogue evidence, never stale operator authority.
     offline = _registry(snapshot_claims=load_snapshot_claims(path))
     capabilities = offline.resolve(ROUTE)
     assert capabilities.context_window_tokens.value == 32_768
-    assert capabilities.context_window_tokens.provenance.tier == SourceTier.OPERATOR_OVERRIDE
+    assert capabilities.context_window_tokens.provenance.tier == SourceTier.SECONDARY_CATALOGUE
     # Tier-7 assumptions were never cached: unevidenced fields stay labelled.
+    assert capabilities.supports_tools.provenance.assumed
     assert capabilities.supports_reasoning.provenance.assumed
 
 
 def test_snapshot_round_trip_is_the_startup_path(tmp_path: Path) -> None:
-    # The bootstrap flow: overrides from config + last-good snapshot, then a
-    # refreshed snapshot is saved for the next offline start.
+    # The bootstrap flow reloads provider/catalogue facts, but operator
+    # authority always comes from current configuration.
     path = ModelCapabilityRegistry.snapshot_path(tmp_path)
     override = OperatorOverride(route=ROUTE, values={"context_window_tokens": 32_768})
     _registry(overrides=[override]).save_snapshot(path)
 
+    snapshot_claims = load_last_good_snapshot(path)
     registry = ModelCapabilityRegistry(
         overrides=(),
-        snapshot_claims=load_last_good_snapshot(path),
+        snapshot_claims=snapshot_claims,
         now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
     )
-    assert registry.resolve(ROUTE).context_window_tokens.value == 32_768
+    assert registry.resolve(ROUTE).context_window_tokens.provenance.assumed
     registry.add_override(override)
+    assert registry.resolve(ROUTE).context_window_tokens.value == 32_768
     registry.save_snapshot(path)
-    assert load_last_good_snapshot(path)[ROUTE]
+    assert load_last_good_snapshot(path) == {}
+
+
+def test_snapshot_does_not_resurrect_removed_exact_vision_denial(tmp_path: Path) -> None:
+    route = RouteIdentity(
+        transport="openai_compatible",
+        endpoint="https://api.example/v1",
+        model="catalog-vision",
+    )
+    path = ModelCapabilityRegistry.snapshot_path(tmp_path)
+    ModelCapabilityRegistry(
+        overrides=[OperatorOverride(route=route, values={"modalities": ("text",)})],
+        builtin_catalog={route.model: {"modalities": ("text", "image")}},
+    ).save_snapshot(path)
+
+    restarted = ModelCapabilityRegistry(
+        snapshot_claims=load_last_good_snapshot(path),
+        builtin_catalog={route.model: {"modalities": ("text", "image")}},
+    ).resolve(route)
+
+    assert restarted.modalities.value == ("text", "image")
+    assert restarted.modalities.provenance.tier is SourceTier.BUILTIN_REGISTRY
 
 
 def test_load_last_good_snapshot_tolerates_missing_and_corrupt_cache(tmp_path: Path) -> None:
@@ -800,6 +873,54 @@ def test_models_dev_builtin_registry_still_wins(tmp_path: Path) -> None:
     assert resolved.context_window_tokens.provenance.tier is SourceTier.BUILTIN_REGISTRY
     assert resolved.supports_reasoning.value is True
     assert resolved.supports_reasoning.provenance.tier is SourceTier.BUILTIN_REGISTRY
+
+
+def test_deepseek_flash_builtin_and_models_dev_agree_on_image_input(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _models_dev_payload()
+        models = payload["deepseek"]["models"]  # type: ignore[index]
+        models["deepseek-v4-flash"] = {  # type: ignore[index]
+            "id": "deepseek-v4-flash",
+            "modalities": {"input": ["text", "image"], "output": ["text"]},
+        }
+        models["deepseek-v4-pro"] = {  # type: ignore[index]
+            "id": "deepseek-v4-pro",
+            "modalities": {"input": ["text"], "output": ["text"]},
+        }
+        return httpx.Response(200, json=payload)
+
+    registry = _registry(catalogue_hooks=[_models_dev_hook(handler, tmp_path=tmp_path)])
+
+    flash = registry.resolve(
+        RouteIdentity(
+            transport="openai_compatible",
+            endpoint="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash",
+        )
+    ).modalities
+    pro = registry.resolve(
+        RouteIdentity(
+            transport="openai_compatible",
+            endpoint="https://api.deepseek.com/v1",
+            model="deepseek-v4-pro",
+        )
+    ).modalities
+    legacy_vision = registry.resolve(
+        RouteIdentity(
+            transport="openai_compatible",
+            endpoint="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash-vision-exp",
+        )
+    ).modalities
+
+    assert flash.value == ("text", "image")
+    assert flash.provenance.tier is SourceTier.BUILTIN_REGISTRY
+    assert flash.provenance.corroborating_sources == ("models.dev",)
+    assert pro.value == ("text",)
+    assert pro.provenance.tier is SourceTier.BUILTIN_REGISTRY
+    assert pro.provenance.corroborating_sources == ("models.dev",)
+    assert legacy_vision.value == ("text", "image")
+    assert legacy_vision.provenance.tier is SourceTier.BUILTIN_REGISTRY
 
 
 def test_models_dev_unknown_host_never_fetches(tmp_path: Path) -> None:

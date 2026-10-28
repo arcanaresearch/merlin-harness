@@ -54,27 +54,26 @@ def _set_model_vision(
     if not model:
         return
     capabilities = _model_capabilities(provider)
+    if preserve_existing and model in capabilities:
+        provider["model_capabilities"] = capabilities
+        return
     current = capabilities.get(model, [])
     if enabled:
         if "vision" not in current:
             current.append("vision")
-    elif not (preserve_existing and "vision" in current):
+    else:
         current = [capability for capability in current if capability != "vision"]
-    if current:
-        capabilities[model] = current
-    else:
-        capabilities.pop(model, None)
-    if capabilities:
-        provider["model_capabilities"] = capabilities
-    else:
-        provider.pop("model_capabilities", None)
+    # Presence is authoritative: an empty list is an explicit per-model
+    # denial, while an absent key leaves capability discovery to the registry.
+    capabilities[model] = current
+    provider["model_capabilities"] = capabilities
 
 
 def _migrate_legacy_vision(provider: dict[str, object], model: str) -> None:
     """Scope the legacy fleet-wide flag to the model it originally described."""
     legacy = provider.pop("vision", None)
-    if legacy is True:
-        _set_model_vision(provider, model, True)
+    if isinstance(legacy, bool):
+        _set_model_vision(provider, model, legacy)
 
 
 def _is_local_base_url(base_url: str) -> bool:

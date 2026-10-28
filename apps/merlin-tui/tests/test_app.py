@@ -2749,6 +2749,60 @@ async def test_setup_discovers_current_models_and_applies_reported_capabilities(
 
 
 @pytest.mark.asyncio
+async def test_unchecked_setup_vision_persists_exact_model_denial(tmp_path) -> None:
+    from merlin_config import ConfigPaths, load_config
+    from merlin_tui.configuration import ProviderConfiguration
+
+    paths = ConfigPaths(tmp_path / "merlin")
+
+    class PersistingBackend(DemoBackend):
+        async def configure_provider(
+            self,
+            base_url,
+            model,
+            api_key,
+            vision=False,
+            context_window_tokens=None,
+            effort="default",
+        ):  # noqa: ANN001, ANN202
+            ProviderConfiguration(paths).save(
+                base_url,
+                model,
+                api_key,
+                vision=vision,
+                context_window_tokens=context_window_tokens,
+                effort=effort,
+            )
+            return "provider saved"
+
+        async def apply_saved_model_routing(self):  # noqa: ANN202
+            return "daemon reconnected"
+
+    app = build_app(PersistingBackend())
+    async with app.run_test() as pilot:
+        app.push_screen(
+            SetupScreen(
+                "openai",
+                base_url="https://example.test/v1",
+                model="catalog-vision-model",
+            ),
+            app._save_provider,  # noqa: SLF001
+        )
+        await pilot.pause()
+        app.screen.query_one("#setup-api-key", Input).value = "opaque-secret"
+        assert app.screen.query_one("#setup-vision", Checkbox).value is False
+        app.screen.query_one("#save", Button).press()
+        for _ in range(20):
+            await pilot.pause(0.1)
+            if paths.config.exists():
+                break
+
+    config = load_config(paths, environ={})
+    assert config.values["provider"]["model_capabilities"] == {"catalog-vision-model": []}
+    assert config.provider_model_capabilities == {"catalog-vision-model": ()}
+
+
+@pytest.mark.asyncio
 async def test_model_routing_screen_keeps_exact_discovered_vision(monkeypatch) -> None:
     from merlin_config import Config
     from merlin_tui.provider_catalog import ModelCandidate, ModelDiscovery

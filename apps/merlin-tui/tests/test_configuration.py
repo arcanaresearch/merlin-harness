@@ -124,9 +124,62 @@ def test_model_routing_persists_exact_discovered_vision_without_cross_model_leak
 
     reloaded = load_config(paths, environ={})
     provider = reloaded.values["provider"]
-    assert provider["model_capabilities"] == {"vision-recon": ["vision"]}
-    assert reloaded.provider_model_capabilities == {"vision-recon": ("vision",)}
+    assert provider["model_capabilities"] == {
+        "text-worker": [],
+        "vision-recon": ["vision"],
+    }
+    assert reloaded.provider_model_capabilities == {
+        "text-worker": (),
+        "vision-recon": ("vision",),
+    }
     assert "vision" not in provider
+
+
+def test_provider_configuration_round_trips_exact_vision_denial_per_model(
+    tmp_path: Path,
+) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save("https://example.test/v1", "denied-model", "secret", vision=False)
+    configuration.save("https://example.test/v1", "allowed-model", vision=True)
+
+    reloaded = load_config(paths, environ={})
+
+    assert reloaded.values["provider"]["model_capabilities"] == {
+        "allowed-model": ["vision"],
+        "denied-model": [],
+    }
+    assert reloaded.provider_model_capabilities == {
+        "allowed-model": ("vision",),
+        "denied-model": (),
+    }
+
+
+def test_discovery_and_legacy_migration_preserve_exact_vision_denial(tmp_path: Path) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save("https://example.test/v1", "denied-model", "secret", vision=False)
+    configuration.save_model_routing(
+        "denied-model",
+        "openai_compatible",
+        heterogeneous=False,
+        model_vision={"denied-model": True},
+    )
+    assert load_config(paths, environ={}).provider_model_capabilities == {"denied-model": ()}
+
+    legacy_paths = ConfigPaths(tmp_path / "legacy")
+    legacy_paths.directory.mkdir(parents=True)
+    legacy_paths.directory.chmod(0o700)
+    legacy_paths.config.write_text(
+        "[provider]\nbase_url='https://example.test/v1'\nmodel='legacy-model'\nvision=false\n",
+        encoding="utf-8",
+    )
+    legacy_paths.config.chmod(0o600)
+    ProviderConfiguration(legacy_paths).save_model("new-model")
+
+    legacy = load_config(legacy_paths, environ={})
+    assert legacy.values["provider"]["model_capabilities"] == {"legacy-model": []}
+    assert "vision" not in legacy.values["provider"]
 
 
 def test_model_routing_preserves_explicit_capabilities_and_unknown_stays_unknown(

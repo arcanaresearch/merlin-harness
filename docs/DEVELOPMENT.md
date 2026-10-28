@@ -83,12 +83,19 @@ routine = ["stronger-model", "strongest-model"]
 [provider.model_capabilities]
 vision-tool-model = ["vision", "tools"]
 economical-tool-model = ["tools"]
+# An empty exact entry explicitly denies image input for this model.
+catalog-vision-model = []
 
 [provider.model_pricing.high-reliability-model]
 input_cost_per_million = 3.0
 output_cost_per_million = 12.0
 
 ```
+
+For `model_capabilities`, presence is authoritative. An exact entry containing `vision` enables
+image input, while an exact entry without `vision` (including `[]`) disables it. Omit the model key
+to let reviewed provider/catalog metadata determine image capability. The Provider Setup checkbox
+persists the checked or unchecked choice as an exact per-model override.
 
 Per-model pricing overrides the provider-wide pricing used by homogeneous configurations. A
 cost-capped route without either price fails closed. Before reconnaissance, route preflight checks

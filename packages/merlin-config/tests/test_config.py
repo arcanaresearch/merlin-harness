@@ -503,6 +503,20 @@ def test_provider_model_capabilities_are_validated(tmp_path: Path) -> None:
         load_config(paths, {})
 
 
+def test_provider_model_capabilities_preserve_explicit_empty_override(tmp_path: Path) -> None:
+    paths = ConfigPaths(tmp_path)
+    paths.config.write_text(
+        "[provider.model_capabilities]\ntext_only=[]\n",
+        encoding="utf-8",
+    )
+    paths.config.chmod(0o600)
+
+    config = load_config(paths, {})
+
+    assert config.values["provider"]["model_capabilities"] == {"text_only": []}
+    assert config.provider_model_capabilities == {"text_only": ()}
+
+
 def test_provider_output_token_parameter_is_explicit_and_validated(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path)
     paths.config.write_text(

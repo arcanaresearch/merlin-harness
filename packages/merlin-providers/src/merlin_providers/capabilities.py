@@ -737,9 +737,10 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
         "supports_structured_output": True,
         "modalities": ("text", "image"),
     },
-    # DeepSeek V4 limits reconciled with models.dev on 2026-10-13. The official
-    # endpoint's /models response exposes ids only, so models.dev remains the
-    # live corroborating source for output limits.
+    # DeepSeek V4 limits and modalities reconciled with models.dev and the
+    # official API documentation on 2026-10-29. V4 Flash is now served by the
+    # multimodal V4.1 Flash route; Pro remains text-only, while the legacy
+    # Vision-Exp alias continues to accept images.
     "deepseek-v4-pro": {
         "context_window_tokens": 1_048_576,
         "max_output_tokens": 393_216,
@@ -768,7 +769,7 @@ BUILTIN_CATALOG: Mapping[str, Mapping[str, object]] = {
         "supports_streaming": True,
         "supports_prompt_cache": True,
         "supports_structured_output": True,
-        "modalities": ("text",),
+        "modalities": ("text", "image"),
     },
     "deepseek-v4": {
         "context_window_tokens": 1_048_576,
@@ -848,17 +849,19 @@ def overrides_from_provider_config(
     if isinstance(context, (int, float)) and not isinstance(context, bool):
         values["context_window_tokens"] = int(context)
     capabilities = provider.get("model_capabilities", {})
-    if isinstance(capabilities, Mapping):
-        configured = capabilities.get(model)
+    exact_capabilities = False
+    if isinstance(capabilities, Mapping) and model in capabilities:
+        configured = capabilities[model]
         if isinstance(configured, list):
+            exact_capabilities = True
+            values["modalities"] = ("text", "image") if "vision" in configured else ("text",)
             for item in configured:
                 field_name = _CAPABILITY_ALIASES.get(str(item))
                 if field_name is not None:
                     values[field_name] = True
-                elif str(item) == "vision":
-                    values["modalities"] = ("text", "image")
-    if provider.get("vision"):
-        values["modalities"] = ("text", "image")
+    legacy_vision = provider.get("vision")
+    if not exact_capabilities and isinstance(legacy_vision, bool):
+        values["modalities"] = ("text", "image") if legacy_vision else ("text",)
     pricing = provider.get("model_pricing", {})
     if isinstance(pricing, Mapping):
         rates = pricing.get(model)
@@ -1167,6 +1170,9 @@ class ModelCapabilityRegistry:
 def load_snapshot_claims(path: Path) -> dict[RouteIdentity, list[CapabilityClaim]]:
     """Parse a saved snapshot into per-route claims at their recorded tiers.
 
+    Tier-1 operator overrides are never reloaded: current configuration is the
+    only source of operator authority, so removing an override must take effect
+    after restart. Cached provider/catalogue evidence remains available.
     Tier-7 assumptions are never reloaded as evidence — they are recomputed on
     demand so an offline startup keeps labelling unknowns as assumptions.
     """
@@ -1189,7 +1195,10 @@ def load_snapshot_claims(path: Path) -> dict[RouteIdentity, list[CapabilityClaim
                     continue
                 provenance = entry.get("provenance", {})
                 tier = SourceTier(int(provenance["tier"]))
-                if tier is SourceTier.CONSERVATIVE_ASSUMPTION:
+                if tier in {
+                    SourceTier.OPERATOR_OVERRIDE,
+                    SourceTier.CONSERVATIVE_ASSUMPTION,
+                }:
                     continue
                 per_tier.setdefault(tier, {})[field_name] = entry.get("value")
                 retrieved_at = retrieved_at or provenance.get("retrieved_at")

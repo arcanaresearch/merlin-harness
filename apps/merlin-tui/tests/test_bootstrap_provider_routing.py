@@ -1,7 +1,25 @@
 from pathlib import Path
 
 import pytest
-from merlin_tui.bootstrap import _capability_values_for_route, _route_vision_enabled
+from merlin_tui.bootstrap import (
+    _capability_values_for_route,
+    _route_cache_read_pricing_entries,
+    _route_vision_enabled,
+)
+
+
+def test_operator_pricing_without_cache_suppresses_catalog_discount() -> None:
+    entries = _route_cache_read_pricing_entries(
+        {"operator-priced", "catalog-priced"},
+        {"operator-priced": (7.0, 8.0)},
+        {"operator-priced": None},
+        lambda _model: (1e-6, 2e-6, 0.25e-6),
+    )
+
+    assert dict(entries) == {
+        "catalog-priced": 0.25,
+        "operator-priced": None,
+    }
 
 
 def test_route_vision_is_exact_per_model_and_transport() -> None:
@@ -179,6 +197,92 @@ def test_route_vision_uses_exact_non_assumed_catalog_modalities() -> None:
     )
 
 
+def test_exact_vision_denial_beats_catalog_without_leaking_to_other_models() -> None:
+    from merlin_providers import ModelCapabilityRegistry
+
+    registry = ModelCapabilityRegistry(
+        builtin_catalog={
+            "catalog-denied": {"modalities": ("text", "image")},
+            "catalog-discovered": {"modalities": ("text", "image")},
+            "catalog-operator-enabled": {"modalities": ("text",)},
+        }
+    )
+    provider = {
+        "context_window_tokens": 65_536,
+        "input_cost_per_million": 9.0,
+        "output_cost_per_million": 12.0,
+        "model_capabilities": {
+            "catalog-denied": [],
+            "catalog-operator-enabled": ["vision"],
+        },
+    }
+
+    assert not _route_vision_enabled(
+        provider,
+        "catalog-denied",
+        "openai_compatible",
+        default_model="default",
+        capability_registry=registry,
+        endpoint="https://api.example/v1",
+    )
+    assert _route_vision_enabled(
+        provider,
+        "catalog-discovered",
+        "openai_compatible",
+        default_model="default",
+        capability_registry=registry,
+        endpoint="https://api.example/v1",
+    )
+    assert _route_vision_enabled(
+        provider,
+        "catalog-operator-enabled",
+        "openai_compatible",
+        default_model="default",
+        capability_registry=registry,
+        endpoint="https://api.example/v1",
+    )
+
+    denied = _capability_values_for_route(
+        provider,
+        "catalog-denied",
+        "openai_compatible",
+        default_model="default",
+    )
+    assert denied["model_capabilities"] == {"catalog-denied": []}
+    assert denied["vision"] is False
+    for default_only in (
+        "context_window_tokens",
+        "input_cost_per_million",
+        "output_cost_per_million",
+    ):
+        assert default_only not in denied
+
+    discovered = _capability_values_for_route(
+        provider,
+        "catalog-discovered",
+        "openai_compatible",
+        default_model="default",
+    )
+    assert "model_capabilities" not in discovered
+    assert "vision" not in discovered
+
+    legacy_false = _capability_values_for_route(
+        {"vision": False},
+        "catalog-discovered",
+        "openai_compatible",
+        default_model="catalog-discovered",
+    )
+    assert legacy_false["vision"] is False
+    assert not _route_vision_enabled(
+        legacy_false,
+        "catalog-discovered",
+        "openai_compatible",
+        default_model="catalog-discovered",
+        capability_registry=registry,
+        endpoint="https://api.example/v1",
+    )
+
+
 def test_route_vision_catalogue_never_overrides_transport_or_operator_authority() -> None:
     from merlin_providers import ModelCapabilityRegistry
 
@@ -296,12 +400,8 @@ async def test_build_backend_constructs_text_default_and_vision_recon_exactly(
             ),
         )
         monkeypatch.setattr(CredentialStore, "load", lambda _self: {"api_key": "secret"})
-        monkeypatch.setattr(
-            "merlin_providers.OpenAICompatibleProvider", CapturingOpenAIProvider
-        )
-        monkeypatch.setattr(
-            "merlin_providers.OpenAIResponsesProvider", CapturingResponsesProvider
-        )
+        monkeypatch.setattr("merlin_providers.OpenAICompatibleProvider", CapturingOpenAIProvider)
+        monkeypatch.setattr("merlin_providers.OpenAIResponsesProvider", CapturingResponsesProvider)
         monkeypatch.setattr(
             "merlin_providers.AnthropicMessagesProvider", CapturingAnthropicProvider
         )
@@ -330,20 +430,41 @@ async def test_build_backend_applies_catalog_modalities_to_concrete_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from merlin_config import Config, CredentialStore
-    from merlin_providers import CapabilityClaim, SourceTier
+    from merlin_providers import (
+        CapabilityClaim,
+        ProviderCapabilities,
+        RouteIdentity,
+        SourceTier,
+    )
     from merlin_storage_postgres import Database, DatabaseConfig
     from merlin_tui.bootstrap import build_backend
 
     class Catalog:
         def lookup(self, route):
+            metadata = {
+                "catalog-text": (65_536, ("text",), 20.0, 30.0, 10.0),
+                "catalog-denied": (131_072, ("text", "image"), 1.0, 2.0, 0.5),
+                "catalog-escalation-vision": (
+                    262_144,
+                    ("text", "image"),
+                    3.0,
+                    4.0,
+                    1.5,
+                ),
+                "catalog-escalation-text": (524_288, ("text",), 5.0, 6.0, 2.5),
+            }
+            if route.model not in metadata:
+                return None
+            context, modalities, input_cost, output_cost, cache_read_cost = metadata[route.model]
             return CapabilityClaim(
                 tier=SourceTier.SECONDARY_CATALOGUE,
                 source="models.dev",
                 values={
-                    "context_window_tokens": 131_072,
-                    "modalities": (
-                        ("text", "image") if route.model == "catalog-vision" else ("text",)
-                    ),
+                    "context_window_tokens": context,
+                    "modalities": modalities,
+                    "input_price_per_token_usd": input_cost / 1_000_000,
+                    "output_price_per_token_usd": output_cost / 1_000_000,
+                    "cache_read_input_price_per_token_usd": cache_read_cost / 1_000_000,
                 },
                 retrieved_at="2026-10-28T00:00:00+00:00",
                 raw_model_id=route.model,
@@ -351,15 +472,37 @@ async def test_build_backend_applies_catalog_modalities_to_concrete_provider(
 
     class CapturingOpenAIProvider:
         configs = []
+        instances = []
+        transport = "openai_compatible"
 
         def __init__(self, config) -> None:
             self.config = config
+            self.close_calls = 0
+            self.capabilities = ProviderCapabilities(
+                model=config.model,
+                vision=config.vision,
+                context_window_tokens=config.context_window_tokens,
+            )
+            self.route_identity = RouteIdentity(
+                transport=self.transport,
+                endpoint=config.base_url,
+                model=config.model,
+            )
             type(self).configs.append(config)
+            type(self).instances.append(self)
 
         async def close(self) -> None:
-            return None
+            self.close_calls += 1
+
+    class CapturingResponsesProvider(CapturingOpenAIProvider):
+        configs = []
+        instances = []
+        transport = "openai_responses"
 
     CapturingOpenAIProvider.configs = []
+    CapturingOpenAIProvider.instances = []
+    CapturingResponsesProvider.configs = []
+    CapturingResponsesProvider.instances = []
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
         monkeypatch.setattr(
             "merlin_config.load_config",
@@ -369,7 +512,29 @@ async def test_build_backend_applies_catalog_modalities_to_concrete_provider(
                     "provider": {
                         "base_url": "https://api.deepseek.com/v1",
                         "model": "catalog-text",
-                        "role_models": {"recon": "catalog-vision"},
+                        "context_window_tokens": 32_768,
+                        "input_cost_per_million": 9.0,
+                        "output_cost_per_million": 12.0,
+                        "cache_read_input_cost_per_million": 4.0,
+                        "role_models": {"recon": "catalog-denied"},
+                        "model_capabilities": {"catalog-denied": []},
+                        "model_pricing": {
+                            "catalog-escalation-vision": {
+                                "input_cost_per_million": 7.0,
+                                "output_cost_per_million": 8.0,
+                            }
+                        },
+                        "escalation_models": {
+                            "recon": [
+                                "catalog-denied",
+                                "catalog-escalation-vision",
+                                "catalog-escalation-text",
+                                "catalog-unknown",
+                            ]
+                        },
+                        "model_transports": {
+                            "catalog-escalation-vision": "openai_responses",
+                        },
                     }
                 },
             ),
@@ -380,13 +545,78 @@ async def test_build_backend_applies_catalog_modalities_to_concrete_provider(
             lambda **_kwargs: Catalog(),
         )
         monkeypatch.setattr("merlin_providers.OpenAICompatibleProvider", CapturingOpenAIProvider)
+        monkeypatch.setattr("merlin_providers.OpenAIResponsesProvider", CapturingResponsesProvider)
 
         backend = build_backend(tmp_path / "workspace")
         try:
-            by_model = {config.model: config.vision for config in CapturingOpenAIProvider.configs}
-            assert by_model == {
-                "catalog-text": False,
-                "catalog-vision": True,
+            by_model = {config.model: config for config in CapturingOpenAIProvider.configs}
+            assert set(by_model) == {
+                "catalog-text",
+                "catalog-denied",
+                "catalog-escalation-text",
+                "catalog-unknown",
             }
+            assert (
+                by_model["catalog-text"].vision,
+                by_model["catalog-text"].context_window_tokens,
+                by_model["catalog-text"].input_cost_per_million,
+                by_model["catalog-text"].output_cost_per_million,
+                by_model["catalog-text"].cache_read_input_cost_per_million,
+            ) == (False, 32_768, 9.0, 12.0, 4.0)
+            assert (
+                by_model["catalog-denied"].vision,
+                by_model["catalog-denied"].context_window_tokens,
+                by_model["catalog-denied"].input_cost_per_million,
+                by_model["catalog-denied"].output_cost_per_million,
+                by_model["catalog-denied"].cache_read_input_cost_per_million,
+            ) == (False, 131_072, 1.0, 2.0, 0.5)
+            assert (
+                by_model["catalog-escalation-text"].vision,
+                by_model["catalog-escalation-text"].context_window_tokens,
+                by_model["catalog-escalation-text"].input_cost_per_million,
+                by_model["catalog-escalation-text"].output_cost_per_million,
+                by_model["catalog-escalation-text"].cache_read_input_cost_per_million,
+            ) == (False, 524_288, 5.0, 6.0, 2.5)
+            assert (
+                by_model["catalog-unknown"].vision,
+                by_model["catalog-unknown"].context_window_tokens,
+                by_model["catalog-unknown"].input_cost_per_million,
+                by_model["catalog-unknown"].output_cost_per_million,
+                by_model["catalog-unknown"].cache_read_input_cost_per_million,
+            ) == (False, None, None, None, None)
+            (responses_config,) = CapturingResponsesProvider.configs
+            assert (
+                responses_config.model,
+                responses_config.vision,
+                responses_config.context_window_tokens,
+                responses_config.input_cost_per_million,
+                responses_config.output_cost_per_million,
+                responses_config.cache_read_input_cost_per_million,
+            ) == ("catalog-escalation-vision", True, 262_144, 7.0, 8.0, None)
+
+            routing = backend.kernel._provider  # noqa: SLF001
+            assert {
+                routed_model: (
+                    routing.capabilities_for_model(routed_model).vision,
+                    routing.capabilities_for_model(routed_model).context_window_tokens,
+                )
+                for routed_model in (
+                    "catalog-text",
+                    "catalog-denied",
+                    "catalog-escalation-vision",
+                    "catalog-escalation-text",
+                    "catalog-unknown",
+                )
+            } == {
+                "catalog-text": (False, 32_768),
+                "catalog-denied": (False, 131_072),
+                "catalog-escalation-vision": (True, 262_144),
+                "catalog-escalation-text": (False, 524_288),
+                "catalog-unknown": (False, None),
+            }
+            await backend.kernel._provider.close()  # noqa: SLF001
         finally:
             await backend.close()
+        instances = CapturingOpenAIProvider.instances + CapturingResponsesProvider.instances
+        assert len(instances) == 5
+        assert [provider.close_calls for provider in instances] == [1, 1, 1, 1, 1]

@@ -3603,6 +3603,74 @@ async def test_unavailable_visual_route_preserves_pending_visual_review(
     )
 
 
+async def test_exact_vision_denial_prevents_catalog_driven_visual_capture(tmp_path) -> None:
+    from merlin_providers import ModelRoutingProvider
+
+    image = tmp_path / "content.jpg"
+    image.write_bytes(b"visual recon evidence")
+    route = RouteIdentity(
+        transport="openai_compatible",
+        endpoint="https://api.example/v1",
+        model="model-1",
+    )
+    registry = ModelCapabilityRegistry(
+        overrides=[OperatorOverride(route=route, values={"modalities": ("text",)})],
+        builtin_catalog={"model-1": {"modalities": ("text", "image")}},
+    )
+    concrete = Provider(
+        [
+            [
+                ToolCall(call_id="snapshot-1", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ],
+            [TextDelta(text='{"finding":"pending"}'), ModelCompleted()],
+        ],
+        vision=False,
+    )
+    concrete.route_identity = route
+    provider = ModelRoutingProvider(concrete, {}, capability_registry=registry)
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Snapshot",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert context.visual_evidence_enabled is False
+            return ToolResult(
+                content="snapshot with retained visual evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "d" * 64,
+                            "attachment": {
+                                "media_type": "image/jpeg",
+                                "path": str(image),
+                                "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    result = await WorkerRuntime(provider, VisualTools()).run(handoff(tools=("browser_snapshot",)))
+
+    assert registry.resolve(route).modalities.value == ("text",)
+    assert provider.capabilities_for_model("model-1").vision is False
+    assert result.status == "completed"
+    assert not any(message.image_attachments for message in concrete.requests[1].messages)
+    assert any(
+        item["source"] == "runtime.visual_review" and "visual_review_pending" in item["reason"]
+        for item in result.evaluation_uncertainties
+    )
+
+
 def test_checkpoint_closes_unexecuted_calls_in_multi_tool_assistant_prefix() -> None:
     messages = [
         ChatMessage(

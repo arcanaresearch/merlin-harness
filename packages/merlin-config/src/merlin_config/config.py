@@ -973,14 +973,10 @@ def _validate(values: Mapping[str, object]) -> None:
         if not isinstance(model_capabilities, Mapping):
             raise TypeError("provider.model_capabilities must be a table")
         for model, capabilities in model_capabilities.items():
-            if (
-                not isinstance(capabilities, list)
-                or not capabilities
-                or any(not isinstance(item, str) or not item.strip() for item in capabilities)
+            if not isinstance(capabilities, list) or any(
+                not isinstance(item, str) or not item.strip() for item in capabilities
             ):
-                raise TypeError(
-                    f"provider.model_capabilities.{model} must be a non-empty string array"
-                )
+                raise TypeError(f"provider.model_capabilities.{model} must be a string array")
             if len(set(capabilities)) != len(capabilities):
                 raise ValueError(f"provider.model_capabilities.{model} must not contain duplicates")
         escalation_models = provider.get("escalation_models", {})
