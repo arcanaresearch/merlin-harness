@@ -162,22 +162,53 @@ def test_rust_injection_catalogue_is_bundled_and_reconciled() -> None:
     assert "language-variant:mixed" in language_variants["cat/direct/multilingual-pivot-zh-en"].tags
 
 
-def test_seven_canonical_rpk_assets_are_authenticated_and_routable() -> None:
+def test_eight_canonical_rpk_assets_are_authenticated_and_routable() -> None:
     packs = load_knowledge_packs()
     assert [pack.kind for pack in packs] == [
         "attack_catalogue",
         "benign_controls",
+        "compliance_controls",
         "emerging_techniques",
         "industry_profiles",
         "interaction_guidance",
         "pricing_schedules",
         "target_capability_guidance",
     ]
-    assert len(knowledge_catalogue()) == 7
+    assert len(knowledge_catalogue()) == 8
     selected = select_knowledge("recon browser chatbot financial payments")
     assert selected
     assert len(selected) <= 12
     assert any("browser" in entry.routing_terms for entry in selected)
+
+
+def test_compliance_controls_require_reviewed_bindings_and_independent_evidence() -> None:
+    selected = select_knowledge(
+        "test sales price discount binding contract confidentiality canary cross tenant privacy",
+        limit=12,
+    )
+    controls = {
+        item.entry_id: json.loads(item.content)
+        for item in selected
+        if item.pack_id == "com.merlin.compliance-controls"
+    }
+
+    assert set(controls) == {
+        "compliance.business.commitment-authority",
+        "compliance.business.price-authority",
+        "compliance.confidentiality.synthetic-canary",
+        "compliance.privacy.subject-isolation",
+    }
+    assert all(item["binding_required"] for item in controls.values())
+    assert all(item["benign_controls"] for item in controls.values())
+    assert all(item["evidence_requirements"] for item in controls.values())
+    assert all(item["inconclusive_when"] for item in controls.values())
+    assert all(item["absence_authority"] == "bounded_only" for item in controls.values())
+    assert controls["compliance.confidentiality.synthetic-canary"]["test_data_class"] == (
+        "synthetic_only"
+    )
+    assert controls["compliance.privacy.subject-isolation"]["test_data_class"] == (
+        "synthetic_only"
+    )
 
 
 def test_resource_exhaustion_frontier_is_explicit_and_safely_bounded() -> None:
@@ -242,7 +273,7 @@ def test_resource_exhaustion_frontier_is_explicit_and_safely_bounded() -> None:
 def test_builtin_knowledge_assets_are_encrypted_and_authenticated() -> None:
     root = Path(__file__).parents[1] / "src/merlin_packs/knowledge"
     encrypted_assets = sorted(root.glob("*.rpk.enc"))
-    assert len(encrypted_assets) == 7
+    assert len(encrypted_assets) == 8
     for encrypted in encrypted_assets:
         payload = encrypted.read_bytes()
         assert payload.startswith(b"MERLIN-RPK-AESGCM-V1\n")

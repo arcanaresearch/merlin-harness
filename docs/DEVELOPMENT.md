@@ -349,11 +349,11 @@ apply the customer-redaction policy; internal reports retain attributable eviden
   decision. English-only execution cannot close a reviewed multilingual frontier.
 - Multiple TUI/plain/NDJSON clients may attach to the same local daemon. The daemon owns the shared
   PostgreSQL control plane; clients do not each start an independent scheduler.
-- The encrypted seven-pack inventory is bundled and integrity/authenticity checked. Workers can
+- The encrypted eight-pack inventory is bundled and integrity/authenticity checked. Workers can
   discover the inventory but receive only the skill, tool, MCP, pack projections, and authority
   compiled for their specialist role.
 
 ## License
 
-First-party code and all seven bundled knowledge packs are licensed under
+First-party code and all eight bundled knowledge packs are licensed under
 [Apache-2.0](../LICENSE). See [licensing details](LICENSING.md) for third-party components.

@@ -37,7 +37,14 @@ accept operator guidance, and produce an evidence-linked report.
 
 > [!NOTE]
 > Merlin is under active development. Standalone releases currently target macOS 14 on
-> Apple silicon. First-party code and all seven bundled knowledge packs use Apache-2.0.
+> Apple silicon. First-party code and all eight bundled knowledge packs use Apache-2.0.
+
+Merlin includes adversarial policy-control guidance for commercial price authority, binding
+commitments, synthetic confidentiality canaries, and customer or tenant isolation. These controls
+require target-specific reviewed policy bindings, benign controls, and independent target-state or
+receipt evidence. They help test defined controls; they do not certify legal or regulatory
+compliance, and a bounded negative result must not be reported as organization-wide compliance.
+
 > Use Merlin only against targets you are authorized to assess.
 
 ## See Merlin investigate
@@ -472,7 +479,7 @@ Merlin is pre-release software. Issues, test targets, attack ideas, adapter cont
 reproducible evaluations are welcome. Claims about finding yield should include the target, model,
 scope, tools, budget, evidence standard, and comparison conditions.
 
-First-party code and all seven bundled knowledge packs are licensed under
+First-party code and all eight bundled knowledge packs are licensed under
 [Apache-2.0](LICENSE). Third-party components retain their own licenses; see
 [licensing details](docs/LICENSING.md) and the [dependency inventory](docs/THIRD-PARTY.md).
 For development setup and checks, see [Contributing](docs/CONTRIBUTING.md),

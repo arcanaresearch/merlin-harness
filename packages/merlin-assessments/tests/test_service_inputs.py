@@ -1097,7 +1097,7 @@ async def test_campaign_preserves_policy_inventory_and_matching_guidance() -> No
     document_ids = [item["id"] for item in inputs["documents"]]
     assert "pack:merlin-injection-taxonomy" in document_ids
     assert any(item.startswith("knowledge:com.merlin.") for item in document_ids)
-    assert len(inputs["knowledge_catalogue"]) == 7
+    assert len(inputs["knowledge_catalogue"]) == 8
     assert inputs["selected_knowledge"]
 
 

@@ -12,6 +12,7 @@ from ._bundle_crypto import decrypt_builtin_pack
 PACK_FILES = (
     "attack-catalogue.rpk",
     "benign-controls.rpk",
+    "compliance-controls.rpk",
     "emerging-techniques.rpk",
     "industry-profiles.rpk",
     "interaction-guidance.rpk",
@@ -57,7 +58,7 @@ class KnowledgePack:
 
 
 def load_knowledge_packs() -> tuple[KnowledgePack, ...]:
-    """Load and authenticate the seven canonical Rust knowledge-pack assets."""
+    """Load and authenticate the eight canonical Rust knowledge-pack assets."""
     root = files("merlin_packs").joinpath("knowledge")
     packs = []
     for name in PACK_FILES:

@@ -1,8 +1,8 @@
 # Licensing
 
-Merlin first-party code and all seven bundled knowledge packs are licensed under
+Merlin first-party code and all eight bundled knowledge packs are licensed under
 Apache-2.0; see [LICENSE](../LICENSE). The project owner confirmed ownership or
-redistribution rights for the seven packs and authorized their Apache-2.0 release.
+redistribution rights for the eight packs and authorized their Apache-2.0 release.
 Pack provenance metadata records that license. Third-party components retain their
 own licenses; see [THIRD-PARTY.md](THIRD-PARTY.md).
 
