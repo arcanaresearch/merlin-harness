@@ -120,8 +120,10 @@ class GeminiProvider(OpenAICompatibleProvider):
         }
         if request.temperature is not None:
             generation_config["temperature"] = request.temperature
-        if request.reasoning == "enabled" or self.config.reasoning_effort != "default":
-            effort = self.config.reasoning_effort
+        effort = request.reasoning_effort or self.config.reasoning_effort
+        if request.reasoning != "disabled" and (
+            request.reasoning == "enabled" or effort != "default"
+        ):
             thinking: dict[str, Any] = {"includeThoughts": True}
             if "gemini-3" in (request.model or self.config.model).lower():
                 thinking["thinkingLevel"] = {

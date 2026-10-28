@@ -175,11 +175,14 @@ class AnthropicMessagesProvider(OpenAICompatibleProvider):
             payload["tools"] = tools
         if request.temperature is not None and request.reasoning != "enabled":
             payload["temperature"] = request.temperature
-        if request.reasoning == "enabled" or self.config.reasoning_effort != "default":
+        effort = request.reasoning_effort or self.config.reasoning_effort
+        if request.reasoning != "disabled" and (
+            request.reasoning == "enabled" or effort != "default"
+        ):
             payload.update(
                 _reasoning_payload(
                     model=request.model or self.config.model,
-                    effort=self.config.reasoning_effort,
+                    effort=effort,
                     max_tokens=max_tokens,
                     fallback_budget=self.config.thinking_budget_tokens,
                 )

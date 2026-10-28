@@ -264,6 +264,7 @@ class AgentService:
                 ),
                 ChatMessage(role="user", content=objective),
             ],
+            workload="lead",
         )
         parts: list[str] = []
         completed = False

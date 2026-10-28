@@ -284,6 +284,23 @@ def test_provider_role_models_are_validated_and_preserve_homogeneous_fallback(
         load_config(paths, {})
 
 
+def test_provider_request_controls_are_explicit_and_validated(tmp_path: Path) -> None:
+    paths = ConfigPaths(tmp_path)
+    paths.config.write_text(
+        "[provider.request_efforts]\nlead='high'\nassessment_target='off'\n"
+        "[provider.request_output_tokens]\nworker=4096\nassessment_target=512\n",
+        encoding="utf-8",
+    )
+    paths.config.chmod(0o600)
+    config = load_config(paths, {})
+    assert config.provider_request_efforts == {"lead": "high", "assessment_target": "off"}
+    assert config.provider_request_output_tokens == {"worker": 4096, "assessment_target": 512}
+
+    paths.config.write_text("[provider.request_efforts]\nvictim='off'\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown provider request workload"):
+        load_config(paths, {})
+
+
 def test_provider_model_transports_are_exact_and_validated(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path)
     paths.config.write_text(

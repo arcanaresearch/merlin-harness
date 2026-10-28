@@ -4388,6 +4388,19 @@ def test_legacy_checkpoint_marks_terminal_prompt_attribution_incomplete() -> Non
     assert checkpoint["terminal_prompt_state"] == "incomplete"
 
 
+def test_provider_request_digest_preserves_legacy_shape_until_controls_are_present() -> None:
+    request = ChatRequest(model="model", messages=[ChatMessage(role="user", content="hello")])
+    legacy = request.model_dump(mode="json", exclude={"workload", "reasoning_effort"})
+    serialized = json.dumps(legacy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert WorkerRuntime._provider_request_digest(request) == (  # noqa: SLF001
+        "sha256:" + hashlib.sha256(serialized.encode()).hexdigest()
+    )
+    controlled = request.model_copy(update={"workload": "worker"})
+    assert WorkerRuntime._provider_request_digest(controlled) != (  # noqa: SLF001
+        WorkerRuntime._provider_request_digest(request)  # noqa: SLF001
+    )
+
+
 async def test_provider_failure_after_target_effect_forbids_replay() -> None:
     class FailingAfterEffectProvider:
         def __init__(self) -> None:
@@ -8015,8 +8028,7 @@ async def test_crescendo_prose_only_planner_loop_is_bounded_and_checkpointed() -
     assert tools.calls == []
     assert len(provider.requests) == CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT
     assert any(
-        checkpoint["crescendo_planner_strikes"]
-        == CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT - 1
+        checkpoint["crescendo_planner_strikes"] == CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT - 1
         for checkpoint in checkpoints
     )
     assert result.checkpoint["crescendo_planner_strikes"] == (

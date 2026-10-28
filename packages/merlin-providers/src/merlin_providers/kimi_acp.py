@@ -103,6 +103,12 @@ class KimiAcpProvider:
         return RouteIdentity(transport="kimi_acp", endpoint="", model=self.config.model or "")
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+        if request.reasoning == "disabled" or request.reasoning_effort is not None:
+            yield ModelError(
+                message="Kimi ACP does not support request reasoning controls",
+                code="unsupported_request_control",
+            )
+            return
         if request.tools:
             yield ModelError(
                 message="Kimi ACP tool calls are not connected to Merlin's tool-result protocol",

@@ -85,7 +85,7 @@ from .mailbox import (
 from .memory import PortableMemoryRecord
 from .repeat_planning import repeat_plan_audit
 from .scheduler import RetryFailureKind
-from .specialists import WorkerAssignment, WorkerProfile
+from .specialists import AssignmentContext, WorkerAssignment, WorkerProfile
 from .strategy_controller import EvaluationUncertainty, StrategyProposal, propose_strategy_action
 from .strategy_plugin import (
     CrescendoStrategyAdapter,
@@ -3778,6 +3778,19 @@ class WorkerRuntime:
                 if model_output_limit is None
                 else min(remaining_tokens, model_output_limit)
             )
+            request_workload = AssignmentContext.request_workload(handoff.assignment.profile_id)
+            effective_request = ChatRequest(
+                model=handoff.model,
+                messages=[],
+                reasoning="disabled" if finalization_only else None,
+                max_output_tokens=output_limit,
+                budget_id=handoff.assignment.id,
+                workload=request_workload,
+            )
+            resolve_request = getattr(self._provider, "resolve_request", None)
+            if callable(resolve_request):
+                effective_request = resolve_request(effective_request)
+            output_limit = effective_request.max_output_tokens
             baseline_target_first = (
                 (
                     handoff.assignment.execution_stage in {"control", "direct", "replay"}
@@ -3944,9 +3957,11 @@ class WorkerRuntime:
                 # A finalization turn only re-renders known evidence as compact
                 # JSON; reasoning tokens would burn the output budget that
                 # already proved too small, so ask the provider to skip them.
-                reasoning="disabled" if finalization_only else None,
+                reasoning=effective_request.reasoning,
+                reasoning_effort=effective_request.reasoning_effort,
                 max_output_tokens=output_limit,
                 budget_id=handoff.assignment.id,
+                workload=request_workload,
             )
             terminal_prompt_digest = self._provider_request_digest(request)
             await write_checkpoint(
@@ -6716,8 +6731,14 @@ class WorkerRuntime:
 
     @staticmethod
     def _provider_request_digest(request: ChatRequest) -> str:
+        # v1 deliberately excludes fields introduced after durable checkpoints shipped.
+        # Once a workload control is present, v2 binds the exact effective request.
+        if request.workload is None and request.reasoning_effort is None:
+            dumped = request.model_dump(mode="json", exclude={"workload", "reasoning_effort"})
+        else:
+            dumped = request.model_dump(mode="json")
         payload = json.dumps(
-            request.model_dump(mode="json"),
+            dumped,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,

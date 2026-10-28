@@ -69,6 +69,8 @@ async def test_runs_bounded_alternating_stream() -> None:
     assert [turn.role for turn in result.turns] == ["attacker", "target"] * 2
     assert [turn.sequence for turn in result.turns] == [0, 1, 2, 3]
     assert len(attacker.requests) == len(target.requests) == 2
+    assert {request.workload for request in attacker.requests} == {"assessment_attacker"}
+    assert {request.workload for request in target.requests} == {"assessment_target"}
     assert attacker.requests[1].messages[-1].content == "The target replied:\n\ntarget one"
     assert [event.kind for event in progress].count("text_delta") == 5
     assert progress[0].kind == "run_started"

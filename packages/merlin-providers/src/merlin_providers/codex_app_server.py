@@ -53,7 +53,7 @@ class _ProviderResponseError(RuntimeError):
 
 
 def _turn_parameters(
-    config: CodexAppServerConfig, thread_id: str, prompt: str, model: str | None
+    config: CodexAppServerConfig, thread_id: str, prompt: str, model: str | None, effort: str
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "threadId": thread_id,
@@ -62,8 +62,8 @@ def _turn_parameters(
         "approvalPolicy": "never",
         "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
     }
-    if config.reasoning_effort != "default":
-        params["effort"] = config.reasoning_effort
+    if effort != "default":
+        params["effort"] = effort
     return params
 
 
@@ -120,6 +120,12 @@ class CodexAppServerProvider:
         )
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+        if request.reasoning == "disabled":
+            yield ModelError(
+                message="Codex App Server cannot authoritatively disable reasoning",
+                code="unsupported_request_control",
+            )
+            return
         if request.tools:
             yield ModelError(
                 message=(
@@ -142,6 +148,12 @@ class CodexAppServerProvider:
     async def _stream(
         self, request: ChatRequest, handler: DynamicToolHandler | None
     ) -> AsyncIterator[ModelEvent]:
+        if request.reasoning == "disabled":
+            yield ModelError(
+                message="Codex App Server cannot authoritatively disable reasoning",
+                code="unsupported_request_control",
+            )
+            return
         if request.tools and handler is None:
             yield ModelError(
                 message="Codex App Server tools require Merlin's authority callback",
@@ -234,7 +246,13 @@ class _CodexSession:
             prompt, history = _request_prompt(request.messages, self._history)
             turn_request_id = await self._send_request(
                 "turn/start",
-                _turn_parameters(self.config, self.thread_id, prompt, request.model),
+                _turn_parameters(
+                    self.config,
+                    self.thread_id,
+                    prompt,
+                    request.model,
+                    request.reasoning_effort or self.config.reasoning_effort,
+                ),
             )
             turn_id: str | None = None
             usage: ModelUsage | None = None

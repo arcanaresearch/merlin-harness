@@ -4491,8 +4491,15 @@ def build_backend(
                 else:
                     transport_routes[routed_model] = GeminiProvider(GeminiConfig(**shared))
         provider = (
-            ModelRoutingProvider(default_provider, transport_routes)
+            ModelRoutingProvider(
+                default_provider,
+                transport_routes,
+                request_efforts=config.provider_request_efforts,
+                request_output_tokens=config.provider_request_output_tokens,
+            )
             if transport_routes
+            or config.provider_request_efforts
+            or config.provider_request_output_tokens
             else default_provider
         )
 
@@ -5856,6 +5863,7 @@ def build_backend(
                         # attempt at the operator-selected setting, then make daemon
                         # retries a compact provider-native final-answer request.
                         reasoning="disabled" if attempt > 0 else None,
+                        workload="lead",
                     )
                 ):
                     if isinstance(event, (TextDelta, ReasoningDelta)):

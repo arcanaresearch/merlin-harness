@@ -697,6 +697,7 @@ class AssessmentService:
                     ChatRequest(
                         model=profile.model,
                         messages=[ChatMessage(role="user", content=prompt)],
+                        workload="assessment_target",
                     )
                 ):
                     response_event_refs.append(

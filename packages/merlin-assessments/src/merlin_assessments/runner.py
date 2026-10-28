@@ -101,7 +101,11 @@ class AssessmentRunner:
         for _ in range(case.turn_limit):
             attacker_text, failure = await self._collect(
                 self._attacker,
-                ChatRequest(model=self._attacker_model, messages=attacker_messages),
+                ChatRequest(
+                    model=self._attacker_model,
+                    messages=attacker_messages,
+                    workload="assessment_attacker",
+                ),
                 run_id=run_id,
                 role="attacker",
                 sequence=len(turns),
@@ -115,7 +119,11 @@ class AssessmentRunner:
 
             target_text, failure = await self._collect(
                 self._target,
-                ChatRequest(model=self._target_model, messages=target_messages),
+                ChatRequest(
+                    model=self._target_model,
+                    messages=target_messages,
+                    workload="assessment_target",
+                ),
                 run_id=run_id,
                 role="target",
                 sequence=len(turns),

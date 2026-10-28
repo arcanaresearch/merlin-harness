@@ -93,14 +93,11 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
             payload["tools"] = [_tool_payload(tool) for tool in request.tools]
         if request.temperature is not None:
             payload["temperature"] = request.temperature
-        if request.reasoning == "enabled" or self.config.reasoning_effort != "default":
-            payload["reasoning"] = {
-                "effort": (
-                    "medium"
-                    if self.config.reasoning_effort == "default"
-                    else self.config.reasoning_effort
-                )
-            }
+        effort = request.reasoning_effort or self.config.reasoning_effort
+        if request.reasoning != "disabled" and (
+            request.reasoning == "enabled" or effort != "default"
+        ):
+            payload["reasoning"] = {"effort": ("medium" if effort == "default" else effort)}
         payload["max_output_tokens"] = (
             request.max_output_tokens
             if request.max_output_tokens is not None

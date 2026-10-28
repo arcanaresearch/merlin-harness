@@ -5845,6 +5845,7 @@ class DurableAgentService:
                 ),
                 ChatMessage(role="user", content=objective),
             ],
+            workload="planner",
         )
         parts: list[str] = []
         async for event in self._provider.stream(request):

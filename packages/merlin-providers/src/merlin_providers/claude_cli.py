@@ -85,6 +85,12 @@ class ClaudeCliProvider:
         return RouteIdentity(transport="claude_cli", endpoint="", model=self.config.model or "")
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+        if request.reasoning == "disabled":
+            yield ModelError(
+                message="Claude CLI cannot authoritatively disable reasoning",
+                code="unsupported_request_control",
+            )
+            return
         if request.tools:
             yield ModelError(
                 message="Claude CLI tool calls are not connected to Merlin's tool-result protocol",
@@ -137,7 +143,9 @@ class ClaudeCliProvider:
         ]
         if request.model or self.config.model:
             arguments.extend(("--model", request.model or self.config.model or ""))
-        arguments.extend(_effort_arguments(self.config.reasoning_effort))
+        arguments.extend(
+            _effort_arguments(request.reasoning_effort or self.config.reasoning_effort)
+        )
         arguments.extend(("--resume" if resume else "--session-id", session_id, prompt))
         stderr: deque[str] = deque(maxlen=self.config.stderr_lines)
         process: asyncio.subprocess.Process | None = None
