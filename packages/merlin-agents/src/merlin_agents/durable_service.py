@@ -7186,8 +7186,7 @@ def _validated_target_evidence_receipts(
             not isinstance(call_id, str)
             or not call_id
             or item.get("reference") != f"target-call:{call_id}"
-            or item.get("tool_name")
-            not in {"target_chat", "target_request", "browser_chat_exchange"}
+            or item.get("tool_name") not in LEGACY_TARGET_EXCHANGE_TOOL_IDS
             or item.get("assignment_id") != task.id
             or item.get("campaign_id") != expected_campaign_id
             or item.get("attempt_id") not in valid_attempt_ids

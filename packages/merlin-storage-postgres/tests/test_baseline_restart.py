@@ -88,6 +88,7 @@ def _api_effect(
     observed_language: str = "und",
     latency_ms: int = 25,
     response_pad: str = "",
+    tool_name: str = "target_request",
 ) -> None:
     arguments_digest = sha256(
         ("benign-control" if stage == "control" else "exact-direct-prompt").encode()
@@ -136,7 +137,7 @@ def _api_effect(
             attempt_id=attempt_id,
             campaign_id="campaign/baseline",
             target_id="target-1",
-            tool_name="target_request",
+            tool_name=tool_name,
             effect="target_network",
             arguments_digest=arguments_digest,
             state=ToolEffectState.INTENT,
@@ -172,6 +173,7 @@ def _commit_api_stage(
     observed_language: str = "und",
     latency_ms: int = 25,
     response_pad: str = "",
+    tool_name: str = "target_request",
 ) -> None:
     physical_session_id = target_session_id or f"{SESSION_ID}-{stage}"
     with Database(DatabaseConfig(data_dir=data_dir)) as database:
@@ -201,6 +203,7 @@ def _commit_api_stage(
                 observed_language=observed_language,
                 latency_ms=latency_ms,
                 response_pad=response_pad,
+                tool_name=tool_name,
             )
             store.commit_reducer(
                 lease.id,
@@ -692,6 +695,47 @@ def test_api_pair_accepts_isolated_physical_sessions_with_one_reviewed_identity(
             assert gate["comparisons"]["agenda/prompt-leak"]["reason"] == (
                 "deterministic observations recorded; validator review is required"
             )
+
+
+def test_injection_pair_records_remote_session_bound_baseline_receipts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "postgres-injection-pair"
+    assignments = (
+        _assignment("control", predecessor=None),
+        _assignment("direct", predecessor="campaign/baseline/control"),
+    )
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("injection pair")
+            schedule_id = DurableSchedulerStore(connection).create_schedule(
+                session.id,
+                {"assignments": assignments},
+                {"completed": []},
+                [f"worker:{item['id']}" for item in assignments],
+                ready_nodes=[f"worker:{item['id']}" for item in assignments],
+            )
+
+    for stage, matched in (("control", False), ("direct", True)):
+        _commit_api_stage(
+            data_dir,
+            schedule_id,
+            stage,
+            matched=matched,
+            target_session_id=f"physical-{stage}",
+            tool_name="target_inject",
+        )
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            stages = DurableSchedulerStore(connection).baseline_gate(schedule_id)["agendas"][
+                "agenda/prompt-leak"
+            ]
+            assert [stage["outcome"] for stage in stages] == ["completed", "completed"]
+            assert [stage["target_session_id"] for stage in stages] == [
+                "physical-control",
+                "physical-direct",
+            ]
+            assert all(stage["witness_effect_ids"] for stage in stages)
 
 
 def test_api_pair_marks_reused_physical_session_as_contaminated_evidence(

@@ -3079,7 +3079,7 @@ def _transform_payload_receipt_chain(
     for effect in eligible:
         exchanges = effect.result_metadata.get("target_exchanges")
         if (
-            effect.tool_name in {"target_chat", "target_request"}
+            effect.tool_name in {"target_chat", "target_request", "target_inject"}
             and bound(effect)
             and (
                 effect.result_metadata.get("target") == target_id
@@ -9340,9 +9340,9 @@ def build_backend(
                 for step in receipt.get("steps", ())
                 if isinstance(step, Mapping) and step.get("effect_id")
             }
-            for effect in await effect_store.list_for_session(
-                manifest.session_id, tool_name="target_request"
-            ):
+            for effect in await effect_store.list_for_session(manifest.session_id):
+                if effect.tool_name not in {"target_request", "target_inject"}:
+                    continue
                 if effect.result_metadata.get("campaign_id") != campaign_id:
                     continue
                 rows = effect.result_metadata.get("target_exchanges", ())
@@ -9353,7 +9353,9 @@ def build_backend(
                         continue
                     request = row.get("request")
                     if request is None:
-                        request = effect.arguments_payload.get("input")
+                        request = effect.arguments_payload.get(
+                            "input", effect.arguments_payload.get("content")
+                        )
                     if request is None:
                         strategy_plan = effect.arguments_payload.get("strategy_plan")
                         if isinstance(strategy_plan, Mapping):

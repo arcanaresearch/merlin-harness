@@ -359,6 +359,16 @@ def test_legacy_transport_normalization_preserves_non_target_tools() -> None:
     )
 
 
+def test_http_runtime_keeps_injection_alongside_primary_reviewed_actor() -> None:
+    reviewed = reviewed_handoff(
+        interface="http_api",
+        tools=("target_chat", "target_request", "target_inject", "browser_chat_exchange"),
+    )
+
+    assert _runtime_admitted_tool_names(reviewed) == ("target_request", "target_inject")
+    assert _controller_target_tool(reviewed) == "target_request"
+
+
 @pytest.mark.asyncio
 async def test_missing_reviewed_actor_is_retryable_infrastructure_failure() -> None:
     reviewed = reviewed_handoff(interface="http_api", tools=("target_chat",))
@@ -2376,6 +2386,61 @@ async def test_target_chat_session_is_checkpointed() -> None:
     assert result.status == "completed"
     assert result.target_session_id == "provider:conversation-1"
     assert result.checkpoint["target_session_id"] == "provider:conversation-1"
+
+
+async def test_target_inject_session_is_checkpointed() -> None:
+    class TargetInjectTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(
+                    name=name,
+                    description="Reviewed target exchange",
+                    input_schema={"type": "object"},
+                    interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                )
+                for name in ("target_request", "target_inject")
+            )
+
+        async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
+            self.calls.append(name)
+            return ToolResult(
+                content="injection evidence",
+                metadata={
+                    "target_session_id": "api:context-1",
+                    "target_exchanges": [
+                        {
+                            "interaction": True,
+                            "cleanup": False,
+                            "request": dict(arguments),
+                            "response": {"reply": "accepted"},
+                        }
+                    ],
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="inject-1",
+                    name="target_inject",
+                    arguments={"content": "reviewed payload"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+            [TextDelta(text='{"finding":"ok"}'), ModelCompleted(finish_reason="stop")],
+        ]
+    )
+    reviewed = reviewed_handoff(
+        interface="http_api", tools=("target_request", "target_inject")
+    )
+
+    result = await WorkerRuntime(provider, TargetInjectTools(effect="target_network")).run(reviewed)
+
+    assert result.status == "completed", result.error
+    assert result.target_session_id == "api:context-1"
+    assert result.checkpoint["target_session_id"] == "api:context-1"
+    assert result.checkpoint["target_evidence"][0]["tool_name"] == "target_inject"
 
 
 async def test_browser_observation_does_not_replace_api_target_session() -> None:
@@ -5173,6 +5238,43 @@ def test_worker_compaction_preserves_tool_lifecycle_identity() -> None:
     assert '"type":"worker_context_projection"' in summary
     assert '"tool_name":"target_request"' in summary
     assert '"tool_call_id":"call-structured"' in summary
+    assert '"content_digest":"sha256:' in summary
+
+
+def test_worker_compaction_preserves_injection_lifecycle_identity() -> None:
+    messages = [
+        ChatMessage(role="system", content="identity"),
+        ChatMessage(role="user", content="objective"),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-inject",
+                    "type": "function",
+                    "function": {
+                        "name": "target_inject",
+                        "arguments": '{"content":"reviewed payload"}',
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            content="observed",
+            name="target_inject",
+            tool_call_id="call-inject",
+        ),
+        *[ChatMessage(role="user", content=f"message-{index}") for index in range(50)],
+    ]
+
+    compacted, _ = WorkerRuntime._compact_messages(  # noqa: SLF001
+        messages, context_window_tokens=2_048
+    )
+
+    summary = compacted[2].content
+    assert '"tool_name":"target_inject"' in summary
+    assert '"tool_call_id":"call-inject"' in summary
     assert '"content_digest":"sha256:' in summary
 
 

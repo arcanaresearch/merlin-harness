@@ -1806,6 +1806,52 @@ def test_authenticated_target_receipt_survives_runtime_guidance_in_transcript() 
     assert admitted == {call_id: receipt}
 
 
+def test_authenticated_injection_receipt_is_admitted() -> None:
+    task = AgentTask(id="campaign/injection", objective="inject", status="completed")
+    attempt_id = "attempt-injection"
+    call_id = "inject-1"
+    arguments = {"content": "reviewed payload"}
+    content = '"target reply"'
+    receipt_body = {
+        "call_id": call_id,
+        "tool_name": "target_inject",
+        "reference": f"target-call:{call_id}",
+        "campaign_id": "campaign/injection",
+        "assignment_id": task.id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": None,
+        "target_id": "target-1",
+        "target_session_id": "target-session-1",
+        "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+            "target_inject", arguments
+        ),
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "content_bytes": len(content.encode()),
+        "metadata_sha256": "3" * 64,
+        "is_error": False,
+        "acknowledged": True,
+    }
+    receipt = {
+        **receipt_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(receipt_body),  # noqa: SLF001
+    }
+
+    admitted = _validated_target_evidence_receipts(
+        [receipt],
+        task=task,
+        attempt_id=attempt_id,
+        payload={
+            "target_id": "target-1",
+            "target_session_id": "target-session-1",
+            "worker_checkpoint": {"technique_attempt_id": None},
+        },
+        request_hashes={call_id: receipt_body["request_sha256"]},
+        content_hashes={call_id: hashlib.sha256(content.encode()).hexdigest()},
+    )
+
+    assert admitted == {call_id: receipt}
+
+
 @pytest.mark.parametrize("drifted_field", ["campaign_id", "agent_id", "attempt_id", "target_id"])
 async def test_compacted_target_document_requires_exact_durable_effect_attribution(
     drifted_field: str,

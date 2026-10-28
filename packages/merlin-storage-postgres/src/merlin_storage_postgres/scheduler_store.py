@@ -4312,7 +4312,7 @@ class DurableSchedulerStore:
                 continue
             target_exchanges = metadata.get("target_exchanges")
             if (
-                effect["tool_name"] in {"target_chat", "target_request"}
+                effect["tool_name"] in {"target_chat", "target_request", "target_inject"}
                 and isinstance(target_exchanges, list)
                 and any(
                     isinstance(item, Mapping)
@@ -4423,7 +4423,8 @@ class DurableSchedulerStore:
             effect for effect in effects if effect["idempotency_key"] in witness_effect_ids
         )
         requires_remote_session_identity = any(
-            effect["tool_name"] == "target_request" for effect in witness_effects
+            effect["tool_name"] in {"target_request", "target_inject"}
+            for effect in witness_effects
         )
         remote_target_session_ids = {
             remote_id

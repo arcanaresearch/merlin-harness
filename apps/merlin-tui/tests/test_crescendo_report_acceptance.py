@@ -101,6 +101,7 @@ async def _campaign_with_effect(
     context_strategy_id: str = "crescendo",
     create_target_effect: bool = True,
     complete_cleanup: bool = False,
+    target_tool_name: str = "target_request",
 ) -> tuple[CampaignManifest, str, str, str, str]:
     session_id = await backend.kernel.start()  # type: ignore[attr-defined]
     target_id = f"target-{campaign_id.rsplit('/', 1)[-1]}"
@@ -121,7 +122,7 @@ async def _campaign_with_effect(
         authority_ids=(),
         catalogue=(),
         skill_documents=(),
-        tool_ids=("target_request",),
+        tool_ids=(target_tool_name,),
         budget=AssignmentBudget(),
     )
     context = AssignmentContext(
@@ -141,7 +142,7 @@ async def _campaign_with_effect(
                 ),
             ),
         ),
-        tool_ids=("target_request",),
+        tool_ids=(target_tool_name,),
         skill_ids=(),
         provider_id="test",
         authority_ids=(),
@@ -172,7 +173,7 @@ async def _campaign_with_effect(
             "target_profile_id": target_id,
             "technique_ids": [technique_id],
             "guidance_ids": ["attack-catalogue:crescendo"],
-            "tool_ids": ["target_request"],
+            "tool_ids": [target_tool_name],
             "skill_ids": [],
             "provider_id": "test",
             "authority_ids": [],
@@ -228,7 +229,7 @@ async def _campaign_with_effect(
                     attempt_id=lease.id,
                     campaign_id=campaign_id,
                     target_id=target_id,
-                    tool_name="target_request",
+                    tool_name=target_tool_name,
                     effect="target_network",
                     arguments_digest=hashlib.sha256(b"raw escalating prompt").hexdigest(),
                     state=ToolEffectState.INTENT,
@@ -407,6 +408,60 @@ async def test_ordinary_saturated_report_is_complete_and_confident(
             assert "Assessment completed" in report.metadata["verdict"]
             assert report.coverage["negative"] == 1
             assert report.cleanup_status == "completed"
+        finally:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_injection_exchange_is_included_in_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-injection")) as database:
+        monkeypatch.setattr(
+            "merlin_config.load_config",
+            lambda: Config(
+                database_url=database.url,
+                values={
+                    "provider": {"base_url": "http://127.0.0.1:9/v1", "model": "test"},
+                    "permission_mode": "auto",
+                },
+            ),
+        )
+        monkeypatch.setattr(CredentialStore, "load", lambda self: {"api_key": "secret"})
+        backend = build_backend(tmp_path / "workspace-injection")
+        try:
+            campaign_id = "campaign/injection-report"
+            manifest, schedule_id, _attempt_id, _effect_id, call_id = (
+                await _campaign_with_effect(
+                    backend,
+                    database,
+                    tmp_path,
+                    campaign_id=campaign_id,
+                    valid_receipt=True,
+                    objective_match=False,
+                    context_strategy_id="direct",
+                    complete_cleanup=True,
+                    target_tool_name="target_inject",
+                )
+            )
+            # This focused fixture does not run the scheduler daemon that normally
+            # reconciles an all-terminal node set into the terminal schedule state.
+            with database.connect() as connection:
+                connection.execute(
+                    "UPDATE merlin_storage.scheduler_schedules SET status = 'completed' "
+                    "WHERE id = %s",
+                    (schedule_id,),
+                )
+                connection.commit()
+            await _seal_and_report(backend, campaign_id, manifest)
+            revision = backend._report_repository.list(campaign_id)[-1]  # type: ignore[attr-defined]
+            report = backend._report_repository.get(revision.revision_id)  # type: ignore[attr-defined]
+
+            assert [exchange["id"] for exchange in report.exchanges] == [
+                f"{call_id}:interaction"
+            ]
+            assert report.exchanges[0]["request"] == "raw escalating prompt"
+            assert report.exchanges[0]["response"] == "raw target response"
         finally:
             await backend.close()
 
