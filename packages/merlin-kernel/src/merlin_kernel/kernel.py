@@ -1183,8 +1183,8 @@ class Kernel:
                         and call.name in _described_tool_names
                     )
                     if is_preferred_tool_call and not duplicate_owned_cleanup:
-                        # Invocation discharges the obligation even when the tool returns a
-                        # typed error. Tool integrity failures are evidence, not provider prose.
+                        # Invocation initially discharges the obligation. A typed retryable
+                        # failure below re-establishes it from durable tool evidence.
                         preferred_next_tool_name = None
                         preferred_tool_follow_through_failures = 0
                         preferred_transition_observation_used = False
@@ -1306,6 +1306,18 @@ class Kernel:
                         preferred_next_tool_mode = str(
                             result.metadata.get("preferred_next_tool_mode") or "strict"
                         )
+                        preferred_tool_follow_through_failures = 0
+                    elif (
+                        result.is_error
+                        and result.metadata.get("retryable") is True
+                        and is_preferred_tool_call
+                        and current_preferred_tool_name is not None
+                    ):
+                        # A retryable typed failure means the required action remains
+                        # incomplete. Keep the same strict obligation unless the tool
+                        # explicitly selected a different repair tool above.
+                        preferred_next_tool_name = current_preferred_tool_name
+                        preferred_next_tool_mode = "strict"
                         preferred_tool_follow_through_failures = 0
                     elif (
                         not result.is_error
@@ -2040,12 +2052,19 @@ class Kernel:
                     )
                 raise _AwaitingUserInput
             next_tool = result.metadata.get("preferred_next_tool")
-            if not result.is_error and isinstance(next_tool, str):
+            retryable_error = result.is_error and result.metadata.get("retryable") is True
+            if isinstance(next_tool, str) and (not result.is_error or retryable_error):
                 preferred_next_tool = next_tool
                 preferred_next_tool_mode = str(
                     result.metadata.get("preferred_next_tool_mode") or "strict"
                 )
                 admitted_tool_name = next_tool
+            elif retryable_error and admitted_tool_name == event.name:
+                # Invoking a required tool does not discharge the obligation when
+                # that tool reports a retryable failure without another repair step.
+                preferred_next_tool = event.name
+                preferred_next_tool_mode = "strict"
+                admitted_tool_name = event.name
             if event.name == _RECON_RECALL_TOOL and not result.is_error:
                 recon_recall_completed = True
             if continuation is not None:

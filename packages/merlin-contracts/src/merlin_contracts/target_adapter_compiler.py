@@ -657,8 +657,25 @@ def _json_pointer_exists(value: object, pointer: str) -> bool:
     return True
 
 
-def _locator_present(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+_BROWSER_LOCATOR_ROLES = frozenset({"button", "textbox", "link", "checkbox", "radio", "combobox"})
+
+
+def _canonical_browser_locator(value: object) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if not isinstance(value, Mapping) or set(value) != {"role", "name"}:
+        return None
+    role = value.get("role")
+    name = value.get("name")
+    if (
+        not isinstance(role, str)
+        or role.casefold() not in _BROWSER_LOCATOR_ROLES
+        or not isinstance(name, str)
+        or not name.strip()
+    ):
+        return None
+    normalized_name = " ".join(name.strip().split())
+    return f"{role.casefold()}[name={json.dumps(normalized_name, ensure_ascii=False)}]"
 
 
 _BROWSER_ARGUMENT_KEYS = {
@@ -1111,16 +1128,8 @@ def _compile_browser_steps(
         )
     compiled: list[BrowserStep] = []
     seen_step_ids: set[str] = set()
-    input_locator = (
-        str(interaction["input_locator"]).strip()
-        if _locator_present(interaction.get("input_locator"))
-        else None
-    )
-    submit_locator = (
-        str(interaction["submit_action"]).strip()
-        if _locator_present(interaction.get("submit_action"))
-        else None
-    )
+    input_locator = _canonical_browser_locator(interaction.get("input_locator"))
+    submit_locator = _canonical_browser_locator(interaction.get("submit_action"))
     for index, item in enumerate(raw_steps):
         path = f"browser_steps[{index}]"
         if not isinstance(item, Mapping):
@@ -1157,11 +1166,7 @@ def _compile_browser_steps(
                 value=dict(item),
             )
             continue
-        step_locator = (
-            str(arguments["locator"]).strip()
-            if _locator_present(arguments.get("locator"))
-            else None
-        )
+        step_locator = _canonical_browser_locator(arguments.get("locator"))
         locator = step_locator or (submit_locator if tool == "browser_click" else input_locator)
         if tool == "browser_fill" and locator is None:
             _unsupported_step(

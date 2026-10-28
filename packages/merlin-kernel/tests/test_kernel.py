@@ -2841,6 +2841,219 @@ async def test_preferred_tool_integrity_rejection_remains_real_tool_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_retryable_preferred_tool_error_retains_same_obligation() -> None:
+    class RetryableTools(Tools):
+        def __init__(self):
+            self.calls = []
+            self.repair_attempts = 0
+
+        def describe(self):
+            return (
+                ToolSpec(name="observe", description="Observe", input_schema={}),
+                ToolSpec(name="repair", description="Repair", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    metadata={"preferred_next_tool": "repair"},
+                )
+            self.repair_attempts += 1
+            if self.repair_attempts == 1:
+                return ToolResult(
+                    content="locator remains ambiguous",
+                    is_error=True,
+                    metadata={"retryable": True},
+                )
+            return ToolResult(content="repaired")
+
+    class RetryableProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="observe", name="observe", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 2:
+                yield ToolCall(call_id="repair-1", name="repair", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 3:
+                yield TextDelta(text="Choose a manual attack instead.")
+                yield ModelCompleted()
+                return
+            if len(self.requests) == 4:
+                yield ToolCall(call_id="repair-2", name="repair", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Repair complete.")
+            yield ModelCompleted()
+
+    provider = RetryableProvider()
+    tools = RetryableTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("repair the handoff")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 5
+    assert all(
+        [tool["function"]["name"] for tool in request.tools] == ["repair"]
+        and request.required_tool_name == "repair"
+        for request in provider.requests[1:4]
+    )
+    assert tools.calls == ["observe", "repair", "repair"]
+    assert not any(
+        message.role == "assistant" and "manual attack" in message.content
+        for message in store.messages[kernel.session_id]
+    )
+    assert store.messages[kernel.session_id][-1].content == "Repair complete."
+
+
+@pytest.mark.asyncio
+async def test_retryable_preferred_tool_error_can_select_repair_transition() -> None:
+    class TransitionTools(Tools):
+        def __init__(self):
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("observe", "repair", "compile")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    metadata={"preferred_next_tool": "repair"},
+                )
+            if name == "repair":
+                return ToolResult(
+                    content="repair produced canonical input",
+                    is_error=True,
+                    metadata={
+                        "retryable": True,
+                        "preferred_next_tool": "compile",
+                    },
+                )
+            return ToolResult(content="compiled")
+
+    class TransitionProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(call_id="observe", name="observe", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 2:
+                yield ToolCall(call_id="repair", name="repair", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 3:
+                yield ToolCall(call_id="compile", name="compile", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="Compiled.")
+            yield ModelCompleted()
+
+    provider = TransitionProvider()
+    tools = TransitionTools()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("repair and compile")
+    await kernel.wait_for_turn()
+
+    assert [tool["function"]["name"] for tool in provider.requests[2].tools] == ["compile"]
+    assert provider.requests[2].required_tool_name == "compile"
+    assert tools.calls == ["observe", "repair", "compile"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_retryable_preferred_tool_error_retains_same_obligation() -> None:
+    class DynamicTools(Tools):
+        def __init__(self):
+            self.calls = []
+            self.repair_attempts = 0
+
+        def describe(self):
+            return (
+                ToolSpec(name="observe", description="Observe", input_schema={}),
+                ToolSpec(name="repair", description="Repair", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "observe":
+                return ToolResult(
+                    content="repair required",
+                    metadata={"preferred_next_tool": "repair"},
+                )
+            self.repair_attempts += 1
+            if self.repair_attempts == 1:
+                return ToolResult(
+                    content="locator remains ambiguous",
+                    is_error=True,
+                    metadata={"retryable": True},
+                )
+            return ToolResult(content="repaired")
+
+    class DynamicProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                observed = await handler(ToolCall(call_id="observe", name="observe", arguments={}))
+                assert observed.success is True
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 2:
+                failed = await handler(ToolCall(call_id="repair-1", name="repair", arguments={}))
+                assert failed.success is False
+                yield TextDelta(text="Choose a manual attack instead.")
+                yield ModelCompleted()
+                return
+            repaired = await handler(ToolCall(call_id="repair-2", name="repair", arguments={}))
+            assert repaired.success is True
+            yield TextDelta(text="Repair complete.")
+            yield ModelCompleted()
+
+    provider = DynamicProvider()
+    tools = DynamicTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("repair the handoff")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 3
+    assert [tool["function"]["name"] for tool in provider.requests[2].tools] == ["repair"]
+    assert provider.requests[2].required_tool_name == "repair"
+    assert tools.calls == ["observe", "repair", "repair"]
+    assert not any(
+        message.role == "assistant" and "manual attack" in message.content
+        for message in store.messages[kernel.session_id]
+    )
+    assert store.messages[kernel.session_id][-1].content == "Repair complete."
+
+
+@pytest.mark.asyncio
 async def test_dynamic_preferred_tool_rejects_stale_advertised_tool_in_same_request() -> None:
     class DynamicTools(Tools):
         def __init__(self):

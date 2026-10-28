@@ -653,6 +653,39 @@ def test_browser_compiles_actor_input_and_typed_actions() -> None:
     assert [item.path for item in compiled.advisories] == ["interaction_contract.success_indicator"]
 
 
+def test_structured_browser_locators_compile_to_canonical_role_name_identity() -> None:
+    structured = _browser_adapter()
+    steps = structured["browser_steps"]
+    contract = structured["interaction_contract"]
+    assert isinstance(steps, list)
+    assert isinstance(contract, dict)
+    steps[0]["arguments"]["locator"] = {"role": "textbox", "name": "Message"}
+    steps[1]["arguments"]["locator"] = {"role": "button", "name": "Send"}
+    contract["input_locator"] = {"role": "textbox", "name": "Message"}
+    contract["submit_action"] = {"role": "button", "name": "Send"}
+
+    compiled = compile_target_adapter(structured)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.input_locator == 'textbox[name="Message"]'
+    assert compiled.executable.interaction.submit_action == 'button[name="Send"]'
+    assert compiled.executable.steps[0].arguments["locator"] == 'textbox[name="Message"]'
+    assert compiled.executable.steps[1].arguments["locator"] == 'button[name="Send"]'
+
+    canonical_strings = deepcopy(structured)
+    canonical_steps = canonical_strings["browser_steps"]
+    canonical_contract = canonical_strings["interaction_contract"]
+    assert isinstance(canonical_steps, list)
+    assert isinstance(canonical_contract, dict)
+    canonical_steps[0]["arguments"]["locator"] = 'textbox[name="Message"]'
+    canonical_steps[1]["arguments"]["locator"] = 'button[name="Send"]'
+    canonical_contract["input_locator"] = 'textbox[name="Message"]'
+    canonical_contract["submit_action"] = 'button[name="Send"]'
+    assert compiled_target_adapter_digest(compiled) == compiled_target_adapter_digest(
+        compile_target_adapter(canonical_strings)
+    )
+
+
 @pytest.mark.parametrize("interface", ["api", "open_ai_compatible", "browser"])
 def test_delivery_contradiction_is_typed_advisory_not_execution_gate(interface: str) -> None:
     raw = (
