@@ -1131,6 +1131,28 @@ class BrowserTool:
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
         target_session_id = f"browser:{session.context_id}"
+        authenticated_target_reobservation = bool(
+            context.expected_target_session_id == target_session_id
+            and context.target_reobservation_generation_id is not None
+            and context.target_reobservation_event_set_digest is not None
+        )
+
+        def pre_dispatch_metadata(
+            *,
+            effect: str,
+            failure_code: str | None = None,
+            retryable: bool | None = None,
+            **metadata: object,
+        ) -> dict[str, object]:
+            if authenticated_target_reobservation:
+                metadata["target_session_id"] = target_session_id
+            return _campaign_pre_dispatch_rejection_metadata(
+                effect=effect,
+                failure_code=failure_code,
+                retryable=retryable,
+                **metadata,
+            )
+
         if (
             context.expected_target_session_id is not None
             and context.expected_target_session_id != target_session_id
@@ -1328,6 +1350,18 @@ class BrowserTool:
             evidence_refs=tuple(evidence_refs),
             redaction_status="not_needed",
         )
+        requested_reobservation_tab_ref: str | None = None
+        if authenticated_target_reobservation and kind in {
+            "snapshot",
+            "wait_for_text",
+            "network_events",
+        }:
+            open_tab_refs = tuple(
+                tab.tab_ref for tab in session.metadata().tabs if tab.state == "open"
+            )
+            if action.tab_ref not in open_tab_refs and len(open_tab_refs) == 1:
+                requested_reobservation_tab_ref = action.tab_ref
+                action = action.model_copy(update={"tab_ref": open_tab_refs[0]})
         actor_id = context.agent_id or f"console:{context.session_id}"
         if kind == "release":
             if session.mode == "persistent" and context.campaign_id is not None:
@@ -1338,7 +1372,7 @@ class BrowserTool:
                         "runtime releases the browser actor at terminal worker outcomes"
                     ),
                     is_error=True,
-                    metadata=_campaign_pre_dispatch_rejection_metadata(
+                    metadata=pre_dispatch_metadata(
                         effect=self.effect,
                         target=session.bounds.target_id,
                         release_rejected=True,
@@ -1363,7 +1397,7 @@ class BrowserTool:
                     "releases the browser actor at terminal worker outcomes"
                 ),
                 is_error=True,
-                metadata=_campaign_pre_dispatch_rejection_metadata(
+                metadata=pre_dispatch_metadata(
                     effect=self.effect,
                     target=session.bounds.target_id,
                     release_rejected=True,
@@ -1456,7 +1490,7 @@ class BrowserTool:
                     return ToolResult(
                         content="reviewed browser state is already owned by another execution",
                         is_error=True,
-                        metadata=_campaign_pre_dispatch_rejection_metadata(
+                        metadata=pre_dispatch_metadata(
                             effect=self.effect,
                             failure_code="physical_state_unavailable",
                             retryable=True,
@@ -1475,7 +1509,7 @@ class BrowserTool:
                         "surface; create the initial tab during pre-campaign reconnaissance"
                     ),
                     is_error=True,
-                    metadata=_campaign_pre_dispatch_rejection_metadata(
+                    metadata=pre_dispatch_metadata(
                         effect=self.effect,
                         failure_code="campaign_open_tab_requires_existing_surface",
                         retryable=False,
@@ -1493,7 +1527,7 @@ class BrowserTool:
                     return ToolResult(
                         content="browser state could not be observed before the target action",
                         is_error=True,
-                        metadata=_campaign_pre_dispatch_rejection_metadata(
+                        metadata=pre_dispatch_metadata(
                             effect=self.effect,
                             failure_code="state_scope_before_unavailable",
                             retryable=True,
@@ -1548,7 +1582,7 @@ class BrowserTool:
                     "the target was not called and passive re-observation is required"
                 ),
                 is_error=True,
-                metadata=_campaign_pre_dispatch_rejection_metadata(
+                metadata=pre_dispatch_metadata(
                     effect=self.effect,
                     failure_code="compiled_browser_adapter_required",
                     retryable=False,
@@ -1664,7 +1698,7 @@ class BrowserTool:
                 ),
                 is_error=True,
                 metadata=(
-                    _campaign_pre_dispatch_rejection_metadata(
+                    pre_dispatch_metadata(
                         effect=self.effect,
                         target=session.bounds.target_id,
                     )
@@ -2234,6 +2268,14 @@ class BrowserTool:
                 )
             ),
         }
+        if requested_reobservation_tab_ref is not None:
+            metadata.update(
+                {
+                    "target_reobservation_tab_rebound": True,
+                    "requested_tab_ref": requested_reobservation_tab_ref,
+                    "resolved_tab_ref": action.tab_ref,
+                }
+            )
         if (
             state_scope is not None
             and kind in _GENERIC_TARGET_EFFECT_KINDS

@@ -2141,6 +2141,200 @@ async def test_stale_campaign_navigate_attests_zero_dispatch_before_session_act(
 
 
 @pytest.mark.asyncio
+async def test_target_reobservation_snapshot_rebinds_one_open_tab_and_attests_session() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+    observed_tabs: list[str] = []
+
+    class Session:
+        context_id = "reobservation-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "persistent"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref="tab:current",
+                        state="open",
+                        url="https://target.example/current",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del frame_ref
+            observed_tabs.append(tab_ref)
+            if tab_ref != "tab:current":
+                raise BrowserBoundaryError("stale campaign tab")
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id="target",
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                step=step,
+            )
+
+        async def act(self, action, *, actor_id):
+            del actor_id
+            assert action.kind == "snapshot"
+            return await self.snapshot(action.tab_ref, action.frame_ref, step=action.step)
+
+    result = await BrowserTool(
+        "browser_snapshot",
+        lambda _: Session(),
+        state_scope_store=scope_store,
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:reobservation",
+            call_id="call:reobservation",
+            agent_id="campaign:reobservation/worker-1",
+            technique_attempt_id="attempt:reobservation",
+            target_id="target",
+            expected_target_session_id="browser:reobservation-context",
+            target_reobservation_generation_id="sha256:" + "a" * 64,
+            target_reobservation_event_set_digest="sha256:" + "b" * 64,
+        ),
+        {"tab_ref": "tab:stale", "step": 1},
+    )
+
+    assert result.is_error is False
+    assert result.metadata["target_session_id"] == "browser:reobservation-context"
+    assert result.metadata["target_reobservation_tab_rebound"] is True
+    assert result.metadata["requested_tab_ref"] == "tab:stale"
+    assert result.metadata["resolved_tab_ref"] == "tab:current"
+    assert observed_tabs == ["tab:current", "tab:current"]
+
+
+@pytest.mark.parametrize("open_tabs", [(), ("tab:one", "tab:two")], ids=("zero", "multiple"))
+@pytest.mark.asyncio
+async def test_target_reobservation_snapshot_does_not_guess_without_one_open_tab(
+    open_tabs: tuple[str, ...],
+) -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+    observed_tabs: list[str] = []
+
+    class Session:
+        context_id = "reobservation-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "persistent"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(
+                tabs=tuple(
+                    SimpleNamespace(
+                        tab_ref=tab_ref,
+                        state="open",
+                        url="https://target.example/current",
+                    )
+                    for tab_ref in open_tabs
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del frame_ref, step
+            observed_tabs.append(tab_ref)
+            raise BrowserBoundaryError("stale campaign tab")
+
+    result = await BrowserTool(
+        "browser_snapshot",
+        lambda _: Session(),
+        state_scope_store=scope_store,
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:reobservation",
+            call_id="call:reobservation",
+            agent_id="campaign:reobservation/worker-1",
+            technique_attempt_id="attempt:reobservation",
+            target_id="target",
+            expected_target_session_id="browser:reobservation-context",
+            target_reobservation_generation_id="sha256:" + "a" * 64,
+            target_reobservation_event_set_digest="sha256:" + "b" * 64,
+        ),
+        {"tab_ref": "tab:stale", "step": 1},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "state_scope_before_unavailable"
+    assert result.metadata["target_session_id"] == "browser:reobservation-context"
+    assert result.metadata.get("target_reobservation_tab_rebound") is not True
+    assert observed_tabs == ["tab:stale"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_campaign_snapshot_does_not_rebind_one_open_tab() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+    observed_tabs: list[str] = []
+
+    class Session:
+        context_id = "ordinary-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "persistent"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref="tab:current",
+                        state="open",
+                        url="https://target.example/current",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del frame_ref, step
+            observed_tabs.append(tab_ref)
+            raise BrowserBoundaryError("stale campaign tab")
+
+    result = await BrowserTool(
+        "browser_snapshot",
+        lambda _: Session(),
+        state_scope_store=scope_store,
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:ordinary",
+            call_id="call:ordinary",
+            agent_id="campaign:ordinary/worker-1",
+            technique_attempt_id="attempt:ordinary",
+            target_id="target",
+            expected_target_session_id="browser:ordinary-context",
+        ),
+        {"tab_ref": "tab:stale", "step": 1},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "state_scope_before_unavailable"
+    assert "target_session_id" not in result.metadata
+    assert observed_tabs == ["tab:stale"]
+
+
+@pytest.mark.asyncio
 async def test_raw_browser_action_does_not_deliver_when_global_scope_lease_fails() -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events)
