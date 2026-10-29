@@ -619,6 +619,10 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
             "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
             True,
         ),
+        (
+            "Assess https://a.test while logged in and continue testing for authorization bypass.",
+            True,
+        ),
     ],
 )
 async def test_backend_handback_continuation_is_target_aware(

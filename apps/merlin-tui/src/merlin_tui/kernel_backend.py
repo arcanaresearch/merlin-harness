@@ -49,6 +49,7 @@ from .operator_tools import (
     _has_url_candidate,
     _is_recon_handback_continuation,
     _latest_campaign_request_scope,
+    _looks_like_campaign_request,
     _primary_target,
     campaign_submit_envelope,
     new_campaign_request_id,
@@ -303,11 +304,16 @@ class KernelBackend:
                 if active_boundary.state == "none"
                 else None
             )
-        continuation_matches_active = _is_campaign_continuation_prompt(prompt) and (
-            not continuation_has_url
-            or (
-                active_campaign_objective is not None
-                and continuation_target == _primary_target(active_campaign_objective)
+        explicit_campaign_request = _looks_like_campaign_request(prompt)
+        continuation_matches_active = (
+            not explicit_campaign_request
+            and _is_campaign_continuation_prompt(prompt)
+            and (
+                not continuation_has_url
+                or (
+                    active_campaign_objective is not None
+                    and continuation_target == _primary_target(active_campaign_objective)
+                )
             )
         )
         operator_campaign_objective = (

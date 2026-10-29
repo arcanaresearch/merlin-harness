@@ -460,6 +460,7 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
         "Signed in at https://b.test. Hand the browser back and continue reconnaissance.",
         "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
         "Signed in at ftp://a.test. Hand the browser back and continue reconnaissance.",
+        "Assess https://a.test while logged in and continue testing for authorization bypass.",
         "Explain current runtime status",
     ],
 )
@@ -486,6 +487,35 @@ async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
 
     assert result.is_error
     assert delegate.calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_campaign_intent_outranks_same_target_handback_cues() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = (
+        "Assess https://a.test while logged in and continue testing for authorization bypass."
+    )
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": "00000000-0000-4000-8000-000000000078",
+                "status": "configured",
+                "settings": {"objective": objective_a, "campaign_profile": "exhaustive"},
+            },
+        ),
+        ChatMessage(role="user", content=objective_b),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(context(), {})
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert "campaign_request_id" not in receipt
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
 
 
 @pytest.mark.asyncio
@@ -1310,6 +1340,55 @@ async def test_profile_annotation_parser_ignores_spoof_inside_v2_objective() -> 
 
     assert not result.is_error
     assert json.loads(result.content)["settings"]["campaign_profile"] == "exhaustive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_profile", [None, "quickscan"])
+async def test_identical_v2_retry_retains_earliest_profile_epoch(
+    later_profile: str | None,
+) -> None:
+    objective = "Assess https://b.test"
+    request_id = "00000000-0000-4000-8000-000000000079"
+    envelope = campaign_submit_envelope(objective, campaign_request_id=request_id)
+    messages = [
+        ChatMessage(
+            role="user",
+            content=(
+                objective
+                + "\n"
+                + envelope
+                + "\nThe operator explicitly selected campaign profile: exhaustive; "
+                "do not ask for the profile again. Budget: 12 turns. "
+                "Composition: autonomous."
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            content="Retry the exact CLI submission.\n" + envelope,
+        ),
+    ]
+    if later_profile is not None:
+        messages.append(
+            ChatMessage(
+                role="user",
+                content=(
+                    "Retry with the updated client selection.\n"
+                    + envelope
+                    + f"\nThe operator explicitly selected campaign profile: {later_profile}; "
+                    "do not ask for the profile again."
+                ),
+            )
+        )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(messages))).invoke(
+        context(), {}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == request_id
+    assert receipt["settings"]["objective"] == objective
+    assert receipt["settings"]["campaign_profile"] == (later_profile or "exhaustive")
 
 
 @pytest.mark.asyncio

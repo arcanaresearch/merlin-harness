@@ -222,12 +222,19 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
                     active_objective = None
                     continue
                 request_objectives[request_id] = objective_digest
+                epoch_start = (
+                    boundary.message_index
+                    if boundary.state == "v2"
+                    and boundary.request_id == request_id
+                    and boundary.objective_digest == objective_digest
+                    else index
+                )
                 boundary = _CampaignBoundary(
                     "v2",
                     request_id,
                     objective_digest,
                     objective,
-                    index,
+                    epoch_start,
                 )
             else:
                 boundary = _CampaignBoundary("unbound", objective=objective, message_index=index)
@@ -241,16 +248,16 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
             active_objective = message.content.strip()
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
+        if _looks_like_campaign_request(message.content):
+            active_objective = message.content.strip()
+            boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
+            continue
         if _is_recon_handback_continuation(message.content):
             target = _primary_target(message.content)
             if not _has_url_candidate(message.content) or (
                 active_objective is not None and target == _primary_target(active_objective)
             ):
                 continue
-            active_objective = message.content.strip()
-            boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
-            continue
-        if _looks_like_campaign_request(message.content):
             active_objective = message.content.strip()
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
