@@ -5,6 +5,7 @@ from .knowledge import (
     KnowledgePack,
     knowledge_catalogue,
     load_knowledge_packs,
+    policy_control_catalogue,
     select_knowledge,
 )
 from .parser import load_pack, parse_case, parse_manifest
@@ -21,6 +22,7 @@ __all__ = [
     "KnowledgeSearchTool",
     "knowledge_catalogue",
     "load_knowledge_packs",
+    "policy_control_catalogue",
     "select_knowledge",
     "load_pack",
     "parse_case",

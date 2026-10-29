@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any
 
+from merlin_contracts import PolicyControl, PolicyControlEnvelope
+
 from ._bundle_crypto import decrypt_builtin_pack
 
 PACK_FILES = (
@@ -88,6 +90,22 @@ def knowledge_catalogue() -> tuple[dict[str, Any], ...]:
     )
 
 
+def policy_control_catalogue() -> tuple[PolicyControlEnvelope, ...]:
+    """Return authenticated, machine-validated policy controls."""
+    return tuple(
+        PolicyControlEnvelope(
+            pack_id=entry.pack_id,
+            pack_version=entry.pack_version,
+            pack_digest=entry.pack_digest,
+            entry_digest=entry.entry_digest,
+            control=PolicyControl.model_validate_json(entry.content),
+        )
+        for pack in load_knowledge_packs()
+        for entry in pack.entries
+        if entry.kind == "compliance_control"
+    )
+
+
 def select_knowledge(
     objective: str, *, limit: int = MAX_SELECTED_ENTRIES
 ) -> tuple[KnowledgeEntry, ...]:
@@ -122,6 +140,13 @@ def _load_pack(payload: str) -> KnowledgePack:
         entry_id, entry_digest = _required_string(raw, "entry_id"), _digest(raw, "digest")
         if "sha256:" + hashlib.sha256(content.encode()).hexdigest() != entry_digest:
             raise ValueError(f"knowledge entry {entry_id} digest mismatch")
+        kind = _required_string(raw, "kind")
+        if kind == "compliance_control":
+            control = PolicyControl.model_validate_json(content)
+            if control.control_id != entry_id:
+                raise ValueError(
+                    f"policy control {control.control_id} does not match entry {entry_id}"
+                )
         parsed.append(
             KnowledgeEntry(
                 pack_id,
@@ -129,7 +154,7 @@ def _load_pack(payload: str) -> KnowledgePack:
                 pack_digest,
                 entry_id,
                 entry_digest,
-                _required_string(raw, "kind"),
+                kind,
                 content,
                 _strings(raw, "specialist_tags"),
                 _strings(raw, "target_tags"),

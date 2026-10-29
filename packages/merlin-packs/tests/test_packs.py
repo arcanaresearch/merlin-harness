@@ -1,3 +1,4 @@
+import hashlib
 import json
 import zipfile
 from importlib.util import module_from_spec, spec_from_file_location
@@ -14,9 +15,11 @@ from merlin_packs import (
     knowledge_catalogue,
     load_knowledge_packs,
     load_pack,
+    policy_control_catalogue,
     select_knowledge,
 )
 from merlin_packs._bundle_crypto import decrypt_builtin_pack
+from merlin_packs.knowledge import _load_pack
 
 
 def _write_pack(root: Path, pack_id: str = "demo") -> Path:
@@ -207,6 +210,23 @@ def test_compliance_controls_require_reviewed_bindings_and_independent_evidence(
         "synthetic_only"
     )
     assert controls["compliance.privacy.subject-isolation"]["test_data_class"] == ("synthetic_only")
+    typed_controls = policy_control_catalogue()
+    assert {item.control.control_id for item in typed_controls} == set(controls)
+    assert all(item.pack_id == "com.merlin.compliance-controls" for item in typed_controls)
+    assert all(item.pack_digest.startswith("sha256:") for item in typed_controls)
+
+
+def test_compliance_control_identity_must_match_its_authenticated_entry() -> None:
+    source = Path(__file__).parents[1] / "src/merlin_packs/knowledge/compliance-controls.rpk"
+    pack = json.loads(source.read_text(encoding="utf-8"))
+    entry = pack["entries"][0]
+    content = json.loads(entry["content"])
+    content["control_id"] = "compliance.unrelated"
+    entry["content"] = json.dumps(content, separators=(",", ":"))
+    entry["digest"] = "sha256:" + hashlib.sha256(entry["content"].encode()).hexdigest()
+
+    with pytest.raises(ValueError, match="does not match entry"):
+        _load_pack(json.dumps(pack))
 
 
 def test_resource_exhaustion_frontier_is_explicit_and_safely_bounded() -> None:

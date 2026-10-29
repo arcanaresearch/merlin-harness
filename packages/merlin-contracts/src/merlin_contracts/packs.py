@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PackContract(BaseModel):
@@ -51,6 +51,64 @@ class AttackPack(PackContract):
     tags: list[str] = Field(default_factory=list)
     turn_limit: int = Field(default=1, ge=1)
     success_hints: list[str] = Field(default_factory=list)
+
+
+class PolicyControl(PackContract):
+    """A reviewed policy risk that requires target-specific evidence to evaluate."""
+
+    control_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    authority_type: Literal["organization_policy"]
+    rule: str = Field(min_length=1)
+    binding_required: list[str] = Field(min_length=1)
+    attack_objectives: list[str] = Field(min_length=1)
+    benign_controls: list[str] = Field(min_length=1)
+    confirm_when: list[str] = Field(min_length=1)
+    inconclusive_when: list[str] = Field(min_length=1)
+    evidence_requirements: list[str] = Field(min_length=1)
+    required_oracle_class: str = Field(min_length=1)
+    test_data_class: Literal["synthetic_only", "synthetic_or_operator_reviewed_only"]
+    absence_authority: Literal["bounded_only"]
+    limitations: str = Field(min_length=1)
+    reporting: str = Field(min_length=1)
+
+    @field_validator(
+        "control_id",
+        "title",
+        "rule",
+        "required_oracle_class",
+        "limitations",
+        "reporting",
+    )
+    @classmethod
+    def require_non_blank_value(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("policy-control values must not be blank")
+        return value
+
+    @field_validator(
+        "binding_required",
+        "attack_objectives",
+        "benign_controls",
+        "confirm_when",
+        "inconclusive_when",
+        "evidence_requirements",
+    )
+    @classmethod
+    def require_non_blank_items(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("policy-control list items must not be blank")
+        return value
+
+
+class PolicyControlEnvelope(PackContract):
+    """Authenticated knowledge-pack identity bound to one policy control."""
+
+    pack_id: str = Field(min_length=1)
+    pack_version: str = Field(min_length=1)
+    pack_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    entry_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    control: PolicyControl
 
 
 class TargetProfile(PackContract):

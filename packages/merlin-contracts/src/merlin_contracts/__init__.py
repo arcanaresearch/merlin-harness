@@ -153,6 +153,8 @@ from .packs import (
     PackRunStatus,
     PackTurn,
     PackTurnRole,
+    PolicyControl,
+    PolicyControlEnvelope,
     TargetProfile,
 )
 from .promotion import (
@@ -338,6 +340,8 @@ __all__ = [
     "PackRunStatus",
     "PackTurn",
     "PackTurnRole",
+    "PolicyControl",
+    "PolicyControlEnvelope",
     "PartialComplianceSignal",
     "Provider",
     "ProviderFailureKind",

@@ -8078,6 +8078,7 @@ def build_backend(
                             "enabled_skills": enabled_names,
                             "pack_techniques": tuple(item.id for item in techniques),
                             "knowledge_packs": inputs.get("knowledge_catalogue", ()),
+                            "policy_controls": inputs.get("policy_controls", ()),
                             "selected_knowledge": inputs.get("selected_knowledge", ()),
                             "available_tools": available_tools,
                             "rule": (

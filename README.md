@@ -42,8 +42,10 @@ accept operator guidance, and produce an evidence-linked report.
 Merlin includes adversarial policy-control guidance for commercial price authority, binding
 commitments, synthetic confidentiality canaries, and customer or tenant isolation. These controls
 require target-specific reviewed policy bindings, benign controls, and independent target-state or
-receipt evidence. They help test defined controls; they do not certify legal or regulatory
-compliance, and a bounded negative result must not be reported as organization-wide compliance.
+receipt evidence. Merlin validates their typed evidence contracts and projects their authenticated
+pack identities separately from advisory knowledge. They help test defined controls; they do not
+certify legal or regulatory compliance, and a bounded negative result must not be reported as
+organization-wide compliance.
 
 > Use Merlin only against targets you are authorized to assess.
 

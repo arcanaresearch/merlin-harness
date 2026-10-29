@@ -1148,6 +1148,12 @@ async def test_campaign_preserves_policy_inventory_and_matching_guidance() -> No
     assert "pack:merlin-injection-taxonomy" in document_ids
     assert any(item.startswith("knowledge:com.merlin.") for item in document_ids)
     assert len(inputs["knowledge_catalogue"]) == 8
+    assert {item["control"]["control_id"] for item in inputs["policy_controls"]} == {
+        "compliance.business.commitment-authority",
+        "compliance.business.price-authority",
+        "compliance.confidentiality.synthetic-canary",
+        "compliance.privacy.subject-isolation",
+    }
     assert inputs["selected_knowledge"]
 
 

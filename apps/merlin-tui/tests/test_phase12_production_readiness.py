@@ -2097,6 +2097,7 @@ Preserve attributable evidence and reviewed authority.
             )
             inventory_value = json.loads(inventory.content)
             assert len(inventory_value["knowledge_packs"]) == 8
+            assert len(inventory_value["policy_controls"]) == 4
             assert "browser_end_owned_session" not in inventory_value["available_tools"]
             assert "browser_end_owned_session" not in prepared.manifest.tool_ids
             assert "browser_end_owned_session" not in prepared.assignment_context.tool_ids

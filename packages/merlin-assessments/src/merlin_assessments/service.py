@@ -33,7 +33,12 @@ from merlin_contracts.target_adapter_compiler import (
     compiled_target_adapter_digest,
     read_target_adapter,
 )
-from merlin_packs import PackCatalog, knowledge_catalogue, select_knowledge
+from merlin_packs import (
+    PackCatalog,
+    knowledge_catalogue,
+    policy_control_catalogue,
+    select_knowledge,
+)
 from merlin_providers import ProviderConfig, TargetProviderFactory
 from merlin_storage_postgres import PostgresPackStore
 
@@ -472,6 +477,9 @@ class AssessmentService:
             "documents": list(document_by_id.values()),
             "techniques": techniques,
             "knowledge_catalogue": knowledge_catalogue(),
+            "policy_controls": tuple(
+                item.model_dump(mode="json") for item in policy_control_catalogue()
+            ),
             "selected_knowledge": tuple(
                 {
                     "pack_id": entry.pack_id,
