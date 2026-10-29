@@ -13120,7 +13120,14 @@ def test_hybrid_mode_requires_browser_context_transport() -> None:
 
 
 async def test_campaign_service_seals_explicit_budget_into_review() -> None:
-    store = Store()
+    class StatusStore(Store):
+        def list_waves(self, campaign_id):
+            return []
+
+        def list_lead(self, campaign_id):
+            return []
+
+    store = StatusStore()
     requested = AssignmentBudget(50, 100_000, 3_600)
 
     async def budgeted_preparation(session_id, objective, profile, adapter, budget):
@@ -13158,6 +13165,14 @@ async def test_campaign_service_seals_explicit_budget_into_review() -> None:
 
     assert review["review"]["budget"] == {
         "turns": 50,
+        "tokens": 100_000,
+        "seconds": 3_600,
+        "cost_usd": None,
+    }
+    status = await service.status(str(review["campaign_id"]))
+    assert status["budget"]["reviewed_limits"] == review["review"]["budget"]
+    assert status["budget"]["limits"] == {
+        "turns": None,
         "tokens": 100_000,
         "seconds": 3_600,
         "cost_usd": None,

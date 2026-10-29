@@ -1187,7 +1187,15 @@ async def _submit_campaign(arguments: list[str]) -> None:
                             "durable prepared campaign manifest digest is inconsistent"
                         )
                     budget_state = status.get("budget")
-                    budget = budget_state.get("limits") if isinstance(budget_state, dict) else None
+                    budget = None
+                    if isinstance(budget_state, dict):
+                        budget = (
+                            budget_state.get("reviewed_limits")
+                            if "reviewed_limits" in budget_state
+                            # Compatibility with daemons that predate the distinct
+                            # reviewed/runtime budget projections.
+                            else budget_state.get("limits")
+                        )
                     durable_review = {
                         "campaign_id": campaign_id,
                         "manifest_digest": list_digest,

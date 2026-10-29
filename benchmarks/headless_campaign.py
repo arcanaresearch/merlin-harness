@@ -231,6 +231,14 @@ def _budget_projection(value: object) -> Mapping[str, object] | None:
     if isinstance(value, Mapping):
         budget = value.get("budget")
         if isinstance(budget, Mapping):
+            if "reviewed_limits" in budget:
+                reviewed = budget.get("reviewed_limits")
+                if not isinstance(reviewed, Mapping):
+                    raise BenchmarkFailure("campaign reviewed budget projection is malformed")
+                return reviewed
+            limits = budget.get("limits")
+            if isinstance(limits, Mapping):
+                return limits
             return budget
         review = value.get("review")
         if isinstance(review, Mapping) and isinstance(review.get("budget"), Mapping):
@@ -274,7 +282,9 @@ def _validate_campaign_binding(
     if row_digest is not None and status_digest is not None and row_digest != status_digest:
         raise BenchmarkFailure("campaign inventory and status disagree on the manifest digest")
     if limits:
-        budget = _budget_projection(status) or _budget_projection(row)
+        budget = _budget_projection(status)
+        if budget is None:
+            budget = _budget_projection(row)
         if budget is None:
             raise BenchmarkFailure("campaign omitted the selected benchmark budget")
         for name, expected in limits.items():

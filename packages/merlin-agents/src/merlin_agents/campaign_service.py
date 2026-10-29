@@ -20873,7 +20873,18 @@ class CampaignService:
             "capability_probes": completion_document["capability_probes"],
             "observed_capability_surfaces": observed_capability_surfaces,
             "saturation_decision": saturation_decision,
-            "budget": budget,
+            "budget": {
+                **budget,
+                # Aggregate runtime limits intentionally treat turns as
+                # telemetry-only. Approval and audit need the immutable values
+                # sealed into the reviewed manifest, including max_turns.
+                "reviewed_limits": {
+                    "turns": manifest.budget.max_turns,
+                    "tokens": manifest.budget.max_tokens,
+                    "seconds": manifest.budget.max_seconds,
+                    "cost_usd": manifest.budget.max_cost_usd,
+                },
+            },
             "service_objectives": service_objectives,
             "objective_phase_gates": objective_phase_gates,
             **(

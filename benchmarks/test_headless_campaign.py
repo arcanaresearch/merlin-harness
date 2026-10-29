@@ -167,6 +167,50 @@ def test_mismatched_manifest_is_rejected() -> None:
         )
 
 
+def test_campaign_binding_prefers_reviewed_limits_over_runtime_limits() -> None:
+    headless._validate_campaign_binding(
+        _row(),
+        _status(
+            review={},
+            budget={
+                "limits": {"turns": None},
+                "reviewed_limits": {"turns": 8},
+            },
+        ),
+        objective="Assess https://benchmark.test exactly",
+        profile="recommended",
+        composition="autonomous",
+        limits={"turns": 8},
+    )
+
+
+@pytest.mark.parametrize(
+    ("reviewed_limits", "match"),
+    [
+        ([], "reviewed budget projection is malformed"),
+        ({}, "budget drifted"),
+    ],
+)
+def test_campaign_binding_rejects_invalid_reviewed_limits(
+    reviewed_limits: object, match: str
+) -> None:
+    with pytest.raises(headless.BenchmarkFailure, match=match):
+        headless._validate_campaign_binding(
+            _row(),
+            _status(
+                review={},
+                budget={
+                    "limits": {"turns": 8},
+                    "reviewed_limits": reviewed_limits,
+                },
+            ),
+            objective="Assess https://benchmark.test exactly",
+            profile="recommended",
+            composition="autonomous",
+            limits={"turns": 8},
+        )
+
+
 @pytest.mark.parametrize(
     ("row", "status", "match"),
     [

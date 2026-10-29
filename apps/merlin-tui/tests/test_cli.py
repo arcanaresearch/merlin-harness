@@ -25,9 +25,13 @@ def _install_durable_campaign(
     digest: str = "sha256:reviewed",
     profile: str = "recommended",
     budget: dict[str, object] | None = None,
+    runtime_budget: dict[str, object] | None = None,
     composition: str | None = None,
     execute: bool = True,
 ):
+    reviewed_budget = {} if budget is None else budget
+    runtime_limits = reviewed_budget if runtime_budget is None else runtime_budget
+
     class Client:
         def __init__(self) -> None:
             self.build_calls = 0
@@ -61,7 +65,10 @@ def _install_durable_campaign(
                 "campaign_id": campaign_id,
                 "status": "executing" if self.approved and execute else "prepared",
                 "manifest_digest": digest,
-                "budget": {"limits": {} if budget is None else budget},
+                "budget": {
+                    "limits": runtime_limits,
+                    "reviewed_limits": reviewed_budget,
+                },
                 **({"specialist_composition": composition} if composition is not None else {}),
             }
 
@@ -1067,6 +1074,153 @@ def test_campaign_approve_does_not_wait_for_open_preparation_stream(monkeypatch)
     main()
 
     assert client.execute_calls == [("campaign/waiting", "sha256:reviewed")]
+
+
+@pytest.mark.asyncio
+async def test_campaign_approve_uses_durable_reviewed_budget_when_runtime_turns_are_telemetry_only(
+    monkeypatch,
+) -> None:
+    objective = "Assess durable budget target"
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=objective,
+        campaign_id="campaign/durable-budget",
+        budget={
+            "turns": 500,
+            "tokens": 2_000_000,
+            "seconds": 21_600,
+            "cost_usd": None,
+        },
+        runtime_budget={
+            "turns": None,
+            "tokens": 2_000_000,
+            "seconds": 21_600,
+            "cost_usd": None,
+        },
+    )
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        if prompt.startswith(objective):
+            await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    from merlin_tui.cli import _submit_campaign
+
+    await asyncio.wait_for(
+        _submit_campaign(
+            [
+                "--approve",
+                "--max-turns",
+                "500",
+                "--max-tokens",
+                "2000000",
+                "--max-seconds",
+                "21600",
+                objective,
+            ]
+        ),
+        timeout=0.5,
+    )
+
+    assert client.list_calls >= 2
+    assert client.execute_calls == [("campaign/durable-budget", "sha256:reviewed")]
+    assert client.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_campaign_approve_rejects_malformed_durable_reviewed_budget(
+    monkeypatch,
+) -> None:
+    objective = "Assess malformed durable budget"
+    expected_budget = {
+        "turns": 500,
+        "tokens": 2_000_000,
+        "seconds": 21_600,
+        "cost_usd": None,
+    }
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=objective,
+        campaign_id="campaign/malformed-durable-budget",
+        budget=expected_budget,
+    )
+    campaign_status = client.campaign_status
+
+    async def malformed_campaign_status(campaign_id):
+        status = await campaign_status(campaign_id)
+        status["budget"]["reviewed_limits"] = []
+        return status
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        if prompt.startswith(objective):
+            await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(client, "campaign_status", malformed_campaign_status)
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    from merlin_tui.cli import _submit_campaign
+
+    with pytest.raises(SystemExit, match="omitted the explicit provider/model budget"):
+        await asyncio.wait_for(
+            _submit_campaign(
+                [
+                    "--approve",
+                    "--max-turns",
+                    "500",
+                    "--max-tokens",
+                    "2000000",
+                    "--max-seconds",
+                    "21600",
+                    objective,
+                ]
+            ),
+            timeout=0.5,
+        )
+
+    assert client.execute_calls == []
+
+
+@pytest.mark.asyncio
+async def test_campaign_approve_accepts_legacy_status_budget_when_reviewed_limits_are_absent(
+    monkeypatch,
+) -> None:
+    objective = "Assess legacy durable budget"
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective=objective,
+        campaign_id="campaign/legacy-durable-budget",
+        budget={"turns": 50},
+    )
+    campaign_status = client.campaign_status
+
+    async def legacy_campaign_status(campaign_id):
+        status = await campaign_status(campaign_id)
+        del status["budget"]["reviewed_limits"]
+        return status
+
+    async def print_stream(prompt, *, approve_once=False, stop_after_tool=None, concise=False):
+        if prompt.startswith(objective):
+            await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(client, "campaign_status", legacy_campaign_status)
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    from merlin_tui.cli import _submit_campaign
+
+    await asyncio.wait_for(
+        _submit_campaign(
+            [
+                "--approve",
+                "--max-turns",
+                "50",
+                objective,
+            ]
+        ),
+        timeout=0.5,
+    )
+
+    assert client.execute_calls == [("campaign/legacy-durable-budget", "sha256:reviewed")]
 
 
 def test_campaign_approve_bounds_polling_client_cleanup_before_direct_execution(

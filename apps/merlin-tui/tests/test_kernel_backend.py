@@ -2002,7 +2002,12 @@ def _sealed_review_row():
     )
     from merlin_agents.campaign_service import _json_value, _reviewed_preparation_digest
 
-    budget = AssignmentBudget()
+    budget = AssignmentBudget(
+        max_turns=12,
+        max_tokens=120_000,
+        max_seconds=900,
+        max_cost_usd=3.0,
+    )
     manifest = CampaignManifest.create(
         id="campaign/recovery",
         session_id="session-recovery",
@@ -2061,6 +2066,12 @@ async def test_saved_review_recovers_sealed_plan_after_truncated_transcript():
     backend = KernelBackend(kernel, campaigns=campaigns)
     restored = await backend._saved_campaign_review(row["id"], row["manifest_digest"])
     assert restored["review"]["recovered_fields"]["Agent composition"] == "autonomous"
+    assert restored["review"]["budget"] == {
+        "turns": 12,
+        "tokens": 120_000,
+        "seconds": 900,
+        "cost_usd": 3.0,
+    }
     assert restored["approval_required"] is True
     assert restored["manifest_digest"] == row["manifest_digest"]
     assert "secret-ref" not in json.dumps(restored)

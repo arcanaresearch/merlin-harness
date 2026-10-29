@@ -70,6 +70,12 @@ def recover_campaign_review(
         "profile": manifest.profile.value,
         "approval_required": True,
         "review": {
+            "budget": {
+                "turns": manifest.budget.max_turns,
+                "tokens": manifest.budget.max_tokens,
+                "seconds": manifest.budget.max_seconds,
+                "cost_usd": manifest.budget.max_cost_usd,
+            },
             "recovered_fields": fields,
             "target_contract": {"interface": manifest.target.interface, "execution_options": []},
         },
