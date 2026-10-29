@@ -938,7 +938,10 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
     assert calls == [
         ("/new", False, None, False),
         (
-            "Assess https://target.test\nThe operator explicitly selected campaign profile: "
+            "Assess https://target.test\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+            '{"operator_objective": "Assess https://target.test", '
+            '"schema_version": "merlin.cli-campaign-submit.v1"}\n'
+            "The operator explicitly selected campaign profile: "
             "recommended; do not ask for the profile again. Any max_* values below are "
             "provider/model campaign budgets, not target chat/message limits.\n"
             "The operator requested no provider/model campaign limits. Keep max_turns, "
@@ -2043,7 +2046,10 @@ def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch
     main()
 
     assert calls[1] == (
-        "Assess target\nThe operator explicitly selected campaign profile: recommended; "
+        "Assess target\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        '{"operator_objective": "Assess target", '
+        '"schema_version": "merlin.cli-campaign-submit.v1"}\n'
+        "The operator explicitly selected campaign profile: recommended; "
         "do not ask for the profile again. Any max_* values below are provider/model "
         "campaign budgets, not target chat/message limits.\n"
         "Seal this exact campaign budget into assessment_prepare: "

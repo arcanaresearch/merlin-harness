@@ -16,6 +16,8 @@ MessageLoader = Callable[[str], Awaitable[Sequence[ChatMessage]]]
 PROFILES = ("quickscan", "recommended", "exhaustive", "exploration")
 MODES = ("api", "browser", "hybrid")
 _URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+_CLI_CAMPAIGN_SUBMIT_MARKER = "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+_CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v1"
 READ_OPERATIONS = (
     "get_runtime_status",
     "list_campaigns",
@@ -111,12 +113,38 @@ def _operator_campaign_request(
 
     proposed = str(proposed_objective or "").strip()
     target_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(proposed)}
+    user_messages: list[str] = []
     for message in reversed(messages):
         if message.role != "user":
             continue
         content = message.content.strip()
         if content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
+        user_messages.append(content)
+
+    # Typed CLI provenance outranks later model-facing retry prompts. Those
+    # retries contain the same target URL but are internal orchestration, not a
+    # replacement operator objective.
+    for content in user_messages:
+        # The CLI appends this envelope after the exact objective. Use the final
+        # marker so operator-authored text that happens to mention the protocol
+        # token cannot shadow the authoritative envelope.
+        marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
+        if marker_index >= 0:
+            encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
+            try:
+                envelope, _end = json.JSONDecoder().raw_decode(encoded)
+            except (ValueError, TypeError):
+                envelope = None
+            if (
+                isinstance(envelope, Mapping)
+                and envelope.get("schema_version") == _CLI_CAMPAIGN_SUBMIT_SCHEMA
+                and isinstance(envelope.get("operator_objective"), str)
+                and envelope["operator_objective"].strip()
+            ):
+                return str(envelope["operator_objective"])
+
+    for content in user_messages:
         authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
         if (target_urls & authored_urls) or (not target_urls and len(authored_urls) == 1):
             return content

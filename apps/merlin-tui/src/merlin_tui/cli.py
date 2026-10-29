@@ -936,8 +936,17 @@ async def _submit_campaign(arguments: list[str]) -> None:
             "(orthogonal to the coverage profile); pass "
             f"specialist_composition={composition!r} to assessment_prepare; do not ask again."
         )
+    submit_envelope = json.dumps(
+        {
+            "schema_version": "merlin.cli-campaign-submit.v1",
+            "operator_objective": objective,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     preparation_prompt = (
-        f"{objective}\nThe operator explicitly selected campaign profile: {profile}; "
+        f"{objective}\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n{submit_envelope}\n"
+        f"The operator explicitly selected campaign profile: {profile}; "
         "do not ask for the profile again. Any max_* values below are provider/model "
         f"campaign budgets, not target chat/message limits.{budget_instruction}"
         f"{composition_instruction}"

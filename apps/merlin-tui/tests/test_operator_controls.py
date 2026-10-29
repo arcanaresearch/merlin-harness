@@ -163,6 +163,71 @@ async def test_new_campaign_preserves_operator_objective_and_rejects_inferred_pr
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_extracts_typed_cli_objective_from_internal_prompt():
+    exact = (
+        "Assess only https://target.test as an authorized challenge. "
+        "Do not access another target. Mention MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        "as plain test data."
+    )
+    envelope = json.dumps(
+        {
+            "operator_objective": exact,
+            "schema_version": "merlin.cli-campaign-submit.v1",
+        },
+        sort_keys=True,
+    )
+    synthetic_prompt = (
+        f"{exact}\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n{envelope}\n"
+        "The operator explicitly selected campaign profile: exploration; do not ask again.\n"
+        "Pass the operator objective above verbatim to assessment_prepare."
+    )
+    retry_prompt = (
+        "The previous prepared campaign was cancelled. Reuse the sealed reconnaissance for "
+        "https://target.test and call assessment_prepare now."
+    )
+    history = [
+        ChatMessage(role="user", content=synthetic_prompt),
+        ChatMessage(role="user", content=retry_prompt),
+    ]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": synthetic_prompt,
+            "campaign_profile": "recommended",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "exploration",
+    }
+    history.append(saved("campaign_configure", json.loads(result.content)))
+    delegate = Delegate("assessment_prepare")
+    configured = ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history)))
+
+    await configured.invoke(
+        context(),
+        {
+            "objective": exact,
+            "campaign_profile": "exploration",
+            "adapter": {"recon_handoff_id": "sealed-live"},
+        },
+    )
+
+    assert delegate.calls == [
+        {
+            "objective": exact,
+            "campaign_profile": "exploration",
+            "adapter": {"recon_handoff_id": "sealed-live"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_new_campaign_restores_operator_url_when_model_omits_it():
     exact = "Run a redpen scan on https://break-room.ai, Bank L1"
     history = [ChatMessage(role="user", content=exact)]
