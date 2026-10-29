@@ -5,6 +5,7 @@ from merlin_contracts import ChatMessage
 from merlin_tui.bootstrap import (
     _active_schedule_provider_assignment,
     _browser_target_objective,
+    _campaign_assignment_schedule_refs,
     _campaign_status_allows_provider,
     _same_schedule_id,
 )
@@ -65,6 +66,40 @@ def test_campaign_schedule_identity_accepts_uuid_retry_value() -> None:
 
     assert _same_schedule_id(value, UUID(value))
     assert not _same_schedule_id(value, UUID("e438c3ad-01dc-42e7-a9b7-ea48d9aa95d3"))
+
+
+def test_campaign_assignment_schedule_refs_include_authenticated_reobservation() -> None:
+    waves = (
+        {"schedule_id": "wave-1", "status": "completed"},
+        {"schedule_id": "wave-2", "status": "running"},
+    )
+
+    refs = _campaign_assignment_schedule_refs(
+        waves,
+        ("reobserve-1",),
+        schedule_id="reobserve-1",
+    )
+
+    assert refs == (
+        {
+            "schedule_id": "reobserve-1",
+            "status": "running",
+            "kind": "target_reobservation",
+        },
+    )
+
+
+def test_campaign_assignment_schedule_refs_do_not_invent_auxiliary_ownership() -> None:
+    waves = ({"schedule_id": "wave-1", "status": "running"},)
+
+    assert (
+        _campaign_assignment_schedule_refs(
+            waves,
+            (),
+            schedule_id="unreviewed-auxiliary",
+        )
+        == ()
+    )
 
 
 def test_campaign_provider_continues_only_during_acknowledged_settlement() -> None:

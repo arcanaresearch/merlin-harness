@@ -333,6 +333,43 @@ def _same_schedule_id(persisted: object, requested: object) -> bool:
     return bool(persisted and requested) and str(persisted) == str(requested)
 
 
+def _campaign_assignment_schedule_refs(
+    waves: Sequence[Mapping[str, object]],
+    target_reobservation_schedule_ids: Sequence[str],
+    *,
+    schedule_id: str | None,
+) -> tuple[Mapping[str, object], ...]:
+    """Return campaign-owned schedule references admitted for assignment lookup.
+
+    Target re-observation schedules are auxiliary scheduler work, not campaign
+    waves. Their IDs must already have been authenticated against the campaign
+    journal before they reach this projection.
+    """
+
+    references: list[Mapping[str, object]] = list(waves)
+    known = {
+        str(reference.get("schedule_id"))
+        for reference in references
+        if reference.get("schedule_id") is not None
+    }
+    references.extend(
+        {
+            "schedule_id": candidate,
+            "status": "running",
+            "kind": "target_reobservation",
+        }
+        for candidate in target_reobservation_schedule_ids
+        if candidate not in known
+    )
+    if schedule_id is not None:
+        return tuple(
+            reference
+            for reference in references
+            if _same_schedule_id(reference.get("schedule_id"), schedule_id)
+        )
+    return tuple(reversed(references))
+
+
 def _campaign_status_allows_provider(
     campaign: Mapping[str, object], *, allow_settlement_pause: bool
 ) -> bool:
@@ -4277,6 +4314,7 @@ def build_backend(
         plan_capability_probes,
     )
     from merlin_agents.lifecycle_recovery import DurableLifecycleRecovery
+    from merlin_agents.target_reobservation import target_reobservation_schedule_ids
     from merlin_agents.telemetry import (
         TelemetrySettings,
         configure_telemetry,
@@ -5024,14 +5062,23 @@ def build_backend(
             ):
                 return None
             waves = await asyncio.to_thread(campaign_store.list_waves, campaign_id)
-            matching_waves = (
-                tuple(
-                    wave
-                    for wave in waves
-                    if _same_schedule_id(wave.get("schedule_id"), schedule_id)
+            envelope = campaign.get("manifest")
+            reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+            target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+            target_id = target.get("id") if isinstance(target, Mapping) else None
+            reobservation_schedule_ids: tuple[str, ...] = ()
+            if isinstance(target_id, str) and target_id:
+                lead = await asyncio.to_thread(campaign_store.list_lead, campaign_id)
+                reobservation_schedule_ids = target_reobservation_schedule_ids(
+                    lead,
+                    campaign_id=campaign_id,
+                    session_id=str(session_id),
+                    target_id=target_id,
                 )
-                if schedule_id
-                else tuple(reversed(waves))
+            matching_waves = _campaign_assignment_schedule_refs(
+                waves,
+                reobservation_schedule_ids,
+                schedule_id=schedule_id,
             )
             for wave in matching_waves:
                 schedule = await asyncio.to_thread(
