@@ -1,6 +1,6 @@
 [project]
 name = "merlin-tools"
-version = "0.2.19"
+version = "0.2.20"
 description = "Tool broker and safe workspace tools for Merlin"
 requires-python = ">=3.13"
 dependencies = ["jsonschema>=4.26.0", "merlin-contracts", "merlin-permissions", "merlin-browser"]
