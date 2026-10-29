@@ -27,7 +27,7 @@ jobs:
           uv venv "$RUNNER_TEMP/merlin-wheel-smoke" --python 3.13
           uv pip install --python "$RUNNER_TEMP/merlin-wheel-smoke/bin/python" dist/wheels/*.whl
           "$RUNNER_TEMP/merlin-wheel-smoke/bin/merlin" --version
-          "$RUNNER_TEMP/merlin-wheel-smoke/bin/python" -c 'from merlin_packs.knowledge import knowledge_catalogue; assert len(knowledge_catalogue()) == 7'
+          "$RUNNER_TEMP/merlin-wheel-smoke/bin/python" -c 'from merlin_packs.knowledge import knowledge_catalogue; assert len(knowledge_catalogue()) == 8'
       - name: Run source regression tests
         run: >-
           uv run pytest

@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 LIVE_FLAG = "MERLIN_RUN_LIVE_BENCHMARK"
 AUTHORIZED_ORIGIN = "MERLIN_LIVE_AUTHORIZED_ORIGIN"
+AUTHORIZED_TARGET = "MERLIN_LIVE_AUTHORIZED_TARGET"
 EXECUTABLE = "MERLIN_LIVE_RELEASE_BINARY"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "paused"})
 REPORT_STATES = frozenset({"complete", "provisional", "incomplete"})
@@ -93,8 +94,24 @@ def _normalized_origin(value: str) -> str:
     return f"{scheme}://{parsed.hostname.casefold()}{port_suffix}"
 
 
-def authorized_executable(origin: str) -> Path:
-    """Require explicit live authorization for this normalized origin and binary."""
+def _canonical_target(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise BenchmarkFailure("benchmark target must be an HTTP(S) URL without userinfo")
+    origin = _normalized_origin(f"{parsed.scheme}://{parsed.netloc}")
+    return f"{origin}{parsed.path}"
+
+
+def authorized_executable(origin: str, target: str) -> Path:
+    """Require explicit live authorization for this exact target and binary."""
     if os.environ.get(LIVE_FLAG) != "1":
         raise BenchmarkFailure(f"set {LIVE_FLAG}=1 for a live benchmark")
     requested_origin = _normalized_origin(origin)
@@ -107,6 +124,16 @@ def authorized_executable(origin: str) -> Path:
         raise BenchmarkFailure(
             f"{AUTHORIZED_ORIGIN} must authorize the normalized origin {requested_origin!r}"
         )
+    requested_target = _canonical_target(target)
+    raw_authorized_target = os.environ.get(AUTHORIZED_TARGET, "")
+    try:
+        authorized_target = _canonical_target(raw_authorized_target)
+    except BenchmarkFailure:
+        authorized_target = ""
+    if authorized_target != requested_target:
+        raise BenchmarkFailure(
+            f"{AUTHORIZED_TARGET} must authorize the exact target {requested_target!r}"
+        )
     raw = os.environ.get(EXECUTABLE)
     if not raw:
         raise BenchmarkFailure(f"set {EXECUTABLE} to the release executable")
@@ -116,10 +143,11 @@ def authorized_executable(origin: str) -> Path:
     return binary.resolve()
 
 
-def _validate_objective_origin(origin: str, objective: str) -> None:
-    """Bind every URL in the live objective to the authorized origin."""
+def _validate_objective_origin(origin: str, target: str, objective: str) -> None:
+    """Bind every URL in the live objective to the authorized origin and exact target."""
     authorized_origin = _normalized_origin(origin)
-    urls = [urlsplit(value.rstrip(".,;:)]}")) for value in re.findall(r"https?://\S+", objective)]
+    raw_urls = [value.rstrip(".,;:)]}") for value in re.findall(r"https?://\S+", objective)]
+    urls = [urlsplit(value) for value in raw_urls]
     if not urls:
         raise BenchmarkFailure("the benchmark objective must name the authorized origin")
     try:
@@ -129,6 +157,14 @@ def _validate_objective_origin(origin: str, objective: str) -> None:
     if observed != {authorized_origin}:
         raise BenchmarkFailure(
             "every URL in the benchmark objective must use the authorized benchmark origin"
+        )
+    try:
+        observed_targets = {_canonical_target(value) for value in raw_urls}
+    except BenchmarkFailure as error:
+        raise BenchmarkFailure("the benchmark objective contains an invalid target URL") from error
+    if observed_targets != {_canonical_target(target)}:
+        raise BenchmarkFailure(
+            "every URL in the benchmark objective must equal the exact authorized target"
         )
 
 
@@ -377,8 +413,8 @@ async def run(
     launcher: Launcher = _launcher,
     client_factory: ClientFactory = _default_client_factory,
 ) -> dict[str, object]:
-    _validate_objective_origin(args.target_origin, args.objective)
-    binary = authorized_executable(args.target_origin)
+    _validate_objective_origin(args.target_origin, args.target_url, args.objective)
+    binary = authorized_executable(args.target_origin, args.target_url)
     owner: ControlClient | None = None
     owner_has_lease = False
     result: dict[str, object] | None = None
@@ -461,6 +497,7 @@ async def run(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-origin", required=True)
+    parser.add_argument("--target-url", required=True)
     parser.add_argument("--objective", required=True)
     parser.add_argument("--profile", default="recommended")
     parser.add_argument("--composition", default="autonomous")

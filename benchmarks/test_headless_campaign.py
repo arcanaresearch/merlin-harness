@@ -15,6 +15,8 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 DRIVER = Path(__file__).with_name("headless_campaign.py")
+TARGET = "https://benchmark.test/exact-task"
+LAKERA_TARGET = "https://play.lakera.ai/agent-breaker/email_tool_invocation"
 SPEC = importlib.util.spec_from_file_location("benchmark_headless_campaign", DRIVER)
 assert SPEC is not None and SPEC.loader is not None
 headless = importlib.util.module_from_spec(SPEC)
@@ -24,7 +26,8 @@ SPEC.loader.exec_module(headless)
 def _args(**overrides: object) -> argparse.Namespace:
     values: dict[str, object] = {
         "target_origin": "https://benchmark.test",
-        "objective": "Assess https://benchmark.test exactly",
+        "target_url": TARGET,
+        "objective": f"Assess {TARGET} exactly",
         "profile": "recommended",
         "composition": "autonomous",
         "max_turns": 8,
@@ -49,6 +52,7 @@ def _authorize(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     binary.chmod(0o700)
     monkeypatch.setenv(headless.LIVE_FLAG, "1")
     monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://benchmark.test")
+    monkeypatch.setenv(headless.AUTHORIZED_TARGET, TARGET)
     monkeypatch.setenv(headless.EXECUTABLE, str(binary))
     return binary
 
@@ -101,7 +105,7 @@ def _row(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "id": "campaign/new",
         "session_id": "session/new",
-        "objective": "Assess https://benchmark.test exactly",
+        "objective": f"Assess {TARGET} exactly",
         "profile": "recommended",
         "manifest_digest": "sha256:one",
         "budget": {"turns": 8},
@@ -126,24 +130,51 @@ def test_requires_exact_live_flag_normalized_origin_and_absolute_executable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     binary = _authorize(monkeypatch, tmp_path)
-    assert headless.authorized_executable("https://BENCHMARK.test:443/") == binary.resolve()
+    assert headless.authorized_executable("https://BENCHMARK.test:443/", TARGET) == binary.resolve()
     monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://other.test")
     with pytest.raises(headless.BenchmarkFailure, match="normalized origin"):
-        headless.authorized_executable("https://benchmark.test")
+        headless.authorized_executable("https://benchmark.test", TARGET)
     monkeypatch.setenv(headless.AUTHORIZED_ORIGIN, "https://benchmark.test")
     monkeypatch.setenv(headless.EXECUTABLE, "relative-merlin")
     with pytest.raises(headless.BenchmarkFailure, match="absolute executable"):
-        headless.authorized_executable("https://benchmark.test")
+        headless.authorized_executable("https://benchmark.test", TARGET)
+
+
+def test_exact_target_authorization_is_required_and_must_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _authorize(monkeypatch, tmp_path)
+    monkeypatch.delenv(headless.AUTHORIZED_TARGET)
+    with pytest.raises(headless.BenchmarkFailure, match=headless.AUTHORIZED_TARGET):
+        headless.authorized_executable("https://benchmark.test", TARGET)
+    monkeypatch.setenv(headless.AUTHORIZED_TARGET, "https://benchmark.test/another-task")
+    with pytest.raises(headless.BenchmarkFailure, match="exact target"):
+        headless.authorized_executable("https://benchmark.test", TARGET)
+
+
+def test_lakera_target_canonicalizes_to_the_exact_audited_url() -> None:
+    assert (
+        headless._canonical_target("https://PLAY.LAKERA.AI:443/agent-breaker/email_tool_invocation")
+        == LAKERA_TARGET
+    )
 
 
 def test_objective_is_bound_to_only_the_authorized_origin() -> None:
-    headless._validate_objective_origin(
-        "https://benchmark.test", "Assess https://benchmark.test/path"
-    )
+    headless._validate_objective_origin("https://benchmark.test", TARGET, f"Assess {TARGET}")
     with pytest.raises(headless.BenchmarkFailure, match="every URL"):
         headless._validate_objective_origin(
             "https://benchmark.test",
-            "Assess https://benchmark.test and https://other.test",
+            TARGET,
+            f"Assess {TARGET} and https://other.test/path",
+        )
+
+
+def test_objective_rejects_same_origin_wrong_path() -> None:
+    with pytest.raises(headless.BenchmarkFailure, match="exact authorized target"):
+        headless._validate_objective_origin(
+            "https://benchmark.test",
+            TARGET,
+            "Assess https://benchmark.test/wrong-task",
         )
 
 
@@ -160,7 +191,7 @@ def test_mismatched_manifest_is_rejected() -> None:
         headless._validate_campaign_binding(
             _row(),
             _status(manifest_digest="sha256:other"),
-            objective="Assess https://benchmark.test exactly",
+            objective=f"Assess {TARGET} exactly",
             profile="recommended",
             composition="autonomous",
             limits={"turns": 8},
@@ -177,7 +208,7 @@ def test_campaign_binding_prefers_reviewed_limits_over_runtime_limits() -> None:
                 "reviewed_limits": {"turns": 8},
             },
         ),
-        objective="Assess https://benchmark.test exactly",
+        objective=f"Assess {TARGET} exactly",
         profile="recommended",
         composition="autonomous",
         limits={"turns": 8},
@@ -204,7 +235,7 @@ def test_campaign_binding_rejects_invalid_reviewed_limits(
                     "reviewed_limits": reviewed_limits,
                 },
             ),
-            objective="Assess https://benchmark.test exactly",
+            objective=f"Assess {TARGET} exactly",
             profile="recommended",
             composition="autonomous",
             limits={"turns": 8},
@@ -231,7 +262,7 @@ def test_objective_profile_composition_and_budget_drift_fail_closed(
         headless._validate_campaign_binding(
             row,
             status,
-            objective="Assess https://benchmark.test exactly",
+            objective=f"Assess {TARGET} exactly",
             profile="recommended",
             composition="autonomous",
             limits={"turns": 8},
@@ -243,7 +274,7 @@ def test_campaign_requires_an_owning_session() -> None:
         headless._validate_campaign_binding(
             _row(session_id=""),
             _status(),
-            objective="Assess https://benchmark.test exactly",
+            objective=f"Assess {TARGET} exactly",
             profile="recommended",
             composition="autonomous",
             limits={"turns": 8},
@@ -393,7 +424,7 @@ async def test_public_submit_path_and_owned_restart_are_used(
         "--strict-objective",
         "--max-turns",
         "8",
-        "Assess https://benchmark.test exactly",
+        f"Assess {TARGET} exactly",
     )
     assert status_calls == 2
     assert first.shutdown_calls == 1
@@ -438,7 +469,7 @@ async def test_runner_and_real_cli_do_not_collide_on_foreground_lease(
     from merlin_tui.local_control import LocalControlClient, LocalControlTuning, serve
 
     socket_path = Path(f"/tmp/merlin-headless-{uuid4().hex[:12]}.sock")
-    objective = "Assess https://benchmark.test exactly"
+    objective = f"Assess {TARGET} exactly"
 
     class Backend:
         def __init__(self) -> None:

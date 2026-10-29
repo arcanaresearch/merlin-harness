@@ -59,6 +59,24 @@ cp -R "$build/dist/merlin-runtime" "$release_root/payload/merlin-runtime"
 cp -R "$assets" "$release_root/payload/playwright"
 mkdir -p "$release_root/payload/postgresql"
 cp -R "$postgres_source" "$release_root/payload/postgresql/$postgres_version"
+# pg0 can retain this legacy Redpen compatibility link inside the installation.
+# Remove only that audited self-named entry; the bundle contract rejects every
+# other absolute symlink instead of silently changing the PostgreSQL payload.
+legacy_postgres_link="$release_root/payload/postgresql/$postgres_version/$postgres_version"
+if [ -L "$legacy_postgres_link" ]; then
+  case $(readlink "$legacy_postgres_link") in
+    "$HOME"/.local/share/redpen/redpen-*-darwin-arm64/payload/postgresql/"$postgres_version")
+      rm -f -- "$legacy_postgres_link"
+      ;;
+    *)
+      echo "unexpected self-named PostgreSQL link: $legacy_postgres_link" >&2
+      exit 1
+      ;;
+  esac
+elif [ -e "$legacy_postgres_link" ]; then
+  echo "unexpected self-named PostgreSQL entry: $legacy_postgres_link" >&2
+  exit 1
+fi
 cp "$repository/dist/wheelhouse-manifest.json" "$release_root/manifest.json"
 cp "$repository/LICENSE" "$release_root/LICENSE"
 mkdir -p "$release_root/notices"
@@ -94,5 +112,6 @@ trap - EXIT HUP INT TERM
   --manifest "$release_root/manifest.json" --version "$version" \
   --name "$release_name" --platform darwin-arm64 --channel "$release_channel" \
   --binary "$release_root/merlin" --archive "$archive"
-shasum -a 256 "$archive" > "$archive.sha256"
+(cd "$(dirname "$archive")" && \
+  shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
 echo "$archive"

@@ -5,12 +5,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import posixpath
 import re
 import subprocess
 import tarfile
 from pathlib import Path
 
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.+-]*)?$")
+
+
+def _contained_archive_path(value: str, release_name: str) -> str:
+    if posixpath.isabs(value):
+        raise SystemExit(f"release archive contains absolute path: {value}")
+    normalized = posixpath.normpath(value)
+    if (
+        normalized in {".", ".."}
+        or posixpath.isabs(normalized)
+        or (normalized != release_name and not normalized.startswith(f"{release_name}/"))
+    ):
+        raise SystemExit(f"release archive contains path outside bundle: {value}")
+    return normalized
+
+
+def _archive_member_path(value: str, release_name: str) -> str:
+    if any(part in {".", ".."} for part in value.split("/")):
+        raise SystemExit(f"release archive contains unsafe path: {value}")
+    return _contained_archive_path(value, release_name)
 
 
 def stamp(manifest: Path, *, version: str, name: str, platform: str, channel: str) -> None:
@@ -49,6 +70,19 @@ def verify(
         raise SystemExit(f"release manifest mismatch: expected {expected!r}")
     if manifest.parent.name != name:
         raise SystemExit(f"release folder {manifest.parent.name!r} does not match {name!r}")
+    release_root = manifest.parent
+    for path in release_root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        link_target = os.readlink(path)
+        if posixpath.isabs(link_target):
+            raise SystemExit(f"release bundle contains absolute symlink: {path}")
+        relative_path = path.relative_to(release_root).as_posix()
+        lexical_target = posixpath.normpath(
+            posixpath.join(posixpath.dirname(relative_path), link_target)
+        )
+        if lexical_target == ".." or lexical_target.startswith("../"):
+            raise SystemExit(f"release bundle symlink escapes bundle: {path}")
     channel_path = manifest.parent / "release-channel"
     if channel_path.read_text(encoding="utf-8").strip() != channel:
         raise SystemExit("release-channel does not match manifest")
@@ -62,9 +96,22 @@ def verify(
         if archive.name != expected["archive"]:
             raise SystemExit("archive filename does not match manifest")
         with tarfile.open(archive, "r:gz") as bundle:
-            names = bundle.getnames()
-        if not names or any(item != name and not item.startswith(f"{name}/") for item in names):
-            raise SystemExit("archive contains paths outside its versioned release directory")
+            members = bundle.getmembers()
+        if not members:
+            raise SystemExit("release archive is empty")
+        normalized_names = {
+            id(member): _archive_member_path(member.name, name) for member in members
+        }
+        for member in members:
+            if not (member.issym() or member.islnk()):
+                continue
+            if member.linkname.startswith("/"):
+                raise SystemExit(f"release archive contains absolute link: {member.name}")
+            base = posixpath.dirname(normalized_names[id(member)]) if member.issym() else ""
+            try:
+                _contained_archive_path(posixpath.join(base, member.linkname), name)
+            except SystemExit as error:
+                raise SystemExit(f"release archive link escapes bundle: {member.name}") from error
 
 
 def _validate(version: str, name: str, platform: str, channel: str) -> None:
