@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import ValidationError, validate
 from merlin_agents import (
     AssignmentBudget,
     AssignmentContext,
@@ -1667,10 +1668,25 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
     assert assignment.technique_ids == ()
     assert assignment.strategy_id == "target-reobservation/v1"
     assert _Agents([]).target_exchange_tool_ids(assignment.tool_ids) == ()
+    output_schema = json.loads(assignment.output_schema)
+    valid_result = {
+        "recon_handoff_id": "handoff:21ae6fa0-7e8a-5bd1-a303-504f943317de",
+        "evidence_refs": ["target-surface-generation:1", "request:1", "response:1"],
+    }
+    validate(instance=valid_result, schema=output_schema)
+    with pytest.raises(ValidationError, match="does not match"):
+        validate(
+            instance={**valid_result, "recon_handoff_id": "call_00_IHxhg5LgUSg6nJIz0UHG4384"},
+            schema=output_schema,
+        )
     instructions = compilation.worker_contexts[0].profile.content
     assert "Do not navigate" in instructions
     assert "click" in instructions
     assert "execute an attack" in instructions
+    assert "never a provider or tool call id" in instructions
+    assert (
+        "Do not complete the assignment until browser_record_api_handoff succeeds" in instructions
+    )
 
 
 async def test_pass_modal_refresh_requires_fresh_lead_review_before_completion() -> None:

@@ -2232,7 +2232,10 @@ _TARGET_REOBSERVATION_INSTRUCTIONS = (
     "choose behavior from labels. Inspect the current shared tab, refresh the interaction "
     "contract and executable handoff from observed state, and return the durable handoff id plus "
     "the exact target-surface-generation and request/response evidence references emitted by the "
-    "handoff tool. Merlin derives the sealed snapshot reference from the authenticated receipt."
+    "handoff tool. The recon_handoff_id must be the handoff:* id returned by "
+    "browser_record_api_handoff, never a provider or tool call id. Do not complete the assignment "
+    "until browser_record_api_handoff succeeds. Merlin derives the sealed snapshot reference from "
+    "the authenticated receipt."
 )
 
 
@@ -14589,7 +14592,11 @@ class CampaignService:
                 {
                     "type": "object",
                     "properties": {
-                        "recon_handoff_id": {"type": "string", "minLength": 1},
+                        "recon_handoff_id": {
+                            "type": "string",
+                            "minLength": len("handoff:"),
+                            "pattern": "^handoff:",
+                        },
                         "evidence_refs": {
                             "type": "array",
                             "minItems": 3,
