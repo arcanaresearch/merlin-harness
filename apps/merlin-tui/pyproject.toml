@@ -1,6 +1,6 @@
 [project]
 name = "merlin-tui"
-version = "0.2.28"
+version = "0.2.29"
 description = "Conversation-first terminal UI for Merlin"
 requires-python = ">=3.13"
 dependencies = [
