@@ -348,6 +348,105 @@ async def test_configured_prepare_rejects_new_v2_id_with_same_objective() -> Non
 
 
 @pytest.mark.asyncio
+async def test_prepare_continuation_does_not_hide_newer_typed_request() -> None:
+    objective_b = "Assess https://b.test"
+    objective_c = "Assess https://c.test"
+    request_b = "00000000-0000-4000-8000-000000000047"
+    request_c = "00000000-0000-4000-8000-000000000048"
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_b,
+                "status": "configured",
+                "settings": {"objective": objective_b, "campaign_profile": "recommended"},
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_c, campaign_request_id=request_c),
+        ),
+        ChatMessage(role="user", content="Retry the preparation."),
+    )
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=history)).invoke(
+        context(), {"objective": objective_b, "adapter": {}}
+    )
+
+    assert result.is_error
+    assert "does not match the configured operator request" in result.content
+    assert delegate.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configure_continuation_does_not_hide_newer_typed_request() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000051"
+    request_b = "00000000-0000-4000-8000-000000000052"
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {"objective": objective_a, "campaign_profile": "exhaustive"},
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_b, campaign_request_id=request_b),
+        ),
+        ChatMessage(role="user", content="Continue with the scan."),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == request_b
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["untyped", "malformed"])
+async def test_prepare_requires_reconfigure_for_newer_unbound_boundary(boundary: str) -> None:
+    objective_a = "Assess https://a.test"
+    request_a = "00000000-0000-4000-8000-000000000049"
+    content = (
+        "Assess https://b.test"
+        if boundary == "untyped"
+        else "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n{malformed"
+    )
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {"objective": objective_a, "campaign_profile": "recommended"},
+            },
+        ),
+        ChatMessage(role="user", content=content),
+    )
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=history)).invoke(
+        context(), {"objective": objective_a, "adapter": {}}
+    )
+
+    assert result.is_error
+    assert "requires campaign_configure" in result.content
+    assert delegate.calls == []
+
+
+@pytest.mark.asyncio
 async def test_configured_prepare_same_v2_id_retry_retains_configuration() -> None:
     objective = "Assess https://target.test"
     campaign_request_id = "00000000-0000-4000-8000-000000000013"
@@ -413,15 +512,91 @@ async def test_settings_revision_preserves_unspecified_fields_and_new_scan_reset
         "specialist_composition": "autonomous",
     }
     history.append(saved("campaign_configure", json.loads(revised.content)))
+    history.append(ChatMessage(role="user", content="Assess https://l2.test"))
     new = await tool.invoke(
-        context(), {"new_campaign": True, "objective": "L2", "campaign_profile": "quickscan"}
+        context(),
+        {
+            "new_campaign": True,
+            "objective": "Assess https://l2.test",
+            "campaign_profile": "quickscan",
+        },
     )
     assert json.loads(new.content)["settings"] == {
-        "objective": "L2",
-        "campaign_profile": "quickscan",
+        "objective": "Assess https://l2.test",
+        "campaign_profile": "recommended",
     }
     assert new.metadata["preferred_next_tool"] == "browser_recall_reconnaissance"
     assert new.metadata["preferred_next_tool_mode"] == "after_one_admitted_action"
+
+
+@pytest.mark.asyncio
+async def test_model_new_campaign_retry_without_new_operator_message_retains_binding() -> None:
+    objective = "Assess https://b.test"
+    request_id = "00000000-0000-4000-8000-000000000041"
+    receipt = {
+        "campaign_request_id": request_id,
+        "status": "configured",
+        "settings": {
+            "objective": objective,
+            "campaign_profile": "exhaustive",
+            "execution_mode": "hybrid",
+            "budget": {"max_turns": 12},
+        },
+    }
+
+    result = await CampaignConfigureTool(
+        AsyncMock(return_value=(saved("campaign_configure", receipt),))
+    ).invoke(context(), {"new_campaign": True, "campaign_profile": "quickscan"})
+
+    assert not result.is_error
+    configured = json.loads(result.content)
+    assert configured["campaign_request_id"] == request_id
+    assert configured["settings"] == {
+        "objective": objective,
+        "campaign_profile": "quickscan",
+        "execution_mode": "hybrid",
+        "budget": {"max_turns": 12},
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_v2_operator_retry_with_new_campaign_wording_is_partial_update() -> None:
+    objective = "Assess https://b.test"
+    request_id = "00000000-0000-4000-8000-000000000042"
+    boundary = ChatMessage(
+        role="user",
+        content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+    )
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_id,
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                    "budget": {"max_turns": 12},
+                },
+            },
+        ),
+        boundary,
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True, "campaign_profile": "quickscan"}
+    )
+
+    assert not result.is_error
+    configured = json.loads(result.content)
+    assert configured["campaign_request_id"] == request_id
+    assert configured["settings"] == {
+        "objective": objective,
+        "campaign_profile": "quickscan",
+        "execution_mode": "hybrid",
+        "budget": {"max_turns": 12},
+    }
 
 
 @pytest.mark.asyncio
@@ -467,6 +642,349 @@ async def test_different_v2_request_omission_starts_fresh_settings() -> None:
         "campaign_profile": "recommended",
     }
     assert result.metadata["preferred_next_tool"] == "browser_recall_reconnaissance"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_schema", ["v1", "v2"])
+async def test_new_v2_request_does_not_inherit_prior_explicit_profile(
+    prior_schema: str,
+) -> None:
+    objective_a = "Use the exhaustive campaign profile for https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000030"
+    request_b = "00000000-0000-4000-8000-000000000031"
+    prior_boundary = (
+        campaign_submit_envelope(objective_a, campaign_request_id=request_a)
+        if prior_schema == "v2"
+        else "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "operator_objective": objective_a,
+                "schema_version": "merlin.cli-campaign-submit.v1",
+            },
+            sort_keys=True,
+        )
+    )
+    configured_a = {
+        "status": "configured",
+        "settings": {
+            "objective": objective_a,
+            "campaign_profile": "exhaustive",
+        },
+    }
+    if prior_schema == "v2":
+        configured_a["campaign_request_id"] = request_a
+    history = [
+        ChatMessage(role="user", content=objective_a + "\n" + prior_boundary),
+        saved("campaign_configure", configured_a),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_b, campaign_request_id=request_b),
+        ),
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == request_b
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["explicit", "structured"])
+async def test_new_v2_request_uses_only_current_profile_selection(selection: str) -> None:
+    objective_a = "Use the exhaustive campaign profile for https://a.test"
+    objective_b = (
+        "Assess https://b.test with campaign profile exploration"
+        if selection == "explicit"
+        else "Assess https://b.test"
+    )
+    request_a = "00000000-0000-4000-8000-000000000032"
+    request_b = "00000000-0000-4000-8000-000000000033"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {
+                    "objective": objective_a,
+                    "campaign_profile": "exhaustive",
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_b, campaign_request_id=request_b),
+        ),
+    ]
+    if selection == "structured":
+        history.append(
+            ChatMessage(
+                role="user",
+                content="MERLIN_USER_INPUT_RESPONSE\n"
+                + json.dumps(
+                    {
+                        "request_id": "profile-b",
+                        "answers": {"profile": {"option_ids": ["exploration"], "text": ""}},
+                    }
+                ),
+            )
+        )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {}
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "exploration",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_untyped_new_campaign_cannot_bind_prior_v2_request() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Run Merlin against https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000034"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {
+                    "objective": objective_a,
+                    "campaign_profile": "exhaustive",
+                },
+            },
+        ),
+        ChatMessage(role="user", content=objective_b),
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"new_campaign": True, "objective": objective_b}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert "campaign_request_id" not in receipt
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+async def test_first_configuration_uses_newer_untyped_different_target() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Run Merlin against https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000043"
+    history = (
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+        ),
+        ChatMessage(role="user", content=objective_b),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True, "objective": objective_b}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert "campaign_request_id" not in receipt
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+async def test_first_untyped_request_does_not_inherit_older_typed_profile() -> None:
+    objective_a = "Use the exhaustive campaign profile for https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000053"
+    history = (
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+        ),
+        ChatMessage(role="user", content=objective_b),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True, "objective": objective_b}
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True])
+async def test_newer_untyped_objective_overrides_stale_model_objective(
+    configured: bool,
+) -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000050"
+    history: list[ChatMessage] = []
+    if configured:
+        history.append(
+            saved(
+                "campaign_configure",
+                {
+                    "campaign_request_id": request_a,
+                    "status": "configured",
+                    "settings": {"objective": objective_a, "campaign_profile": "exhaustive"},
+                },
+            )
+        )
+    else:
+        history.append(
+            ChatMessage(
+                role="user",
+                content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+            )
+        )
+    history.append(ChatMessage(role="user", content=objective_b))
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"new_campaign": True, "objective": objective_a}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["settings"]["objective"] == objective_b
+    assert "campaign_request_id" not in receipt
+
+
+@pytest.mark.asyncio
+async def test_newer_untyped_request_terminates_intervening_typed_scope() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Assess https://b.test"
+    objective_c = "Run Merlin against https://c.test"
+    request_a = "00000000-0000-4000-8000-000000000044"
+    request_b = "00000000-0000-4000-8000-000000000045"
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {"objective": objective_a, "campaign_profile": "exhaustive"},
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_b, campaign_request_id=request_b),
+        ),
+        ChatMessage(role="user", content=objective_c),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True, "objective": objective_c}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert "campaign_request_id" not in receipt
+    assert receipt["settings"] == {
+        "objective": objective_c,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_v2_id_cannot_be_rebound_to_different_objective() -> None:
+    request_id = "00000000-0000-4000-8000-000000000046"
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_id,
+                "status": "configured",
+                "settings": {
+                    "objective": "Assess https://a.test",
+                    "campaign_profile": "recommended",
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                "Assess https://b.test", campaign_request_id=request_id
+            ),
+        ),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(
+        context(), {"new_campaign": True, "objective": "Assess https://b.test"}
+    )
+
+    assert result.is_error
+    assert "already bound to a different objective" in result.content
+
+
+@pytest.mark.asyncio
+async def test_untyped_resume_keeps_configured_v2_request_binding() -> None:
+    objective = "Assess https://a.test"
+    campaign_request_id = "00000000-0000-4000-8000-000000000035"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                objective,
+                campaign_request_id=campaign_request_id,
+            ),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": campaign_request_id,
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                },
+            },
+        ),
+        ChatMessage(role="user", content="Resume the previous campaign."),
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"campaign_profile": "quickscan"}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == campaign_request_id
+    assert receipt["settings"] == {
+        "objective": objective,
+        "campaign_profile": "quickscan",
+        "execution_mode": "hybrid",
+    }
 
 
 @pytest.mark.asyncio

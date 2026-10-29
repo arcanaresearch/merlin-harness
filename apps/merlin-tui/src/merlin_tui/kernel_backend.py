@@ -42,7 +42,11 @@ from .backend import (
     TargetView,
 )
 from .configuration import ProviderConfiguration
-from .operator_tools import campaign_submit_envelope, new_campaign_request_id
+from .operator_tools import (
+    _campaign_submit_payload,
+    campaign_submit_envelope,
+    new_campaign_request_id,
+)
 
 _CAMPAIGN_PROFILE_PROMPT = (
     "Choose the campaign profile:\n"
@@ -248,9 +252,24 @@ class KernelBackend:
             response = InputResponse.model_validate_json(prompt[len(ANSWER_PREFIX) :])
             response.validate_for(pending)
         campaign_selection = False
-        operator_campaign_objective = prompt if _is_campaign_request(prompt) else None
+        existing_campaign_envelope = _campaign_submit_payload(prompt)
+        has_typed_campaign_envelope = (
+            existing_campaign_envelope is not None
+            and existing_campaign_envelope.get("schema_version") == "merlin.cli-campaign-submit.v2"
+        )
+        operator_campaign_objective = (
+            str(existing_campaign_envelope["operator_objective"])
+            if has_typed_campaign_envelope
+            else prompt
+            if _is_campaign_request(prompt)
+            else None
+        )
         operator_campaign_request_id = (
-            new_campaign_request_id() if operator_campaign_objective is not None else None
+            str(existing_campaign_envelope["campaign_request_id"])
+            if has_typed_campaign_envelope
+            else new_campaign_request_id()
+            if operator_campaign_objective is not None
+            else None
         )
         if prompt.strip() == "/new":
             self._pending_campaign_objective = None
@@ -351,10 +370,11 @@ class KernelBackend:
             )
         elif operator_campaign_objective is not None:
             assert operator_campaign_request_id is not None
-            prompt = f"{prompt}\n" + campaign_submit_envelope(
-                operator_campaign_objective,
-                campaign_request_id=operator_campaign_request_id,
-            )
+            if not has_typed_campaign_envelope:
+                prompt = f"{prompt}\n" + campaign_submit_envelope(
+                    operator_campaign_objective,
+                    campaign_request_id=operator_campaign_request_id,
+                )
         if not new_session:
             await self._recover_agents()
             if self._mcp is not None and not self._mcp_started:

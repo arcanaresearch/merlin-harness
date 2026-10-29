@@ -523,6 +523,35 @@ async def test_explicit_profile_campaign_request_still_emits_typed_boundary() ->
 
 
 @pytest.mark.asyncio
+async def test_cli_typed_campaign_prompt_keeps_one_stable_backend_boundary() -> None:
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+    objective = "Assess https://target.test"
+    campaign_request_id = "00000000-0000-4000-8000-000000000040"
+    prompt = (
+        objective
+        + "\n"
+        + campaign_submit_envelope(
+            objective,
+            campaign_request_id=campaign_request_id,
+        )
+        + "\nThe operator explicitly selected campaign profile: exhaustive; "
+        "do not ask for the profile again."
+    )
+
+    assert [event async for event in backend.stream(prompt)] == []
+    assert [event async for event in backend.stream(prompt)] == []
+
+    assert kernel.submissions == [prompt, prompt]
+    for submission in kernel.submissions:
+        assert submission.count("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n") == 1
+        envelope, _end = json.JSONDecoder().raw_decode(
+            submission.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+        )
+        assert envelope["campaign_request_id"] == campaign_request_id
+
+
+@pytest.mark.asyncio
 async def test_campaign_route_preflight_blocks_before_provider_and_retries() -> None:
     kernel = FakeKernel([])
     attempts = 0

@@ -9,7 +9,7 @@ import re
 import shlex
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
 from merlin_contracts import ChatMessage, ToolContext, ToolResult, ToolSpec
@@ -85,23 +85,80 @@ def _campaign_submit_payload(content: str) -> Mapping[str, object] | None:
     return envelope
 
 
-def _latest_campaign_request_scope(
-    messages: Sequence[ChatMessage],
-) -> tuple[str, str] | None:
-    for message in reversed(messages):
+def _is_internal_campaign_continuation(content: str) -> bool:
+    normalized = " ".join(content.casefold().split())
+    return (
+        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+        or normalized.startswith("the previous prepared campaign was cancelled")
+        or normalized.startswith("reuse the sealed reconnaissance")
+    )
+
+
+@dataclass(frozen=True)
+class _CampaignBoundary:
+    state: str
+    request_id: str | None = None
+    objective_digest: str | None = None
+
+
+def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _CampaignBoundary:
+    for message in reversed(_messages_after_latest_configuration(messages)):
         if message.role != "user":
             continue
-        envelope = _campaign_submit_payload(message.content)
-        if envelope is None or envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_SCHEMA:
+        if message.content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
+        if _is_internal_campaign_continuation(message.content):
+            continue
+        envelope = _campaign_submit_payload(message.content)
+        if envelope is None:
+            state = "invalid" if _CLI_CAMPAIGN_SUBMIT_MARKER in message.content else "unbound"
+            return _CampaignBoundary(state)
+        if envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_SCHEMA:
+            return _CampaignBoundary("unbound")
         request_id = envelope.get("campaign_request_id")
         if _valid_campaign_request_id(request_id):
             objective = str(envelope["operator_objective"]).strip()
-            return (
+            return _CampaignBoundary(
+                "v2",
                 str(request_id),
                 "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
             )
-    return None
+        return _CampaignBoundary("invalid")
+    return _CampaignBoundary("none")
+
+
+def _messages_after_latest_configuration(
+    messages: Sequence[ChatMessage],
+) -> Sequence[ChatMessage]:
+    """Return messages newer than the latest durable configured receipt."""
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.role != "tool" or message.name != "campaign_configure":
+            continue
+        if _payload(message).get("status") == "configured":
+            return messages[index + 1 :]
+    return messages
+
+
+def _has_configured_campaign_receipt(messages: Sequence[ChatMessage]) -> bool:
+    return len(_messages_after_latest_configuration(messages)) != len(messages)
+
+
+def _active_campaign_epoch(messages: Sequence[ChatMessage]) -> Sequence[ChatMessage]:
+    """Keep the newest substantive request and its subsequent structured answers."""
+
+    scoped_messages = _messages_after_latest_configuration(messages)
+    for index in range(len(scoped_messages) - 1, -1, -1):
+        message = scoped_messages[index]
+        if message.role != "user":
+            continue
+        if message.content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
+            continue
+        if _is_internal_campaign_continuation(message.content):
+            continue
+        return scoped_messages[index:]
+    return scoped_messages
 
 
 READ_OPERATIONS = (
@@ -207,30 +264,54 @@ def _operator_campaign_request(
 
     proposed = str(proposed_objective or "").strip()
     target_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(proposed)}
+    scoped_messages = _messages_after_latest_configuration(messages)
     user_messages: list[str] = []
-    for message in reversed(messages):
+    for message in reversed(scoped_messages):
         if message.role != "user":
             continue
         content = message.content.strip()
         if content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
+        if _is_internal_campaign_continuation(content):
+            continue
         user_messages.append(content)
+
+    if _has_configured_campaign_receipt(messages) and user_messages:
+        # After a durable configure receipt, the newest substantive operator
+        # message is the only admissible campaign epoch. An untyped or malformed
+        # message must not fall through to an older typed request.
+        user_messages = user_messages[:1]
+
+    def matches_proposed(content: str) -> bool:
+        authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
+        return bool(target_urls & authored_urls) or (not target_urls and len(authored_urls) == 1)
+
+    if user_messages:
+        newest = user_messages[0]
+        envelope = _campaign_submit_payload(newest)
+        if envelope is not None:
+            return str(envelope["operator_objective"])
+        if not _is_internal_campaign_continuation(newest):
+            authored_urls = _URL_RE.findall(newest)
+            if authored_urls or matches_proposed(newest):
+                return newest
 
     # Typed CLI provenance outranks later model-facing retry prompts. Those
     # retries contain the same target URL but are internal orchestration, not a
     # replacement operator objective.
-    for content in user_messages:
+    for content in user_messages[1:]:
         # The client appends this envelope after the exact objective. Use the
         # final marker so operator-authored text that happens to mention the
         # protocol token cannot shadow the authoritative envelope. Legacy v1
         # envelopes remain objective provenance, but are not campaign boundaries.
         envelope = _campaign_submit_payload(content)
         if envelope is not None:
-            return str(envelope["operator_objective"])
+            envelope_objective = str(envelope["operator_objective"])
+            if envelope_objective == proposed or matches_proposed(envelope_objective):
+                return envelope_objective
 
-    for content in user_messages:
-        authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
-        if (target_urls & authored_urls) or (not target_urls and len(authored_urls) == 1):
+    for content in user_messages[1:]:
+        if not _is_internal_campaign_continuation(content) and matches_proposed(content):
             return content
     return None
 
@@ -238,7 +319,25 @@ def _operator_campaign_request(
 def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> str | None:
     """Return a profile only when operator-authored text explicitly selects it."""
 
-    for message in reversed(messages):
+    scoped_messages = _active_campaign_epoch(messages)
+    active_request_id: str | None = None
+    active_request_start = 0
+    for index, message in enumerate(scoped_messages):
+        if message.role != "user":
+            continue
+        envelope = _campaign_submit_payload(message.content)
+        if envelope is None or envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_SCHEMA:
+            continue
+        request_id = envelope.get("campaign_request_id")
+        if not _valid_campaign_request_id(request_id):
+            continue
+        if request_id != active_request_id:
+            active_request_id = str(request_id)
+            active_request_start = index
+    if active_request_id is not None:
+        scoped_messages = scoped_messages[active_request_start:]
+
+    for message in reversed(scoped_messages):
         if message.role != "user" or not message.content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
         try:
@@ -259,7 +358,7 @@ def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> 
                 return selected[0]
 
     values = [objective]
-    values.extend(message.content for message in messages if message.role == "user")
+    values.extend(message.content for message in scoped_messages if message.role == "user")
     for value in reversed(values):
         normalized = " ".join(value.lower().split())
         for profile in PROFILES:
@@ -320,14 +419,37 @@ class CampaignConfigureTool:
             _foreground(context)
             messages = await self._load(context.session_id)
             configured_receipt = _configured_campaign_receipt(messages)
-            campaign_request_scope = _latest_campaign_request_scope(messages)
+            campaign_boundary = _latest_campaign_request_scope(messages)
+            if campaign_boundary.state == "invalid":
+                raise ValueError("latest campaign request envelope is malformed")
             configured_request_id = configured_receipt.get("campaign_request_id")
+            configured_settings = _settings(messages)
+            configured_objective = str(configured_settings.get("objective") or "").strip()
+            if (
+                campaign_boundary.state == "v2"
+                and configured_request_id == campaign_boundary.request_id
+                and configured_objective
+                and campaign_boundary.objective_digest
+                != "sha256:" + hashlib.sha256(configured_objective.encode()).hexdigest()
+            ):
+                raise ValueError("campaign_request_id is already bound to a different objective")
             fresh_v2_campaign = (
-                campaign_request_scope is not None
-                and configured_request_id != campaign_request_scope[0]
+                campaign_boundary.state == "v2"
+                and configured_request_id != campaign_boundary.request_id
             )
-            starts_new_campaign = arguments.get("new_campaign") is True or fresh_v2_campaign
-            settings = {} if starts_new_campaign else _settings(messages)
+            explicit_new_campaign = arguments.get("new_campaign") is True
+            has_configured_receipt = bool(configured_receipt)
+            operator_objective = _operator_campaign_request(messages, arguments.get("objective"))
+            newer_untyped_campaign = (
+                has_configured_receipt
+                and campaign_boundary.state == "unbound"
+                and explicit_new_campaign
+                and operator_objective is not None
+            )
+            starts_new_campaign = (
+                not has_configured_receipt or fresh_v2_campaign or newer_untyped_campaign
+            )
+            settings = {} if starts_new_campaign else configured_settings
             allowed = set(self.describe().input_schema["properties"])
             if set(arguments) - allowed:
                 raise ValueError("unknown campaign setting")
@@ -380,8 +502,15 @@ class CampaignConfigureTool:
                 "revision": context.call_id,
                 "requires_review": True,
             }
-            if campaign_request_scope is not None:
-                result["campaign_request_id"] = campaign_request_scope[0]
+            bound_request_id = (
+                campaign_boundary.request_id
+                if campaign_boundary.state == "v2"
+                else str(configured_request_id)
+                if not newer_untyped_campaign and _valid_campaign_request_id(configured_request_id)
+                else None
+            )
+            if bound_request_id is not None:
+                result["campaign_request_id"] = bound_request_id
             metadata = dict(result)
             if starts_new_campaign:
                 metadata["preferred_next_tool"] = "browser_recall_reconnaissance"
@@ -426,11 +555,19 @@ class ConfiguredCampaignTool:
             prepare_scope_digest = (
                 "sha256:" + hashlib.sha256(str(settings["objective"]).strip().encode()).hexdigest()
             )
-            campaign_request_scope = _latest_campaign_request_scope(messages)
+            newer_campaign_boundary = _latest_campaign_request_scope(messages)
             configured_request_id = configured_receipt.get("campaign_request_id")
-            if campaign_request_scope is not None and (
-                configured_request_id != campaign_request_scope[0]
-                or campaign_request_scope[1] != prepare_scope_digest
+            if newer_campaign_boundary.state in {"unbound", "invalid"}:
+                return ToolResult(
+                    content=(
+                        "A newer operator campaign request requires campaign_configure "
+                        "before preparation."
+                    ),
+                    is_error=True,
+                )
+            if newer_campaign_boundary.state == "v2" and (
+                configured_request_id != newer_campaign_boundary.request_id
+                or newer_campaign_boundary.objective_digest != prepare_scope_digest
             ):
                 return ToolResult(
                     content=(
@@ -440,7 +577,11 @@ class ConfiguredCampaignTool:
                     is_error=True,
                 )
             prepare_scope_request_id = (
-                campaign_request_scope[0] if campaign_request_scope is not None else None
+                newer_campaign_boundary.request_id
+                if newer_campaign_boundary.state == "v2"
+                else str(configured_request_id)
+                if _valid_campaign_request_id(configured_request_id)
+                else None
             )
             if settings.get("execution_mode"):
                 values["adapter"] = {
