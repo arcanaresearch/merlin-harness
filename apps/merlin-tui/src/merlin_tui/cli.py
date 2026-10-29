@@ -977,9 +977,10 @@ async def _submit_campaign(arguments: list[str]) -> None:
     campaign_poll_error: BaseException | None = None
     objective_repair_needed: tuple[str, str] | None = None
     try:
-        # The preparing model occasionally ends its turn asking for confirmation
-        # instead of calling assessment_prepare even though --approve was given.
-        # Retry once with an explicit nudge before refusing approval.
+        # The preparing model can end a turn before calling assessment_prepare,
+        # including after advancing a durable browser-handoff repair obligation.
+        # Keep the existing three-attempt bound and nudge each continuation turn
+        # before refusing approval.
         for preparation_attempt in range(3):
             if objective_repair_needed is not None:
                 preparation_prompt = (
@@ -1230,8 +1231,6 @@ async def _submit_campaign(arguments: list[str]) -> None:
                 break
             if objective_repair_needed is not None:
                 continue
-            if preparation_attempt >= 1:
-                break
             if campaign_poll is not None and not campaign_poll.done():
                 await _bounded_task_teardown(campaign_poll)
                 campaign_poll = None

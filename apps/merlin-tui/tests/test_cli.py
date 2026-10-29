@@ -2153,6 +2153,61 @@ def test_campaign_approve_retries_once_when_prepare_turn_ends_without_tool(monke
     assert client.execute_calls == [("campaign/one", "sha256:reviewed")]
 
 
+def test_campaign_approve_continues_bounded_durable_preparation_progress(monkeypatch) -> None:
+    """A durable repair chain can need two continuation turns before prepare."""
+    client = _install_durable_campaign(
+        monkeypatch,
+        objective="Assess target",
+        campaign_id="campaign/one",
+        composition="opinionated",
+    )
+
+    async def no_campaigns():
+        return ()
+
+    client.list_campaigns = no_campaigns
+    prompts: list[str] = []
+
+    async def print_stream(prompt, *, approve_once=False, **_kwargs):
+        prompts.append(prompt)
+        if prompt.startswith("Assess target"):
+            return {
+                "preparation_note": (
+                    "provider returned an unadmitted native tool call; "
+                    "expected browser_network_events"
+                )
+            }
+        if len(prompts) == 3:
+            return {
+                "preparation_note": (
+                    "provider returned an unadmitted native tool call; "
+                    "expected browser_compile_api_handoff"
+                )
+            }
+        if len(prompts) == 4:
+            return {
+                "campaign_id": "campaign/one",
+                "manifest_digest": "sha256:reviewed",
+                "objective": "Assess target",
+                "profile": "recommended",
+                "review": {"budget": {}},
+            }
+        return None
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["merlin", "campaign", "submit", "--approve", "Assess target"],
+    )
+
+    main()
+
+    assert len(prompts) == 4
+    assert all("ended without calling assessment_prepare" in prompt for prompt in prompts[2:])
+    assert client.execute_calls == [("campaign/one", "sha256:reviewed")]
+
+
 def test_campaign_approve_recovers_one_numbered_profile_prompt(monkeypatch) -> None:
     calls = []
     _install_durable_campaign(
@@ -2181,10 +2236,10 @@ def test_campaign_approve_recovers_one_numbered_profile_prompt(monkeypatch) -> N
     with pytest.raises(SystemExit, match="campaign was not durably prepared"):
         main()
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert calls[0] == ("/new", False)
     assert "operator explicitly selected campaign profile: exhaustive" in calls[1][0]
-    assert "ended without calling assessment_prepare" in calls[2][0]
+    assert all("ended without calling assessment_prepare" in call[0] for call in calls[2:])
 
 
 def test_campaign_approve_refusal_carries_terminal_preparation_note(monkeypatch) -> None:
@@ -2244,10 +2299,10 @@ def test_campaign_approve_recovers_exploration_profile_prompt(monkeypatch) -> No
     with pytest.raises(SystemExit, match="campaign was not durably prepared"):
         main()
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert calls[0] == ("/new", False)
     assert "operator explicitly selected campaign profile: exploration" in calls[1][0]
-    assert "ended without calling assessment_prepare" in calls[2][0]
+    assert all("ended without calling assessment_prepare" in call[0] for call in calls[2:])
 
 
 def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch) -> None:
