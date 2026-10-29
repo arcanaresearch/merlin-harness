@@ -1,6 +1,6 @@
 [project]
 name = "merlin-browser"
-version = "0.2.21"
+version = "0.2.22"
 description = "Bounded Playwright browser automation for Merlin"
 requires-python = ">=3.13"
 dependencies = ["playwright>=1.55,<2", "pydantic>=2.10,<3", "merlin-contracts"]
