@@ -646,14 +646,16 @@ def _target_surface_transition_decision(
             infrastructure_failure_category="adapter_state_integrity",
         )
     strict_pre_effect = _strict_target_surface_transition(result)
-    retry_failure_kind = (
-        RetryFailureKind.TRANSPORT_TRANSIENT
-        if strict_pre_effect is not None
-        and result.metadata.get("retryable") is True
-        and result.metadata.get("failure_code")
-        in {"target_tab_unavailable", "state_scope_before_unavailable"}
-        else None
-    )
+    failure_code = result.metadata.get("failure_code")
+    retry_failure_kind = None
+    if result.metadata.get("retryable") is True:
+        if failure_code == "compiled_response_boundary_incomplete":
+            retry_failure_kind = RetryFailureKind.ADAPTER_TIMEOUT
+        elif strict_pre_effect is not None and failure_code in {
+            "target_tab_unavailable",
+            "state_scope_before_unavailable",
+        }:
+            retry_failure_kind = RetryFailureKind.TRANSPORT_TRANSIENT
     result_session_id = result.metadata.get("target_session_id")
     disposition_valid = bool(
         isinstance(target_session_id, str)

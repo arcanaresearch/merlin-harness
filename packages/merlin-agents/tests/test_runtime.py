@@ -12399,6 +12399,7 @@ async def test_incomplete_compiled_response_stops_without_fabricating_exchange(
     assert result.status == "failed"
     assert result.error_code == "target_surface_disrupted"
     assert result.retry_class == "terminal"
+    assert result.retry_failure_kind is RetryFailureKind.ADAPTER_TIMEOUT
     assert tools.calls == ["browser_chat_exchange"]
     assert len(provider.requests) == 1
     if dynamic:
@@ -13100,6 +13101,8 @@ class BrowserIncompleteResponseTools(BrowserAttemptedTransitionTools):
             content=("compiled_browser_response_incomplete: passive re-observation is required"),
             is_error=True,
             metadata={
+                "failure_code": "compiled_response_boundary_incomplete",
+                "retryable": True,
                 "target_effect_attempted": True,
                 "target_call_budget_charge": 1,
                 "limit_interaction_count": 1,

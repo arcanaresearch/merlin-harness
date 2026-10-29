@@ -4072,6 +4072,11 @@ async def test_target_admission_hold_survives_terminal_settlement_projection() -
         (False, "target_tab_unavailable", RetryFailureKind.TRANSPORT_TRANSIENT.value),
         (False, "state_scope_before_unavailable", RetryFailureKind.TRANSPORT_TRANSIENT.value),
         (True, None, RetryFailureKind.UNKNOWN.value),
+        (
+            True,
+            "compiled_response_boundary_incomplete",
+            RetryFailureKind.ADAPTER_TIMEOUT.value,
+        ),
     ),
 )
 async def test_terminal_surface_drift_commits_transition_without_replacement(
@@ -4253,6 +4258,11 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
                             "interaction_count": 0,
                         }
                         if not target_effect_attempted
+                        else {}
+                    ),
+                    **(
+                        {"failure_code": failure_code, "retryable": True}
+                        if target_effect_attempted and failure_code is not None
                         else {}
                     ),
                     "target_effect_attempted": target_effect_attempted,
