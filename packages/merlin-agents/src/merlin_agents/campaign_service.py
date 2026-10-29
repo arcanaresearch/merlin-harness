@@ -22863,6 +22863,14 @@ class AssessmentPrepareTool:
                         )
                         adapter["evaluation_uncertainties"] = uncertainties
                 else:
+                    cache_key = (context.session_id, _campaign_request_id)
+                    cached_candidate = self._adapter_candidates.get(cache_key)
+                    if cached_candidate is not None:
+                        self._adapter_candidates[cache_key] = {
+                            key: value
+                            for key, value in cached_candidate.items()
+                            if key not in {"expected_target_id", "expected_target_session_id"}
+                        }
                     return ToolResult(content=str(error), is_error=True)
             if isinstance(handoff_id, str) and handoff_id.strip():
                 resolved_handoff_id = (

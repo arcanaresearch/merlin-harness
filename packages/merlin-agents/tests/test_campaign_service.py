@@ -14297,6 +14297,85 @@ async def test_prepare_tool_replaces_cached_candidate_when_handoff_id_changes() 
     ]
 
 
+@pytest.mark.parametrize(
+    ("identity_field", "wrong_identity", "error_message"),
+    [
+        (
+            "expected_target_id",
+            "target:wrong",
+            "reviewed reconnaissance handoff belongs to another target",
+        ),
+        (
+            "expected_target_session_id",
+            "browser:wrong-context",
+            "reviewed reconnaissance handoff belongs to another target session",
+        ),
+    ],
+)
+async def test_prepare_tool_drops_rejected_handoff_identity_claim_before_retry(
+    identity_field: str,
+    wrong_identity: str,
+    error_message: str,
+) -> None:
+    requests: list[Mapping[str, object]] = []
+    prepared: list[Mapping[str, object]] = []
+    handoff_id = "handoff:reviewed"
+    hydrated = {
+        **_reviewed_browser_adapter(),
+        "recon_handoff_id": handoff_id,
+    }
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            if adapter.get(identity_field) == wrong_identity:
+                raise ValueError(error_message)
+            return hydrated
+
+        async def prepare(self, _session_id, _objective, _profile, adapter, **_kwargs):
+            prepared.append(adapter)
+            return {"campaign_id": "campaign-1"}
+
+    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    context = ToolContext(session_id="session-1", workspace_root="/workspace")
+    base_arguments = {
+        "objective": "Assess target",
+        "campaign_profile": "recommended",
+    }
+
+    rejected = await tool.invoke_for_campaign_request(
+        context,
+        {
+            **base_arguments,
+            "adapter": {
+                "recon_handoff_id": handoff_id,
+                identity_field: wrong_identity,
+            },
+        },
+        campaign_request_id="00000000-0000-4000-8000-000000000040",
+    )
+    retried = await tool.invoke_for_campaign_request(
+        context,
+        {
+            **base_arguments,
+            "adapter": {"recon_handoff_id": handoff_id},
+        },
+        campaign_request_id="00000000-0000-4000-8000-000000000040",
+    )
+
+    assert rejected.is_error is True
+    assert rejected.content == error_message
+    assert retried.is_error is False
+    assert requests == [
+        {"recon_handoff_id": handoff_id, identity_field: wrong_identity},
+        {"recon_handoff_id": handoff_id},
+    ]
+    assert len(prepared) == 1
+    assert prepared[0]["recon_handoff_id"] == handoff_id
+    assert prepared[0]["adapter_identity_version"] == "merlin.executable-adapter.v1"
+    assert identity_field not in prepared[0]
+
+
 def test_prepare_tool_schema_admits_handoff_id_only_adapter() -> None:
     schema = AssessmentPrepareTool(object()).describe().input_schema
     adapter_schema = schema["properties"]["adapter"]
