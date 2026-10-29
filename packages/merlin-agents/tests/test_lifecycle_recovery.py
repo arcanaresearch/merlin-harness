@@ -66,7 +66,11 @@ async def test_recorded_recovery_actions_match_legacy_boundaries(
 
     class Store:
         def get(self, campaign_id):
-            return {"id": campaign_id, "manifest": {"manifest": {}, "assignment_context": {}}}
+            return {
+                "id": campaign_id,
+                "status": "executing",
+                "manifest": {"manifest": {}, "assignment_context": {}},
+            }
 
         def list_executing(self):
             return [self.get("campaign/test")]

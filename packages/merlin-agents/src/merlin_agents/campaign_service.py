@@ -14169,9 +14169,7 @@ class CampaignService:
                             "frontier_claimed": False,
                         },
                     )
-                    pause_campaign = getattr(self._store, "pause", None)
-                    if callable(pause_campaign):
-                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    await self._pause_campaign_if_executing(campaign_id)
                     return False, wave
                 wave += 1
                 attempts += 1
@@ -14283,16 +14281,44 @@ class CampaignService:
                     gate_succeeded = True
                     break
                 if settled["status"] == "blocked":
-                    pause_campaign = getattr(self._store, "pause", None)
-                    if callable(pause_campaign):
-                        await asyncio.to_thread(pause_campaign, campaign_id)
+                    await self._pause_campaign_if_executing(campaign_id)
                     return False, wave
             if not gate_succeeded:
-                pause_campaign = getattr(self._store, "pause", None)
-                if callable(pause_campaign):
-                    await asyncio.to_thread(pause_campaign, campaign_id)
+                await self._pause_campaign_if_executing(campaign_id)
                 return False, wave
         return True, wave
+
+    async def _pause_campaign_if_executing(self, campaign_id: str) -> bool:
+        """Conditionally pause without turning a concurrent terminal transition into failure."""
+
+        pause_campaign = getattr(self._store, "pause", None)
+        if not callable(pause_campaign):
+            return False
+        get_campaign = getattr(self._store, "get", None)
+        if callable(get_campaign):
+            row = await asyncio.to_thread(get_campaign, campaign_id)
+            if row is None:
+                return False
+            if not isinstance(row, Mapping) or not isinstance(row.get("status"), str):
+                raise RuntimeError("campaign status is unavailable for conditional pause")
+            if row["status"] != "executing":
+                return False
+        try:
+            await asyncio.to_thread(pause_campaign, campaign_id)
+        except ValueError as error:
+            if str(error) != "campaign is unknown or not executing" or not callable(get_campaign):
+                raise
+            row = await asyncio.to_thread(get_campaign, campaign_id)
+            if row is None:
+                return False
+            if not isinstance(row, Mapping) or not isinstance(row.get("status"), str):
+                raise RuntimeError(
+                    "campaign status is unavailable after conditional pause"
+                ) from error
+            if row["status"] == "executing":
+                raise
+            return False
+        return True
 
     async def _run_objective_navigation(
         self,
@@ -18605,12 +18631,7 @@ class CampaignService:
             first_wave=candidate_wave,
         )
         if not gates_ready:
-            pause_campaign = getattr(self._store, "pause", None)
-            if callable(pause_campaign):
-                try:
-                    await asyncio.to_thread(pause_campaign, campaign_id)
-                except ValueError:
-                    pass
+            await self._pause_campaign_if_executing(campaign_id)
             return None
         candidate_wave = max(candidate_wave, last_gate_wave + 1)
 
@@ -18806,6 +18827,14 @@ class CampaignService:
             await self._pause_recovered_campaign(campaign_id)
             return 1
         row = await asyncio.to_thread(self._store.get, campaign_id)
+        if row is None:
+            return 0
+        if not isinstance(row, Mapping) or not isinstance(row.get("status"), str):
+            raise _CampaignRecoveryIncompatible(
+                "recorded recovery campaign has no authoritative lifecycle status"
+            )
+        if row["status"] != "executing":
+            return 0
         envelope = row["manifest"]
         try:
             manifest = _manifest(envelope["manifest"])
@@ -18916,6 +18945,15 @@ class CampaignService:
                 campaign_id, manifest, context, waves
             )
             if successor is None:
+                current = await asyncio.to_thread(self._store.get, campaign_id)
+                if current is None:
+                    return 0
+                if not isinstance(current, Mapping) or not isinstance(current.get("status"), str):
+                    raise _CampaignRecoveryIncompatible(
+                        "recorded recovery campaign lost its authoritative lifecycle status"
+                    )
+                if current["status"] != "executing":
+                    return 0
                 raise _CampaignRecoveryIncompatible("claimed recovery could not install successor")
             live, wave = successor
             wave_running = True

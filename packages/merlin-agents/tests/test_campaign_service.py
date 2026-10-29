@@ -3947,6 +3947,126 @@ async def test_recovery_does_not_start_frontier_after_blocked_objective_gate() -
     assert events == [("pause", manifest.id)]
 
 
+async def test_startup_recovery_treats_concurrent_terminal_campaign_as_applied_noop() -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    gate = _objective_gate()
+    manifest = manifest_with_objective_phase_gates(prepared.manifest, (gate,))
+    events: list[tuple[str, str]] = []
+
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.status = "executing"
+
+        def get(self, campaign_id):
+            assert campaign_id == manifest.id
+            return {
+                "id": campaign_id,
+                "status": self.status,
+                "manifest": {
+                    "manifest": asdict(manifest),
+                    "assignment_context": asdict(prepared.assignment_context),
+                },
+            }
+
+        def list_waves(self, _campaign_id):
+            return ({"wave": 1, "status": "completed", "schedule_id": "schedule-1"},)
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return None
+
+        def list_lead(self, _campaign_id):
+            return (
+                {
+                    "wave": 1,
+                    "payload": {
+                        "kind": "objective_phase_gate_settled",
+                        "gate_id": gate.id,
+                        "status": "blocked",
+                        "blocker": "authoritative prerequisite evidence is unavailable",
+                    },
+                },
+            )
+
+        def pause(self, campaign_id):
+            assert campaign_id == manifest.id
+            events.append(("pause", campaign_id))
+            self.status = "failed"
+            raise ValueError("campaign is unknown or not executing")
+
+    class RecoveryRepository:
+        def claim(self, campaign_id, **_kwargs):
+            events.append(("claim", campaign_id))
+            return "claim-1"
+
+        def renew(self, *_args, **_kwargs):
+            return True
+
+        def apply(self, campaign_id, *, claim_id, error=None):
+            assert claim_id == "claim-1"
+            assert error is None
+            events.append(("apply", campaign_id))
+
+        def reject_incompatible(self, *_args, **_kwargs):
+            raise AssertionError("a terminalized campaign is an obsolete no-op, not incompatible")
+
+    class NoTrafficAgents:
+        def __getattr__(self, name):
+            raise AssertionError(f"startup recovery must not call agent operation {name}")
+
+    store = RecoveryStore()
+    service = CampaignService(store, NoTrafficAgents(), preparation)  # type: ignore[arg-type]
+    service._recovery_repository = RecoveryRepository()  # noqa: SLF001
+    decision = SimpleNamespace(
+        campaign_id=manifest.id,
+        status="executing",
+        recovery_action="claim_successor",
+        recovery_state_digest="sha256:" + "a" * 64,
+        recovery_decision_digest="sha256:" + "b" * 64,
+        recovery_fence_digest="sha256:" + "c" * 64,
+    )
+
+    recovered = await service._apply_lifecycle_report(  # noqa: SLF001
+        SimpleNamespace(campaigns=(decision,)),
+        True,
+    )
+
+    assert recovered == 0
+    assert store.status == "failed"
+    assert events == [
+        ("claim", manifest.id),
+        ("pause", manifest.id),
+        ("apply", manifest.id),
+    ]
+    assert service._supervisors == {}  # noqa: SLF001
+
+
+async def test_conditional_campaign_pause_does_not_mutate_unknown_campaign() -> None:
+    class Store:
+        def get(self, _campaign_id):
+            return None
+
+        def pause(self, _campaign_id):
+            raise AssertionError("unknown campaign must not be mutated")
+
+    service = CampaignService(Store(), object(), preparation)  # type: ignore[arg-type]
+
+    assert not await service._pause_campaign_if_executing("campaign/missing")  # noqa: SLF001
+
+
+async def test_conditional_campaign_pause_preserves_real_storage_errors() -> None:
+    class Store:
+        def get(self, campaign_id):
+            return {"id": campaign_id, "status": "executing"}
+
+        def pause(self, _campaign_id):
+            raise RuntimeError("storage unavailable")
+
+    service = CampaignService(Store(), object(), preparation)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        await service._pause_campaign_if_executing("campaign/executing")  # noqa: SLF001
+
+
 async def test_recovery_successor_uses_one_transition_fence_for_claim_and_start() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
     observed = []
