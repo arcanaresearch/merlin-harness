@@ -4564,17 +4564,11 @@ class DurableAgentService:
                 None,
             )
         worker_context = live.worker_contexts.get(assignment.id)
-        profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or live.profiles.get(assignment.id)
-        if profile is None and worker_context is not None:
-            profile = WorkerProfile(
-                assignment.profile_id,
-                int(worker_context.profile.id.rsplit("@", 1)[1]),
-                "",
-                worker_context.profile.content,
-                frozenset(),
-            )
-        if profile is not None and worker_context is not None:
-            profile = replace(profile, instructions=worker_context.profile.content)
+        profile = _profile_for_handoff(
+            assignment,
+            worker_context,
+            live.profiles.get(assignment.id),
+        )
         sealed_arm = _sealed_arm_contract(assignment.objective)
         raw_candidate_identity = _sealed_assignment_candidate_identity(
             assignment,
@@ -5459,26 +5453,13 @@ class DurableAgentService:
                         refusal_judge=self._refusal_judge,
                     )
                     worker_context = live.worker_contexts.get(assignment.id)
-                    profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or live.profiles.get(
-                        assignment.id
+                    profile = _profile_for_handoff(
+                        assignment,
+                        worker_context,
+                        live.profiles.get(assignment.id),
                     )
                     if profile is None:
-                        # Dynamic specialist identities are campaign-local: their
-                        # sealed profile document is the only profile source.
-                        if worker_context is None:
-                            raise KeyError(assignment.profile_id)
-                        profile = WorkerProfile(
-                            assignment.profile_id,
-                            int(worker_context.profile.id.rsplit("@", 1)[1]),
-                            "",
-                            worker_context.profile.content,
-                            frozenset(),
-                        )
-                    if worker_context is not None:
-                        # The digest-sealed profile document is the runtime system authority.
-                        # Baseline controls deliberately replace the attack playbook here; merely
-                        # storing a neutral document alongside the handoff would contaminate them.
-                        profile = replace(profile, instructions=worker_context.profile.content)
+                        raise KeyError(assignment.profile_id)
                     memory_query = (
                         self._portable_memory_scope(live.session_id, assignment)
                         if self._portable_memory_scope is not None
@@ -8487,6 +8468,28 @@ def _worker_context(value: dict[str, object]) -> WorkerContext:
         if persisted_digest != context.digest:
             raise
     return context
+
+
+def _profile_for_handoff(
+    assignment: WorkerAssignment,
+    worker_context: WorkerContext | None,
+    schedule_profile: WorkerProfile | None = None,
+) -> WorkerProfile | None:
+    """Resolve the runtime profile from the digest-sealed worker context."""
+    profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or schedule_profile
+    if worker_context is None:
+        return profile
+    prefix = f"profile:{assignment.profile_id}@"
+    version = worker_context.profile.id.removeprefix(prefix)
+    if not worker_context.profile.id.startswith(prefix) or not version.isdigit():
+        raise ValueError("worker context profile identity is invalid")
+    return WorkerProfile(
+        assignment.profile_id,
+        int(version),
+        profile.summary if profile is not None else "",
+        worker_context.profile.content,
+        profile.specialty_tags if profile is not None else frozenset(),
+    )
 
 
 def _contract_status(value: str) -> str:

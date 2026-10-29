@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from merlin_agents import (
+    CORE_PROFILES_BY_ID,
     AssignmentBudget,
     AssignmentContext,
     AssignmentTechnique,
@@ -35,6 +36,7 @@ from merlin_agents.durable_service import (
     _advisory_evaluation_failure,
     _assignment,
     _capability_grant_narrows,
+    _profile_for_handoff,
     _sealed_assignment_candidate_identity,
     _target_control_hold_marker,
     _target_control_hold_projection,
@@ -181,6 +183,91 @@ def test_persisted_adaptive_worker_context_restores_strategy_before_digest_valid
     assert isinstance(restored, WorkerContext)
     assert restored.strategy_id == "hydra-select"
     assert restored.strategy_contract == (("version", "merlin.hydra-select.v1"),)
+
+
+def test_sealed_worker_context_profile_version_overrides_core_profile() -> None:
+    assignment = WorkerAssignment(
+        id="campaign/reobserve/worker",
+        objective="Passively refresh the reviewed target.",
+        profile_id="recon",
+        target_profile_id="target-1",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider-1",
+        authority_ids=("target:target-1",),
+        budget=AssignmentBudget(2, 1024, 60),
+        input_schema="input/v1",
+        output_schema="output/v1",
+    )
+    profile = ContextDocument.create("profile:recon@2", "Refresh without navigation.")
+    target = ReviewedTargetAdapter("target-1", "browser", "https://target.test")
+    values = {
+        "assignment_id": assignment.id,
+        "profile": asdict(profile),
+        "guidance": [],
+        "skills": [],
+        "tool_ids": (),
+        "target": asdict(target),
+        "authority_ids": assignment.authority_ids,
+        "strategy_id": "direct",
+        "strategy_contract": (),
+    }
+    worker_context = WorkerContext(
+        assignment_id=assignment.id,
+        profile=profile,
+        guidance=(),
+        skills=(),
+        tool_ids=(),
+        target=target,
+        authority_ids=assignment.authority_ids,
+        digest=_digest(values),
+    )
+
+    resolved = _profile_for_handoff(assignment, worker_context)
+
+    assert resolved is not None
+    assert resolved.id == "recon"
+    assert resolved.version == 2
+    assert resolved.instructions == "Refresh without navigation."
+    WorkerHandoff(
+        "session-1",
+        ".",
+        "model",
+        resolved,
+        assignment,
+        worker_context=worker_context,
+    )
+
+
+def test_core_profile_precedes_schedule_profile_without_worker_context() -> None:
+    assignment = WorkerAssignment(
+        id="campaign/dynamic/worker",
+        objective="Run the admitted specialist.",
+        profile_id="adversarial-explorer",
+        target_profile_id="target-1",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider-1",
+        authority_ids=("target:target-1",),
+        budget=AssignmentBudget(2, 1024, 60),
+        input_schema="input/v1",
+        output_schema="output/v1",
+    )
+    schedule_profile = WorkerProfile(
+        "adversarial-explorer",
+        99,
+        "Dynamic schedule profile",
+        "Dynamic instructions",
+        frozenset({"dynamic"}),
+    )
+
+    resolved = _profile_for_handoff(assignment, None, schedule_profile)
+
+    assert resolved == CORE_PROFILES_BY_ID["adversarial-explorer"]
 
 
 def test_persisted_adaptive_assignment_preserves_execution_mode_provenance() -> None:
