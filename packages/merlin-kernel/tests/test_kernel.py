@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 from types import SimpleNamespace
@@ -6379,12 +6380,14 @@ async def test_steering_revalidates_durable_campaign_tool_authority(
         for message in store.messages[session_id]
         if message.role == "tool" and message.tool_call_id == "delayed-compile-a"
     ]
-    assert delayed_results, [event.payload for event in store.events if event.type == "error"]
-    delayed_result = delayed_results[0]
-    if retained:
+    call_was_persisted = retained or steer_during_tool
+    assert bool(delayed_results) is call_was_persisted
+    if retained and delayed_results:
+        delayed_result = delayed_results[0]
         assert _CAMPAIGN_REQUEST_ID_A in delayed_result.content
     else:
-        assert _CAMPAIGN_REQUEST_ID_A not in delayed_result.content
+        if delayed_results:
+            assert _CAMPAIGN_REQUEST_ID_A not in delayed_results[0].content
         assert len(provider.requests) >= 2
         assert provider.requests[1].required_tool_name is None
         assert {tool["function"]["name"] for tool in provider.requests[1].tools} == set(
@@ -6491,6 +6494,12 @@ async def test_steering_serializes_tool_admission_and_terminal_append(
     expected_calls = [] if blocked_append == "assistant" else ["browser_snapshot"]
     assert tools.calls == expected_calls
     messages = store.messages[kernel.session_id]
+    assistant_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.role == "assistant"
+        and any(call.get("id") == "serialized-tool" for call in message.tool_calls)
+    )
     terminal_index = next(
         index
         for index, message in enumerate(messages)
@@ -6502,6 +6511,7 @@ async def test_steering_serializes_tool_admission_and_terminal_append(
         if message.role == "user" and _CAMPAIGN_REQUEST_ID_B in message.content
     )
     terminal = messages[terminal_index]
+    assert assistant_index < boundary_b_index
     if blocked_append == "assistant":
         assert boundary_b_index < terminal_index
         assert _CAMPAIGN_REQUEST_ID_A not in terminal.content
@@ -6509,6 +6519,116 @@ async def test_steering_serializes_tool_admission_and_terminal_append(
         assert terminal_index < boundary_b_index
     if dynamic:
         assert provider.dynamic_outputs[0].success is (blocked_append == "terminal")
+    projection = await kernel._provider_transcript(kernel.session_id, model="test-model")
+    projected_assistant_index = next(
+        index
+        for index, message in enumerate(projection)
+        if message.role == "assistant"
+        and any(call.get("id") == "serialized-tool" for call in message.tool_calls)
+    )
+    projected_terminal_index = next(
+        index
+        for index, message in enumerate(projection)
+        if message.role == "tool" and message.tool_call_id == "serialized-tool"
+    )
+    projected_boundary_b_index = next(
+        index
+        for index, message in enumerate(projection)
+        if message.role == "user" and _CAMPAIGN_REQUEST_ID_B in message.content
+    )
+    assert projected_assistant_index < projected_terminal_index < projected_boundary_b_index
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_new_boundary_before_provider_tool_delivery_drops_stale_call(
+    dynamic: bool,
+) -> None:
+    provider_blocked, release_provider = asyncio.Event(), asyncio.Event()
+
+    class RecordingTools(Tools):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return (ToolSpec(name="browser_snapshot", description="snapshot", input_schema={}),)
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(content="stale snapshot")
+
+    class DelayedProvider:
+        def __init__(self) -> None:
+            self.requests = []
+            self.dynamic_outputs: list[DynamicToolOutput] = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                provider_blocked.set()
+                await release_provider.wait()
+                yield ToolCall(
+                    call_id="late-a-call",
+                    name="browser_snapshot",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="B request processed")
+            yield ModelCompleted()
+
+        async def dynamic_stream(self, request, handler):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                provider_blocked.set()
+                await release_provider.wait()
+                self.dynamic_outputs.append(
+                    await handler(
+                        ToolCall(
+                            call_id="late-a-call",
+                            name="browser_snapshot",
+                            arguments={},
+                        )
+                    )
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="B request processed")
+            yield ModelCompleted()
+
+    store = Store()
+    provider = DelayedProvider()
+    if dynamic:
+        provider.stream_with_tools = provider.dynamic_stream
+    tools = RecordingTools()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await provider_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_provider.set()
+    await kernel.wait_for_turn()
+
+    assert tools.calls == []
+    assert not any(
+        message.role == "assistant"
+        and any(call.get("id") == "late-a-call" for call in message.tool_calls)
+        for message in store.messages[kernel.session_id]
+    )
+    assert not any(
+        message.role == "tool" and message.tool_call_id == "late-a-call"
+        for message in store.messages[kernel.session_id]
+    )
+    assert len(provider.requests) >= 2
+    assert not any(
+        message.role == "assistant"
+        and any(call.get("id") == "late-a-call" for call in message.tool_calls)
+        for message in provider.requests[1].messages
+    )
+    if dynamic:
+        assert provider.dynamic_outputs[0].success is False
 
 
 @pytest.mark.asyncio
@@ -6621,6 +6741,539 @@ async def test_steering_revalidates_before_no_tool_recovery_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "retryable"),
+    [("fatal_provider_error", False), ("read_timeout", True)],
+)
+@pytest.mark.parametrize("partial_content", [False, True])
+async def test_steering_during_terminal_error_emit_services_new_campaign(
+    error_code: str,
+    retryable: bool,
+    partial_content: bool,
+) -> None:
+    error_emit_blocked, release_error_emit = asyncio.Event(), asyncio.Event()
+
+    class BlockingEventStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked_once = False
+
+        async def append_event(self, session_id, event):
+            if (
+                not self.blocked_once
+                and event.type == "error"
+                and event.payload.get("code") == error_code
+            ):
+                self.blocked_once = True
+                error_emit_blocked.set()
+                await release_error_emit.wait()
+            await super().append_event(session_id, event)
+
+    class TerminalErrorProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                if partial_content:
+                    yield TextDelta(text="A partial")
+                yield ModelError(
+                    message=f"provider {error_code}",
+                    code=error_code,
+                    retryable=retryable,
+                )
+                return
+            yield TextDelta(text="B serviced")
+            yield ModelCompleted()
+
+    store = BlockingEventStore()
+    provider = TerminalErrorProvider()
+    kernel = Kernel(provider, store, Tools(), Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await error_emit_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_error_emit.set()
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) >= 2
+    second_request = provider.requests[1]
+    assert second_request.required_tool_name is None
+    assert not any(
+        "previous provider attempt ended" in message.content.lower()
+        for message in second_request.messages
+        if message.role == "system"
+    )
+    messages = store.messages[kernel.session_id]
+    assert [message.role for message in messages[:2]] == ["user", "user"]
+    assert _CAMPAIGN_REQUEST_ID_A in messages[0].content
+    assert _CAMPAIGN_REQUEST_ID_B in messages[1].content
+    assert all(message.content != "A partial" for message in messages)
+    assert any(
+        message.role == "assistant" and message.content == "B serviced" for message in messages
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_content", [False, True])
+async def test_steering_during_incomplete_stream_emit_services_new_campaign(
+    partial_content: bool,
+) -> None:
+    error_emit_blocked, release_error_emit = asyncio.Event(), asyncio.Event()
+
+    class BlockingEventStore(Store):
+        async def append_event(self, session_id, event):
+            if event.type == "error" and event.payload.get("code") == "incomplete_stream":
+                error_emit_blocked.set()
+                await release_error_emit.wait()
+            await super().append_event(session_id, event)
+
+    class IncompleteProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                if partial_content:
+                    yield TextDelta(text="A incomplete partial")
+                return
+            yield TextDelta(text="B serviced after incomplete stream")
+            yield ModelCompleted()
+
+    store = BlockingEventStore()
+    provider = IncompleteProvider()
+    kernel = Kernel(provider, store, Tools(), Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await error_emit_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_error_emit.set()
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) >= 2
+    messages = store.messages[kernel.session_id]
+    assert [message.role for message in messages[:2]] == ["user", "user"]
+    assert all(message.content != "A incomplete partial" for message in messages)
+    assert any(
+        message.role == "assistant" and message.content == "B serviced after incomplete stream"
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_steering_before_normal_completion_commit_discards_old_prose() -> None:
+    completion_check_blocked, release_completion_check = asyncio.Event(), asyncio.Event()
+
+    class CompletionProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield TextDelta(text="A completed prose")
+                yield ModelCompleted()
+                return
+            yield TextDelta(text="B completed prose")
+            yield ModelCompleted()
+
+    provider = CompletionProvider()
+    store = Store()
+    kernel = Kernel(provider, store, Tools(), Settings())
+    commitment_checks = 0
+
+    async def gated_commitment_check(text: str) -> bool:
+        nonlocal commitment_checks
+        commitment_checks += 1
+        if commitment_checks == 1:
+            assert text == "A completed prose"
+            completion_check_blocked.set()
+            await release_completion_check.wait()
+        return False
+
+    kernel._commits_immediate_tool_action = gated_commitment_check
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await completion_check_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_completion_check.set()
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) >= 2
+    messages = store.messages[kernel.session_id]
+    assert [message.role for message in messages[:2]] == ["user", "user"]
+    assert all(message.content != "A completed prose" for message in messages)
+    assert any(
+        message.role == "assistant" and message.content == "B completed prose"
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_steering_during_request_input_emit_services_accepted_followup() -> None:
+    tool_emit_blocked, release_tool_emit = asyncio.Event(), asyncio.Event()
+
+    class BlockingEventStore(Store):
+        async def append_event(self, session_id, event):
+            if (
+                event.type == "tool"
+                and event.payload.get("name") == "request_user_input"
+                and event.payload.get("state") == "completed"
+            ):
+                tool_emit_blocked.set()
+                await release_tool_emit.wait()
+            await super().append_event(session_id, event)
+
+    class InputTools(Tools):
+        def describe(self):
+            return (ToolSpec(name="request_user_input", description="ask", input_schema={}),)
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(content="question emitted")
+
+    class InputProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                await handler(
+                    ToolCall(
+                        call_id="ask-a",
+                        name="request_user_input",
+                        arguments={},
+                    )
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="accepted steer serviced")
+            yield ModelCompleted()
+
+    store = BlockingEventStore()
+    provider = InputProvider()
+    kernel = Kernel(provider, store, InputTools(), Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await tool_emit_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_tool_emit.set()
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) >= 2
+    assert any(
+        message.role == "assistant" and message.content == "accepted steer serviced"
+        for message in store.messages[kernel.session_id]
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_turn_close_atomically_rejects_late_steering() -> None:
+    closing, release_close = asyncio.Event(), asyncio.Event()
+
+    class ClosingGateLock:
+        def __init__(self, kernel: Kernel) -> None:
+            self._kernel = kernel
+            self._lock = asyncio.Lock()
+            self._gated = False
+
+        async def __aenter__(self):
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            if (
+                not self._gated
+                and self._kernel._steering_turn_task is asyncio.current_task()
+                and not self._kernel._steering_admission_open
+            ):
+                self._gated = True
+                closing.set()
+                await release_close.wait()
+            self._lock.release()
+
+    class CompletingProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def stream(self, request):
+            self.requests += 1
+            yield TextDelta(text="complete")
+            yield ModelCompleted()
+
+    store = Store()
+    provider = CompletingProvider()
+    kernel = Kernel(provider, store, Tools(), Settings())
+    kernel._steering_lock = ClosingGateLock(kernel)
+    await kernel.start()
+    await kernel.submit("initial request")
+    await closing.wait()
+
+    late_steer = asyncio.create_task(kernel.steer("late accepted work"))
+    await asyncio.sleep(0)
+    assert not late_steer.done()
+    release_close.set()
+
+    assert await late_steer is False
+    await kernel.wait_for_turn()
+    assert provider.requests == 1
+    assert [message.content for message in store.messages[kernel.session_id]] == [
+        "initial request",
+        "complete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_accepted_terminal_steer_refreshes_skill_selection() -> None:
+    error_emit_blocked, release_error_emit = asyncio.Event(), asyncio.Event()
+
+    class BlockingEventStore(Store):
+        async def append_event(self, session_id, event):
+            if event.type == "error" and event.payload.get("code") == "fatal_provider_error":
+                error_emit_blocked.set()
+                await release_error_emit.wait()
+            await super().append_event(session_id, event)
+
+    class RecordingSkills:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        async def instructions_for(self, session_id, user_text):
+            self.texts.append(user_text)
+            return [f"skill-selected-for:{user_text}"]
+
+    class TerminalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelError(
+                    message="terminal A failure",
+                    code="fatal_provider_error",
+                    retryable=False,
+                )
+                return
+            yield TextDelta(text="B complete")
+            yield ModelCompleted()
+
+    request_a = "initial request A"
+    request_b = "authoritative steered request B"
+    store = BlockingEventStore()
+    skills = RecordingSkills()
+    provider = TerminalProvider()
+    kernel = Kernel(provider, store, Tools(), Settings(), skills=skills)
+    await kernel.start()
+    await kernel.submit(request_a)
+    await error_emit_blocked.wait()
+    assert await kernel.steer(request_b)
+    release_error_emit.set()
+    await kernel.wait_for_turn()
+
+    assert skills.texts == [request_a, request_b]
+    assert len(provider.requests) >= 2
+    assert any(
+        message.role == "system" and message.content == f"skill-selected-for:{request_b}"
+        for message in provider.requests[1].messages
+    )
+    assert not any(
+        message.role == "system" and message.content == f"skill-selected-for:{request_a}"
+        for message in provider.requests[1].messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_steering_uses_bounded_turn_stack() -> None:
+    steer_count = 20
+    started = [asyncio.Event() for _ in range(steer_count + 1)]
+    releases = [asyncio.Event() for _ in range(steer_count + 1)]
+    observed_texts: list[str] = []
+    stack_depths: list[int] = []
+
+    kernel = Kernel(Provider(), Store(), Tools(), Settings())
+
+    async def gated_iteration(session_id: str, user_text: str) -> None:
+        index = len(observed_texts)
+        observed_texts.append(user_text)
+        stack_depths.append(len(inspect.stack()))
+        async with kernel._steering_lock:
+            kernel._steering_serviced_version = kernel._steering_version
+        started[index].set()
+        await releases[index].wait()
+
+    kernel._run_turn_iteration = gated_iteration
+    await kernel.start()
+    await kernel.submit("request-0")
+    for index in range(steer_count):
+        await started[index].wait()
+        assert await kernel.steer(f"request-{index + 1}")
+        releases[index].set()
+    await started[-1].wait()
+    releases[-1].set()
+    await kernel.wait_for_turn()
+
+    assert observed_texts == [f"request-{index}" for index in range(steer_count + 1)]
+    assert max(stack_depths) - min(stack_depths) <= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_exit", "terminal_code"),
+    [
+        ("retry_exhaustion", "preferred_tool_retry_exhausted"),
+        ("owned_cleanup", "owned_session_cleanup_failed"),
+        ("automatic_stall", "automatic_recon_stalled"),
+    ],
+)
+async def test_steering_during_held_terminal_exit_services_new_campaign(
+    terminal_exit: str,
+    terminal_code: str,
+) -> None:
+    terminal_emit_blocked, release_terminal_emit = asyncio.Event(), asyncio.Event()
+    objective = "Assess https://a.test"
+
+    class BlockingEventStore(Store):
+        async def append_event(self, session_id, event):
+            if event.type == "error" and event.payload.get("code") == terminal_code:
+                terminal_emit_blocked.set()
+                await release_terminal_emit.wait()
+            await super().append_event(session_id, event)
+
+    class ExitTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_end_owned_session",
+                    "browser_snapshot",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            if terminal_exit == "retry_exhaustion":
+                if name == "assessment_prepare":
+                    return ToolResult(
+                        content="compile required",
+                        is_error=True,
+                        metadata={
+                            "retryable": True,
+                            "repair_reason": "recon_handoff_required",
+                            "preferred_next_tool": "browser_compile_api_handoff",
+                        },
+                    )
+                return ToolResult(
+                    content="still blocked", is_error=True, metadata={"retryable": True}
+                )
+            if terminal_exit == "owned_cleanup":
+                if name == "assessment_prepare":
+                    return ToolResult(
+                        content="owned cleanup required",
+                        is_error=True,
+                        metadata={
+                            "automatic_recon_continuation": _cleanup_continuation(
+                                "handoff:terminal-steer",
+                                ownership="owned",
+                                ownership_evidence_refs=["creation:before", "creation:after"],
+                            )
+                        },
+                    )
+                return ToolResult(content="cleanup failed", is_error=True)
+            return ToolResult(
+                content="cleanup discovery required",
+                is_error=True,
+                metadata={
+                    "automatic_recon_continuation": _cleanup_continuation("handoff:terminal-stall")
+                },
+            )
+
+    class ExitProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if terminal_exit == "retry_exhaustion":
+                if call_number == 1:
+                    yield ToolCall(
+                        call_id="prepare-terminal",
+                        name="assessment_prepare",
+                        arguments={"objective": objective},
+                    )
+                    yield ModelCompleted(finish_reason="tool_calls")
+                    return
+                if call_number == 2:
+                    yield ToolCall(
+                        call_id="compile-terminal",
+                        name="browser_compile_api_handoff",
+                        arguments={},
+                    )
+                    yield ModelCompleted(finish_reason="tool_calls")
+                    return
+            elif terminal_exit == "owned_cleanup":
+                if call_number == 1:
+                    yield ToolCall(
+                        call_id="prepare-owned-terminal",
+                        name="assessment_prepare",
+                        arguments={"objective": objective},
+                    )
+                    yield ModelCompleted(finish_reason="tool_calls")
+                    return
+                if call_number == 2:
+                    yield ToolCall(
+                        call_id="cleanup-owned-terminal",
+                        name="browser_end_owned_session",
+                        arguments={},
+                    )
+                    yield ModelCompleted(finish_reason="tool_calls")
+                    return
+            elif call_number == 1:
+                yield ToolCall(
+                    call_id="prepare-stall-terminal",
+                    name="assessment_prepare",
+                    arguments={"objective": objective},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            elif call_number < 4:
+                yield ModelCompleted()
+                return
+            yield TextDelta(text="B serviced after terminal hold")
+            yield ModelCompleted()
+
+    store = BlockingEventStore()
+    provider = ExitProvider()
+    kernel = Kernel(provider, store, ExitTools(), Settings(), max_provider_retries=0)
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content(objective))
+    await terminal_emit_blocked.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_terminal_emit.set()
+    await kernel.wait_for_turn()
+
+    assert any(
+        message.role == "assistant" and message.content == "B serviced after terminal hold"
+        for message in store.messages[kernel.session_id]
+    )
+    assert provider.requests[-1].required_tool_name is None
+
+
+@pytest.mark.asyncio
 async def test_new_campaign_epoch_clears_recon_recall_tool_filter() -> None:
     request_two_started, release_request_two = asyncio.Event(), asyncio.Event()
 
@@ -6677,8 +7330,11 @@ async def test_new_campaign_epoch_clears_recon_recall_tool_filter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_buffered_post_invoke_authority_keeps_pairing_order() -> None:
-    authority_blocked, release_authority = asyncio.Event(), asyncio.Event()
+@pytest.mark.parametrize("cancellation_window", ["assistant", "post_authority", "terminal"])
+async def test_buffered_cancellation_persists_text_and_pairing_exactly_once(
+    cancellation_window: str,
+) -> None:
+    cancellation_blocked, release_cancellation = asyncio.Event(), asyncio.Event()
 
     class BlockingAuthorityStore(Store):
         def __init__(self) -> None:
@@ -6688,9 +7344,25 @@ async def test_cancellation_during_buffered_post_invoke_authority_keeps_pairing_
         async def load_messages(self, session_id):
             if self.block_next_load:
                 self.block_next_load = False
-                authority_blocked.set()
-                await release_authority.wait()
+                cancellation_blocked.set()
+                await release_cancellation.wait()
             return await super().load_messages(session_id)
+
+        async def append_message(self, session_id, message):
+            blocked_assistant = (
+                cancellation_window == "assistant"
+                and message.role == "assistant"
+                and any(call.get("id") == "cancelled-buffered-tool" for call in message.tool_calls)
+            )
+            blocked_terminal = (
+                cancellation_window == "terminal"
+                and message.role == "tool"
+                and message.tool_call_id == "cancelled-buffered-tool"
+            )
+            if blocked_assistant or blocked_terminal:
+                cancellation_blocked.set()
+                await release_cancellation.wait()
+            await super().append_message(session_id, message)
 
     class BlockingTools(Tools):
         def __init__(self, store: BlockingAuthorityStore) -> None:
@@ -6700,7 +7372,7 @@ async def test_cancellation_during_buffered_post_invoke_authority_keeps_pairing_
             return (ToolSpec(name="browser_snapshot", description="snapshot", input_schema={}),)
 
         async def invoke(self, name, context, arguments):
-            self.store.block_next_load = True
+            self.store.block_next_load = cancellation_window == "post_authority"
             return ToolResult(content="snapshot complete")
 
     class BufferedProvider:
@@ -6717,26 +7389,51 @@ async def test_cancellation_during_buffered_post_invoke_authority_keeps_pairing_
     kernel = Kernel(BufferedProvider(), store, BlockingTools(store), Settings())
     await kernel.start()
     await kernel.submit(_campaign_scope_content("Assess https://a.test"))
-    await authority_blocked.wait()
+    await cancellation_blocked.wait()
     assert kernel._turn is not None
     kernel._turn.cancel()
-    release_authority.set()
+    release_cancellation.set()
     await kernel.wait_for_turn()
 
     messages = store.messages[kernel.session_id]
-    assistant_index = next(
-        index
-        for index, message in enumerate(messages)
-        if message.role == "assistant"
-        and any(call.get("id") == "cancelled-buffered-tool" for call in message.tool_calls)
-    )
-    terminal_index = next(
-        index
-        for index, message in enumerate(messages)
+    assistants = [message for message in messages if message.role == "assistant"]
+    terminals = [
+        message
+        for message in messages
         if message.role == "tool" and message.tool_call_id == "cancelled-buffered-tool"
-    )
-    assert messages[assistant_index].content == "Buffered assistant text"
-    assert terminal_index == assistant_index + 1
+    ]
+    assert len(assistants) == 1
+    assert assistants[0].content == "Buffered assistant text"
+    assert [call.get("id") for call in assistants[0].tool_calls] == ["cancelled-buffered-tool"]
+    assert len(terminals) == 1
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_buffered_batch_persists_unbatched_text() -> None:
+    text_streamed, release_provider = asyncio.Event(), asyncio.Event()
+
+    class TextOnlyUntilCancelledProvider:
+        async def stream(self, request):
+            yield TextDelta(text="Unbatched assistant text")
+            text_streamed.set()
+            await release_provider.wait()
+            yield ModelCompleted()
+
+    store = Store()
+    kernel = Kernel(TextOnlyUntilCancelledProvider(), store, Tools(), Settings())
+    await kernel.start()
+    await kernel.submit("inspect")
+    await text_streamed.wait()
+    assert kernel._turn is not None
+    kernel._turn.cancel()
+    release_provider.set()
+    await kernel.wait_for_turn()
+
+    assistants = [
+        message for message in store.messages[kernel.session_id] if message.role == "assistant"
+    ]
+    assert [message.content for message in assistants] == ["Unbatched assistant text"]
 
 
 @pytest.mark.asyncio

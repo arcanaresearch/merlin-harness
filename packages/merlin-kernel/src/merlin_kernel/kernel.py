@@ -1406,6 +1406,10 @@ class Kernel:
         self._turn: asyncio.Task[None] | None = None
         self._steering_lock = asyncio.Lock()
         self._steering_version = 0
+        self._steering_turn_task: asyncio.Task[None] | None = None
+        self._steering_admission_open = False
+        self._steering_serviced_version = 0
+        self._latest_steer_text: str | None = None
         self._assessment: asyncio.Task[None] | None = None
         self._swarm: asyncio.Task[None] | None = None
         self._events: asyncio.Queue[AppEvent] = asyncio.Queue()
@@ -1520,10 +1524,19 @@ class Kernel:
         async with self._steering_lock:
             if self._turn is None or self._turn.done() or self._session_id is None:
                 return False
+            if self._steering_turn_task is not self._turn:
+                # ``submit`` has scheduled a new turn that has not started yet.
+                # Admit steering for that opening window without reopening a
+                # task whose final reconciliation already closed admission.
+                self._steering_turn_task = self._turn
+                self._steering_admission_open = True
+            elif not self._steering_admission_open:
+                return False
             await self._store.append_message(
                 self._session_id, ChatMessage(role="user", content=text)
             )
             self._steering_version += 1
+            self._latest_steer_text = text
             await self._emit(
                 self._event(
                     "message",
@@ -1594,6 +1607,31 @@ class Kernel:
             yield await self.next_event()
 
     async def _run_turn(self, session_id: str, user_text: str) -> None:
+        """Run accepted foreground work iteratively until steering is reconciled."""
+
+        turn_task = asyncio.current_task()
+        if turn_task is None:
+            raise RuntimeError("turn execution requires an asyncio task")
+        async with self._steering_lock:
+            if self._steering_turn_task is not turn_task:
+                self._steering_turn_task = turn_task
+                self._steering_admission_open = True
+                self._latest_steer_text = user_text
+            active_user_text = self._latest_steer_text or user_text
+        try:
+            while True:
+                await self._run_turn_iteration(session_id, active_user_text)
+                async with self._steering_lock:
+                    if self._steering_version == self._steering_serviced_version:
+                        self._steering_admission_open = False
+                        return
+                    active_user_text = self._latest_steer_text or active_user_text
+        finally:
+            async with self._steering_lock:
+                if self._steering_turn_task is turn_task:
+                    self._steering_admission_open = False
+
+    async def _run_turn_iteration(self, session_id: str, user_text: str) -> None:
         assistant = ""
         reasoning = ""
         provider_failures = 0
@@ -1621,16 +1659,21 @@ class Kernel:
         owned_cleanup_evidence_failed = False
         owned_cleanup_completed = False
         owned_cleanup_attempted_in_turn: set[str] = set()
+        buffered_assistant_content_persisted = False
         consumed_steering_version = self._steering_version
         try:
-            skill_messages: list[ChatMessage] = []
-            if self._skills is not None:
-                instructions = await self._skills.instructions_for(session_id, user_text)
-                skill_messages = [
+
+            async def skill_messages_for(text: str) -> list[ChatMessage]:
+                if self._skills is None:
+                    return []
+                instructions = await self._skills.instructions_for(session_id, text)
+                return [
                     ChatMessage(role="system", content=instruction)
                     for instruction in instructions
                     if instruction.strip()
                 ]
+
+            skill_messages = await skill_messages_for(user_text)
 
             async def handle_preferred_tool_miss(tool_name: str) -> str:
                 nonlocal preferred_tool_follow_through_failures
@@ -1812,6 +1855,7 @@ class Kernel:
                 return epoch, state.scope if state.kind == "bound" else None
 
             while True:
+                buffered_assistant_content_persisted = False
                 durable_messages = list(await self._store.load_messages(session_id))
                 current_user_boundaries = sum(
                     message.role == "user" for message in durable_messages
@@ -1847,9 +1891,15 @@ class Kernel:
                         ) = restored_repair
                     restored_steering_version = self._steering_version
                     restored_user_boundaries = current_user_boundaries
-                request_steering_version = self._steering_version
+                async with self._steering_lock:
+                    request_steering_version = self._steering_version
+                    request_user_text = self._latest_steer_text or user_text
+                    self._steering_serviced_version = request_steering_version
                 request_has_followup = request_steering_version != consumed_steering_version
                 consumed_steering_version = request_steering_version
+                if request_has_followup:
+                    user_text = request_user_text
+                    skill_messages = await skill_messages_for(user_text)
                 # Recovery constraints apply to exactly one provider request. A
                 # successful repaired tool call must not trap the rest of the
                 # turn behind that tool's schema or repair instruction.
@@ -2084,37 +2134,47 @@ class Kernel:
                         request_authority_valid,
                         current_repair_scope,
                     ) = await revalidate_request_authority()
-                    assistant_append = asyncio.create_task(
-                        self._store.append_message(
-                            session_id,
-                            ChatMessage(
-                                role="assistant",
-                                content="",
-                                tool_calls=[
-                                    {
-                                        "id": call.call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": call.name,
-                                            "arguments": json.dumps(call.arguments),
-                                        },
-                                    }
-                                ],
-                            ),
+                    async with self._steering_lock:
+                        (
+                            append_authority_valid,
+                            current_repair_scope,
+                        ) = await revalidate_request_authority()
+                        if not append_authority_valid:
+                            return DynamicToolOutput(
+                                content="tool call is stale for the current campaign boundary",
+                                success=False,
+                            )
+                        assistant_append = asyncio.create_task(
+                            self._store.append_message(
+                                session_id,
+                                ChatMessage(
+                                    role="assistant",
+                                    content="",
+                                    tool_calls=[
+                                        {
+                                            "id": call.call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": call.name,
+                                                "arguments": json.dumps(call.arguments),
+                                            },
+                                        }
+                                    ],
+                                ),
+                            )
                         )
-                    )
-                    try:
-                        await asyncio.shield(assistant_append)
-                    except asyncio.CancelledError:
-                        with suppress(asyncio.CancelledError):
-                            await assistant_append
-                        await self._append_tool_terminal(
-                            session_id,
-                            name=call.name,
-                            call_id=call.call_id,
-                            content="tool call interrupted before admission",
-                        )
-                        raise
+                        try:
+                            await asyncio.shield(assistant_append)
+                        except asyncio.CancelledError:
+                            with suppress(asyncio.CancelledError):
+                                await assistant_append
+                            await self._append_tool_terminal(
+                                session_id,
+                                name=call.name,
+                                call_id=call.call_id,
+                                content="tool call interrupted before admission",
+                            )
+                            raise
                     invocation = _safe_shell_invocation(
                         call.name, call.arguments, self._workspace_root
                     )
@@ -2595,14 +2655,29 @@ class Kernel:
                                 **failure_event_payload(failure_category),
                             )
                         )
-                        # The received bytes are authoritative even when a provider
-                        # mislabels the error as non-partial.
-                        if assistant or reasoning:
-                            await self._save_assistant(
-                                session_id,
-                                assistant,
-                                reasoning_content=reasoning or None,
+                        async with self._steering_lock:
+                            (
+                                terminal_error_authority_valid,
+                                _current_repair_scope,
+                            ) = await revalidate_request_authority()
+                            terminal_error_was_steered = (
+                                self._steering_version != request_steering_version
                             )
+                            if (
+                                terminal_error_authority_valid
+                                and not terminal_error_was_steered
+                                and (assistant or reasoning)
+                            ):
+                                await self._save_assistant(
+                                    session_id,
+                                    assistant,
+                                    reasoning_content=reasoning or None,
+                                )
+                        if not terminal_error_authority_valid or terminal_error_was_steered:
+                            assistant = ""
+                            reasoning = ""
+                            retry_provider = True
+                            break
                         return
                 if retry_provider:
                     assistant = ""
@@ -2659,6 +2734,11 @@ class Kernel:
                     )
                     return
                 if used_tool:
+
+                    def mark_buffered_assistant_persisted() -> None:
+                        nonlocal buffered_assistant_content_persisted
+                        buffered_assistant_content_persisted = True
+
                     (
                         request_authority_valid,
                         _current_repair_scope,
@@ -2695,6 +2775,7 @@ class Kernel:
                         recon_recall_completed=recon_recall_completed,
                         request_authority_valid=request_authority_valid,
                         authority_check=revalidate_request_authority,
+                        assistant_persisted=mark_buffered_assistant_persisted,
                     )
                     async with self._steering_lock:
                         (
@@ -2993,14 +3074,14 @@ class Kernel:
                     # arriving during generation must receive a provider step even
                     # when the previous response ended without a tool call.
                     async with self._steering_lock:
-                        if assistant:
-                            await self._save_assistant(
-                                session_id, assistant, reasoning_content=reasoning or None
-                            )
                         if self._steering_version != request_steering_version:
                             assistant = ""
                             reasoning = ""
                             continue
+                        if assistant:
+                            await self._save_assistant(
+                                session_id, assistant, reasoning_content=reasoning or None
+                            )
                         if request_has_followup:
                             repair_messages = [
                                 ChatMessage(
@@ -3026,7 +3107,7 @@ class Kernel:
         except _AwaitingUserInput:
             return
         except asyncio.CancelledError:
-            if assistant:
+            if assistant and not buffered_assistant_content_persisted:
                 await self._save_assistant(
                     session_id, assistant, reasoning_content=reasoning or None
                 )
@@ -3053,6 +3134,7 @@ class Kernel:
         recon_recall_completed: bool = False,
         request_authority_valid: bool = True,
         authority_check: Callable[[], Awaitable[tuple[bool, str | None]]] | None = None,
+        assistant_persisted: Callable[[], None] | None = None,
     ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
         if not events:
             return (
@@ -3082,6 +3164,15 @@ class Kernel:
         async with self._steering_lock:
             if authority_check is not None:
                 request_authority_valid, repair_scope_campaign_request_id = await authority_check()
+            if not request_authority_valid:
+                return (
+                    preferred_next_tool,
+                    None,
+                    None,
+                    None,
+                    recon_recall_completed,
+                    preferred_next_tool_mode,
+                )
             assistant_append = asyncio.create_task(
                 self._store.append_message(
                     session_id,
@@ -3110,9 +3201,13 @@ class Kernel:
             )
             try:
                 await asyncio.shield(assistant_append)
+                if assistant_persisted is not None:
+                    assistant_persisted()
             except asyncio.CancelledError:
                 with suppress(asyncio.CancelledError):
                     await assistant_append
+                if assistant_persisted is not None:
+                    assistant_persisted()
                 for interrupted in events:
                     await self._append_tool_terminal(
                         session_id,
