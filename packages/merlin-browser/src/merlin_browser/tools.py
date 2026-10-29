@@ -858,6 +858,32 @@ def _foreground_recon_probe_rejection(
     return ToolResult(content=message, is_error=True, metadata=metadata)
 
 
+def _campaign_pre_dispatch_rejection_metadata(
+    *,
+    effect: str,
+    failure_code: str | None = None,
+    retryable: bool | None = None,
+    **metadata: object,
+) -> dict[str, object]:
+    """Attest that a campaign browser action stopped before physical dispatch."""
+
+    result: dict[str, object] = {
+        "effect": effect,
+        **metadata,
+        "target_effect_dispatch_status": "rejected_before_dispatch",
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+    }
+    if failure_code is not None:
+        result["failure_code"] = failure_code
+    if retryable is not None:
+        result["retryable"] = retryable
+    return result
+
+
 def _foreground_recon_dispatch_receipt(
     *,
     session: BrowserSession,
@@ -1312,13 +1338,12 @@ class BrowserTool:
                         "runtime releases the browser actor at terminal worker outcomes"
                     ),
                     is_error=True,
-                    metadata={
-                        "effect": self.effect,
-                        "target": session.bounds.target_id,
-                        "target_session_id": f"browser:{session.context_id}",
-                        "release_rejected": True,
-                        "campaign_scoped": True,
-                    },
+                    metadata=_campaign_pre_dispatch_rejection_metadata(
+                        effect=self.effect,
+                        target=session.bounds.target_id,
+                        release_rejected=True,
+                        campaign_scoped=True,
+                    ),
                 )
             await session.release_actor(actor_id)
             return ToolResult(
@@ -1338,13 +1363,12 @@ class BrowserTool:
                     "releases the browser actor at terminal worker outcomes"
                 ),
                 is_error=True,
-                metadata={
-                    "effect": self.effect,
-                    "target": session.bounds.target_id,
-                    "target_session_id": f"browser:{session.context_id}",
-                    "release_rejected": True,
-                    "campaign_scoped": True,
-                },
+                metadata=_campaign_pre_dispatch_rejection_metadata(
+                    effect=self.effect,
+                    target=session.bounds.target_id,
+                    release_rejected=True,
+                    campaign_scoped=True,
+                ),
             )
         state_scope: _BrowserStateScope | None = None
         session_recon_scope = False
@@ -1426,13 +1450,11 @@ class BrowserTool:
                     return ToolResult(
                         content="reviewed browser state is already owned by another execution",
                         is_error=True,
-                        metadata={
-                            "effect": self.effect,
-                            "failure_code": "physical_state_unavailable",
-                            "retryable": True,
-                            "target_effect_attempted": False,
-                            "target_call_budget_charge": 0,
-                        },
+                        metadata=_campaign_pre_dispatch_rejection_metadata(
+                            effect=self.effect,
+                            failure_code="physical_state_unavailable",
+                            retryable=True,
+                        ),
                     )
             if kind == "open_tab" and context.campaign_id is not None and not transition_tab_ref:
                 assert state_scope is not None
@@ -1447,18 +1469,12 @@ class BrowserTool:
                         "surface; create the initial tab during pre-campaign reconnaissance"
                     ),
                     is_error=True,
-                    metadata={
-                        "effect": self.effect,
-                        "failure_code": "campaign_open_tab_requires_existing_surface",
-                        "retryable": False,
-                        "reobserve_required": True,
-                        "target_effect_dispatch_status": "rejected_before_dispatch",
-                        "effect_applied": False,
-                        "target_effect_attempted": False,
-                        "interaction_count": 0,
-                        "limit_interaction_count": 0,
-                        "target_call_budget_charge": 0,
-                    },
+                    metadata=_campaign_pre_dispatch_rejection_metadata(
+                        effect=self.effect,
+                        failure_code="campaign_open_tab_requires_existing_surface",
+                        retryable=False,
+                        reobserve_required=True,
+                    ),
                 )
             if transition_tab_ref:
                 try:
@@ -1471,13 +1487,11 @@ class BrowserTool:
                     return ToolResult(
                         content="browser state could not be observed before the target action",
                         is_error=True,
-                        metadata={
-                            "effect": self.effect,
-                            "failure_code": "state_scope_before_unavailable",
-                            "retryable": True,
-                            "target_effect_attempted": False,
-                            "target_call_budget_charge": 0,
-                        },
+                        metadata=_campaign_pre_dispatch_rejection_metadata(
+                            effect=self.effect,
+                            failure_code="state_scope_before_unavailable",
+                            retryable=True,
+                        ),
                     )
                 before_url = _browser_tab_url(session, transition_tab_ref)
                 before_refs = (_browser_evidence_ref("before", before),)
@@ -1528,15 +1542,12 @@ class BrowserTool:
                     "the target was not called and passive re-observation is required"
                 ),
                 is_error=True,
-                metadata={
-                    "effect": self.effect,
-                    "failure_code": "compiled_browser_adapter_required",
-                    "retryable": False,
-                    "reobserve_required": True,
-                    "target_effect_attempted": False,
-                    "target_call_budget_charge": 0,
-                    "target_session_id": f"browser:{session.context_id}",
-                },
+                metadata=_campaign_pre_dispatch_rejection_metadata(
+                    effect=self.effect,
+                    failure_code="compiled_browser_adapter_required",
+                    retryable=False,
+                    reobserve_required=True,
+                ),
             )
         if state_scope is not None:
             try:
@@ -1646,11 +1657,18 @@ class BrowserTool:
                     "change strategy once, or report a blocker"
                 ),
                 is_error=True,
-                metadata={
-                    "effect": self.effect,
-                    "target": session.bounds.target_id,
-                    "target_session_id": f"browser:{session.context_id}",
-                },
+                metadata=(
+                    _campaign_pre_dispatch_rejection_metadata(
+                        effect=self.effect,
+                        target=session.bounds.target_id,
+                    )
+                    if context.campaign_id is not None
+                    else {
+                        "effect": self.effect,
+                        "target": session.bounds.target_id,
+                        "target_session_id": f"browser:{session.context_id}",
+                    }
+                ),
             )
         visual_evidence: tuple[dict[str, object], ...] = ()
         visual_capture_errors: tuple[str, ...] = ()

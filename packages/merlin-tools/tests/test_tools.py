@@ -5,8 +5,10 @@ import json
 import sys
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from merlin_browser import BrowserBoundaryError, BrowserBounds, BrowserOwner, BrowserTool
 from merlin_contracts import (
     MAX_TARGET_SESSION_ID_LENGTH,
     TargetDeliveryClass,
@@ -1254,6 +1256,108 @@ def test_permitted_target_strict_pre_dispatch_rejection_is_acknowledged(
     assert "effect_ambiguous" not in result.metadata
     assert "replacement_blocked" not in result.metadata
     assert tool.calls == 1
+    record = store.records[next(iter(store.records))]
+    assert record.state is ToolEffectState.ACKNOWLEDGED
+    assert record.result_is_error is True
+    assert record.result_metadata == result.metadata
+
+
+def test_broker_injects_session_witness_for_stale_campaign_navigate(
+    tmp_path: Path,
+) -> None:
+    class ScopeStore:
+        def create_state_scope(self, *_args, **_kwargs):
+            return {}
+
+        def claim_state_scope_lease(self, *_args, **_kwargs):
+            return "claim-stale-navigation"
+
+        def pause_state_scope(self, *_args, **_kwargs):
+            return {}
+
+        def release_state_scope_lease(self, *_args, **_kwargs):
+            return True
+
+    class Session:
+        context_id = "stale-navigation-context"
+        bounds = BrowserBounds(
+            target_id="target-1",
+            allowed_origins={"https://target.example"},
+        )
+        owner = BrowserOwner(
+            session_id="test-session",
+            worker_id="campaign/one/worker",
+            technique_id="recon",
+        )
+        mode = "persistent"
+        act_calls = 0
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref="tab:stale",
+                        state="open",
+                        url="https://target.example/current",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del tab_ref, frame_ref, step
+            raise BrowserBoundaryError("stale campaign tab")
+
+        async def act(self, action, *, actor_id):
+            del action, actor_id
+            self.act_calls += 1
+            raise AssertionError("stale navigation must be rejected before session.act")
+
+    store = PermitEffectStore()
+    session = Session()
+    tool = BrowserTool(
+        "browser_navigate",
+        lambda _: session,
+        state_scope_store=ScopeStore(),
+    )
+    permit_digest = "sha256:" + "9" * 64
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-stale-navigation",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        technique_attempt_id="technique-attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:stale-navigation-context",
+    )
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "browser_navigate",
+            context,
+            {"tab_ref": "tab:stale", "url": "https://target.example/next"},
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "state_scope_before_unavailable"
+    assert result.metadata["target_effect_dispatch_status"] == "rejected_before_dispatch"
+    assert result.metadata["target_session_id"] == "browser:stale-navigation-context"
+    assert result.metadata["target_effect_attempted"] is False
+    assert "effect_ambiguous" not in result.metadata
+    assert "replacement_blocked" not in result.metadata
+    assert session.act_calls == 0
     record = store.records[next(iter(store.records))]
     assert record.state is ToolEffectState.ACKNOWLEDGED
     assert record.result_is_error is True

@@ -39,6 +39,7 @@ from merlin_browser.core import BrowserSession, _sanitized_visual_source_url
 from merlin_browser.tools import (
     ApiReconHandoffTool,
     BrowserTool,
+    _campaign_pre_dispatch_rejection_metadata,
     _effective_browser_step_id,
     _ForegroundReconProbePermit,
     _leading_browser_setup_count,
@@ -2042,6 +2043,100 @@ async def test_campaign_open_tab_without_reviewed_surface_attests_zero_dispatch(
         "limit_interaction_count": 0,
         "target_call_budget_charge": 0,
     }
+    assert events == ["created", "claimed", "paused", "released"]
+
+
+def test_campaign_pre_dispatch_attestation_cannot_be_weakened_by_extra_metadata() -> None:
+    metadata = _campaign_pre_dispatch_rejection_metadata(
+        effect="target_read",
+        target_effect_dispatch_status="dispatched",
+        effect_applied=True,
+        target_effect_attempted=True,
+        interaction_count=4,
+        limit_interaction_count=3,
+        target_call_budget_charge=2,
+    )
+
+    assert metadata["target_effect_dispatch_status"] == "rejected_before_dispatch"
+    assert metadata["effect_applied"] is False
+    assert metadata["target_effect_attempted"] is False
+    assert metadata["interaction_count"] == 0
+    assert metadata["limit_interaction_count"] == 0
+    assert metadata["target_call_budget_charge"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_campaign_navigate_attests_zero_dispatch_before_session_act() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+
+    class Session:
+        context_id = "stale-navigation-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "persistent"
+        act_calls = 0
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref="tab:stale",
+                        state="open",
+                        url="https://target.example/current",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del tab_ref, frame_ref, step
+            raise BrowserBoundaryError("stale campaign tab")
+
+        async def act(self, action, *, actor_id):
+            del action, actor_id
+            self.act_calls += 1
+            raise AssertionError("stale navigation must be rejected before session.act")
+
+    session = Session()
+    result = await BrowserTool(
+        "browser_navigate",
+        lambda _: session,
+        state_scope_store=scope_store,
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:stale-navigation",
+            call_id="call:stale-navigation",
+            agent_id="campaign:stale-navigation/worker-1",
+            technique_attempt_id="attempt:stale-navigation",
+            target_id="target",
+            expected_target_session_id="browser:stale-navigation-context",
+        ),
+        {
+            "tab_ref": "tab:stale",
+            "url": "https://target.example/next",
+            "step": 1,
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata == {
+        "effect": "target_read",
+        "failure_code": "state_scope_before_unavailable",
+        "retryable": True,
+        "target_effect_dispatch_status": "rejected_before_dispatch",
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+    }
+    assert session.act_calls == 0
     assert events == ["created", "claimed", "paused", "released"]
 
 
