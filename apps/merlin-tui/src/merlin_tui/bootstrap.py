@@ -4121,6 +4121,21 @@ def _compile_objective_phase_gate_audit(
     compiled_by_key = dict(existing_by_key)
     final_id_by_key = {key: key for key in existing_by_key}
     used_ids = set(existing_by_key)
+    interaction_contract = reviewed_adapter.get("interaction_contract")
+    reviewed_probe = (
+        interaction_contract.get("probe") if isinstance(interaction_contract, Mapping) else None
+    )
+    reviewed_interaction_evidence = (
+        interaction_contract.get("evidence_refs")
+        if isinstance(interaction_contract, Mapping)
+        else None
+    )
+    recon_baseline_satisfied = (
+        isinstance(reviewed_probe, Mapping)
+        and bool(str(reviewed_probe.get("message") or "").strip())
+        and isinstance(reviewed_interaction_evidence, (list, tuple))
+        and len(reviewed_interaction_evidence) >= 2
+    )
     for index, proposal in enumerate(proposals):
         if not isinstance(proposal, Mapping):
             raise ValueError("objective prerequisite audit returned an invalid gate proposal")
@@ -4163,6 +4178,16 @@ def _compile_objective_phase_gate_audit(
         selected_interaction = any(
             steps_by_id[action["step_id"]].get("interaction") is True for action in compiled_actions
         )
+        proposal_text = f"{key} {gate_objective}".casefold()
+        normal_play_gate = selected_interaction and any(
+            marker in proposal_text
+            for marker in ("baseline", "normal play", "normal-play", "ordinary")
+        )
+        if normal_play_gate and recon_baseline_satisfied:
+            raise ValueError(
+                "objective prerequisite audit rescheduled a normal-play baseline already "
+                "satisfied by reviewed reconnaissance"
+            )
         if observation_name not in observation_names and not (
             receipt_predicate and selected_interaction
         ):
@@ -4229,6 +4254,40 @@ def _compile_objective_phase_gate_audit(
             raise ValueError("objective prerequisite requirement lacks exact operator provenance")
         if key not in compiled_by_key:
             raise ValueError("objective prerequisite requirement references an unknown gate key")
+        quote_text = f" {quote.casefold()} "
+        explicit_ordering = any(
+            marker in quote_text
+            for marker in (
+                " first ",
+                " before ",
+                "prior to",
+                "prerequisite",
+                "start by",
+                "begin by",
+                " then ",
+            )
+        )
+        explicit_setup = any(
+            marker in quote_text
+            for marker in (
+                "authenticate",
+                "authentication",
+                "sign in",
+                "signin",
+                "log in",
+                "login",
+                "connect wallet",
+                "set up",
+                "setup",
+                "configure",
+                "initialize",
+            )
+        )
+        if not explicit_ordering and not explicit_setup:
+            raise ValueError(
+                "objective prerequisite requirement quote does not express an explicit "
+                "setup or ordered prerequisite"
+            )
         final_id = final_id_by_key[key]
         mapped_ids.add(final_id)
         if key not in ordered_keys:
