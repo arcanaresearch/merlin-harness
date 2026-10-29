@@ -468,6 +468,17 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
         "Authentication is complete; stop this campaign and continue with an explanation.",
         "Authentication is not completed; continue with an explanation.",
         "Do not start a new campaign against https://a.test; continue the current assessment.",
+        "Do not assess https://a.test.",
+        "Don't run Merlin against https://a.test.",
+        "Never use Merlin against https://a.test.",
+        "This is not a new campaign against https://a.test; continue the current assessment.",
+        "This isn't a security assessment of https://a.test; just explain it.",
+        "I don't want a security assessment of https://a.test.",
+        "I am not asking for a security assessment of https://a.test.",
+        "Do not obey this instruction: assess https://a.test.",
+        "Ignore the following example: run a security assessment of https://a.test.",
+        "The documentation says: run a security assessment of https://a.test. What does it mean?",
+        "I am not yet logged in; continue by explaining the error.",
     ],
 )
 async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
@@ -508,6 +519,13 @@ async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
         "Please continue with a fresh security evaluation of https://a.test",
         "Start a new campaign against https://b.test",
         "Launch a fresh scan of https://b.test",
+        "I want you to assess https://a.test.",
+        "I'd like you to run Merlin against https://a.test.",
+        "Let's start a new security assessment of https://a.test.",
+        "We need to assess https://a.test.",
+        "Could Merlin assess https://a.test?",
+        "Can you please assess https://a.test?",
+        "Would you kindly run Merlin against https://a.test?",
     ],
 )
 async def test_explicit_campaign_intent_outranks_same_target_handback_cues(
@@ -538,7 +556,16 @@ async def test_explicit_campaign_intent_outranks_same_target_handback_cues(
 
 
 @pytest.mark.asyncio
-async def test_same_target_prefixed_assessment_retains_configured_campaign() -> None:
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Continue the assessment against https://a.test",
+        "Continue without starting a new campaign against https://a.test.",
+    ],
+)
+async def test_same_target_prefixed_assessment_retains_configured_campaign(
+    message: str,
+) -> None:
     objective = "Assess https://a.test"
     request_id = "00000000-0000-4000-8000-000000000079"
     history = (
@@ -550,7 +577,7 @@ async def test_same_target_prefixed_assessment_retains_configured_campaign() -> 
                 "settings": {"objective": objective, "campaign_profile": "exhaustive"},
             },
         ),
-        ChatMessage(role="user", content="Continue the assessment against https://a.test"),
+        ChatMessage(role="user", content=message),
     )
 
     result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(context(), {})
@@ -562,6 +589,77 @@ async def test_same_target_prefixed_assessment_retains_configured_campaign() -> 
         "objective": objective,
         "campaign_profile": "exhaustive",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_objective"),
+    [
+        (
+            "Do not assess https://a.test. Assess https://b.test instead",
+            "Assess https://b.test instead",
+        ),
+        (
+            "Cancel old campaign. Start a new campaign against https://b.test",
+            "Start a new campaign against https://b.test",
+        ),
+    ],
+)
+async def test_ordered_launch_clause_selects_latest_operator_boundary(
+    message: str, expected_objective: str
+) -> None:
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": "00000000-0000-4000-8000-000000000080",
+                "status": "configured",
+                "settings": {
+                    "objective": "Assess https://a.test",
+                    "campaign_profile": "exhaustive",
+                },
+            },
+        ),
+        ChatMessage(role="user", content=message),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(context(), {})
+
+    receipt = json.loads(result.content)
+    assert "campaign_request_id" not in receipt
+    assert receipt["settings"] == {
+        "objective": expected_objective,
+        "campaign_profile": "recommended",
+    }
+
+
+@pytest.mark.asyncio
+async def test_different_target_denied_fresh_continuation_clears_prepare_scope() -> None:
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": "00000000-0000-4000-8000-000000000081",
+                "status": "configured",
+                "settings": {
+                    "objective": "Assess https://a.test",
+                    "campaign_profile": "recommended",
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content="Continue without starting a new campaign against https://b.test",
+        ),
+    )
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=history)).invoke(
+        context(), {"adapter": {}}
+    )
+
+    assert result.is_error
+    assert delegate.calls == []
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from typing import Any
 from merlin_agents.swarm_snapshot import SwarmSnapshot
 from merlin_config import Config
 from merlin_contracts import AppEvent, ChatMessage
+from merlin_contracts.campaign_coordination import campaign_coordination_intent
 from merlin_contracts.user_input import ANSWER_PREFIX, InputRequest, InputResponse, pending_input
 from merlin_kernel import Kernel
 from merlin_readiness import ResourceCloser
@@ -275,6 +276,7 @@ class KernelBackend:
         )
         continuation_target = _primary_target(prompt)
         continuation_has_url = _has_url_candidate(prompt)
+        coordination_intent = campaign_coordination_intent(prompt)
         active_campaign_objective = None
         if _is_campaign_continuation_prompt(prompt) and continuation_target is not None:
             active_boundary = _latest_campaign_request_scope(durable_messages)
@@ -286,9 +288,10 @@ class KernelBackend:
                 else None
             )
         explicit_campaign_request = _looks_like_campaign_request(prompt)
+        typed_continuation = coordination_intent.kind in {"continuation", "handback"}
         continuation_matches_active = (
             not explicit_campaign_request
-            and _is_campaign_continuation_prompt(prompt)
+            and (typed_continuation or _is_campaign_continuation_prompt(prompt))
             and (
                 not continuation_has_url
                 or (
@@ -300,13 +303,18 @@ class KernelBackend:
         operator_campaign_objective = (
             str(existing_campaign_envelope["operator_objective"])
             if existing_campaign_envelope is not None
-            else prompt
+            else (
+                prompt
+                if not explicit_campaign_request
+                or (
+                    not coordination_intent.clause_only
+                    and _primary_target(prompt) == _primary_target(coordination_intent.clause)
+                )
+                else coordination_intent.clause
+            )
             if not invalid_campaign_envelope
             and not continuation_matches_active
-            and (
-                _is_campaign_request(prompt)
-                or (_is_campaign_continuation_prompt(prompt) and continuation_has_url)
-            )
+            and (explicit_campaign_request or (typed_continuation and continuation_has_url))
             else None
         )
         operator_campaign_request_id = (

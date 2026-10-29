@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from merlin_contracts import ChatMessage, ToolContext, ToolResult, ToolSpec
 from merlin_contracts.campaign_coordination import (
+    campaign_coordination_intent,
     has_url_candidate,
     is_explicit_campaign_launch,
     is_recon_handback_coordination,
@@ -109,7 +110,10 @@ def _primary_target(content: str) -> str | None:
     if match is None:
         return None
     raw_url = match.group(0).rstrip(".,;:!?")
-    parsed = urlsplit(raw_url)
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError:
+        return None
     if (
         parsed.scheme.casefold() not in {"http", "https"}
         or not parsed.hostname
@@ -153,7 +157,8 @@ class _CampaignBoundary:
 def _looks_like_campaign_request(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
     return is_explicit_campaign_launch(content) and (
-        _primary_target(content) is not None or "target" in normalized
+        _primary_target(campaign_coordination_intent(content).clause) is not None
+        or re.search(r"\btarget\b", normalized) is not None
     )
 
 
@@ -211,20 +216,33 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
             else:
                 boundary = _CampaignBoundary("unbound", objective=objective, message_index=index)
             continue
+        intent = campaign_coordination_intent(message.content)
         if _looks_like_campaign_request(message.content):
-            active_objective = message.content.strip()
+            active_objective = (
+                message.content.strip()
+                if not intent.clause_only
+                and _primary_target(message.content) == _primary_target(intent.clause)
+                else intent.clause
+            )
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
-        if _is_internal_campaign_continuation(message.content):
+        if intent.kind == "targeted_barrier":
+            target = _primary_target(intent.clause)
+            if active_objective is not None and target == _primary_target(active_objective):
+                continue
+            active_objective = None
+            boundary = _CampaignBoundary("unbound", message_index=index)
+            continue
+        if intent.kind == "continuation" or _is_internal_campaign_continuation(message.content):
             target = _primary_target(message.content)
             if target is None and not _has_url_candidate(message.content):
                 continue
             if active_objective is not None and target == _primary_target(active_objective):
                 continue
-            active_objective = message.content.strip()
+            active_objective = intent.clause
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
-        if _is_recon_handback_continuation(message.content):
+        if intent.kind == "handback":
             target = _primary_target(message.content)
             if not _has_url_candidate(message.content) or (
                 active_objective is not None and target == _primary_target(active_objective)

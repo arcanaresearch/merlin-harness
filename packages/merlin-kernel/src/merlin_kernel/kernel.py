@@ -40,6 +40,7 @@ from merlin_contracts import (
     ToolResult,
 )
 from merlin_contracts.campaign_coordination import (
+    campaign_coordination_intent,
     has_url_candidate,
     is_explicit_campaign_launch,
     is_recon_handback_coordination,
@@ -524,7 +525,10 @@ def _campaign_primary_target(content: str) -> str | None:
     if match is None:
         return None
     raw_url = match.group(0).rstrip(".,;:!?")
-    parsed = urlsplit(raw_url)
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError:
+        return None
     if (
         parsed.scheme.lower() not in {"http", "https"}
         or not parsed.hostname
@@ -596,20 +600,26 @@ def _advance_campaign_boundary(
                 "unbound", primary_target=_typed_campaign_primary_target(content)
             ), True
         return _CampaignBoundaryState("invalid"), True
-    explicit_campaign_launch = _is_explicit_campaign_launch(content)
-    continuation = _is_campaign_boundary_continuation(content)
-    handback = not explicit_campaign_launch and _is_recon_handback_coordination(content)
-    target_token = has_url_candidate(content)
+    intent = campaign_coordination_intent(content)
+    continuation = intent.kind == "continuation" or _is_campaign_boundary_continuation(content)
+    handback = intent.kind == "handback"
+    target_text = content if continuation or handback else intent.clause
+    target_token = has_url_candidate(target_text)
+    if intent.kind == "targeted_barrier":
+        continuation_target = _campaign_primary_target(target_text)
+        if continuation_target is not None and continuation_target == state.primary_target:
+            return state, False
+        return _CampaignBoundaryState("unbound"), True
     if continuation or handback:
         if not target_token:
             return state, False
-        continuation_target = _campaign_primary_target(content)
+        continuation_target = _campaign_primary_target(target_text)
         if continuation_target is not None and continuation_target == state.primary_target:
             return state, False
         return _CampaignBoundaryState("unbound", primary_target=continuation_target), True
     return _CampaignBoundaryState(
         "unbound",
-        primary_target=_campaign_primary_target(content) if target_token else None,
+        primary_target=_campaign_primary_target(target_text) if target_token else None,
     ), True
 
 

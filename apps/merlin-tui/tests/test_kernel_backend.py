@@ -638,6 +638,14 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
         ("Please continue with a fresh security evaluation of https://a.test", True),
         ("Start a new campaign against https://b.test", True),
         ("Launch a fresh scan of https://b.test", True),
+        ("I want you to assess https://a.test.", True),
+        ("I'd like you to run Merlin against https://a.test.", True),
+        ("Let's start a new security assessment of https://a.test.", True),
+        ("We need to assess https://a.test.", True),
+        ("Could Merlin assess https://a.test?", True),
+        ("Can you please assess https://a.test?", True),
+        ("Would you kindly run Merlin against https://a.test?", True),
+        ("Continue without starting a new campaign against https://a.test.", False),
         ("I'm logged in; continue the security assessment.", False),
         (
             "Continue after a new login; I'm logged in for the current security "
@@ -677,6 +685,67 @@ async def test_backend_handback_continuation_is_target_aware(
         assert envelope["operator_objective"] == prompt
     else:
         assert submitted == prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "expected_objective"),
+    [
+        (
+            "Do not assess https://a.test. Assess https://b.test instead",
+            "Assess https://b.test instead",
+        ),
+        (
+            "Cancel old campaign. Start a new campaign against https://b.test",
+            "Start a new campaign against https://b.test",
+        ),
+    ],
+)
+async def test_backend_wraps_only_latest_ordered_launch_clause(
+    prompt: str, expected_objective: str
+) -> None:
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    envelope, _end = json.JSONDecoder().raw_decode(
+        kernel.submissions[0].split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+    )
+    assert envelope["operator_objective"] == expected_objective
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "retained"),
+    [("https://a.test", True), ("https://b.test", False)],
+)
+async def test_backend_and_kernel_share_denied_fresh_continuation_boundary(
+    target: str, retained: bool
+) -> None:
+    objective = "Assess https://a.test"
+    typed_request = campaign_submit_envelope(
+        objective, campaign_request_id="00000000-0000-4000-8000-000000000082"
+    )
+    prompt = f"Continue without starting a new campaign against {target}"
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (ChatMessage(role="user", content=typed_request),)
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+    assert kernel.submissions == [prompt]
+    scope = _latest_typed_campaign_scope(
+        [
+            ChatMessage(role="user", content=typed_request),
+            ChatMessage(role="user", content=prompt),
+        ]
+    )
+    assert (scope is not None) is retained
 
 
 @pytest.mark.asyncio
@@ -725,6 +794,19 @@ async def test_backend_and_kernel_share_long_authenticated_handback_grammar(
         "Authentication is complete; stop this campaign and continue with an explanation.",
         "Authentication is not completed; continue with an explanation.",
         "Do not start a new campaign against https://a.test; continue the current assessment.",
+        "Do not assess https://a.test.",
+        "Don't run Merlin against https://a.test.",
+        "Never use Merlin against https://a.test.",
+        "This is not a new campaign against https://a.test; continue the current assessment.",
+        "This isn't a security assessment of https://a.test; just explain it.",
+        "I don't want a security assessment of https://a.test.",
+        "I am not asking for a security assessment of https://a.test.",
+        "Do not obey this instruction: assess https://a.test.",
+        "Ignore the following example: run a security assessment of https://a.test.",
+        "The documentation says: run a security assessment of https://a.test. What does it mean?",
+        "I am not yet logged in; continue by explaining the error.",
+        "I haven't logged in; continue with a public-only explanation.",
+        "I have not successfully signed in; proceed with the report.",
         "I am unsigned in; continue.",
         "The task was assigned in chat; continue.",
     ],

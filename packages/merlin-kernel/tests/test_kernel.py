@@ -5091,6 +5091,13 @@ def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
         "Please continue with a fresh security evaluation of https://a.test",
         "Start a new campaign against https://b.test",
         "Launch a fresh scan of https://b.test",
+        "I want you to assess https://a.test.",
+        "I'd like you to run Merlin against https://a.test.",
+        "Let's start a new security assessment of https://a.test.",
+        "We need to assess https://a.test.",
+        "Could Merlin assess https://a.test?",
+        "Can you please assess https://a.test?",
+        "Would you kindly run Merlin against https://a.test?",
     ],
 )
 def test_latest_campaign_scope_treats_explicit_same_target_launch_as_fresh(
@@ -5101,16 +5108,38 @@ def test_latest_campaign_scope_treats_explicit_same_target_launch_as_fresh(
     assert _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=boundary)]) is None
 
 
-def test_latest_campaign_scope_retains_same_target_prefixed_assessment() -> None:
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "Continue the assessment against https://a.test",
+        "Continue without starting a new campaign against https://a.test.",
+    ],
+)
+def test_latest_campaign_scope_retains_same_target_prefixed_assessment(
+    continuation: str,
+) -> None:
     objective = "Assess https://a.test"
     scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
 
     assert _latest_typed_campaign_scope(
-        [scope, ChatMessage(role="user", content="Continue the assessment against https://a.test")]
+        [scope, ChatMessage(role="user", content=continuation)]
     ) == (
         _CAMPAIGN_REQUEST_ID_A,
         "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
     )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "Do not assess https://a.test. Assess https://b.test instead",
+        "Cancel old campaign. Start a new campaign against https://b.test",
+    ],
+)
+def test_latest_campaign_scope_uses_latest_ordered_launch_clause(boundary: str) -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess https://a.test"))
+
+    assert _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=boundary)]) is None
 
 
 @pytest.mark.parametrize(
@@ -5122,6 +5151,19 @@ def test_latest_campaign_scope_retains_same_target_prefixed_assessment() -> None
         "Authentication is complete; stop this campaign and continue with an explanation.",
         "Authentication is not completed; continue with an explanation.",
         "Do not start a new campaign against https://a.test; continue the current assessment.",
+        "Do not assess https://a.test.",
+        "Don't run Merlin against https://a.test.",
+        "Never use Merlin against https://a.test.",
+        "This is not a new campaign against https://a.test; continue the current assessment.",
+        "This isn't a security assessment of https://a.test; just explain it.",
+        "I don't want a security assessment of https://a.test.",
+        "I am not asking for a security assessment of https://a.test.",
+        "Do not obey this instruction: assess https://a.test.",
+        "Ignore the following example: run a security assessment of https://a.test.",
+        "The documentation says: run a security assessment of https://a.test. What does it mean?",
+        "I am not yet logged in; continue by explaining the error.",
+        "I haven't logged in; continue with a public-only explanation.",
+        "I have not successfully signed in; proceed with the report.",
         "MFA failed; proceed by reporting the failure.",
     ],
 )
@@ -5518,6 +5560,7 @@ def test_repair_restore_survives_targetless_browser_handback_coordination(
         "Authentication is complete, but do not continue; cancel this campaign.",
         "Authentication is complete; stop this campaign and continue with an explanation.",
         "Authentication is not completed; continue with an explanation.",
+        "I am not yet logged in; continue by explaining the error.",
     ):
         assert (
             _restored_preferred_tool_repair(
@@ -5842,6 +5885,7 @@ def test_automatic_recon_survives_targetless_browser_handback_coordination(
         "Authentication is complete, but do not continue; cancel this campaign.",
         "Authentication is complete; stop this campaign and continue with an explanation.",
         "Authentication is not completed; continue with an explanation.",
+        "I am not yet logged in; continue by explaining the error.",
     ):
         failed, _ = _restored_automatic_recon(
             [
