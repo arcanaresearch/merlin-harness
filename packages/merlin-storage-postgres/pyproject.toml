@@ -1,6 +1,6 @@
 [project]
 name = "merlin-storage-postgres"
-version = "0.2.22"
+version = "0.2.23"
 requires-python = ">=3.13"
 dependencies = [
   "pg0-embedded==0.15.1",
