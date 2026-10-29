@@ -3489,6 +3489,91 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
     assert later_effect["target_ui_transition_receipts"] == {}
 
 
+async def test_generic_pre_dispatch_recovery_requires_strict_zero_attestation() -> None:
+    assignment = WorkerAssignment(
+        id="campaign/pre-dispatch/worker",
+        objective="Use the reviewed browser surface.",
+        profile_id="recon",
+        target_profile_id="target-surface",
+        technique_ids=("surface-transition",),
+        guidance_ids=(),
+        tool_ids=("browser_open_tab",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=20_000, max_seconds=30),
+        max_target_exchanges=1,
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+        strategy_id="direct",
+    )
+    attempt_id = "attempt-pre-dispatch"
+    effect = SimpleNamespace(
+        call_id="call-pre-dispatch",
+        tool_name="browser_open_tab",
+        campaign_id="campaign/pre-dispatch",
+        session_id="session-pre-dispatch",
+        agent_id=assignment.id,
+        attempt_id=attempt_id,
+        target_id=assignment.target_profile_id,
+        state="acknowledged",
+        effect="target_read",
+        arguments_payload={"url": "https://target.test"},
+        result_content="reviewed surface must be reobserved before dispatch",
+        result_metadata={
+            "interaction_role": ToolInteractionRole.AUXILIARY.value,
+            "target_effect_dispatch_status": "rejected_before_dispatch",
+            "target_session_id": "browser:pre-dispatch-context",
+            "effect_applied": False,
+            "target_effect_attempted": False,
+            "interaction_count": 0,
+            "limit_interaction_count": 0,
+            "target_call_budget_charge": 0,
+        },
+        result_is_error=True,
+    )
+
+    class EffectTools(Tools):
+        async def list_effects_for_attempt(self, loaded_attempt_id, *, limit=None):
+            assert loaded_attempt_id == attempt_id
+            values = (effect,)
+            return values if limit is None else values[-limit:]
+
+    service = DurableAgentService(Provider(), EffectTools(), Store())
+    outcome = await service._material_transition_effect_outcome(  # noqa: SLF001
+        SimpleNamespace(
+            id="schedule-pre-dispatch",
+            session_id="session-pre-dispatch",
+            worker_contexts={},
+            profiles={},
+        ),
+        assignment,
+        (attempt_id,),
+    )
+
+    assert outcome is None
+    effect.result_metadata = {
+        key: value
+        for key, value in effect.result_metadata.items()
+        if key != "target_call_budget_charge"
+    }
+    incomplete = await service._material_transition_effect_outcome(  # noqa: SLF001
+        SimpleNamespace(
+            id="schedule-pre-dispatch",
+            session_id="session-pre-dispatch",
+            worker_contexts={},
+            profiles={},
+        ),
+        assignment,
+        (attempt_id,),
+    )
+
+    assert incomplete is not None
+    assert incomplete[1].status == "quarantined"
+    assert incomplete[1].error_code == "target_effect_ambiguous"
+    assert incomplete[1].infrastructure_failure_category == ("effect_reconciliation_required")
+
+
 @pytest.mark.parametrize(
     ("tool_name", "effect_kind"),
     (("browser_click", "target_network"), ("browser_navigate", "target_read")),

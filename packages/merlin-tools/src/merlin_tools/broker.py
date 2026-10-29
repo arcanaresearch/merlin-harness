@@ -888,6 +888,31 @@ class ToolBroker:
         result = self._bound_result(result)
         if intent is not None and permit_digest is not None:
             witnessed_target_session_id = result.metadata.get("target_session_id")
+            rejected_before_dispatch = bool(
+                witnessed_target_session_id is None
+                and result.is_error
+                and result.metadata.get("target_effect_dispatch_status")
+                == "rejected_before_dispatch"
+                and result.metadata.get("effect_applied") is False
+                and result.metadata.get("target_effect_attempted") is False
+                and type(result.metadata.get("interaction_count")) is int
+                and result.metadata.get("interaction_count") == 0
+                and type(result.metadata.get("limit_interaction_count")) is int
+                and result.metadata.get("limit_interaction_count") == 0
+                and type(result.metadata.get("target_call_budget_charge")) is int
+                and result.metadata.get("target_call_budget_charge") == 0
+            )
+            if rejected_before_dispatch:
+                result = result.model_copy(
+                    update={
+                        "metadata": result.metadata
+                        | {
+                            "effect": effect.value,
+                            "target_session_id": context.expected_target_session_id,
+                        }
+                    }
+                )
+                witnessed_target_session_id = context.expected_target_session_id
             if (
                 not _valid_target_session_id(witnessed_target_session_id)
                 or witnessed_target_session_id != context.expected_target_session_id

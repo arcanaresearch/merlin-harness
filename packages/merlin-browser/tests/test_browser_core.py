@@ -1990,6 +1990,62 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
 
 
 @pytest.mark.asyncio
+async def test_campaign_open_tab_without_reviewed_surface_attests_zero_dispatch() -> None:
+    events: list[str] = []
+    scope_store = _StateScopeFixtureStore(events)
+
+    class Session:
+        context_id = "empty-persistent-context"
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={"https://target.example"},
+        )
+        owner = owner()
+        mode = "persistent"
+
+        def metadata(self, restart=False):
+            del restart
+            return SimpleNamespace(tabs=())
+
+        async def act(self, action, *, actor_id):
+            del action, actor_id
+            raise AssertionError("pre-dispatch rejection must not call the target")
+
+    result = await BrowserTool(
+        "browser_open_tab",
+        lambda _: Session(),
+        state_scope_store=scope_store,
+    ).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:empty-persistent-context",
+            call_id="call:empty-persistent-context",
+            agent_id="campaign:empty-persistent-context/worker-1",
+            technique_attempt_id="attempt:empty-persistent-context",
+            target_id="target",
+            expected_target_session_id="browser:empty-persistent-context",
+        ),
+        {"url": "https://target.example", "step": 0},
+    )
+
+    assert result.is_error is True
+    assert result.metadata == {
+        "effect": "target_read",
+        "failure_code": "campaign_open_tab_requires_existing_surface",
+        "retryable": False,
+        "reobserve_required": True,
+        "target_effect_dispatch_status": "rejected_before_dispatch",
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+    }
+    assert events == ["created", "claimed", "paused", "released"]
+
+
+@pytest.mark.asyncio
 async def test_raw_browser_action_does_not_deliver_when_global_scope_lease_fails() -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events)

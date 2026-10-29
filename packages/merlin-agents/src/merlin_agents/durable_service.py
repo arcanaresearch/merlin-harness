@@ -4612,7 +4612,6 @@ class DurableAgentService:
                 or is_generic_browser_effect
             ):
                 continue
-            target_effects.append(effect)
             effect_state = str(getattr(effect, "state", ""))
             generic_identity_valid = bool(
                 is_generic_browser_effect
@@ -4624,6 +4623,28 @@ class DurableAgentService:
                 and getattr(effect, "target_id", None) == assignment.target_profile_id
                 and tool_name in assignment.tool_ids
             )
+            rejected_before_dispatch = bool(
+                is_generic_browser_effect
+                and generic_identity_valid
+                and effect_state in {"acknowledged", "reconciled"}
+                and getattr(effect, "result_is_error", None) is True
+                and isinstance(metadata, Mapping)
+                and metadata.get("target_effect_dispatch_status") == "rejected_before_dispatch"
+                and isinstance(metadata.get("target_session_id"), str)
+                and bool(str(metadata["target_session_id"]).strip())
+                and "target_ui_transition" not in metadata
+                and metadata.get("effect_applied") is False
+                and metadata.get("target_effect_attempted") is False
+                and type(metadata.get("interaction_count")) is int
+                and metadata.get("interaction_count") == 0
+                and type(metadata.get("limit_interaction_count")) is int
+                and metadata.get("limit_interaction_count") == 0
+                and type(metadata.get("target_call_budget_charge")) is int
+                and metadata.get("target_call_budget_charge") == 0
+            )
+            if rejected_before_dispatch:
+                continue
+            target_effects.append(effect)
             if is_generic_browser_effect and effect_state in {"intent", "ambiguous"}:
                 projected_effects.append(
                     (

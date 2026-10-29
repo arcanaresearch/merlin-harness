@@ -1452,7 +1452,11 @@ class BrowserTool:
                         "failure_code": "campaign_open_tab_requires_existing_surface",
                         "retryable": False,
                         "reobserve_required": True,
+                        "target_effect_dispatch_status": "rejected_before_dispatch",
+                        "effect_applied": False,
                         "target_effect_attempted": False,
+                        "interaction_count": 0,
+                        "limit_interaction_count": 0,
                         "target_call_budget_charge": 0,
                     },
                 )

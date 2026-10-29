@@ -1197,6 +1197,124 @@ def test_permitted_target_result_without_exact_session_witness_stays_ambiguous(
     assert store.records[next(iter(store.records))].state is ToolEffectState.AMBIGUOUS
 
 
+def test_permitted_target_strict_pre_dispatch_rejection_is_acknowledged(
+    tmp_path: Path,
+) -> None:
+    class RejectedBeforeDispatchTool(CountingEffectTool):
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            del context, arguments
+            self.calls += 1
+            return ToolResult(
+                content="reviewed surface must be reobserved before dispatch",
+                is_error=True,
+                metadata={
+                    "failure_code": "reviewed_surface_required",
+                    "target_effect_dispatch_status": "rejected_before_dispatch",
+                    "effect_applied": False,
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                    "target_call_budget_charge": 0,
+                },
+            )
+
+    store = PermitEffectStore()
+    tool = RejectedBeforeDispatchTool()
+    permit_digest = "sha256:" + "e" * 64
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-rejected-before-dispatch",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:context-1",
+    )
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat", context, {"prompt": "hello"}, admit
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "reviewed surface must be reobserved before dispatch"
+    assert result.metadata["failure_code"] == "reviewed_surface_required"
+    assert result.metadata["target_session_id"] == "browser:context-1"
+    assert result.metadata["target_effect_attempted"] is False
+    assert "effect_ambiguous" not in result.metadata
+    assert "replacement_blocked" not in result.metadata
+    assert tool.calls == 1
+    record = store.records[next(iter(store.records))]
+    assert record.state is ToolEffectState.ACKNOWLEDGED
+    assert record.result_is_error is True
+    assert record.result_metadata == result.metadata
+
+
+def test_permitted_target_incomplete_pre_dispatch_claim_stays_ambiguous(
+    tmp_path: Path,
+) -> None:
+    class IncompletePreDispatchTool(CountingEffectTool):
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            del context, arguments
+            self.calls += 1
+            return ToolResult(
+                content="unproven pre-dispatch rejection",
+                is_error=True,
+                metadata={
+                    "target_effect_dispatch_status": "rejected_before_dispatch",
+                    "effect_applied": False,
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                },
+            )
+
+    store = PermitEffectStore()
+    tool = IncompletePreDispatchTool()
+    permit_digest = "sha256:" + "f" * 64
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-incomplete-pre-dispatch",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:context-1",
+    )
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat", context, {"prompt": "hello"}, admit
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_unavailable"
+    assert result.metadata["effect_ambiguous"] is True
+    assert result.metadata["target_effect_attempted"] is True
+    assert tool.calls == 1
+    assert store.records[next(iter(store.records))].state is ToolEffectState.AMBIGUOUS
+
+
 def test_identical_terminal_duplicate_ancestors_are_adopted_without_dispatch(
     tmp_path: Path,
 ) -> None:
