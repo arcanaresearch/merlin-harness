@@ -105,6 +105,31 @@ class _NoTools:
         return ()
 
 
+def _complete_synthetic_schedule(scheduler: DurableSchedulerStore, schedule_id: str) -> None:
+    schedule = scheduler.load_schedule(schedule_id)
+    assert schedule is not None
+    scheduler.transition_ready(
+        schedule_id,
+        ("reducer",),
+        checkpoint=schedule["checkpoint"],
+        expected_event_count=schedule["event_count"],
+    )
+    reducer = scheduler.claim(
+        schedule_id,
+        "reducer",
+        "scheduler",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    scheduler.commit_reducer(
+        reducer.id,
+        reducer.generation,
+        schema_id="reducer-result/v1",
+        result={"structured": {}},
+        checkpoint=schedule["checkpoint"],
+    )
+    scheduler.complete_schedule(schedule_id)
+
+
 class _NoPrerequisiteAuditProvider:
     def __init__(self, config) -> None:
         self.config = config
@@ -3175,7 +3200,7 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
                     ],
                 },
                 {"completed": []},
-                ["worker:source"],
+                ["worker:source", "reducer"],
                 ready_nodes=["worker:source"],
             )
             campaigns.add_wave(campaign_id, 0, "initial", source_schedule_id)
@@ -3223,7 +3248,7 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
                     ],
                 },
                 {"completed": []},
-                ["worker:validator"],
+                ["worker:validator", "reducer"],
                 ready_nodes=["worker:validator"],
             )
             campaigns.add_wave(campaign_id, 1, "validation", schedule_id)
@@ -3293,6 +3318,8 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
                     }
                 )
             )
+            _complete_synthetic_schedule(scheduler, source_schedule_id)
+            _complete_synthetic_schedule(scheduler, schedule_id)
 
         reconciler = first._campaigns._validation_reconciler  # type: ignore[attr-defined]
         await reconciler(campaign_id, manifest, 1, (finding.id,))
@@ -3330,7 +3357,7 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
                     ],
                 },
                 {"completed": []},
-                ["worker:remediation"],
+                ["worker:remediation", "reducer"],
                 ready_nodes=["worker:remediation"],
             )
             campaigns.add_wave(campaign_id, 2, "remediation", remediation_schedule_id)
@@ -3362,6 +3389,7 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
                 },
                 checkpoint={"completed": ["worker:remediation"]},
             )
+            _complete_synthetic_schedule(scheduler, remediation_schedule_id)
         remediation_reconciler = first._campaigns._remediation_reconciler  # type: ignore[attr-defined]
         assert await remediation_reconciler(campaign_id, manifest, 2, (finding.id,)) == ()
         remediated = next(  # type: ignore[attr-defined]
@@ -3477,7 +3505,13 @@ async def test_validator_attribution_survives_postgres_restart_and_reports_once(
             assert "Bind authorization to server-side records" in exported
             assert "stale remediation failure" not in exported
             with database.connect() as connection:
-                assert len(DurableSchedulerStore(connection).list_results(schedule_id)) == 1
+                validator_results = [
+                    row
+                    for row in DurableSchedulerStore(connection).list_results(schedule_id)
+                    if row["node_id"] == "worker:validator"
+                    and row["schema_id"] == "worker-result/v1"
+                ]
+                assert len(validator_results) == 1
                 assert len(ToolEffectRepository(connection).list_for_attempt(lease.id)) == 1
         finally:
             await second.close()
@@ -4057,7 +4091,7 @@ async def test_transform_receipt_is_derived_by_real_report_callback_after_pg_res
                     ],
                 },
                 {"completed": []},
-                [node_id],
+                [node_id, "reducer"],
                 ready_nodes=[node_id],
             )
             campaigns.add_wave(campaign_id, 0, "initial", schedule_id)
@@ -4105,6 +4139,7 @@ async def test_transform_receipt_is_derived_by_real_report_callback_after_pg_res
                 {"message": "mensaje exacto"},
             )
             assert sent.is_error is False
+            _complete_synthetic_schedule(scheduler, schedule_id)
         await first.close()
         database.stop()
         database.start()
@@ -4439,7 +4474,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                     "assignments": assignments,
                 },
                 {"completed": []},
-                node_ids,
+                [*node_ids, "reducer"],
                 ready_nodes=node_ids,
             )
             campaigns.add_wave(campaign_id, 0, "initial", schedule_id)
@@ -4490,6 +4525,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                     target_session_id=emitted_session_id,
                 )
                 attempts[stage] = (lease.id, call_id)
+            _complete_synthetic_schedule(scheduler, schedule_id)
             assert target_session_ids == [
                 (
                     f"api:{campaign_id}:{target_id}:scope:{node_id}"
