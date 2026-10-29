@@ -10945,15 +10945,14 @@ class WorkerRuntime:
     def _has_repeated_immutable_pre_dispatch_rejection(
         history: Sequence[Mapping[str, str]],
     ) -> bool:
-        if len(history) < 3:
+        if len(history) < 2:
             return False
-        recent = history[-3:]
+        recent = history[-2:]
         rejection = recent[0].get("immutable_pre_dispatch_rejection")
         return bool(
             rejection
             and all(item.get("immutable_pre_dispatch_rejection") == rejection for item in recent)
             and len({item.get("call") for item in recent}) == 1
-            and len({item.get("result") for item in recent}) == 1
         )
 
     @staticmethod

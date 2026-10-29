@@ -57,6 +57,7 @@ from merlin_agents.runtime import (
     _controller_target_tool,
     _goat_contract,
     _hydra_select_contract,
+    _immutable_pre_dispatch_rejection_fingerprint,
     _merge_strategy_evaluation_uncertainties,
     _runtime_admitted_tool_names,
     _target_exchange_tool_names,
@@ -12071,6 +12072,10 @@ async def test_reobservation_bounds_identical_immutable_pre_dispatch_rejections(
     ]
 
     class ImmutableRejectionTools(Tools):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
         def describe(self):
             return (
                 ToolSpec(
@@ -12082,8 +12087,9 @@ async def test_reobservation_bounds_identical_immutable_pre_dispatch_rejections(
 
         async def invoke(self, name, context, arguments):
             self.calls.append(name)
+            self.index += 1
             return ToolResult(
-                content="browser state could not be observed before the target action",
+                content=f"cosmetic rejection wording {self.index}",
                 is_error=True,
                 metadata={
                     "failure_code": "state_scope_before_unavailable",
@@ -12116,7 +12122,8 @@ async def test_reobservation_bounds_identical_immutable_pre_dispatch_rejections(
 
     assert result.status == "failed"
     assert "immutable pre-dispatch rejection repeated" in (result.error or "")
-    assert tools.calls == ["browser_snapshot"] * 3
+    assert "after one authorized retry" in (result.error or "")
+    assert tools.calls == ["browser_snapshot"] * 2
 
 
 async def test_reobservation_immutable_rejection_bound_resets_on_changed_receipt() -> None:
@@ -12150,7 +12157,7 @@ async def test_reobservation_immutable_rejection_bound_resets_on_changed_receipt
                     "limit_interaction_count": 0,
                     "target_call_budget_charge": 0,
                     "target_session_id": (
-                        "browser:recovered" if self.index == 3 else "browser:immutable"
+                        "browser:recovered" if self.index == 2 else "browser:immutable"
                     ),
                 },
             )
@@ -12161,7 +12168,7 @@ async def test_reobservation_immutable_rejection_bound_resets_on_changed_receipt
                 ToolCall(call_id=f"snapshot-{index}", name="browser_snapshot", arguments={}),
                 ModelCompleted(),
             ]
-            for index in range(3)
+            for index in range(2)
         ]
         + [[TextDelta(text='{"finding":"changed observation inspected"}'), ModelCompleted()]]
     )
@@ -12171,7 +12178,70 @@ async def test_reobservation_immutable_rejection_bound_resets_on_changed_receipt
     )
 
     assert result.status == "completed"
-    assert tools.calls == ["browser_snapshot"] * 3
+    assert tools.calls == ["browser_snapshot"] * 2
+
+
+async def test_reobservation_immutable_rejection_bound_survives_checkpoint_restoration() -> None:
+    call = ToolCall(call_id="snapshot-restored", name="browser_snapshot", arguments={})
+    first_result = ToolResult(
+        content="first cosmetic rejection wording",
+        is_error=True,
+        metadata={
+            "failure_code": "state_scope_before_unavailable",
+            "retryable": True,
+            "target_effect_dispatch_status": "rejected_before_dispatch",
+            "effect_applied": False,
+            "target_effect_attempted": False,
+            "interaction_count": 0,
+            "limit_interaction_count": 0,
+            "target_call_budget_charge": 0,
+            "target_session_id": "browser:immutable",
+        },
+    )
+    fingerprint = _immutable_pre_dispatch_rejection_fingerprint(first_result)
+    assert fingerprint is not None
+    reviewed = _reobservation_handoff(tools=("browser_snapshot",))
+    checkpoint = WorkerRuntime._checkpoint_payload(  # noqa: SLF001
+        WorkerRuntime._initial_messages(reviewed),  # noqa: SLF001
+        {},
+        False,
+        action_history=[
+            {
+                "call": WorkerRuntime._action_fingerprint(call.name, call.arguments),  # noqa: SLF001
+                "result": WorkerRuntime._result_fingerprint(first_result.content),  # noqa: SLF001
+                "call_semantic": WorkerRuntime._semantic_action_signature(  # noqa: SLF001
+                    call.name, call.arguments
+                ),
+                "result_semantic": WorkerRuntime._semantic_text_signature(  # noqa: SLF001
+                    first_result.content
+                ),
+                "immutable_pre_dispatch_rejection": fingerprint,
+            }
+        ],
+    )
+
+    class RestoredRejectionTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Observe browser",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return first_result.model_copy(update={"content": "second cosmetic rejection wording"})
+
+    tools = RestoredRejectionTools()
+    result = await WorkerRuntime(
+        Provider([[call, ModelCompleted()]]), tools, max_model_turns=20
+    ).run(reviewed, checkpoint=checkpoint)
+
+    assert result.status == "failed"
+    assert "after one authorized retry" in (result.error or "")
+    assert tools.calls == ["browser_snapshot"]
 
 
 async def test_restored_surface_transition_from_unrelated_attempt_fails_closed() -> None:
