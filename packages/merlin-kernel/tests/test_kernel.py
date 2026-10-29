@@ -4095,6 +4095,205 @@ async def test_dynamic_owned_cleanup_limit_is_per_outer_turn(
 
 
 @pytest.mark.asyncio
+async def test_buffered_cleanup_blocks_later_dynamic_cleanup_in_outer_turn() -> None:
+    class MixedCleanupTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_end_owned_session",
+                    "browser_compile_api_handoff",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare":
+                return ToolResult(
+                    content="owned cleanup required",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:mixed-buffered-first",
+                            ownership="owned",
+                            ownership_evidence_refs=["creation:before", "creation:after"],
+                        )
+                    },
+                )
+            if name == "browser_end_owned_session":
+                return ToolResult(
+                    content="owned session ended",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            return ToolResult(
+                content="cleanup evidence still missing",
+                is_error=True,
+                metadata={
+                    "automatic_recon_continuation": _cleanup_continuation(
+                        "handoff:mixed-buffered-second",
+                        ownership="owned",
+                        ownership_evidence_refs=["creation:new:before", "creation:new:after"],
+                    ),
+                    "preferred_next_tool": "browser_end_owned_session",
+                    "preferred_next_tool_mode": "strict",
+                },
+            )
+
+    class MixedCleanupProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+            self.second_cleanup = None
+
+        async def stream(self, request):
+            raise AssertionError("mixed provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests += 1
+            if self.requests == 1:
+                yield ToolCall(call_id="prepare", name="assessment_prepare", arguments={})
+            elif self.requests == 2:
+                yield ToolCall(
+                    call_id="cleanup-buffered",
+                    name="browser_end_owned_session",
+                    arguments={},
+                )
+            else:
+                await handler(
+                    ToolCall(
+                        call_id="compile-dynamic",
+                        name="browser_compile_api_handoff",
+                        arguments={},
+                    )
+                )
+                self.second_cleanup = await handler(
+                    ToolCall(
+                        call_id="cleanup-dynamic",
+                        name="browser_end_owned_session",
+                        arguments={},
+                    )
+                )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    store = Store()
+    tools = MixedCleanupTools()
+    provider = MixedCleanupProvider()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("run mixed cleanup")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_end_owned_session",
+        "browser_compile_api_handoff",
+    ]
+    assert provider.second_cleanup == DynamicToolOutput(
+        content="browser_end_owned_session failed: tool is not admitted for this provider request",
+        success=False,
+    )
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "owned_session_cleanup_evidence_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_cleanup_blocks_later_buffered_cleanup_in_outer_turn() -> None:
+    class MixedCleanupTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_end_owned_session",
+                    "browser_compile_api_handoff",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare":
+                return ToolResult(
+                    content="owned cleanup required",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:mixed-dynamic-first",
+                            ownership="owned",
+                            ownership_evidence_refs=["creation:before", "creation:after"],
+                        )
+                    },
+                )
+            if name == "browser_end_owned_session":
+                return ToolResult(
+                    content="owned session ended",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            return ToolResult(
+                content="compile requires cleanup again",
+                metadata={
+                    "preferred_next_tool": "browser_end_owned_session",
+                    "preferred_next_tool_mode": "strict",
+                },
+            )
+
+    class MixedCleanupProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def stream(self, request):
+            raise AssertionError("mixed provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests += 1
+            if self.requests == 1:
+                await handler(ToolCall(call_id="prepare", name="assessment_prepare", arguments={}))
+                await handler(
+                    ToolCall(
+                        call_id="cleanup-dynamic",
+                        name="browser_end_owned_session",
+                        arguments={},
+                    )
+                )
+            elif self.requests == 2:
+                yield ToolCall(
+                    call_id="compile-buffered",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+            else:
+                yield ToolCall(
+                    call_id="cleanup-buffered",
+                    name="browser_end_owned_session",
+                    arguments={},
+                )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    store = Store()
+    tools = MixedCleanupTools()
+    kernel = Kernel(MixedCleanupProvider(), store, tools, Settings())
+    await kernel.start()
+    await kernel.submit("run reverse mixed cleanup")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_end_owned_session",
+        "browser_compile_api_handoff",
+    ]
+    assert tools.calls.count("browser_end_owned_session") == 1
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "owned_session_cleanup_failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("second_handoff", ["handoff:repeated-hold", "handoff:superseding"])
 async def test_repeated_owned_cleanup_hold_fails_evidence_without_repeating_cleanup(
     second_handoff: str,

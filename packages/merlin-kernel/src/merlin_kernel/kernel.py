@@ -1611,7 +1611,7 @@ class Kernel:
         owned_cleanup_failed = False
         owned_cleanup_evidence_failed = False
         owned_cleanup_completed = False
-        owned_cleanup_attempted_in_turn = False
+        owned_cleanup_attempted_in_turn: set[str] = set()
         consumed_steering_version = self._steering_version
         try:
             skill_messages: list[ChatMessage] = []
@@ -1927,7 +1927,6 @@ class Kernel:
                     nonlocal owned_cleanup_failed
                     nonlocal owned_cleanup_evidence_failed
                     nonlocal owned_cleanup_completed
-                    nonlocal owned_cleanup_attempted_in_turn
                     nonlocal preferred_next_tool_name
                     nonlocal preferred_next_tool_mode
                     nonlocal preferred_tool_follow_through_failures
@@ -1966,8 +1965,8 @@ class Kernel:
                     is_active_owned_cleanup = call.name == _OWNED_SESSION_CLEANUP_TOOL and bool(
                         active_owned_cleanup_key
                     )
-                    duplicate_owned_cleanup = (
-                        is_active_owned_cleanup and owned_cleanup_attempted_in_turn
+                    duplicate_owned_cleanup = is_active_owned_cleanup and bool(
+                        owned_cleanup_attempted_in_turn
                     )
                     current_preferred_tool_name = preferred_next_tool_name
                     is_preferred_tool_call = call.name == current_preferred_tool_name
@@ -2031,7 +2030,7 @@ class Kernel:
                     )
                     admitted_owned_cleanup = tool_admitted and is_active_owned_cleanup
                     if admitted_owned_cleanup:
-                        owned_cleanup_attempted_in_turn = True
+                        owned_cleanup_attempted_in_turn.add(call.call_id)
                     if bounded_preferred_observation:
                         preferred_transition_observation_used = True
                     try:
@@ -2463,6 +2462,7 @@ class Kernel:
                         preferred_tool_name=request_preferred_tool_name,
                         preferred_tool_mode=request_preferred_tool_mode,
                         preferred_retry_state=preferred_tool_retry_state,
+                        owned_cleanup_attempted_in_turn=owned_cleanup_attempted_in_turn,
                         repair_scope_campaign_request_id=(repair_scope_campaign_request_id),
                         recon_recall_completed=recon_recall_completed,
                     )
@@ -2796,6 +2796,7 @@ class Kernel:
         preferred_tool_name: str | None = None,
         preferred_tool_mode: str = "strict",
         preferred_retry_state: dict[str, object] | None = None,
+        owned_cleanup_attempted_in_turn: set[str] | None = None,
         repair_scope_campaign_request_id: str | None = None,
         recon_recall_completed: bool = False,
     ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
@@ -2816,7 +2817,12 @@ class Kernel:
         last_known_continuation: dict[str, object] | None = None
         automatic_progress_fingerprint: str | None = None
         prepare_succeeded: bool | None = None
-        owned_cleanup_invoked = False
+        cleanup_attempts = (
+            owned_cleanup_attempted_in_turn
+            if owned_cleanup_attempted_in_turn is not None
+            else set()
+        )
+        owned_cleanup_invoked = bool(cleanup_attempts)
         preferred_nonpreferred_action_used = False
         signatures = getattr(self._provider, "tool_call_signatures", None)
         await self._store.append_message(
@@ -2892,6 +2898,7 @@ class Kernel:
                     admitted_tool_name = current_preferred_tool
                 if event.name == _OWNED_SESSION_CLEANUP_TOOL:
                     owned_cleanup_invoked = True
+                    cleanup_attempts.add(event.call_id)
                 async with asyncio.timeout(self._tool_timeout_seconds):
                     result = await self._tools.invoke(event.name, context, event.arguments)
             except asyncio.CancelledError:
