@@ -51,6 +51,7 @@ class DurableLifecycleStore(Protocol):
 class TargetReobservationRecoveryState:
     phase: Literal["reobserve", "review"]
     generation_id: str
+    target_session_id: str
     event_set_digest: str
     source_wave: int
     schedule_id: str | None
@@ -259,6 +260,7 @@ def _target_reobservation_recovery_state(
         "schema",
         "phase",
         "generation_id",
+        "target_session_id",
         "event_set_digest",
         "source_wave",
         "schedule_id",
@@ -272,15 +274,18 @@ def _target_reobservation_recovery_state(
     phase = _nonempty(value.get("phase"), "target_reobservation.phase")
     if phase not in {"reobserve", "review"}:
         raise ValueError("durable target re-observation recovery phase is invalid")
-    schedule_id = _optional_nonempty(
-        value.get("schedule_id"), "target_reobservation.schedule_id"
-    )
+    schedule_id = _optional_nonempty(value.get("schedule_id"), "target_reobservation.schedule_id")
     settlement_id = _optional_nonempty(
         value.get("settlement_id"), "target_reobservation.settlement_id"
     )
     lead_decision_id = _optional_nonempty(
         value.get("lead_decision_id"), "target_reobservation.lead_decision_id"
     )
+    target_session_id = _nonempty(
+        value.get("target_session_id"), "target_reobservation.target_session_id"
+    )
+    if len(target_session_id) > 256:
+        raise ValueError("durable lifecycle target_reobservation.target_session_id is too long")
     if phase == "reobserve" and (settlement_id is not None or lead_decision_id is not None):
         raise ValueError("re-observation phase cannot carry review settlement state")
     if phase == "review" and (schedule_id is None or settlement_id is None):
@@ -290,6 +295,7 @@ def _target_reobservation_recovery_state(
         generation_id=_qualified_digest(
             value.get("generation_id"), "target_reobservation.generation_id"
         ),
+        target_session_id=target_session_id,
         event_set_digest=_qualified_digest(
             value.get("event_set_digest"), "target_reobservation.event_set_digest"
         ),

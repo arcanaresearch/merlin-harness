@@ -369,6 +369,12 @@ class ReviewedBrowserAdapterResolver(Protocol):
     ) -> Mapping[str, object] | None | Awaitable[Mapping[str, object] | None]: ...
 
 
+class ReviewedBrowserAssignmentAdapterResolver(Protocol):
+    def __call__(
+        self, context: ToolContext
+    ) -> Mapping[str, object] | None | Awaitable[Mapping[str, object] | None]: ...
+
+
 class BrowserRecorder(Protocol):
     async def save_metadata(self, metadata: BrowserMetadata) -> None: ...
     async def append_action(self, action: BrowserAction) -> None: ...
@@ -463,7 +469,9 @@ def _adapter_state_integrity_result(
             "failure_code": failure_code,
             "retryable": False,
             "effect_applied": False,
+            "target_effect_attempted": False,
             "target_call_budget_charge": 0,
+            "limit_interaction_count": 0,
             "identity_field": identity_field,
             "expected": expected,
             "observed": observed,
@@ -640,6 +648,7 @@ _GENERIC_TARGET_EFFECT_KINDS = frozenset(
         "upload",
     }
 )
+_VISUAL_BOOTSTRAP_SCOPE_LIMIT = 256
 
 
 def _bounded_json_pointer_schema(value: object) -> dict[str, object]:
@@ -678,6 +687,7 @@ class BrowserTool:
         network_seen: dict[tuple[str, ...], deque[str]] | None = None,
         state_scope_store: object | None = None,
         recalled_recon: dict[tuple[str, str], str] | None = None,
+        visual_bootstrap_seen: dict[tuple[str, ...], None] | None = None,
     ) -> None:
         if name not in _SPECS:
             raise ValueError(f"unknown browser tool: {name}")
@@ -688,6 +698,9 @@ class BrowserTool:
         self._network_seen = network_seen if network_seen is not None else {}
         self._state_scope_store = state_scope_store
         self._recalled_recon = recalled_recon
+        self._visual_bootstrap_seen = (
+            visual_bootstrap_seen if visual_bootstrap_seen is not None else {}
+        )
 
     def describe(self) -> ToolSpec:
         kind, properties = _SPECS[self.name][:2]
@@ -718,21 +731,18 @@ class BrowserTool:
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
-        expected_target_session_id = getattr(context, "expected_target_session_id", None)
+        target_session_id = f"browser:{session.context_id}"
         if (
-            expected_target_session_id is not None
-            and expected_target_session_id != f"browser:{session.context_id}"
+            context.expected_target_session_id is not None
+            and context.expected_target_session_id != target_session_id
         ):
-            return ToolResult(
-                content="browser context changed after durable effect admission",
-                is_error=True,
-                metadata={
-                    "effect": self.effect,
-                    "failure_code": "target_session_mismatch",
-                    "target_effect_attempted": False,
-                    "target_call_budget_charge": 0,
-                    "target_session_id": f"browser:{session.context_id}",
-                },
+            return _adapter_state_integrity_result(
+                "browser context does not match the refreshed target session",
+                effect=self.effect,
+                expected=context.expected_target_session_id,
+                observed=target_session_id,
+                identity_field="target_session_id",
+                failure_code="target_session_identity_mismatch",
             )
         kind, properties = _SPECS[self.name][:2]
         allowed = {*properties, "step", "timeout_ms"}
@@ -1162,16 +1172,34 @@ class BrowserTool:
                         action=action,
                     )
                 post_action_ref = _browser_evidence_ref("after", post_action_observation)
-            if (
-                kind == "snapshot"
-                and observation.kind == "snapshot"
-                and _browser_action_kind(context, kind) == StateScopeActionKind.RECONNAISSANCE
+            recon_visual_capture = (
+                _browser_action_kind(context, kind) == StateScopeActionKind.RECONNAISSANCE
                 and context.visual_evidence_enabled
-            ):
+                and kind not in {"close_tab", "release"}
+                and bool(observation.tab_ref)
+            )
+            bootstrap_scope = (
+                context.session_id,
+                session.context_id,
+                context.target_reobservation_generation_id or "",
+                context.attempt_id or "",
+                context.technique_attempt_id or "",
+                context.agent_id or "",
+            )
+            implicit_bootstrap = recon_visual_capture and (
+                bootstrap_scope not in self._visual_bootstrap_seen
+            )
+            explicit_snapshot = kind == "snapshot" and observation.kind == "snapshot"
+            if recon_visual_capture and (implicit_bootstrap or explicit_snapshot):
+                if implicit_bootstrap:
+                    if len(self._visual_bootstrap_seen) >= _VISUAL_BOOTSTRAP_SCOPE_LIMIT:
+                        del self._visual_bootstrap_seen[next(iter(self._visual_bootstrap_seen))]
+                    self._visual_bootstrap_seen[bootstrap_scope] = None
                 try:
                     visual_evidence, visual_capture_errors = await session.capture_visual_evidence(
-                        action.tab_ref,
+                        observation.tab_ref,
                         action.frame_ref,
+                        reemit_trusted_duplicates=implicit_bootstrap,
                     )
                 except Exception as visual_error:
                     visual_capture_errors = (f"visual_capture:{type(visual_error).__name__}",)
@@ -4281,9 +4309,7 @@ def _browser_unknown_after_exchange_transition(
         "controls_truncated": False,
         "reviewed_state_changes": [],
         "state_changes_truncated": False,
-        "evidence_refs": list(
-            dict.fromkeys((_browser_evidence_ref("before", before), action_ref))
-        ),
+        "evidence_refs": list(dict.fromkeys((_browser_evidence_ref("before", before), action_ref))),
         "reobservation_recommended": True,
     }
 
@@ -4667,10 +4693,12 @@ class BrowserChatExchangeTool:
         state_scope_store: object | None = None,
         checkpoint_store: BrowserCheckpointStore | None = None,
         checkpoint_vault: BrowserCheckpointVault | None = None,
+        assignment_adapter_resolver: ReviewedBrowserAssignmentAdapterResolver | None = None,
     ) -> None:
         self._resolver = resolver
         self._recorder = recorder
         self._adapter_resolver = adapter_resolver
+        self._assignment_adapter_resolver = assignment_adapter_resolver
         self._state_scope_store = state_scope_store
         self._checkpoint_store = checkpoint_store
         self._checkpoint_vault = checkpoint_vault
@@ -4780,9 +4808,7 @@ class BrowserChatExchangeTool:
                     "target_ui_transition": transition,
                     "preferred_next_tool": "browser_snapshot",
                     "preferred_next_tool_mode": "strict",
-                    "error_type": (
-                        f"{type(error).__module__}.{type(error).__qualname__}"
-                    ),
+                    "error_type": (f"{type(error).__module__}.{type(error).__qualname__}"),
                 },
             )
 
@@ -4798,7 +4824,11 @@ class BrowserChatExchangeTool:
                 is_error=True,
                 metadata={"effect": self.effect},
             )
-        resolved_adapter = self._adapter_resolver(context.campaign_id)
+        resolved_adapter = (
+            self._assignment_adapter_resolver(context)
+            if self._assignment_adapter_resolver is not None
+            else self._adapter_resolver(context.campaign_id)
+        )
         adapter = await resolved_adapter if isawaitable(resolved_adapter) else resolved_adapter
         if not isinstance(adapter, Mapping) or adapter.get("interface") != "browser":
             return ToolResult(
@@ -4808,21 +4838,21 @@ class BrowserChatExchangeTool:
             )
         session_value = self._resolver(context.session_id)
         session = await session_value if isawaitable(session_value) else session_value
-        expected_target_session_id = getattr(context, "expected_target_session_id", None)
+        session_target_id = str(session.bounds.target_id)
+        target_session_id = f"browser:{session.context_id}"
         if (
-            expected_target_session_id is not None
-            and expected_target_session_id != f"browser:{session.context_id}"
+            context.expected_target_session_id is not None
+            and context.expected_target_session_id != target_session_id
         ):
             return _adapter_state_integrity_result(
-                "browser context changed after durable effect admission",
+                "browser context does not match the refreshed target session",
                 effect=self.effect,
-                expected=str(expected_target_session_id),
-                observed=f"browser:{session.context_id}",
+                expected=context.expected_target_session_id,
+                observed=target_session_id,
                 identity_field="target_session_id",
-                failure_code="target_session_mismatch",
+                failure_code="target_session_identity_mismatch",
             )
         guard.session = session
-        session_target_id = str(session.bounds.target_id)
         if context.target_id is not None and context.target_id != session_target_id:
             return _adapter_state_integrity_result(
                 "browser session target identity does not match the sealed worker context",
@@ -12229,6 +12259,7 @@ def browser_tools(
     state_scope_store: object | None = None,
     checkpoint_store: BrowserCheckpointStore | None = None,
     checkpoint_vault: BrowserCheckpointVault | None = None,
+    assignment_adapter_resolver: ReviewedBrowserAssignmentAdapterResolver | None = None,
 ) -> tuple[
     BrowserTool
     | BrowserOwnedSessionCleanupTool
@@ -12241,6 +12272,7 @@ def browser_tools(
     failures: dict[tuple[str, ...], int] = {}
     network_seen: dict[tuple[str, ...], deque[str]] = {}
     recalled_recon: dict[tuple[str, str], str] | None = {} if recorder is not None else None
+    visual_bootstrap_seen: dict[tuple[str, ...], None] = {}
     actions: tuple[
         BrowserTool
         | BrowserOwnedSessionCleanupTool
@@ -12258,6 +12290,7 @@ def browser_tools(
             network_seen,
             state_scope_store,
             recalled_recon,
+            visual_bootstrap_seen,
         )
         for name in _SPECS
     )
@@ -12287,6 +12320,7 @@ def browser_tools(
                     state_scope_store,
                     checkpoint_store,
                     checkpoint_vault,
+                    assignment_adapter_resolver,
                 ),
             )
     return actions

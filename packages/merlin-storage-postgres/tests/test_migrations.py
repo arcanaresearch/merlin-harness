@@ -1,11 +1,15 @@
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Queue
 
 import pytest
 from merlin_storage_postgres import (
     CampaignStore,
     Database,
     DatabaseConfig,
+    DurableSchedulerStore,
     MigrationRunner,
     SessionRepository,
     load_migrations,
@@ -15,11 +19,12 @@ from psycopg.errors import CheckViolation
 
 def test_migrations_have_stable_versions_and_checksums() -> None:
     migrations = load_migrations()
-    assert [migration.version for migration in migrations] == list(range(1, 97))
+    assert [migration.version for migration in migrations] == list(range(1, 98))
     assert next(item for item in migrations if item.version == 93).sql
     assert next(item for item in migrations if item.version == 94).sql
     assert next(item for item in migrations if item.version == 95).sql
     assert next(item for item in migrations if item.version == 96).sql
+    assert next(item for item in migrations if item.version == 97).sql
     assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "'partial'" in migrations[74].sql
     assert "ADD COLUMN partial_signal" in migrations[74].sql
@@ -34,7 +39,7 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     assert "campaign_lead_directives_ready_idx" in migrations[90].sql
     assert "'planned', 'retry_wait', 'rejected', 'applied'" in migrations[90].sql
     assert "CREATE TABLE merlin_storage.daemon_runs" in migrations[91].sql
-    assert migrations[-1].version == 96
+    assert migrations[-1].version == 97
     assert "'storage_exhausted'" in next(item for item in migrations if item.version == 95).sql
     assert "daemon_runs_one_active_idx" in migrations[91].sql
     assert "CREATE TABLE merlin_storage.technique_history" in migrations[60].sql
@@ -117,6 +122,342 @@ def test_migrations_have_stable_versions_and_checksums() -> None:
     evidence = next(migration for migration in migrations if migration.version == 17)
     assert "CREATE TABLE merlin_storage.campaign_observations" in evidence.sql
     assert "CREATE TABLE IF NOT EXISTS merlin_storage.report_revisions" in migrations[17].sql
+
+
+def test_target_admission_migration_materializes_preupgrade_transition_hold(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-latch-upgrade")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:96])
+            session = SessionRepository(connection).create("preupgrade target transition")
+            campaign_id = "campaign/preupgrade-target-transition"
+            target_id = "target/preupgrade"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                str(session.id),
+                {"manifest": {"id": campaign_id, "target": {"id": target_id}}},
+                "sha256:reviewed",
+            )
+            event_digest = "sha256:" + "a" * 64
+            payload = {
+                "kind": "target_surface_transition_observed",
+                "schema": "merlin.target-surface-transition-observed.v2",
+                "campaign_id": campaign_id,
+                "session_id": str(session.id),
+                "target_id": target_id,
+                "target_session_id": "browser:preupgrade",
+                "event_digest": event_digest,
+            }
+            campaigns.commit_lead_decision(
+                campaign_id,
+                0,
+                "target-surface-transition-observed/" + event_digest.removeprefix("sha256:"),
+                payload,
+                (),
+            )
+            legacy_event_digest = "sha256:" + "b" * 64
+            campaigns.commit_lead_decision(
+                campaign_id,
+                0,
+                "target-surface-transition-observed/" + legacy_event_digest.removeprefix("sha256:"),
+                {
+                    "kind": "target_surface_transition_observed",
+                    "schema": "merlin.target-surface-transition-observed.v1",
+                    "campaign_id": campaign_id,
+                    "session_id": str(session.id),
+                    "target_id": target_id,
+                    "target_session_id": "browser:untrusted-legacy-claim",
+                    "event_digest": legacy_event_digest,
+                },
+                (),
+            )
+
+            runner.apply(migrations[96:])
+
+            session_latch = connection.execute(
+                """SELECT state, transition_count, pending_event_digests,
+                          event_set_digest
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = 'browser:preupgrade'""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert session_latch == {
+                "state": "latched",
+                "transition_count": 1,
+                "pending_event_digests": [event_digest],
+                "event_set_digest": None,
+            }
+            assert (
+                connection.execute(
+                    """SELECT count(*) AS count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = 'browser:untrusted-legacy-claim'""",
+                    (campaign_id, target_id),
+                ).fetchone()["count"]
+                == 0
+            )
+            head = connection.execute(
+                """SELECT state, transition_count, latched_session_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = ''""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert head == {
+                "state": "latched",
+                "transition_count": 2,
+                "latched_session_count": 2,
+            }
+
+
+def test_target_admission_migration_ignores_untrusted_settlement_claims(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-latch-forgery")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:96])
+            session = SessionRepository(connection).create("forged transition settlement")
+            campaign_id = "campaign/forged-transition-settlement"
+            target_id = "target/forged-transition-settlement"
+            target_session_id = "browser:forged-transition-settlement"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                str(session.id),
+                {"manifest": {"id": campaign_id, "target": {"id": target_id}}},
+                "sha256:reviewed",
+            )
+            event_digest = "sha256:" + "c" * 64
+            campaigns.commit_lead_decision(
+                campaign_id,
+                0,
+                "target-surface-transition-observed/" + event_digest.removeprefix("sha256:"),
+                {
+                    "kind": "target_surface_transition_observed",
+                    "schema": "merlin.target-surface-transition-observed.v2",
+                    "campaign_id": campaign_id,
+                    "session_id": str(session.id),
+                    "target_id": target_id,
+                    "target_session_id": target_session_id,
+                    "event_digest": event_digest,
+                },
+                (),
+            )
+            for suffix, claimed_digests in (
+                ("real", [event_digest]),
+                ("unknown", ["sha256:" + "d" * 64]),
+            ):
+                campaigns.commit_lead_decision(
+                    campaign_id,
+                    0,
+                    f"target-reobservation-settlement:{suffix}",
+                    {
+                        "kind": "target_reobservation_settled",
+                        "schema": "merlin.target-reobservation-settlement.v1",
+                        "status": "refreshed",
+                        "campaign_id": campaign_id,
+                        "session_id": str(session.id),
+                        "target_id": target_id,
+                        "target_session_id": target_session_id,
+                        "event_digests": claimed_digests,
+                    },
+                    (),
+                )
+
+            runner.apply(migrations[96:])
+
+            latch = connection.execute(
+                """SELECT state, transition_count, pending_event_digests,
+                          pending_event_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s""",
+                (campaign_id, target_id, target_session_id),
+            ).fetchone()
+            assert latch == {
+                "state": "latched",
+                "transition_count": 1,
+                "pending_event_digests": [event_digest],
+                "pending_event_count": 1,
+            }
+
+
+def test_target_admission_migration_rejects_fresh_v1_but_allows_exact_replay(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-v1-interlock")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:96])
+            session = SessionRepository(connection).create("legacy transition interlock")
+            campaign_id = "campaign/legacy-transition-interlock"
+            target_id = "target/legacy-transition-interlock"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                str(session.id),
+                {"manifest": {"id": campaign_id, "target": {"id": target_id}}},
+                "sha256:reviewed",
+            )
+            event_digest = "sha256:" + "e" * 64
+            decision_id = "target-surface-transition-observed/" + event_digest.removeprefix(
+                "sha256:"
+            )
+            payload = {
+                "kind": "target_surface_transition_observed",
+                "schema": "merlin.target-surface-transition-observed.v1",
+                "campaign_id": campaign_id,
+                "session_id": str(session.id),
+                "target_id": target_id,
+                "event_digest": event_digest,
+            }
+            original = campaigns.commit_lead_decision(campaign_id, 0, decision_id, payload, ())
+
+            runner.apply(migrations[96:])
+
+            replay = campaigns.commit_lead_decision(campaign_id, 0, decision_id, payload, ())
+            assert replay["sequence"] == original["sequence"]
+            fresh_digest = "sha256:" + "f" * 64
+            with pytest.raises(
+                CheckViolation,
+                match="legacy target transition observations are read-only",
+            ):
+                campaigns.commit_lead_decision(
+                    campaign_id,
+                    0,
+                    "target-surface-transition-observed/" + fresh_digest.removeprefix("sha256:"),
+                    {**payload, "event_digest": fresh_digest},
+                    (),
+                )
+            assert (
+                connection.execute(
+                    """SELECT count(*) AS count
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s
+                     AND payload->>'schema' =
+                         'merlin.target-surface-transition-observed.v1'""",
+                    (campaign_id,),
+                ).fetchone()["count"]
+                == 1
+            )
+
+
+def test_legacy_writer_racing_with_upgrader_cannot_append(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-v1-race")) as database:
+        with database.connect() as connection:
+            runner = MigrationRunner(connection)
+            runner.apply(migrations[:96])
+            session = SessionRepository(connection).create("legacy transition upgrade race")
+            session_id = str(session.id)
+            campaign_id = "campaign/legacy-transition-upgrade-race"
+            target_id = "target/legacy-transition-upgrade-race"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                session_id,
+                {"manifest": {"id": campaign_id, "target": {"id": target_id}}},
+                "sha256:reviewed",
+            )
+            existing_digest = "sha256:" + "1" * 64
+            existing_decision_id = (
+                "target-surface-transition-observed/" + existing_digest.removeprefix("sha256:")
+            )
+            base_payload = {
+                "kind": "target_surface_transition_observed",
+                "schema": "merlin.target-surface-transition-observed.v1",
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "target_id": target_id,
+                "event_digest": existing_digest,
+            }
+            campaigns.commit_lead_decision(campaign_id, 0, existing_decision_id, base_payload, ())
+            runner.apply(migrations[96:])
+
+        upgrade_pids: Queue[int] = Queue()
+
+        def upgrade() -> dict[str, object]:
+            with database.connect() as upgrade_connection:
+                upgrade_pids.put(
+                    upgrade_connection.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
+                )
+                return DurableSchedulerStore(upgrade_connection).upgrade_legacy_target_admission(
+                    campaign_id, session_id, target_id
+                )
+
+        def write_fresh_v1() -> str:
+            with database.connect() as writer_connection:
+                fresh_digest = "sha256:" + "2" * 64
+                try:
+                    CampaignStore(writer_connection).commit_lead_decision(
+                        campaign_id,
+                        0,
+                        "target-surface-transition-observed/"
+                        + fresh_digest.removeprefix("sha256:"),
+                        {**base_payload, "event_digest": fresh_digest},
+                        (),
+                    )
+                except CheckViolation as error:
+                    return str(error.sqlstate)
+                return "inserted"
+
+        def wait_for_lock(connection: object, pid: int) -> None:
+            deadline = time.monotonic() + 10
+            last_row = None
+            while time.monotonic() < deadline:
+                row = connection.execute(
+                    """SELECT state, wait_event_type, wait_event, query
+                       FROM pg_stat_activity WHERE pid = %s""",
+                    (pid,),
+                ).fetchone()
+                last_row = row
+                if row is not None and row["wait_event_type"] == "Lock":
+                    return
+                time.sleep(0.01)
+            pytest.fail(f"backend {pid} did not reach the expected lock wait: {last_row!r}")
+
+        with database.connect() as blocker_connection:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                with blocker_connection.transaction():
+                    blocker_connection.execute(
+                        """SELECT id
+                           FROM merlin_storage.assessment_campaigns
+                           WHERE id = %s
+                           FOR UPDATE""",
+                        (campaign_id,),
+                    ).fetchone()
+                    upgrade_future = executor.submit(upgrade)
+                    wait_for_lock(blocker_connection, upgrade_pids.get(timeout=10))
+                    writer_future = executor.submit(write_fresh_v1)
+                    writer_result = writer_future.result(timeout=10)
+                    assert not upgrade_future.done()
+
+                upgraded = upgrade_future.result(timeout=15)
+
+        assert upgraded["status"] == "blocked"
+        assert writer_result == "23514"
+        with database.connect() as connection:
+            assert (
+                connection.execute(
+                    """SELECT count(*) AS count
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s
+                     AND payload->>'schema' =
+                         'merlin.target-surface-transition-observed.v1'""",
+                    (campaign_id,),
+                ).fetchone()["count"]
+                == 1
+            )
 
 
 def test_campaign_terminal_taxonomy_migrates_legacy_rows_and_rejects_legacy_writes(

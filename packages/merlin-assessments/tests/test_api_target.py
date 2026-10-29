@@ -45,6 +45,7 @@ from merlin_contracts import (
     StateEnumerationDeclaration,
     StateEnumerationShape,
     ToolContext,
+    ToolEffectState,
     ToolInteractionRole,
     executable_adapter_digest,
 )
@@ -442,6 +443,200 @@ def _sealed_context(campaign_id: str, adapter: dict[str, object]) -> ToolContext
             "compiled_adapter_digest": compiled_target_adapter_digest(compilation),
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_api_resolver_binds_concurrent_initial_delivery_to_one_generation(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path.rsplit("/", 1)[-1])
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "resolved-session"})
+        if request.url.path.endswith("/message"):
+            body = json.loads(request.content)
+            return httpx.Response(200, json={"reply": body["userMessage"]})
+        raise AssertionError("unexpected reviewed API request")
+
+    campaign_id = "campaign/api-session-resolution-initial"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                context = _sealed_context(campaign_id, adapter)
+                target_session_id = await tool.resolve_target_session_id(context)
+                assert target_session_id is not None
+                assert (
+                    await ReviewedTargetInjectTool(tool).resolve_target_session_id(context)
+                    == target_session_id
+                )
+                bound = context.model_copy(update={"expected_target_session_id": target_session_id})
+                first, second = await asyncio.gather(
+                    tool.invoke(bound, {"input": "first"}),
+                    tool.invoke(bound, {"input": "second"}),
+                )
+
+    assert first.is_error is False
+    assert second.is_error is False
+    assert first.metadata["target_session_id"] == target_session_id
+    assert second.metadata["target_session_id"] == target_session_id
+    assert calls == ["start", "message", "message"]
+
+
+@pytest.mark.asyncio
+async def test_reviewed_api_resolver_drives_initial_permitted_delivery(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path.rsplit("/", 1)[-1])
+        if request.url.path.endswith("/start"):
+            return httpx.Response(200, json={"sessionId": "permitted-session"})
+        return httpx.Response(200, json={"reply": "delivered"})
+
+    class Effects:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def adopt_permitted(self, record, permit_digest):
+            assert permit_digest == "sha256:" + "a" * 64
+            self.records.append(record)
+            return record, True
+
+        async def finish(self, record):
+            self.records[-1] = record
+            return record
+
+    async def allow(*_args, **_kwargs):
+        return True
+
+    campaign_id = "campaign/api-session-resolution-permitted"
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                target = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                effects = Effects()
+                broker = ToolBroker((target,), confirmer=allow, effect_store=effects)
+                context = _sealed_context(campaign_id, adapter).model_copy(
+                    update={"attempt_id": "attempt-1"}
+                )
+                target_session_id = await broker.resolve_target_session_id(
+                    "target_request", context
+                )
+                assert target_session_id is not None
+                admitted = []
+
+                async def admit(record):
+                    admitted.append(record)
+                    return "sha256:" + "a" * 64
+
+                result = await broker.invoke_with_admission(
+                    "target_request",
+                    context.model_copy(update={"expected_target_session_id": target_session_id}),
+                    {"input": "permitted delivery"},
+                    admit,
+                )
+
+    assert result.is_error is False
+    assert result.metadata["target_session_id"] == target_session_id
+    assert result.metadata["limit_interaction_count"] == 1
+    assert calls == ["start", "message"]
+    assert len(admitted) == 1
+    assert len(effects.records) == 1
+    assert effects.records[0].state is ToolEffectState.ACKNOWLEDGED
+    assert effects.records[0].result_metadata["target_session_id"] == target_session_id
+
+
+@pytest.mark.asyncio
+async def test_reviewed_api_resolver_rejects_cleaned_generation_drift_before_http(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    compilation = compile_target_adapter(adapter)
+    campaign_id = "campaign/api-session-resolution-drift"
+    scope_id = f"{campaign_id}/injection"
+    calls: list[str] = []
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            sessions.create(
+                campaign_id,
+                "target-refund",
+                compiled_target_adapter_digest(compilation),
+                session_scope_id=scope_id,
+            )
+            sessions.finish_cleanup(
+                campaign_id,
+                target_id="target-refund",
+                session_scope_id=scope_id,
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: (
+                        calls.append(request.url.path)
+                        or httpx.Response(500, text="must not be called")
+                    )
+                )
+            ) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                context = _sealed_context(campaign_id, adapter)
+                expected_generation_two = await tool.resolve_target_session_id(context)
+                assert expected_generation_two is not None
+
+                sessions.create(
+                    campaign_id,
+                    "target-refund",
+                    compiled_target_adapter_digest(compilation),
+                    session_scope_id=scope_id,
+                )
+                sessions.finish_cleanup(
+                    campaign_id,
+                    target_id="target-refund",
+                    session_scope_id=scope_id,
+                )
+                generation_three = sessions.create(
+                    campaign_id,
+                    "target-refund",
+                    compiled_target_adapter_digest(compilation),
+                    session_scope_id=scope_id,
+                )
+                result = await tool.invoke(
+                    context.model_copy(
+                        update={"expected_target_session_id": expected_generation_two}
+                    ),
+                    {"input": "must not dispatch"},
+                )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert result.metadata["expected_target_session_id"] == expected_generation_two
+    assert result.metadata["target_session_id"] == generation_three.target_session_id
+    assert calls == []
 
 
 @pytest.mark.asyncio

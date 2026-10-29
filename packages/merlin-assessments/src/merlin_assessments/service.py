@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from merlin_contracts import (
+    MAX_TARGET_SESSION_ID_LENGTH,
     AttackCase,
     ChatMessage,
     ChatRequest,
@@ -519,6 +520,28 @@ class AssessmentService:
         """Return the broker-registered adapter for the currently selected target."""
         return SelectedTargetTool(self)
 
+    def resolved_target_session_id(self, target_id: str) -> str | None:
+        """Project the authenticated non-secret preflight session identity."""
+
+        identity = self._target_session_identity
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("target_id") != target_id
+            or identity.get("authenticated") is not True
+        ):
+            return None
+        server_identity = identity.get("server_identity")
+        if (
+            not isinstance(server_identity, str)
+            or not server_identity
+            or server_identity != server_identity.strip()
+            or "\0" in server_identity
+        ):
+            return None
+        digest = hashlib.sha256(f"{target_id}\0{server_identity}".encode()).hexdigest()
+        target_session_id = f"provider-session:sha256:{digest}"
+        return target_session_id if len(target_session_id) <= MAX_TARGET_SESSION_ID_LENGTH else None
+
     @property
     def selected_target_id(self) -> str | None:
         return self._selected_target_id
@@ -927,12 +950,41 @@ class SelectedTargetTool:
             target_delivery=TargetDeliveryClass.DIRECT_USER_CHANNEL,
         )
 
+    def resolve_target_session_id(self, context: ToolContext) -> str | None:
+        """Resolve only a matching authenticated provider preflight identity."""
+
+        if context.target_id is None:
+            return None
+        return self._service.resolved_target_session_id(context.target_id)
+
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return ToolResult(content="prompt must be a non-empty string", is_error=True)
+        expected_target_session_id = context.expected_target_session_id
+        if expected_target_session_id is not None:
+            resolved_target_session_id = self.resolve_target_session_id(context)
+            if resolved_target_session_id != expected_target_session_id:
+                return ToolResult(
+                    content="reviewed provider target session changed before delivery",
+                    is_error=True,
+                    metadata={
+                        "effect": "target_network",
+                        "failure_code": "target_session_identity_mismatch",
+                        "retryable": False,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                        "limit_interaction_count": 0,
+                        "expected_target_session_id": expected_target_session_id,
+                        **(
+                            {"target_session_id": resolved_target_session_id}
+                            if resolved_target_session_id is not None
+                            else {}
+                        ),
+                    },
+                )
         action_id = str(context.call_id or uuid4())
-        return await self._service.invoke_selected_target(
+        result = await self._service.invoke_selected_target(
             prompt,
             campaign_id=context.campaign_id,
             action_id=action_id,
@@ -941,3 +993,8 @@ class SelectedTargetTool:
             compiled_adapter=context.compiled_adapter,
             expected_compiled_adapter_digest=context.compiled_adapter_digest,
         )
+        if expected_target_session_id is None:
+            return result
+        metadata = dict(result.metadata)
+        metadata.setdefault("target_session_id", expected_target_session_id)
+        return result.model_copy(update={"metadata": metadata})

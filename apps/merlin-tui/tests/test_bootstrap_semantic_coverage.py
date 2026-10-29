@@ -8,6 +8,7 @@ from merlin_findings import DurableReportService
 from merlin_tui.bootstrap import (
     _apply_pair_verdict,
     _canonical_report_candidate_projections,
+    _completion_limitation_lines,
     _current_terminal_report_authority,
     _fold_attempted_technique_outcome,
     _language_evidence_disagreement,
@@ -19,6 +20,29 @@ from merlin_tui.bootstrap import (
     _semantic_unsearched_frontier,
     _transform_payload_receipt_chain,
 )
+
+
+def test_completion_limitations_render_independent_session_unavailable() -> None:
+    reason = (
+        "Independent reproduction was not attempted because no daemon-authenticated distinct "
+        "fresh target session was available after the source surface changed."
+    )
+
+    lines = _completion_limitation_lines(
+        {
+            "limitations": (
+                {
+                    "scope": "validation",
+                    "outcome": "blocked",
+                    "reason_code": "independent_session_acquisition_unavailable",
+                    "finding_ids": ("F-1",),
+                    "reason": reason,
+                },
+            )
+        }
+    )
+
+    assert lines == [reason]
 
 
 class _ReportRepository:

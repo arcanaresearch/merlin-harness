@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,6 +11,10 @@ from threading import RLock
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from merlin_agents.target_reobservation import (
+    normalize_target_ui_transition,
+    project_target_reobservations,
+)
 from merlin_contracts import (
     GOAT_TOOLBOX_CATALOG_DIGEST,
     HYDRA_SELECT_CATALOG_DIGEST,
@@ -17,16 +22,31 @@ from merlin_contracts import (
     TechniqueAttempt,
     TechniqueAttemptControlKind,
     TechniqueAttemptState,
+    ToolEffectRecord,
+    ToolEffectState,
     trusted_goat_toolbox,
     trusted_hydra_select_mechanisms,
 )
 from psycopg.types.json import Jsonb
 
+from .sanitize import escape_nul
 from .technique_attempt_store import TechniqueAttemptRepository
 
 
 class StaleLeaseError(RuntimeError):
     """An attempt no longer owns the node generation it tried to mutate."""
+
+
+class TargetAdmissionLatchedError(StaleLeaseError):
+    """A changed target surface fenced a stale target-capable assignment."""
+
+    target_admission_latched = True
+
+
+class TargetLaneRecoveryRequiredError(StaleLeaseError):
+    """A terminal target attempt still has unresolved durable effect authority."""
+
+    target_lane_recovery_required = True
 
 
 _ATTEMPT_FAILURE_KINDS = frozenset(
@@ -51,6 +71,18 @@ _ATTEMPT_FAILURE_KINDS = frozenset(
 )
 
 _MAX_SCHEDULE_JSONB_BYTES = 64 * 1024 * 1024
+
+_TARGET_REOBSERVATION_TOOLS = frozenset(
+    {
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_network_events",
+        "browser_recall_reconnaissance",
+        "browser_record_api_handoff",
+        "browser_compile_api_handoff",
+    }
+)
+_TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_snapshot", "browser_record_api_handoff"})
 
 
 class ScheduleArtifactTooLarge(ValueError):
@@ -143,6 +175,8 @@ class AttemptLease:
     generation: int
     owner: str
     lease_expires_at: datetime
+    replaced_attempt_id: str | None = None
+    lane_recovery_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -3527,6 +3561,3268 @@ class DurableSchedulerStore:
                 },
             )
 
+    def _target_admission_scope_locked(
+        self,
+        schedule_id: str,
+        node_id: str,
+        target_admission: Mapping[str, object],
+        *,
+        require_admission_contract: bool = True,
+    ) -> tuple[dict[str, Any], Mapping[str, object], dict[str, Any]]:
+        """Validate daemon-authored admission identity against durable campaign state."""
+
+        required = ("campaign_id", "session_id", "target_id", "assignment_id")
+        if any(
+            not isinstance(target_admission.get(name), str)
+            or not str(target_admission[name]).strip()
+            for name in required
+        ):
+            raise ValueError("target admission identity is incomplete")
+        campaign_id = str(target_admission["campaign_id"])
+        campaign = self.connection.execute(
+            """SELECT id, session_id, manifest, status
+               FROM merlin_storage.assessment_campaigns
+               WHERE id = %s FOR UPDATE""",
+            (campaign_id,),
+        ).fetchone()
+        if campaign is None:
+            raise TargetAdmissionLatchedError("target admission campaign is unknown")
+        schedule = self.connection.execute(
+            """SELECT id, session_id, graph, status
+               FROM merlin_storage.scheduler_schedules WHERE id = %s""",
+            (schedule_id,),
+        ).fetchone()
+        if schedule is None:
+            raise StaleLeaseError("scheduler schedule is unknown")
+        assignment_id = str(target_admission["assignment_id"])
+        if node_id != f"worker:{assignment_id}":
+            raise ValueError("target admission assignment does not match scheduler node")
+        assignment = next(
+            (
+                item
+                for item in schedule["graph"].get("assignments", ())
+                if isinstance(item, Mapping) and item.get("id") == assignment_id
+            ),
+            None,
+        )
+        envelope = campaign["manifest"]
+        reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+        target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+        contract = (
+            self._target_admission_contract(assignment) if isinstance(assignment, Mapping) else {}
+        )
+        target_session_id = target_admission.get("target_session_id")
+        strategy_id = target_admission.get("strategy_id")
+        target_effect_tools = target_admission.get("target_effect_tool_ids")
+        target_exchange_tools = target_admission.get("target_exchange_tool_ids")
+        assignment_tools = assignment.get("tool_ids") if isinstance(assignment, Mapping) else None
+        typed_tools_match = bool(
+            isinstance(target_effect_tools, (list, tuple))
+            and len(target_effect_tools) <= 64
+            and all(
+                isinstance(item, str) and item and len(item) <= 256 for item in target_effect_tools
+            )
+            and tuple(target_effect_tools)
+            == tuple(sorted(set(str(item) for item in target_effect_tools)))
+            and isinstance(target_exchange_tools, (list, tuple))
+            and len(target_exchange_tools) <= 64
+            and all(
+                isinstance(item, str) and item and len(item) <= 256
+                for item in target_exchange_tools
+            )
+            and tuple(target_exchange_tools)
+            == tuple(sorted(set(str(item) for item in target_exchange_tools)))
+            and isinstance(assignment_tools, (list, tuple))
+            and set(target_effect_tools) <= set(assignment_tools)
+            and set(target_exchange_tools) <= set(target_effect_tools)
+            and (
+                bool(target_effect_tools)
+                or assignment.get("strategy_id") == "target-reobservation/v1"
+            )
+        )
+        admission_contract_matches = bool(
+            not require_admission_contract
+            or (
+                target_admission.get("schema") == "merlin.target-admission.v1"
+                and target_admission.get("schedule_id") == schedule_id
+                and target_admission.get("node_id") == node_id
+                and isinstance(assignment, Mapping)
+                and assignment.get("reviewed_adapter_digest")
+                == target_admission.get("reviewed_adapter_digest")
+                and typed_tools_match
+            )
+        )
+        if (
+            not isinstance(assignment, Mapping)
+            or not admission_contract_matches
+            or _campaign_id_from_assignment(assignment_id) != campaign_id
+            or str(schedule["session_id"]) != str(target_admission["session_id"])
+            or str(campaign["session_id"]) != str(target_admission["session_id"])
+            or not isinstance(target, Mapping)
+            or target.get("id") != target_admission["target_id"]
+            or assignment.get("target_profile_id") != target_admission["target_id"]
+            or require_admission_contract
+            and target_session_id is not None
+            and (not isinstance(target_session_id, str) or not target_session_id)
+            or require_admission_contract
+            and contract.get("target_session_id") is not None
+            and contract.get("target_session_id") != target_session_id
+            or require_admission_contract
+            and strategy_id is not None
+            and assignment.get("strategy_id") != strategy_id
+        ):
+            raise TargetAdmissionLatchedError("target admission scope does not match durable state")
+        return dict(campaign), assignment, dict(schedule)
+
+    @staticmethod
+    def _target_admission_contract(assignment: Mapping[str, object]) -> dict[str, object]:
+        values = assignment.get("strategy_contract")
+        if not isinstance(values, (list, tuple)):
+            return {}
+        contract: dict[str, object] = {}
+        for item in values:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+                contract[item[0]] = item[1]
+        return contract
+
+    def _target_admission_latch_locked(
+        self,
+        campaign_id: str,
+        target_id: str,
+        target_session_id: str | None,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT * FROM merlin_storage.target_admission_latches
+               WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s
+               FOR UPDATE""",
+            (campaign_id, target_id, target_session_id or ""),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _upsert_target_admission_latch_locked(
+        self,
+        *,
+        campaign_id: str,
+        session_id: str,
+        target_id: str,
+        target_session_id: str | None,
+        values: Mapping[str, object],
+    ) -> dict[str, Any]:
+        row = self.connection.execute(
+            """INSERT INTO merlin_storage.target_admission_latches
+                   (campaign_id, session_id, target_id, target_session_id, state,
+                    revision, transition_count, latched_session_count,
+                    pending_event_digests, pending_event_count, event_set_digest,
+                    generation_id, start_decision_id, settlement_id, lead_decision_id,
+                    authorized_schedule_id, current_surface_digest,
+                    compiled_adapter_digest, reviewed_adapter_digest,
+                    authorized_assignment_tools,
+                    lane_schedule_id, lane_node_id, lane_assignment_id,
+                    lane_attempt_id, lane_generation, lane_recovery_required,
+                    lane_recovery_root_attempt_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (campaign_id, target_id, target_session_id) DO UPDATE SET
+                   session_id = EXCLUDED.session_id,
+                   state = EXCLUDED.state,
+                   revision = EXCLUDED.revision,
+                   transition_count = EXCLUDED.transition_count,
+                   latched_session_count = EXCLUDED.latched_session_count,
+                   pending_event_digests = EXCLUDED.pending_event_digests,
+                   pending_event_count = EXCLUDED.pending_event_count,
+                   event_set_digest = EXCLUDED.event_set_digest,
+                   generation_id = EXCLUDED.generation_id,
+                   start_decision_id = EXCLUDED.start_decision_id,
+                   settlement_id = EXCLUDED.settlement_id,
+                   lead_decision_id = EXCLUDED.lead_decision_id,
+                   authorized_schedule_id = EXCLUDED.authorized_schedule_id,
+                   current_surface_digest = EXCLUDED.current_surface_digest,
+                   compiled_adapter_digest = EXCLUDED.compiled_adapter_digest,
+                   reviewed_adapter_digest = EXCLUDED.reviewed_adapter_digest,
+                   authorized_assignment_tools = EXCLUDED.authorized_assignment_tools,
+                   lane_schedule_id = EXCLUDED.lane_schedule_id,
+                   lane_node_id = EXCLUDED.lane_node_id,
+                   lane_assignment_id = EXCLUDED.lane_assignment_id,
+                   lane_attempt_id = EXCLUDED.lane_attempt_id,
+                   lane_generation = EXCLUDED.lane_generation,
+                   lane_recovery_required = EXCLUDED.lane_recovery_required,
+                   lane_recovery_root_attempt_id = EXCLUDED.lane_recovery_root_attempt_id,
+                   updated_at = now()
+               RETURNING *""",
+            (
+                campaign_id,
+                session_id,
+                target_id,
+                target_session_id or "",
+                values["state"],
+                values.get("revision", 0),
+                values.get("transition_count", 0),
+                values.get("latched_session_count", 0),
+                list(values.get("pending_event_digests", ())),
+                values.get("pending_event_count", 0),
+                values.get("event_set_digest"),
+                values.get("generation_id"),
+                values.get("start_decision_id"),
+                values.get("settlement_id"),
+                values.get("lead_decision_id"),
+                values.get("authorized_schedule_id"),
+                values.get("current_surface_digest"),
+                values.get("compiled_adapter_digest"),
+                values.get("reviewed_adapter_digest"),
+                Jsonb(dict(values.get("authorized_assignment_tools", {}))),
+                values.get("lane_schedule_id"),
+                values.get("lane_node_id"),
+                values.get("lane_assignment_id"),
+                values.get("lane_attempt_id"),
+                values.get("lane_generation"),
+                values.get("lane_recovery_required", False),
+                values.get("lane_recovery_root_attempt_id"),
+            ),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("target admission latch upsert returned no row")
+        return dict(row)
+
+    def _exact_lead_rows_locked(
+        self, campaign_id: str, decision_ids: Sequence[str]
+    ) -> tuple[dict[str, Any], ...]:
+        expected = tuple(dict.fromkeys(decision_ids))
+        if not expected or len(expected) > 260:
+            raise TargetAdmissionLatchedError("target admission authority set is unbounded")
+        rows = tuple(
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT sequence, wave, decision_id, payload, payload_digest
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s AND decision_id = ANY(%s)
+                   ORDER BY sequence""",
+                (campaign_id, list(expected)),
+            ).fetchall()
+        )
+        if {str(row["decision_id"]) for row in rows} != set(expected) or any(
+            row["payload_digest"] != _qualified_digest(dict(row["payload"])) for row in rows
+        ):
+            raise TargetAdmissionLatchedError("target admission journal authority is incomplete")
+        return rows
+
+    def _bounded_target_reobservation_projection_locked(
+        self,
+        latch: Mapping[str, object],
+        *,
+        start_decision_id: str,
+        settlement_id: str | None = None,
+        lead_decision_id: str | None = None,
+    ) -> Any:
+        events = latch.get("pending_event_digests")
+        if (
+            latch.get("state") == "overflow"
+            or not isinstance(events, (list, tuple))
+            or not events
+            or len(events) > 256
+            or latch.get("pending_event_count") != len(events)
+        ):
+            raise TargetAdmissionLatchedError("target admission event set cannot be refreshed")
+        decisions = [
+            *(
+                "target-surface-transition-observed/" + str(event).removeprefix("sha256:")
+                for event in events
+            ),
+            start_decision_id,
+        ]
+        if settlement_id is not None:
+            decisions.append(settlement_id)
+        if lead_decision_id is not None:
+            decisions.append(lead_decision_id)
+        rows = self._exact_lead_rows_locked(str(latch["campaign_id"]), decisions)
+        return project_target_reobservations(
+            rows,
+            campaign_id=str(latch["campaign_id"]),
+            session_id=str(latch["session_id"]),
+            target_id=str(latch["target_id"]),
+        )
+
+    @staticmethod
+    def _exact_passive_reobservation_assignment(
+        assignment: Mapping[str, object],
+        contract: Mapping[str, object],
+        target_admission: Mapping[str, object],
+    ) -> bool:
+        tools = assignment.get("tool_ids")
+        start_decision_id = target_admission.get("target_reobservation_start_decision_id")
+        return bool(
+            assignment.get("strategy_id") == "target-reobservation/v1"
+            and target_admission.get("strategy_id") == "target-reobservation/v1"
+            and contract.get("schema") == "merlin.target-reobservation.v1"
+            and isinstance(tools, (list, tuple))
+            and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= set(tools)
+            and set(tools) <= _TARGET_REOBSERVATION_TOOLS
+            and not assignment.get("technique_ids")
+            and isinstance(start_decision_id, str)
+            and start_decision_id.startswith("target-reobservation-started/")
+            and contract.get("target_reobservation_start_decision_id") == start_decision_id
+        )
+
+    def _target_lane_available_locked(
+        self,
+        latch: Mapping[str, object] | None,
+        *,
+        current_attempt_id: str | None,
+        current_schedule_id: str | None = None,
+        current_node_id: str | None = None,
+        current_generation: int | None = None,
+        prospective_assignment_id: str | None = None,
+    ) -> str | None:
+        if latch is None or latch.get("lane_attempt_id") is None:
+            if current_attempt_id is not None:
+                raise TargetAdmissionLatchedError("target effect lost its durable lane")
+            return None
+        lane_attempt_id = str(latch["lane_attempt_id"])
+        if current_attempt_id is not None:
+            if (
+                lane_attempt_id != current_attempt_id
+                or str(latch.get("lane_schedule_id")) != current_schedule_id
+                or latch.get("lane_node_id") != current_node_id
+                or latch.get("lane_generation") != current_generation
+            ):
+                raise TargetAdmissionLatchedError("another target attempt owns the durable lane")
+            if latch.get("lane_recovery_required") is True:
+                raise TargetAdmissionLatchedError(
+                    "target lane requires prior effect recovery before another effect"
+                )
+            return None
+        prior = self.connection.execute(
+            """SELECT state FROM merlin_storage.scheduler_attempts WHERE id = %s""",
+            (lane_attempt_id,),
+        ).fetchone()
+        if prior is not None and prior["state"] in {
+            "cancelled",
+            "completed",
+            "failed",
+            "quarantined",
+        }:
+            disposition = self._target_lane_terminal_disposition_locked(
+                lane_attempt_id,
+                authority=("cancelled" if prior["state"] == "cancelled" else "recovery"),
+                revoke_unadopted=prior["state"] == "cancelled",
+            )
+            if disposition in {"released", "latched"}:
+                return None
+            raise TargetLaneRecoveryRequiredError(
+                "terminal target lane requires durable effect reconciliation"
+            )
+        if (
+            prior is not None
+            and prior["state"] == "expired"
+            and str(latch.get("lane_schedule_id")) == current_schedule_id
+            and latch.get("lane_node_id") == current_node_id
+            and latch.get("lane_assignment_id") == prospective_assignment_id
+        ):
+            return lane_attempt_id
+        if (
+            prior is not None
+            and prior["state"] == "expired"
+            and latch.get("lane_recovery_required") is True
+        ):
+            raise TargetLaneRecoveryRequiredError(
+                "expired target lane requires durable effect reconciliation"
+            )
+        raise TargetAdmissionLatchedError("another target attempt owns the durable lane")
+
+    def _target_admission_allowed_locked(
+        self,
+        schedule_id: str,
+        node_id: str,
+        target_admission: Mapping[str, object],
+        *,
+        current_attempt_id: str | None = None,
+        current_generation: int | None = None,
+    ) -> tuple[str, str, str, str | None]:
+        campaign, assignment, _schedule = self._target_admission_scope_locked(
+            schedule_id, node_id, target_admission
+        )
+        campaign_id = str(campaign["id"])
+        target_id = str(target_admission["target_id"])
+        target_session = target_admission.get("target_session_id")
+        target_session_id = str(target_session) if isinstance(target_session, str) else ""
+        head = self._target_admission_latch_locked(campaign_id, target_id, None)
+        latch = (
+            self._target_admission_latch_locked(campaign_id, target_id, target_session_id)
+            if target_session_id
+            else head
+        )
+        contract = self._target_admission_contract(assignment)
+        passive_reobservation = self._exact_passive_reobservation_assignment(
+            assignment, contract, target_admission
+        )
+        if (
+            head is not None
+            and int(head["latched_session_count"]) > 0
+            and not (
+                latch is not None
+                and latch["state"] in {"latched", "overflow"}
+                and passive_reobservation
+            )
+        ):
+            raise TargetAdmissionLatchedError(
+                "another target session requires passive re-observation"
+            )
+        if not target_session_id:
+            if head is not None and int(head["transition_count"]) > 0:
+                raise TargetAdmissionLatchedError(
+                    "target transition requires an explicit refreshed target session"
+                )
+        elif latch is None:
+            if head is not None and int(head["transition_count"]) > 0:
+                raise TargetAdmissionLatchedError("target session has no refreshed authority")
+        elif latch["state"] in {"latched", "overflow"}:
+            generation_id = target_admission.get("generation_id")
+            event_set_digest = target_admission.get("event_set_digest")
+            start_decision_id = target_admission.get("target_reobservation_start_decision_id")
+            if not passive_reobservation:
+                raise TargetAdmissionLatchedError(
+                    "material target transition requires passive re-observation"
+                )
+            projection = self._bounded_target_reobservation_projection_locked(
+                latch, start_decision_id=str(start_decision_id)
+            )
+            generation = projection.generations.get(str(generation_id))
+            canonical_event_set_digest = (
+                _qualified_digest({"event_digests": generation.event_digests})
+                if generation is not None
+                else None
+            )
+            if latch["event_set_digest"] is None and canonical_event_set_digest is not None:
+                self.connection.execute(
+                    """UPDATE merlin_storage.target_admission_latches
+                       SET event_set_digest = %s, revision = revision + 1,
+                           updated_at = now()
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND target_session_id = %s AND event_set_digest IS NULL""",
+                    (
+                        canonical_event_set_digest,
+                        campaign_id,
+                        target_id,
+                        target_session_id,
+                    ),
+                )
+                latch = {**latch, "event_set_digest": canonical_event_set_digest}
+            if (
+                latch["state"] == "overflow"
+                or generation is None
+                or generation.target_session_id != target_session_id
+                or tuple(latch["pending_event_digests"]) != generation.event_digests
+                or canonical_event_set_digest != event_set_digest
+                or contract.get("generation_id") != generation_id
+                or contract.get("event_set_digest") != event_set_digest
+                or contract.get("target_session_id") != target_session_id
+                or schedule_id not in projection.starts.get(str(generation_id), ())
+                or schedule_id in projection.blocked
+            ):
+                raise TargetAdmissionLatchedError(
+                    "passive target re-observation authority does not match the latch"
+                )
+        elif latch["state"] == "activated":
+            authorized_assignment_tools = latch.get("authorized_assignment_tools")
+            authorized_tools = (
+                authorized_assignment_tools.get(str(assignment.get("id")))
+                if isinstance(authorized_assignment_tools, Mapping)
+                else None
+            )
+            if (
+                str(latch["authorized_schedule_id"]) != schedule_id
+                or not isinstance(authorized_tools, list)
+                or tuple(authorized_tools)
+                != tuple(target_admission.get("target_effect_tool_ids", ()))
+                or contract.get("target_reobservation_generation_id") != latch["generation_id"]
+                or contract.get("target_reobservation_event_set_digest")
+                != latch["event_set_digest"]
+                or contract.get("target_session_id") != target_session_id
+                or contract.get("initial_state_equivalence_digest")
+                != latch["current_surface_digest"]
+                or contract.get("compiled_adapter_digest") != latch["compiled_adapter_digest"]
+                or assignment.get("reviewed_adapter_digest") != latch["reviewed_adapter_digest"]
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target assignment is not the activated refreshed rebound"
+                )
+        elif latch["state"] == "resolved":
+            raise TargetAdmissionLatchedError("target admission was terminally resolved")
+        elif latch["state"] != "open":
+            raise TargetAdmissionLatchedError("target admission latch state is invalid")
+        elif head is not None and int(head["transition_count"]) > 0:
+            raise TargetAdmissionLatchedError("target session has no refreshed authority")
+
+        other_lanes = self.connection.execute(
+            """SELECT * FROM merlin_storage.target_admission_latches
+               WHERE campaign_id = %s AND target_id = %s
+                 AND lane_attempt_id IS NOT NULL
+                 AND target_session_id <> %s
+               ORDER BY target_session_id LIMIT 2 FOR UPDATE""",
+            (campaign_id, target_id, target_session_id),
+        ).fetchall()
+        if len(other_lanes) > 1:
+            raise TargetAdmissionLatchedError("multiple durable target lanes require recovery")
+        for other_lane in other_lanes:
+            self._target_lane_available_locked(
+                dict(other_lane),
+                current_attempt_id=current_attempt_id,
+                current_schedule_id=schedule_id,
+                current_node_id=node_id,
+                current_generation=current_generation,
+                prospective_assignment_id=str(target_admission["assignment_id"]),
+            )
+        recovery_attempt_id = self._target_lane_available_locked(
+            latch,
+            current_attempt_id=current_attempt_id,
+            current_schedule_id=schedule_id,
+            current_node_id=node_id,
+            current_generation=current_generation,
+            prospective_assignment_id=str(target_admission["assignment_id"]),
+        )
+        return campaign_id, target_id, target_session_id, recovery_attempt_id
+
+    def _append_campaign_lead_event_locked(
+        self,
+        campaign_id: str,
+        wave: int,
+        decision_id: str,
+        payload: Mapping[str, object],
+    ) -> bool:
+        payload_digest = _qualified_digest(dict(payload))
+        row = self.connection.execute(
+            """INSERT INTO merlin_storage.campaign_lead_journal
+                   (campaign_id, wave, payload, payload_digest, decision_id)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (campaign_id, decision_id) WHERE decision_id IS NOT NULL
+               DO NOTHING
+               RETURNING payload_digest""",
+            (campaign_id, wave, Jsonb(dict(payload)), payload_digest, decision_id),
+        ).fetchone()
+        inserted = row is not None
+        if row is None:
+            row = self.connection.execute(
+                """SELECT payload_digest
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s AND decision_id = %s""",
+                (campaign_id, decision_id),
+            ).fetchone()
+        if row is None or row["payload_digest"] != payload_digest:
+            raise ValueError("target admission journal identity conflicts")
+        return inserted
+
+    def _latch_target_surface_transition_locked(
+        self,
+        *,
+        campaign_id: str,
+        session_id: str,
+        target_id: str,
+        target_session_id: str,
+        event_digest: str,
+    ) -> None:
+        head = self._target_admission_latch_locked(campaign_id, target_id, None)
+        current = self._target_admission_latch_locked(campaign_id, target_id, target_session_id)
+        was_latched = current is not None and current["state"] in {"latched", "overflow"}
+        existing_events = (
+            tuple(str(item) for item in current["pending_event_digests"]) if was_latched else ()
+        )
+        pending_count = int(current["pending_event_count"]) + 1 if was_latched else 1
+        pending_events = (*existing_events, event_digest)
+        overflow = pending_count > 256
+        bounded_events = pending_events[:256]
+        state_values = {
+            **(current or {}),
+            "state": "overflow" if overflow else "latched",
+            "revision": int(current["revision"]) + 1 if current is not None else 1,
+            "transition_count": (
+                int(current["transition_count"]) + 1 if current is not None else 1
+            ),
+            "latched_session_count": 0,
+            "pending_event_digests": bounded_events,
+            "pending_event_count": pending_count,
+            "event_set_digest": (
+                None if overflow else _qualified_digest({"event_digests": pending_events})
+            ),
+            "generation_id": None,
+            "start_decision_id": None,
+            "settlement_id": None,
+            "lead_decision_id": None,
+            "authorized_schedule_id": None,
+            "current_surface_digest": None,
+            "compiled_adapter_digest": None,
+            "reviewed_adapter_digest": None,
+            "authorized_assignment_tools": {},
+        }
+        self._upsert_target_admission_latch_locked(
+            campaign_id=campaign_id,
+            session_id=session_id,
+            target_id=target_id,
+            target_session_id=target_session_id,
+            values=state_values,
+        )
+        self._upsert_target_admission_latch_locked(
+            campaign_id=campaign_id,
+            session_id=session_id,
+            target_id=target_id,
+            target_session_id=None,
+            values={
+                **(head or {}),
+                "state": "latched",
+                "revision": int(head["revision"]) + 1 if head is not None else 1,
+                "transition_count": (int(head["transition_count"]) + 1 if head is not None else 1),
+                "latched_session_count": (
+                    int(head["latched_session_count"]) if head is not None else 0
+                )
+                + (0 if was_latched else 1),
+                "pending_event_digests": (),
+                "pending_event_count": 0,
+            },
+        )
+
+    def _bind_target_lane_locked(
+        self,
+        *,
+        campaign_id: str,
+        session_id: str,
+        target_id: str,
+        target_session_id: str,
+        schedule_id: str,
+        node_id: str,
+        assignment_id: str,
+        attempt_id: str,
+        generation: int,
+        recovery_attempt_id: str | None,
+    ) -> None:
+        current = self._target_admission_latch_locked(
+            campaign_id, target_id, target_session_id or None
+        )
+        if (
+            current is not None
+            and current.get("lane_attempt_id") is not None
+            and str(current["lane_attempt_id"]) != recovery_attempt_id
+        ):
+            raise TargetAdmissionLatchedError("another target attempt owns the durable lane")
+        self._upsert_target_admission_latch_locked(
+            campaign_id=campaign_id,
+            session_id=session_id,
+            target_id=target_id,
+            target_session_id=target_session_id or None,
+            values={
+                **(current or {}),
+                "state": current["state"] if current is not None else "open",
+                "revision": int(current["revision"]) + 1 if current is not None else 1,
+                "lane_schedule_id": schedule_id,
+                "lane_node_id": node_id,
+                "lane_assignment_id": assignment_id,
+                "lane_attempt_id": attempt_id,
+                "lane_generation": generation,
+                "lane_recovery_required": recovery_attempt_id is not None,
+                "lane_recovery_root_attempt_id": (
+                    current.get("lane_recovery_root_attempt_id") or recovery_attempt_id
+                    if current is not None
+                    else recovery_attempt_id
+                ),
+            },
+        )
+
+    def _release_target_lane_locked(self, attempt_id: str) -> None:
+        scope = self.connection.execute(
+            """SELECT campaign_id, target_id, target_session_id
+               FROM merlin_storage.target_admission_latches
+               WHERE lane_attempt_id = %s""",
+            (attempt_id,),
+        ).fetchone()
+        if scope is None:
+            return
+        self.connection.execute(
+            """SELECT id FROM merlin_storage.assessment_campaigns
+               WHERE id = %s FOR UPDATE""",
+            (scope["campaign_id"],),
+        ).fetchone()
+        self.connection.execute(
+            """UPDATE merlin_storage.target_admission_latches
+               SET lane_schedule_id = NULL, lane_node_id = NULL,
+                   lane_assignment_id = NULL, lane_attempt_id = NULL,
+                   lane_generation = NULL, lane_recovery_required = false,
+                   lane_recovery_root_attempt_id = NULL,
+                   revision = revision + 1, updated_at = now()
+               WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s
+                 AND lane_attempt_id = %s""",
+            (
+                scope["campaign_id"],
+                scope["target_id"],
+                scope["target_session_id"],
+                attempt_id,
+            ),
+        )
+
+    def _lock_target_lane_campaigns_for_schedule_locked(
+        self, schedule_id: str, *, node_id: str | None = None
+    ) -> tuple[str, ...]:
+        """Take campaign locks before schedule/attempt/permit locks on cancellation paths."""
+
+        parameters: tuple[object, ...] = (schedule_id,)
+        node_filter = ""
+        if node_id is not None:
+            node_filter = " AND lane_node_id = %s"
+            parameters = (schedule_id, node_id)
+        campaign_ids = tuple(
+            str(row["campaign_id"])
+            for row in self.connection.execute(
+                """SELECT DISTINCT campaign_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE lane_schedule_id = %s"""
+                + node_filter
+                + " ORDER BY campaign_id",
+                parameters,
+            ).fetchall()
+        )
+        for campaign_id in campaign_ids:
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (campaign_id,),
+            ).fetchone()
+        return campaign_ids
+
+    def _lock_target_latches_for_schedule_locked(
+        self, schedule_id: str, *, node_id: str | None = None
+    ) -> None:
+        """Lock lane rows before attempts so cancellation matches effect adoption order."""
+
+        parameters: tuple[object, ...] = (schedule_id,)
+        node_filter = ""
+        if node_id is not None:
+            node_filter = " AND lane_node_id = %s"
+            parameters = (schedule_id, node_id)
+        self.connection.execute(
+            """SELECT campaign_id, target_id, target_session_id
+               FROM merlin_storage.target_admission_latches
+               WHERE lane_schedule_id = %s"""
+            + node_filter
+            + " ORDER BY campaign_id, target_id, target_session_id FOR UPDATE",
+            parameters,
+        ).fetchall()
+
+    def _target_lane_terminal_disposition_locked(
+        self,
+        attempt_id: str,
+        *,
+        authority: str,
+        committed_transition_call_id: str | None = None,
+        revoke_unadopted: bool = False,
+    ) -> str:
+        """Release one lane only from bounded, terminal durable effect evidence."""
+
+        if authority not in {"settled", "cancelled", "recovery"}:
+            raise ValueError("target lane terminal authority is invalid")
+        latch_row = self.connection.execute(
+            """SELECT * FROM merlin_storage.target_admission_latches
+               WHERE lane_attempt_id = %s FOR UPDATE""",
+            (attempt_id,),
+        ).fetchone()
+        if latch_row is None:
+            return "released"
+        latch = dict(latch_row)
+        lineage = self.connection.execute(
+            """WITH RECURSIVE lineage AS (
+                   SELECT id, schedule_id, node_id, state, replaced_attempt_id, 1 AS depth
+                   FROM merlin_storage.scheduler_attempts WHERE id = %s
+                   UNION ALL
+                   SELECT prior.id, prior.schedule_id, prior.node_id, prior.state,
+                          prior.replaced_attempt_id, lineage.depth + 1
+                   FROM merlin_storage.scheduler_attempts AS prior
+                   JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                   WHERE lineage.depth < 257
+               )
+               SELECT * FROM lineage ORDER BY depth""",
+            (attempt_id,),
+        ).fetchall()
+        lineage_ids = tuple(str(row["id"]) for row in lineage)
+        root_attempt_id = str(latch.get("lane_recovery_root_attempt_id") or attempt_id)
+        bounded_lineage = bool(
+            lineage
+            and len(lineage) <= 256
+            and lineage_ids[-1] == root_attempt_id
+            and (len(lineage) < 256 or lineage[-1]["replaced_attempt_id"] is None)
+            and all(
+                str(row["schedule_id"]) == str(latch["lane_schedule_id"])
+                and row["node_id"] == latch["lane_node_id"]
+                for row in lineage
+            )
+        )
+        if not bounded_lineage:
+            self.connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_recovery_required = true,
+                       lane_recovery_root_attempt_id = coalesce(
+                           lane_recovery_root_attempt_id, lane_attempt_id
+                       ), revision = revision + 1, updated_at = now()
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s AND lane_attempt_id = %s""",
+                (
+                    latch["campaign_id"],
+                    latch["target_id"],
+                    latch["target_session_id"],
+                    attempt_id,
+                ),
+            )
+            return "held"
+
+        permit_rows = [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT * FROM merlin_storage.target_effect_permits
+                   WHERE attempt_id = ANY(%s)
+                   ORDER BY attempt_id, call_id, tool_name FOR UPDATE""",
+                (list(lineage_ids),),
+            ).fetchall()
+        ]
+        permit_effect_ids = tuple(str(row["idempotency_key"]) for row in permit_rows)
+        effect_rows = [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT * FROM merlin_storage.tool_effects
+                   WHERE attempt_id = ANY(%s)
+                     AND (effect = 'target_network' OR idempotency_key = ANY(%s))
+                   ORDER BY idempotency_key FOR UPDATE""",
+                (list(lineage_ids), list(permit_effect_ids)),
+            ).fetchall()
+        ]
+        effect_by_id = {str(row["idempotency_key"]): row for row in effect_rows}
+
+        if revoke_unadopted:
+            for permit in permit_rows:
+                effect = effect_by_id.get(str(permit["idempotency_key"]))
+                if permit["state"] != "intent" or effect is None or effect["state"] != "intent":
+                    continue
+                revoked = self.connection.execute(
+                    """UPDATE merlin_storage.target_effect_permits
+                       SET state = 'revoked', updated_at = now()
+                       WHERE permit_digest = %s AND state = 'intent'
+                       RETURNING permit_digest""",
+                    (permit["permit_digest"],),
+                ).fetchone()
+                if revoked is None:
+                    continue
+                no_dispatch = {
+                    "target_effect_dispatch_status": "revoked_before_dispatch",
+                    "target_session_id": permit["target_session_id"],
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                    "target_call_budget_charge": 0,
+                }
+                self.connection.execute(
+                    """UPDATE merlin_storage.tool_effects
+                       SET state = 'reconciled', result_content = '',
+                           result_is_error = true, result_metadata = %s,
+                           reconciliation = 'scheduler permit revoked before dispatch',
+                           updated_at = now()
+                       WHERE idempotency_key = %s AND state = 'intent'""",
+                    (Jsonb(no_dispatch), permit["idempotency_key"]),
+                )
+                permit["state"] = "revoked"
+                effect.update(
+                    state="reconciled",
+                    result_content="",
+                    result_is_error=True,
+                    result_metadata=no_dispatch,
+                    reconciliation="scheduler permit revoked before dispatch",
+                )
+
+        schedule = self.connection.execute(
+            """SELECT graph FROM merlin_storage.scheduler_schedules WHERE id = %s""",
+            (latch["lane_schedule_id"],),
+        ).fetchone()
+        assignment = None
+        if schedule is not None:
+            assignment = next(
+                (
+                    value
+                    for value in schedule["graph"].get("assignments", ())
+                    if isinstance(value, Mapping) and value.get("id") == latch["lane_assignment_id"]
+                ),
+                None,
+            )
+        assignment_tools = (
+            set(assignment.get("tool_ids", ())) if isinstance(assignment, Mapping) else set()
+        )
+        passive_assignment = bool(
+            isinstance(assignment, Mapping)
+            and assignment.get("strategy_id") == "target-reobservation/v1"
+            and not assignment.get("technique_ids")
+            and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= assignment_tools
+            and assignment_tools <= _TARGET_REOBSERVATION_TOOLS
+        )
+        permit_by_effect = {str(row["idempotency_key"]): row for row in permit_rows}
+
+        def strict_zero_effect(effect: Mapping[str, object]) -> bool:
+            metadata = effect.get("result_metadata")
+            target_session_id = str(latch["target_session_id"])
+            return bool(
+                effect.get("state") in {"acknowledged", "reconciled"}
+                and effect.get("result_is_error") is True
+                and isinstance(metadata, Mapping)
+                and metadata.get("target_effect_attempted") is False
+                and type(metadata.get("interaction_count")) is int
+                and metadata.get("interaction_count") == 0
+                and type(metadata.get("limit_interaction_count")) is int
+                and metadata.get("limit_interaction_count") == 0
+                and type(metadata.get("target_call_budget_charge")) is int
+                and metadata.get("target_call_budget_charge") == 0
+                and "target_ui_transition" not in metadata
+                and (
+                    target_session_id == ""
+                    and isinstance(metadata.get("target_session_id"), str)
+                    and bool(str(metadata["target_session_id"]).strip())
+                    or target_session_id != ""
+                    and metadata.get("target_session_id") == target_session_id
+                )
+            )
+
+        # Expiry and pause are recovery authorities, not evidence that a target
+        # effect did not leave the process.  Even an empty durable effect set
+        # must remain fenced until the replacement attempt authenticates the
+        # exact empty lineage through resolve_target_lane_recovery().  Settled
+        # and cancelled attempts can still release a genuinely effect-free lane.
+        safe = authority != "recovery" or bool(effect_rows)
+        for effect in effect_rows:
+            permit = permit_by_effect.get(str(effect["idempotency_key"]))
+            metadata = effect.get("result_metadata")
+            target_session_matches = bool(
+                isinstance(metadata, Mapping)
+                and metadata.get("target_session_id") == latch["target_session_id"]
+                and (
+                    permit is None or permit.get("target_session_id") == latch["target_session_id"]
+                )
+            )
+            transition_present = isinstance(metadata, Mapping) and (
+                "target_ui_transition" in metadata
+            )
+            if permit is not None and permit["state"] == "revoked":
+                safe = bool(
+                    safe
+                    and effect["state"] == "reconciled"
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("target_effect_dispatch_status") == "revoked_before_dispatch"
+                    and target_session_matches
+                )
+                continue
+            if not target_session_matches:
+                safe = False
+                continue
+            if permit is not None and permit["state"] != "terminal":
+                safe = False
+                continue
+            if effect["state"] not in {"acknowledged", "reconciled"}:
+                safe = False
+                continue
+            if transition_present:
+                safe = bool(
+                    safe
+                    and committed_transition_call_id is not None
+                    and effect["call_id"] == committed_transition_call_id
+                )
+                continue
+            if authority == "settled":
+                continue
+            if passive_assignment and effect["tool_name"] in _TARGET_REOBSERVATION_TOOLS:
+                continue
+            if strict_zero_effect(effect):
+                continue
+            safe = False
+
+        if any(str(row["idempotency_key"]) not in effect_by_id for row in permit_rows):
+            safe = False
+        if safe:
+            disposition = "latched" if committed_transition_call_id is not None else "released"
+            self._release_target_lane_locked(attempt_id)
+            return disposition
+        self.connection.execute(
+            """UPDATE merlin_storage.target_admission_latches
+               SET lane_recovery_required = true,
+                   lane_recovery_root_attempt_id = coalesce(
+                       lane_recovery_root_attempt_id, lane_attempt_id
+                   ), revision = revision + 1, updated_at = now()
+               WHERE campaign_id = %s AND target_id = %s
+                 AND target_session_id = %s AND lane_attempt_id = %s""",
+            (
+                latch["campaign_id"],
+                latch["target_id"],
+                latch["target_session_id"],
+                attempt_id,
+            ),
+        )
+        return "held"
+
+    def _lock_target_lane_campaign_locked(self, attempt_id: str) -> None:
+        scope = self.connection.execute(
+            """SELECT campaign_id, target_id, target_session_id, lane_schedule_id
+               FROM merlin_storage.target_admission_latches
+               WHERE lane_attempt_id = %s""",
+            (attempt_id,),
+        ).fetchone()
+        if scope is not None:
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (scope["campaign_id"],),
+            ).fetchone()
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.scheduler_schedules
+                   WHERE id = %s FOR UPDATE""",
+                (scope["lane_schedule_id"],),
+            ).fetchone()
+            self.connection.execute(
+                """SELECT campaign_id FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s AND lane_attempt_id = %s
+                   FOR UPDATE""",
+                (
+                    scope["campaign_id"],
+                    scope["target_id"],
+                    scope["target_session_id"],
+                    attempt_id,
+                ),
+            ).fetchone()
+
+    def _commit_target_surface_transition_locked(
+        self,
+        schedule_id: str,
+        node_id: str,
+        value: Mapping[str, object],
+    ) -> None:
+        campaign_id = value.get("campaign_id")
+        session_id = value.get("session_id")
+        target_id = value.get("target_id")
+        assignment_id = value.get("source_task_id")
+        if not all(
+            isinstance(item, str) and item
+            for item in (campaign_id, session_id, target_id, assignment_id)
+        ):
+            raise ValueError("target surface transition identity is incomplete")
+        _campaign, assignment, _schedule = self._target_admission_scope_locked(
+            schedule_id,
+            node_id,
+            {
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "target_id": target_id,
+                "assignment_id": assignment_id,
+            },
+            require_admission_contract=False,
+        )
+        wave = self.connection.execute(
+            """SELECT wave FROM merlin_storage.campaign_waves
+               WHERE campaign_id = %s AND schedule_id = %s""",
+            (campaign_id, schedule_id),
+        ).fetchone()
+        if wave is None:
+            contract = self._target_admission_contract(assignment)
+            start_decision_id = contract.get("target_reobservation_start_decision_id")
+            if not isinstance(start_decision_id, str) or not start_decision_id:
+                raise ValueError("target transition schedule has no campaign wave authority")
+            wave = self.connection.execute(
+                """SELECT (payload->>'source_wave')::integer AS wave
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s AND decision_id = %s
+                     AND payload->>'kind' = 'target_reobservation_started'
+                     AND payload->>'schedule_id' = %s""",
+                (campaign_id, start_decision_id, schedule_id),
+            ).fetchone()
+        if wave is None or type(wave["wave"]) is not int:
+            raise ValueError("target transition schedule has no campaign wave authority")
+        keys = (
+            "kind",
+            "schema",
+            "campaign_id",
+            "session_id",
+            "target_id",
+            "target_session_id",
+            "obligation_id",
+            "event_digest",
+            "transition_digest",
+            "source_task_id",
+            "target_call_id",
+            "target_receipt_sha256",
+            "receipt_projection",
+            "target_ui_transition",
+        )
+        payload = {key: value.get(key) for key in keys}
+        payload.update(source_schedule_id=schedule_id, source_wave=int(wave["wave"]))
+        projected = project_target_reobservations(
+            ({"sequence": 1, "payload": payload},),
+            campaign_id=str(campaign_id),
+            session_id=str(session_id),
+            target_id=str(target_id),
+        )
+        if (
+            len(projected.pending) != 1
+            or projected.pending[0].event_digest != payload.get("event_digest")
+            or projected.pending[0].source_task_id != assignment_id
+        ):
+            raise ValueError("target surface transition observation is not canonical")
+        decision_id = "target-surface-transition-observed/" + str(
+            payload["event_digest"]
+        ).removeprefix("sha256:")
+        inserted = self._append_campaign_lead_event_locked(
+            str(campaign_id), int(wave["wave"]), decision_id, payload
+        )
+        target_session_id = payload.get("target_session_id")
+        if not isinstance(target_session_id, str) or not target_session_id:
+            raise ValueError("target transition session identity is missing")
+        existing_latch = self._target_admission_latch_locked(
+            str(campaign_id), str(target_id), target_session_id
+        )
+        if inserted or existing_latch is None:
+            self._latch_target_surface_transition_locked(
+                campaign_id=str(campaign_id),
+                session_id=str(session_id),
+                target_id=str(target_id),
+                target_session_id=target_session_id,
+                event_digest=str(payload["event_digest"]),
+            )
+
+    @_serialized
+    def final_target_effect_admitted(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        tool_name: str,
+        call_id: str,
+        target_admission: Mapping[str, object],
+        effect_intent: Mapping[str, object],
+    ) -> str:
+        """Fence one target call and atomically persist its exact effect intent."""
+
+        if not tool_name or not call_id or len(tool_name) > 256 or len(call_id) > 256:
+            raise ValueError("target effect identity is incomplete")
+        record = ToolEffectRecord.model_validate(effect_intent)
+        if (
+            record.state is not ToolEffectState.INTENT
+            or record.call_id != call_id
+            or record.tool_name != tool_name
+            or record.result_content is not None
+            or record.result_is_error is not None
+            or record.result_metadata
+            or record.reconciliation is not None
+            or record.created_at is not None
+            or record.updated_at is not None
+            or not record.idempotency_key
+            or len(record.idempotency_key) > 1024
+            or not record.effect
+            or len(record.effect) > 256
+            or not record.arguments_digest
+            or len(record.arguments_digest) > 1024
+        ):
+            raise ValueError("target effect intent is invalid")
+        arguments_payload = escape_nul(record.arguments_payload)
+        with self.connection.transaction():
+            raw_target_session_id = target_admission.get("target_session_id")
+            if (
+                not isinstance(raw_target_session_id, str)
+                or not raw_target_session_id
+                or len(raw_target_session_id) > 256
+                or raw_target_session_id != raw_target_session_id.strip()
+                or "\x00" in raw_target_session_id
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target effect requires an exact physical target session"
+                )
+            campaign, assignment, _schedule = self._target_admission_scope_locked(
+                schedule_id, node_id, target_admission
+            )
+            head = self._target_admission_latch_locked(
+                str(campaign["id"]), str(target_admission["target_id"]), None
+            )
+            session_latch = self._target_admission_latch_locked(
+                str(campaign["id"]),
+                str(target_admission["target_id"]),
+                raw_target_session_id,
+            )
+            aggregate_lane_matches = bool(
+                head is not None
+                and head.get("state") == "open"
+                and str(head.get("lane_attempt_id") or "") == attempt_id
+                and int(head.get("transition_count") or 0) == 0
+                and int(head.get("latched_session_count") or 0) == 0
+                and str(head.get("lane_schedule_id") or "") == schedule_id
+                and head.get("lane_node_id") == node_id
+                and head.get("lane_assignment_id") == assignment.get("id")
+                and head.get("lane_generation") == generation
+                and head.get("lane_recovery_required") is False
+            )
+            reusable_session_latch = bool(
+                session_latch is not None
+                and session_latch.get("session_id") == campaign["session_id"]
+                and session_latch.get("state") == "open"
+                and session_latch.get("lane_attempt_id") is None
+                and int(session_latch.get("transition_count") or 0) == 0
+                and int(session_latch.get("pending_event_count") or 0) == 0
+                and not session_latch.get("pending_event_digests")
+                and session_latch.get("generation_id") is None
+                and session_latch.get("authorized_schedule_id") is None
+                and session_latch.get("lane_recovery_required") is False
+            )
+            if aggregate_lane_matches and (session_latch is None or reusable_session_latch):
+                cleared = self.connection.execute(
+                    """UPDATE merlin_storage.target_admission_latches
+                       SET lane_schedule_id = NULL, lane_node_id = NULL,
+                           lane_assignment_id = NULL, lane_attempt_id = NULL,
+                           lane_generation = NULL, lane_recovery_required = false,
+                           lane_recovery_root_attempt_id = NULL,
+                           revision = revision + 1, updated_at = now()
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND target_session_id = '' AND lane_attempt_id = %s""",
+                    (campaign["id"], target_admission["target_id"], attempt_id),
+                )
+                if cleared.rowcount != 1:
+                    raise TargetAdmissionLatchedError(
+                        "physical target session binding lost its aggregate lane"
+                    )
+                if session_latch is None:
+                    session_latch = self._upsert_target_admission_latch_locked(
+                        campaign_id=str(campaign["id"]),
+                        session_id=str(campaign["session_id"]),
+                        target_id=str(target_admission["target_id"]),
+                        target_session_id=raw_target_session_id,
+                        values={
+                            "state": "open",
+                            "revision": 1,
+                            "lane_schedule_id": head["lane_schedule_id"],
+                            "lane_node_id": head["lane_node_id"],
+                            "lane_assignment_id": head["lane_assignment_id"],
+                            "lane_attempt_id": head["lane_attempt_id"],
+                            "lane_generation": head["lane_generation"],
+                            "lane_recovery_required": head["lane_recovery_required"],
+                            "lane_recovery_root_attempt_id": head["lane_recovery_root_attempt_id"],
+                        },
+                    )
+                else:
+                    rebound = self.connection.execute(
+                        """UPDATE merlin_storage.target_admission_latches
+                           SET lane_schedule_id = %s, lane_node_id = %s,
+                               lane_assignment_id = %s, lane_attempt_id = %s,
+                               lane_generation = %s,
+                               lane_recovery_required = false,
+                               lane_recovery_root_attempt_id = NULL,
+                               revision = revision + 1, updated_at = now()
+                           WHERE campaign_id = %s AND target_id = %s
+                             AND target_session_id = %s AND session_id = %s
+                             AND state = 'open' AND lane_attempt_id IS NULL
+                             AND transition_count = 0 AND pending_event_count = 0
+                             AND pending_event_digests = '{}'::text[]
+                             AND generation_id IS NULL
+                             AND authorized_schedule_id IS NULL
+                             AND lane_recovery_required = false
+                           RETURNING *""",
+                        (
+                            head["lane_schedule_id"],
+                            head["lane_node_id"],
+                            head["lane_assignment_id"],
+                            head["lane_attempt_id"],
+                            head["lane_generation"],
+                            campaign["id"],
+                            target_admission["target_id"],
+                            raw_target_session_id,
+                            campaign["session_id"],
+                        ),
+                    ).fetchone()
+                    if rebound is None:
+                        raise TargetAdmissionLatchedError(
+                            "physical target session binding changed during lane transfer"
+                        )
+                    session_latch = dict(rebound)
+            elif session_latch is None:
+                raise TargetAdmissionLatchedError(
+                    "physical target session does not match the durable target lane"
+                )
+            self._target_admission_allowed_locked(
+                schedule_id,
+                node_id,
+                target_admission,
+                current_attempt_id=attempt_id,
+                current_generation=generation,
+            )
+            tools = assignment.get("tool_ids")
+            admitted_effect_tools = target_admission.get("target_effect_tool_ids")
+            if (
+                not isinstance(tools, (list, tuple))
+                or tool_name not in tools
+                or not isinstance(admitted_effect_tools, (list, tuple))
+                or tool_name not in admitted_effect_tools
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target effect tool is outside the admitted assignment"
+                )
+            attempt = self._lock_attempt(attempt_id, generation)
+            if str(attempt["schedule_id"]) != schedule_id or attempt["node_id"] != node_id:
+                raise StaleLeaseError("target effect attempt does not own this assignment")
+            target_session_id = raw_target_session_id
+            if (
+                record.session_id != str(campaign["session_id"])
+                or record.agent_id != assignment.get("id")
+                or record.attempt_id != attempt_id
+                or record.campaign_id != campaign["id"]
+                or record.target_id != target_admission["target_id"]
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target effect intent does not match admitted authority"
+                )
+            permit_body = {
+                "schema": "merlin.target-effect-permit.v1",
+                "campaign_id": str(campaign["id"]),
+                "session_id": str(campaign["session_id"]),
+                "target_id": str(target_admission["target_id"]),
+                "target_session_id": target_session_id,
+                "schedule_id": schedule_id,
+                "node_id": node_id,
+                "assignment_id": str(assignment["id"]),
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "effect": record.effect,
+                "arguments_digest": record.arguments_digest,
+                "arguments_payload": arguments_payload,
+                "idempotency_key": record.idempotency_key,
+            }
+            permit_digest = _qualified_digest(permit_body)
+            existing_permits = self.connection.execute(
+                """SELECT permit_digest, campaign_id, session_id::text AS session_id,
+                          target_id, target_session_id, schedule_id::text AS schedule_id,
+                          node_id, assignment_id, attempt_id::text AS attempt_id,
+                          generation, call_id, tool_name, effect, arguments_digest,
+                          arguments_payload, idempotency_key, state
+                   FROM merlin_storage.target_effect_permits
+                   WHERE permit_digest = %s
+                      OR (attempt_id = %s AND call_id = %s AND tool_name = %s)
+                      OR idempotency_key = %s
+                   FOR UPDATE""",
+                (
+                    permit_digest,
+                    attempt_id,
+                    call_id,
+                    tool_name,
+                    record.idempotency_key,
+                ),
+            ).fetchall()
+            if existing_permits:
+                existing = existing_permits[0]
+                if (
+                    len(existing_permits) != 1
+                    or existing["permit_digest"] != permit_digest
+                    or any(
+                        existing[key] != value
+                        for key, value in permit_body.items()
+                        if key != "schema"
+                    )
+                ):
+                    raise ValueError("target effect permit identity conflicts")
+                return permit_digest
+            existing_effect = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.tool_effects
+                   WHERE idempotency_key = %s
+                      OR (session_id = %s
+                          AND coalesce(attempt_id::text, agent_id, 'legacy') = %s
+                          AND call_id = %s AND tool_name = %s)
+                   FOR UPDATE""",
+                (
+                    record.idempotency_key,
+                    record.session_id,
+                    attempt_id,
+                    record.call_id,
+                    record.tool_name,
+                ),
+            ).fetchall()
+            if existing_effect:
+                raise ValueError("target effect intent already exists without a permit")
+            self.connection.execute(
+                """INSERT INTO merlin_storage.tool_effects
+                       (idempotency_key, session_id, call_id, agent_id, attempt_id,
+                        campaign_id, target_id, tool_name, effect, arguments_digest,
+                        arguments_payload, state)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'intent')""",
+                (
+                    record.idempotency_key,
+                    record.session_id,
+                    record.call_id,
+                    record.agent_id,
+                    record.attempt_id,
+                    record.campaign_id,
+                    record.target_id,
+                    record.tool_name,
+                    record.effect,
+                    record.arguments_digest,
+                    Jsonb(arguments_payload) if arguments_payload is not None else None,
+                ),
+            )
+            self.connection.execute(
+                """INSERT INTO merlin_storage.target_effect_permits
+                       (permit_digest, campaign_id, session_id, target_id,
+                        target_session_id, schedule_id, node_id, assignment_id,
+                        attempt_id, generation, call_id, tool_name, effect,
+                        arguments_digest, arguments_payload, idempotency_key, state)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, 'intent')""",
+                (
+                    permit_digest,
+                    campaign["id"],
+                    campaign["session_id"],
+                    target_admission["target_id"],
+                    target_session_id,
+                    schedule_id,
+                    node_id,
+                    assignment["id"],
+                    attempt_id,
+                    generation,
+                    call_id,
+                    tool_name,
+                    record.effect,
+                    record.arguments_digest,
+                    Jsonb(arguments_payload) if arguments_payload is not None else None,
+                    record.idempotency_key,
+                ),
+            )
+            return permit_digest
+
+    @_serialized
+    def resolve_target_lane_recovery(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        target_admission: Mapping[str, object],
+        recovery: Mapping[str, object],
+    ) -> None:
+        """Unfence one exact replacement after daemon-owned effect adoption."""
+
+        body = {key: value for key, value in recovery.items() if key != "recovery_digest"}
+        effect_ids = recovery.get("effect_ids")
+        prior_attempt_id = recovery.get("prior_attempt_id")
+        if (
+            set(recovery)
+            != {
+                "schema",
+                "prior_attempt_id",
+                "effect_ids",
+                "outcome",
+                "recovery_digest",
+            }
+            or recovery.get("schema") != "merlin.target-lane-recovery.v1"
+            or recovery.get("outcome") != "no_material_transition"
+            or not isinstance(prior_attempt_id, str)
+            or not prior_attempt_id
+            or not isinstance(effect_ids, (list, tuple))
+            or len(effect_ids) > 256
+            or any(not isinstance(item, str) or not item for item in effect_ids)
+            or tuple(effect_ids) != tuple(sorted(set(effect_ids)))
+            or recovery.get("recovery_digest") != _qualified_digest(body)
+        ):
+            raise ValueError("target lane recovery receipt is invalid")
+        with self.connection.transaction():
+            campaign, assignment, _schedule = self._target_admission_scope_locked(
+                schedule_id, node_id, target_admission
+            )
+            target_session = target_admission.get("target_session_id")
+            target_session_id = str(target_session) if isinstance(target_session, str) else ""
+            latch = self._target_admission_latch_locked(
+                str(campaign["id"]),
+                str(target_admission["target_id"]),
+                target_session_id or None,
+            )
+            attempt = self._lock_attempt(attempt_id, generation)
+            replacement = self.connection.execute(
+                """SELECT replaced_attempt_id
+                   FROM merlin_storage.scheduler_attempts WHERE id = %s""",
+                (attempt_id,),
+            ).fetchone()
+            lineage = self.connection.execute(
+                """WITH RECURSIVE lineage AS (
+                       SELECT id, schedule_id, node_id, state, replaced_attempt_id, 1 AS depth
+                       FROM merlin_storage.scheduler_attempts WHERE id = %s
+                       UNION ALL
+                       SELECT prior.id, prior.schedule_id, prior.node_id, prior.state,
+                              prior.replaced_attempt_id, lineage.depth + 1
+                       FROM merlin_storage.scheduler_attempts AS prior
+                       JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                       WHERE lineage.depth < 256
+                   )
+                   SELECT * FROM lineage ORDER BY depth""",
+                (prior_attempt_id,),
+            ).fetchall()
+            lineage_ids = tuple(str(row["id"]) for row in lineage)
+            durable_effects = self.connection.execute(
+                """SELECT idempotency_key, state, session_id, agent_id,
+                          campaign_id, target_id, tool_name, result_is_error,
+                          result_metadata
+                   FROM merlin_storage.tool_effects
+                   WHERE attempt_id = ANY(%s) ORDER BY idempotency_key""",
+                (list(lineage_ids),),
+            ).fetchall()
+            permits = self.connection.execute(
+                """SELECT idempotency_key, state
+                   FROM merlin_storage.target_effect_permits
+                   WHERE attempt_id = ANY(%s) ORDER BY idempotency_key FOR UPDATE""",
+                (list(lineage_ids),),
+            ).fetchall()
+            permit_by_effect = {str(row["idempotency_key"]): str(row["state"]) for row in permits}
+            assignment_tools = set(assignment.get("tool_ids", ()))
+            passive_assignment = bool(
+                assignment.get("strategy_id") == "target-reobservation/v1"
+                and not assignment.get("technique_ids")
+                and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= assignment_tools
+                and assignment_tools <= _TARGET_REOBSERVATION_TOOLS
+            )
+
+            def safely_effect_free(row: Mapping[str, object]) -> bool:
+                metadata = row.get("result_metadata")
+                permit_state = permit_by_effect.get(str(row["idempotency_key"]))
+                revoked_before_dispatch = bool(
+                    permit_state == "revoked"
+                    and row.get("state") == "reconciled"
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("target_effect_dispatch_status") == "revoked_before_dispatch"
+                )
+                exact_passive = bool(
+                    permit_state in {None, "terminal"}
+                    and passive_assignment
+                    and row.get("tool_name") in _TARGET_REOBSERVATION_TOOLS
+                    and row.get("state") in {"acknowledged", "reconciled"}
+                    and isinstance(metadata, Mapping)
+                    and "target_ui_transition" not in metadata
+                )
+                strict_zero_effect = bool(
+                    permit_state in {None, "terminal"}
+                    and row.get("state") in {"acknowledged", "reconciled"}
+                    and row.get("result_is_error") is True
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("target_effect_attempted") is False
+                    and type(metadata.get("interaction_count")) is int
+                    and metadata.get("interaction_count") == 0
+                    and type(metadata.get("limit_interaction_count")) is int
+                    and metadata.get("limit_interaction_count") == 0
+                    and type(metadata.get("target_call_budget_charge")) is int
+                    and metadata.get("target_call_budget_charge") == 0
+                    and "target_ui_transition" not in metadata
+                    and (
+                        target_session_id == ""
+                        and isinstance(metadata.get("target_session_id"), str)
+                        and bool(str(metadata["target_session_id"]).strip())
+                        or target_session_id != ""
+                        and metadata.get("target_session_id") == target_session_id
+                    )
+                )
+                return revoked_before_dispatch or exact_passive or strict_zero_effect
+
+            if (
+                latch is None
+                or latch.get("lane_recovery_required") is not True
+                or str(latch.get("lane_attempt_id")) != attempt_id
+                or str(latch.get("lane_schedule_id")) != schedule_id
+                or latch.get("lane_node_id") != node_id
+                or latch.get("lane_assignment_id") != assignment.get("id")
+                or latch.get("lane_generation") != generation
+                or str(attempt["schedule_id"]) != schedule_id
+                or attempt["node_id"] != node_id
+                or replacement is None
+                or str(replacement["replaced_attempt_id"]) != prior_attempt_id
+                or not lineage
+                or len(lineage) >= 256
+                and lineage[-1]["replaced_attempt_id"] is not None
+                or lineage_ids[-1] != str(latch.get("lane_recovery_root_attempt_id"))
+                or any(
+                    str(item["schedule_id"]) != schedule_id
+                    or item["node_id"] != node_id
+                    or item["state"] != "expired"
+                    for item in lineage
+                )
+                or tuple(str(row["idempotency_key"]) for row in durable_effects)
+                != tuple(effect_ids)
+                or any(
+                    str(row["session_id"]) != str(campaign["session_id"])
+                    or row["agent_id"] != assignment.get("id")
+                    or row["campaign_id"] != campaign["id"]
+                    or row["target_id"] != target_admission["target_id"]
+                    or not safely_effect_free(row)
+                    for row in durable_effects
+                )
+                or any(
+                    str(row["state"]) not in {"terminal", "revoked"}
+                    or str(row["idempotency_key"])
+                    not in {str(effect["idempotency_key"]) for effect in durable_effects}
+                    for row in permits
+                )
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target lane recovery does not match durable replacement authority"
+                )
+            self.connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_recovery_required = false, revision = revision + 1,
+                       updated_at = now()
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s AND lane_attempt_id = %s
+                     AND lane_recovery_required = true""",
+                (
+                    campaign["id"],
+                    target_admission["target_id"],
+                    target_session_id,
+                    attempt_id,
+                ),
+            )
+            self._append_event(
+                schedule_id,
+                "target_lane_recovery_resolved",
+                {
+                    "node_id": node_id,
+                    "attempt_id": attempt_id,
+                    "generation": generation,
+                    "prior_attempt_id": prior_attempt_id,
+                    "recovery_digest": recovery["recovery_digest"],
+                },
+            )
+
+    @_serialized
+    def upgrade_legacy_target_admission(
+        self, campaign_id: str, session_id: str, target_id: str
+    ) -> dict[str, object]:
+        """Adopt bounded v1 observations only through exact durable effect authority."""
+
+        def result(
+            status: str,
+            *,
+            scanned: int,
+            upgraded: int,
+            unresolved: int,
+            overflow: bool = False,
+        ) -> dict[str, object]:
+            return {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": status,
+                "scanned_count": min(scanned, 256),
+                "upgraded_count": min(upgraded, 256),
+                "unresolved_count": min(unresolved, 256),
+                "overflow": overflow,
+            }
+
+        with self.connection.transaction():
+            campaign = self.connection.execute(
+                """SELECT session_id::text AS session_id, manifest
+                   FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (campaign_id,),
+            ).fetchone()
+            envelope = campaign["manifest"] if campaign is not None else None
+            reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+            target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+            if (
+                campaign is None
+                or campaign["session_id"] != session_id
+                or not isinstance(target, Mapping)
+                or target.get("id") != target_id
+            ):
+                raise TargetAdmissionLatchedError("legacy target admission scope is unavailable")
+            legacy_rows = tuple(
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT sequence, wave, decision_id, payload, payload_digest
+                       FROM merlin_storage.campaign_lead_journal
+                       WHERE campaign_id = %s
+                         AND payload->>'kind' = 'target_surface_transition_observed'
+                         AND payload->>'schema' =
+                             'merlin.target-surface-transition-observed.v1'
+                       ORDER BY sequence LIMIT 257 FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchall()
+            )
+            if not legacy_rows:
+                return result("clear", scanned=0, upgraded=0, unresolved=0)
+            head = self._target_admission_latch_locked(campaign_id, target_id, None)
+            if len(legacy_rows) > 256:
+                self._upsert_target_admission_latch_locked(
+                    campaign_id=campaign_id,
+                    session_id=session_id,
+                    target_id=target_id,
+                    target_session_id=None,
+                    values={
+                        **(head or {}),
+                        "state": "latched",
+                        "revision": int(head["revision"]) + 1 if head is not None else 1,
+                        "transition_count": max(
+                            int(head["transition_count"]) if head is not None else 0,
+                            257,
+                        ),
+                        "latched_session_count": max(
+                            int(head["latched_session_count"]) if head is not None else 0,
+                            1,
+                        ),
+                        "pending_event_digests": (),
+                        "pending_event_count": 0,
+                    },
+                )
+                return result(
+                    "blocked",
+                    scanned=256,
+                    upgraded=0,
+                    unresolved=256,
+                    overflow=True,
+                )
+
+            v2_rows = tuple(
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT sequence, wave, decision_id, payload, payload_digest
+                       FROM merlin_storage.campaign_lead_journal
+                       WHERE campaign_id = %s
+                         AND payload->>'kind' = 'target_surface_transition_observed'
+                         AND payload->>'schema' =
+                             'merlin.target-surface-transition-observed.v2'
+                       ORDER BY sequence LIMIT 257 FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchall()
+            )
+            if len(v2_rows) > 256:
+                return result(
+                    "blocked",
+                    scanned=len(legacy_rows),
+                    upgraded=0,
+                    unresolved=len(legacy_rows),
+                    overflow=True,
+                )
+            canonical_v2: dict[tuple[str, str, str, str, str], list[dict[str, object]]] = {}
+            for row in v2_rows:
+                payload = row.get("payload")
+                if not isinstance(payload, Mapping) or row.get(
+                    "payload_digest"
+                ) != _qualified_digest(dict(payload)):
+                    continue
+                projected = project_target_reobservations(
+                    ({"sequence": row["sequence"], "payload": payload},),
+                    campaign_id=campaign_id,
+                    session_id=session_id,
+                    target_id=target_id,
+                )
+                if len(projected.pending) != 1:
+                    continue
+                obligation = projected.pending[0]
+                if row.get("decision_id") != (
+                    "target-surface-transition-observed/"
+                    + obligation.event_digest.removeprefix("sha256:")
+                ):
+                    continue
+                key = (
+                    obligation.source_schedule_id,
+                    obligation.source_task_id,
+                    obligation.target_call_id,
+                    obligation.receipt_sha256,
+                    obligation.transition_digest,
+                )
+                canonical_v2.setdefault(key, []).append(dict(payload))
+
+            upgraded_count = 0
+            unresolved_count = 0
+            for row in legacy_rows:
+                payload = row.get("payload")
+                if not isinstance(payload, Mapping):
+                    unresolved_count += 1
+                    continue
+                source_schedule_id = payload.get("source_schedule_id")
+                source_task_id = payload.get("source_task_id")
+                target_call_id = payload.get("target_call_id")
+                receipt_sha256 = payload.get("target_receipt_sha256")
+                transition_digest = payload.get("transition_digest")
+                event_digest = payload.get("event_digest")
+                source_wave = payload.get("source_wave")
+                normalized = normalize_target_ui_transition(payload.get("target_ui_transition"))
+                legacy_body = json.dumps(
+                    dict(payload), sort_keys=True, separators=(",", ":")
+                ).encode()
+                expected_payload_digest = "sha256:" + sha256(legacy_body).hexdigest()
+                if (
+                    payload.get("campaign_id") != campaign_id
+                    or payload.get("session_id") != session_id
+                    or payload.get("target_id") != target_id
+                    or not all(
+                        isinstance(item, str) and item
+                        for item in (
+                            source_schedule_id,
+                            source_task_id,
+                            target_call_id,
+                            receipt_sha256,
+                            transition_digest,
+                            event_digest,
+                        )
+                    )
+                    or type(source_wave) is not int
+                    or re.fullmatch(r"[0-9a-f]{64}", str(receipt_sha256)) is None
+                    or normalized is None
+                    or normalized[1] != transition_digest
+                    or dict(normalized[0]) != dict(payload["target_ui_transition"])
+                    or event_digest
+                    != _qualified_digest(
+                        [
+                            campaign_id,
+                            source_task_id,
+                            target_call_id,
+                            receipt_sha256,
+                            transition_digest,
+                        ]
+                    )
+                    or payload.get("obligation_id")
+                    != "target-reobservation:" + str(event_digest).removeprefix("sha256:")
+                    or row.get("decision_id")
+                    != "target-surface-transition-observed/"
+                    + str(event_digest).removeprefix("sha256:")
+                    or row.get("payload_digest") != expected_payload_digest
+                    or payload.get("receipt_projection")
+                    not in {"target_evidence_receipts", "target_ui_transition_receipts"}
+                ):
+                    unresolved_count += 1
+                    continue
+                key = (
+                    str(source_schedule_id),
+                    str(source_task_id),
+                    str(target_call_id),
+                    str(receipt_sha256),
+                    str(transition_digest),
+                )
+                existing = canonical_v2.get(key, ())
+                if len(existing) > 1:
+                    unresolved_count += 1
+                    continue
+                canonical_payload: dict[str, object] | None = None
+                # A v2 journal row and latch are not sufficient upgrade authority:
+                # generic journal writes must never choose a physical session. Re-derive
+                # the unique durable witness on every v1 replay; the idempotent append
+                # below then proves any existing v2 payload is byte-identical.
+                if len(existing) <= 1:
+                    try:
+                        source_schedule_uuid = UUID(str(source_schedule_id))
+                    except ValueError:
+                        unresolved_count += 1
+                        continue
+                    if str(source_schedule_uuid) != source_schedule_id:
+                        unresolved_count += 1
+                        continue
+                    schedule = self.connection.execute(
+                        """SELECT session_id::text AS session_id, graph, graph_digest
+                           FROM merlin_storage.scheduler_schedules
+                           WHERE id = %s FOR UPDATE""",
+                        (source_schedule_uuid,),
+                    ).fetchone()
+                    wave = self.connection.execute(
+                        """SELECT wave FROM merlin_storage.campaign_waves
+                           WHERE campaign_id = %s AND schedule_id = %s FOR UPDATE""",
+                        (campaign_id, source_schedule_uuid),
+                    ).fetchone()
+                    assignments = (
+                        schedule["graph"].get("assignments")
+                        if schedule is not None and isinstance(schedule["graph"], Mapping)
+                        else None
+                    )
+                    assignment_matches = (
+                        tuple(
+                            item
+                            for item in assignments
+                            if isinstance(item, Mapping) and item.get("id") == source_task_id
+                        )
+                        if isinstance(assignments, list)
+                        else ()
+                    )
+                    if (
+                        schedule is None
+                        or schedule["session_id"] != session_id
+                        or schedule["graph_digest"] != _digest(schedule["graph"])
+                        or wave is None
+                        or wave["wave"] != source_wave
+                        or len(assignment_matches) != 1
+                        or assignment_matches[0].get("target_profile_id") != target_id
+                        or not isinstance(assignment_matches[0].get("tool_ids"), list)
+                    ):
+                        unresolved_count += 1
+                        continue
+                    assignment_tools = tuple(assignment_matches[0]["tool_ids"])
+                    result_rows = self.connection.execute(
+                        """SELECT result.attempt_id::text AS attempt_id,
+                                  result.payload, result.payload_digest,
+                                  attempt.state, attempt.target_session_id
+                           FROM merlin_storage.scheduler_results AS result
+                           JOIN merlin_storage.scheduler_attempts AS attempt
+                             ON attempt.id = result.attempt_id
+                           WHERE result.schedule_id = %s AND result.node_id = %s
+                           ORDER BY result.created_at LIMIT 257 FOR UPDATE OF attempt""",
+                        (source_schedule_uuid, f"worker:{source_task_id}"),
+                    ).fetchall()
+                    if len(result_rows) > 256:
+                        unresolved_count += 1
+                        continue
+                    witnesses: list[tuple[str, Mapping[str, object]]] = []
+                    for result_row in result_rows:
+                        result_payload = result_row["payload"]
+                        if (
+                            not isinstance(result_payload, Mapping)
+                            or result_row["payload_digest"] != _digest(result_payload)
+                            or result_row["state"] not in {"completed", "failed"}
+                        ):
+                            continue
+                        checkpoint = result_payload.get("worker_checkpoint")
+                        target_evidence = (
+                            checkpoint.get("target_evidence")
+                            if isinstance(checkpoint, Mapping)
+                            else None
+                        )
+                        if not isinstance(target_evidence, list) or len(target_evidence) > 256:
+                            continue
+                        lineage = self.connection.execute(
+                            """WITH RECURSIVE lineage AS (
+                                   SELECT id, schedule_id, node_id, replaced_attempt_id,
+                                          state, target_session_id, 0 AS depth
+                                   FROM merlin_storage.scheduler_attempts WHERE id = %s
+                                   UNION ALL
+                                   SELECT prior.id, prior.schedule_id, prior.node_id,
+                                          prior.replaced_attempt_id, prior.state,
+                                          prior.target_session_id, lineage.depth + 1
+                                   FROM merlin_storage.scheduler_attempts AS prior
+                                   JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                                   WHERE lineage.depth < 256
+                               )
+                               SELECT id::text AS id, schedule_id::text AS schedule_id,
+                                      node_id, replaced_attempt_id, state,
+                                      target_session_id, depth
+                               FROM lineage ORDER BY depth LIMIT 257""",
+                            (result_row["attempt_id"],),
+                        ).fetchall()
+                        if len(lineage) > 256 or any(
+                            item["schedule_id"] != str(source_schedule_id)
+                            or item["node_id"] != f"worker:{source_task_id}"
+                            for item in lineage
+                        ):
+                            continue
+                        lineage_by_id = {str(item["id"]): item for item in lineage}
+                        for receipt in target_evidence:
+                            if not isinstance(receipt, Mapping):
+                                continue
+                            receipt_attempt_id = receipt.get("attempt_id")
+                            receipt_tool = receipt.get("tool_name")
+                            receipt_transition = normalize_target_ui_transition(
+                                receipt.get("target_ui_transition")
+                            )
+                            receipt_body = {
+                                name: value
+                                for name, value in receipt.items()
+                                if name != "receipt_sha256"
+                            }
+                            receipt_session = receipt.get("target_session_id")
+                            if (
+                                receipt.get("receipt_sha256") != receipt_sha256
+                                or receipt.get("call_id") != target_call_id
+                                or receipt.get("reference") != f"target-call:{target_call_id}"
+                                or receipt.get("campaign_id") != campaign_id
+                                or receipt.get("assignment_id") != source_task_id
+                                or receipt.get("target_id") != target_id
+                                or not isinstance(receipt_attempt_id, str)
+                                or receipt_attempt_id not in lineage_by_id
+                                or not isinstance(receipt_tool, str)
+                                or not receipt_tool
+                                or receipt_tool not in assignment_tools
+                                or not isinstance(receipt_session, str)
+                                or not receipt_session.strip()
+                                or len(receipt_session) > 256
+                                or receipt_transition is None
+                                or receipt_transition[1] != transition_digest
+                                or dict(receipt_transition[0]) != dict(normalized[0])
+                                or _qualified_digest(receipt_body).removeprefix("sha256:")
+                                != receipt_sha256
+                                or (
+                                    receipt.get("session_id") is not None
+                                    and receipt.get("session_id") != session_id
+                                )
+                                or (
+                                    payload.get("receipt_projection") == "target_evidence_receipts"
+                                    and (
+                                        receipt.get("is_error") is not False
+                                        or receipt.get("acknowledged") is not True
+                                    )
+                                )
+                                or (
+                                    payload.get("receipt_projection")
+                                    == "target_ui_transition_receipts"
+                                    and receipt.get("is_error") is not True
+                                )
+                            ):
+                                continue
+                            effects = self.connection.execute(
+                                """SELECT session_id::text AS session_id, agent_id,
+                                          attempt_id::text AS attempt_id,
+                                          campaign_id, target_id, call_id, tool_name,
+                                          effect, arguments_payload, state,
+                                          result_content, result_is_error, result_metadata
+                                   FROM merlin_storage.tool_effects
+                                   WHERE attempt_id = %s AND call_id = %s
+                                     AND tool_name = %s
+                                   ORDER BY updated_at LIMIT 2 FOR UPDATE""",
+                                (receipt_attempt_id, target_call_id, receipt_tool),
+                            ).fetchall()
+                            if len(effects) != 1:
+                                continue
+                            effect = effects[0]
+                            metadata = effect["result_metadata"]
+                            effect_transition = (
+                                normalize_target_ui_transition(metadata.get("target_ui_transition"))
+                                if isinstance(metadata, Mapping)
+                                else None
+                            )
+                            arguments = effect["arguments_payload"]
+                            if not isinstance(arguments, Mapping):
+                                continue
+                            request_body = json.dumps(
+                                {"name": receipt_tool, "arguments": arguments},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode()
+                            effect_session = (
+                                metadata.get("target_session_id")
+                                if isinstance(metadata, Mapping)
+                                else None
+                            )
+                            receipt_attempt = lineage_by_id[receipt_attempt_id]
+                            if (
+                                effect["session_id"] != session_id
+                                or effect["agent_id"] != source_task_id
+                                or effect["attempt_id"] != receipt_attempt_id
+                                or effect["campaign_id"] != campaign_id
+                                or effect["target_id"] != target_id
+                                or effect["call_id"] != target_call_id
+                                or effect["tool_name"] != receipt_tool
+                                or effect["effect"] != "target_network"
+                                or effect["state"] not in {"acknowledged", "reconciled"}
+                                or effect["result_is_error"] != receipt.get("is_error")
+                                or not isinstance(effect["result_content"], str)
+                                or not isinstance(metadata, Mapping)
+                                or effect_session != receipt_session
+                                or effect_transition is None
+                                or effect_transition[1] != transition_digest
+                                or dict(effect_transition[0]) != dict(normalized[0])
+                                or receipt_attempt["state"] == "running"
+                                or receipt_attempt["target_session_id"] != receipt_session
+                                or result_row["target_session_id"] != receipt_session
+                                or result_payload.get("target_session_id") != receipt_session
+                                or receipt.get("request_sha256") != sha256(request_body).hexdigest()
+                                or receipt.get("content_sha256")
+                                != sha256(effect["result_content"].encode()).hexdigest()
+                                or receipt.get("metadata_sha256")
+                                != _qualified_digest(dict(metadata)).removeprefix("sha256:")
+                            ):
+                                continue
+                            witnesses.append((receipt_session, receipt))
+                    if len(witnesses) != 1:
+                        unresolved_count += 1
+                        continue
+                    physical_session_id, _receipt = witnesses[0]
+                    canonical_transition = dict(normalized[0])
+                    new_event_digest = _qualified_digest(
+                        [
+                            campaign_id,
+                            physical_session_id,
+                            source_task_id,
+                            target_call_id,
+                            receipt_sha256,
+                            transition_digest,
+                        ]
+                    )
+                    canonical_payload = {
+                        "kind": "target_surface_transition_observed",
+                        "schema": "merlin.target-surface-transition-observed.v2",
+                        "campaign_id": campaign_id,
+                        "session_id": session_id,
+                        "target_id": target_id,
+                        "target_session_id": physical_session_id,
+                        "obligation_id": "target-reobservation:"
+                        + new_event_digest.removeprefix("sha256:"),
+                        "event_digest": new_event_digest,
+                        "transition_digest": transition_digest,
+                        "source_schedule_id": source_schedule_id,
+                        "source_wave": source_wave,
+                        "source_task_id": source_task_id,
+                        "target_call_id": target_call_id,
+                        "target_receipt_sha256": receipt_sha256,
+                        "receipt_projection": payload["receipt_projection"],
+                        "target_ui_transition": canonical_transition,
+                    }
+                    decision_id = (
+                        "target-surface-transition-observed/"
+                        + new_event_digest.removeprefix("sha256:")
+                    )
+                    inserted = self._append_campaign_lead_event_locked(
+                        campaign_id, source_wave, decision_id, canonical_payload
+                    )
+                    if inserted:
+                        upgraded_count += 1
+                    canonical_v2.setdefault(key, []).append(canonical_payload)
+                if canonical_payload is None:
+                    unresolved_count += 1
+                    continue
+                physical_session_id = canonical_payload.get("target_session_id")
+                canonical_event_digest = canonical_payload.get("event_digest")
+                if (
+                    not isinstance(physical_session_id, str)
+                    or not physical_session_id
+                    or not isinstance(canonical_event_digest, str)
+                ):
+                    unresolved_count += 1
+                    continue
+                latch = self._target_admission_latch_locked(
+                    campaign_id, target_id, physical_session_id
+                )
+                pending = (
+                    tuple(str(item) for item in latch["pending_event_digests"])
+                    if latch is not None
+                    else ()
+                )
+                if canonical_event_digest not in pending:
+                    self._latch_target_surface_transition_locked(
+                        campaign_id=campaign_id,
+                        session_id=session_id,
+                        target_id=target_id,
+                        target_session_id=physical_session_id,
+                        event_digest=canonical_event_digest,
+                    )
+
+            child_rows = self.connection.execute(
+                """SELECT state, transition_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id <> '' FOR UPDATE""",
+                (campaign_id, target_id),
+            ).fetchall()
+            head = self._target_admission_latch_locked(campaign_id, target_id, None)
+            latched_children = sum(row["state"] in {"latched", "overflow"} for row in child_rows)
+            latched_session_count = latched_children + (1 if unresolved_count else 0)
+            transition_count = sum(int(row["transition_count"]) for row in child_rows)
+            transition_count += unresolved_count
+            self._upsert_target_admission_latch_locked(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                target_id=target_id,
+                target_session_id=None,
+                values={
+                    **(head or {}),
+                    "state": "latched" if latched_session_count else "open",
+                    "revision": int(head["revision"]) + 1 if head is not None else 1,
+                    "transition_count": transition_count,
+                    "latched_session_count": latched_session_count,
+                    "pending_event_digests": (),
+                    "pending_event_count": 0,
+                },
+            )
+            status = "blocked" if unresolved_count else "upgraded" if upgraded_count else "clear"
+            return result(
+                status,
+                scanned=len(legacy_rows),
+                upgraded=upgraded_count,
+                unresolved=unresolved_count,
+            )
+
+    @_serialized
+    def current_target_admission_latches(
+        self, campaign_id: str, session_id: str, target_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Return the bounded current physical-session barrier, never journal history."""
+
+        campaign = self.connection.execute(
+            """SELECT session_id::text AS session_id, manifest
+               FROM merlin_storage.assessment_campaigns WHERE id = %s""",
+            (campaign_id,),
+        ).fetchone()
+        envelope = campaign["manifest"] if campaign is not None else None
+        reviewed = envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+        target = reviewed.get("target") if isinstance(reviewed, Mapping) else None
+        if (
+            campaign is None
+            or campaign["session_id"] != session_id
+            or not isinstance(target, Mapping)
+            or target.get("id") != target_id
+        ):
+            raise TargetAdmissionLatchedError("target admission scope is unavailable")
+        rows = self.connection.execute(
+            """SELECT target_session_id, state, revision, pending_event_digests,
+                      pending_event_count, event_set_digest, generation_id,
+                      settlement_id, lead_decision_id,
+                      authorized_schedule_id::text AS authorized_schedule_id
+               FROM merlin_storage.target_admission_latches
+               WHERE campaign_id = %s AND target_id = %s AND target_session_id <> ''
+                 AND state IN ('latched', 'overflow', 'activated')
+               ORDER BY target_session_id LIMIT 257""",
+            (campaign_id, target_id),
+        ).fetchall()
+        head = self.connection.execute(
+            """SELECT latched_session_count FROM merlin_storage.target_admission_latches
+               WHERE campaign_id = %s AND target_id = %s AND target_session_id = ''""",
+            (campaign_id, target_id),
+        ).fetchone()
+        if (
+            len(rows) > 256
+            or any(row["state"] == "overflow" for row in rows)
+            or head is None
+            or sum(row["state"] == "activated" for row in rows) > 1
+            or int(head["latched_session_count"]) != sum(row["state"] == "latched" for row in rows)
+        ):
+            raise TargetAdmissionLatchedError(
+                "target admission current session barrier is unbounded or inconsistent"
+            )
+        return tuple(
+            {
+                **dict(row),
+                "pending_event_digests": tuple(row["pending_event_digests"]),
+            }
+            for row in rows
+        )
+
+    @_serialized
+    def activate_target_admission(self, value: Mapping[str, object]) -> str:
+        """Authorize only a newly persisted schedule rebound to a reviewed generation."""
+
+        required = (
+            "campaign_id",
+            "session_id",
+            "target_id",
+            "target_session_id",
+            "claim_id",
+            "claimant_id",
+            "generation_id",
+            "event_set_digest",
+            "settlement_id",
+            "lead_decision_id",
+            "schedule_id",
+            "current_surface_digest",
+            "compiled_adapter_digest",
+            "reviewed_adapter_digest",
+        )
+        if any(not isinstance(value.get(key), str) or not str(value[key]) for key in required):
+            raise ValueError("target admission activation is incomplete")
+        latch_revision = value.get("latch_revision")
+        if type(latch_revision) is not int or latch_revision < 1:
+            raise ValueError("target admission activation latch revision is invalid")
+        raw_assignment_tools = value.get("target_assignment_tools")
+        if (
+            not isinstance(raw_assignment_tools, Mapping)
+            or not raw_assignment_tools
+            or len(raw_assignment_tools) > 256
+        ):
+            raise ValueError("target admission activation lacks bounded target assignments")
+        target_assignment_tools: dict[str, tuple[str, ...]] = {}
+        for raw_assignment_id, raw_tools in raw_assignment_tools.items():
+            if (
+                not isinstance(raw_assignment_id, str)
+                or not raw_assignment_id
+                or len(raw_assignment_id) > 512
+                or not isinstance(raw_tools, (list, tuple))
+                or not raw_tools
+                or len(raw_tools) > 64
+                or any(
+                    not isinstance(tool_id, str) or not tool_id or len(tool_id) > 256
+                    for tool_id in raw_tools
+                )
+                or tuple(raw_tools) != tuple(sorted(set(raw_tools)))
+            ):
+                raise ValueError("target admission activation assignment tools are invalid")
+            target_assignment_tools[raw_assignment_id] = tuple(raw_tools)
+        raw_superseded = value.get("superseded_generations", ())
+        if not isinstance(raw_superseded, (list, tuple)) or len(raw_superseded) > 256:
+            raise ValueError("target admission superseded generations are unbounded")
+        superseded_generations: list[dict[str, object]] = []
+        superseded_keys = {
+            "target_session_id",
+            "generation_id",
+            "event_set_digest",
+            "settlement_id",
+            "lead_decision_id",
+            "latch_revision",
+        }
+        for raw_generation in raw_superseded:
+            if not isinstance(raw_generation, Mapping) or set(raw_generation) != superseded_keys:
+                raise ValueError("target admission superseded generation is invalid")
+            generation = {key: raw_generation.get(key) for key in superseded_keys}
+            target_session_id = generation["target_session_id"]
+            generation_id = generation["generation_id"]
+            event_set_digest = generation["event_set_digest"]
+            settlement_id = generation["settlement_id"]
+            lead_decision_id = generation["lead_decision_id"]
+            sibling_revision = generation["latch_revision"]
+            if (
+                not isinstance(target_session_id, str)
+                or not 0 < len(target_session_id) <= 256
+                or target_session_id == value["target_session_id"]
+                or not isinstance(generation_id, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", generation_id) is None
+                or not isinstance(event_set_digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", event_set_digest) is None
+                or settlement_id
+                != "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+                or not isinstance(lead_decision_id, str)
+                or re.fullmatch(r"lead-decision:[0-9a-f]{64}", lead_decision_id) is None
+                or type(sibling_revision) is not int
+                or sibling_revision < 1
+            ):
+                raise ValueError("target admission superseded generation is invalid")
+            superseded_generations.append({key: generation[key] for key in sorted(superseded_keys)})
+        if tuple(item["target_session_id"] for item in superseded_generations) != tuple(
+            sorted({item["target_session_id"] for item in superseded_generations})
+        ):
+            raise ValueError("target admission superseded generations are not canonical")
+        wave_number = value.get("wave")
+        wave_kind = value.get("kind")
+        source_schedule_id = value.get("source_schedule_id")
+        frontier_batch_id = value.get("frontier_batch_id")
+        if (
+            type(wave_number) is not int
+            or wave_number < 0
+            or wave_kind
+            not in {
+                "initial",
+                "followup",
+                "frontier",
+                "objective_prerequisite",
+                "validation",
+                "reproduction",
+                "review",
+                "remediation",
+                "operator-continuation",
+            }
+            or source_schedule_id is not None
+            and (not isinstance(source_schedule_id, str) or not source_schedule_id)
+            or frontier_batch_id is not None
+            and (not isinstance(frontier_batch_id, str) or not frontier_batch_id)
+        ):
+            raise ValueError("target admission activation wave identity is invalid")
+        campaign_id = str(value["campaign_id"])
+        schedule_id = str(value["schedule_id"])
+        with self.connection.transaction():
+            # Canonical cross-store order: campaign -> frontier lease ->
+            # campaign wave/batch -> scheduler schedule -> target latch/attempt/effect.
+            campaign = self.connection.execute(
+                """SELECT id, session_id, manifest, status
+                   FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (campaign_id,),
+            ).fetchone()
+            transition_lease = self.connection.execute(
+                """SELECT claim_id::text AS claim_id, claimant_id
+                   FROM merlin_storage.campaign_frontier_transition_leases
+                   WHERE campaign_id = %s AND claim_id = %s AND claimant_id = %s
+                     AND expires_at > now()
+                   FOR UPDATE""",
+                (campaign_id, value["claim_id"], value["claimant_id"]),
+            ).fetchone()
+            wave = self.connection.execute(
+                """SELECT wave, kind, schedule_id, status
+                   FROM merlin_storage.campaign_waves
+                   WHERE campaign_id = %s AND wave = %s FOR UPDATE""",
+                (campaign_id, wave_number),
+            ).fetchone()
+            latest_wave = self.connection.execute(
+                """SELECT max(wave) AS wave FROM merlin_storage.campaign_waves
+                   WHERE campaign_id = %s""",
+                (campaign_id,),
+            ).fetchone()
+            batch = None
+            if frontier_batch_id is not None:
+                batch = self.connection.execute(
+                    """SELECT state, schedule_id, wave
+                       FROM merlin_storage.campaign_frontier_batches
+                       WHERE campaign_id = %s AND id = %s FOR UPDATE""",
+                    (campaign_id, frontier_batch_id),
+                ).fetchone()
+            schedule = self.connection.execute(
+                """SELECT id, session_id, graph, status
+                   FROM merlin_storage.scheduler_schedules WHERE id = %s FOR UPDATE""",
+                (schedule_id,),
+            ).fetchone()
+            if (
+                campaign is None
+                or campaign["status"] != "executing"
+                or transition_lease is None
+                or schedule is None
+                or schedule["status"] not in {"paused", "running"}
+                or wave is None
+                or latest_wave is None
+                or latest_wave["wave"] != wave_number
+                or wave["kind"] != wave_kind
+                or str(campaign["session_id"]) != value["session_id"]
+                or str(schedule["session_id"]) != value["session_id"]
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission activation lacks a paused campaign wave"
+                )
+            current_wave_schedule = str(wave["schedule_id"])
+            if source_schedule_id is None:
+                if current_wave_schedule != schedule_id:
+                    raise TargetAdmissionLatchedError(
+                        "target admission activation does not match the current campaign wave"
+                    )
+            else:
+                if source_schedule_id == schedule_id or current_wave_schedule not in {
+                    source_schedule_id,
+                    schedule_id,
+                }:
+                    raise TargetAdmissionLatchedError(
+                        "target admission replacement conflicts with the campaign wave"
+                    )
+                source_schedule = self.connection.execute(
+                    """SELECT status FROM merlin_storage.scheduler_schedules
+                       WHERE id = %s FOR UPDATE""",
+                    (source_schedule_id,),
+                ).fetchone()
+                if source_schedule is None or source_schedule["status"] not in {
+                    "paused",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    raise TargetAdmissionLatchedError(
+                        "target admission replacement source is not durably held"
+                    )
+                if current_wave_schedule == source_schedule_id:
+                    self.connection.execute(
+                        """UPDATE merlin_storage.campaign_waves
+                           SET schedule_id = %s, status = 'running', summary = '{}'::jsonb,
+                               updated_at = now()
+                           WHERE campaign_id = %s AND wave = %s AND schedule_id = %s""",
+                        (schedule_id, campaign_id, wave_number, source_schedule_id),
+                    )
+            if frontier_batch_id is not None:
+                if (
+                    batch is None
+                    or batch["state"] != "scheduled"
+                    or batch["wave"] != wave_number
+                    or str(batch["schedule_id"]) not in {schedule_id, str(source_schedule_id)}
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "target admission replacement frontier authority changed"
+                    )
+                if str(batch["schedule_id"]) != schedule_id:
+                    self.connection.execute(
+                        """UPDATE merlin_storage.campaign_frontier_batches
+                           SET schedule_id = %s, updated_at = now()
+                           WHERE campaign_id = %s AND id = %s AND schedule_id = %s""",
+                        (
+                            schedule_id,
+                            campaign_id,
+                            frontier_batch_id,
+                            source_schedule_id,
+                        ),
+                    )
+            elif source_schedule_id is not None:
+                dangling_batch = self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.campaign_frontier_batches
+                       WHERE campaign_id = %s AND schedule_id = %s LIMIT 1""",
+                    (campaign_id, source_schedule_id),
+                ).fetchone()
+                if dangling_batch is not None:
+                    raise TargetAdmissionLatchedError(
+                        "target admission replacement omitted frontier authority"
+                    )
+            envelope = campaign["manifest"]
+            reviewed_manifest = (
+                envelope.get("manifest", envelope) if isinstance(envelope, Mapping) else None
+            )
+            target = (
+                reviewed_manifest.get("target") if isinstance(reviewed_manifest, Mapping) else None
+            )
+            head = self._target_admission_latch_locked(campaign_id, str(value["target_id"]), None)
+            current_latches = tuple(
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT * FROM merlin_storage.target_admission_latches
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND target_session_id <> ''
+                         AND (target_session_id = %s OR state IN ('latched', 'overflow')
+                              OR target_session_id = ANY(%s))
+                       ORDER BY target_session_id LIMIT 258 FOR UPDATE""",
+                    (
+                        campaign_id,
+                        value["target_id"],
+                        value["target_session_id"],
+                        [item["target_session_id"] for item in superseded_generations],
+                    ),
+                ).fetchall()
+            )
+            if len(current_latches) > 257:
+                raise TargetAdmissionLatchedError(
+                    "target admission physical-session barrier is unbounded"
+                )
+            latch = next(
+                (
+                    row
+                    for row in current_latches
+                    if row["target_session_id"] == value["target_session_id"]
+                ),
+                None,
+            )
+            sibling_latches = tuple(
+                row
+                for row in current_latches
+                if row["target_session_id"] != value["target_session_id"]
+                and row["state"] in {"latched", "overflow", "activated"}
+            )
+            initial_authority = self._exact_lead_rows_locked(
+                campaign_id,
+                (str(value["settlement_id"]), str(value["lead_decision_id"])),
+            )
+            settlement_row = next(
+                (row for row in initial_authority if row["decision_id"] == value["settlement_id"]),
+                None,
+            )
+            settlement_payload = settlement_row["payload"] if settlement_row is not None else None
+            attempt = (
+                settlement_payload.get("attempt")
+                if isinstance(settlement_payload, Mapping)
+                else None
+            )
+            start_decision_id = (
+                "target-reobservation-started/"
+                + str(value["generation_id"]).removeprefix("sha256:")
+                + f"/{attempt}"
+                if type(attempt) is int and attempt > 0
+                else ""
+            )
+            if (
+                latch is None
+                or latch["state"] not in {"latched", "activated"}
+                or latch["state"] == "latched"
+                and latch["revision"] != latch_revision
+                or latch["state"] == "activated"
+                and latch["revision"] not in {latch_revision, latch_revision + 1}
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission has no current latched generation"
+                )
+            projection = self._bounded_target_reobservation_projection_locked(
+                latch,
+                start_decision_id=start_decision_id,
+                settlement_id=str(value["settlement_id"]),
+                lead_decision_id=str(value["lead_decision_id"]),
+            )
+            generation = projection.generations.get(str(value["generation_id"]))
+            settlement = projection.refreshed.get(str(value["generation_id"]))
+            event_digests = generation.event_digests if generation is not None else ()
+            canonical_event_set_digest = (
+                _qualified_digest({"event_digests": event_digests}) if event_digests else None
+            )
+            if latch["event_set_digest"] is None and canonical_event_set_digest is not None:
+                self.connection.execute(
+                    """UPDATE merlin_storage.target_admission_latches
+                       SET event_set_digest = %s, revision = revision + 1,
+                           updated_at = now()
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND target_session_id = %s AND event_set_digest IS NULL""",
+                    (
+                        canonical_event_set_digest,
+                        campaign_id,
+                        value["target_id"],
+                        value["target_session_id"],
+                    ),
+                )
+                latch = {**latch, "event_set_digest": canonical_event_set_digest}
+            observed_rows = (
+                self._exact_lead_rows_locked(
+                    campaign_id,
+                    tuple(
+                        "target-surface-transition-observed/" + event.removeprefix("sha256:")
+                        for event in event_digests
+                    ),
+                )
+                if event_digests
+                else ()
+            )
+            source_schedules = {
+                str(row["payload"].get("source_schedule_id"))
+                for row in observed_rows
+                if isinstance(row.get("payload"), Mapping)
+            }
+            if (
+                not isinstance(target, Mapping)
+                or target.get("id") != value["target_id"]
+                or generation is None
+                or generation.target_session_id != value["target_session_id"]
+                or settlement is None
+                or settlement.get("settlement_id") != value["settlement_id"]
+                or settlement.get("current_surface_digest") != value["current_surface_digest"]
+                or settlement.get("compiled_adapter_digest") != value["compiled_adapter_digest"]
+                or settlement.get("reviewed_adapter_digest") != value["reviewed_adapter_digest"]
+                or projection.reviewed.get(generation.generation_id) != value["lead_decision_id"]
+                or canonical_event_set_digest != value["event_set_digest"]
+                or tuple(latch["pending_event_digests"]) != event_digests
+                or latch["event_set_digest"] != value["event_set_digest"]
+                or latch["lane_attempt_id"] is not None
+                or schedule_id in source_schedules
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission activation does not match reviewed refresh authority"
+                )
+            candidate_by_session = {
+                str(item["target_session_id"]): item for item in superseded_generations
+            }
+            sibling_by_session = {str(item["target_session_id"]): item for item in sibling_latches}
+            exact_activation_replay = bool(
+                latch["state"] == "activated"
+                and str(latch.get("authorized_schedule_id")) == schedule_id
+            )
+            if head is None or (
+                not exact_activation_replay
+                and set(candidate_by_session) != set(sibling_by_session)
+                or exact_activation_replay
+                and sibling_by_session
+                or latch["state"] == "activated"
+                and not exact_activation_replay
+                and any(item["state"] in {"latched", "overflow"} for item in sibling_latches)
+                or int(head["latched_session_count"])
+                != (1 if latch["state"] == "latched" else 0)
+                + sum(item["state"] in {"latched", "overflow"} for item in sibling_latches)
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission sibling-session barrier changed"
+                )
+            validated_siblings: list[tuple[dict[str, Any], dict[str, object], str]] = []
+            for sibling_session_id, candidate in candidate_by_session.items():
+                sibling = next(
+                    (
+                        row
+                        for row in current_latches
+                        if row["target_session_id"] == sibling_session_id
+                    ),
+                    None,
+                )
+                if sibling is None or sibling["lane_attempt_id"] is not None:
+                    raise TargetAdmissionLatchedError(
+                        "target admission sibling session is not quiescent"
+                    )
+                if exact_activation_replay:
+                    if (
+                        sibling["state"] != "resolved"
+                        or sibling["revision"] != candidate["latch_revision"] + 1
+                        or sibling["generation_id"] != candidate["generation_id"]
+                        or sibling["event_set_digest"] != candidate["event_set_digest"]
+                        or sibling["settlement_id"] != candidate["settlement_id"]
+                        or sibling["lead_decision_id"] != candidate["lead_decision_id"]
+                    ):
+                        raise TargetAdmissionLatchedError(
+                            "target admission sibling replay authority changed"
+                        )
+                    continue
+                if sibling["state"] == "activated":
+                    prior_sibling_schedule = self.connection.execute(
+                        """SELECT status FROM merlin_storage.scheduler_schedules
+                           WHERE id = %s FOR UPDATE""",
+                        (sibling["authorized_schedule_id"],),
+                    ).fetchone()
+                    if (
+                        sibling["revision"] != candidate["latch_revision"]
+                        or sibling["generation_id"] != candidate["generation_id"]
+                        or sibling["event_set_digest"] != candidate["event_set_digest"]
+                        or sibling["settlement_id"] != candidate["settlement_id"]
+                        or sibling["lead_decision_id"] != candidate["lead_decision_id"]
+                        or prior_sibling_schedule is None
+                        or prior_sibling_schedule["status"]
+                        not in {"completed", "cancelled", "failed"}
+                    ):
+                        raise TargetAdmissionLatchedError(
+                            "target admission activated sibling is not terminal"
+                        )
+                    validated_siblings.append(
+                        (sibling, candidate, str(sibling["start_decision_id"]))
+                    )
+                    continue
+                sibling_events = tuple(sibling["pending_event_digests"])
+                sibling_event_set = _qualified_digest({"event_digests": sibling_events})
+                if sibling["event_set_digest"] is None and sibling_events:
+                    self.connection.execute(
+                        """UPDATE merlin_storage.target_admission_latches
+                           SET event_set_digest = %s, revision = revision + 1,
+                               updated_at = now()
+                           WHERE campaign_id = %s AND target_id = %s
+                             AND target_session_id = %s AND event_set_digest IS NULL""",
+                        (
+                            sibling_event_set,
+                            campaign_id,
+                            value["target_id"],
+                            sibling_session_id,
+                        ),
+                    )
+                    sibling = {**sibling, "event_set_digest": sibling_event_set}
+                sibling_authority = self._exact_lead_rows_locked(
+                    campaign_id,
+                    (
+                        str(candidate["settlement_id"]),
+                        str(candidate["lead_decision_id"]),
+                    ),
+                )
+                sibling_settlement_row = next(
+                    (
+                        row
+                        for row in sibling_authority
+                        if row["decision_id"] == candidate["settlement_id"]
+                    ),
+                    None,
+                )
+                sibling_payload = (
+                    sibling_settlement_row["payload"]
+                    if sibling_settlement_row is not None
+                    else None
+                )
+                sibling_attempt = (
+                    sibling_payload.get("attempt") if isinstance(sibling_payload, Mapping) else None
+                )
+                sibling_start_id = (
+                    "target-reobservation-started/"
+                    + str(candidate["generation_id"]).removeprefix("sha256:")
+                    + f"/{sibling_attempt}"
+                    if type(sibling_attempt) is int and sibling_attempt > 0
+                    else ""
+                )
+                sibling_projection = self._bounded_target_reobservation_projection_locked(
+                    sibling,
+                    start_decision_id=sibling_start_id,
+                    settlement_id=str(candidate["settlement_id"]),
+                    lead_decision_id=str(candidate["lead_decision_id"]),
+                )
+                sibling_generation = sibling_projection.generations.get(
+                    str(candidate["generation_id"])
+                )
+                sibling_settlement = sibling_projection.refreshed.get(
+                    str(candidate["generation_id"])
+                )
+                if (
+                    sibling["state"] != "latched"
+                    or sibling["revision"] != candidate["latch_revision"]
+                    or sibling["pending_event_count"] != len(sibling_events)
+                    or not sibling_events
+                    or sibling_generation is None
+                    or sibling_generation.target_session_id != sibling_session_id
+                    or sibling_generation.event_digests != sibling_events
+                    or sibling_event_set != candidate["event_set_digest"]
+                    or sibling["event_set_digest"] != candidate["event_set_digest"]
+                    or sibling_settlement is None
+                    or sibling_settlement.get("settlement_id") != candidate["settlement_id"]
+                    or sibling_settlement.get("event_set_digest") != candidate["event_set_digest"]
+                    or sibling_projection.reviewed.get(str(candidate["generation_id"]))
+                    != candidate["lead_decision_id"]
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "target admission sibling refresh authority changed"
+                    )
+                validated_siblings.append((sibling, candidate, sibling_start_id))
+            contexts = schedule["graph"].get("worker_contexts", {})
+            bindings: list[dict[str, object]] = []
+            for assignment in schedule["graph"].get("assignments", ()):
+                if not isinstance(assignment, Mapping):
+                    continue
+                assignment_id = assignment.get("id")
+                if assignment_id not in target_assignment_tools:
+                    continue
+                assignment_tools = assignment.get("tool_ids")
+                context = contexts.get(str(assignment.get("id")))
+                contract = self._target_admission_contract(assignment)
+                context_contract = (
+                    self._target_admission_contract(context) if isinstance(context, Mapping) else {}
+                )
+                context_target = context.get("target") if isinstance(context, Mapping) else None
+                context_values = (
+                    {
+                        key: context.get(key)
+                        for key in (
+                            "assignment_id",
+                            "profile",
+                            "guidance",
+                            "skills",
+                            "tool_ids",
+                            "target",
+                            "authority_ids",
+                            "strategy_id",
+                            "strategy_contract",
+                        )
+                    }
+                    if isinstance(context, Mapping)
+                    else {}
+                )
+                if (
+                    assignment.get("target_profile_id") != value["target_id"]
+                    or not isinstance(assignment_tools, (list, tuple))
+                    or not set(target_assignment_tools[str(assignment_id)]) <= set(assignment_tools)
+                    or assignment.get("reviewed_adapter_digest") != value["reviewed_adapter_digest"]
+                    or contract.get("reviewed_adapter_digest") != value["reviewed_adapter_digest"]
+                    or contract.get("target_session_id") != value["target_session_id"]
+                    or contract.get("initial_state_equivalence_digest")
+                    != value["current_surface_digest"]
+                    or contract.get("compiled_adapter_digest") != value["compiled_adapter_digest"]
+                    or contract.get("target_reobservation_generation_id") != value["generation_id"]
+                    or contract.get("target_reobservation_event_set_digest")
+                    != value["event_set_digest"]
+                    or not isinstance(context, Mapping)
+                    or context.get("assignment_id") != assignment_id
+                    or tuple(context.get("tool_ids", ())) != tuple(assignment_tools)
+                    or not isinstance(context_target, Mapping)
+                    or context_target.get("id") != value["target_id"]
+                    or context.get("strategy_id") != assignment.get("strategy_id")
+                    or context_contract != contract
+                    or context.get("digest") != _qualified_digest(context_values)
+                    or context_contract.get("target_session_id") != value["target_session_id"]
+                    or context_contract.get("initial_state_equivalence_digest")
+                    != value["current_surface_digest"]
+                    or context_contract.get("compiled_adapter_digest")
+                    != value["compiled_adapter_digest"]
+                    or context_contract.get("target_reobservation_generation_id")
+                    != value["generation_id"]
+                    or context_contract.get("target_reobservation_event_set_digest")
+                    != value["event_set_digest"]
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "persisted target assignment is not rebound to refreshed authority"
+                    )
+                bindings.append(
+                    {
+                        "assignment_id": assignment["id"],
+                        "target_effect_tool_ids": list(target_assignment_tools[str(assignment_id)]),
+                        "assignment_digest": _qualified_digest(dict(assignment)),
+                        "worker_context_digest": context.get("digest"),
+                    }
+                )
+            if not bindings or {str(item["assignment_id"]) for item in bindings} != set(
+                target_assignment_tools
+            ):
+                raise ValueError("target admission activation has no target-capable assignment")
+            if source_schedule_id is not None and current_wave_schedule == source_schedule_id:
+                active_source_attempt = self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.scheduler_attempts
+                       WHERE schedule_id = %s AND state = 'running' LIMIT 1""",
+                    (source_schedule_id,),
+                ).fetchone()
+                if active_source_attempt is not None:
+                    raise TargetAdmissionLatchedError(
+                        "target admission source still has an active attempt"
+                    )
+                self.connection.execute(
+                    """UPDATE merlin_storage.scheduler_nodes SET state = 'cancelled'
+                       WHERE schedule_id = %s AND state IN ('pending', 'ready', 'leased')""",
+                    (source_schedule_id,),
+                )
+                retired = self.connection.execute(
+                    """UPDATE merlin_storage.scheduler_schedules
+                       SET status = 'cancelled', updated_at = now()
+                       WHERE id = %s AND status = 'paused' RETURNING id""",
+                    (source_schedule_id,),
+                ).fetchone()
+                if retired is None:
+                    raise TargetAdmissionLatchedError(
+                        "target admission source could not be durably retired"
+                    )
+                self._append_event(
+                    source_schedule_id,
+                    "schedule_superseded",
+                    {
+                        "replacement_schedule_id": schedule_id,
+                        "campaign_id": campaign_id,
+                        "wave": wave_number,
+                    },
+                )
+            prior_activation = None
+            if exact_activation_replay:
+                prior_rows = self.connection.execute(
+                    """SELECT decision_id, payload, payload_digest
+                       FROM merlin_storage.campaign_lead_journal
+                       WHERE campaign_id = %s
+                         AND payload->>'kind' = 'target_admission_generation_activated'
+                         AND payload->>'schema' =
+                             'merlin.target-admission-generation-activation.v2'
+                         AND payload->>'generation_id' = %s
+                         AND payload->>'schedule_id' = %s
+                         AND payload->>'target_session_id' = %s
+                       ORDER BY sequence DESC LIMIT 2""",
+                    (
+                        campaign_id,
+                        value["generation_id"],
+                        schedule_id,
+                        value["target_session_id"],
+                    ),
+                ).fetchall()
+                if len(prior_rows) != 1 or prior_rows[0]["payload_digest"] != _qualified_digest(
+                    dict(prior_rows[0]["payload"])
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "target admission activation replay authority is missing"
+                    )
+                prior_activation = dict(prior_rows[0])
+            prior_payload = prior_activation["payload"] if prior_activation is not None else None
+            if prior_activation is not None:
+                prior_body = {
+                    key: item for key, item in prior_payload.items() if key != "activation_digest"
+                }
+                stable_required = tuple(
+                    key for key in required if key not in {"claim_id", "claimant_id"}
+                )
+                if (
+                    prior_payload.get("activation_digest") != _qualified_digest(prior_body)
+                    or prior_activation["decision_id"]
+                    != "target-admission-activated/"
+                    + str(prior_payload["activation_digest"]).removeprefix("sha256:")
+                    or any(prior_payload.get(key) != value[key] for key in stable_required)
+                    or prior_payload.get("wave") != wave_number
+                    or prior_payload.get("wave_kind") != wave_kind
+                    or prior_payload.get("event_digests") != list(event_digests)
+                    or prior_payload.get("assignment_bindings") != bindings
+                    or prior_payload.get("target_assignment_tools")
+                    != {
+                        assignment_id: list(target_assignment_tools[assignment_id])
+                        for assignment_id in sorted(target_assignment_tools)
+                    }
+                    or str(latch.get("authorized_schedule_id")) != schedule_id
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "target admission activation replay does not match durable authority"
+                    )
+                return str(prior_activation["decision_id"])
+            activation_latch_revision = (
+                prior_payload.get("latch_revision")
+                if isinstance(prior_payload, Mapping)
+                else latch_revision
+            )
+            latched_count_before = (
+                prior_payload.get("latched_session_count_before")
+                if isinstance(prior_payload, Mapping)
+                else (1 if latch["state"] == "latched" else 0)
+                + sum(item["state"] in {"latched", "overflow"} for item in sibling_latches)
+            )
+            body = {
+                "kind": "target_admission_generation_activated",
+                "schema": "merlin.target-admission-generation-activation.v2",
+                **{key: value[key] for key in required},
+                "latch_revision": activation_latch_revision,
+                "start_decision_id": start_decision_id,
+                "event_digests": list(event_digests),
+                "superseded_generations": superseded_generations,
+                "latched_session_count_before": latched_count_before,
+                "superseded_session_count": len(superseded_generations),
+                "latched_session_count_after": 0,
+                "assignment_bindings": bindings,
+                "target_assignment_tools": {
+                    assignment_id: list(target_assignment_tools[assignment_id])
+                    for assignment_id in sorted(target_assignment_tools)
+                },
+                "wave": wave_number,
+                "wave_kind": wave_kind,
+                "source_schedule_id": source_schedule_id,
+                "frontier_batch_id": frontier_batch_id,
+            }
+            payload = {**body, "activation_digest": _qualified_digest(body)}
+            activation_id = "target-admission-activated/" + str(
+                payload["activation_digest"]
+            ).removeprefix("sha256:")
+            if prior_activation is not None and (
+                prior_activation["decision_id"] != activation_id
+                or dict(prior_activation["payload"]) != payload
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission activation replay does not match durable authority"
+                )
+            self._append_campaign_lead_event_locked(
+                campaign_id, int(wave["wave"]), activation_id, payload
+            )
+            if latch["state"] == "activated":
+                if any(
+                    latch[field] != value[field]
+                    for field in (
+                        "generation_id",
+                        "event_set_digest",
+                        "settlement_id",
+                        "lead_decision_id",
+                        "current_surface_digest",
+                        "compiled_adapter_digest",
+                        "reviewed_adapter_digest",
+                    )
+                ) or latch.get("authorized_assignment_tools") != {
+                    assignment_id: list(target_assignment_tools[assignment_id])
+                    for assignment_id in sorted(target_assignment_tools)
+                }:
+                    raise TargetAdmissionLatchedError(
+                        "target admission activation conflicts with current authority"
+                    )
+                if str(latch["authorized_schedule_id"]) == schedule_id:
+                    return activation_id
+                prior_schedule = self.connection.execute(
+                    """SELECT status FROM merlin_storage.scheduler_schedules
+                       WHERE id = %s""",
+                    (latch["authorized_schedule_id"],),
+                ).fetchone()
+                if prior_schedule is None or not (
+                    prior_schedule["status"] in {"completed", "cancelled", "failed"}
+                    or prior_schedule["status"] == "paused"
+                    and str(latch["authorized_schedule_id"]) == source_schedule_id
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "prior activated target schedule is not terminal"
+                    )
+            for sibling, candidate, sibling_start_id in validated_siblings:
+                self._upsert_target_admission_latch_locked(
+                    campaign_id=campaign_id,
+                    session_id=str(value["session_id"]),
+                    target_id=str(value["target_id"]),
+                    target_session_id=str(sibling["target_session_id"]),
+                    values={
+                        **sibling,
+                        "state": "resolved",
+                        "revision": int(sibling["revision"]) + 1,
+                        "generation_id": candidate["generation_id"],
+                        "start_decision_id": sibling_start_id,
+                        "settlement_id": candidate["settlement_id"],
+                        "lead_decision_id": candidate["lead_decision_id"],
+                        "authorized_schedule_id": None,
+                        "current_surface_digest": None,
+                        "compiled_adapter_digest": None,
+                        "reviewed_adapter_digest": None,
+                        "authorized_assignment_tools": {},
+                    },
+                )
+            self._upsert_target_admission_latch_locked(
+                campaign_id=campaign_id,
+                session_id=str(value["session_id"]),
+                target_id=str(value["target_id"]),
+                target_session_id=str(value["target_session_id"]),
+                values={
+                    **latch,
+                    "state": "activated",
+                    "revision": int(latch["revision"]) + 1,
+                    "generation_id": value["generation_id"],
+                    "start_decision_id": start_decision_id,
+                    "settlement_id": value["settlement_id"],
+                    "lead_decision_id": value["lead_decision_id"],
+                    "authorized_schedule_id": schedule_id,
+                    "current_surface_digest": value["current_surface_digest"],
+                    "compiled_adapter_digest": value["compiled_adapter_digest"],
+                    "reviewed_adapter_digest": value["reviewed_adapter_digest"],
+                    "authorized_assignment_tools": {
+                        assignment_id: list(target_assignment_tools[assignment_id])
+                        for assignment_id in sorted(target_assignment_tools)
+                    },
+                },
+            )
+            if latch["state"] == "latched":
+                remaining = (
+                    int(head["latched_session_count"])
+                    - 1
+                    - len(
+                        [
+                            sibling
+                            for sibling, _candidate, _start in validated_siblings
+                            if sibling["state"] in {"latched", "overflow"}
+                        ]
+                    )
+                )
+                if remaining != 0:
+                    raise TargetAdmissionLatchedError("target admission latch head is inconsistent")
+                self._upsert_target_admission_latch_locked(
+                    campaign_id=campaign_id,
+                    session_id=str(value["session_id"]),
+                    target_id=str(value["target_id"]),
+                    target_session_id=None,
+                    values={
+                        **head,
+                        "state": "open",
+                        "revision": int(head["revision"]) + 1,
+                        "latched_session_count": remaining,
+                    },
+                )
+            started = self.connection.execute(
+                """UPDATE merlin_storage.scheduler_schedules
+                   SET status = 'running', updated_at = now()
+                   WHERE id = %s AND status = 'paused' RETURNING id""",
+                (schedule_id,),
+            ).fetchone()
+            if started is not None:
+                self._append_event(
+                    schedule_id,
+                    "target_admission_activated",
+                    {
+                        "campaign_id": campaign_id,
+                        "wave": wave_number,
+                        "activation_id": activation_id,
+                    },
+                )
+            return activation_id
+
+    @_serialized
+    def resolve_target_admission_terminal(self, value: Mapping[str, object]) -> str:
+        """Close a reviewed generation without authorizing any stale successor."""
+
+        required = (
+            "campaign_id",
+            "session_id",
+            "target_id",
+            "target_session_id",
+            "generation_id",
+            "event_set_digest",
+            "settlement_id",
+            "lead_decision_id",
+        )
+        if any(not isinstance(value.get(key), str) or not str(value[key]) for key in required):
+            raise ValueError("target admission terminal resolution is incomplete")
+        campaign_id = str(value["campaign_id"])
+        with self.connection.transaction():
+            campaign = self.connection.execute(
+                """SELECT id, session_id FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (campaign_id,),
+            ).fetchone()
+            if campaign is None or str(campaign["session_id"]) != value["session_id"]:
+                raise TargetAdmissionLatchedError("target admission campaign changed")
+            latch = self._target_admission_latch_locked(
+                campaign_id,
+                str(value["target_id"]),
+                str(value["target_session_id"]),
+            )
+            initial_authority = self._exact_lead_rows_locked(
+                campaign_id,
+                (str(value["settlement_id"]), str(value["lead_decision_id"])),
+            )
+            settlement_row = next(
+                (row for row in initial_authority if row["decision_id"] == value["settlement_id"]),
+                None,
+            )
+            settlement_payload = settlement_row["payload"] if settlement_row is not None else None
+            attempt = (
+                settlement_payload.get("attempt")
+                if isinstance(settlement_payload, Mapping)
+                else None
+            )
+            start_decision_id = (
+                "target-reobservation-started/"
+                + str(value["generation_id"]).removeprefix("sha256:")
+                + f"/{attempt}"
+                if type(attempt) is int and attempt > 0
+                else ""
+            )
+            if latch is None or latch["state"] not in {
+                "latched",
+                "activated",
+                "resolved",
+            }:
+                raise TargetAdmissionLatchedError(
+                    "target admission has no current latched generation"
+                )
+            projection = self._bounded_target_reobservation_projection_locked(
+                latch,
+                start_decision_id=start_decision_id,
+                settlement_id=str(value["settlement_id"]),
+                lead_decision_id=str(value["lead_decision_id"]),
+            )
+            generation = projection.generations.get(str(value["generation_id"]))
+            settlement = projection.refreshed.get(str(value["generation_id"]))
+            canonical_event_set_digest = (
+                _qualified_digest({"event_digests": generation.event_digests})
+                if generation is not None
+                else None
+            )
+            if latch["event_set_digest"] is None and canonical_event_set_digest is not None:
+                self.connection.execute(
+                    """UPDATE merlin_storage.target_admission_latches
+                       SET event_set_digest = %s, revision = revision + 1,
+                           updated_at = now()
+                       WHERE campaign_id = %s AND target_id = %s
+                         AND target_session_id = %s AND event_set_digest IS NULL""",
+                    (
+                        canonical_event_set_digest,
+                        campaign_id,
+                        value["target_id"],
+                        value["target_session_id"],
+                    ),
+                )
+                latch = {**latch, "event_set_digest": canonical_event_set_digest}
+            if (
+                generation is None
+                or generation.target_session_id != value["target_session_id"]
+                or settlement is None
+                or settlement.get("settlement_id") != value["settlement_id"]
+                or projection.reviewed.get(generation.generation_id) != value["lead_decision_id"]
+                or canonical_event_set_digest != value["event_set_digest"]
+                or tuple(latch["pending_event_digests"]) != generation.event_digests
+                or latch["event_set_digest"] != value["event_set_digest"]
+                or latch["lane_attempt_id"] is not None
+            ):
+                raise TargetAdmissionLatchedError(
+                    "target admission resolution does not match reviewed refresh authority"
+                )
+            body = {
+                "kind": "target_admission_generation_resolved",
+                "schema": "merlin.target-admission-generation-resolution.v1",
+                **{key: value[key] for key in required},
+                "start_decision_id": start_decision_id,
+                "event_digests": list(generation.event_digests),
+                "resolution": "campaign_terminal",
+            }
+            payload = {**body, "resolution_digest": _qualified_digest(body)}
+            resolution_id = "target-admission-resolved/" + str(
+                payload["resolution_digest"]
+            ).removeprefix("sha256:")
+            wave = max(generation.source_wave, 0)
+            self._append_campaign_lead_event_locked(campaign_id, wave, resolution_id, payload)
+            if latch["state"] == "resolved":
+                if any(
+                    latch[field] != value[field]
+                    for field in (
+                        "generation_id",
+                        "event_set_digest",
+                        "settlement_id",
+                        "lead_decision_id",
+                    )
+                ):
+                    raise TargetAdmissionLatchedError(
+                        "target admission resolution conflicts with current authority"
+                    )
+                return resolution_id
+            self._upsert_target_admission_latch_locked(
+                campaign_id=campaign_id,
+                session_id=str(value["session_id"]),
+                target_id=str(value["target_id"]),
+                target_session_id=str(value["target_session_id"]),
+                values={
+                    **latch,
+                    "state": "resolved",
+                    "revision": int(latch["revision"]) + 1,
+                    "generation_id": value["generation_id"],
+                    "start_decision_id": start_decision_id,
+                    "settlement_id": value["settlement_id"],
+                    "lead_decision_id": value["lead_decision_id"],
+                    "authorized_schedule_id": None,
+                    "authorized_assignment_tools": {},
+                },
+            )
+            head = self._target_admission_latch_locked(campaign_id, str(value["target_id"]), None)
+            if head is None:
+                raise TargetAdmissionLatchedError("target admission latch head is inconsistent")
+            remaining = int(head["latched_session_count"])
+            if latch["state"] == "latched":
+                if remaining < 1:
+                    raise TargetAdmissionLatchedError("target admission latch head is inconsistent")
+                remaining -= 1
+            self._upsert_target_admission_latch_locked(
+                campaign_id=campaign_id,
+                session_id=str(value["session_id"]),
+                target_id=str(value["target_id"]),
+                target_session_id=None,
+                values={
+                    **head,
+                    "state": "latched" if remaining else "open",
+                    "revision": int(head["revision"]) + 1,
+                    "latched_session_count": remaining,
+                },
+            )
+            return resolution_id
+
     @_serialized
     def claim(
         self,
@@ -3536,16 +6832,33 @@ class DurableSchedulerStore:
         *,
         lease_expires_at: datetime,
         attempt_id: str | None = None,
+        target_admission: Mapping[str, object] | None = None,
     ) -> AttemptLease:
         if lease_expires_at <= datetime.now(lease_expires_at.tzinfo):
             raise ValueError("lease expiry must be in the future")
         identifier = attempt_id or str(uuid4())
         with self.connection.transaction():
+            target_scope: tuple[str, str, str, str | None] | None = None
+            if target_admission is not None:
+                campaign_id = target_admission.get("campaign_id")
+                if not isinstance(campaign_id, str) or not campaign_id:
+                    raise TargetAdmissionLatchedError(
+                        "target admission campaign identity is missing"
+                    )
+                self.connection.execute(
+                    """SELECT id FROM merlin_storage.assessment_campaigns
+                       WHERE id = %s FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchone()
             schedule = self.connection.execute(
                 """SELECT status FROM merlin_storage.scheduler_schedules
                    WHERE id = %s FOR UPDATE""",
                 (schedule_id,),
             ).fetchone()
+            if target_admission is not None:
+                target_scope = self._target_admission_allowed_locked(
+                    schedule_id, node_id, target_admission
+                )
             cleanup_after_cancel = (
                 schedule is not None
                 and schedule["status"] == "cancelled"
@@ -3595,6 +6908,23 @@ class DurableSchedulerStore:
                     replaced_attempt_id,
                 ),
             ).fetchone()
+            if target_scope is not None:
+                if target_scope[3] is not None and str(replaced_attempt_id) != target_scope[3]:
+                    raise TargetAdmissionLatchedError(
+                        "target lane recovery does not match replacement lineage"
+                    )
+                self._bind_target_lane_locked(
+                    campaign_id=target_scope[0],
+                    session_id=str(target_admission["session_id"]),
+                    target_id=target_scope[1],
+                    target_session_id=target_scope[2],
+                    schedule_id=schedule_id,
+                    node_id=node_id,
+                    assignment_id=str(target_admission["assignment_id"]),
+                    attempt_id=identifier,
+                    generation=generation,
+                    recovery_attempt_id=target_scope[3],
+                )
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_nodes
                    SET state = 'leased', lease_generation = %s,
@@ -3614,12 +6944,19 @@ class DurableSchedulerStore:
                     else None,
                 },
             )
-        return AttemptLease(**{**row, "id": str(row["id"]), "schedule_id": str(row["schedule_id"])})
+        return AttemptLease(
+            **{**row, "id": str(row["id"]), "schedule_id": str(row["schedule_id"])},
+            replaced_attempt_id=(
+                str(replaced_attempt_id) if replaced_attempt_id is not None else None
+            ),
+            lane_recovery_required=(target_scope is not None and target_scope[3] is not None),
+        )
 
     @_serialized
     def pause_schedule(self, schedule_id: str, *, reason: str) -> None:
         """Fence live attempts and make their nodes immediately resumable."""
         with self.connection.transaction():
+            self._lock_target_lane_campaigns_for_schedule_locked(schedule_id)
             row = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_schedules
                    SET status = 'paused', updated_at = now()
@@ -3628,6 +6965,7 @@ class DurableSchedulerStore:
             ).fetchone()
             if row is None:
                 raise ValueError("schedule is unknown or not running")
+            self._lock_target_latches_for_schedule_locked(schedule_id)
             fenced = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts
                    SET state = 'expired', error = %s, completed_at = now()
@@ -3644,6 +6982,11 @@ class DurableSchedulerStore:
                     (schedule_id, attempt["node_id"], attempt["generation"]),
                 )
                 self._release_message_claims(str(attempt["id"]), int(attempt["generation"]))
+                self._target_lane_terminal_disposition_locked(
+                    str(attempt["id"]),
+                    authority="recovery",
+                    revoke_unadopted=True,
+                )
             self._append_event(
                 schedule_id,
                 "schedule_paused",
@@ -3692,6 +7035,7 @@ class DurableSchedulerStore:
     @_serialized
     def expire(self, attempt_id: str, generation: int) -> None:
         with self.connection.transaction():
+            self._lock_target_lane_campaign_locked(attempt_id)
             attempt = self._lock_attempt(attempt_id, generation, require_unexpired=False)
             if attempt["lease_expires_at"] > datetime.now(attempt["lease_expires_at"].tzinfo):
                 raise StaleLeaseError("attempt lease has not expired")
@@ -3706,6 +7050,11 @@ class DurableSchedulerStore:
                 (attempt["schedule_id"], attempt["node_id"], generation),
             )
             self._release_message_claims(attempt_id, generation)
+            self._target_lane_terminal_disposition_locked(
+                attempt_id,
+                authority="recovery",
+                revoke_unadopted=True,
+            )
             self._append_event(
                 str(attempt["schedule_id"]),
                 "expired",
@@ -3752,6 +7101,8 @@ class DurableSchedulerStore:
         checkpoint: dict[str, object],
         target_session_id: str | None = None,
         failure_kind: str | None = None,
+        terminal_result: Mapping[str, object] | None = None,
+        target_surface_transition: Mapping[str, object] | None = None,
     ) -> None:
         if outcome not in {"failed", "cancelled", "quarantined"}:
             raise ValueError("attempt outcome must be failed, cancelled, or quarantined")
@@ -3762,6 +7113,16 @@ class DurableSchedulerStore:
             checkpoint, artifact="checkpoint"
         )
         with self.connection.transaction():
+            self._lock_target_lane_campaign_locked(attempt_id)
+            if target_surface_transition is not None:
+                campaign_id = target_surface_transition.get("campaign_id")
+                if not isinstance(campaign_id, str) or not campaign_id:
+                    raise ValueError("target surface transition campaign is missing")
+                self.connection.execute(
+                    """SELECT id FROM merlin_storage.assessment_campaigns
+                       WHERE id = %s FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchone()
             cancelled = self.connection.execute(
                 """SELECT attempt.schedule_id, attempt.node_id
                    FROM merlin_storage.scheduler_attempts AS attempt
@@ -3770,15 +7131,111 @@ class DurableSchedulerStore:
                     AND node.node_id = attempt.node_id
                    WHERE attempt.id = %s AND attempt.generation = %s
                      AND attempt.state = 'cancelled' AND node.state = 'cancelled'
-                     AND node.lease_generation = attempt.generation""",
+                     AND node.lease_generation = attempt.generation
+                   FOR UPDATE OF attempt, node""",
                 (attempt_id, generation),
             ).fetchone()
             if cancelled is not None:
-                # Durable cancellation is authoritative. A provider may finish while
-                # cancellation propagates; discard every late terminal result.
+                schedule_id = str(cancelled["schedule_id"])
+                if terminal_result is not None:
+                    result = dict(terminal_result)
+                    self.connection.execute(
+                        """INSERT INTO merlin_storage.scheduler_results
+                               (attempt_id, schedule_id, node_id, generation, schema_id,
+                                payload, payload_digest)
+                           VALUES (%s, %s, %s, %s, 'schema/partial-result', %s, %s)
+                           ON CONFLICT (attempt_id) DO UPDATE SET
+                               schema_id = excluded.schema_id,
+                               payload = excluded.payload,
+                               payload_digest = excluded.payload_digest""",
+                        (
+                            attempt_id,
+                            schedule_id,
+                            cancelled["node_id"],
+                            generation,
+                            Jsonb(result),
+                            _digest(result),
+                        ),
+                    )
+                transition_call_id = None
+                if target_surface_transition is not None:
+                    if target_surface_transition.get("target_session_id") != target_session_id:
+                        raise ValueError("target transition session does not match terminal result")
+                    self._commit_target_surface_transition_locked(
+                        schedule_id,
+                        str(cancelled["node_id"]),
+                        target_surface_transition,
+                    )
+                    raw_call_id = target_surface_transition.get("target_call_id")
+                    transition_call_id = (
+                        str(raw_call_id) if isinstance(raw_call_id, str) and raw_call_id else None
+                    )
+                    if transition_call_id is None:
+                        raise ValueError("target transition call identity is missing")
+                    updated_cancelled = self.connection.execute(
+                        """UPDATE merlin_storage.scheduler_attempts
+                           SET target_session_id = coalesce(target_session_id, %s)
+                           WHERE id = %s
+                             AND (%s::text IS NULL OR target_session_id IS NULL
+                                  OR target_session_id = %s)""",
+                        (
+                            target_session_id,
+                            attempt_id,
+                            target_session_id,
+                            target_session_id,
+                        ),
+                    )
+                    if updated_cancelled.rowcount != 1:
+                        raise StaleLeaseError("attempt target session identity changed")
+                self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    committed_transition_call_id=transition_call_id,
+                    revoke_unadopted=True,
+                )
+                if transition_call_id is not None:
+                    self._append_event(
+                        schedule_id,
+                        "cancelled_target_transition_adopted",
+                        {
+                            "node_id": cancelled["node_id"],
+                            "attempt_id": attempt_id,
+                            "generation": generation,
+                            "target_call_id": transition_call_id,
+                        },
+                    )
                 return
             attempt = self._lock_attempt(attempt_id, generation)
             schedule_id = str(attempt["schedule_id"])
+            if terminal_result is not None:
+                result = dict(terminal_result)
+                result_digest = _digest(result)
+                self.connection.execute(
+                    """INSERT INTO merlin_storage.scheduler_results
+                           (attempt_id, schedule_id, node_id, generation, schema_id,
+                            payload, payload_digest)
+                       VALUES (%s, %s, %s, %s, 'schema/partial-result', %s, %s)
+                       ON CONFLICT (attempt_id) DO UPDATE SET
+                           schema_id = excluded.schema_id,
+                           payload = excluded.payload,
+                           payload_digest = excluded.payload_digest""",
+                    (
+                        attempt_id,
+                        schedule_id,
+                        attempt["node_id"],
+                        generation,
+                        Jsonb(result),
+                        result_digest,
+                    ),
+                )
+            if target_surface_transition is not None:
+                if target_surface_transition.get("target_session_id") != target_session_id:
+                    raise ValueError("target transition session does not match terminal result")
+                self._commit_target_surface_transition_locked(
+                    schedule_id,
+                    str(attempt["node_id"]),
+                    target_surface_transition,
+                )
             updated = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts
                    SET state = %s, error = %s, completed_at = now(),
@@ -3810,6 +7267,20 @@ class DurableSchedulerStore:
                     attempt["node_id"],
                     generation,
                 ),
+            )
+            transition_call_id = None
+            if target_surface_transition is not None:
+                raw_call_id = target_surface_transition.get("target_call_id")
+                transition_call_id = (
+                    str(raw_call_id) if isinstance(raw_call_id, str) and raw_call_id else None
+                )
+                if transition_call_id is None:
+                    raise ValueError("target transition call identity is missing")
+            self._target_lane_terminal_disposition_locked(
+                attempt_id,
+                authority="settled",
+                committed_transition_call_id=transition_call_id,
+                revoke_unadopted=True,
             )
             self._release_message_claims(attempt_id, generation)
             self.connection.execute(
@@ -3883,6 +7354,59 @@ class DurableSchedulerStore:
             )
 
     @_serialized
+    def reconcile_cancelled_target_lanes(self, schedule_id: str) -> dict[str, tuple[str, ...]]:
+        """Revoke undispatched permits and retain every uncertain cancelled lane."""
+
+        with self.connection.transaction():
+            self._lock_target_lane_campaigns_for_schedule_locked(schedule_id)
+            schedule = self.connection.execute(
+                """SELECT status FROM merlin_storage.scheduler_schedules
+                   WHERE id = %s FOR UPDATE""",
+                (schedule_id,),
+            ).fetchone()
+            if schedule is None:
+                raise KeyError(f"unknown scheduler schedule: {schedule_id}")
+            lanes = self.connection.execute(
+                """SELECT lane_attempt_id::text AS attempt_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE lane_schedule_id = %s AND lane_attempt_id IS NOT NULL
+                   ORDER BY campaign_id, target_id, target_session_id
+                   LIMIT 257 FOR UPDATE""",
+                (schedule_id,),
+            ).fetchall()
+            if len(lanes) > 256:
+                raise RuntimeError("cancelled target-lane reconciliation exceeds its bound")
+            released: list[str] = []
+            held: list[str] = []
+            latched: list[str] = []
+            for lane in lanes:
+                attempt_id = str(lane["attempt_id"])
+                attempt = self.connection.execute(
+                    """SELECT state FROM merlin_storage.scheduler_attempts
+                       WHERE id = %s FOR UPDATE""",
+                    (attempt_id,),
+                ).fetchone()
+                if attempt is None or attempt["state"] != "cancelled":
+                    held.append(attempt_id)
+                    continue
+                disposition = self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    revoke_unadopted=True,
+                )
+                if disposition == "released":
+                    released.append(attempt_id)
+                elif disposition == "latched":
+                    latched.append(attempt_id)
+                else:
+                    held.append(attempt_id)
+            return {
+                "released": tuple(released),
+                "held": tuple(held),
+                "latched": tuple(latched),
+            }
+
+    @_serialized
     def cancel_schedule(
         self,
         schedule_id: str,
@@ -3897,6 +7421,7 @@ class DurableSchedulerStore:
             checkpoint, artifact="checkpoint"
         )
         with self.connection.transaction():
+            self._lock_target_lane_campaigns_for_schedule_locked(schedule_id)
             schedule = self.connection.execute(
                 """SELECT status FROM merlin_storage.scheduler_schedules
                    WHERE id = %s FOR UPDATE""",
@@ -3904,15 +7429,25 @@ class DurableSchedulerStore:
             ).fetchone()
             if schedule is None or schedule["status"] not in {"running", "paused"}:
                 raise ValueError("schedule is unknown or terminal")
-            self.connection.execute(
+            self._lock_target_latches_for_schedule_locked(schedule_id)
+            cancelled_attempts = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts AS attempt
                    SET state = 'cancelled', error = %s, completed_at = now()
                    FROM merlin_storage.scheduler_nodes AS node
                    WHERE attempt.schedule_id = %s AND attempt.state = 'running'
                      AND node.schedule_id = attempt.schedule_id AND node.node_id = attempt.node_id
-                     AND NOT (node.node_id = ANY(%s))""",
+                     AND NOT (node.node_id = ANY(%s))
+                   RETURNING attempt.id, attempt.generation""",
                 (reason, schedule_id, cleanup),
-            )
+            ).fetchall()
+            for attempt in cancelled_attempts:
+                attempt_id = str(attempt["id"])
+                self._release_message_claims(attempt_id, int(attempt["generation"]))
+                self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    revoke_unadopted=True,
+                )
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_nodes SET state = 'cancelled'
                    WHERE schedule_id = %s AND state IN ('pending', 'ready', 'leased')
@@ -3991,6 +7526,7 @@ class DurableSchedulerStore:
     def reject_schedule(self, schedule_id: str, *, reason: str) -> None:
         """Terminalize active state whose persisted graph cannot be safely hydrated."""
         with self.connection.transaction():
+            self._lock_target_lane_campaigns_for_schedule_locked(schedule_id)
             schedule = self.connection.execute(
                 """SELECT status FROM merlin_storage.scheduler_schedules
                    WHERE id = %s FOR UPDATE""",
@@ -4000,6 +7536,7 @@ class DurableSchedulerStore:
                 raise KeyError(f"unknown scheduler schedule: {schedule_id}")
             if schedule["status"] not in {"running", "paused", "cancelled"}:
                 return
+            self._lock_target_latches_for_schedule_locked(schedule_id)
             attempts = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts
                    SET state = 'cancelled', error = %s, completed_at = now()
@@ -4008,7 +7545,13 @@ class DurableSchedulerStore:
                 (reason, schedule_id),
             ).fetchall()
             for attempt in attempts:
-                self._release_message_claims(str(attempt["id"]), int(attempt["generation"]))
+                attempt_id = str(attempt["id"])
+                self._release_message_claims(attempt_id, int(attempt["generation"]))
+                self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    revoke_unadopted=True,
+                )
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_nodes SET state = 'cancelled'
                    WHERE schedule_id = %s
@@ -4053,6 +7596,7 @@ class DurableSchedulerStore:
                             "cancellation identity conflicts with a different node or reason"
                         )
                     return True
+            self._lock_target_lane_campaigns_for_schedule_locked(schedule_id, node_id=node_id)
             schedule = self.connection.execute(
                 """SELECT status FROM merlin_storage.scheduler_schedules
                    WHERE id = %s FOR UPDATE""",
@@ -4069,6 +7613,7 @@ class DurableSchedulerStore:
                 raise KeyError(f"unknown scheduler node: {node_id}")
             if node["state"] in {"completed", "failed", "cancelled", "quarantined"}:
                 return False
+            self._lock_target_latches_for_schedule_locked(schedule_id, node_id=node_id)
             attempts = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts
                    SET state = 'cancelled', error = %s, completed_at = now()
@@ -4077,7 +7622,13 @@ class DurableSchedulerStore:
                 (reason, schedule_id, node_id),
             ).fetchall()
             for attempt in attempts:
-                self._release_message_claims(str(attempt["id"]), int(attempt["generation"]))
+                attempt_id = str(attempt["id"])
+                self._release_message_claims(attempt_id, int(attempt["generation"]))
+                self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    revoke_unadopted=True,
+                )
             self.connection.execute(
                 """UPDATE merlin_storage.scheduler_nodes
                    SET state = 'cancelled'
@@ -4152,7 +7703,8 @@ class DurableSchedulerStore:
         messages: Sequence[tuple[str, str, str, dict[str, object]]] = (),
         applied_message_ids: Sequence[str] = (),
         target_session_id: str | None = None,
-    ) -> str:
+        target_surface_transition: Mapping[str, object] | None = None,
+    ) -> str | None:
         """Atomically commit result, completion, messages, node state, and checkpoint."""
         target_session_id = _target_session_id(target_session_id)
         result_digest = _digest(result)
@@ -4160,6 +7712,79 @@ class DurableSchedulerStore:
             checkpoint, artifact="checkpoint"
         )
         with self.connection.transaction():
+            self._lock_target_lane_campaign_locked(attempt_id)
+            if target_surface_transition is not None:
+                campaign_id = target_surface_transition.get("campaign_id")
+                if not isinstance(campaign_id, str) or not campaign_id:
+                    raise ValueError("target surface transition campaign is missing")
+                self.connection.execute(
+                    """SELECT id FROM merlin_storage.assessment_campaigns
+                       WHERE id = %s FOR UPDATE""",
+                    (campaign_id,),
+                ).fetchone()
+            cancelled = self.connection.execute(
+                """SELECT attempt.schedule_id, attempt.node_id
+                   FROM merlin_storage.scheduler_attempts AS attempt
+                   JOIN merlin_storage.scheduler_nodes AS node
+                     ON node.schedule_id = attempt.schedule_id
+                    AND node.node_id = attempt.node_id
+                   WHERE attempt.id = %s AND attempt.generation = %s
+                     AND attempt.state = 'cancelled' AND node.state = 'cancelled'
+                     AND node.lease_generation = attempt.generation
+                   FOR UPDATE OF attempt, node""",
+                (attempt_id, generation),
+            ).fetchone()
+            if cancelled is not None:
+                transition_call_id = None
+                if target_surface_transition is not None:
+                    if target_surface_transition.get("target_session_id") != target_session_id:
+                        raise ValueError(
+                            "target transition session does not match committed result"
+                        )
+                    self._commit_target_surface_transition_locked(
+                        str(cancelled["schedule_id"]),
+                        str(cancelled["node_id"]),
+                        target_surface_transition,
+                    )
+                    raw_call_id = target_surface_transition.get("target_call_id")
+                    transition_call_id = (
+                        str(raw_call_id) if isinstance(raw_call_id, str) and raw_call_id else None
+                    )
+                    if transition_call_id is None:
+                        raise ValueError("target transition call identity is missing")
+                    updated_cancelled = self.connection.execute(
+                        """UPDATE merlin_storage.scheduler_attempts
+                           SET target_session_id = coalesce(target_session_id, %s)
+                           WHERE id = %s
+                             AND (%s::text IS NULL OR target_session_id IS NULL
+                                  OR target_session_id = %s)""",
+                        (
+                            target_session_id,
+                            attempt_id,
+                            target_session_id,
+                            target_session_id,
+                        ),
+                    )
+                    if updated_cancelled.rowcount != 1:
+                        raise StaleLeaseError("attempt target session identity changed")
+                self._target_lane_terminal_disposition_locked(
+                    attempt_id,
+                    authority="cancelled",
+                    committed_transition_call_id=transition_call_id,
+                    revoke_unadopted=True,
+                )
+                if transition_call_id is not None:
+                    self._append_event(
+                        str(cancelled["schedule_id"]),
+                        "cancelled_target_transition_adopted",
+                        {
+                            "node_id": cancelled["node_id"],
+                            "attempt_id": attempt_id,
+                            "generation": generation,
+                            "target_call_id": transition_call_id,
+                        },
+                    )
+                return None
             attempt = self._lock_attempt(attempt_id, generation)
             schedule_id = str(attempt["schedule_id"])
             node_id = attempt["node_id"]
@@ -4182,6 +7807,12 @@ class DurableSchedulerStore:
                     result_digest,
                 ),
             )
+            if target_surface_transition is not None:
+                if target_surface_transition.get("target_session_id") != target_session_id:
+                    raise ValueError("target transition session does not match committed result")
+                self._commit_target_surface_transition_locked(
+                    schedule_id, str(node_id), target_surface_transition
+                )
             updated = self.connection.execute(
                 """UPDATE merlin_storage.scheduler_attempts
                    SET state = 'completed', completed_at = now(),
@@ -4198,6 +7829,20 @@ class DurableSchedulerStore:
                    SET state = 'completed', result_digest = %s
                    WHERE schedule_id = %s AND node_id = %s AND lease_generation = %s""",
                 (result_digest, schedule_id, node_id, generation),
+            )
+            transition_call_id = None
+            if target_surface_transition is not None:
+                raw_call_id = target_surface_transition.get("target_call_id")
+                transition_call_id = (
+                    str(raw_call_id) if isinstance(raw_call_id, str) and raw_call_id else None
+                )
+                if transition_call_id is None:
+                    raise ValueError("target transition call identity is missing")
+            self._target_lane_terminal_disposition_locked(
+                attempt_id,
+                authority="settled",
+                committed_transition_call_id=transition_call_id,
+                revoke_unadopted=True,
             )
             for sender, recipient, message_schema, payload in messages:
                 self._insert_message(schedule_id, sender, recipient, message_schema, payload)
@@ -4439,8 +8084,7 @@ class DurableSchedulerStore:
             effect for effect in effects if effect["idempotency_key"] in witness_effect_ids
         )
         requires_remote_session_identity = any(
-            effect["tool_name"] in {"target_request", "target_inject"}
-            for effect in witness_effects
+            effect["tool_name"] in {"target_request", "target_inject"} for effect in witness_effects
         )
         remote_target_session_ids = {
             remote_id

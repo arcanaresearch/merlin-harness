@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from merlin_contracts import (
+    MAX_TARGET_SESSION_ID_LENGTH,
     TargetDeliveryClass,
     ToolEffectRecord,
     ToolEffectState,
@@ -633,6 +634,44 @@ class EffectStore:
         return records if limit is None else records[-limit:]
 
 
+class PermitEffectStore(EffectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.permits: dict[str, str] = {}
+        self.adopted: set[str] = set()
+        self.begin_calls = 0
+
+    async def begin(self, record: ToolEffectRecord):
+        self.begin_calls += 1
+        return await super().begin(record)
+
+    async def adopt_permitted(self, record: ToolEffectRecord, permit_digest: str):
+        if self.permits.get(permit_digest) != record.idempotency_key:
+            raise ValueError("target effect permit does not match the durable intent")
+        existing = self.records.get(record.idempotency_key)
+        identity_fields = (
+            "idempotency_key",
+            "session_id",
+            "call_id",
+            "agent_id",
+            "attempt_id",
+            "campaign_id",
+            "target_id",
+            "tool_name",
+            "effect",
+            "arguments_digest",
+            "arguments_payload",
+        )
+        if existing is None or any(
+            getattr(existing, field) != getattr(record, field) for field in identity_fields
+        ):
+            raise ValueError("target effect permit does not match the durable intent")
+        if permit_digest in self.adopted:
+            return existing, False
+        self.adopted.add(permit_digest)
+        return existing, True
+
+
 def test_broker_exposes_read_only_attempt_effect_lookup() -> None:
     store = EffectStore()
     record = ToolEffectRecord(
@@ -678,7 +717,757 @@ class CountingEffectTool(NamedTool):
         self.calls += 1
         if self.fail:
             raise OSError("connection lost after send")
-        return ToolResult(content="sent")
+        metadata = (
+            {"target_session_id": context.expected_target_session_id}
+            if context.expected_target_session_id is not None
+            else {}
+        )
+        return ToolResult(content="sent", metadata=metadata)
+
+
+def _permitted_target_effect(
+    context: ToolContext,
+    arguments: dict[str, object],
+    *,
+    tool_name: str = "target_chat",
+    effect: str = "target_network",
+) -> ToolEffectRecord:
+    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+    ownership = context.attempt_id or context.agent_id or "legacy"
+    key = sha256(
+        f"{context.session_id}\0{ownership}\0{context.call_id}\0{tool_name}".encode()
+    ).hexdigest()
+    return ToolEffectRecord(
+        idempotency_key=key,
+        session_id=context.session_id,
+        call_id=str(context.call_id),
+        agent_id=context.agent_id,
+        attempt_id=context.attempt_id,
+        campaign_id=context.campaign_id,
+        target_id=context.target_id,
+        tool_name=tool_name,
+        effect=effect,
+        arguments_digest=sha256(encoded).hexdigest(),
+        arguments_payload=arguments,
+        state=ToolEffectState.INTENT,
+    )
+
+
+def test_exact_durable_target_effect_permit_adopts_precreated_intent_once(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    permit_digest = "sha256:" + "a" * 64
+    arguments = {"prompt": "hello"}
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-permitted",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:context-1",
+    )
+    admitted: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admitted.append(intent)
+        store.records.setdefault(intent.idempotency_key, intent)
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    broker = ToolBroker((tool,), confirmer=allow, effect_store=store)
+    first = asyncio.run(broker.invoke_with_admission("target_chat", context, arguments, admit))
+    replay = asyncio.run(broker.invoke_with_admission("target_chat", context, arguments, admit))
+
+    assert first.content == replay.content == "sent"
+    assert replay.metadata["idempotent_replay"] is True
+    assert tool.calls == 1
+    assert store.begin_calls == 0
+    assert store.adopted == {permit_digest}
+    assert len(admitted) == 2
+    assert store.records[admitted[0].idempotency_key].state is ToolEffectState.ACKNOWLEDGED
+
+
+@pytest.mark.parametrize(
+    "invalid_permit",
+    (None, 7, "", "a" * 64, "sha256:short", "sha256:" + "G" * 64),
+)
+def test_malformed_admitter_permit_never_falls_back_to_unfenced_begin(
+    tmp_path: Path,
+    invalid_permit: object,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+
+    async def admit(_intent: ToolEffectRecord) -> object:
+        return invalid_permit
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-invalid-permit",
+                expected_target_session_id="browser:context-1",
+            ),
+            {"prompt": "hello"},
+            admit,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["target_effect_permit_invalid"] is True
+    assert tool.calls == 0
+    assert store.begin_calls == 0
+    assert store.records == {}
+
+
+def test_forged_target_effect_permit_never_dispatches_precreated_intent(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    arguments = {"prompt": "hello"}
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-permitted",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        target_effect_permit_digest="sha256:" + "b" * 64,
+    )
+    intent = _permitted_target_effect(context, arguments)
+    store.records[intent.idempotency_key] = intent
+    store.permits["sha256:" + "a" * 64] = intent.idempotency_key
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke(
+            "target_chat", context, arguments
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["target_effect_permit_invalid"] is True
+    assert tool.calls == 0
+    assert store.begin_calls == 0
+    assert store.adopted == set()
+    assert store.records[intent.idempotency_key].state is ToolEffectState.INTENT
+
+
+def test_target_effect_admission_runs_only_after_schema_and_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = SchemaTool()
+    admissions: list[ToolEffectRecord] = []
+
+    async def deny(*_args) -> bool:
+        return False
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        raise AssertionError("denied or invalid call must not reach final admission")
+
+    broker = ToolBroker((tool,), confirmer=deny, effect_store=store)
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-denied",
+        attempt_id="attempt-1",
+    )
+
+    invalid = asyncio.run(broker.invoke_with_admission("schema_tool", context, {}, admit))
+    denied = asyncio.run(
+        broker.invoke_with_admission("schema_tool", context, {"prompt": "hello"}, admit)
+    )
+
+    assert invalid.metadata["schema_validation_failed"] is True
+    assert denied.metadata["confirmation_required"] is True
+    assert admissions == []
+    assert store.records == {}
+    assert tool.invoked is False
+
+
+@pytest.mark.asyncio
+async def test_target_effect_admission_freezes_nested_arguments_before_confirmation(
+    tmp_path: Path,
+) -> None:
+    class CapturingEffectTool(CountingEffectTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arguments: dict[str, object] | None = None
+
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            self.arguments = json.loads(json.dumps(arguments))
+            return await super().invoke(context, arguments)
+
+    store = PermitEffectStore()
+    tool = CapturingEffectTool()
+    permit_digest = "sha256:" + "d" * 64
+    confirmation_started = asyncio.Event()
+    allow_confirmation = asyncio.Event()
+    reviewed: dict[str, object] | None = None
+
+    async def confirm(_spec, _context, arguments):
+        nonlocal reviewed
+        reviewed = json.loads(json.dumps(arguments))
+        confirmation_started.set()
+        await allow_confirmation.wait()
+        return True
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    original = {"prompt": {"text": "approved"}}
+    invocation = asyncio.create_task(
+        ToolBroker((tool,), confirmer=confirm, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-frozen",
+                expected_target_session_id="browser:context-1",
+            ),
+            original,
+            admit,
+        )
+    )
+    await confirmation_started.wait()
+    original["prompt"]["text"] = "MUTATED"  # type: ignore[index]
+    allow_confirmation.set()
+    result = await invocation
+
+    stored = next(iter(store.records.values()))
+    assert result.is_error is False
+    assert reviewed == {"prompt": {"text": "approved"}}
+    assert tool.arguments == reviewed
+    assert stored.arguments_payload == reviewed
+    assert (
+        stored.arguments_digest
+        == sha256(json.dumps(reviewed, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    )
+
+
+def test_target_effect_admission_fails_closed_without_durable_store(
+    tmp_path: Path,
+) -> None:
+    tool = CountingEffectTool()
+    admissions: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        return "sha256:" + "a" * 64
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-no-store",
+            ),
+            {"prompt": "hello"},
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["target_effect_permit_invalid"] is True
+    assert admissions == []
+    assert tool.calls == 0
+
+
+def test_target_effect_admission_fails_closed_without_call_identity(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    admissions: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        return "sha256:" + "a" * 64
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+            ),
+            {"prompt": "hello"},
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["target_effect_permit_invalid"] is True
+    assert admissions == []
+    assert tool.calls == 0
+
+
+def test_target_effect_admission_fails_closed_without_physical_session(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    admissions: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        return "sha256:" + "a" * 64
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-no-physical-session",
+            ),
+            {"prompt": "hello"},
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_unavailable"
+    assert result.metadata["target_effect_attempted"] is False
+    assert admissions == []
+    assert tool.calls == 0
+
+
+def test_target_effect_admission_rejects_oversized_physical_session_before_permit(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    admissions: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        return "sha256:" + "a" * 64
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-oversized-physical-session",
+                expected_target_session_id=("s" * (MAX_TARGET_SESSION_ID_LENGTH + 1)),
+            ),
+            {"prompt": "hello"},
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_invalid"
+    assert result.metadata["target_effect_attempted"] is False
+    assert admissions == []
+    assert tool.calls == 0
+
+
+def test_permit_forces_durable_adoption_for_fenced_target_read_mutator(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+
+    class SessionWitnessTool(NamedTool):
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            return ToolResult(
+                content=self.name,
+                metadata={"target_session_id": context.expected_target_session_id},
+            )
+
+    tool = SessionWitnessTool("browser_navigate")
+    tool.effect = "target_read"
+    permit_digest = "sha256:" + "c" * 64
+    arguments = {"url": "https://target.test/next"}
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-navigate",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:context-1",
+    )
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    result = asyncio.run(
+        ToolBroker((tool,), effect_store=store).invoke_with_admission(
+            "browser_navigate", context, arguments, admit
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == "browser_navigate"
+    assert store.begin_calls == 0
+    assert next(iter(store.records.values())).state is ToolEffectState.ACKNOWLEDGED
+
+
+@pytest.mark.parametrize(
+    ("witness", "failure_code"),
+    (
+        (None, "target_session_identity_unavailable"),
+        ("browser:context-2", "target_session_identity_mismatch"),
+    ),
+)
+def test_permitted_target_result_without_exact_session_witness_stays_ambiguous(
+    tmp_path: Path,
+    witness: str | None,
+    failure_code: str,
+) -> None:
+    class SessionWitnessTool(CountingEffectTool):
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            self.calls += 1
+            metadata = {"target_session_id": witness} if witness is not None else {}
+            return ToolResult(content="untrusted result", metadata=metadata)
+
+    store = PermitEffectStore()
+    tool = SessionWitnessTool()
+    permit_digest = "sha256:" + "d" * 64
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-session-witness",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        expected_target_session_id="browser:context-1",
+    )
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat", context, {"prompt": "hello"}, admit
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == failure_code
+    assert result.metadata["effect_ambiguous"] is True
+    assert result.metadata["replacement_blocked"] is True
+    assert result.metadata["target_effect_attempted"] is True
+    assert tool.calls == 1
+    assert store.records[next(iter(store.records))].state is ToolEffectState.AMBIGUOUS
+
+
+def test_identical_terminal_duplicate_ancestors_are_adopted_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    store = EffectStore()
+    tool = CountingEffectTool()
+    arguments = {"prompt": "hello"}
+    for attempt_id, call_id in (
+        ("attempt-a", "call-a"),
+        ("attempt-b", "call-b"),
+    ):
+        ancestor_context = ToolContext(
+            session_id="test-session",
+            workspace_root=str(tmp_path),
+            call_id=call_id,
+            agent_id="campaign/one/worker",
+            attempt_id=attempt_id,
+            campaign_id="campaign/one",
+            target_id="target-1",
+        )
+        intent = _permitted_target_effect(ancestor_context, arguments)
+        store.records[intent.idempotency_key] = intent.model_copy(
+            update={
+                "state": ToolEffectState.ACKNOWLEDGED,
+                "result_content": "same response",
+                "result_is_error": False,
+                "result_metadata": {"target_session_id": "browser:context-1"},
+            }
+        )
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-current",
+                agent_id="campaign/one/worker",
+                attempt_id="attempt-current",
+                campaign_id="campaign/one",
+                target_id="target-1",
+                effect_attempt_lineage=(
+                    "attempt-a",
+                    "attempt-b",
+                    "attempt-current",
+                ),
+            ),
+            arguments,
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == "same response"
+    assert result.metadata["idempotent_replacement_adoption"] is True
+    assert tool.calls == 0
+    assert len(store.records) == 2
+
+
+def test_conflicting_duplicate_ancestor_effects_block_replacement_dispatch(
+    tmp_path: Path,
+) -> None:
+    store = EffectStore()
+    tool = CountingEffectTool()
+    arguments = {"prompt": "hello"}
+    for attempt_id, call_id, content in (
+        ("attempt-a", "call-a", "first response"),
+        ("attempt-b", "call-b", "different response"),
+    ):
+        ancestor_context = ToolContext(
+            session_id="test-session",
+            workspace_root=str(tmp_path),
+            call_id=call_id,
+            agent_id="campaign/one/worker",
+            attempt_id=attempt_id,
+            campaign_id="campaign/one",
+            target_id="target-1",
+        )
+        intent = _permitted_target_effect(ancestor_context, arguments)
+        store.records[intent.idempotency_key] = intent.model_copy(
+            update={
+                "state": ToolEffectState.ACKNOWLEDGED,
+                "result_content": content,
+                "result_is_error": False,
+                "result_metadata": {"target_session_id": "browser:context-1"},
+            }
+        )
+
+    async def allow(*_args) -> bool:
+        return True
+
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-current",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-current",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        effect_attempt_lineage=("attempt-a", "attempt-b", "attempt-current"),
+    )
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke(
+            "target_chat", context, arguments
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["effect_ambiguous"] is True
+    assert result.metadata["replacement_blocked"] is True
+    assert result.metadata["duplicate_ancestor_effects"] is True
+    assert tool.calls == 0
+    assert len(store.records) == 2
+
+
+def test_permitted_replacement_blocks_wrong_physical_session_ancestor(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    arguments = {"prompt": "hello"}
+    ancestor_context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-ancestor",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-ancestor",
+        campaign_id="campaign/one",
+        target_id="target-1",
+    )
+    ancestor = _permitted_target_effect(ancestor_context, arguments)
+    store.records[ancestor.idempotency_key] = ancestor.model_copy(
+        update={
+            "state": ToolEffectState.ACKNOWLEDGED,
+            "result_content": "old response",
+            "result_is_error": False,
+            "result_metadata": {"target_session_id": "browser:old-context"},
+        }
+    )
+    admissions: list[ToolEffectRecord] = []
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        admissions.append(intent)
+        return "sha256:" + "a" * 64
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-current",
+                agent_id="campaign/one/worker",
+                attempt_id="attempt-current",
+                campaign_id="campaign/one",
+                target_id="target-1",
+                expected_target_session_id="browser:new-context",
+                effect_attempt_lineage=("attempt-ancestor", "attempt-current"),
+            ),
+            arguments,
+            admit,
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["replacement_blocked"] is True
+    assert result.metadata["target_session_identity_mismatch"] is True
+    assert admissions == []
+    assert tool.calls == 0
+
+
+def test_permitted_replacement_can_send_after_revoked_undispatched_ancestor(
+    tmp_path: Path,
+) -> None:
+    store = PermitEffectStore()
+    tool = CountingEffectTool()
+    arguments = {"prompt": "hello"}
+    ancestor_context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-ancestor",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-ancestor",
+        campaign_id="campaign/one",
+        target_id="target-1",
+    )
+    ancestor = _permitted_target_effect(ancestor_context, arguments)
+    store.records[ancestor.idempotency_key] = ancestor.model_copy(
+        update={
+            "state": ToolEffectState.RECONCILED,
+            "result_content": "",
+            "result_is_error": True,
+            "result_metadata": {
+                "target_effect_dispatch_status": "revoked_before_dispatch",
+                "target_session_id": "browser:context-1",
+                "target_effect_attempted": False,
+                "interaction_count": 0,
+                "limit_interaction_count": 0,
+                "target_call_budget_charge": 0,
+            },
+            "reconciliation": "scheduler permit revoked before dispatch",
+        }
+    )
+    permit_digest = "sha256:" + "a" * 64
+
+    async def admit(intent: ToolEffectRecord) -> str:
+        store.records[intent.idempotency_key] = intent
+        store.permits[permit_digest] = intent.idempotency_key
+        return permit_digest
+
+    async def allow(*_args) -> bool:
+        return True
+
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke_with_admission(
+            "target_chat",
+            ToolContext(
+                session_id="test-session",
+                workspace_root=str(tmp_path),
+                call_id="call-current",
+                agent_id="campaign/one/worker",
+                attempt_id="attempt-current",
+                campaign_id="campaign/one",
+                target_id="target-1",
+                expected_target_session_id="browser:context-1",
+                effect_attempt_lineage=("attempt-ancestor", "attempt-current"),
+            ),
+            arguments,
+            admit,
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == "sent"
+    assert tool.calls == 1
+
+
+def test_oversized_target_effect_lineage_fails_closed_before_history_load(
+    tmp_path: Path,
+) -> None:
+    store = EffectStore()
+    tool = CountingEffectTool()
+
+    async def allow(*_args) -> bool:
+        return True
+
+    context = ToolContext(
+        session_id="test-session",
+        workspace_root=str(tmp_path),
+        call_id="call-current",
+        agent_id="campaign/one/worker",
+        attempt_id="attempt-current",
+        campaign_id="campaign/one",
+        target_id="target-1",
+        effect_attempt_lineage=tuple(f"attempt-{index}" for index in range(257)),
+    )
+    result = asyncio.run(
+        ToolBroker((tool,), confirmer=allow, effect_store=store).invoke(
+            "target_chat", context, {"prompt": "hello"}
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata["replacement_blocked"] is True
+    assert result.metadata["effect_lineage_overflow"] is True
+    assert tool.calls == 0
+    assert store.records == {}
 
 
 def test_effectful_call_is_acknowledged_and_replayed_without_second_effect(tmp_path: Path) -> None:
@@ -867,6 +1656,137 @@ def test_target_delivery_receipt_uses_declared_semantics_not_peer_like_name(
 
     assert unknown.metadata["target_delivery_receipt"]["actual_delivery"] == "unknown"
     assert peer.metadata["target_delivery_receipt"]["actual_delivery"] == "inter-agent-message"
+
+
+def test_typed_target_exchange_canonicalizes_omitted_or_conflicting_effect(
+    tmp_path: Path,
+) -> None:
+    class TypedExchange(NamedTool):
+        def __init__(self, name: str, declared_effect: str | None = None) -> None:
+            super().__init__(name)
+            self.invoked = False
+            if declared_effect is not None:
+                self.effect = declared_effect
+
+        def describe(self) -> ToolSpec:
+            return ToolSpec(
+                name=self.name,
+                description="",
+                input_schema={},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+
+        async def invoke(self, context: ToolContext, arguments: dict[str, object]):
+            self.invoked = True
+            return await super().invoke(context, arguments)
+
+    omitted = TypedExchange("typed_omitted")
+    conflicting = TypedExchange("typed_conflicting", "filesystem_write")
+    auxiliary = NamedTool("auxiliary_network")
+    auxiliary.effect = "target_network"
+    broker = ToolBroker((omitted, conflicting, auxiliary))
+
+    assert broker.effect("typed_omitted") == "target_network"
+    assert broker.effect("typed_conflicting") == "target_network"
+    assert broker.effect("auxiliary_network") == "target_network"
+    assert broker.interaction_role("auxiliary_network") is ToolInteractionRole.AUXILIARY
+    assert broker.target_exchange_tool_ids(
+        ("typed_omitted", "typed_conflicting", "auxiliary_network")
+    ) == ("typed_omitted", "typed_conflicting")
+
+    async def deny(*_args) -> bool:
+        return False
+
+    denied = asyncio.run(
+        ToolBroker((omitted,), confirmer=deny).invoke(
+            "typed_omitted",
+            ToolContext(session_id="session", workspace_root=str(tmp_path)),
+            {},
+        )
+    )
+    assert denied.metadata["confirmation_required"] is True
+    assert omitted.invoked is False
+
+    async def allow(*_args) -> bool:
+        return True
+
+    store = EffectStore()
+    allowed = asyncio.run(
+        ToolBroker((conflicting,), confirmer=allow, effect_store=store).invoke(
+            "typed_conflicting",
+            ToolContext(
+                session_id="session",
+                workspace_root=str(tmp_path),
+                call_id="typed-call",
+                attempt_id="typed-attempt",
+            ),
+            {},
+        )
+    )
+    assert allowed.is_error is False
+    assert conflicting.invoked is True
+    assert next(iter(store.records.values())).effect == "target_network"
+
+
+def test_broker_resolves_only_bounded_tool_owned_target_session_identity(
+    tmp_path: Path,
+) -> None:
+    class SessionBoundExchange(NamedTool):
+        def __init__(self, target_session_id: object) -> None:
+            super().__init__("session_bound_exchange")
+            self.target_session_id = target_session_id
+
+        def describe(self) -> ToolSpec:
+            return ToolSpec(
+                name=self.name,
+                description="",
+                input_schema={},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+
+        async def resolve_target_session_id(self, context: ToolContext) -> object:
+            assert context.session_id == "daemon-session"
+            return self.target_session_id
+
+    context = ToolContext(
+        session_id="daemon-session",
+        workspace_root=str(tmp_path),
+    )
+    assert (
+        asyncio.run(
+            ToolBroker((SessionBoundExchange("browser:context-1"),)).resolve_target_session_id(
+                "session_bound_exchange", context
+            )
+        )
+        == "browser:context-1"
+    )
+    bounded = "s" * MAX_TARGET_SESSION_ID_LENGTH
+    assert (
+        asyncio.run(
+            ToolBroker((SessionBoundExchange(bounded),)).resolve_target_session_id(
+                "session_bound_exchange", context
+            )
+        )
+        == bounded
+    )
+    with pytest.raises(ValueError, match="invalid physical target session"):
+        asyncio.run(
+            ToolBroker((SessionBoundExchange(""),)).resolve_target_session_id(
+                "session_bound_exchange", context
+            )
+        )
+    with pytest.raises(ValueError, match="invalid physical target session"):
+        asyncio.run(
+            ToolBroker(
+                (SessionBoundExchange("s" * (MAX_TARGET_SESSION_ID_LENGTH + 1)),)
+            ).resolve_target_session_id("session_bound_exchange", context)
+        )
+    assert (
+        asyncio.run(
+            ToolBroker((NamedTool("offline"),)).resolve_target_session_id("offline", context)
+        )
+        is None
+    )
 
 
 def test_peer_delivery_attribution_survives_durable_broker_restart(tmp_path: Path) -> None:

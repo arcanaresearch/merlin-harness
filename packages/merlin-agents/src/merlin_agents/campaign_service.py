@@ -267,6 +267,11 @@ QUICKSCAN_FOLLOWUP_WAVE_LIMIT = 3
 # digests remain the exact approval authority.
 FRONTIER_PROJECTION_SAMPLE_LIMIT = 32
 
+_INDEPENDENT_SESSION_ACQUISITION_REASON = (
+    "Independent reproduction was not attempted because no daemon-authenticated distinct "
+    "fresh target session was available after the source surface changed."
+)
+
 
 def _bounded_frontier_projection(values: Sequence[object]) -> dict[str, object]:
     """Return a bounded sample plus an exact digest for canonical persisted values."""
@@ -281,6 +286,119 @@ def _bounded_frontier_projection(values: Sequence[object]) -> dict[str, object]:
         "sample": canonical[:FRONTIER_PROJECTION_SAMPLE_LIMIT],
         "omitted": max(0, len(canonical) - FRONTIER_PROJECTION_SAMPLE_LIMIT),
     }
+
+
+def _independent_session_limitation_id(
+    campaign_id: str,
+    source_wave: int,
+    *,
+    finding_count: int,
+    finding_set_digest: str,
+) -> str:
+    if finding_count < 1 or re.fullmatch(r"sha256:[0-9a-f]{64}", finding_set_digest) is None:
+        raise ValueError("independent-session limitation finding projection is invalid")
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "campaign_id": campaign_id,
+                "source_wave": source_wave,
+                "finding_count": finding_count,
+                "finding_set_digest": finding_set_digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return f"independent-session-acquisition-unavailable/{digest}"
+
+
+def _independent_session_finding_projection(
+    finding_ids: Sequence[str],
+) -> tuple[tuple[str, ...], int, str]:
+    """Return a bounded display sample plus exact set identity."""
+
+    canonical = tuple(sorted(set(finding_ids)))
+    if not canonical or any(not isinstance(value, str) or not value for value in canonical):
+        raise ValueError("independent-session limitation finding IDs are invalid")
+    finding_set_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    sample = tuple(
+        value if len(value) <= 512 else "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+        for value in canonical[:FRONTIER_PROJECTION_SAMPLE_LIMIT]
+    )
+    return sample, len(canonical), finding_set_digest
+
+
+def _independent_session_completion_limitations(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    campaign_id: str,
+    session_id: str,
+    target_id: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Project only canonical fail-closed independent-session limitations."""
+
+    limitations: dict[str, Mapping[str, object]] = {}
+    for row in rows:
+        payload = row.get("payload") if isinstance(row, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        finding_ids = payload.get("finding_ids")
+        finding_count = payload.get("finding_count")
+        finding_set_digest = payload.get("finding_set_digest")
+        source_wave = payload.get("source_wave")
+        if (
+            payload.get("kind") != "independent_session_acquisition_unavailable"
+            or payload.get("schema") != "merlin.independent-session-acquisition-unavailable.v1"
+            or payload.get("status") != "unavailable"
+            or payload.get("campaign_id") != campaign_id
+            or payload.get("session_id") != session_id
+            or payload.get("target_id") != target_id
+            or payload.get("validation_mode") != "reproduction"
+            or payload.get("reason_code") != "authoritative_distinct_session_not_prebound"
+            or payload.get("reproduction_provider_attempted") is not False
+            or payload.get("target_effect_attempted") is not False
+            or payload.get("retryable") is not False
+            or payload.get("outcome_classification") != "validation_limitation"
+            or type(source_wave) is not int
+            or source_wave < 0
+            or not isinstance(finding_ids, (tuple, list))
+            or not finding_ids
+            or len(finding_ids) > FRONTIER_PROJECTION_SAMPLE_LIMIT
+            or any(not isinstance(item, str) or not item or len(item) > 512 for item in finding_ids)
+            or tuple(finding_ids) != tuple(sorted(set(finding_ids)))
+            or type(finding_count) is not int
+            or finding_count < len(finding_ids)
+            or not isinstance(finding_set_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", finding_set_digest) is None
+        ):
+            continue
+        limitation_id = _independent_session_limitation_id(
+            campaign_id,
+            source_wave,
+            finding_count=finding_count,
+            finding_set_digest=finding_set_digest,
+        )
+        if (
+            payload.get("limitation_id") != limitation_id
+            or row.get("decision_id") != limitation_id
+            or row.get("payload_digest") != _campaign_digest(dict(payload))
+        ):
+            continue
+        limitations[limitation_id] = {
+            "scope": "validation",
+            "outcome": "blocked",
+            "reason_code": "independent_session_acquisition_unavailable",
+            "finding_ids": tuple(finding_ids),
+            "finding_count": finding_count,
+            "finding_set_digest": finding_set_digest,
+            "reason": _INDEPENDENT_SESSION_ACQUISITION_REASON,
+        }
+    return tuple(limitations[key] for key in sorted(limitations))
 
 
 def _target_reobservation_review_bindings(
@@ -307,18 +425,210 @@ def _target_reobservation_review_bindings(
             continue
         generation_id = item.get("generation_id")
         settlement_id = item.get("settlement_id")
+        target_session_id = item.get("target_session_id")
         if (
             isinstance(generation_id, str)
             and re.fullmatch(r"sha256:[0-9a-f]{64}", generation_id)
             and isinstance(settlement_id, str)
             and settlement_id
             == "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+            and isinstance(target_session_id, str)
+            and 0 < len(target_session_id) <= 256
         ):
             bindings[generation_id] = {
                 "generation_id": generation_id,
                 "settlement_id": settlement_id,
+                "target_session_id": target_session_id,
             }
     return tuple(bindings[key] for key in sorted(bindings))
+
+
+def _legacy_target_surface_observation_v1(
+    row: Mapping[str, object],
+    *,
+    campaign_id: str,
+    session_id: str,
+    target_id: str,
+) -> bool:
+    """Detect only canonically journaled pre-session transition observations."""
+
+    payload = row.get("payload")
+    if not isinstance(payload, Mapping):
+        return False
+    event_digest = payload.get("event_digest")
+    source_task_id = payload.get("source_task_id")
+    target_call_id = payload.get("target_call_id")
+    receipt_sha256 = payload.get("target_receipt_sha256")
+    transition_digest = payload.get("transition_digest")
+    if (
+        payload.get("kind") != "target_surface_transition_observed"
+        or payload.get("schema") != "merlin.target-surface-transition-observed.v1"
+        or payload.get("campaign_id") != campaign_id
+        or payload.get("session_id") != session_id
+        or payload.get("target_id") != target_id
+        or not all(
+            isinstance(item, str) and item
+            for item in (
+                event_digest,
+                source_task_id,
+                target_call_id,
+                receipt_sha256,
+                transition_digest,
+            )
+        )
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt_sha256)) is None
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", str(transition_digest)) is None
+    ):
+        return False
+    expected_event_digest = _campaign_digest(
+        [
+            campaign_id,
+            source_task_id,
+            target_call_id,
+            receipt_sha256,
+            transition_digest,
+        ]
+    )
+    return bool(
+        event_digest == expected_event_digest
+        and payload.get("obligation_id")
+        == "target-reobservation:" + expected_event_digest.removeprefix("sha256:")
+        and row.get("decision_id")
+        == "target-surface-transition-observed/" + expected_event_digest.removeprefix("sha256:")
+        and row.get("payload_digest")
+        == "sha256:"
+        + hashlib.sha256(
+            json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
+def _legacy_target_admission_upgrade_status(value: object) -> str | None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "status",
+        "scanned_count",
+        "upgraded_count",
+        "unresolved_count",
+        "overflow",
+    }:
+        return None
+    status = value.get("status")
+    counts = tuple(
+        value.get(key) for key in ("scanned_count", "upgraded_count", "unresolved_count")
+    )
+    if (
+        value.get("schema") != "merlin.target-admission-legacy-upgrade.v1"
+        or status not in {"clear", "upgraded", "blocked"}
+        or any(type(item) is not int or not 0 <= item <= 256 for item in counts)
+        or type(value.get("overflow")) is not bool
+    ):
+        return None
+    scanned, upgraded, unresolved = counts
+    overflow = value["overflow"]
+    if upgraded + unresolved > scanned:
+        return None
+    if status == "clear":
+        return status if upgraded == unresolved == 0 and overflow is False else None
+    if status == "upgraded":
+        return status if upgraded > 0 and unresolved == 0 and overflow is False else None
+    return status if unresolved > 0 or overflow is True else None
+
+
+def _target_reobservation_superseded_generations(
+    projection: TargetReobservationProjection,
+    selected_generation_id: str,
+    current_latches: Sequence[Mapping[str, object]],
+) -> tuple[int, tuple[Mapping[str, object], ...]]:
+    """Join exact current durable latches to reviewed refresh authority."""
+
+    if not current_latches or len(current_latches) > 256:
+        raise RuntimeError("target admission current latch projection is unbounded")
+    reviewed_by_event_set: dict[tuple[str, str], Mapping[str, str]] = {}
+    for generation_id, settlement in projection.refreshed.items():
+        target_session_id = settlement.get("target_session_id")
+        event_set_digest = settlement.get("event_set_digest")
+        settlement_id = settlement.get("settlement_id")
+        lead_decision_id = projection.reviewed.get(generation_id)
+        if (
+            not isinstance(target_session_id, str)
+            or not target_session_id
+            or len(target_session_id) > 256
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", generation_id) is None
+            or not isinstance(event_set_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", event_set_digest) is None
+            or settlement_id
+            != "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+            or not isinstance(lead_decision_id, str)
+            or re.fullmatch(r"lead-decision:[0-9a-f]{64}", lead_decision_id) is None
+        ):
+            continue
+        reviewed_by_event_set[(target_session_id, event_set_digest)] = {
+            "target_session_id": target_session_id,
+            "generation_id": generation_id,
+            "event_set_digest": event_set_digest,
+            "settlement_id": settlement_id,
+            "lead_decision_id": lead_decision_id,
+        }
+    selected_revision: int | None = None
+    seen_sessions: set[str] = set()
+    superseded: list[Mapping[str, object]] = []
+    for latch in current_latches:
+        if not isinstance(latch, Mapping):
+            raise RuntimeError("target admission current latch projection is invalid")
+        target_session_id = latch.get("target_session_id")
+        revision = latch.get("revision")
+        pending_events = latch.get("pending_event_digests")
+        pending_count = latch.get("pending_event_count")
+        authorized_schedule_id = latch.get("authorized_schedule_id")
+        if (
+            latch.get("state") not in {"latched", "activated"}
+            or not isinstance(target_session_id, str)
+            or not target_session_id
+            or len(target_session_id) > 256
+            or target_session_id in seen_sessions
+            or type(revision) is not int
+            or revision < 1
+            or not isinstance(pending_events, (list, tuple))
+            or not pending_events
+            or len(pending_events) > 256
+            or len(set(pending_events)) != len(pending_events)
+            or any(
+                not isinstance(event, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", event) is None
+                for event in pending_events
+            )
+            or pending_count != len(pending_events)
+            or latch.get("state") == "latched"
+            and authorized_schedule_id is not None
+            or latch.get("state") == "activated"
+            and (not isinstance(authorized_schedule_id, str) or not authorized_schedule_id)
+        ):
+            raise RuntimeError("target admission current latch projection is invalid")
+        seen_sessions.add(target_session_id)
+        event_set_digest = _campaign_digest(
+            {"event_digests": tuple(str(event) for event in pending_events)}
+        )
+        reviewed = reviewed_by_event_set.get((target_session_id, event_set_digest))
+        if reviewed is None or any(
+            latch.get(key) not in {None, reviewed[key]}
+            for key in (
+                "event_set_digest",
+                "generation_id",
+                "settlement_id",
+                "lead_decision_id",
+            )
+        ):
+            raise RuntimeError("target admission current latch lacks reviewed refresh authority")
+        if reviewed["generation_id"] == selected_generation_id:
+            selected_revision = revision
+            continue
+        superseded.append({**reviewed, "latch_revision": revision})
+    if selected_revision is None:
+        raise RuntimeError("selected target admission generation is not currently latched")
+    return (
+        selected_revision,
+        tuple(sorted(superseded, key=lambda item: str(item["target_session_id"]))),
+    )
 
 
 def _frontier_overflow_fields(name: str, projection: Mapping[str, object]) -> dict[str, object]:
@@ -2211,6 +2521,22 @@ class CampaignService:
             )
         )
 
+    def _target_effect_tool_ids(self, assignments: Sequence[WorkerAssignment]) -> tuple[str, ...]:
+        """Resolve every assignment tool that can dispatch to or mutate the target."""
+
+        resolver = getattr(self._agents, "target_effect_tool_ids", None)
+        if not callable(resolver):
+            return self._target_exchange_tool_ids(assignments)
+        return tuple(
+            resolver(
+                tuple(
+                    dict.fromkeys(
+                        tool_id for assignment in assignments for tool_id in assignment.tool_ids
+                    )
+                )
+            )
+        )
+
     async def resolve_reviewed_adapter(
         self, session_id: str, adapter: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -3645,10 +3971,26 @@ class CampaignService:
 
         wave = int(batch["wave"])
         batch_id = str(batch["id"])
-        schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
         persisted_wave = next(
             (item for item in waves if int(item.get("wave", -1)) == wave),
             None,
+        )
+        bound_schedule_id = str(batch.get("schedule_id") or "")
+        persisted_schedule_id = (
+            str(persisted_wave.get("schedule_id") or "")
+            if isinstance(persisted_wave, Mapping)
+            else ""
+        )
+        if (
+            persisted_schedule_id
+            and bound_schedule_id
+            and persisted_schedule_id != bound_schedule_id
+        ):
+            raise RuntimeError("active frontier wave and batch disagree on schedule identity")
+        schedule_id = (
+            persisted_schedule_id
+            or bound_schedule_id
+            or self._campaign_wave_schedule_id(campaign_id, wave)
         )
         prior = next(
             (item for item in waves if int(item.get("wave", -1)) == wave - 1),
@@ -3656,10 +3998,6 @@ class CampaignService:
         )
         prior_live = None
         if persisted_wave is not None:
-            if str(persisted_wave.get("schedule_id") or "") != schedule_id:
-                raise RuntimeError(
-                    "persisted frontier wave is bound to a non-deterministic schedule id"
-                )
             kind = str(persisted_wave.get("kind") or "frontier")
         elif wave == 0:
             kind = "initial"
@@ -3676,9 +4014,20 @@ class CampaignService:
             )
         else:
             kind = "frontier"
-        bound_schedule_id = str(batch.get("schedule_id") or "")
-        if bound_schedule_id and bound_schedule_id != schedule_id:
-            raise RuntimeError("active frontier batch is bound to a non-deterministic schedule id")
+        projection = await self._target_reobservation_projection(campaign_id)
+        reviewed_settlement = projection.latest_refreshed
+        expected_rebound_schedule_id = None
+        if isinstance(reviewed_settlement, Mapping):
+            generation_id = reviewed_settlement.get("generation_id")
+            if projection.reviewed.get(str(generation_id)):
+                expected_rebound_schedule_id = self._target_rebound_wave_schedule_id(
+                    campaign_id,
+                    wave,
+                    reviewed_settlement,
+                )
+        requires_rebound = (
+            expected_rebound_schedule_id is not None and schedule_id != expected_rebound_schedule_id
+        )
         recon_tasks: tuple[AgentTask, ...] = ()
         applicability: Mapping[str, object] | None = None
         recon_source: AgentTask | None = None
@@ -3704,9 +4053,11 @@ class CampaignService:
                     else await verifier(prior_live.id, recon_source)
                 )
         try:
+            if requires_rebound:
+                raise KeyError(schedule_id)
             live = await self._agents.reopen(schedule_id, resume_execution=False)
         except (KeyError, TypeError, ValueError):
-            if bound_schedule_id:
+            if bound_schedule_id and not requires_rebound:
                 raise
             batch_context = replace(
                 context,
@@ -5411,19 +5762,17 @@ class CampaignService:
             # mutable wave counter can address a schedule that does not exist yet.
             source_schedule_id = live.id
             source_evidence = await self._source_evidence(source_schedule_id, tasks)
-            source_transition_obligations = extract_target_reobservation_obligations(
-                campaign_id=campaign_id,
-                session_id=manifest.session_id,
-                target_id=manifest.target.id,
-                source_schedule_id=source_schedule_id,
-                source_wave=initial_wave,
-                task_ids=tuple(task.id for task in tasks),
-                evidence=source_evidence,
+            target_admission_deferred_task_ids = _target_admission_deferred_task_ids(
+                tasks,
+                source_evidence,
             )
-            noncredit_transition_task_ids = frozenset(
-                item.source_task_id
-                for item in source_transition_obligations
-                if item.receipt_projection == "target_ui_transition_receipts"
+            target_surface_transition_task_ids = _target_surface_transition_task_ids(
+                manifest,
+                campaign_id,
+                initial_wave,
+                str(source_schedule_id),
+                tasks,
+                source_evidence,
             )
             if callable(getattr(self._store, "commit_lead_decision", None)):
                 # Authenticate and journal a material target transition before
@@ -5576,16 +5925,18 @@ class CampaignService:
                     campaign_id,
                     initial_wave,
                     tasks,
-                    (noncredit_transition_task_ids if surface_barrier_active else frozenset()),
+                    target_admission_deferred_task_ids | target_surface_transition_task_ids,
                 )
-                frontier_counts = await self._settle_execution_frontier_batch(
-                    campaign_id,
-                    live,
-                    tasks,
-                    evidence=frontier_evidence,
-                    manifest=manifest,
-                    transition_lease=transition_lease,
-                )
+                frontier_counts = None
+                if not surface_barrier_active:
+                    frontier_counts = await self._settle_execution_frontier_batch(
+                        campaign_id,
+                        live,
+                        tasks,
+                        evidence=frontier_evidence,
+                        manifest=manifest,
+                        transition_lease=transition_lease,
+                    )
                 # Incremental semantic reviewers finish while sibling workers are
                 # still running. Their typed merge is now available at this exact
                 # transition boundary, so its candidate recommendations can steer
@@ -5787,6 +6138,26 @@ class CampaignService:
             assessment = live_assessment or await self._assess_and_journal(
                 campaign_id, manifest, initial_wave, tasks
             )
+            deferred_rebound = await self._rebound_deferred_dynamic_specialists(
+                campaign_id,
+                manifest,
+                context,
+                wave=initial_wave,
+                source_schedule_id=str(source_schedule_id),
+                deferred_task_ids=target_admission_deferred_task_ids,
+                frontier_batch=transition_batch,
+            )
+            if deferred_rebound is not None:
+                self._supervisors[campaign_id] = asyncio.create_task(
+                    self._supervise(
+                        campaign_id,
+                        manifest,
+                        context,
+                        deferred_rebound,
+                        initial_wave=initial_wave,
+                    )
+                )
+                return
             source_evidence = await self._source_evidence(source_schedule_id, tasks)
             prior_hypothesis_ids = frozenset(
                 followup.hypothesis.id
@@ -5964,6 +6335,19 @@ class CampaignService:
                 ):
                     if not candidate_ids:
                         continue
+                    if reproduce and await self._record_unavailable_independent_session(
+                        campaign_id,
+                        manifest,
+                        wave,
+                        candidate_ids,
+                    ):
+                        # A transitioned source session is not independent evidence.  Until a
+                        # daemon-authenticated acquisition receipt can bind a distinct physical
+                        # session before target admission, keep the finding provisional without
+                        # starting a worker, provider request, or target call.
+                        independent = False
+                        independence_blocked = True
+                        continue
                     wave += 1
                     validation = self._validator_compilation(
                         manifest,
@@ -5982,7 +6366,9 @@ class CampaignService:
                         "reproduction" if reproduce else "review" if review else "validation",
                         validation,
                     )
-                    validation_schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    validation_schedule_id = await self._persisted_campaign_wave_schedule_id(
+                        campaign_id, wave
+                    )
                     source_schedule_id = validation_schedule_id
                     independence_verifier = getattr(self._agents, "validation_is_independent", None)
                     group_independent = not reproduce or bool(
@@ -6546,7 +6932,9 @@ class CampaignService:
                 wave = candidate_wave
                 tasks = await self._run_wave(campaign_id, manifest, wave, "followup", compiled)
                 await self._journal_language_escalation(campaign_id, wave, escalation_cells, tasks)
-                source_schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                source_schedule_id = await self._persisted_campaign_wave_schedule_id(
+                    campaign_id, wave
+                )
                 wave_evidence = await self._source_evidence(source_schedule_id, tasks)
                 await self._record_arm_outcomes(campaign_id, tasks, wave_evidence, wave=wave)
                 attempt_loader = getattr(self._store, "list_technique_attempts", None)
@@ -6557,23 +6945,18 @@ class CampaignService:
                 )
                 seen.update(_resolved_candidate_keys(tasks, wave_evidence, technique_attempts))
                 if dynamic:
-                    transition_obligations = extract_target_reobservation_obligations(
-                        campaign_id=campaign_id,
-                        session_id=manifest.session_id,
-                        target_id=manifest.target.id,
-                        source_schedule_id=source_schedule_id,
-                        source_wave=wave,
-                        task_ids=tuple(task.id for task in tasks),
-                        evidence=wave_evidence,
-                    )
                     await self._retire_terminal_dynamic_specialists(
                         campaign_id,
                         wave,
                         tasks,
-                        frozenset(
-                            item.source_task_id
-                            for item in transition_obligations
-                            if item.receipt_projection == "target_ui_transition_receipts"
+                        _target_admission_deferred_task_ids(tasks, wave_evidence)
+                        | _target_surface_transition_task_ids(
+                            manifest,
+                            campaign_id,
+                            wave,
+                            str(source_schedule_id),
+                            tasks,
+                            wave_evidence,
                         ),
                     )
                 admitted_hypotheses.update(_resolved_hypothesis_ids(tasks, wave_evidence))
@@ -6760,7 +7143,9 @@ class CampaignService:
                     # later coverage decision and completion seal.
                     campaign_failed = False
                 if wave != previous_wave:
-                    source_schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    source_schedule_id = await self._persisted_campaign_wave_schedule_id(
+                        campaign_id, wave
+                    )
                 admitted_hypotheses.update(continued_hypotheses)
                 budget_capped = await self._campaign_budget_capped(campaign_id)
                 continuation_status = await self.status(campaign_id)
@@ -7861,6 +8246,106 @@ class CampaignService:
             if retired is not record:
                 await self._persist_dynamic_retirement(campaign_id, wave, retired)
 
+    async def _rebound_deferred_dynamic_specialists(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        context: AssignmentContext,
+        *,
+        wave: int,
+        source_schedule_id: str,
+        deferred_task_ids: frozenset[str],
+        frontier_batch: Mapping[str, object] | None,
+    ) -> Any | None:
+        """Re-run only dynamic work held behind a reviewed surface generation."""
+
+        if not deferred_task_ids:
+            return None
+        projection = await self._target_reobservation_projection(campaign_id)
+        settlement = projection.latest_refreshed
+        generation_id = settlement.get("generation_id") if isinstance(settlement, Mapping) else None
+        if (
+            projection.pending
+            or projection.review_pending
+            or not isinstance(generation_id, str)
+            or not projection.reviewed.get(generation_id)
+        ):
+            return None
+        async with self._frontier_transition(campaign_id, required=True) as transition_lease:
+            if transition_lease is None:
+                return None
+            projection = await self._target_reobservation_projection(campaign_id)
+            settlement = projection.latest_refreshed
+            generation_id = (
+                settlement.get("generation_id") if isinstance(settlement, Mapping) else None
+            )
+            if (
+                projection.pending
+                or projection.review_pending
+                or not isinstance(generation_id, str)
+                or not projection.reviewed.get(generation_id)
+            ):
+                return None
+            waves = await asyncio.to_thread(self._store.list_waves, campaign_id)
+            source_wave = next(
+                (item for item in waves if int(item.get("wave", -1)) == wave),
+                None,
+            )
+            if (
+                not isinstance(source_wave, Mapping)
+                or str(source_wave.get("schedule_id") or "") != source_schedule_id
+            ):
+                # Another supervisor already rebound this wave.
+                return None
+            active_frontier_batch: Mapping[str, object] | None = None
+            if frontier_batch is not None:
+                active_loader = getattr(self._store, "load_active_frontier_batch", None)
+                active_frontier_batch = (
+                    await asyncio.to_thread(active_loader, campaign_id)
+                    if callable(active_loader)
+                    else frontier_batch
+                )
+                if (
+                    not isinstance(active_frontier_batch, Mapping)
+                    or str(active_frontier_batch.get("id") or "")
+                    != str(frontier_batch.get("id") or "")
+                    or str(active_frontier_batch.get("schedule_id") or source_schedule_id)
+                    != source_schedule_id
+                ):
+                    return None
+            records = tuple(
+                record
+                for record in await self._durable_dynamic_specialists(campaign_id)
+                if record.state == "active" and record.assignment.id in deferred_task_ids
+            )
+            if not records:
+                return None
+            compiled = CampaignCompilation(
+                tuple(record.assignment for record in records),
+                tuple(
+                    compile_worker_context(
+                        manifest,
+                        record.assignment,
+                        record.profile,
+                        capability_grant=profile_grant(
+                            "adversarial-explorer", target_scope=manifest.target.id
+                        ),
+                    )
+                    for record in records
+                ),
+            )
+            return await self._start_wave(
+                campaign_id,
+                manifest,
+                wave,
+                str(source_wave.get("kind") or "followup"),
+                compiled,
+                frontier_batch_id=(
+                    None if active_frontier_batch is None else str(active_frontier_batch["id"])
+                ),
+                transition_lease=transition_lease,
+            )
+
     async def _admit_dynamic_specialists(
         self,
         campaign_id: str,
@@ -8879,7 +9364,7 @@ class CampaignService:
             tasks = await self._run_wave(
                 campaign_id, manifest, wave, "operator-continuation", compiled
             )
-            source_schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+            source_schedule_id = await self._persisted_campaign_wave_schedule_id(campaign_id, wave)
             wave_evidence = await self._source_evidence(source_schedule_id, tasks)
             await self._record_arm_outcomes(campaign_id, tasks, wave_evidence, wave=wave)
             attempt_loader = getattr(self._store, "list_technique_attempts", None)
@@ -8890,23 +9375,18 @@ class CampaignService:
             )
             seen.update(_resolved_candidate_keys(tasks, wave_evidence, technique_attempts))
             if dynamic:
-                transition_obligations = extract_target_reobservation_obligations(
-                    campaign_id=campaign_id,
-                    session_id=manifest.session_id,
-                    target_id=manifest.target.id,
-                    source_schedule_id=source_schedule_id,
-                    source_wave=wave,
-                    task_ids=tuple(task.id for task in tasks),
-                    evidence=wave_evidence,
-                )
                 await self._retire_terminal_dynamic_specialists(
                     campaign_id,
                     wave,
                     tasks,
-                    frozenset(
-                        item.source_task_id
-                        for item in transition_obligations
-                        if item.receipt_projection == "target_ui_transition_receipts"
+                    _target_admission_deferred_task_ids(tasks, wave_evidence)
+                    | _target_surface_transition_task_ids(
+                        manifest,
+                        campaign_id,
+                        wave,
+                        str(source_schedule_id),
+                        tasks,
+                        wave_evidence,
                     ),
                 )
             if await self._campaign_budget_capped(campaign_id):
@@ -9609,6 +10089,11 @@ class CampaignService:
             committed = evidence.get(task.id)
             if not isinstance(committed, Mapping):
                 continue
+            if committed.get("error_code") == "target_admission_latched":
+                # This worker was stopped by the authenticated surface barrier
+                # before a fresh adapter generation existed. It is deferred
+                # control-plane work, not an attack or infrastructure outcome.
+                continue
             catalogue_arm = False
             if not isinstance(arm, Mapping):
                 identities = tuple(
@@ -10154,7 +10639,7 @@ class CampaignService:
         *,
         source_evidence_override: Mapping[str, Mapping[str, object]] | None = None,
     ) -> LeadAssessment:
-        schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+        schedule_id = await self._persisted_campaign_wave_schedule_id(campaign_id, wave)
         source_evidence = (
             await self._source_evidence(schedule_id, tasks)
             if source_evidence_override is None
@@ -10443,6 +10928,23 @@ class CampaignService:
                 if current is not None and self._supervisors.get(campaign_id) is current:
                     current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
                 return False
+            settlement = projection.latest_refreshed
+            if isinstance(settlement, Mapping):
+                generation_id = str(settlement.get("generation_id") or "")
+                lead_decision_id = projection.reviewed.get(generation_id)
+                resolution = {
+                    "campaign_id": campaign_id,
+                    "session_id": settlement.get("session_id"),
+                    "target_id": settlement.get("target_id"),
+                    "target_session_id": settlement.get("target_session_id"),
+                    "generation_id": generation_id,
+                    "event_set_digest": settlement.get("event_set_digest"),
+                    "settlement_id": settlement.get("settlement_id"),
+                    "lead_decision_id": lead_decision_id,
+                }
+                if any(not isinstance(value, str) or not value for value in resolution.values()):
+                    raise RuntimeError("terminal target admission authority is incomplete")
+                await self._agents.resolve_target_admission_terminal(resolution)
         # Production stores expose the full projection/decision surface.  Tiny legacy
         # protocol fakes retain terminal compatibility, but cannot claim a completion
         # receipt or generate a production report.
@@ -12181,13 +12683,103 @@ class CampaignService:
         target_id = getattr(getattr(manifest, "target", None), "id", None)
         if not isinstance(session_id, str) or not isinstance(target_id, str):
             return project_target_reobservations(())
+        legacy_upgrader = getattr(self._store, "upgrade_legacy_target_admission", None)
+        legacy_upgrade: object = None
+        if callable(legacy_upgrader):
+            legacy_upgrade = await asyncio.to_thread(
+                legacy_upgrader,
+                campaign_id,
+                session_id,
+                target_id,
+            )
         rows = await asyncio.to_thread(loader, campaign_id)
+        has_legacy_v1 = any(
+            _legacy_target_surface_observation_v1(
+                row,
+                campaign_id=campaign_id,
+                session_id=session_id,
+                target_id=target_id,
+            )
+            for row in rows
+            if isinstance(row, Mapping)
+        )
+        legacy_status = _legacy_target_admission_upgrade_status(legacy_upgrade)
+        if legacy_status == "blocked" or (
+            has_legacy_v1 and legacy_status not in {"clear", "upgraded"}
+        ):
+            raise _TargetReobservationBlocked(
+                "legacy target transition requires authenticated session adoption"
+            )
         return project_target_reobservations(
             tuple(rows),
             campaign_id=campaign_id,
             session_id=session_id,
             target_id=target_id,
         )
+
+    async def _current_target_admission_latches(
+        self, campaign_id: str, manifest: CampaignManifest
+    ) -> tuple[Mapping[str, object], ...]:
+        """Load only the compact durable latch rows current at activation time."""
+
+        loader = getattr(self._agents, "current_target_admission_latches", None)
+        if not callable(loader):
+            raise RuntimeError("scheduler cannot project current target admission latches")
+        rows = await loader(campaign_id, manifest.session_id, manifest.target.id)
+        if not isinstance(rows, (list, tuple)):
+            raise RuntimeError("scheduler returned an invalid target admission projection")
+        return tuple(rows)
+
+    async def _record_unavailable_independent_session(
+        self,
+        campaign_id: str,
+        manifest: CampaignManifest,
+        source_wave: int,
+        finding_ids: Sequence[str],
+    ) -> bool:
+        """Fail closed when post-transition reproduction lacks fresh-session authority."""
+
+        projection = await self._target_reobservation_projection(campaign_id)
+        if not projection.observation_sequences:
+            return False
+        # Strategy-contract values are model-visible scheduling data, not proof that a new
+        # physical target session exists.  A future acquisition path must validate a
+        # daemon-sealed distinct-session receipt before changing this fail-closed outcome.
+        bounded_finding_ids, finding_count, finding_set_digest = (
+            _independent_session_finding_projection(finding_ids)
+        )
+        limitation_id = _independent_session_limitation_id(
+            campaign_id,
+            source_wave,
+            finding_count=finding_count,
+            finding_set_digest=finding_set_digest,
+        )
+        await self._commit_target_reobservation_event(
+            campaign_id,
+            source_wave,
+            limitation_id,
+            {
+                "kind": "independent_session_acquisition_unavailable",
+                "schema": "merlin.independent-session-acquisition-unavailable.v1",
+                "limitation_id": limitation_id,
+                "status": "unavailable",
+                "campaign_id": campaign_id,
+                "session_id": manifest.session_id,
+                "target_id": manifest.target.id,
+                "source_wave": source_wave,
+                "finding_ids": list(bounded_finding_ids),
+                "finding_count": finding_count,
+                "finding_set_digest": finding_set_digest,
+                "validation_mode": "reproduction",
+                "reason_code": "authoritative_distinct_session_not_prebound",
+                "reason": _INDEPENDENT_SESSION_ACQUISITION_REASON,
+                "reproduction_provider_attempted": False,
+                "target_effect_attempted": False,
+                "retryable": False,
+                "outcome_classification": "validation_limitation",
+            },
+        )
+        return True
 
     async def _commit_target_reobservation_event(
         self,
@@ -13634,7 +14226,7 @@ class CampaignService:
                                 compiled,
                             )
                 except TimeoutError:
-                    schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    schedule_id = await self._persisted_campaign_wave_schedule_id(campaign_id, wave)
                     await self._agents.cancel_schedule(
                         schedule_id,
                         reason="objective-phase-gate-time-budget-exhausted",
@@ -13649,7 +14241,7 @@ class CampaignService:
                     }
                 else:
                     elapsed_seconds += max(0.0, time.monotonic() - attempt_started)
-                    schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+                    schedule_id = await self._persisted_campaign_wave_schedule_id(campaign_id, wave)
                     evidence = await self._source_evidence(schedule_id, tasks)
                     settled = dict(
                         await self._settle_objective_phase_gate(
@@ -13752,7 +14344,7 @@ class CampaignService:
             "objective_prerequisite",
             compiled,
         )
-        schedule_id = self._campaign_wave_schedule_id(campaign_id, navigation_wave)
+        schedule_id = await self._persisted_campaign_wave_schedule_id(campaign_id, navigation_wave)
         evidence = await self._source_evidence(schedule_id, tasks)
         await self._record_worker_objective_selector_resolutions(
             manifest,
@@ -13918,7 +14510,17 @@ class CampaignService:
         manifest: CampaignManifest,
         context: AssignmentContext,
         generation: TargetReobservationGeneration,
+        start_decision_id: str,
     ) -> CampaignCompilation:
+        expected_start_prefix = (
+            "target-reobservation-started/" + generation.generation_id.removeprefix("sha256:") + "/"
+        )
+        if (
+            not start_decision_id.startswith(expected_start_prefix)
+            or not start_decision_id.removeprefix(expected_start_prefix).isdigit()
+            or int(start_decision_id.removeprefix(expected_start_prefix)) < 1
+        ):
+            raise ValueError("target re-observation start decision identity is invalid")
         parent = compile_recon_campaign(manifest, context).assignments[0]
         tools = tuple(tool for tool in _TARGET_REOBSERVATION_TOOLS if tool in manifest.tool_ids)
         missing = sorted(_TARGET_REOBSERVATION_REQUIRED_TOOLS - set(tools))
@@ -13931,9 +14533,11 @@ class CampaignService:
             "schema": "merlin.target-reobservation.v1",
             "obligation_id": generation.obligation_id,
             "generation_id": generation.generation_id,
+            "target_session_id": generation.target_session_id,
             "event_digests": json.dumps(generation.event_digests, separators=(",", ":")),
             "event_set_digest": _campaign_digest({"event_digests": generation.event_digests}),
             "observation_cutoff_sequence": str(generation.observation_cutoff_sequence),
+            "target_reobservation_start_decision_id": start_decision_id,
         }
         assignment = replace(
             parent,
@@ -13995,13 +14599,14 @@ class CampaignService:
         return target_reobservation_schedule_id(campaign_id, generation_id, attempt)
 
     async def _resolve_target_reobservation_handoff(
-        self, manifest: CampaignManifest, handoff_id: str
+        self, manifest: CampaignManifest, handoff_id: str, target_session_id: str
     ) -> tuple[ContextDocument, str, str, str]:
         resolved = await self.resolve_reviewed_adapter(
             manifest.session_id,
             {
                 "recon_handoff_id": handoff_id,
                 "expected_target_id": manifest.target.id,
+                "expected_target_session_id": target_session_id,
             },
         )
         original = next(
@@ -14083,7 +14688,9 @@ class CampaignService:
                     _,
                     compiled_digest,
                     reviewed_digest,
-                ) = await self._resolve_target_reobservation_handoff(manifest, handoff_id)
+                ) = await self._resolve_target_reobservation_handoff(
+                    manifest, handoff_id, generation.target_session_id
+                )
             except (KeyError, TypeError, ValueError) as error:
                 blocker = f"target re-observation handoff validation failed: {error}"
             if blocker is None:
@@ -14111,6 +14718,8 @@ class CampaignService:
                         and receipt.get("campaign_id") == campaign_id
                         and receipt.get("session_id") == manifest.session_id
                         and receipt.get("target_id") == manifest.target.id
+                        and "browser:" + str(receipt.get("context_id"))
+                        == generation.target_session_id
                         and receipt.get("generation_id") == generation.generation_id
                         and receipt.get("event_set_digest") == expected_event_set
                         and receipt.get("assignment_id") == expected_assignment_id
@@ -14155,6 +14764,7 @@ class CampaignService:
             "campaign_id": campaign_id,
             "session_id": manifest.session_id,
             "target_id": manifest.target.id,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": generation.event_digests,
@@ -14277,6 +14887,7 @@ class CampaignService:
                         "campaign_id": campaign_id,
                         "session_id": manifest.session_id,
                         "target_id": manifest.target.id,
+                        "target_session_id": generation.target_session_id,
                         "generation_id": generation.generation_id,
                         "obligation_id": generation.obligation_id,
                         "event_digests": generation.event_digests,
@@ -14291,7 +14902,17 @@ class CampaignService:
                 )
             else:
                 attempt = tuple(projection.starts[generation.generation_id]).index(schedule_id) + 1
-            compilation = self._target_reobservation_compilation(manifest, context, generation)
+            start_decision_id = (
+                "target-reobservation-started/"
+                + generation.generation_id.removeprefix("sha256:")
+                + f"/{attempt}"
+            )
+            compilation = self._target_reobservation_compilation(
+                manifest,
+                context,
+                generation,
+                start_decision_id,
+            )
             contexts = {item.assignment_id: item for item in compilation.worker_contexts}
             status_reader = getattr(self._agents, "schedule_status", None)
             schedule_status = await status_reader(schedule_id) if callable(status_reader) else None
@@ -14347,7 +14968,7 @@ class CampaignService:
         manifest: CampaignManifest,
         compilation: CampaignCompilation,
     ) -> CampaignCompilation:
-        target_tools = frozenset(self._target_exchange_tool_ids(compilation.assignments))
+        target_tools = frozenset(self._target_effect_tool_ids(compilation.assignments))
         if not target_tools:
             return compilation
         settled = (await self._target_reobservation_projection(campaign_id)).latest_refreshed
@@ -14355,20 +14976,47 @@ class CampaignService:
             return compilation
         handoff_id = settled.get("recon_handoff_id")
         surface_digest = settled.get("current_surface_digest")
-        if not isinstance(handoff_id, str) or not isinstance(surface_digest, str):
+        target_session_id = settled.get("target_session_id")
+        generation_id = settled.get("generation_id")
+        event_set_digest = settled.get("event_set_digest")
+        if (
+            not isinstance(handoff_id, str)
+            or not isinstance(surface_digest, str)
+            or not isinstance(target_session_id, str)
+            or not isinstance(generation_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", generation_id) is None
+            or not isinstance(event_set_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", event_set_digest) is None
+        ):
             raise RuntimeError("settled target re-observation adapter identity is incomplete")
         (
             guidance_document,
             compiled_adapter,
             compiled_digest,
             reviewed_digest,
-        ) = await self._resolve_target_reobservation_handoff(manifest, handoff_id)
+        ) = await self._resolve_target_reobservation_handoff(
+            manifest, handoff_id, target_session_id
+        )
         if (
             compiled_digest != settled.get("compiled_adapter_digest")
             or reviewed_digest != settled.get("reviewed_adapter_digest")
             or re.fullmatch(r"sha256:[0-9a-f]{64}", surface_digest) is None
         ):
             raise RuntimeError("target re-observation adapter identity changed after settlement")
+        _header, separator, reviewed_adapter_json = guidance_document.content.partition("\n")
+        if not separator or len(reviewed_adapter_json) > 1_000_000:
+            raise RuntimeError("target re-observation reviewed adapter projection is invalid")
+        try:
+            reviewed_adapter = json.loads(reviewed_adapter_json)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                "target re-observation reviewed adapter projection is malformed"
+            ) from error
+        if not isinstance(reviewed_adapter, Mapping):
+            raise RuntimeError("target re-observation reviewed adapter projection is invalid")
+        reviewed_adapter_json = json.dumps(
+            dict(reviewed_adapter), sort_keys=True, separators=(",", ":")
+        )
         rebound: dict[str, WorkerAssignment] = {}
         assignments: list[WorkerAssignment] = []
         for assignment in compilation.assignments:
@@ -14380,9 +15028,13 @@ class CampaignService:
             contract.update(
                 {
                     "reviewed_adapter_digest": reviewed_digest,
+                    "reviewed_adapter": reviewed_adapter_json,
                     "compiled_adapter": compiled_adapter,
                     "compiled_adapter_digest": compiled_digest,
                     "initial_state_equivalence_digest": surface_digest,
+                    "target_session_id": target_session_id,
+                    "target_reobservation_generation_id": generation_id,
+                    "target_reobservation_event_set_digest": event_set_digest,
                 }
             )
             updated = replace(
@@ -14450,7 +15102,39 @@ class CampaignService:
             and inherited_transition[0] == campaign_id
         ):
             transition_lease = inherited_transition[1]
-        target_tools = self._target_exchange_tool_ids(compiled.assignments)
+        if transition_lease is None:
+            # Every path that can create a campaign-wave schedule shares one
+            # cross-daemon transition fence.  Callers that already own the
+            # fence pass it through; direct, validation, operator, and recovery
+            # continuations acquire it here before the scheduler can persist a
+            # new artifact.
+            async with self._frontier_transition(campaign_id, required=True) as acquired_transition:
+                if acquired_transition is None:
+                    raise RuntimeError(
+                        "frontier transition lease is unavailable before schedule submission"
+                    )
+                return await self._start_wave(
+                    campaign_id,
+                    manifest,
+                    wave,
+                    kind,
+                    compiled,
+                    frontier_batch_id=frontier_batch_id,
+                    transition_lease=acquired_transition,
+                    recon_tasks=recon_tasks,
+                    recon_applicability=recon_applicability,
+                )
+        lease_kwargs = transition_lease.store_kwargs
+        validate_transition = getattr(self._store, "validate_frontier_transition", None)
+        if lease_kwargs and callable(validate_transition):
+            lease_valid = await asyncio.to_thread(
+                validate_transition,
+                lease_kwargs["claim_id"],
+                lease_kwargs["claimant_id"],
+            )
+            if not lease_valid:
+                raise RuntimeError("frontier transition lease expired before schedule submission")
+        target_tools = self._target_effect_tool_ids(compiled.assignments)
         if target_tools:
             row = await asyncio.to_thread(self._store.get, campaign_id)
             envelope = row.get("manifest") if isinstance(row, Mapping) else None
@@ -14486,7 +15170,7 @@ class CampaignService:
         scheduled = CampaignCompilation(assignments, compiled.worker_contexts)
         compiled = (
             scheduled
-            if kind == "validation"
+            if kind in {"validation", "reproduction"}
             else await self._rebind_compilation_to_target_reobservation(
                 campaign_id,
                 manifest,
@@ -14496,6 +15180,31 @@ class CampaignService:
         adapter_rebound = compiled is not scheduled
         assignments = compiled.assignments
         worker_contexts = {item.assignment_id: item for item in compiled.worker_contexts}
+        rebound_settlement: Mapping[str, object] | None = None
+        rebound_projection: TargetReobservationProjection | None = None
+        schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+        superseded_schedule_id: str | None = None
+        if adapter_rebound:
+            rebound_projection = await self._target_reobservation_projection(campaign_id)
+            rebound_settlement = rebound_projection.latest_refreshed
+            if not isinstance(rebound_settlement, Mapping):
+                raise RuntimeError("refreshed target admission lost its settlement authority")
+            schedule_id = self._target_rebound_wave_schedule_id(
+                campaign_id,
+                wave,
+                rebound_settlement,
+            )
+            wave_loader = getattr(self._store, "list_waves", None)
+            if callable(wave_loader):
+                persisted_waves = await asyncio.to_thread(wave_loader, campaign_id)
+                persisted_wave = next(
+                    (item for item in persisted_waves if int(item.get("wave", -1)) == wave),
+                    None,
+                )
+                if isinstance(persisted_wave, Mapping):
+                    persisted_schedule_id = str(persisted_wave.get("schedule_id") or "")
+                    if persisted_schedule_id and persisted_schedule_id != schedule_id:
+                        superseded_schedule_id = persisted_schedule_id
         live = await self._agents.submit(
             manifest.session_id,
             assignments,
@@ -14505,7 +15214,7 @@ class CampaignService:
             worker_contexts=worker_contexts,
             start_immediately=False,
             minimum_workers=1,
-            schedule_id=self._campaign_wave_schedule_id(campaign_id, wave),
+            schedule_id=schedule_id,
             grants=_schedule_grant_universe(assignments),
         )
         if adapter_rebound and (
@@ -14521,7 +15230,7 @@ class CampaignService:
             raise RuntimeError(
                 "deterministic schedule identity conflicts with refreshed target adapter"
             )
-        if frontier_batch_id is not None:
+        if frontier_batch_id is not None and superseded_schedule_id is None:
             lease_kwargs = {} if transition_lease is None else dict(transition_lease.store_kwargs)
             binder = (
                 getattr(self._store, "bind_frontier_batch_fenced", None)
@@ -14541,18 +15250,98 @@ class CampaignService:
             if transition_lease is not None and transition_lease.store_kwargs
             else None
         )
-        await asyncio.to_thread(
-            wave_writer if callable(wave_writer) else self._store.add_wave,
-            campaign_id,
-            wave,
-            kind,
-            live.id,
-            **(
-                transition_lease.store_kwargs
-                if callable(wave_writer) and transition_lease is not None
-                else {}
-            ),
-        )
+        if superseded_schedule_id is None:
+            await asyncio.to_thread(
+                wave_writer if callable(wave_writer) else self._store.add_wave,
+                campaign_id,
+                wave,
+                kind,
+                live.id,
+                **(
+                    transition_lease.store_kwargs
+                    if callable(wave_writer) and transition_lease is not None
+                    else {}
+                ),
+            )
+        if adapter_rebound:
+            assert rebound_projection is not None
+            assert rebound_settlement is not None
+            projection = rebound_projection
+            settlement = rebound_settlement
+            generation_id = settlement.get("generation_id")
+            lead_decision_id = projection.reviewed.get(str(generation_id))
+            activation = {
+                "campaign_id": campaign_id,
+                "session_id": manifest.session_id,
+                "target_id": manifest.target.id,
+                "target_session_id": settlement.get("target_session_id"),
+                "generation_id": generation_id,
+                "event_set_digest": settlement.get("event_set_digest"),
+                "settlement_id": settlement.get("settlement_id"),
+                "lead_decision_id": lead_decision_id,
+                "schedule_id": live.id,
+                "current_surface_digest": settlement.get("current_surface_digest"),
+                "compiled_adapter_digest": settlement.get("compiled_adapter_digest"),
+                "reviewed_adapter_digest": settlement.get("reviewed_adapter_digest"),
+                "wave": wave,
+                "kind": kind,
+            }
+            activation_lease = transition_lease.store_kwargs if transition_lease is not None else {}
+            if set(activation_lease) != {"claim_id", "claimant_id"}:
+                raise RuntimeError(
+                    "refreshed target admission requires a live frontier transition lease"
+                )
+            activation.update(activation_lease)
+            if superseded_schedule_id is not None:
+                activation["source_schedule_id"] = superseded_schedule_id
+            if frontier_batch_id is not None:
+                activation["frontier_batch_id"] = frontier_batch_id
+            if any(
+                not isinstance(activation.get(key), str) or not activation[key]
+                for key in (
+                    "campaign_id",
+                    "session_id",
+                    "target_id",
+                    "target_session_id",
+                    "generation_id",
+                    "event_set_digest",
+                    "settlement_id",
+                    "lead_decision_id",
+                    "schedule_id",
+                    "current_surface_digest",
+                    "compiled_adapter_digest",
+                    "reviewed_adapter_digest",
+                    "claim_id",
+                    "claimant_id",
+                )
+            ):
+                raise RuntimeError("refreshed target admission authority is incomplete")
+            target_assignment_tools = {
+                assignment.id: sorted(set(self._target_effect_tool_ids((assignment,))))
+                for assignment in assignments
+                if dict(assignment.strategy_contract).get("target_reobservation_generation_id")
+                == generation_id
+            }
+            if not target_assignment_tools:
+                raise RuntimeError("refreshed target admission has no rebound target assignment")
+            current_latches = await self._current_target_admission_latches(campaign_id, manifest)
+            latch_revision, superseded_generations = _target_reobservation_superseded_generations(
+                projection, str(generation_id), current_latches
+            )
+            activation["latch_revision"] = latch_revision
+            activation["target_assignment_tools"] = target_assignment_tools
+            activation["superseded_generations"] = superseded_generations
+            await self._agents.activate_target_admission(activation)
+            if superseded_schedule_id is not None:
+                await self._agents.stop_local_schedule(superseded_schedule_id)
+                reject = getattr(self._agents, "reject_persisted_schedule", None)
+                if callable(reject):
+                    await reject(
+                        superseded_schedule_id,
+                        reason=(
+                            "superseded by reviewed target-surface generation " + str(generation_id)
+                        ),
+                    )
         if recon_tasks:
             guidance_ready = await self._publish_recon_guidance_to_assignments(
                 campaign_id,
@@ -14590,6 +15379,55 @@ class CampaignService:
     @staticmethod
     def _campaign_wave_schedule_id(campaign_id: str, wave: int) -> str:
         return str(uuid5(NAMESPACE_URL, f"merlin.campaign-wave.v1\n{campaign_id}\n{wave}"))
+
+    async def _persisted_campaign_wave_schedule_id(self, campaign_id: str, wave: int) -> str:
+        """Resolve the durable schedule bound to a wave, including a rebound."""
+
+        loader = getattr(self._store, "list_waves", None)
+        if callable(loader):
+            waves = await asyncio.to_thread(loader, campaign_id)
+            persisted = next(
+                (item for item in waves if int(item.get("wave", -1)) == wave),
+                None,
+            )
+            if isinstance(persisted, Mapping):
+                schedule_id = persisted.get("schedule_id")
+                if isinstance(schedule_id, str) and schedule_id:
+                    return schedule_id
+        return self._campaign_wave_schedule_id(campaign_id, wave)
+
+    @staticmethod
+    def _target_rebound_wave_schedule_id(
+        campaign_id: str,
+        wave: int,
+        settlement: Mapping[str, object],
+    ) -> str:
+        """Bind a replacement schedule to the exact reviewed surface generation."""
+
+        fields = tuple(
+            settlement.get(key)
+            for key in (
+                "generation_id",
+                "event_set_digest",
+                "current_surface_digest",
+                "compiled_adapter_digest",
+                "reviewed_adapter_digest",
+            )
+        )
+        if any(
+            not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in fields
+        ):
+            raise RuntimeError("refreshed target schedule identity is incomplete")
+        identity = "\n".join(
+            (
+                "merlin.campaign-wave-rebound.v1",
+                campaign_id,
+                str(wave),
+                *(str(value) for value in fields),
+            )
+        )
+        return str(uuid5(NAMESPACE_URL, identity))
 
     async def _record_lessons(
         self,
@@ -16346,7 +17184,12 @@ class CampaignService:
                 commit = getattr(self._store, "commit_lead_decision", None)
                 if commit is not None:
                     wave = current_wave
+                    source_ids = tuple(sorted(str(row["id"]) for row in pending))
                     payload = {
+                        "schema": "merlin.campaign-lead-decision.v1",
+                        "campaign_id": manifest.id,
+                        "wave": wave,
+                        "source_message_ids": source_ids,
                         "summary": verified.summary,
                         "coverage_complete": verified.coverage_complete,
                         "finish_current_work": verified.finish_current_work,
@@ -16365,7 +17208,6 @@ class CampaignService:
                         payload["target_reobservation_generations"] = list(
                             presented_reobservation_events
                         )
-                    source_ids = tuple(sorted(str(row["id"]) for row in pending))
                     identity_body = json.dumps(
                         {
                             "campaign_id": manifest.id,
@@ -17670,7 +18512,27 @@ class CampaignService:
             if not isinstance(active, Mapping) or str(active.get("id")) != str(batch.get("id")):
                 return None
             wave = int(active["wave"])
-            schedule_id = self._campaign_wave_schedule_id(campaign_id, wave)
+            persisted_wave = next(
+                (item for item in waves if int(item.get("wave", -1)) == wave),
+                None,
+            )
+            persisted_schedule_id = (
+                str(persisted_wave.get("schedule_id") or "")
+                if isinstance(persisted_wave, Mapping)
+                else ""
+            )
+            bound_schedule_id = str(active.get("schedule_id") or "")
+            if (
+                persisted_schedule_id
+                and bound_schedule_id
+                and persisted_schedule_id != bound_schedule_id
+            ):
+                raise RuntimeError("active frontier wave and batch disagree on schedule identity")
+            schedule_id = (
+                persisted_schedule_id
+                or bound_schedule_id
+                or self._campaign_wave_schedule_id(campaign_id, wave)
+            )
             existing_live = None
             if transition_lease.store_kwargs:
                 try:
@@ -17678,10 +18540,6 @@ class CampaignService:
                 except (KeyError, TypeError, ValueError):
                     pass
             if existing_live is not None:
-                persisted_wave = next(
-                    (item for item in waves if int(item.get("wave", -1)) == wave),
-                    None,
-                )
                 if isinstance(persisted_wave, Mapping):
                     kind = str(persisted_wave.get("kind") or "frontier")
                 elif wave == 0:
@@ -17974,6 +18832,7 @@ class CampaignService:
                     "schema": "merlin.target-reobservation-recovery-state.v1",
                     "phase": claimed.phase,
                     "generation_id": claimed.generation_id,
+                    "target_session_id": claimed.target_session_id,
                     "event_set_digest": claimed.event_set_digest,
                     "source_wave": claimed.source_wave,
                     "schedule_id": claimed.schedule_id,
@@ -19787,6 +20646,12 @@ class CampaignService:
                 )
             )
         )
+        independent_session_limitations = _independent_session_completion_limitations(
+            lead,
+            campaign_id=campaign_id,
+            session_id=manifest.session_id,
+            target_id=manifest.target.id,
+        )
         completion_document = {
             "schema": (
                 "merlin.campaign-completion.v2"
@@ -19813,6 +20678,7 @@ class CampaignService:
                     }
                     for (task_id, technique_id), (outcome, reason) in sorted(limited_cells.items())
                 )
+                + independent_session_limitations
                 + (
                     (
                         {
@@ -20703,6 +21569,7 @@ class CampaignService:
                     "campaign_id": generation.campaign_id,
                     "session_id": generation.session_id,
                     "target_id": generation.target_id,
+                    "target_session_id": generation.target_session_id,
                     "generation_id": generation.generation_id,
                     "obligation_id": generation.obligation_id,
                     "event_set_digest": _campaign_digest(
@@ -24378,6 +25245,142 @@ def _resolved_candidate_keys(
             ) in {"confirmed", "refuted"}:
                 resolved.add(identity.key)
     return resolved
+
+
+def _target_admission_deferred_task_ids(
+    tasks: Sequence[AgentTask],
+    evidence: Mapping[str, Mapping[str, object]],
+) -> frozenset[str]:
+    """Identify only terminal siblings deferred by the authenticated target latch."""
+
+    return frozenset(
+        task.id
+        for task in tasks
+        if task.status == "cancelled"
+        and isinstance((committed := evidence.get(task.id)), Mapping)
+        and committed.get("error_code") == "target_admission_latched"
+        and _authenticated_target_admission_hold(task, committed)
+    )
+
+
+def _target_surface_transition_task_ids(
+    manifest: CampaignManifest,
+    campaign_id: str,
+    wave: int,
+    schedule_id: str,
+    tasks: Sequence[AgentTask],
+    evidence: Mapping[str, Mapping[str, object]],
+) -> frozenset[str]:
+    """Keep authenticated transition sources routable until passive refresh settles."""
+
+    return frozenset(
+        obligation.source_task_id
+        for obligation in extract_target_reobservation_obligations(
+            campaign_id=campaign_id,
+            session_id=manifest.session_id,
+            target_id=manifest.target.id,
+            source_schedule_id=schedule_id,
+            source_wave=wave,
+            task_ids=tuple(task.id for task in tasks),
+            evidence=evidence,
+        )
+        if obligation.receipt_projection == "target_ui_transition_receipts"
+    )
+
+
+def _authenticated_target_admission_hold(
+    task: AgentTask,
+    committed: Mapping[str, object],
+) -> bool:
+    """Accept only a daemon-authenticated, exact zero-effect admission hold."""
+
+    structured = committed.get("structured_result")
+    hold = structured.get("control_plane_hold") if isinstance(structured, Mapping) else None
+    if not isinstance(hold, Mapping):
+        return False
+    required = {
+        "schema",
+        "task_id",
+        "assignment_id",
+        "attempt_id",
+        "technique_attempt_id",
+        "tool_name",
+        "call_id",
+        "failure_code",
+        "target_session_id",
+        "receipt_sha256",
+        "effect_applied",
+        "target_effect_attempted",
+        "interaction_count",
+        "limit_interaction_count",
+        "target_call_budget_charge",
+        "target_call_ids",
+        "target_evidence",
+        "target_ui_transitions",
+    }
+    if set(hold) != required:
+        return False
+    target_session_id = hold.get("target_session_id")
+    marker_fields = (
+        "schema",
+        "assignment_id",
+        "attempt_id",
+        "technique_attempt_id",
+        "tool_name",
+        "call_id",
+        "failure_code",
+        "target_session_id",
+    )
+    marker_body = {key: hold.get(key) for key in marker_fields}
+    marker_digest = hashlib.sha256(
+        json.dumps(
+            marker_body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    return bool(
+        hold.get("schema") == "merlin.target-control-hold.v1"
+        and hold.get("task_id") == task.id
+        and hold.get("assignment_id") == task.id
+        and hold.get("attempt_id") == committed.get("attempt_id")
+        and isinstance(hold.get("tool_name"), str)
+        and bool(str(hold["tool_name"]).strip())
+        and len(str(hold["tool_name"])) <= 128
+        and isinstance(hold.get("call_id"), str)
+        and bool(str(hold["call_id"]).strip())
+        and len(str(hold["call_id"])) <= 512
+        and hold.get("failure_code")
+        in {
+            "target_session_identity_unavailable",
+            "target_session_identity_invalid",
+            "target_session_identity_mismatch",
+            "target_session_resolution_unavailable",
+        }
+        and isinstance(target_session_id, str)
+        and bool(target_session_id.strip())
+        and target_session_id == target_session_id.strip()
+        and len(target_session_id) <= 256
+        and "\0" not in target_session_id
+        and hold.get("receipt_sha256") == marker_digest
+        and hold.get("effect_applied") is False
+        and hold.get("target_effect_attempted") is False
+        and type(hold.get("interaction_count")) is int
+        and hold.get("interaction_count") == 0
+        and type(hold.get("limit_interaction_count")) is int
+        and hold.get("limit_interaction_count") == 0
+        and type(hold.get("target_call_budget_charge")) is int
+        and hold.get("target_call_budget_charge") == 0
+        and hold.get("target_call_ids") == []
+        and hold.get("target_evidence") == []
+        and hold.get("target_ui_transitions") == []
+        and committed.get("target_call_ids") == ()
+        and committed.get("target_evidence_receipts") == {}
+        and committed.get("target_ui_transition_receipts") == {}
+        and committed.get("target_delivery_receipts") == {}
+        and committed.get("probe_effect_calls") == {}
+    )
 
 
 def _exact_candidate_outcome(

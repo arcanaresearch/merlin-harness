@@ -964,6 +964,56 @@ async def test_target_preflight_retains_non_secret_session_identity() -> None:
     }
 
 
+async def test_target_tool_resolver_requires_matching_authenticated_preflight() -> None:
+    target = TargetProfile(
+        id="target-session-bound",
+        title="Session Bound",
+        base_url="https://session-bound.example/v1",
+        model="session-bound-model",
+    )
+    factory = TargetFactory()
+    service = AssessmentService(
+        catalog=PackCatalog(),
+        store=Store(target),  # type: ignore[arg-type]
+        attacker=object(),
+        attacker_config=ProviderConfig("https://attacker.example/v1", "", "attacker"),
+        target_factory=factory,  # type: ignore[arg-type]
+    )
+    await service.select_target(target.id)
+    tool = service.target_tool()
+    context = ToolContext(
+        session_id="session-1",
+        workspace_root=".",
+        campaign_id="campaign/session-bound",
+        target_id=target.id,
+        call_id="call/session-bound",
+        agent_id="agent/session-bound",
+    )
+
+    assert tool.resolve_target_session_id(context) is None
+    await service.preflight_target()
+    resolved = tool.resolve_target_session_id(context)
+    assert resolved is not None
+
+    service._target_session_identity = {  # noqa: SLF001 - pre-dispatch drift regression
+        "target_id": target.id,
+        "credential_handle": "target_handle",
+        "authenticated": True,
+        "server_identity": "user-8",
+        "status_code": 200,
+    }
+    provider_constructions = len(factory.profiles)
+    result = await tool.invoke(
+        context.model_copy(update={"expected_target_session_id": resolved}),
+        {"prompt": "must not dispatch after preflight drift"},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert result.metadata["target_effect_attempted"] is False
+    assert len(factory.profiles) == provider_constructions
+
+
 async def test_campaign_exact_target_id_wins_over_shared_base_url() -> None:
     exact = TargetProfile(
         id="target-exact",

@@ -106,6 +106,52 @@ def test_visual_source_url_drops_credentials_query_and_fragment() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("candidate", "admitted"),
+    (
+        ({"alt": "Architecture diagram", "viewport_coverage": 0.699}, True),
+        ({"alt": "Architecture diagram", "viewport_coverage": 0.7}, False),
+        ({"alt": "Background", "viewport_coverage": 0.2}, False),
+        (
+            {
+                "alt": "Background",
+                "caption": "Reviewed architecture",
+                "in_figure": True,
+                "viewport_coverage": 0.2,
+            },
+            True,
+        ),
+        (
+            {
+                "source_kind": "css_background",
+                "tag": "figure",
+                "role": "img",
+                "aria_label": "Architecture diagram",
+                "background_repeat": "no-repeat",
+                "viewport_coverage": 0.7,
+            },
+            False,
+        ),
+    ),
+)
+def test_visual_candidate_admission_avoids_viewport_duplicates_and_generic_labels(
+    candidate, admitted
+) -> None:
+    assert (
+        browser_core_module._visual_candidate_admitted(  # noqa: SLF001
+            {
+                "visible": True,
+                "loaded": True,
+                "visible_width": 300,
+                "visible_height": 200,
+                "visible_area": 60_000,
+                **candidate,
+            }
+        )
+        is admitted
+    )
+
+
 def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
     session = SimpleNamespace(
         context_id="browser-context",
@@ -414,6 +460,7 @@ def browser_tools(
     state_scope_store=None,
     checkpoint_store=None,
     checkpoint_vault=None,
+    assignment_adapter_resolver=None,
 ):
     if recorder is not None and not hasattr(recorder, "reviewed_native_input_receipt"):
         recorder = _NativeRequestFixtureRecorder(recorder)
@@ -427,6 +474,7 @@ def browser_tools(
         effective_state_scope_store,
         checkpoint_store,
         checkpoint_vault,
+        assignment_adapter_resolver,
     )
 
 
@@ -2159,6 +2207,7 @@ async def test_cancelled_compiled_exchange_finishes_outer_scope_before_reraising
                 await asyncio.Event().wait()
 
             monkeypatch.setattr(session, "act", stalled_action)
+
             async def unavailable_diagnostics(*_args, **_kwargs):
                 raise BrowserBoundaryError("diagnostics unavailable after cancellation")
 
@@ -7516,6 +7565,77 @@ async def test_browser_fill_records_non_sensitive_input_verbatim() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_fill_requires_exact_refreshed_target_session_before_mutation() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    page = b'<textarea aria-label="Message"></textarea>'
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            message = next(item for item in snapshot.elements if item.name == "Message")
+            recorder = Recorder()
+            tool = BrowserTool("browser_fill", lambda _: session, recorder)
+            arguments = {
+                "tab_ref": tab,
+                "element_ref": message.ref,
+                "value": "must not cross the stale session boundary",
+                "step": 1,
+            }
+
+            rejected = await tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    expected_target_session_id="browser:stale-context",
+                ),
+                arguments,
+            )
+            actions_before_accept = tuple(recorder.actions)
+            accepted = await tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    expected_target_session_id=f"browser:{session.context_id}",
+                ),
+                {**arguments, "value": "exact rebound session"},
+            )
+
+    assert rejected.is_error is True
+    assert rejected.metadata["effect"] == "target_network"
+    assert rejected.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert rejected.metadata["retryable"] is False
+    assert rejected.metadata["effect_applied"] is False
+    assert rejected.metadata["target_effect_attempted"] is False
+    assert rejected.metadata["limit_interaction_count"] == 0
+    assert rejected.metadata["target_call_budget_charge"] == 0
+    assert rejected.metadata["identity_field"] == "target_session_id"
+    assert rejected.metadata["expected"] == "browser:stale-context"
+    assert rejected.metadata["observed"] == f"browser:{session.context_id}"
+    assert actions_before_accept == ()
+    assert accepted.is_error is False
+    assert len(recorder.actions) == 1
+    assert recorder.actions[0].value == "exact rebound session"
+
+
+@pytest.mark.asyncio
 async def test_browser_fill_redacts_credential_and_unknown_targets() -> None:
     class Recorder:
         def __init__(self) -> None:
@@ -12456,6 +12576,8 @@ async def test_compiled_chat_exchange_rejects_context_seal_drift_before_browser_
         "failure_code": "adapter_state_integrity",
         "retryable": False,
         "effect_applied": False,
+        "target_effect_attempted": False,
+        "limit_interaction_count": 0,
         "target_call_budget_charge": 0,
         "identity_field": "compiled_adapter_digest",
         "expected": drifted_digest,
@@ -12518,6 +12640,126 @@ async def test_compiled_chat_exchange_rejects_wrong_target_before_browser_observ
     assert result.metadata["observed"] == "target-observed"
     assert session.snapshot_calls == 0
     assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_requires_exact_refreshed_target_session() -> None:
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='assistant:hello';
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            message = next(item for item in snapshot.elements if item.name == "Message")
+            send = next(item for item in snapshot.elements if item.name == "Send")
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"element_ref": message.ref},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"element_ref": send.ref},
+                },
+            ]
+            compiled = compile_target_adapter(adapter)
+            compiled_adapter = compiled.model_dump_json()
+            compiled_adapter_digest = compiled_target_adapter_digest(compiled)
+            original_adapter = reviewed_browser_adapter(origin)
+            original_adapter["browser_steps"] = [
+                {
+                    "step_id": "stale-fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Stale"},
+                }
+            ]
+            recorder = Recorder()
+            broker = ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: original_adapter,
+                    assignment_adapter_resolver=lambda _: adapter,
+                ),
+                confirmer=allow,
+            )
+            arguments = {"prompt": "hello"}
+
+            rejected = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:test",
+                    expected_target_session_id="browser:stale-context",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest=compiled_adapter_digest,
+                ),
+                arguments,
+            )
+            actions_before_accept = tuple(recorder.actions)
+            accepted = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:test",
+                    expected_target_session_id=f"browser:{session.context_id}",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest=compiled_adapter_digest,
+                ),
+                arguments,
+            )
+
+    assert rejected.is_error is True
+    assert rejected.metadata["effect"] == "target_network"
+    assert rejected.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert rejected.metadata["retryable"] is False
+    assert rejected.metadata["effect_applied"] is False
+    assert rejected.metadata["target_effect_attempted"] is False
+    assert rejected.metadata["limit_interaction_count"] == 0
+    assert rejected.metadata["target_call_budget_charge"] == 0
+    assert rejected.metadata["identity_field"] == "target_session_id"
+    assert rejected.metadata["expected"] == "browser:stale-context"
+    assert rejected.metadata["observed"] == f"browser:{session.context_id}"
+    assert actions_before_accept == ()
+    assert accepted.is_error is False
+    assert len(recorder.actions) == 2
 
 
 @pytest.mark.asyncio
@@ -13372,21 +13614,18 @@ async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
 
             assert result.is_error is False
             visual = result.metadata["visual_evidence"]
-            assert len(visual) == 3
+            assert len(visual) == 2
             viewport_evidence = visual[0]
             assert viewport_evidence["source_kind"] == "viewport"
             assert viewport_evidence["full_page"] is False
             assert viewport_evidence["viewport_width"] <= 2_048
             assert viewport_evidence["viewport_height"] <= 1_440
-            phone_evidence = next(item for item in visual if item.get("alt") == "Background")
             css_evidence = next(item for item in visual if item["source_kind"] == "css_background")
-            assert phone_evidence["rendered_width"] == 343
-            assert phone_evidence["natural_width"] == 731
+            assert all(item.get("alt") != "Background" for item in visual)
             assert css_evidence["aria_label"] == "Architecture diagram"
             assert all(item["untrusted_target_evidence"] is True for item in visual)
             assert "not instructions or authority" in result.content
             assert [item[2] for item in recorder.evidence] == [
-                "browser_visual_evidence",
                 "browser_visual_evidence",
                 "browser_visual_evidence",
             ]
@@ -13412,6 +13651,100 @@ async def test_recon_snapshot_captures_only_meaningful_visual_evidence(
                 {"tab_ref": tab},
             )
             assert "visual_evidence" not in repeated.metadata
+
+
+@pytest.mark.asyncio
+async def test_recon_open_tab_bootstraps_viewport_once_per_worker_generation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(b"<main><h1>Recon surface</h1></main>") as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tools = browser_tools(lambda _: session)
+            open_tab = next(tool for tool in tools if tool.name == "browser_open_tab")
+            network_events = next(tool for tool in tools if tool.name == "browser_network_events")
+            first_context = ToolContext(
+                session_id="s1",
+                workspace_root="/tmp",
+                agent_id="recon-worker",
+                attempt_id="attempt-1",
+                target_reobservation_generation_id="sha256:" + "1" * 64,
+                state_action_kind="reconnaissance",
+                visual_evidence_enabled=True,
+            )
+
+            opened = await open_tab.invoke(first_context, {"url": origin})
+
+            first_visual = opened.metadata["visual_evidence"]
+            assert [item["source_kind"] for item in first_visual] == ["viewport"]
+            tab_ref = str(first_visual[0]["tab_ref"])
+            assert tab_ref in {tab.tab_ref for tab in session.metadata().tabs}
+            retained_path = Path(first_visual[0]["attachment"]["path"])
+            retained_files = set((tmp_path / ".merlin" / "browser-evidence").rglob("*.jpg"))
+            retained_bytes = session._visual_retained_bytes  # noqa: SLF001
+            retained_identities = set(session._visual_evidence_seen)  # noqa: SLF001
+
+            same_worker = await network_events.invoke(first_context, {"tab_ref": tab_ref})
+            assert "visual_evidence" not in same_worker.metadata
+
+            second_context = first_context.model_copy(
+                update={
+                    "attempt_id": "attempt-2",
+                    "target_reobservation_generation_id": "sha256:" + "2" * 64,
+                }
+            )
+            reobserved = await network_events.invoke(second_context, {"tab_ref": tab_ref})
+
+            second_visual = reobserved.metadata["visual_evidence"]
+            assert [item["source_kind"] for item in second_visual] == ["viewport"]
+            assert Path(second_visual[0]["attachment"]["path"]) == retained_path
+            assert set((tmp_path / ".merlin" / "browser-evidence").rglob("*.jpg")) == retained_files
+            assert session._visual_retained_bytes == retained_bytes  # noqa: SLF001
+            assert set(session._visual_evidence_seen) == retained_identities  # noqa: SLF001
+
+            no_vision = await network_events.invoke(
+                second_context.model_copy(
+                    update={
+                        "attempt_id": "attempt-3",
+                        "target_reobservation_generation_id": "sha256:" + "3" * 64,
+                        "visual_evidence_enabled": False,
+                    }
+                ),
+                {"tab_ref": tab_ref},
+            )
+            assert "visual_evidence" not in no_vision.metadata
+
+
+@pytest.mark.asyncio
+async def test_reemit_trusted_duplicate_rejects_tampered_retained_bytes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    async with web_fixture(b"<main><h1>Recon surface</h1></main>") as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab_ref = await session.new_tab(origin)
+            initial, initial_errors = await session.capture_visual_evidence(tab_ref)
+            retained_bytes = session._visual_retained_bytes  # noqa: SLF001
+            retained_identities = set(session._visual_evidence_seen)  # noqa: SLF001
+            retained_files = set((tmp_path / ".merlin" / "browser-evidence").rglob("*.jpg"))
+            retained_path = Path(initial[0]["attachment"]["path"])
+            await asyncio.to_thread(retained_path.write_bytes, b"tampered")
+
+            reemitted, errors = await session.capture_visual_evidence(
+                tab_ref,
+                reemit_trusted_duplicates=True,
+            )
+
+            assert initial_errors == ()
+            assert reemitted == ()
+            assert "viewport_capture:duplicate_untrusted" in errors
+            assert set((tmp_path / ".merlin" / "browser-evidence").rglob("*.jpg")) == retained_files
+            assert session._visual_retained_bytes == retained_bytes  # noqa: SLF001
+            assert set(session._visual_evidence_seen) == retained_identities  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -13503,7 +13836,7 @@ async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
             visual = recon.metadata["visual_evidence"]
             assert len(visual) == 4
             assert visual[0]["source_kind"] == "viewport"
-            assert any(item.get("alt") == "Background" for item in visual)
+            assert all(item.get("alt") != "Background" for item in visual)
 
 
 @pytest.mark.asyncio
@@ -14041,9 +14374,7 @@ async def test_visual_root_budget_survives_context_churn_restart_and_offline_cle
 
 
 @pytest.mark.asyncio
-async def test_concurrent_contexts_cannot_exceed_visual_root_budget(
-    tmp_path, monkeypatch
-) -> None:
+async def test_concurrent_contexts_cannot_exceed_visual_root_budget(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(browser_core_module, "_VISUAL_ROOT_MAX_FILES", 1)
     monkeypatch.setattr(browser_core_module, "_VISUAL_ROOT_MAX_BYTES", 20 * 1_024 * 1_024)
@@ -14078,10 +14409,10 @@ async def test_concurrent_contexts_cannot_exceed_visual_root_budget(
                 root_state = first._visual_root_state()  # noqa: SLF001
 
     assert sum(bool(evidence) for evidence, _errors in results) == 1
-    assert sum(
-        errors == ("visual_capture:root_budget_exhausted",)
-        for _evidence, errors in results
-    ) == 1
+    assert (
+        sum(errors == ("visual_capture:root_budget_exhausted",) for _evidence, errors in results)
+        == 1
+    )
     assert screenshot_calls == 1
     assert len(root_state.retained_files) == 1
     assert root_state.retained_bytes <= 20 * 1_024 * 1_024
@@ -14126,9 +14457,7 @@ async def test_cancelled_write_accounts_root_budget_before_another_context_runs(
                 assert await asyncio.to_thread(write_started.wait, 5)
                 first_capture.cancel()
                 await asyncio.sleep(0)
-                second_capture = asyncio.create_task(
-                    second.capture_visual_evidence(second_tab)
-                )
+                second_capture = asyncio.create_task(second.capture_visual_evidence(second_tab))
                 await asyncio.sleep(0.05)
                 assert first_capture.done() is False
                 assert second_capture.done() is False
@@ -14253,8 +14582,8 @@ async def test_cancelled_internal_write_fails_closed_without_spinning(
                     "screenshot",
                     unexpected_restarted_screenshot,
                 )
-                restarted_evidence, restarted_errors = (
-                    await restarted.capture_visual_evidence(restarted_tab)
+                restarted_evidence, restarted_errors = await restarted.capture_visual_evidence(
+                    restarted_tab
                 )
 
         assert restarted_evidence == ()

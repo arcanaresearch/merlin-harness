@@ -31,10 +31,15 @@ from merlin_agents import (
 from merlin_agents.campaign import ContextDocument, ReviewedTargetAdapter, WorkerContext, _digest
 from merlin_agents.campaign_service import CampaignService
 from merlin_agents.durable_service import (
+    _AdaptiveConcurrency,
     _advisory_evaluation_failure,
     _assignment,
     _capability_grant_narrows,
     _sealed_assignment_candidate_identity,
+    _target_control_hold_marker,
+    _target_control_hold_projection,
+    _TargetAdmissionFencedTools,
+    _TargetAdmissionHeld,
     _transport_retry_backoff_seconds,
     _usage_with_assignment_cost,
     _validated_target_evidence_receipts,
@@ -57,6 +62,7 @@ from merlin_contracts import (
     TextDelta,
     ToolCall,
     ToolContext,
+    ToolEffectRecord,
     ToolEffectState,
     ToolInteractionRole,
     ToolResult,
@@ -287,6 +293,39 @@ class Tools:
     async def invoke(self, name, context, arguments):
         raise AssertionError("no tools admitted")
 
+    async def resolve_target_session_id(self, name, context):
+        del name
+        return context.expected_target_session_id or f"test:{context.target_id or 'target'}"
+
+    async def invoke_with_admission(self, name, context, arguments, admit):
+        """Test double for a broker that atomically adopts its admission permit."""
+        assert context.call_id is not None
+        encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+        ownership = context.attempt_id or context.agent_id or "legacy"
+        record = ToolEffectRecord(
+            idempotency_key=hashlib.sha256(
+                (f"{context.session_id}\0{ownership}\0{context.call_id}\0{name}").encode()
+            ).hexdigest(),
+            session_id=context.session_id,
+            call_id=context.call_id,
+            agent_id=context.agent_id,
+            attempt_id=context.attempt_id,
+            campaign_id=context.campaign_id,
+            target_id=context.target_id,
+            tool_name=name,
+            effect="target_network",
+            arguments_digest=hashlib.sha256(encoded).hexdigest(),
+            arguments_payload=dict(arguments),
+            state=ToolEffectState.INTENT,
+        )
+        permit_digest = await admit(record)
+        assert permit_digest.startswith("sha256:")
+        return await self.invoke(
+            name,
+            context.model_copy(update={"target_effect_permit_digest": permit_digest}),
+            arguments,
+        )
+
 
 def test_durable_service_resolves_target_exchange_by_typed_role() -> None:
     class TypedTools(Tools):
@@ -306,6 +345,229 @@ def test_durable_service_resolves_target_exchange_by_typed_role() -> None:
     assert service.target_exchange_tool_ids(("browser_upload", "custom_exchange")) == (
         "custom_exchange",
     )
+
+
+async def test_target_effect_fence_binds_trusted_session_before_permit_and_rejects_drift() -> None:
+    class Delegate:
+        def __init__(self) -> None:
+            self.session_id = "browser:context-a"
+            self.invocations = 0
+            self.invalid_session = False
+
+        def describe(self):
+            return ()
+
+        def effect(self, name):
+            assert name == "browser_chat_exchange"
+            return "target_network"
+
+        async def resolve_target_session_id(self, name, context):
+            del name, context
+            if self.invalid_session:
+                raise ValueError("invalid physical session witness")
+            return self.session_id
+
+        async def invoke_with_admission(self, name, context, arguments, admit):
+            self.invocations += 1
+            assert context.expected_target_session_id == self.session_id
+            encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+            record = ToolEffectRecord(
+                idempotency_key=hashlib.sha256(encoded).hexdigest(),
+                session_id=context.session_id,
+                call_id=str(context.call_id),
+                agent_id=context.agent_id,
+                attempt_id=context.attempt_id,
+                campaign_id=context.campaign_id,
+                target_id=context.target_id,
+                tool_name=name,
+                effect="target_network",
+                arguments_digest=hashlib.sha256(encoded).hexdigest(),
+                arguments_payload=dict(arguments),
+                state=ToolEffectState.INTENT,
+            )
+            await admit(record)
+            return ToolResult(content="delivered")
+
+    delegate = Delegate()
+    admitted_sessions: list[str | None] = []
+
+    async def admit(_record, target_session_id):
+        admitted_sessions.append(target_session_id)
+        return "sha256:" + "a" * 64
+
+    tools = _TargetAdmissionFencedTools(delegate, ("browser_chat_exchange",), admit)
+    context = ToolContext(
+        session_id="daemon-session",
+        workspace_root="/tmp",
+        call_id="call-1",
+        agent_id="worker-1",
+        attempt_id="attempt-1",
+        campaign_id="campaign/one",
+        target_id="target-1",
+    )
+
+    result = await tools.invoke("browser_chat_exchange", context, {"prompt": "probe"})
+    assert result.is_error is False
+    assert admitted_sessions == ["browser:context-a"]
+
+    delegate.session_id = "browser:context-b"
+    conflict = await tools.invoke(
+        "browser_chat_exchange",
+        context.model_copy(update={"expected_target_session_id": "browser:context-a"}),
+        {"prompt": "must not dispatch"},
+    )
+    assert conflict.is_error is True
+    assert conflict.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert delegate.invocations == 1
+    assert admitted_sessions == ["browser:context-a"]
+
+    delegate.invalid_session = True
+    invalid = await tools.invoke(
+        "browser_chat_exchange",
+        context.model_copy(update={"expected_target_session_id": "browser:context-a"}),
+        {"prompt": "must still not dispatch"},
+    )
+    assert invalid.is_error is True
+    assert invalid.metadata["failure_code"] == "target_session_identity_unavailable"
+    assert delegate.invocations == 1
+
+    delegate.invalid_session = False
+    malformed = await tools.invoke(
+        "browser_chat_exchange",
+        context.model_copy(update={"expected_target_session_id": " browser:context-a"}),
+        {"prompt": "must not dispatch with a malformed prebound identity"},
+    )
+    assert malformed.is_error is True
+    assert malformed.metadata["failure_code"] == "target_session_identity_unavailable"
+    assert delegate.invocations == 1
+    assert admitted_sessions == ["browser:context-a"]
+
+    delegate.session_id = "a" * 256
+    accepted_boundary = await tools.invoke(
+        "browser_chat_exchange",
+        context,
+        {"prompt": "accept the canonical session-id boundary"},
+    )
+    assert accepted_boundary.is_error is False
+    assert admitted_sessions[-1] == "a" * 256
+    assert delegate.invocations == 2
+
+    delegate.session_id = "b" * 257
+    rejected_boundary = await tools.invoke(
+        "browser_chat_exchange",
+        context,
+        {"prompt": "reject before permit or dispatch"},
+    )
+    assert rejected_boundary.is_error is True
+    assert rejected_boundary.metadata["failure_code"] == "target_session_identity_unavailable"
+    assert delegate.invocations == 2
+    assert admitted_sessions[-1] == "a" * 256
+
+
+@pytest.mark.parametrize("latched_phase", ("admission", "adoption"))
+async def test_target_effect_fence_attributes_latched_admission_before_dispatch(
+    latched_phase: str,
+) -> None:
+    class AdmissionLatched(RuntimeError):
+        target_admission_latched = True
+
+    class Delegate:
+        def __init__(self) -> None:
+            self.dispatched = False
+
+        def describe(self):
+            return ()
+
+        def effect(self, _name):
+            return "target_network"
+
+        async def resolve_target_session_id(self, _name, _context):
+            return "browser:held-context"
+
+        async def invoke_with_admission(self, name, context, arguments, admit):
+            encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+            intent = ToolEffectRecord(
+                idempotency_key=hashlib.sha256(encoded).hexdigest(),
+                session_id=context.session_id,
+                call_id=str(context.call_id),
+                agent_id=context.agent_id,
+                attempt_id=context.attempt_id,
+                campaign_id=context.campaign_id,
+                target_id=context.target_id,
+                tool_name=name,
+                effect="target_network",
+                arguments_digest=hashlib.sha256(encoded).hexdigest(),
+                arguments_payload=dict(arguments),
+                state=ToolEffectState.INTENT,
+            )
+            await admit(intent)
+            if latched_phase == "adoption":
+                raise AdmissionLatched("permit adoption lost its lane authority")
+            self.dispatched = True
+            return ToolResult(content="must not dispatch")
+
+    async def reject(_intent, _target_session_id):
+        if latched_phase == "admission":
+            raise AdmissionLatched("surface transition fenced the stale assignment")
+        return "sha256:" + "a" * 64
+
+    delegate = Delegate()
+    tools = _TargetAdmissionFencedTools(delegate, ("custom_exchange",), reject)
+    context = ToolContext(
+        session_id="daemon-session",
+        workspace_root="/tmp",
+        call_id="call-held",
+        agent_id="campaign/held/worker",
+        attempt_id="attempt-held",
+        technique_attempt_id="technique-held",
+        campaign_id="campaign/held",
+        target_id="target-held",
+    )
+
+    with pytest.raises(_TargetAdmissionHeld) as raised:
+        await tools.invoke("custom_exchange", context, {"prompt": "probe"})
+
+    hold = raised.value
+    assert delegate.dispatched is False
+    assert hold.assignment_id == context.agent_id
+    assert hold.attempt_id == context.attempt_id
+    assert hold.technique_attempt_id == context.technique_attempt_id
+    assert hold.tool_name == "custom_exchange"
+    assert hold.call_id == context.call_id
+    assert hold.failure_code == "target_session_resolution_unavailable"
+    assert hold.target_session_id == "browser:held-context"
+    marker = _target_control_hold_marker(hold)
+    projection = _target_control_hold_projection(hold, marker)
+    assert set(marker) == {
+        "schema",
+        "assignment_id",
+        "attempt_id",
+        "technique_attempt_id",
+        "tool_name",
+        "call_id",
+        "failure_code",
+        "target_session_id",
+        "receipt_sha256",
+    }
+    assert set(projection) == set(marker) | {
+        "task_id",
+        "effect_applied",
+        "target_effect_attempted",
+        "interaction_count",
+        "limit_interaction_count",
+        "target_call_budget_charge",
+        "target_call_ids",
+        "target_evidence",
+        "target_ui_transitions",
+    }
+    assert projection["effect_applied"] is False
+    assert projection["target_effect_attempted"] is False
+    assert projection["interaction_count"] == 0
+    assert projection["limit_interaction_count"] == 0
+    assert projection["target_call_budget_charge"] == 0
+    assert projection["target_call_ids"] == []
+    assert projection["target_evidence"] == []
+    assert projection["target_ui_transitions"] == []
 
 
 def test_worker_graph_uses_typed_retry_policy_instead_of_one_retry() -> None:
@@ -549,7 +811,7 @@ def test_retry_progress_ignores_fresh_receipt_and_session_identifiers() -> None:
         WorkerRuntime._record_target_evidence(  # noqa: SLF001
             evidence,
             SimpleNamespace(
-                    session_id=session_id,
+                session_id=session_id,
                 assignment=SimpleNamespace(
                     id="campaign/retry-progress/worker",
                     target_profile_id="target",
@@ -895,7 +1157,16 @@ class Store:
             self.nodes[schedule_id][node_id]["state"] = "failed"
         self._advance(schedule_id, checkpoint)
 
-    def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+    def claim(
+        self,
+        schedule_id,
+        node_id,
+        owner,
+        *,
+        lease_expires_at,
+        attempt_id=None,
+        target_admission=None,
+    ):
         self.created_before_claim = schedule_id in self.schedules
         node = self.nodes[schedule_id][node_id]
         assert node["state"] == "ready"
@@ -911,10 +1182,58 @@ class Store:
             lease_expires_at=lease_expires_at,
             heartbeat_at=datetime.now(UTC),
             state="running",
+            replaced_attempt_id=None,
+            lane_recovery_required=False,
         )
         self.attempts[identifier] = lease
         self.schedules[schedule_id]["event_count"] += 1
         return lease
+
+    def final_target_effect_admitted(
+        self,
+        schedule_id,
+        node_id,
+        attempt_id,
+        generation,
+        *,
+        tool_name,
+        call_id,
+        target_admission,
+        effect_intent,
+    ):
+        lease = self.attempts[attempt_id]
+        assert lease.schedule_id == schedule_id
+        assert lease.node_id == node_id
+        assert lease.generation == generation
+        assert self.nodes[schedule_id][node_id]["state"] == "leased"
+        assert effect_intent["tool_name"] == tool_name
+        assert effect_intent["call_id"] == call_id
+        return (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    effect_intent,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+
+    def resolve_target_lane_recovery(
+        self,
+        schedule_id,
+        node_id,
+        attempt_id,
+        generation,
+        *,
+        target_admission,
+        recovery,
+    ):
+        lease = self.attempts[attempt_id]
+        assert lease.schedule_id == schedule_id
+        assert lease.node_id == node_id
+        assert lease.generation == generation
+        lease.lane_recovery_required = False
 
     def heartbeat(self, attempt_id, generation, *, lease_expires_at):
         lease = self.attempts[attempt_id]
@@ -934,9 +1253,20 @@ class Store:
         checkpoint,
         target_session_id=None,
         failure_kind=None,
+        terminal_result=None,
+        target_surface_transition=None,
     ):
         lease = self.attempts[attempt_id]
         assert lease.generation == generation
+        if terminal_result is not None:
+            commit_partial = getattr(self, "commit_partial", None)
+            if callable(commit_partial):
+                commit_partial(
+                    attempt_id,
+                    generation,
+                    result=terminal_result,
+                )
+        lease.target_surface_transition = target_surface_transition
         lease.state = outcome
         lease.error = reason
         lease.failure_kind = failure_kind
@@ -982,6 +1312,10 @@ class Store:
             if node["state"] in {"pending", "ready", "leased"}:
                 node["state"] = "cancelled"
 
+    def reconcile_cancelled_target_lanes(self, schedule_id):
+        assert schedule_id in self.schedules
+        return {"released": (), "held": (), "latched": ()}
+
     def cancel_node(self, schedule_id, node_id, *, reason, checkpoint, idempotency_key=None):
         receipt = (schedule_id, idempotency_key)
         previous = getattr(self, "cancel_receipts", {}).get(receipt)
@@ -1006,6 +1340,36 @@ class Store:
     def _advance(self, schedule_id, checkpoint):
         self.schedules[schedule_id]["checkpoint"] = checkpoint
         self.schedules[schedule_id]["event_count"] += 1
+
+
+@pytest.mark.asyncio
+async def test_current_target_admission_latches_forwards_exact_compact_projection() -> None:
+    expected = (
+        {
+            "target_session_id": "browser:context-1",
+            "state": "latched",
+            "revision": 3,
+            "authorized_schedule_id": None,
+        },
+    )
+
+    class LatchStore(Store):
+        def current_target_admission_latches(
+            self, campaign_id: str, session_id: str, target_id: str
+        ) -> tuple[dict[str, object], ...]:
+            assert (campaign_id, session_id, target_id) == (
+                "campaign-1",
+                "session-1",
+                "target-1",
+            )
+            return expected
+
+    service = DurableAgentService(Provider(), Tools(), LatchStore(), model="test")
+
+    assert (
+        await service.current_target_admission_latches("campaign-1", "session-1", "target-1")
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1628,8 +1992,7 @@ async def test_committed_evidence_fails_closed_on_bounded_effect_projection_over
         def replacement_attempt_lineage(self, loaded_attempt_id, *, limit=None):
             assert loaded_attempt_id == attempt_id
             values = (
-                tuple(f"attempt-ancestor-{index}" for index in range(count - 1))
-                + (attempt_id,)
+                tuple(f"attempt-ancestor-{index}" for index in range(count - 1)) + (attempt_id,)
                 if projection == "lineage"
                 else (attempt_id,)
             )
@@ -1841,6 +2204,7 @@ async def test_committed_evidence_accepts_authenticated_compacted_target_receipt
         "tool_name": "target_request",
         "reference": "target-call:call-compacted",
         "campaign_id": "campaign/recon",
+        "session_id": "session-1",
         "assignment_id": task_id,
         "attempt_id": attempt_id,
         "technique_attempt_id": "technique-attempt-1",
@@ -1908,6 +2272,7 @@ async def test_committed_evidence_accepts_authenticated_compacted_target_receipt
             },
         }
     }
+    store.schedules["schedule-1"] = {"session_id": "session-1"}
     service = DurableAgentService(Provider(), Tools(), store)
 
     evidence = await service.committed_task_result_evidence(
@@ -1924,6 +2289,20 @@ async def test_committed_evidence_accepts_authenticated_compacted_target_receipt
     assert evidence["target_call_ids"] == ("call-compacted",)
     assert evidence["target_call_documents"] == {}
     assert evidence["target_evidence_receipts"] == {"call-compacted": receipt}
+
+    store.schedules.pop("schedule-1")
+    unbound = await service.committed_task_result_evidence(
+        "schedule-1",
+        AgentTask(
+            id=task_id,
+            objective="recon",
+            status="completed",
+            result='{"applicable_techniques":[]}',
+        ),
+    )
+    assert unbound is not None
+    assert unbound["target_evidence_receipts"] == {}
+    store.schedules["schedule-1"] = {"session_id": "session-1"}
 
     sentinel_document = {
         "call_id": "call-compacted",
@@ -1961,9 +2340,7 @@ async def test_committed_evidence_accepts_authenticated_compacted_target_receipt
     )
 
     assert sentinel_evidence is not None
-    assert sentinel_evidence["target_call_documents"] == {
-        "call-compacted": sentinel_document
-    }
+    assert sentinel_evidence["target_call_documents"] == {"call-compacted": sentinel_document}
 
 
 def test_authenticated_target_receipt_survives_runtime_guidance_in_transcript() -> None:
@@ -1977,6 +2354,7 @@ def test_authenticated_target_receipt_survives_runtime_guidance_in_transcript() 
         "tool_name": "target_request",
         "reference": f"target-call:{call_id}",
         "campaign_id": "campaign/probe",
+        "session_id": "session-1",
         "assignment_id": task.id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -2028,6 +2406,7 @@ def test_authenticated_injection_receipt_is_admitted() -> None:
         "tool_name": "target_inject",
         "reference": f"target-call:{call_id}",
         "campaign_id": "campaign/injection",
+        "session_id": "session-1",
         "assignment_id": task.id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -2064,7 +2443,9 @@ def test_authenticated_injection_receipt_is_admitted() -> None:
     assert admitted == {call_id: receipt}
 
 
-@pytest.mark.parametrize("drifted_field", ["campaign_id", "agent_id", "attempt_id", "target_id"])
+@pytest.mark.parametrize(
+    "drifted_field", ["campaign_id", "session_id", "agent_id", "attempt_id", "target_id"]
+)
 async def test_compacted_target_document_requires_exact_durable_effect_attribution(
     drifted_field: str,
 ) -> None:
@@ -2078,6 +2459,7 @@ async def test_compacted_target_document_requires_exact_durable_effect_attributi
         "tool_name": "target_request",
         "reference": "target-call:call-compacted",
         "campaign_id": "campaign/recon",
+        "session_id": "session-1",
         "assignment_id": task_id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -2100,6 +2482,7 @@ async def test_compacted_target_document_requires_exact_durable_effect_attributi
         "call_id": "call-compacted",
         "tool_name": "target_request",
         "campaign_id": "campaign/recon",
+        "session_id": "session-1",
         "agent_id": task_id,
         "attempt_id": attempt_id,
         "target_id": "target-1",
@@ -2183,6 +2566,7 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
         call_id="call-compacted",
         tool_name="target_request",
         campaign_id="campaign/recon",
+        session_id="session-1",
         agent_id=task_id,
         attempt_id=attempt_id,
         target_id="target-1",
@@ -2200,6 +2584,7 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
             return values if limit is None else values[-limit:]
 
     store = Store()
+    store.schedules["schedule-1"] = {"session_id": "session-1"}
     store.results["schedule-1"] = {
         f"worker:{task_id}": {
             "node_id": f"worker:{task_id}",
@@ -2230,6 +2615,12 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
     assert evidence is not None
     assert evidence["target_call_documents"] == {"call-compacted": {"reply": "objective reached"}}
     assert evidence["target_delivery_receipts"] == {"call-compacted": delivery}
+    adopted_receipt = evidence["target_evidence_receipts"]["call-compacted"]
+    assert adopted_receipt["session_id"] == "session-1"
+    adopted_body = {key: value for key, value in adopted_receipt.items() if key != "receipt_sha256"}
+    assert adopted_receipt["receipt_sha256"] == WorkerRuntime._json_fingerprint(  # noqa: SLF001
+        adopted_body
+    )
 
     unmatched = DurableAgentService._committed_task_evidence(  # noqa: SLF001
         "schedule-1",
@@ -2358,6 +2749,153 @@ def test_custom_typed_target_exchange_requires_matching_durable_effect_role(
     assert bool(evidence["target_evidence_receipts"]) is credited
 
 
+async def test_preupgrade_error_transition_receipt_is_adopted_after_restart_without_replay() -> (
+    None
+):
+    task_id = "campaign/legacy-transition/worker"
+    attempt_id = "attempt-legacy-transition"
+    call_id = "call-legacy-transition"
+    arguments = {"prompt": "authorized probe"}
+    content = "reviewed controls changed before delivery"
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": "sha256:" + hashlib.sha256(b"legacy-before").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"legacy-after").hexdigest(),
+        "changed_dimensions": ["controls"],
+        "added_controls": [{"role": "button", "name": "Continue"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:legacy-after"],
+        "reobservation_recommended": True,
+    }
+    metadata = {
+        "target_session_id": "browser:legacy-context",
+        "target_effect_attempted": False,
+        "target_call_budget_charge": 0,
+        "limit_interaction_count": 0,
+        "target_exchanges": [],
+        "target_ui_transition": transition,
+    }
+    legacy_body = {
+        "call_id": call_id,
+        "tool_name": "target_request",
+        "reference": f"target-call:{call_id}",
+        "campaign_id": "campaign/legacy-transition",
+        "assignment_id": task_id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": None,
+        "target_id": "target-1",
+        "target_session_id": "browser:legacy-context",
+        "request_sha256": WorkerRuntime._action_fingerprint(  # noqa: SLF001
+            "target_request", arguments
+        ),
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "content_bytes": len(content.encode()),
+        "metadata_sha256": WorkerRuntime._json_fingerprint(  # noqa: SLF001
+            WorkerRuntime._semantic_value(metadata)  # noqa: SLF001
+        ),
+        "is_error": True,
+        "acknowledged": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "attempt_disposition": "infrastructure_failed",
+        "target_ui_transition": transition,
+    }
+    legacy_receipt = {
+        **legacy_body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(legacy_body),  # noqa: SLF001
+    }
+    effect = SimpleNamespace(
+        call_id=call_id,
+        tool_name="target_request",
+        campaign_id="campaign/legacy-transition",
+        session_id="session-1",
+        agent_id=task_id,
+        attempt_id=attempt_id,
+        target_id="target-1",
+        state="acknowledged",
+        effect="target_network",
+        arguments_payload=arguments,
+        result_content=content,
+        result_metadata=metadata,
+        result_is_error=True,
+    )
+
+    class NoReplayProvider(Provider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            del request
+            self.calls += 1
+            raise AssertionError("legacy receipt adoption must not replay the provider")
+            yield  # pragma: no cover
+
+    class EvidenceTools(Tools):
+        def __init__(self) -> None:
+            self.invocations = 0
+
+        async def invoke(self, name, context, values):
+            del name, context, values
+            self.invocations += 1
+            raise AssertionError("legacy receipt adoption must not replay the target")
+
+        async def list_effects_for_attempt(self, value, *, limit=None):
+            assert value == attempt_id
+            effects = (effect,)
+            return effects if limit is None else effects[-limit:]
+
+    row = {
+        "node_id": f"worker:{task_id}",
+        "attempt_id": attempt_id,
+        "payload_digest": "a" * 64,
+        "payload": {
+            "content": content,
+            "target_id": "target-1",
+            "target_session_id": "browser:legacy-context",
+            "worker_checkpoint": {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {
+                                    "name": "target_request",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": call_id, "content": content},
+                ],
+                "technique_attempt_id": None,
+                "target_evidence": [legacy_receipt],
+            },
+        },
+    }
+    store = Store()
+    store.schedules["schedule-legacy"] = {"session_id": "session-1"}
+    provider = NoReplayProvider()
+    tools = EvidenceTools()
+    service = DurableAgentService(provider, tools, store)
+    task = AgentTask(id=task_id, objective="probe", status="failed", result=content)
+
+    evidence = await service._committed_task_evidence_with_authority(  # noqa: SLF001
+        "schedule-legacy", task, row
+    )
+
+    assert evidence is not None
+    adopted = evidence["target_ui_transition_receipts"][call_id]
+    assert adopted["session_id"] == "session-1"
+    assert provider.calls == 0
+    assert tools.invocations == 0
+
+
 def test_transition_receipts_require_complete_call_pair_and_canonical_payload() -> None:
     task = AgentTask(
         id="campaign/one/surface-drift",
@@ -2397,6 +2935,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         return SimpleNamespace(
             call_id=effect_call_id,
             state="acknowledged",
+            session_id="session-1",
             agent_id=task.id,
             attempt_id=attempt_id,
             campaign_id="campaign/one",
@@ -2432,6 +2971,8 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         receipt_overrides: Mapping[str, object] | None = None,
         extra_receipts: tuple[Mapping[str, object], ...] = (),
         extra_effects: tuple[SimpleNamespace, ...] = (),
+        legacy_session: bool = False,
+        expected_campaign_session: str = "session-1",
     ) -> Mapping[str, object]:
         receipt_metadata = effect_record(
             projected_transition=projected_transition,
@@ -2445,6 +2986,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
             "tool_name": "browser_chat_exchange",
             "reference": f"target-call:{call_id}",
             "campaign_id": "campaign/one",
+            "session_id": "session-1",
             "assignment_id": task.id,
             "attempt_id": attempt_id,
             "technique_attempt_id": None,
@@ -2481,6 +3023,8 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
             ),
             **dict(receipt_overrides or {}),
         }
+        if legacy_session:
+            receipt_body.pop("session_id")
         receipt = {
             **receipt_body,
             "receipt_sha256": WorkerRuntime._json_fingerprint(receipt_body),  # noqa: SLF001
@@ -2507,12 +3051,13 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
                 effect_record(
                     projected_transition=(effect_transition or projected_transition),
                     effect_tool=effect_tool,
-                        effect_is_error=effect_is_error,
-                        effect_kind=effect_kind,
-                        effect_session=effect_session,
+                    effect_is_error=effect_is_error,
+                    effect_kind=effect_kind,
+                    effect_session=effect_session,
                 ),
                 *extra_effects,
             ),
+            expected_session_id=expected_campaign_session,
         )
         assert evidence is not None
         return evidence
@@ -2535,6 +3080,28 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
 
     admitted = committed(messages=complete_messages, projected_transition=transition)
     assert tuple(admitted["target_ui_transition_receipts"]) == (call_id,)
+
+    legacy_admitted = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        legacy_session=True,
+    )
+    legacy_receipt = legacy_admitted["target_ui_transition_receipts"][call_id]
+    assert legacy_receipt["session_id"] == "session-1"
+    legacy_wrong_schedule = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        legacy_session=True,
+        expected_campaign_session="other-session",
+    )
+    assert legacy_wrong_schedule["target_ui_transition_receipts"] == {}
+    legacy_ambiguous_effect = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        legacy_session=True,
+        extra_effects=(effect_record(projected_transition=transition),),
+    )
+    assert legacy_ambiguous_effect["target_ui_transition_receipts"] == {}
 
     duplicate_receipt = committed(
         messages=complete_messages,
@@ -2576,6 +3143,14 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         effect_session="browser:other-context",
     )
     assert wrong_session_success["target_evidence_receipts"] == {}
+
+    wrong_campaign_session_success = committed(
+        messages=complete_messages,
+        projected_transition=transition,
+        effect_is_error=False,
+        receipt_overrides={"session_id": "other-session"},
+    )
+    assert wrong_campaign_session_success["target_evidence_receipts"] == {}
 
     wrong_effect_success = committed(
         messages=complete_messages,
@@ -2676,6 +3251,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         "tool_name": "browser_chat_exchange",
         "reference": f"target-call:{call_id}",
         "campaign_id": "campaign/one",
+        "session_id": "session-1",
         "assignment_id": task.id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -2732,9 +3308,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         ),
     )
     assert fake_marker_evidence is not None
-    assert fake_marker_evidence["target_ui_transition_receipts"] == {
-        call_id: fake_marker_receipt
-    }
+    assert fake_marker_evidence["target_ui_transition_receipts"] == {call_id: fake_marker_receipt}
 
     exact_marker_content = WorkerRuntime._durable_checkpoint_text(  # noqa: SLF001
         "z" * 20_000,
@@ -2778,9 +3352,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         ),
     )
     assert exact_marker_evidence is not None
-    assert exact_marker_evidence["target_ui_transition_receipts"] == {
-        call_id: exact_marker_receipt
-    }
+    assert exact_marker_evidence["target_ui_transition_receipts"] == {call_id: exact_marker_receipt}
 
     elided_original = (
         content
@@ -2798,6 +3370,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         "tool_name": "browser_chat_exchange",
         "reference": f"target-call:{call_id}",
         "campaign_id": "campaign/one",
+        "session_id": "session-1",
         "assignment_id": task.id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -2854,9 +3427,7 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
         ),
     )
     assert elided_evidence is not None
-    assert elided_evidence["target_ui_transition_receipts"] == {
-        call_id: elided_receipt
-    }
+    assert elided_evidence["target_ui_transition_receipts"] == {call_id: elided_receipt}
 
     ghost = committed(messages=[], projected_transition=transition)
     assert ghost["target_ui_transition_receipts"] == {}
@@ -3072,6 +3643,256 @@ def test_generic_browser_transition_projects_to_lead_reobservation_without_attac
     assert projection.lead_projection()["generation"]["status"] == "ready"  # type: ignore[index]
 
 
+async def test_target_admission_hold_checkpoint_restores_without_provider_or_tool_dispatch(
+    monkeypatch,
+) -> None:
+    class HoldStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.partial_results: list[dict[str, object]] = []
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            del applied_message_ids
+            lease = self.attempts[attempt_id]
+            assert lease.generation == generation
+            payload = dict(result)
+            self.partial_results.append(payload)
+            self.results.setdefault(lease.schedule_id, {})[lease.node_id] = {
+                "node_id": lease.node_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "schema_id": "schema/partial-result",
+                "payload_digest": "sha256:" + "d" * 64,
+                "payload": payload,
+            }
+            return "sha256:" + "d" * 64
+
+    assignment = WorkerAssignment(
+        id="campaign/held-restart/worker",
+        objective="probe the reviewed target",
+        profile_id="injection",
+        target_profile_id="target-held",
+        technique_ids=("technique-held",),
+        guidance_ids=(),
+        tool_ids=("custom_exchange",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=2_000, max_seconds=30),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    original_run = WorkerRuntime.run
+
+    async def hold_before_dispatch(_runtime, handoff, _control=None, *, checkpoint=None):
+        del checkpoint
+        raise _TargetAdmissionHeld(
+            assignment_id=handoff.assignment.id,
+            attempt_id=handoff.attempt_id,
+            technique_attempt_id=handoff.technique_attempt_id,
+            tool_name="custom_exchange",
+            call_id="call-held-restart",
+            failure_code="target_session_resolution_unavailable",
+            target_session_id="browser:held-restart",
+        )
+
+    monkeypatch.setattr(WorkerRuntime, "run", hold_before_dispatch)
+    store = HoldStore()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    live = await service.submit(
+        "session-held-restart",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+    )
+    assert live.execution is not None
+    await asyncio.wait_for(live.execution, timeout=1)
+
+    partial = next(item for item in store.partial_results if item.get("partial") is True)
+    checkpoint = partial["worker_checkpoint"]
+    assert isinstance(checkpoint, Mapping)
+    marker = checkpoint["target_control_hold"]
+    assert isinstance(marker, Mapping)
+    assert checkpoint["target_session_id"] == "browser:held-restart"
+    assert marker["assignment_id"] == assignment.id
+    assert marker["call_id"] == "call-held-restart"
+    assert marker["target_session_id"] == "browser:held-restart"
+
+    class CountingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, _request):
+            self.calls += 1
+            raise AssertionError("provider must not run for a restored control hold")
+            yield ModelCompleted()
+
+    class CountingTools:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return ()
+
+        async def invoke(self, _name, _context, _arguments):
+            self.calls += 1
+            raise AssertionError("tool must not run for a restored control hold")
+
+    provider = CountingProvider()
+    tools = CountingTools()
+    restored = await original_run(
+        WorkerRuntime(provider, tools),
+        WorkerHandoff(
+            "session-held-restart",
+            ".",
+            "test",
+            WorkerProfile("injection", 1, "", "", frozenset()),
+            assignment,
+            attempt_id=str(marker["attempt_id"]),
+            technique_attempt_id=(
+                str(marker["technique_attempt_id"])
+                if marker["technique_attempt_id"] is not None
+                else None
+            ),
+        ),
+        checkpoint=checkpoint,
+    )
+
+    assert restored.status == "cancelled"
+    assert restored.error_code == "target_admission_latched"
+    assert restored.target_session_id == "browser:held-restart"
+    assert provider.calls == 0
+    assert tools.calls == 0
+
+
+def test_committed_evidence_projects_typed_target_admission_hold() -> None:
+    task = AgentTask(
+        id="campaign/held/worker",
+        objective="probe the reviewed target",
+        status="cancelled",
+        result="",
+    )
+    row = {
+        "node_id": f"worker:{task.id}",
+        "attempt_id": "attempt-held",
+        "payload_digest": "a" * 64,
+        "schema_id": "schema/partial-result",
+        "payload": {
+            "content": "",
+            "error_code": "target_admission_latched",
+            "target_id": "target-1",
+            "worker_checkpoint": {"messages": []},
+        },
+    }
+
+    committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-held",
+        task,
+        row,
+    )
+
+    assert committed is not None
+    assert committed["error_code"] == "target_admission_latched"
+    assert "infrastructure_failure_category" not in committed
+
+
+async def test_target_admission_hold_survives_terminal_settlement_projection() -> None:
+    class EvidenceStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.technique_terminal: list[tuple[str, str, dict[str, object]]] = []
+
+        def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
+            del applied_message_ids
+            lease = self.attempts[attempt_id]
+            assert lease.generation == generation
+            row = {
+                "node_id": lease.node_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "schema_id": "schema/partial-result",
+                "payload_digest": "sha256:" + "d" * 64,
+                "payload": dict(result),
+            }
+            self.results.setdefault(lease.schedule_id, {})[lease.node_id] = row
+            return row["payload_digest"]
+
+        def terminalize_technique_attempt(self, attempt_id, state, **metadata):
+            self.technique_terminal.append((attempt_id, state, dict(metadata)))
+
+    assignment = WorkerAssignment(
+        id="campaign/held/worker",
+        objective="probe the reviewed target",
+        profile_id="injection",
+        target_profile_id="target-1",
+        technique_ids=("technique-1",),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(max_turns=2, max_tokens=2_000, max_seconds=30),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    store = EvidenceStore()
+    arm_outcomes: list[Mapping[str, object]] = []
+    service = DurableAgentService(
+        Provider(),
+        Tools(),
+        store,
+        model="test",
+        arm_outcome_recorder=arm_outcomes.append,
+    )
+    live = await service.submit(
+        "session-held",
+        (assignment,),
+        max_workers=1,
+        minimum_workers=1,
+        start_immediately=False,
+    )
+    start_handle = live.scheduler.claim("start", "scheduler", 1)
+    start_lease = await service._claim(live, start_handle)  # noqa: SLF001
+    live.scheduler.complete(start_handle, "start", 2)
+    await service._commit(  # noqa: SLF001
+        live,
+        start_lease,
+        {"started": True},
+        "schema/envelope",
+    )
+    await service._ready(live, live.scheduler.ready_nodes())  # noqa: SLF001
+    node_id = f"worker:{assignment.id}"
+    worker_handle = live.scheduler.claim(node_id, node_id, 4)
+    worker_lease = await service._claim(live, worker_handle, assignment)  # noqa: SLF001
+    result = WorkerResult(
+        task_id=assignment.id,
+        status="cancelled",
+        error="surface generation changed before delivery",
+        error_code="target_admission_latched",
+        retry_class="terminal",
+        infrastructure_failure_category=None,
+        checkpoint={"messages": []},
+    )
+    ticks = iter(range(5, 20))
+
+    await service._settle_worker_outcome(  # noqa: SLF001
+        live,
+        (worker_handle, worker_lease, result, None, (), "technique-attempt-held"),
+        lambda: next(ticks),
+        _AdaptiveConcurrency(1),
+    )
+
+    projection = await service.completion_projection(live.id)
+    assert projection["tasks"][0].status == "cancelled"
+    committed = projection["evidence"][assignment.id]
+    assert committed["error_code"] == "target_admission_latched"
+    assert "infrastructure_failure_category" not in committed
+    assert arm_outcomes == []
+    assert [item[:2] for item in store.technique_terminal] == [
+        ("technique-attempt-held", "cancelled")
+    ]
+
+
 @pytest.mark.parametrize("target_effect_attempted", (False, True))
 async def test_terminal_surface_drift_commits_transition_without_replacement(
     target_effect_attempted: bool,
@@ -3181,6 +4002,20 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
             self.records[record.idempotency_key] = record
             return record, True
 
+        async def adopt_permitted(self, record, permit_digest):
+            expected = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        record.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
+            assert permit_digest == expected
+            return await self.begin(record)
+
         async def finish(self, record):
             self.records[record.idempotency_key] = record
             return record
@@ -3198,9 +4033,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
             return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
-            records = [
-                item for item in self.records.values() if item.campaign_id == campaign_id
-            ]
+            records = [item for item in self.records.values() if item.campaign_id == campaign_id]
             return records if limit is None else records[-limit:]
 
     class SurfaceTool:
@@ -3216,6 +4049,10 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
                 input_schema={"type": "object"},
                 interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
             )
+
+        def resolve_target_session_id(self, context):
+            del context
+            return "browser:context-1"
 
         async def invoke(self, context, arguments):
             del context, arguments
@@ -3238,9 +4075,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
                     "target_call_budget_charge": interaction_count,
                     "limit_interaction_count": interaction_count,
                     "target_exchanges": (
-                        [{"interaction": True, "cleanup": False}]
-                        if target_effect_attempted
-                        else []
+                        [{"interaction": True, "cleanup": False}] if target_effect_attempted else []
                     ),
                     "target_session_id": "browser:context-1",
                     "target_ui_transition": transition,
@@ -3294,6 +4129,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
         digest=_digest(context_values),
     )
     provider = SurfaceProvider()
+
     async def allow(*_args):
         return True
 
@@ -3318,11 +4154,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
 
     node_id = f"worker:{assignment.id}"
     task = (await service.list_schedule_tasks(live.id))[0]
-    attempts = [
-        attempt
-        for attempt in store.attempts.values()
-        if attempt.node_id == node_id
-    ]
+    attempts = [attempt for attempt in store.attempts.values() if attempt.node_id == node_id]
     assert task.status == "failed"
     assert store.nodes[live.id][node_id]["state"] == "failed"
     assert live.scheduler.status(node_id).value == "failed"
@@ -3407,6 +4239,20 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
             self.records[record.idempotency_key] = record
             return record, True
 
+        async def adopt_permitted(self, record, permit_digest):
+            expected = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        record.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
+            assert permit_digest == expected
+            return await self.begin(record)
+
         async def finish(self, record):
             self.records[record.idempotency_key] = record
             return record
@@ -3424,9 +4270,7 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
             return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
-            records = [
-                item for item in self.records.values() if item.campaign_id == campaign_id
-            ]
+            records = [item for item in self.records.values() if item.campaign_id == campaign_id]
             return records if limit is None else records[-limit:]
 
     class SurfaceTool:
@@ -3442,6 +4286,10 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
                 input_schema={"type": "object"},
                 interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
             )
+
+        def resolve_target_session_id(self, context):
+            del context
+            return "browser:context-1"
 
         async def invoke(self, context, arguments):
             del context, arguments
@@ -3588,9 +4436,7 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
     await asyncio.wait_for(live.execution, timeout=1)
 
     node_id = f"worker:{assignment.id}"
-    attempts = [
-        attempt for attempt in store.attempts.values() if attempt.node_id == node_id
-    ]
+    attempts = [attempt for attempt in store.attempts.values() if attempt.node_id == node_id]
     assert store.nodes[live.id][node_id]["state"] == (
         "quarantined" if transition_case == "malformed" else "completed"
     )
@@ -3638,9 +4484,7 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
     task = (await service.list_schedule_tasks(live.id))[0]
     committed = await service.committed_task_result_evidence(live.id, task)
     assert committed is not None
-    assert committed["target_evidence_receipts"] == {
-        "crash-transition": crash_receipt
-    }
+    assert committed["target_evidence_receipts"] == {"crash-transition": crash_receipt}
 
 
 async def test_replacement_result_inherits_authenticated_ancestor_evidence_after_restart() -> None:
@@ -3655,6 +4499,7 @@ async def test_replacement_result_inherits_authenticated_ancestor_evidence_after
         "tool_name": "target_request",
         "reference": "target-call:call-before-restart",
         "campaign_id": "campaign/recon",
+        "session_id": "session-1",
         "assignment_id": task_id,
         "attempt_id": ancestor_attempt_id,
         "technique_attempt_id": "technique-attempt-1",
@@ -3677,6 +4522,7 @@ async def test_replacement_result_inherits_authenticated_ancestor_evidence_after
         call_id="call-before-restart",
         tool_name="target_request",
         campaign_id="campaign/recon",
+        session_id="session-1",
         agent_id=task_id,
         attempt_id=ancestor_attempt_id,
         target_id="target-1",
@@ -3703,6 +4549,10 @@ async def test_replacement_result_inherits_authenticated_ancestor_evidence_after
             return values if limit is None else values[-limit:]
 
     store = ReplacementStore()
+    store.schedules["schedule-1"] = {
+        "id": "schedule-1",
+        "session_id": "session-1",
+    }
     store.results["schedule-1"] = {
         f"worker:{task_id}": {
             "node_id": f"worker:{task_id}",
@@ -3756,6 +4606,7 @@ async def test_replacement_result_inherits_authenticated_ancestor_evidence_after
     "tampered_field",
     (
         "campaign_id",
+        "session_id",
         "assignment_id",
         "target_id",
         "target_session_id",
@@ -3778,6 +4629,7 @@ def test_inherited_target_evidence_rejects_cross_lineage_attribution(
         "tool_name": "target_request",
         "reference": f"target-call:{call_id}",
         "campaign_id": "campaign/fixture-id",
+        "session_id": "session-1",
         "assignment_id": task_id,
         "attempt_id": ancestor_attempt_id,
         "technique_attempt_id": "technique-attempt-1",
@@ -3802,6 +4654,7 @@ def test_inherited_target_evidence_rejects_cross_lineage_attribution(
         call_id=call_id,
         tool_name="target_request",
         campaign_id="campaign/fixture-id",
+        session_id="session-1",
         agent_id=task_id,
         attempt_id=(
             replacement_attempt_id if tampered_field == "effect_attempt_id" else ancestor_attempt_id
@@ -3836,6 +4689,7 @@ def test_inherited_target_evidence_rejects_cross_lineage_attribution(
         row,
         durable_effects=(effect,),
         evidence_attempt_ids=(ancestor_attempt_id, replacement_attempt_id),
+        expected_session_id="session-1",
     )
 
     assert evidence is not None
@@ -4430,6 +5284,55 @@ async def test_cancel_task_accepts_task_or_node_id_and_preserves_schedule() -> N
     }
     with pytest.raises(ValueError, match="already terminal"):
         await service.cancel_task("session", "worker:campaign/task-0")
+
+
+async def test_cancel_task_persists_fence_before_interrupting_live_worker() -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    class BlockingProvider:
+        async def stream(self, request):
+            del request
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield ModelCompleted()  # pragma: no cover
+            finally:
+                closed.set()
+
+    class OrderingStore(Store):
+        def cancel_node(self, *args, **kwargs):
+            observed["worker_open_at_durable_cancel"] = not closed.is_set()
+            return super().cancel_node(*args, **kwargs)
+
+    store = OrderingStore()
+    service = DurableAgentService(BlockingProvider(), Tools(), store, model="test")
+    assignment = WorkerAssignment(
+        id="campaign/cancel-fence/task",
+        objective="Assess",
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    live = await service.submit("session", (assignment,), max_workers=1, minimum_workers=1)
+    assert live.execution is not None
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await service.cancel_task("session", assignment.id)
+    await asyncio.wait_for(live.execution, timeout=1)
+
+    assert observed == {"worker_open_at_durable_cancel": True}
+    assert closed.is_set()
+    assert store.nodes[live.id][f"worker:{assignment.id}"]["state"] == "cancelled"
 
 
 @pytest.mark.parametrize("directive", [False, True])
@@ -7068,7 +7971,16 @@ async def test_capability_probe_server_error_runs_bounded_replacement(
             self.retry_transitions = 0
             self.interrupt_retry = restart_after_second_5xx
 
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
             prior = [
                 attempt
                 for attempt in self.attempts.values()
@@ -7080,6 +7992,7 @@ async def test_capability_probe_server_error_runs_bounded_replacement(
                 owner,
                 lease_expires_at=lease_expires_at,
                 attempt_id=attempt_id,
+                target_admission=target_admission,
             )
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
@@ -7104,6 +8017,7 @@ async def test_capability_probe_server_error_runs_bounded_replacement(
             checkpoint,
             target_session_id=None,
             failure_kind=None,
+            **kwargs,
         ):
             super().settle_attempt(
                 attempt_id,
@@ -7113,6 +8027,7 @@ async def test_capability_probe_server_error_runs_bounded_replacement(
                 checkpoint=checkpoint,
                 target_session_id=target_session_id,
                 failure_kind=failure_kind,
+                **kwargs,
             )
             self.attempts[attempt_id].target_session_id = target_session_id
 
@@ -7298,7 +8213,16 @@ async def test_retryable_delivery_failure_retries_with_fresh_worker_before_excha
     initial_status_code: int,
 ) -> None:
     class RetryStore(Store):
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
             prior = [
                 attempt
                 for attempt in self.attempts.values()
@@ -7310,6 +8234,7 @@ async def test_retryable_delivery_failure_retries_with_fresh_worker_before_excha
                 owner,
                 lease_expires_at=lease_expires_at,
                 attempt_id=attempt_id,
+                target_admission=target_admission,
             )
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
@@ -7454,7 +8379,16 @@ async def test_repeated_capability_probe_http_failure_is_bounded_and_exact_args_
     statuses: tuple[int, ...],
 ) -> None:
     class LineageStore(Store):
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
             prior = [
                 attempt
                 for attempt in self.attempts.values()
@@ -7466,6 +8400,7 @@ async def test_repeated_capability_probe_http_failure_is_bounded_and_exact_args_
                 owner,
                 lease_expires_at=lease_expires_at,
                 attempt_id=attempt_id,
+                target_admission=target_admission,
             )
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
@@ -10195,6 +11130,178 @@ async def test_cancel_schedule_persists_durable_cancel_before_stopping_tasks() -
     assert store.schedules[live.id]["status"] == "cancelled"
 
 
+async def test_cancel_schedule_reconciles_target_lanes_after_local_unwind() -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    class BlockingProvider:
+        async def stream(self, request):
+            del request
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield ModelCompleted()  # pragma: no cover
+            finally:
+                closed.set()
+
+    class ReconciliationStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconciliations: list[tuple[str, bool]] = []
+
+        def reconcile_cancelled_target_lanes(self, schedule_id):
+            self.reconciliations.append((schedule_id, closed.is_set()))
+            return {
+                "released": (),
+                "held": ("attempt-with-acknowledged-effect",),
+                "latched": (),
+            }
+
+    store = ReconciliationStore()
+    service = DurableAgentService(BlockingProvider(), Tools(), store, model="test")
+    assignment = WorkerAssignment(
+        id="campaign/cancel-reconcile/task",
+        objective="Assess",
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    live = await service.submit("session", (assignment,), max_workers=1, minimum_workers=1)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await service.cancel_schedule(live.id, reason="operator")
+
+    assert store.reconciliations == [(live.id, True)]
+    assert store.schedules[live.id]["status"] == "cancelled"
+
+
+async def test_reject_schedule_reconciliation_fails_closed_on_ambiguous_projection() -> None:
+    class AmbiguousStore(Store):
+        def reconcile_cancelled_target_lanes(self, schedule_id):
+            assert schedule_id in self.schedules
+            return {
+                "released": ("attempt-1",),
+                "held": ("attempt-1",),
+                "latched": (),
+            }
+
+    store = AmbiguousStore()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    assignment = WorkerAssignment(
+        id="campaign/reject-reconcile/task",
+        objective="Assess",
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    live = await service.submit(
+        "session", (assignment,), max_workers=1, minimum_workers=1, start_immediately=False
+    )
+
+    with pytest.raises(RuntimeError, match="reconciliation is ambiguous"):
+        await service.reject_persisted_schedule(live.id, reason="incompatible")
+
+    assert store.schedules[live.id]["status"] == "cancelled"
+
+
+async def test_pause_resume_preserves_same_source_lane_without_cancel_reconciliation() -> None:
+    class TrackingStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_reconciliations = 0
+
+        def reconcile_cancelled_target_lanes(self, schedule_id):
+            assert schedule_id in self.schedules
+            self.cancel_reconciliations += 1
+            return {"released": (), "held": (), "latched": ()}
+
+    store = TrackingStore()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    assignment = WorkerAssignment(
+        id="campaign/pause-lane/task",
+        objective="Assess",
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=(),
+        guidance_ids=(),
+        tool_ids=(),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+    live = await service.submit(
+        "session", (assignment,), max_workers=1, minimum_workers=1, start_immediately=False
+    )
+
+    await service.pause_schedule(live.id, reason="operator")
+    resumed = await service.resume_schedule(live.id)
+    assert resumed.execution is not None
+    await asyncio.wait_for(resumed.execution, timeout=1)
+
+    assert store.cancel_reconciliations == 0
+    assert store.nodes[live.id][f"worker:{assignment.id}"]["state"] == "completed"
+
+
+async def test_late_cancelled_commit_reconciles_without_attack_failure() -> None:
+    class StaleLeaseError(RuntimeError):
+        pass
+
+    class CancelledCommitStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconciliations = 0
+
+        def commit_reducer(self, *args, **kwargs):
+            del args, kwargs
+            raise StaleLeaseError("attempt was cancelled")
+
+        def list_attempts(self, schedule_id):
+            assert schedule_id == "schedule-1"
+            return [{"id": "attempt-1", "generation": 1, "state": "cancelled"}]
+
+        def reconcile_cancelled_target_lanes(self, schedule_id):
+            assert schedule_id == "schedule-1"
+            self.reconciliations += 1
+            return {"released": (), "held": ("attempt-1",), "latched": ()}
+
+    store = CancelledCommitStore()
+    service = DurableAgentService(Provider(), Tools(), store, model="test")
+    live = SimpleNamespace(
+        id="schedule-1",
+        scheduler=SimpleNamespace(checkpoint=lambda: {}),
+    )
+    lease = SimpleNamespace(id="attempt-1", generation=1)
+
+    digest = await service._commit(  # noqa: SLF001
+        live,
+        lease,
+        {"content": "late", "target_session_id": "browser:session"},
+        "schema/result",
+    )
+
+    assert digest is None
+    assert store.reconciliations == 1
+
+
 async def test_cancel_schedule_store_failure_leaves_tasks_running() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -10385,12 +11492,26 @@ class StaleLeaseError(RuntimeError):
 class FencingStore(Store):
     """Store double with PostgreSQL lease fencing: stale claims/commits raise."""
 
-    def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+    def claim(
+        self,
+        schedule_id,
+        node_id,
+        owner,
+        *,
+        lease_expires_at,
+        attempt_id=None,
+        target_admission=None,
+    ):
         node = self.nodes[schedule_id][node_id]
         if node["state"] != "ready":
             raise StaleLeaseError("scheduler node is not ready")
         return super().claim(
-            schedule_id, node_id, owner, lease_expires_at=lease_expires_at, attempt_id=attempt_id
+            schedule_id,
+            node_id,
+            owner,
+            lease_expires_at=lease_expires_at,
+            attempt_id=attempt_id,
+            target_admission=target_admission,
         )
 
     def commit_reducer(self, attempt_id, generation, **kwargs):
@@ -10447,7 +11568,9 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
 ) -> None:
     generic_case = transition_case.startswith("generic_")
     generic_tool_name = (
-        "browser_navigate" if transition_case == "generic_navigate" else "browser_click"
+        "browser_navigate"
+        if transition_case == "generic_navigate"
+        else "browser_click"
         if generic_case
         else None
     )
@@ -10546,6 +11669,20 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             self.records[record.idempotency_key] = record
             return record, True
 
+        async def adopt_permitted(self, record, permit_digest):
+            expected = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        record.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
+            assert permit_digest == expected
+            return await self.begin(record)
+
         async def finish(self, record):
             self.records[record.idempotency_key] = record
             return record
@@ -10563,9 +11700,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
-            records = [
-                item for item in self.records.values() if item.campaign_id == campaign_id
-            ]
+            records = [item for item in self.records.values() if item.campaign_id == campaign_id]
             return records if limit is None else records[-limit:]
 
     class SurfaceTool:
@@ -10719,12 +11854,19 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
                 "payload_digest": payload_digest,
                 "payload": payload,
             }
-            self.results.setdefault(lease.schedule_id, {})[
-                f"partial:{attempt_id}"
-            ] = row
+            self.results.setdefault(lease.schedule_id, {})[f"partial:{attempt_id}"] = row
             return payload_digest
 
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
             prior = next(
                 (
                     attempt
@@ -10741,6 +11883,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
                 owner,
                 lease_expires_at=lease_expires_at,
                 attempt_id=attempt_id,
+                target_admission=target_admission,
             )
             lease.replaced_attempt_id = prior.id if prior is not None else None
             return lease
@@ -10839,9 +11982,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         effect_store=effect_store,
     )
     store = RestartStore()
-    first = DurableAgentService(
-        NoWorkerProvider(), broker, store, model="test", lease_seconds=0.05
-    )
+    first = DurableAgentService(NoWorkerProvider(), broker, store, model="test", lease_seconds=0.05)
     live = await first.submit(
         "session-restart-transition",
         (assignment,),
@@ -10936,38 +12077,35 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
     first._live.clear()  # noqa: SLF001 - simulate daemon process loss
 
     provider = NoWorkerProvider()
-    replacement = DurableAgentService(
-        provider, broker, store, model="test", lease_seconds=0.05
-    )
+    replacement = DurableAgentService(provider, broker, store, model="test", lease_seconds=0.05)
     reopened = await replacement.reopen(live.id)
     assert reopened.execution is not None
     await asyncio.wait_for(reopened.execution, timeout=2)
 
-    attempts = [
-        attempt for attempt in store.attempts.values() if attempt.node_id == node_id
-    ]
+    attempts = [attempt for attempt in store.attempts.values() if attempt.node_id == node_id]
     assert len(attempts) == 2
-    assert store.nodes[live.id][node_id]["state"] == {
-        "success": "completed",
-        "pre_effect": "failed",
-        "malformed": "quarantined",
-        "ambiguous": "quarantined",
-        "continued": "quarantined",
-        "wrong_session": "quarantined",
-        "unauthorized_tool": "quarantined",
-        "generic_click": "completed",
-        "generic_navigate": "completed",
-        "generic_nonmaterial": "completed",
-        "generic_intent": "quarantined",
-        "generic_ambiguous": "quarantined",
-        "generic_missing_transition": "quarantined",
-        "generic_fill_submit": "completed",
-        "generic_invalid_prior": "quarantined",
-    }[transition_case]
-    assert provider.calls == 0
-    assert surface_tool.calls == (
-        2 if transition_case in {"ambiguous", "continued"} else 1
+    assert (
+        store.nodes[live.id][node_id]["state"]
+        == {
+            "success": "completed",
+            "pre_effect": "failed",
+            "malformed": "quarantined",
+            "ambiguous": "quarantined",
+            "continued": "quarantined",
+            "wrong_session": "quarantined",
+            "unauthorized_tool": "quarantined",
+            "generic_click": "completed",
+            "generic_navigate": "completed",
+            "generic_nonmaterial": "completed",
+            "generic_intent": "quarantined",
+            "generic_ambiguous": "quarantined",
+            "generic_missing_transition": "quarantined",
+            "generic_fill_submit": "completed",
+            "generic_invalid_prior": "quarantined",
+        }[transition_case]
     )
+    assert provider.calls == 0
+    assert surface_tool.calls == (2 if transition_case in {"ambiguous", "continued"} else 1)
     assert len(effect_store.records) == (
         2
         if transition_case
@@ -10981,9 +12119,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         for _, event_type, _ in store.lifecycle_events
     )
     task = next(
-        item
-        for item in await replacement.list_schedule_tasks(live.id)
-        if item.id == assignment.id
+        item for item in await replacement.list_schedule_tasks(live.id) if item.id == assignment.id
     )
     if transition_case in {
         "success",
@@ -10997,8 +12133,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         row = next(
             item
             for item in reversed(store.list_results(live.id))
-            if item.get("node_id") == node_id
-            and item.get("schema_id") == "schema/partial-result"
+            if item.get("node_id") == node_id and item.get("schema_id") == "schema/partial-result"
         )
         if transition_case in {
             "generic_intent",
@@ -11039,9 +12174,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         assert receipt["candidate_outcome_projection"]["outcome"] == "unclear"
     elif transition_case in {"generic_click", "generic_navigate", "generic_fill_submit"}:
         assert committed["target_evidence_receipts"] == {}
-        assert tuple(committed["target_ui_transition_receipts"]) == (
-            "restart-transition",
-        )
+        assert tuple(committed["target_ui_transition_receipts"]) == ("restart-transition",)
         receipt = committed["target_ui_transition_receipts"]["restart-transition"]
         assert receipt["tool_name"] == generic_tool_name
         assert receipt["generic_browser_effect"] is True
@@ -11079,9 +12212,7 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         assert committed["target_ui_transition_receipts"] == {}
     elif transition_case == "pre_effect":
         assert committed["target_evidence_receipts"] == {}
-        assert tuple(committed["target_ui_transition_receipts"]) == (
-            "restart-transition",
-        )
+        assert tuple(committed["target_ui_transition_receipts"]) == ("restart-transition",)
         receipt = committed["target_ui_transition_receipts"]["restart-transition"]
         assert receipt["attempt_id"] == attempts[0].id
         assert receipt["target_effect_attempted"] is False
@@ -11175,7 +12306,17 @@ async def test_stale_lease_without_fence_loss_still_raises() -> None:
     """A StaleLeaseError that durable state cannot explain stays a failure."""
 
     class SpuriousStore(FencingStore):
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
+            del schedule_id, node_id, owner, lease_expires_at, attempt_id, target_admission
             raise StaleLeaseError("scheduler node is not ready")
 
     store = SpuriousStore()
@@ -11210,7 +12351,21 @@ async def test_restart_resume_fences_out_the_pre_restart_executor() -> None:
             yield TextDelta(text='{"finding":"checked"}')
             yield ModelCompleted()
 
-    store = FencingStore()
+    class RestartFencingStore(FencingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped_attempt_ids: set[str] = set()
+
+        def heartbeat(self, attempt_id, generation, *, lease_expires_at):
+            if attempt_id in self.stopped_attempt_ids:
+                raise StaleLeaseError("pre-restart executor no longer heartbeats")
+            return super().heartbeat(
+                attempt_id,
+                generation,
+                lease_expires_at=lease_expires_at,
+            )
+
+    store = RestartFencingStore()
     creator = DurableAgentService(
         BlockingProvider(), Tools(), store, model="test", lease_seconds=0.2
     )
@@ -11221,7 +12376,13 @@ async def test_restart_resume_fences_out_the_pre_restart_executor() -> None:
     )
     assert live.execution is not None
     await asyncio.wait_for(started.wait(), timeout=5)
-    assert any(attempt.state == "running" for attempt in store.attempts.values())
+    pre_restart_attempt = next(
+        attempt for attempt in store.attempts.values() if attempt.state == "running"
+    )
+    # A daemon restart stops the old process's async and thread heartbeat
+    # keepers even though this fixture retains its blocked provider so the
+    # eventual late commit can prove generation fencing.
+    store.stopped_attempt_ids.add(pre_restart_attempt.id)
 
     recovered = DurableAgentService(Provider(), Tools(), store, model="test", lease_seconds=0.2)
     reopened = await recovered.reopen(live.id)
@@ -11593,13 +12754,23 @@ async def test_executor_recovers_mid_wave_worker_whose_keepers_went_silent() -> 
             super().__init__()
             self.silent_attempt = None
 
-        def claim(self, schedule_id, node_id, owner, *, lease_expires_at, attempt_id=None):
+        def claim(
+            self,
+            schedule_id,
+            node_id,
+            owner,
+            *,
+            lease_expires_at,
+            attempt_id=None,
+            target_admission=None,
+        ):
             lease = super().claim(
                 schedule_id,
                 node_id,
                 owner,
                 lease_expires_at=lease_expires_at,
                 attempt_id=attempt_id,
+                target_admission=target_admission,
             )
             if self.silent_attempt is None and node_id.startswith("worker:"):
                 self.silent_attempt = lease.id

@@ -24,6 +24,46 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def validated_target_reobservation_lead_decision(
+    row: Mapping[str, object], *, campaign_id: str
+) -> str | None:
+    """Return one canonical typed Lead decision that can consume a refresh."""
+
+    payload = row.get("payload")
+    decision_id = row.get("decision_id")
+    wave = row.get("wave")
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema") != "merlin.campaign-lead-decision.v1"
+        or payload.get("campaign_id") != campaign_id
+        or type(wave) is not int
+        or payload.get("wave") != wave
+        or not isinstance(decision_id, str)
+        or re.fullmatch(r"lead-decision:[0-9a-f]{64}", decision_id) is None
+    ):
+        return None
+    source_ids = payload.get("source_message_ids")
+    if (
+        not isinstance(source_ids, (list, tuple))
+        or len(source_ids) > 1024
+        or any(not isinstance(item, str) or not item for item in source_ids)
+        or tuple(source_ids) != tuple(sorted(set(source_ids)))
+    ):
+        return None
+    identity = json.dumps(
+        {
+            "campaign_id": campaign_id,
+            "wave": wave,
+            "source_message_ids": tuple(source_ids),
+            "payload": dict(payload),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = "lead-decision:" + hashlib.sha256(identity.encode()).hexdigest()
+    return decision_id if decision_id == expected else None
+
+
 def _text(value: object, *, limit: int, required: bool = False) -> str | None:
     if not isinstance(value, str) or len(value) > limit or required and not value:
         return None
@@ -142,6 +182,7 @@ class TargetReobservationObligation:
     campaign_id: str
     session_id: str
     target_id: str
+    target_session_id: str
     event_digest: str
     transition_digest: str
     source_schedule_id: str
@@ -159,10 +200,11 @@ class TargetReobservationObligation:
     def observed_payload(self, campaign_id: str, target_id: str) -> dict[str, object]:
         return {
             "kind": "target_surface_transition_observed",
-            "schema": "merlin.target-surface-transition-observed.v1",
+            "schema": "merlin.target-surface-transition-observed.v2",
             "campaign_id": campaign_id,
             "session_id": self.session_id,
             "target_id": target_id,
+            "target_session_id": self.target_session_id,
             "obligation_id": self.obligation_id,
             "event_digest": self.event_digest,
             "transition_digest": self.transition_digest,
@@ -211,6 +253,9 @@ def extract_target_reobservation_obligations(
                     or receipt.get("campaign_id") != campaign_id
                     or receipt.get("session_id") != session_id
                     or receipt.get("target_id") != target_id
+                    or not isinstance(receipt.get("target_session_id"), str)
+                    or not str(receipt["target_session_id"]).strip()
+                    or len(str(receipt["target_session_id"])) > 256
                     or not isinstance(receipt.get("tool_name"), str)
                     or not receipt["tool_name"]
                     or not isinstance(receipt_sha256, str)
@@ -270,7 +315,14 @@ def extract_target_reobservation_obligations(
                 ):
                     continue
                 event_digest = _digest(
-                    [campaign_id, task_id, call_id, receipt_sha256, transition_digest]
+                    [
+                        campaign_id,
+                        str(receipt["target_session_id"]),
+                        task_id,
+                        call_id,
+                        receipt_sha256,
+                        transition_digest,
+                    ]
                 )
                 found.setdefault(
                     event_digest,
@@ -278,6 +330,7 @@ def extract_target_reobservation_obligations(
                         campaign_id=campaign_id,
                         session_id=session_id,
                         target_id=target_id,
+                        target_session_id=str(receipt["target_session_id"]),
                         event_digest=event_digest,
                         transition_digest=transition_digest,
                         source_schedule_id=source_schedule_id,
@@ -299,6 +352,7 @@ def _obligation(payload: Mapping[str, object]) -> TargetReobservationObligation 
         payload.get("campaign_id"),
         payload.get("session_id"),
         payload.get("target_id"),
+        payload.get("target_session_id"),
         payload.get("event_digest"),
         payload.get("transition_digest"),
         payload.get("source_schedule_id"),
@@ -309,31 +363,33 @@ def _obligation(payload: Mapping[str, object]) -> TargetReobservationObligation 
     )
     if (
         payload.get("kind") != "target_surface_transition_observed"
-        or payload.get("schema") != "merlin.target-surface-transition-observed.v1"
+        or payload.get("schema") != "merlin.target-surface-transition-observed.v2"
         or normalized is None
         or type(source_wave) is not int
         or any(not isinstance(item, str) or not item for item in values)
-        or _DIGEST.fullmatch(str(values[3])) is None
-        or normalized[1] != values[4]
-        or _HEX_DIGEST.fullmatch(str(values[8])) is None
-        or values[9] not in _PROJECTIONS
-        or values[3] != _digest([values[0], values[6], values[7], values[8], values[4]])
+        or _text(values[3], limit=256, required=True) is None
+        or _DIGEST.fullmatch(str(values[4])) is None
+        or normalized[1] != values[5]
+        or _HEX_DIGEST.fullmatch(str(values[9])) is None
+        or values[10] not in _PROJECTIONS
+        or values[4] != _digest([values[0], values[3], values[7], values[8], values[9], values[5]])
         or payload.get("obligation_id")
-        != "target-reobservation:" + str(values[3]).removeprefix("sha256:")
+        != "target-reobservation:" + str(values[4]).removeprefix("sha256:")
     ):
         return None
     return TargetReobservationObligation(
         campaign_id=str(values[0]),
         session_id=str(values[1]),
         target_id=str(values[2]),
-        event_digest=str(values[3]),
-        transition_digest=str(values[4]),
-        source_schedule_id=str(values[5]),
+        target_session_id=str(values[3]),
+        event_digest=str(values[4]),
+        transition_digest=str(values[5]),
+        source_schedule_id=str(values[6]),
         source_wave=source_wave,
-        source_task_id=str(values[6]),
-        target_call_id=str(values[7]),
-        receipt_sha256=str(values[8]),
-        receipt_projection=str(values[9]),
+        source_task_id=str(values[7]),
+        target_call_id=str(values[8]),
+        receipt_sha256=str(values[9]),
+        receipt_projection=str(values[10]),
         transition=normalized[0],
     )
 
@@ -343,6 +399,7 @@ class TargetReobservationGeneration:
     campaign_id: str
     session_id: str
     target_id: str
+    target_session_id: str
     generation_id: str
     event_digests: tuple[str, ...]
     observation_cutoff_sequence: int
@@ -358,6 +415,7 @@ class TargetReobservationOverflow:
     campaign_id: str
     session_id: str
     target_id: str
+    target_session_id: str
     generation_id: str
     event_set_digest: str
     event_count: int
@@ -368,12 +426,25 @@ def target_reobservation_generation(
     pending: Sequence[TargetReobservationObligation],
     observation_sequences: Mapping[str, int],
 ) -> TargetReobservationGeneration | None:
-    if not pending or len(pending) > 256:
+    if not pending:
+        return None
+    first = min(
+        pending,
+        key=lambda item: (observation_sequences.get(item.event_digest, 0), item.event_digest),
+    )
+    pending = tuple(item for item in pending if item.target_session_id == first.target_session_id)
+    if len(pending) > 256:
         return None
     campaign_ids = {item.campaign_id for item in pending}
     session_ids = {item.session_id for item in pending}
     target_ids = {item.target_id for item in pending}
-    if len(campaign_ids) != 1 or len(session_ids) != 1 or len(target_ids) != 1:
+    target_session_ids = {item.target_session_id for item in pending}
+    if (
+        len(campaign_ids) != 1
+        or len(session_ids) != 1
+        or len(target_ids) != 1
+        or len(target_session_ids) != 1
+    ):
         return None
     ordered = tuple(
         sorted(
@@ -387,12 +458,14 @@ def target_reobservation_generation(
     campaign_id = next(iter(campaign_ids))
     session_id = next(iter(session_ids))
     target_id = next(iter(target_ids))
+    target_session_id = next(iter(target_session_ids))
     generation_id = _digest(
         {
             "schema": "merlin.target-reobservation-generation.v1",
             "campaign_id": campaign_id,
             "session_id": session_id,
             "target_id": target_id,
+            "target_session_id": target_session_id,
             "observation_cutoff_sequence": cutoff,
             "event_digests": ordered,
         }
@@ -401,6 +474,7 @@ def target_reobservation_generation(
         campaign_id,
         session_id,
         target_id,
+        target_session_id,
         generation_id,
         ordered,
         cutoff,
@@ -487,6 +561,7 @@ class TargetReobservationProjection:
             {
                 "generation_id": str(payload["generation_id"]),
                 "settlement_id": str(payload["settlement_id"]),
+                "target_session_id": str(payload["target_session_id"]),
             }
             for payload in self.review_pending
         )
@@ -509,6 +584,7 @@ class TargetReobservationProjection:
         generation = (
             {
                 "generation_id": current.generation_id,
+                "target_session_id": current.target_session_id,
                 "event_count": len(current.event_digests),
                 "event_set_digest": _digest({"event_digests": current.event_digests}),
                 "status": (
@@ -522,6 +598,7 @@ class TargetReobservationProjection:
             if current is not None
             else {
                 "generation_id": self.overflow.generation_id,
+                "target_session_id": self.overflow.target_session_id,
                 "event_count": self.overflow.event_count,
                 "event_set_digest": self.overflow.event_set_digest,
                 "status": "blocked_event_overflow",
@@ -548,6 +625,7 @@ class TargetReobservationProjection:
                 key: payload[key]
                 for key in (
                     "generation_id",
+                    "target_session_id",
                     "settlement_id",
                     "event_count",
                     "event_set_digest",
@@ -580,6 +658,7 @@ class TargetReobservationProjection:
                 "schema": "merlin.target-reobservation-recovery-state.v1",
                 "phase": "reobserve",
                 "generation_id": generation.generation_id,
+                "target_session_id": generation.target_session_id,
                 "event_set_digest": event_set_digest,
                 "source_wave": generation.source_wave,
                 "schedule_id": recovery_schedule,
@@ -591,6 +670,7 @@ class TargetReobservationProjection:
                 "schema": "merlin.target-reobservation-recovery-state.v1",
                 "phase": "reobserve",
                 "generation_id": self.overflow.generation_id,
+                "target_session_id": self.overflow.target_session_id,
                 "event_set_digest": self.overflow.event_set_digest,
                 "source_wave": self.overflow.source_wave,
                 "schedule_id": None,
@@ -606,6 +686,7 @@ class TargetReobservationProjection:
                 "schema": "merlin.target-reobservation-recovery-state.v1",
                 "phase": "review",
                 "generation_id": generation_id,
+                "target_session_id": settlement["target_session_id"],
                 "event_set_digest": settlement["event_set_digest"],
                 "source_wave": source_wave,
                 "schedule_id": settlement["schedule_id"],
@@ -656,6 +737,7 @@ def _generation_from_start(
         or payload.get("campaign_id") != generation.campaign_id
         or payload.get("session_id") != generation.session_id
         or payload.get("target_id") != generation.target_id
+        or payload.get("target_session_id") != generation.target_session_id
         or payload.get("generation_id") != generation.generation_id
         or payload.get("obligation_id") != generation.obligation_id
         or payload.get("event_set_digest") != _digest({"event_digests": generation.event_digests})
@@ -752,6 +834,7 @@ def project_target_reobservations(
                 and payload.get("campaign_id") == generation.campaign_id
                 and payload.get("session_id") == generation.session_id
                 and payload.get("target_id") == generation.target_id
+                and payload.get("target_session_id") == generation.target_session_id
                 and payload.get("obligation_id") == generation.obligation_id
                 and tuple(payload.get("event_digests") or ()) == generation.event_digests
                 and payload.get("event_count") == len(generation.event_digests)
@@ -777,6 +860,7 @@ def project_target_reobservations(
                 and payload.get("campaign_id") == generation.campaign_id
                 and payload.get("session_id") == generation.session_id
                 and payload.get("target_id") == generation.target_id
+                and payload.get("target_session_id") == generation.target_session_id
                 and payload.get("obligation_id") == generation.obligation_id
                 and payload.get("event_set_digest")
                 == _digest({"event_digests": generation.event_digests})
@@ -828,6 +912,7 @@ def project_target_reobservations(
                 and payload.get("campaign_id") == generation.campaign_id
                 and payload.get("session_id") == generation.session_id
                 and payload.get("target_id") == generation.target_id
+                and payload.get("target_session_id") == generation.target_session_id
                 and payload.get("obligation_id") == generation.obligation_id
                 and payload.get("event_set_digest") == expected_event_set
                 and payload.get("event_count") == len(generation.event_digests)
@@ -854,7 +939,14 @@ def project_target_reobservations(
             ):
                 refreshed[generation.generation_id] = dict(payload)
                 settled_events.update(generation.event_digests)
-        decision_id = row.get("decision_id") if isinstance(row, Mapping) else None
+        decision_campaign_id = campaign_id or payload.get("campaign_id")
+        decision_id = (
+            validated_target_reobservation_lead_decision(row, campaign_id=decision_campaign_id)
+            if isinstance(row, Mapping)
+            and isinstance(decision_campaign_id, str)
+            and decision_campaign_id
+            else None
+        )
         bindings = payload.get("target_reobservation_generations")
         if (
             isinstance(decision_id, str)
@@ -866,6 +958,7 @@ def project_target_reobservations(
                 if not isinstance(binding, Mapping) or set(binding) != {
                     "generation_id",
                     "settlement_id",
+                    "target_session_id",
                 }:
                     continue
                 generation_id = binding.get("generation_id")
@@ -876,6 +969,7 @@ def project_target_reobservations(
                     and isinstance(settlement_id, str)
                     and settlement is not None
                     and settlement.get("settlement_id") == settlement_id
+                    and binding.get("target_session_id") == settlement.get("target_session_id")
                 ):
                     reviewed[generation_id] = decision_id
     pending = tuple(
@@ -885,32 +979,40 @@ def project_target_reobservations(
         )
     )
     overflow: TargetReobservationOverflow | None = None
-    if len(pending) > 256 and not any(
+    pending_scope = (
+        tuple(item for item in pending if item.target_session_id == pending[0].target_session_id)
+        if pending
+        else ()
+    )
+    if len(pending_scope) > 256 and not any(
         generation_id not in refreshed for generation_id in generations
     ):
-        campaign_ids = {item.campaign_id for item in pending}
-        session_ids = {item.session_id for item in pending}
-        target_ids = {item.target_id for item in pending}
-        if len(campaign_ids) == len(session_ids) == len(target_ids) == 1:
-            event_digests = tuple(item.event_digest for item in pending)
+        campaign_ids = {item.campaign_id for item in pending_scope}
+        session_ids = {item.session_id for item in pending_scope}
+        target_ids = {item.target_id for item in pending_scope}
+        target_session_ids = {item.target_session_id for item in pending_scope}
+        if len(campaign_ids) == len(session_ids) == len(target_ids) == len(target_session_ids) == 1:
+            event_digests = tuple(item.event_digest for item in pending_scope)
             event_set_digest = _digest({"event_digests": event_digests})
             overflow = TargetReobservationOverflow(
                 campaign_id=next(iter(campaign_ids)),
                 session_id=next(iter(session_ids)),
                 target_id=next(iter(target_ids)),
+                target_session_id=next(iter(target_session_ids)),
                 generation_id=_digest(
                     {
                         "schema": "merlin.target-reobservation-overflow.v1",
                         "campaign_id": next(iter(campaign_ids)),
                         "session_id": next(iter(session_ids)),
                         "target_id": next(iter(target_ids)),
+                        "target_session_id": next(iter(target_session_ids)),
                         "event_set_digest": event_set_digest,
                         "event_count": len(event_digests),
                     }
                 ),
                 event_set_digest=event_set_digest,
                 event_count=len(event_digests),
-                source_wave=max(item.source_wave for item in pending),
+                source_wave=max(item.source_wave for item in pending_scope),
             )
     return TargetReobservationProjection(
         pending,

@@ -20,6 +20,20 @@ CleanupDisposition = Literal[
 ]
 
 
+def campaign_api_target_session_id(
+    campaign_id: str,
+    target_id: str,
+    session_scope_id: str,
+    generation: int,
+) -> str:
+    """Return the canonical durable identity for one API target-session generation."""
+
+    legacy = f"api:{campaign_id}:{target_id}:generation:{generation}"
+    if session_scope_id == LEGACY_API_SESSION_SCOPE_ID:
+        return legacy
+    return f"api:{campaign_id}:{target_id}:scope:{session_scope_id}:generation:{generation}"
+
+
 class RemoteSessionClaimConflict(ValueError):
     """A physical target session is already owned by another live scope."""
 
@@ -53,12 +67,11 @@ class CampaignApiSession:
     @property
     def target_session_id(self) -> str:
         """Durable identity of this target-session scope and generation."""
-        legacy = f"api:{self.campaign_id}:{self.target_id}:generation:{self.generation}"
-        if self.session_scope_id == LEGACY_API_SESSION_SCOPE_ID:
-            return legacy
-        return (
-            f"api:{self.campaign_id}:{self.target_id}:scope:{self.session_scope_id}:"
-            f"generation:{self.generation}"
+        return campaign_api_target_session_id(
+            self.campaign_id,
+            self.target_id,
+            self.session_scope_id,
+            self.generation,
         )
 
 

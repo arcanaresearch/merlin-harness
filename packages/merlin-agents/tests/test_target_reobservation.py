@@ -11,12 +11,43 @@ from merlin_agents.target_reobservation import (
 CAMPAIGN_ID = "campaign-1"
 SESSION_ID = "session-1"
 TARGET_ID = "target-1"
+TARGET_SESSION_ID = "browser:context-1"
 TASK_ID = "task-1"
 
 
 def _digest(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _lead_decision_row(
+    bindings: list[dict[str, str]],
+    *,
+    wave: int = 1,
+    source_message_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": "merlin.campaign-lead-decision.v1",
+        "campaign_id": CAMPAIGN_ID,
+        "wave": wave,
+        "source_message_ids": list(sorted(set(source_message_ids))),
+        "target_reobservation_generations": bindings,
+    }
+    identity = json.dumps(
+        {
+            "campaign_id": CAMPAIGN_ID,
+            "wave": wave,
+            "source_message_ids": tuple(sorted(set(source_message_ids))),
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "wave": wave,
+        "decision_id": "lead-decision:" + hashlib.sha256(identity.encode()).hexdigest(),
+        "payload": payload,
+    }
 
 
 def _transition(*, adapter_stale: bool, include_extra: bool = False) -> dict[str, object]:
@@ -63,6 +94,7 @@ def _receipt(
     zero_effect: bool = False,
     attempted_effect: bool = False,
     include_extra: bool = False,
+    target_session_id: str = TARGET_SESSION_ID,
 ) -> dict[str, object]:
     body: dict[str, object] = {
         "call_id": call_id,
@@ -71,6 +103,7 @@ def _receipt(
         "campaign_id": CAMPAIGN_ID,
         "session_id": SESSION_ID,
         "target_id": TARGET_ID,
+        "target_session_id": target_session_id,
         "tool_name": "browser_chat_exchange",
         "is_error": zero_effect or attempted_effect,
         "request_sha256": "3" * 64,
@@ -185,6 +218,7 @@ def test_attempted_effect_error_accepts_fresh_adapter_without_attack_credit() ->
         "campaign_id",
         "session_id",
         "target_id",
+        "target_session_id",
         "event_digest",
         "transition_digest",
         "source_schedule_id",
@@ -291,6 +325,12 @@ def test_exact_receipt_replay_dedupes_across_replacement_schedules() -> None:
 def test_projection_rejects_untyped_observation_and_start_rows() -> None:
     obligation = _extract(_receipt(call_id="call-schema", adapter_stale=False))[0]
     observed_payload = obligation.observed_payload(CAMPAIGN_ID, TARGET_ID)
+    assert observed_payload["schema"] == "merlin.target-surface-transition-observed.v2"
+    legacy_observation = dict(observed_payload)
+    legacy_observation["schema"] = "merlin.target-surface-transition-observed.v1"
+    assert project_target_reobservations([{"payload": legacy_observation}]).pending == ()
+    legacy_observation.pop("target_session_id")
+    assert project_target_reobservations([{"payload": legacy_observation}]).pending == ()
     untyped_observation = dict(observed_payload)
     untyped_observation.pop("schema")
     assert project_target_reobservations([{"payload": untyped_observation}]).pending == ()
@@ -304,6 +344,7 @@ def test_projection_rejects_untyped_observation_and_start_rows() -> None:
         "campaign_id": CAMPAIGN_ID,
         "session_id": SESSION_ID,
         "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
         "generation_id": generation.generation_id,
         "obligation_id": generation.obligation_id,
         "event_digests": generation.event_digests,
@@ -357,6 +398,119 @@ def test_identical_transition_shape_creates_one_obligation_per_authenticated_eve
     assert generation.event_digests == tuple(item.event_digest for item in obligations)
 
 
+def test_generations_partition_target_sessions_and_advance_after_review() -> None:
+    first = _extract(
+        _receipt(
+            call_id="call-context-first",
+            adapter_stale=False,
+            target_session_id=TARGET_SESSION_ID,
+        )
+    )[0]
+    second_target_session = "browser:context-2"
+    second = _extract(
+        _receipt(
+            call_id="call-context-second",
+            adapter_stale=False,
+            target_session_id=second_target_session,
+        )
+    )[0]
+    rows: list[dict[str, object]] = [
+        {"sequence": 1, "payload": first.observed_payload(CAMPAIGN_ID, TARGET_ID)},
+        {"sequence": 2, "payload": second.observed_payload(CAMPAIGN_ID, TARGET_ID)},
+    ]
+    projected = project_target_reobservations(rows)
+    generation = projected.current_generation
+    assert generation is not None
+    assert generation.target_session_id == TARGET_SESSION_ID
+    assert generation.event_digests == (first.event_digest,)
+    assert tuple(item.event_digest for item in projected.pending) == (
+        first.event_digest,
+        second.event_digest,
+    )
+
+    event_set_digest = _digest({"event_digests": generation.event_digests})
+    schedule_id = target_reobservation_schedule_id(CAMPAIGN_ID, generation.generation_id, 1)
+    evidence_refs = ["browser-snapshot:first-context-current"]
+    settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+        "sha256:"
+    )
+    rows.extend(
+        (
+            {
+                "sequence": 3,
+                "payload": {
+                    "kind": "target_reobservation_started",
+                    "schema": "merlin.target-reobservation-started.v1",
+                    "wave_kind": "objective_prerequisite",
+                    "campaign_id": CAMPAIGN_ID,
+                    "session_id": SESSION_ID,
+                    "target_id": TARGET_ID,
+                    "target_session_id": TARGET_SESSION_ID,
+                    "generation_id": generation.generation_id,
+                    "obligation_id": generation.obligation_id,
+                    "event_digests": list(generation.event_digests),
+                    "event_set_digest": event_set_digest,
+                    "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+                    "source_wave": generation.source_wave,
+                    "attempt": 1,
+                    "schedule_id": schedule_id,
+                },
+            },
+            {
+                "sequence": 4,
+                "payload": {
+                    "kind": "target_reobservation_settled",
+                    "schema": "merlin.target-reobservation-settlement.v1",
+                    "campaign_id": CAMPAIGN_ID,
+                    "session_id": SESSION_ID,
+                    "target_id": TARGET_ID,
+                    "target_session_id": TARGET_SESSION_ID,
+                    "generation_id": generation.generation_id,
+                    "obligation_id": generation.obligation_id,
+                    "event_digests": list(generation.event_digests),
+                    "event_set_digest": event_set_digest,
+                    "event_count": len(generation.event_digests),
+                    "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+                    "source_wave": generation.source_wave,
+                    "status": "refreshed",
+                    "attempt": 1,
+                    "schedule_id": schedule_id,
+                    "settlement_id": settlement_id,
+                    "current_surface_digest": "sha256:" + "6" * 64,
+                    "surface_evidence_digest": _digest({"evidence_refs": evidence_refs}),
+                    "surface_evidence_refs": evidence_refs,
+                    "recon_handoff_id": "handoff-first-context",
+                    "compiled_adapter_digest": "sha256:" + "7" * 64,
+                    "reviewed_adapter_digest": "sha256:" + "8" * 64,
+                    "result_reference": "task-result:first-context",
+                    "result_digest": "sha256:" + "9" * 64,
+                },
+            },
+            {
+                "sequence": 5,
+                **_lead_decision_row(
+                    [
+                        {
+                            "generation_id": generation.generation_id,
+                            "settlement_id": settlement_id,
+                            "target_session_id": TARGET_SESSION_ID,
+                        }
+                    ]
+                ),
+            },
+        )
+    )
+    projected = project_target_reobservations(rows)
+    assert projected.reviewed == {
+        generation.generation_id: rows[-1]["decision_id"],
+    }
+    assert tuple(item.event_digest for item in projected.pending) == (second.event_digest,)
+    next_generation = projected.current_generation
+    assert next_generation is not None
+    assert next_generation.target_session_id == second_target_session
+    assert next_generation.event_digests == (second.event_digest,)
+
+
 def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() -> None:
     obligations = extract_target_reobservation_obligations(
         campaign_id=CAMPAIGN_ID,
@@ -398,6 +552,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
             "campaign_id": CAMPAIGN_ID,
             "session_id": SESSION_ID,
             "target_id": TARGET_ID,
+            "target_session_id": TARGET_SESSION_ID,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": list(generation.event_digests),
@@ -428,6 +583,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
                 "campaign_id": CAMPAIGN_ID,
                 "session_id": SESSION_ID,
                 "target_id": TARGET_ID,
+                "target_session_id": TARGET_SESSION_ID,
                 "generation_id": generation.generation_id,
                 "obligation_id": generation.obligation_id,
                 "event_digests": generation.event_digests,
@@ -447,6 +603,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
         "schema": "merlin.target-reobservation-recovery-state.v1",
         "phase": "reobserve",
         "generation_id": generation.generation_id,
+        "target_session_id": TARGET_SESSION_ID,
         "event_set_digest": event_set_digest,
         "source_wave": generation.source_wave,
         "schedule_id": first_schedule_id,
@@ -462,6 +619,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
                 "campaign_id": CAMPAIGN_ID,
                 "session_id": SESSION_ID,
                 "target_id": TARGET_ID,
+                "target_session_id": TARGET_SESSION_ID,
                 "generation_id": generation.generation_id,
                 "obligation_id": generation.obligation_id,
                 "event_set_digest": event_set_digest,
@@ -499,6 +657,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
         "campaign_id": CAMPAIGN_ID,
         "session_id": SESSION_ID,
         "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
         "generation_id": generation.generation_id,
         "obligation_id": generation.obligation_id,
         "event_digests": list(generation.event_digests),
@@ -548,6 +707,7 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
                     {
                         "generation_id": generation.generation_id,
                         "settlement_id": settled_payload["settlement_id"],
+                        "target_session_id": TARGET_SESSION_ID,
                     }
                 ]
             },
@@ -555,20 +715,153 @@ def test_projection_blocks_retry_until_authorized_then_closes_after_refresh() ->
     )
     assert project_target_reobservations(rows).reviewed == {}
     rows.append(
-        {
-            "decision_id": "lead-decision:" + "a" * 64,
-            "payload": {
-                "target_reobservation_generations": [
-                    {
-                        "generation_id": generation.generation_id,
-                        "settlement_id": settled_payload["settlement_id"],
-                    }
-                ]
-            },
-        }
+        _lead_decision_row(
+            [
+                {
+                    "generation_id": generation.generation_id,
+                    "settlement_id": str(settled_payload["settlement_id"]),
+                    "target_session_id": TARGET_SESSION_ID,
+                }
+            ]
+        )
     )
     assert project_target_reobservations(rows).reviewed == {
-        generation.generation_id: "lead-decision:" + "a" * 64
+        generation.generation_id: rows[-1]["decision_id"]
+    }
+
+
+def test_projection_requires_exact_target_session_binding_at_every_lifecycle_stage() -> None:
+    obligation = _extract(_receipt(call_id="call-target-session-binding", adapter_stale=False))[0]
+    observed = obligation.observed_payload(CAMPAIGN_ID, TARGET_ID)
+    wrong_observed = {**observed, "target_session_id": "browser:foreign-context"}
+    missing_observed = dict(observed)
+    missing_observed.pop("target_session_id")
+    assert project_target_reobservations([{"payload": wrong_observed}]).pending == ()
+    assert project_target_reobservations([{"payload": missing_observed}]).pending == ()
+
+    rows: list[dict[str, object]] = [{"sequence": 1, "payload": observed}]
+    generation = project_target_reobservations(rows).current_generation
+    assert generation is not None
+    event_set_digest = _digest({"event_digests": generation.event_digests})
+    schedule_id = target_reobservation_schedule_id(CAMPAIGN_ID, generation.generation_id, 1)
+    start = {
+        "kind": "target_reobservation_started",
+        "schema": "merlin.target-reobservation-started.v1",
+        "wave_kind": "objective_prerequisite",
+        "campaign_id": CAMPAIGN_ID,
+        "session_id": SESSION_ID,
+        "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_digests": list(generation.event_digests),
+        "event_set_digest": event_set_digest,
+        "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+        "source_wave": generation.source_wave,
+        "attempt": 1,
+        "schedule_id": schedule_id,
+    }
+    wrong_start = {**start, "target_session_id": "browser:foreign-context"}
+    assert project_target_reobservations([*rows, {"payload": wrong_start}]).starts == {}
+    rows.append({"sequence": 2, "payload": start})
+
+    blocked = {
+        "kind": "target_reobservation_blocked",
+        "schema": "merlin.target-reobservation-blocked.v1",
+        "campaign_id": CAMPAIGN_ID,
+        "session_id": SESSION_ID,
+        "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_digests": list(generation.event_digests),
+        "event_count": len(generation.event_digests),
+        "event_set_digest": event_set_digest,
+        "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+        "source_wave": generation.source_wave,
+        "attempt": 1,
+        "schedule_id": schedule_id,
+    }
+    wrong_blocked = {**blocked, "target_session_id": "browser:foreign-context"}
+    wrong_blocked_projection = project_target_reobservations([*rows, {"payload": wrong_blocked}])
+    assert wrong_blocked_projection.blocked == frozenset()
+    assert wrong_blocked_projection.active_schedule(generation.generation_id) == schedule_id
+
+    retry = {
+        "kind": "target_reobservation_retry_authorized",
+        "schema": "merlin.target-reobservation-retry-authorized.v1",
+        "campaign_id": CAMPAIGN_ID,
+        "session_id": SESSION_ID,
+        "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_set_digest": event_set_digest,
+        "authorized_after_attempt": 1,
+        "command_id": "operator-resume-target-session",
+    }
+    wrong_retry = {**retry, "target_session_id": "browser:foreign-context"}
+    wrong_retry_projection = project_target_reobservations(
+        [*rows, {"payload": blocked}, {"payload": wrong_retry}]
+    )
+    assert wrong_retry_projection.retry_authorizations.get(generation.generation_id, {}) == {}
+
+    evidence_refs = ["browser-snapshot:target-session-current"]
+    settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+        "sha256:"
+    )
+    settlement = {
+        "kind": "target_reobservation_settled",
+        "schema": "merlin.target-reobservation-settlement.v1",
+        "campaign_id": CAMPAIGN_ID,
+        "session_id": SESSION_ID,
+        "target_id": TARGET_ID,
+        "target_session_id": TARGET_SESSION_ID,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_digests": list(generation.event_digests),
+        "event_set_digest": event_set_digest,
+        "event_count": len(generation.event_digests),
+        "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+        "source_wave": generation.source_wave,
+        "status": "refreshed",
+        "attempt": 1,
+        "schedule_id": schedule_id,
+        "settlement_id": settlement_id,
+        "current_surface_digest": "sha256:" + "6" * 64,
+        "surface_evidence_digest": _digest({"evidence_refs": evidence_refs}),
+        "surface_evidence_refs": evidence_refs,
+        "recon_handoff_id": "handoff-target-session",
+        "compiled_adapter_digest": "sha256:" + "7" * 64,
+        "reviewed_adapter_digest": "sha256:" + "8" * 64,
+        "result_reference": "task-result:target-session",
+        "result_digest": "sha256:" + "9" * 64,
+    }
+    wrong_settlement = {**settlement, "target_session_id": "browser:foreign-context"}
+    assert project_target_reobservations([*rows, {"payload": wrong_settlement}]).refreshed == {}
+
+    settled_rows = [*rows, {"sequence": 3, "payload": settlement}]
+    wrong_review = _lead_decision_row(
+        [
+            {
+                "generation_id": generation.generation_id,
+                "settlement_id": settlement_id,
+                "target_session_id": "browser:foreign-context",
+            }
+        ]
+    )
+    assert project_target_reobservations([*settled_rows, wrong_review]).reviewed == {}
+    valid_review = _lead_decision_row(
+        [
+            {
+                "generation_id": generation.generation_id,
+                "settlement_id": settlement_id,
+                "target_session_id": TARGET_SESSION_ID,
+            }
+        ]
+    )
+    assert project_target_reobservations([*settled_rows, valid_review]).reviewed == {
+        generation.generation_id: valid_review["decision_id"]
     }
 
 
@@ -597,6 +890,7 @@ def test_lead_projection_drains_more_than_sixteen_unreviewed_generations() -> No
                         "campaign_id": CAMPAIGN_ID,
                         "session_id": SESSION_ID,
                         "target_id": TARGET_ID,
+                        "target_session_id": TARGET_SESSION_ID,
                         "generation_id": generation.generation_id,
                         "obligation_id": generation.obligation_id,
                         "event_digests": list(generation.event_digests),
@@ -614,6 +908,7 @@ def test_lead_projection_drains_more_than_sixteen_unreviewed_generations() -> No
                         "campaign_id": CAMPAIGN_ID,
                         "session_id": SESSION_ID,
                         "target_id": TARGET_ID,
+                        "target_session_id": TARGET_SESSION_ID,
                         "generation_id": generation.generation_id,
                         "obligation_id": generation.obligation_id,
                         "event_digests": list(generation.event_digests),
@@ -649,18 +944,16 @@ def test_lead_projection_drains_more_than_sixteen_unreviewed_generations() -> No
     ]
 
     rows.append(
-        {
-            "decision_id": "lead-decision:" + "a" * 64,
-            "payload": {
-                "target_reobservation_generations": [
-                    {
-                        "generation_id": generation_id,
-                        "settlement_id": settlement_id,
-                    }
-                    for generation_id, settlement_id in settlements[:16]
-                ]
-            },
-        }
+        _lead_decision_row(
+            [
+                {
+                    "generation_id": generation_id,
+                    "settlement_id": settlement_id,
+                    "target_session_id": TARGET_SESSION_ID,
+                }
+                for generation_id, settlement_id in settlements[:16]
+            ]
+        )
     )
     projected = project_target_reobservations(rows)
     assert len(projected.review_pending) == 1
@@ -669,17 +962,15 @@ def test_lead_projection_drains_more_than_sixteen_unreviewed_generations() -> No
     ] == [settlements[-1][0]]
 
     rows.append(
-        {
-            "decision_id": "lead-decision:" + "b" * 64,
-            "payload": {
-                "target_reobservation_generations": [
-                    {
-                        "generation_id": settlements[-1][0],
-                        "settlement_id": settlements[-1][1],
-                    }
-                ]
-            },
-        }
+        _lead_decision_row(
+            [
+                {
+                    "generation_id": settlements[-1][0],
+                    "settlement_id": settlements[-1][1],
+                    "target_session_id": TARGET_SESSION_ID,
+                }
+            ]
+        )
     )
     projected = project_target_reobservations(rows)
     assert projected.review_pending == ()
@@ -723,6 +1014,7 @@ def test_projection_rejects_subset_initial_generation_and_attempt_gaps() -> None
             "campaign_id": CAMPAIGN_ID,
             "session_id": SESSION_ID,
             "target_id": TARGET_ID,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": list(generation.event_digests),
@@ -766,6 +1058,7 @@ def test_duplicate_retry_authorization_cannot_preapprove_later_attempt() -> None
             "campaign_id": CAMPAIGN_ID,
             "session_id": SESSION_ID,
             "target_id": TARGET_ID,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": generation.event_digests,
@@ -785,6 +1078,7 @@ def test_duplicate_retry_authorization_cannot_preapprove_later_attempt() -> None
             "campaign_id": CAMPAIGN_ID,
             "session_id": SESSION_ID,
             "target_id": TARGET_ID,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": generation.event_digests,
@@ -805,6 +1099,7 @@ def test_duplicate_retry_authorization_cannot_preapprove_later_attempt() -> None
             "campaign_id": CAMPAIGN_ID,
             "session_id": SESSION_ID,
             "target_id": TARGET_ID,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_set_digest": event_set_digest,
@@ -854,20 +1149,28 @@ def test_pending_event_overflow_stays_in_typed_recovery_barrier() -> None:
         task_ids=[TASK_ID],
         evidence={TASK_ID: {"target_evidence_receipts": receipts}},
     )
+    other_target_session = _extract(
+        _receipt(
+            call_id="call-overflow-other-context",
+            adapter_stale=False,
+            target_session_id="browser:context-2",
+        )
+    )
     projection = project_target_reobservations(
         [
             {
                 "sequence": index,
                 "payload": obligation.observed_payload(CAMPAIGN_ID, TARGET_ID),
             }
-            for index, obligation in enumerate(obligations, 1)
+            for index, obligation in enumerate((*obligations, *other_target_session), 1)
         ]
     )
 
-    assert len(projection.pending) == 257
+    assert len(projection.pending) == 258
     assert projection.current_generation is None
     assert projection.overflow is not None
     assert projection.overflow.event_count == 257
+    assert projection.overflow.target_session_id == TARGET_SESSION_ID
     assert projection.lead_projection()["generation"]["status"] == "blocked_event_overflow"  # type: ignore[index]
     recovery = projection.recovery_state(latest_wave=3)
     assert recovery is not None

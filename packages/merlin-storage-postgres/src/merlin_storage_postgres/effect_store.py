@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
+from hashlib import sha256
 from typing import Any
 
 from merlin_contracts import (
@@ -14,6 +16,12 @@ from psycopg.types.json import Jsonb
 
 from .observability_store import TechniqueLanguageEvidenceRepository
 from .sanitize import escape_nul
+
+
+class TargetEffectPermitLatchedError(RuntimeError):
+    """The scheduler authority that admitted an effect no longer permits dispatch."""
+
+    target_admission_latched = True
 
 
 class ToolEffectRepository:
@@ -97,29 +105,337 @@ class ToolEffectRepository:
                 raise ValueError("idempotency key reused for a different tool effect")
             return existing, created
 
+    def adopt_permitted(
+        self, record: ToolEffectRecord, permit_digest: str
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Adopt one exact scheduler-created effect intent before dispatch."""
+
+        arguments_payload = escape_nul(record.arguments_payload)
+        identity_fields = (
+            "idempotency_key",
+            "session_id",
+            "call_id",
+            "agent_id",
+            "attempt_id",
+            "campaign_id",
+            "target_id",
+            "tool_name",
+            "effect",
+            "arguments_digest",
+            "arguments_payload",
+        )
+        with self.connection.transaction():
+            scope = self.connection.execute(
+                """SELECT campaign_id, session_id::text AS session_id, target_id,
+                          target_session_id, schedule_id::text AS schedule_id,
+                          node_id, assignment_id, attempt_id::text AS attempt_id,
+                          generation
+                   FROM merlin_storage.target_effect_permits
+                   WHERE permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            if scope is None:
+                raise KeyError(permit_digest)
+            campaign = self.connection.execute(
+                """SELECT id, session_id::text AS session_id
+                   FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (scope["campaign_id"],),
+            ).fetchone()
+            schedule = self.connection.execute(
+                """SELECT id::text AS id, session_id::text AS session_id, status
+                   FROM merlin_storage.scheduler_schedules
+                   WHERE id = %s FOR UPDATE""",
+                (scope["schedule_id"],),
+            ).fetchone()
+            latches = self.connection.execute(
+                """SELECT target_session_id, state, transition_count,
+                          latched_session_count, authorized_schedule_id::text
+                              AS authorized_schedule_id,
+                          lane_schedule_id::text AS lane_schedule_id,
+                          lane_node_id, lane_assignment_id,
+                          lane_attempt_id::text AS lane_attempt_id,
+                          lane_generation, lane_recovery_required
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id IN ('', %s)
+                   ORDER BY target_session_id FOR UPDATE""",
+                (
+                    scope["campaign_id"],
+                    scope["target_id"],
+                    scope["target_session_id"],
+                ),
+            ).fetchall()
+            attempt = self.connection.execute(
+                """SELECT id::text AS id, schedule_id::text AS schedule_id,
+                          node_id, generation, state,
+                          lease_expires_at > now() AS lease_active
+                   FROM merlin_storage.scheduler_attempts
+                   WHERE id = %s FOR UPDATE""",
+                (scope["attempt_id"],),
+            ).fetchone()
+            permit = self.connection.execute(
+                """SELECT permit_digest, campaign_id,
+                          session_id::text AS session_id, target_id,
+                          target_session_id,
+                          schedule_id::text AS schedule_id, node_id,
+                          assignment_id, attempt_id::text AS attempt_id,
+                          generation,
+                          call_id, tool_name, effect, arguments_digest,
+                          arguments_payload, idempotency_key, state
+                   FROM merlin_storage.target_effect_permits
+                   WHERE permit_digest = %s FOR UPDATE""",
+                (permit_digest,),
+            ).fetchone()
+            effect_row = self.connection.execute(
+                """SELECT * FROM merlin_storage.tool_effects
+                   WHERE idempotency_key = %s FOR UPDATE""",
+                (record.idempotency_key,),
+            ).fetchone()
+            latch_by_session = {str(row["target_session_id"]): row for row in latches}
+            head = latch_by_session.get("")
+            latch = latch_by_session.get(str(scope["target_session_id"]))
+            if (
+                campaign is None
+                or schedule is None
+                or attempt is None
+                or permit is None
+                or effect_row is None
+                or not scope["target_session_id"]
+                or campaign["session_id"] != scope["session_id"]
+                or schedule["session_id"] != scope["session_id"]
+                or schedule["status"] != "running"
+                or attempt["id"] != scope["attempt_id"]
+                or attempt["schedule_id"] != scope["schedule_id"]
+                or attempt["node_id"] != scope["node_id"]
+                or attempt["generation"] != scope["generation"]
+                or attempt["state"] != "running"
+                or attempt["lease_active"] is not True
+                or (head is not None and int(head["latched_session_count"]) != 0)
+                or latch is None
+                or latch["state"] not in {"open", "activated"}
+                or (
+                    latch["state"] == "open"
+                    and head is not None
+                    and int(head["transition_count"]) != 0
+                )
+                or (
+                    latch["state"] == "activated"
+                    and latch["authorized_schedule_id"] != scope["schedule_id"]
+                )
+                or latch["lane_schedule_id"] != scope["schedule_id"]
+                or latch["lane_node_id"] != scope["node_id"]
+                or latch["lane_assignment_id"] != scope["assignment_id"]
+                or latch["lane_attempt_id"] != scope["attempt_id"]
+                or latch["lane_generation"] != scope["generation"]
+                or latch["lane_recovery_required"] is True
+            ):
+                raise TargetEffectPermitLatchedError(
+                    "target effect permit authority is no longer active"
+                )
+            if any(
+                permit[field] != scope[field]
+                for field in (
+                    "campaign_id",
+                    "session_id",
+                    "target_id",
+                    "target_session_id",
+                    "schedule_id",
+                    "node_id",
+                    "assignment_id",
+                    "attempt_id",
+                    "generation",
+                )
+            ):
+                raise ValueError("target effect permit authority changed before adoption")
+            permit_body = {
+                "schema": "merlin.target-effect-permit.v1",
+                **{
+                    field: permit[field]
+                    for field in (
+                        "campaign_id",
+                        "session_id",
+                        "target_id",
+                        "target_session_id",
+                        "schedule_id",
+                        "node_id",
+                        "assignment_id",
+                        "attempt_id",
+                        "generation",
+                        "call_id",
+                        "tool_name",
+                        "effect",
+                        "arguments_digest",
+                        "arguments_payload",
+                        "idempotency_key",
+                    )
+                },
+            }
+            expected_permit_digest = (
+                "sha256:"
+                + sha256(
+                    json.dumps(
+                        permit_body,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+            )
+            if permit["permit_digest"] != expected_permit_digest:
+                raise ValueError("target effect permit digest is not canonical")
+            if permit["state"] == "revoked":
+                raise TargetEffectPermitLatchedError(
+                    "target effect permit was revoked before dispatch"
+                )
+            existing = self._record(effect_row)
+            normalized = record.model_copy(update={"arguments_payload": arguments_payload})
+            if (
+                permit["idempotency_key"] != record.idempotency_key
+                or permit["campaign_id"] != record.campaign_id
+                or permit["session_id"] != record.session_id
+                or permit["target_id"] != record.target_id
+                or permit["assignment_id"] != record.agent_id
+                or permit["attempt_id"] != record.attempt_id
+                or permit["call_id"] != record.call_id
+                or permit["tool_name"] != record.tool_name
+                or permit["effect"] != record.effect
+                or permit["arguments_digest"] != record.arguments_digest
+                or permit["arguments_payload"] != arguments_payload
+                or any(
+                    getattr(existing, field) != getattr(normalized, field)
+                    for field in identity_fields
+                )
+            ):
+                raise ValueError("target effect permit does not match its durable intent")
+            permit_state = str(permit["state"])
+            if permit_state == "intent":
+                if existing.state is not ToolEffectState.INTENT:
+                    raise ValueError("target effect permit intent is already resolved")
+                adopted = self.connection.execute(
+                    """UPDATE merlin_storage.target_effect_permits
+                       SET state = 'adopted', updated_at = now()
+                       WHERE permit_digest = %s AND state = 'intent'
+                       RETURNING permit_digest""",
+                    (permit_digest,),
+                ).fetchone()
+                if adopted is None:
+                    raise ValueError("target effect permit adoption lost its fence")
+                return existing, True
+            if permit_state == "adopted" and existing.state is ToolEffectState.INTENT:
+                return existing, False
+            if permit_state == "terminal" and existing.state in {
+                ToolEffectState.ACKNOWLEDGED,
+                ToolEffectState.RECONCILED,
+            }:
+                return existing, False
+            raise ValueError("target effect permit state conflicts with its durable intent")
+
     def finish(self, record: ToolEffectRecord) -> ToolEffectRecord:
+        with self.connection.transaction():
+            return self._finish_locked(record)
+
+    def _finish_locked(self, record: ToolEffectRecord) -> ToolEffectRecord:
         record = record.model_copy(
             update={
                 "result_content": escape_nul(record.result_content),
                 "result_metadata": escape_nul(record.result_metadata),
             }
         )
+        permit_scope = self.connection.execute(
+            """SELECT campaign_id, target_id, target_session_id, schedule_id,
+                      attempt_id
+               FROM merlin_storage.target_effect_permits
+               WHERE idempotency_key = %s""",
+            (record.idempotency_key,),
+        ).fetchone()
+        if permit_scope is not None:
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.assessment_campaigns
+                   WHERE id = %s FOR UPDATE""",
+                (permit_scope["campaign_id"],),
+            ).fetchone()
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.scheduler_schedules
+                   WHERE id = %s FOR UPDATE""",
+                (permit_scope["schedule_id"],),
+            ).fetchone()
+            self.connection.execute(
+                """SELECT target_session_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id IN ('', %s)
+                   ORDER BY target_session_id FOR UPDATE""",
+                (
+                    permit_scope["campaign_id"],
+                    permit_scope["target_id"],
+                    permit_scope["target_session_id"],
+                ),
+            ).fetchall()
+            self.connection.execute(
+                """SELECT id FROM merlin_storage.scheduler_attempts
+                   WHERE id = %s FOR UPDATE""",
+                (permit_scope["attempt_id"],),
+            ).fetchone()
+        permit = self.connection.execute(
+            """SELECT permit_digest, state, target_session_id
+               FROM merlin_storage.target_effect_permits
+               WHERE idempotency_key = %s FOR UPDATE""",
+            (record.idempotency_key,),
+        ).fetchone()
         current_row = self.connection.execute(
             "SELECT * FROM merlin_storage.tool_effects WHERE idempotency_key = %s FOR UPDATE",
             (record.idempotency_key,),
         ).fetchone()
         if current_row is None:
-            self.connection.rollback()
             raise KeyError(record.idempotency_key)
         current = self._record(current_row)
         terminal = {ToolEffectState.ACKNOWLEDGED, ToolEffectState.RECONCILED}
+        revoked_before_dispatch = bool(
+            permit is not None
+            and permit["state"] == "revoked"
+            and record.state is ToolEffectState.RECONCILED
+            and record.result_is_error is True
+            and record.result_metadata.get("target_effect_dispatch_status")
+            == "revoked_before_dispatch"
+            and record.result_metadata.get("target_session_id") == permit["target_session_id"]
+            and record.result_metadata.get("target_effect_attempted") is False
+            and type(record.result_metadata.get("interaction_count")) is int
+            and record.result_metadata.get("interaction_count") == 0
+            and type(record.result_metadata.get("limit_interaction_count")) is int
+            and record.result_metadata.get("limit_interaction_count") == 0
+            and type(record.result_metadata.get("target_call_budget_charge")) is int
+            and record.result_metadata.get("target_call_budget_charge") == 0
+        )
+        if (
+            permit is not None
+            and record.state in terminal
+            and not revoked_before_dispatch
+            and record.result_metadata.get("target_session_id") != permit["target_session_id"]
+        ):
+            raise ValueError(
+                "terminal target effect receipt does not match its permitted target session"
+            )
         if current.state in terminal:
             if current.model_dump(exclude={"updated_at"}) == record.model_dump(
                 exclude={"updated_at"}
             ):
-                self.connection.rollback()
+                if permit is not None and permit["state"] == "adopted":
+                    repaired = self.connection.execute(
+                        """UPDATE merlin_storage.target_effect_permits
+                           SET state = 'terminal', updated_at = now()
+                           WHERE permit_digest = %s AND state = 'adopted'
+                           RETURNING permit_digest""",
+                        (permit["permit_digest"],),
+                    ).fetchone()
+                    if repaired is None:
+                        raise ValueError("target effect permit repair lost its durable fence")
+                elif permit is not None and permit["state"] not in {
+                    "terminal",
+                    "revoked",
+                }:
+                    raise ValueError("terminal tool effect conflicts with its target effect permit")
                 return current
-            self.connection.rollback()
             raise ValueError("terminal tool effect receipt is immutable")
         allowed = {
             ToolEffectState.INTENT: {
@@ -129,8 +445,13 @@ class ToolEffectRepository:
             ToolEffectState.AMBIGUOUS: {ToolEffectState.RECONCILED},
         }
         if record.state not in allowed.get(current.state, set()):
-            self.connection.rollback()
             raise ValueError(f"invalid tool effect transition: {current.state} -> {record.state}")
+        if (
+            permit is not None
+            and permit["state"] not in {"adopted", "terminal"}
+            and not revoked_before_dispatch
+        ):
+            raise ValueError("target effect permit was not adopted before completion")
         result_metadata = dict(record.result_metadata)
         delivery = result_metadata.get("target_delivery_receipt")
         technique_attempt_id = result_metadata.get("technique_attempt_id")
@@ -200,9 +521,18 @@ class ToolEffectRepository:
                 record.idempotency_key,
             ),
         ).fetchone()
+        if permit is not None and permit["state"] == "adopted" and record.state in terminal:
+            terminal = self.connection.execute(
+                """UPDATE merlin_storage.target_effect_permits
+                   SET state = 'terminal', updated_at = now()
+                   WHERE permit_digest = %s AND state = 'adopted'
+                   RETURNING permit_digest""",
+                (permit["permit_digest"],),
+            ).fetchone()
+            if terminal is None:
+                raise ValueError("target effect permit completion lost its fence")
         if row is not None and language_evidence is not None:
             language_repository.record(language_evidence)
-        self.connection.commit()
         if row is None:
             raise KeyError(record.idempotency_key)
         return self._record(row)
@@ -304,6 +634,11 @@ class PostgresToolEffectStore:
     async def begin(self, record: ToolEffectRecord) -> tuple[ToolEffectRecord, bool]:
         return await asyncio.to_thread(self._repository.begin, record)
 
+    async def adopt_permitted(
+        self, record: ToolEffectRecord, permit_digest: str
+    ) -> tuple[ToolEffectRecord, bool]:
+        return await asyncio.to_thread(self._repository.adopt_permitted, record, permit_digest)
+
     async def finish(self, record: ToolEffectRecord) -> ToolEffectRecord:
         return await asyncio.to_thread(self._repository.finish, record)
 
@@ -329,6 +664,4 @@ class PostgresToolEffectStore:
     async def list_for_campaign(
         self, campaign_id: str, *, limit: int | None = None
     ) -> list[ToolEffectRecord]:
-        return await asyncio.to_thread(
-            self._repository.list_for_campaign, campaign_id, limit=limit
-        )
+        return await asyncio.to_thread(self._repository.list_for_campaign, campaign_id, limit=limit)

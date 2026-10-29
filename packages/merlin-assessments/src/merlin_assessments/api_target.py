@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 from merlin_contracts import (
+    MAX_TARGET_SESSION_ID_LENGTH,
     InfrastructureFailureCategory,
     ToolContext,
     ToolInteractionRole,
@@ -58,6 +59,7 @@ from merlin_storage_postgres import (
     CampaignApiSession,
     CampaignApiSessionRepository,
     RemoteSessionClaimConflict,
+    campaign_api_target_session_id,
 )
 
 
@@ -422,6 +424,45 @@ class ReviewedApiTargetTool:
             target_delivery_from_reviewed_adapter=True,
         )
 
+    async def resolve_target_session_id(self, context: ToolContext) -> str | None:
+        """Resolve one sealed API-session generation without creating target state."""
+
+        if context.campaign_id is None or context.target_id is None or context.agent_id is None:
+            return None
+        adapter = self._adapter(context.campaign_id, context.target_id)
+        if _context_adapter_identity_failure(context, adapter) is not None:
+            return None
+        session_scope_id = _reviewed_session_scope_id(
+            context.agent_id,
+            attempt_id=context.attempt_id,
+        )
+        state = await asyncio.to_thread(
+            self._sessions.load,
+            context.campaign_id,
+            target_id=context.target_id,
+            session_scope_id=session_scope_id,
+        )
+        if state is None:
+            generation = 1
+        else:
+            if (
+                state.target_id != adapter.target_id
+                or state.adapter_digest != adapter.compiled_digest
+            ):
+                return None
+            if state.pending_step is not None or state.state == "ambiguous":
+                return None
+            generation = state.generation + 1 if state.state == "cleaned" else state.generation
+        target_session_id = campaign_api_target_session_id(
+            context.campaign_id,
+            adapter.target_id,
+            session_scope_id,
+            generation,
+        )
+        if not 0 < len(target_session_id) <= MAX_TARGET_SESSION_ID_LENGTH:
+            return None
+        return target_session_id
+
     async def invoke(
         self,
         context: ToolContext,
@@ -456,6 +497,10 @@ class ReviewedApiTargetTool:
 
         def resolved(result: ToolResult) -> ToolResult:
             identified = _with_adapter_identity(result, adapter)
+            if context.expected_target_session_id is not None:
+                metadata = dict(identified.metadata)
+                metadata.setdefault("target_session_id", context.expected_target_session_id)
+                identified = identified.model_copy(update={"metadata": metadata})
             if context.compiled_adapter is None and context.compiled_adapter_digest is None:
                 metadata = dict(identified.metadata)
                 metadata["legacy_compiled_adapter_context"] = True
@@ -490,8 +535,12 @@ class ReviewedApiTargetTool:
                     metadata={"infrastructure_failure_category": "configuration"},
                 )
             )
-        if requested_step_id is None and not _injection_authorized and not any(
-            step.interaction and step.id != adapter.injection_step_id for step in adapter.steps
+        if (
+            requested_step_id is None
+            and not _injection_authorized
+            and not any(
+                step.interaction and step.id != adapter.injection_step_id for step in adapter.steps
+            )
         ):
             return resolved(
                 ToolResult(
@@ -907,6 +956,39 @@ class ReviewedApiTargetTool:
             adapter.compiled_digest,
             session_scope_id=session_scope_id,
         )
+        expected_target_session_id = context.expected_target_session_id
+        if (
+            expected_target_session_id is not None
+            and state.target_session_id != expected_target_session_id
+        ):
+            return ToolResult(
+                content="reviewed API target session changed before delivery",
+                is_error=True,
+                metadata={
+                    "failure_code": "target_session_identity_mismatch",
+                    "retryable": False,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "expected_target_session_id": expected_target_session_id,
+                    "target_session_id": state.target_session_id,
+                },
+            )
+        if expected_target_session_id is not None and (
+            state.pending_step is not None or state.state == "ambiguous"
+        ):
+            return ToolResult(
+                content="reviewed API target session requires recovery before delivery",
+                is_error=True,
+                metadata={
+                    "failure_code": "target_session_resolution_unavailable",
+                    "retryable": False,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "target_session_id": state.target_session_id,
+                },
+            )
         if state.pending_step is not None or state.state == "ambiguous":
             await self._cleanup_locked(context.campaign_id, adapter.target_id, session_scope_id)
             state = await asyncio.to_thread(
@@ -3384,6 +3466,11 @@ class ReviewedTargetInjectTool:
             interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
             target_delivery_from_reviewed_adapter=True,
         )
+
+    async def resolve_target_session_id(self, context: ToolContext) -> str | None:
+        """Use the exact reviewed API-session identity owned by the engine."""
+
+        return await self._engine.resolve_target_session_id(context)
 
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
         content = arguments.get("content")

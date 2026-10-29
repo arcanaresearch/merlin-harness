@@ -1597,12 +1597,18 @@ class CampaignStore:
         claim_id: str | None,
         claimant_id: str | None,
     ) -> None:
-        """Fence a frontier mutation when the caller supplies lease authority."""
+        """Fence a frontier mutation using campaign -> transition-lease lock order."""
 
         if claim_id is None and claimant_id is None:
             return
         if not (claim_id or "").strip() or not (claimant_id or "").strip():
             raise ValueError("frontier transition fencing requires claim and claimant together")
+        campaign = self.connection.execute(
+            "SELECT id FROM merlin_storage.assessment_campaigns WHERE id = %s FOR UPDATE",
+            (campaign_id,),
+        ).fetchone()
+        if campaign is None:
+            raise KeyError(campaign_id)
         row = self.connection.execute(
             """SELECT 1 FROM merlin_storage.campaign_frontier_transition_leases
                WHERE campaign_id = %s AND claim_id = %s AND claimant_id = %s

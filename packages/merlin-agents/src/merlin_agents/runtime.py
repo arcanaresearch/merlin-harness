@@ -108,6 +108,20 @@ from .telemetry import emit_judgment, emit_target_exchange
 
 _logger = logging.getLogger(__name__)
 
+_TARGET_CONTROL_HOLD_SCHEMA = "merlin.target-control-hold.v1"
+_TARGET_CONTROL_HOLD_REASONS = {
+    "target_session_identity_unavailable": (
+        "target session identity is unavailable before effect delivery"
+    ),
+    "target_session_identity_invalid": (
+        "target session identity is invalid before effect delivery"
+    ),
+    "target_session_identity_mismatch": ("target session identity changed before effect delivery"),
+    "target_session_resolution_unavailable": (
+        "target session recovery is required before effect delivery"
+    ),
+}
+
 
 def _plugin_strategy_proposal(
     plugin: StrategyPlugin[Any], session: StrategySession[Any]
@@ -227,6 +241,7 @@ _GENERIC_BROWSER_MUTATION_TOOLS = frozenset(
 )
 _GENERIC_BROWSER_NAVIGATION_TOOLS = frozenset({"browser_navigate", "browser_open_tab"})
 _GENERIC_BROWSER_EFFECT_TOOLS = _GENERIC_BROWSER_MUTATION_TOOLS | _GENERIC_BROWSER_NAVIGATION_TOOLS
+_BROWSER_VISUAL_EVIDENCE_TOOLS = _BROWSER_OBSERVATION_TOOLS | _GENERIC_BROWSER_EFFECT_TOOLS
 _SUPERSEDABLE_OBSERVATION_TOOLS = _BROWSER_OBSERVATION_TOOLS | {
     "knowledge_search",
     "list_directory",
@@ -1000,9 +1015,7 @@ def _restored_generic_browser_receipt_integrity_result(
         call_id = item.get("call_id")
         body = {key: value for key, value in item.items() if key != "receipt_sha256"}
         expected_effect = (
-            "target_network"
-            if tool_name in _GENERIC_BROWSER_MUTATION_TOOLS
-            else "target_read"
+            "target_network" if tool_name in _GENERIC_BROWSER_MUTATION_TOOLS else "target_read"
         )
         transition = normalize_target_ui_transition(item)
         if (
@@ -1204,6 +1217,90 @@ def _restored_generic_effect_reconciliation_result(
         infrastructure_failure_category=(
             "effect_reconciliation_required" if marker_valid else "adapter_state_integrity"
         ),
+    )
+
+
+def _restored_target_control_hold_result(
+    handoff: WorkerHandoff,
+    checkpoint: Mapping[str, object] | None,
+) -> WorkerResult | None:
+    """Restore a proven pre-effect hold without re-entering the provider loop."""
+
+    raw = (checkpoint or {}).get("target_control_hold")
+    if raw is None:
+        return None
+    target_session_id = (
+        str(checkpoint["target_session_id"])
+        if checkpoint is not None and checkpoint.get("target_session_id") is not None
+        else None
+    )
+    try:
+        if not isinstance(raw, Mapping):
+            raise ValueError("control hold is not an object")
+        required = {
+            "schema",
+            "assignment_id",
+            "attempt_id",
+            "technique_attempt_id",
+            "tool_name",
+            "call_id",
+            "failure_code",
+            "target_session_id",
+            "receipt_sha256",
+        }
+        if set(raw) != required:
+            raise ValueError("control hold fields are not canonical")
+        body = {key: value for key, value in raw.items() if key != "receipt_sha256"}
+        failure_code = body.get("failure_code")
+        if (
+            body.get("schema") != _TARGET_CONTROL_HOLD_SCHEMA
+            or body.get("assignment_id") != handoff.assignment.id
+            or body.get("attempt_id") != handoff.attempt_id
+            or body.get("technique_attempt_id") != handoff.technique_attempt_id
+            or failure_code not in _TARGET_CONTROL_HOLD_REASONS
+            or body.get("target_session_id") != target_session_id
+            or not isinstance(body.get("tool_name"), str)
+            or not str(body["tool_name"]).strip()
+            or len(str(body["tool_name"])) > 128
+            or not isinstance(body.get("call_id"), str)
+            or not str(body["call_id"]).strip()
+            or len(str(body["call_id"])) > 512
+            or raw.get("receipt_sha256") != WorkerRuntime._json_fingerprint(body)
+        ):
+            raise ValueError("control hold identity or receipt is invalid")
+    except (TypeError, ValueError) as error:
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="quarantined",
+            error=f"restored target control hold is not attributable: {error}",
+            error_code="target_control_hold_invalid",
+            retry_class="terminal",
+            checkpoint=checkpoint,
+            target_session_id=target_session_id,
+            infrastructure_failure_category="adapter_state_integrity",
+        )
+    assert isinstance(failure_code, str)
+    control_plane_hold = {
+        **dict(raw),
+        "task_id": handoff.assignment.id,
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "target_call_ids": [],
+        "target_evidence": [],
+        "target_ui_transitions": [],
+    }
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="cancelled",
+        structured={"control_plane_hold": control_plane_hold},
+        error=_TARGET_CONTROL_HOLD_REASONS[failure_code],
+        error_code="target_admission_latched",
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
     )
 
 
@@ -1966,7 +2063,21 @@ def _project_target_result_content(
 _PRIMARY_TARGET_EXCHANGE_TOOLS = frozenset(
     {"target_chat", "target_request", "browser_chat_exchange"}
 )
+# Compatibility export for tests and downstream diagnostics. Runtime decisions
+# resolve the active set from ToolSpec.interaction_role via the helper below.
 _BUILTIN_TARGET_EXCHANGE_TOOLS = LEGACY_TARGET_EXCHANGE_TOOL_IDS
+
+
+def _target_exchange_tool_names(tool_specs: Sequence[ToolSpec]) -> frozenset[str]:
+    """Resolve typed target actors while retaining legacy built-in compatibility."""
+
+    return frozenset(
+        spec.name
+        for spec in tool_specs
+        if getattr(spec, "interaction_role", None) is ToolInteractionRole.TARGET_EXCHANGE
+        or spec.name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+    )
+
 
 _REFUSAL_MARKER = re.compile(
     r"(i can'?t|i cannot|i can’t|can'?t assist|cannot assist|unable to (?:help|assist)|"
@@ -2648,6 +2759,9 @@ class WorkerRuntime:
         )
         if restored_surface_result is not None:
             return restored_surface_result
+        restored_control_hold = _restored_target_control_hold_result(handoff, checkpoint)
+        if restored_control_hold is not None:
+            return restored_control_hold
         strategy_values = dict(handoff.assignment.strategy_contract)
         try:
             objective_checkpoint_context = {
@@ -2662,6 +2776,45 @@ class WorkerRuntime:
                 f"sealed objective checkpoint contract is invalid: {error}",
                 retry_class="terminal",
             )
+        rebound_generation_id = strategy_values.get("target_reobservation_generation_id")
+        rebound_event_set_digest = strategy_values.get("target_reobservation_event_set_digest")
+        if handoff.assignment.strategy_id != "target-reobservation/v1" and (
+            rebound_generation_id is not None or rebound_event_set_digest is not None
+        ):
+            if (
+                not isinstance(rebound_generation_id, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", rebound_generation_id) is None
+                or not isinstance(rebound_event_set_digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", rebound_event_set_digest) is None
+                or not isinstance(strategy_values.get("reviewed_adapter"), str)
+                or not isinstance(strategy_values.get("compiled_adapter"), str)
+                or not isinstance(strategy_values.get("compiled_adapter_digest"), str)
+                or not isinstance(strategy_values.get("target_session_id"), str)
+            ):
+                return self._failed(
+                    handoff,
+                    "sealed refreshed target-adapter generation is malformed",
+                    retry_class="terminal",
+                )
+            objective_checkpoint_context["target_reobservation_generation_id"] = (
+                rebound_generation_id
+            )
+            objective_checkpoint_context["target_reobservation_event_set_digest"] = (
+                rebound_event_set_digest
+            )
+        expected_target_session_id = strategy_values.get("target_session_id")
+        if expected_target_session_id is not None and (
+            not isinstance(expected_target_session_id, str)
+            or not expected_target_session_id.strip()
+            or len(expected_target_session_id) > 256
+        ):
+            return self._failed(
+                handoff,
+                "sealed target-session affinity is malformed",
+                retry_class="terminal",
+            )
+        if isinstance(expected_target_session_id, str):
+            objective_checkpoint_context["expected_target_session_id"] = expected_target_session_id
         raw_compiled_adapter = strategy_values.get("compiled_adapter")
         raw_compiled_adapter_digest = strategy_values.get("compiled_adapter_digest")
         if bool(raw_compiled_adapter) != bool(raw_compiled_adapter_digest):
@@ -2855,6 +3008,7 @@ class WorkerRuntime:
         if missing:
             return self._failed(handoff, f"admitted tools are unavailable: {', '.join(missing)}")
         admitted = [specs[name] for name in admitted_names]
+        target_exchange_tool_names = _target_exchange_tool_names(admitted)
         # Grant-carrying assignments admit by effect class against the worker
         # profile's capability grant; legacy assignments (grant_id=None) keep the
         # projected name-list check.
@@ -3005,6 +3159,14 @@ class WorkerRuntime:
             and not isinstance(restored_session_generation, bool)
             else None
         )
+
+        def target_tool_context() -> dict[str, object]:
+            """Bind every later mutation to the authenticated physical session."""
+            values = dict(objective_checkpoint_context)
+            if target_session_id is not None:
+                values["expected_target_session_id"] = target_session_id
+            return values
+
         evaluation_uncertainties: list[dict[str, object]] = []
         raw_uncertainties = (checkpoint or {}).get("evaluation_uncertainties", ())
         if isinstance(raw_uncertainties, (list, tuple)):
@@ -3082,7 +3244,7 @@ class WorkerRuntime:
             result: ToolResult,
             candidates: list[_VisualEvidenceCandidate] | None = None,
         ) -> None:
-            if call_name != "browser_snapshot":
+            if call_name not in _BROWSER_VISUAL_EVIDENCE_TOOLS:
                 return
             capture_errors = result.metadata.get("visual_capture_uncertainty")
             if (
@@ -3102,7 +3264,7 @@ class WorkerRuntime:
             raw_items = [item for item in raw_evidence if isinstance(item, Mapping)]
             items = sorted(
                 raw_items[:_VISUAL_EVIDENCE_CANDIDATE_LIMIT],
-                key=lambda item: item.get("source_kind") == "viewport",
+                key=lambda item: item.get("source_kind") != "viewport",
             )
             references = [
                 str(item["evidence_ref"])
@@ -3155,7 +3317,7 @@ class WorkerRuntime:
                     _VisualEvidenceCandidate(
                         attachment=attachment,
                         evidence_ref=reference,
-                        source="browser_snapshot.visual_evidence",
+                        source=f"{call_name}.visual_evidence",
                     )
                 )
             overflow = max(0, len(raw_items) - len(considered))
@@ -3897,6 +4059,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=checkpoint_tokenizer,
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=target_exchange_tool_names,
                 ),
                 target_session_id=result.target_session_id,
                 infrastructure_failure_category=result.infrastructure_failure_category,
@@ -4228,6 +4391,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=checkpoint_tokenizer,
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=target_exchange_tool_names,
                 ),
                 target_session_id=target_session_id,
                 evaluation_uncertainties=tuple(evaluation_uncertainties),
@@ -4287,6 +4451,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=checkpoint_tokenizer,
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=target_exchange_tool_names,
                 ),
                 target_session_id=target_session_id,
                 evaluation_uncertainties=tuple(evaluation_uncertainties),
@@ -4418,6 +4583,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=checkpoint_tokenizer,
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=target_exchange_tool_names,
                 )
 
             async def close_reservation() -> None:
@@ -4626,7 +4792,7 @@ class WorkerRuntime:
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
                                 requested_transform_id=handoff.assignment.requested_transform_id,
-                                **objective_checkpoint_context,
+                                **target_tool_context(),
                             ),
                             call.arguments,
                         ),
@@ -4825,7 +4991,7 @@ class WorkerRuntime:
                     planned_language=handoff.assignment.planned_language,
                     requested_language=handoff.assignment.requested_language,
                     requested_transform_id=handoff.assignment.requested_transform_id,
-                    **objective_checkpoint_context,
+                    **target_tool_context(),
                 ),
                 pending_call.arguments,
             )
@@ -5054,6 +5220,7 @@ class WorkerRuntime:
                     stall_hint = await self._stall_pivot_hint(
                         messages,
                         tuple(target_evidence.values()),
+                        target_exchange_tool_names=target_exchange_tool_names,
                         language=handoff.assignment.planned_language or None,
                     )
                     if stall_hint is not None and not any(
@@ -5640,7 +5807,7 @@ class WorkerRuntime:
                 )
                 call_fingerprint = self._action_fingerprint(call.name, call.arguments)
                 call_semantic = self._semantic_action_signature(call.name, call.arguments)
-                is_target_exchange_call = call.name in _BUILTIN_TARGET_EXCHANGE_TOOLS
+                is_target_exchange_call = call.name in target_exchange_tool_names
                 target_stall = (
                     self._target_request_stall(action_history, call_fingerprint)
                     if is_target_exchange_call
@@ -5751,7 +5918,7 @@ class WorkerRuntime:
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
                                 requested_transform_id=handoff.assignment.requested_transform_id,
-                                **objective_checkpoint_context,
+                                **target_tool_context(),
                             ),
                             call.arguments,
                         ),
@@ -6906,7 +7073,7 @@ class WorkerRuntime:
                     )
                     call_fingerprint = self._action_fingerprint(call.name, call.arguments)
                     call_semantic = self._semantic_action_signature(call.name, call.arguments)
-                    is_target_exchange_call = call.name in _BUILTIN_TARGET_EXCHANGE_TOOLS
+                    is_target_exchange_call = call.name in target_exchange_tool_names
                     target_stall = (
                         self._target_request_stall(action_history, call_fingerprint)
                         if is_target_exchange_call
@@ -7009,7 +7176,7 @@ class WorkerRuntime:
                                     requested_transform_id=(
                                         handoff.assignment.requested_transform_id
                                     ),
-                                    **objective_checkpoint_context,
+                                    **target_tool_context(),
                                 ),
                                 call.arguments,
                             ),
@@ -7992,6 +8159,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=checkpoint_tokenizer,
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=target_exchange_tool_names,
                 ),
                 target_session_id=target_session_id,
                 evaluation_uncertainties=tuple(evaluation_uncertainties),
@@ -8096,6 +8264,12 @@ class WorkerRuntime:
             else None
         )
 
+        def target_tool_context() -> dict[str, object]:
+            values = dict(objective_checkpoint_context)
+            if target_session_id is not None:
+                values["expected_target_session_id"] = target_session_id
+            return values
+
         def checkpoint_payload() -> dict[str, object]:
             return self._checkpoint_payload(
                 messages,
@@ -8108,6 +8282,7 @@ class WorkerRuntime:
                 target_session_generation=target_session_generation,
                 technique_attempt_id=handoff.technique_attempt_id,
                 target_evidence=tuple(target_evidence.values()),
+                target_exchange_tool_names=_target_exchange_tool_names(self._tools.describe()),
             )
 
         for ordinal, (action_id, step_id, input_text) in enumerate(actions):
@@ -8190,7 +8365,7 @@ class WorkerRuntime:
                                 planned_language=handoff.assignment.planned_language,
                                 requested_language=handoff.assignment.requested_language,
                                 requested_transform_id=handoff.assignment.requested_transform_id,
-                                **objective_checkpoint_context,
+                                **target_tool_context(),
                             ),
                             arguments,
                         ),
@@ -8404,6 +8579,7 @@ class WorkerRuntime:
                     context_compaction_target_ratio=self._context_compaction_target_ratio,
                     tokenizer=self._provider_tokenizer(provider_model),
                     compact_exchange_window=compact_exchange_window,
+                    target_exchange_tool_names=_target_exchange_tool_names(self._tools.describe()),
                 ),
                 message_ids,
             )
@@ -8444,6 +8620,7 @@ class WorkerRuntime:
         context_compaction_target_ratio: float = 0.5,
         tokenizer: Callable[[str], int] | None = None,
         compact_exchange_window: int | None = None,
+        target_exchange_tool_names: frozenset[str] = LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     ) -> dict[str, object]:
         complete = cls._protocol_complete_messages(messages)
         compacted, provenance = cls._compact_messages(
@@ -8459,6 +8636,7 @@ class WorkerRuntime:
             trigger_ratio=context_compaction_trigger_ratio,
             target_ratio=context_compaction_target_ratio,
             exchange_window=compact_exchange_window,
+            target_exchange_tool_names=target_exchange_tool_names,
         )
         return {
             "version": 1,
@@ -8674,7 +8852,11 @@ class WorkerRuntime:
 
     @classmethod
     def _projection_protocol(
-        cls, messages: Sequence[ChatMessage], *, prefix_count: int
+        cls,
+        messages: Sequence[ChatMessage],
+        *,
+        prefix_count: int,
+        target_exchange_tool_names: frozenset[str],
     ) -> tuple[tuple[ProtocolUnit, ...], tuple[tuple[ChatMessage, ...], ...]]:
         """Convert chat history to indivisible assistant/tool protocol units."""
 
@@ -8783,7 +8965,7 @@ class WorkerRuntime:
                 tool_call_id = str(tool_message.tool_call_id)
                 tool_name = tool_message.name or expected_names[tool_call_id]
                 digest = "sha256:" + hashlib.sha256(event_payload.encode()).hexdigest()
-                if tool_name in _BUILTIN_TARGET_EXCHANGE_TOOLS:
+                if tool_name in target_exchange_tool_names:
                     semantic = _project_target_result_content(
                         tool_message.content, excerpt_chars=2_048
                     )
@@ -8948,6 +9130,7 @@ class WorkerRuntime:
         progress: Sequence[str] = (),
         stall: Sequence[str] = (),
         exchange_window: int | None = None,
+        target_exchange_tool_names: frozenset[str] = LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     ) -> tuple[ContextProjection, list[ChatMessage], dict[str, object] | None]:
         complete = cls._protocol_complete_messages(messages)
         prefix_count = (
@@ -8961,7 +9144,11 @@ class WorkerRuntime:
                 complete[1].content if prefix_count else "Continue the durable worker protocol."
             ),
         )
-        protocol, grouped = cls._projection_protocol(complete, prefix_count=prefix_count)
+        protocol, grouped = cls._projection_protocol(
+            complete,
+            prefix_count=prefix_count,
+            target_exchange_tool_names=target_exchange_tool_names,
+        )
         facts = tuple(
             StrategyFact(
                 str(key),
@@ -8984,7 +9171,7 @@ class WorkerRuntime:
         for unit in protocol:
             for event in unit.events:
                 if event.durable_receipt is not None and event.tool_name in (
-                    _BUILTIN_TARGET_EXCHANGE_TOOLS
+                    target_exchange_tool_names
                     | {
                         "browser_compile_api_handoff",
                         "browser_recall_reconnaissance",
@@ -9019,7 +9206,7 @@ class WorkerRuntime:
                 context_target_ratio=target_ratio,
                 recent_exchange_window=exchange_window,
             ),
-            exchange_tool_names=_BUILTIN_TARGET_EXCHANGE_TOOLS,
+            exchange_tool_names=target_exchange_tool_names,
         )
         tail_start = len(grouped) - len(projection.recent_protocol_tail)
         omitted = [message for group in grouped[:tail_start] for message in group]
@@ -9078,6 +9265,7 @@ class WorkerRuntime:
         trigger_ratio: float = 0.8,
         target_ratio: float = 0.5,
         exchange_window: int | None = None,
+        target_exchange_tool_names: frozenset[str] = LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     ) -> tuple[list[ChatMessage], dict[str, object] | None]:
         _, projected, provenance = cls._project_messages(
             messages,
@@ -9092,6 +9280,7 @@ class WorkerRuntime:
             trigger_ratio=trigger_ratio,
             target_ratio=target_ratio,
             exchange_window=exchange_window,
+            target_exchange_tool_names=target_exchange_tool_names,
         )
         return projected, provenance
 
@@ -9281,6 +9470,7 @@ class WorkerRuntime:
             progress=progress,
             stall=stall,
             exchange_window=exchange_window,
+            target_exchange_tool_names=_target_exchange_tool_names(tools),
         )
 
     def _compact_for_context(
@@ -9307,6 +9497,7 @@ class WorkerRuntime:
         before: int,
         min_content_bytes: int = 0,
         include_unique: bool = False,
+        target_exchange_tool_names: frozenset[str] = LEGACY_TARGET_EXCHANGE_TOOL_IDS,
     ) -> list[ChatMessage]:
         projected = list(messages)
         call_keys: dict[str, tuple[str, str]] = {}
@@ -9324,7 +9515,7 @@ class WorkerRuntime:
                         and name
                         in (
                             _SUPERSEDABLE_OBSERVATION_TOOLS
-                            | _BUILTIN_TARGET_EXCHANGE_TOOLS
+                            | target_exchange_tool_names
                             | {
                                 "browser_compile_api_handoff",
                                 "browser_recall_reconnaissance",
@@ -9383,13 +9574,13 @@ class WorkerRuntime:
                 "type": "tool_result_receipt",
             }
             semantic_target_or_handoff = message.name in (
-                _BUILTIN_TARGET_EXCHANGE_TOOLS
+                target_exchange_tool_names
                 | {
                     "browser_compile_api_handoff",
                     "browser_recall_reconnaissance",
                 }
             )
-            if message.name in _BUILTIN_TARGET_EXCHANGE_TOOLS:
+            if message.name in target_exchange_tool_names:
                 receipt_payload["reference"] = f"target-call:{message.tool_call_id}"
             elif semantic_target_or_handoff:
                 receipt_payload["reference"] = f"tool-call:{message.tool_call_id}"
@@ -9410,7 +9601,7 @@ class WorkerRuntime:
                     message.content,
                     excerpt_chars=768,
                 )
-            elif message.name in _BUILTIN_TARGET_EXCHANGE_TOOLS:
+            elif message.name in target_exchange_tool_names:
                 receipt_payload["semantic_projection"] = _project_target_result_content(
                     message.content,
                     excerpt_chars=2_048,
@@ -9567,6 +9758,7 @@ class WorkerRuntime:
         messages: Sequence[ChatMessage],
         target_evidence: Sequence[Mapping[str, object]],
         *,
+        target_exchange_tool_names: frozenset[str] = LEGACY_TARGET_EXCHANGE_TOOL_IDS,
         language: str | None = None,
     ) -> str | None:
         """Refusal-without-progress detector for direct workers.
@@ -9580,7 +9772,7 @@ class WorkerRuntime:
         """
         last_exchange: ChatMessage | None = None
         for message in reversed(messages):
-            if message.role == "tool" and message.name in _BUILTIN_TARGET_EXCHANGE_TOOLS:
+            if message.role == "tool" and message.name in target_exchange_tool_names:
                 last_exchange = message
                 break
         if last_exchange is None:
@@ -9793,8 +9985,8 @@ class WorkerRuntime:
             "call_id": call.call_id,
             "tool_name": call.name,
             "reference": f"target-call:{call.call_id}",
-            "session_id": handoff.session_id,
             "campaign_id": campaign_id,
+            "session_id": handoff.session_id,
             "assignment_id": handoff.assignment.id,
             "attempt_id": handoff.attempt_id,
             "technique_attempt_id": handoff.technique_attempt_id,

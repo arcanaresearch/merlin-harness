@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import asdict, replace
 from hashlib import sha256
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -12,6 +13,7 @@ from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 from merlin_contracts import (
     LEGACY_TARGET_EXCHANGE_TOOL_IDS,
+    MAX_TARGET_SESSION_ID_LENGTH,
     InfrastructureFailureCategory,
     TargetDeliveryClass,
     Tool,
@@ -104,6 +106,15 @@ def _infrastructure_failure_category(
     ):
         return InfrastructureFailureCategory.UNHEALTHY_TARGET_SESSION
     return None
+
+
+def _qualified_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 def _shell_command_scope(
@@ -209,9 +220,11 @@ class ToolBroker:
         return tuple(tool.describe() for tool in self._tools.values())
 
     def effect(self, name: str) -> str | None:
-        """Return only a tool's explicitly declared effect classification."""
+        """Return the canonical permission effect for one registered tool."""
 
         tool = self._tools.get(name)
+        if tool is not None and self.interaction_role(name) is ToolInteractionRole.TARGET_EXCHANGE:
+            return PermissionEffect.TARGET_NETWORK.value
         declared = getattr(tool, "effect", None) if tool is not None else None
         return declared if isinstance(declared, str) and declared else None
 
@@ -243,6 +256,32 @@ class ToolBroker:
         # Compatibility for callers registering pre-role target tools.
         return tuple(name for name in candidates if name in LEGACY_TARGET_EXCHANGE_TOOL_IDS)
 
+    async def resolve_target_session_id(self, name: str, context: ToolContext) -> str | None:
+        """Resolve a tool's daemon-trusted physical target session before admission."""
+
+        tool = self._tools.get(name)
+        resolver = getattr(tool, "resolve_target_session_id", None)
+        if not callable(resolver):
+            return None
+        try:
+            pending = resolver(context)
+            value = await pending if isawaitable(pending) else pending
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise ValueError(
+                "tool could not resolve its physical target session identity"
+            ) from error
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > MAX_TARGET_SESSION_ID_LENGTH
+            or "\0" in value
+        ):
+            raise ValueError("tool returned an invalid physical target session identity")
+        return value
+
     async def list_effects_for_attempt(
         self, attempt_id: str, *, limit: int | None = None
     ) -> tuple[ToolEffectRecord, ...]:
@@ -273,6 +312,37 @@ class ToolBroker:
         context: ToolContext,
         arguments: Mapping[str, Any],
     ) -> ToolResult:
+        return await self._invoke(
+            name,
+            context,
+            arguments,
+            target_effect_admitter=None,
+        )
+
+    async def invoke_with_admission(
+        self,
+        name: str,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        admitter: Callable[[ToolEffectRecord], Awaitable[str]],
+    ) -> ToolResult:
+        """Admit one effect after validation/confirmation and immediately before dispatch."""
+
+        return await self._invoke(
+            name,
+            context,
+            arguments,
+            target_effect_admitter=admitter,
+        )
+
+    async def _invoke(
+        self,
+        name: str,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        *,
+        target_effect_admitter: (Callable[[ToolEffectRecord], Awaitable[str]] | None),
+    ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(content=f"unknown tool: {name}", is_error=True)
@@ -283,15 +353,19 @@ class ToolBroker:
             encoded_arguments = json.dumps(
                 arguments, sort_keys=True, separators=(",", ":")
             ).encode()
+            if len(encoded_arguments) > self._max_argument_bytes:
+                return ToolResult(
+                    content=f"tool arguments exceed {self._max_argument_bytes} byte limit",
+                    is_error=True,
+                    metadata={"arguments_too_large": True},
+                )
+            frozen_arguments = json.loads(encoded_arguments)
+            if not isinstance(frozen_arguments, dict):
+                raise TypeError("tool arguments must encode as a JSON object")
+            arguments = frozen_arguments
             encoded_effect_arguments = _encode_effect_arguments(arguments)
         except (TypeError, ValueError) as error:
             return ToolResult(content=f"invalid tool arguments: {error}", is_error=True)
-        if len(encoded_arguments) > self._max_argument_bytes:
-            return ToolResult(
-                content=f"tool arguments exceed {self._max_argument_bytes} byte limit",
-                is_error=True,
-                metadata={"arguments_too_large": True},
-            )
         try:
             validator = validator_for(spec.input_schema)
             validator.check_schema(spec.input_schema)
@@ -463,16 +537,101 @@ class ToolBroker:
                     metadata={"effect": effect.value, "confirmation_required": True},
                 )
         intent: ToolEffectRecord | None = None
-        if self._effect_store is not None and context.call_id is not None and self._durable(effect):
+        permit_digest: str | None = None
+        if context.target_effect_permit_digest is not None and target_effect_admitter is None:
+            return ToolResult(
+                content="durable target-effect permit requires fresh daemon admission",
+                is_error=True,
+                metadata={"target_effect_permit_invalid": True},
+            )
+        if (target_effect_admitter is not None) and (
+            self._effect_store is None or context.call_id is None
+        ):
+            return ToolResult(
+                content="durable target-effect admission is unavailable",
+                is_error=True,
+                metadata={"target_effect_permit_invalid": True},
+            )
+        if target_effect_admitter is not None and not _valid_target_session_id(
+            context.expected_target_session_id
+        ):
+            missing_session = context.expected_target_session_id is None
+            return ToolResult(
+                content=(
+                    "physical target session identity is unavailable before admission"
+                    if missing_session
+                    else "physical target session identity is invalid before admission"
+                ),
+                is_error=True,
+                metadata={
+                    "failure_code": (
+                        "target_session_identity_unavailable"
+                        if missing_session
+                        else "target_session_identity_invalid"
+                    ),
+                    "retryable": False,
+                    "effect_applied": False,
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                    "target_call_budget_charge": 0,
+                },
+            )
+        if (
+            self._effect_store is not None
+            and context.call_id is not None
+            and (self._durable(effect) or target_effect_admitter is not None)
+        ):
             digest = sha256(encoded_arguments).hexdigest()
             ownership = context.attempt_id or context.agent_id or "legacy"
             lineage_loader = getattr(self._effect_store, "list_for_attempt", None)
-            if context.effect_attempt_lineage and lineage_loader is not None:
-                ancestor_effects = [
-                    item
-                    for lineage_attempt_id in context.effect_attempt_lineage[:-1]
-                    for item in await lineage_loader(lineage_attempt_id)
-                ]
+            if context.effect_attempt_lineage and not callable(lineage_loader):
+                return ToolResult(
+                    content="durable target-effect lineage cannot be authenticated",
+                    is_error=True,
+                    metadata={
+                        "effect_ambiguous": True,
+                        "replacement_blocked": True,
+                        "effect_lineage_unavailable": True,
+                    },
+                )
+            if context.effect_attempt_lineage and callable(lineage_loader):
+                ancestor_attempt_ids = context.effect_attempt_lineage[:-1]
+                if len(context.effect_attempt_lineage) > 256:
+                    return ToolResult(
+                        content="durable target-effect lineage exceeds the recovery bound",
+                        is_error=True,
+                        metadata={
+                            "effect_ambiguous": True,
+                            "replacement_blocked": True,
+                            "effect_lineage_overflow": True,
+                        },
+                    )
+                ancestor_effects: list[ToolEffectRecord] = []
+                for lineage_attempt_id in ancestor_attempt_ids:
+                    remaining = 256 - len(ancestor_effects)
+                    if remaining <= 0:
+                        return ToolResult(
+                            content="durable target-effect history exceeds the recovery bound",
+                            is_error=True,
+                            metadata={
+                                "effect_ambiguous": True,
+                                "replacement_blocked": True,
+                                "effect_history_overflow": True,
+                            },
+                        )
+                    loaded = await lineage_loader(lineage_attempt_id, limit=remaining + 1)
+                    if len(loaded) > remaining:
+                        return ToolResult(
+                            content="durable target-effect history exceeds the recovery bound",
+                            is_error=True,
+                            metadata={
+                                "effect_ambiguous": True,
+                                "replacement_blocked": True,
+                                "effect_history_overflow": True,
+                            },
+                        )
+                    ancestor_effects.extend(loaded)
                 if (
                     is_target_exchange
                     and context.expected_target_sequence
@@ -509,6 +668,22 @@ class ToolBroker:
                         return sha256(encoded).hexdigest() == actual_target_digest
                     return item.arguments_digest == digest
 
+                def revoked_before_dispatch(item: ToolEffectRecord) -> bool:
+                    metadata = item.result_metadata
+                    return bool(
+                        item.state is ToolEffectState.RECONCILED
+                        and item.result_is_error is True
+                        and metadata.get("target_effect_dispatch_status")
+                        == "revoked_before_dispatch"
+                        and metadata.get("target_effect_attempted") is False
+                        and type(metadata.get("interaction_count")) is int
+                        and metadata.get("interaction_count") == 0
+                        and type(metadata.get("limit_interaction_count")) is int
+                        and metadata.get("limit_interaction_count") == 0
+                        and type(metadata.get("target_call_budget_charge")) is int
+                        and metadata.get("target_call_budget_charge") == 0
+                    )
+
                 matching_ancestors = tuple(
                     item
                     for item in ancestor_effects
@@ -518,8 +693,59 @@ class ToolBroker:
                     and same_effect_arguments(item)
                     and (context.target_id is None or item.target_id == context.target_id)
                     and (context.campaign_id is None or item.campaign_id == context.campaign_id)
+                    and not revoked_before_dispatch(item)
                 )
+                if target_effect_admitter is not None and any(
+                    item.result_metadata.get("target_session_id")
+                    != context.expected_target_session_id
+                    for item in matching_ancestors
+                ):
+                    return ToolResult(
+                        content=(
+                            "durable ancestor effect belongs to a different physical target session"
+                        ),
+                        is_error=True,
+                        metadata={
+                            "effect_ambiguous": True,
+                            "replacement_blocked": True,
+                            "target_session_identity_mismatch": True,
+                        },
+                    )
                 prior = matching_ancestors[0] if len(matching_ancestors) == 1 else None
+                if len(matching_ancestors) > 1:
+                    first = matching_ancestors[0]
+                    terminal = {
+                        ToolEffectState.ACKNOWLEDGED,
+                        ToolEffectState.RECONCILED,
+                    }
+                    if all(
+                        item.state in terminal
+                        and item.state is first.state
+                        and item.arguments_digest == first.arguments_digest
+                        and item.arguments_payload == first.arguments_payload
+                        and item.result_content == first.result_content
+                        and item.result_is_error is first.result_is_error
+                        and item.result_metadata == first.result_metadata
+                        and item.reconciliation == first.reconciliation
+                        for item in matching_ancestors
+                    ):
+                        prior = min(
+                            matching_ancestors,
+                            key=lambda item: item.idempotency_key,
+                        )
+                    else:
+                        return ToolResult(
+                            content=(
+                                "multiple durable ancestor target effects conflict; "
+                                "replacement cannot resend"
+                            ),
+                            is_error=True,
+                            metadata={
+                                "effect_ambiguous": True,
+                                "replacement_blocked": True,
+                                "duplicate_ancestor_effects": True,
+                            },
+                        )
                 if prior is not None:
                     if prior.state in {
                         ToolEffectState.ACKNOWLEDGED,
@@ -560,13 +786,50 @@ class ToolBroker:
                 arguments_payload=dict(arguments),
                 state=ToolEffectState.INTENT,
             )
-            intent, created = await self._effect_store.begin(proposed)
+            permit_digest = context.target_effect_permit_digest
+            if target_effect_admitter is not None:
+                permit_digest = await target_effect_admitter(proposed)
+                if not _qualified_sha256(permit_digest):
+                    return ToolResult(
+                        content="durable target-effect admission returned an invalid permit",
+                        is_error=True,
+                        metadata={"target_effect_permit_invalid": True},
+                    )
+                context = context.model_copy(update={"target_effect_permit_digest": permit_digest})
+            if permit_digest is not None:
+                permit_adopter = getattr(self._effect_store, "adopt_permitted", None)
+                if not callable(permit_adopter):
+                    return ToolResult(
+                        content="durable target-effect permit cannot be authenticated",
+                        is_error=True,
+                        metadata={"target_effect_permit_invalid": True},
+                    )
+                try:
+                    intent, created = await permit_adopter(proposed, permit_digest)
+                except (KeyError, TypeError, ValueError):
+                    return ToolResult(
+                        content="durable target-effect permit is invalid or stale",
+                        is_error=True,
+                        metadata={"target_effect_permit_invalid": True},
+                    )
+            else:
+                intent, created = await self._effect_store.begin(proposed)
             if not created:
                 if intent.state in (ToolEffectState.ACKNOWLEDGED, ToolEffectState.RECONCILED):
                     return ToolResult(
                         content=intent.result_content or "",
                         is_error=bool(intent.result_is_error),
                         metadata=intent.result_metadata | {"idempotent_replay": True},
+                    )
+                if permit_digest is not None:
+                    return ToolResult(
+                        content="durable target-effect permit is already in flight",
+                        is_error=True,
+                        metadata={
+                            "effect_ambiguous": True,
+                            "target_effect_permit_in_flight": True,
+                            "idempotency_key": key,
+                        },
                     )
                 if intent.state is ToolEffectState.INTENT:
                     intent = intent.model_copy(
@@ -623,6 +886,48 @@ class ToolBroker:
                 )
             return ToolResult(content=str(error), is_error=True, metadata=failure_metadata)
         result = self._bound_result(result)
+        if intent is not None and permit_digest is not None:
+            witnessed_target_session_id = result.metadata.get("target_session_id")
+            if (
+                not _valid_target_session_id(witnessed_target_session_id)
+                or witnessed_target_session_id != context.expected_target_session_id
+            ):
+                missing_witness = witnessed_target_session_id is None
+                hold_metadata = result.metadata | {
+                    "effect": effect.value,
+                    "effect_ambiguous": True,
+                    "replacement_blocked": True,
+                    "target_effect_attempted": True,
+                    "target_session_identity_mismatch": not missing_witness,
+                    "target_session_identity_unavailable": missing_witness,
+                    "failure_code": (
+                        "target_session_identity_unavailable"
+                        if missing_witness
+                        else "target_session_identity_mismatch"
+                    ),
+                }
+                await self._effect_store.finish(
+                    intent.model_copy(
+                        update={
+                            "state": ToolEffectState.AMBIGUOUS,
+                            "result_content": result.content,
+                            "result_is_error": True,
+                            "result_metadata": hold_metadata,
+                            "reconciliation": (
+                                "permitted target effect returned without its exact "
+                                "physical target session witness"
+                            ),
+                        }
+                    )
+                )
+                return ToolResult(
+                    content=(
+                        "target effect result did not authenticate the admitted "
+                        "physical target session"
+                    ),
+                    is_error=True,
+                    metadata=hold_metadata,
+                )
         if evaluation_uncertainties:
             existing = result.metadata.get("evaluation_uncertain")
             retained = (
@@ -764,3 +1069,13 @@ def _encode_effect_arguments(arguments: Mapping[str, Any]) -> bytes:
         if key not in {"strategy_plan", "strategy_turn_index"}
     }
     return json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _valid_target_session_id(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and len(value) <= MAX_TARGET_SESSION_ID_LENGTH
+        and "\0" not in value
+    )

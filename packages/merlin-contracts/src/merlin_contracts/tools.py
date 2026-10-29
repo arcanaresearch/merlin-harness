@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 LEGACY_TARGET_EXCHANGE_TOOL_IDS = frozenset(
     {"target_chat", "target_request", "target_inject", "browser_chat_exchange"}
 )
+MAX_TARGET_SESSION_ID_LENGTH = 256
 
 
 class ToolInteractionRole(StrEnum):
@@ -68,6 +69,8 @@ class ToolContext(BaseModel):
     objective_phase_gate_contract: dict[str, object] | None = None
     target_reobservation_generation_id: str | None = None
     target_reobservation_event_set_digest: str | None = None
+    expected_target_session_id: str | None = None
+    target_effect_permit_digest: str | None = None
 
 
 class ToolResult(BaseModel):

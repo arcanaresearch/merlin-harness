@@ -4,6 +4,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from merlin_storage_postgres import (
@@ -549,6 +550,88 @@ def test_frontier_transition_lease_fences_recovery_and_survives_restart(tmp_path
             assert not store.release_frontier_transition(replacement, "daemon/a")
             assert store.release_frontier_transition(replacement, "daemon/b")
             assert not store.validate_frontier_transition(replacement, "daemon/b")
+
+
+def test_fenced_wave_uses_campaign_before_transition_lease_lock_order(
+    tmp_path: Path,
+) -> None:
+    """Activation and fenced wave persistence cannot deadlock campaign against lease."""
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-frontier-lock-order")) as database:
+        with database.connect() as connection:
+            store, session_id = _prepare(connection)
+            schedule_id = DurableSchedulerStore(connection).create_schedule(
+                session_id,
+                {"assignments": []},
+                {"states": {}},
+                ["lead"],
+                ready_nodes=["lead"],
+            )
+            claim_id = store.claim_frontier_transition("campaign/frontier", "daemon/lock-order", 30)
+            assert claim_id is not None
+
+        campaign_locked = Event()
+        wave_locked_lease = Event()
+        activation_waiting_for_lease = Event()
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def execute(self, query, *args, **kwargs):
+                result = self._connection.execute(query, *args, **kwargs)
+                normalized = " ".join(str(query).split())
+                if (
+                    "FROM merlin_storage.campaign_frontier_transition_leases" in normalized
+                    and "FOR UPDATE" in normalized
+                ):
+                    wave_locked_lease.set()
+                    assert activation_waiting_for_lease.wait(3)
+                return result
+
+        def activation_lock_order() -> str:
+            with database.connect() as connection, connection.transaction():
+                connection.execute("SET LOCAL deadlock_timeout = '100ms'")
+                connection.execute(
+                    """SELECT id FROM merlin_storage.assessment_campaigns
+                       WHERE id = %s FOR UPDATE""",
+                    ("campaign/frontier",),
+                )
+                campaign_locked.set()
+                wave_locked_lease.wait(0.5)
+                activation_waiting_for_lease.set()
+                connection.execute(
+                    """SELECT 1
+                       FROM merlin_storage.campaign_frontier_transition_leases
+                       WHERE campaign_id = %s FOR UPDATE""",
+                    ("campaign/frontier",),
+                )
+            return "activation"
+
+        def persist_fenced_wave() -> str:
+            assert campaign_locked.wait(3)
+            with database.connect() as connection:
+                connection.execute("SET deadlock_timeout = '100ms'")
+                CampaignStore(ObservedConnection(connection)).add_wave_fenced(
+                    "campaign/frontier",
+                    0,
+                    "initial",
+                    schedule_id,
+                    claim_id=claim_id,
+                    claimant_id="daemon/lock-order",
+                )
+            return "wave"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            activation = executor.submit(activation_lock_order)
+            wave = executor.submit(persist_fenced_wave)
+            assert {activation.result(timeout=5), wave.result(timeout=5)} == {
+                "activation",
+                "wave",
+            }
 
 
 def test_frontier_wave_mutations_require_the_same_transition_fence(tmp_path: Path) -> None:

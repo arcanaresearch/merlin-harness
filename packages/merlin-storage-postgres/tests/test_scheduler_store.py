@@ -1,7 +1,10 @@
+import asyncio
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import merlin_storage_postgres.scheduler_store as scheduler_store_module
@@ -14,6 +17,12 @@ from merlin_agents import (
     WorkerHandoff,
     WorkerProfile,
     WorkerRuntime,
+)
+from merlin_agents.target_reobservation import (
+    extract_target_reobservation_obligations,
+    normalize_target_ui_transition,
+    project_target_reobservations,
+    target_reobservation_schedule_id,
 )
 from merlin_contracts import (
     AgentTask,
@@ -36,9 +45,163 @@ from merlin_storage_postgres import (
     SessionRepository,
     StaleLeaseError,
     ToolEffectRepository,
+    load_migrations,
 )
+from merlin_storage_postgres.effect_store import TargetEffectPermitLatchedError
 from merlin_tools import ToolBroker
 from psycopg.errors import ForeignKeyViolation
+from psycopg.types.json import Jsonb
+
+
+def _qualified(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _surface_transition_observation(
+    *,
+    campaign_id: str,
+    session_id: str,
+    target_id: str,
+    target_session_id: str,
+    task_id: str,
+    call_id: str,
+    error: bool = False,
+) -> dict[str, object]:
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": error,
+        "before_digest": "sha256:" + "1" * 64,
+        "after_digest": "sha256:" + "2" * 64,
+        "changed_dimensions": ["controls"],
+        "added_controls": [{"role": "button", "name": "Continue", "frame_ref": "main"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser-snapshot:transition"],
+        "reobservation_recommended": True,
+    }
+    body: dict[str, object] = {
+        "call_id": call_id,
+        "reference": f"target-call:{call_id}",
+        "assignment_id": task_id,
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "tool_name": "browser_chat_exchange",
+        "is_error": error,
+        "request_sha256": "3" * 64,
+        "content_sha256": "4" * 64,
+        "metadata_sha256": "5" * 64,
+        "target_ui_transition": transition,
+    }
+    if error:
+        body.update(
+            target_effect_attempted=False,
+            interaction_count=0,
+            limit_interaction_count=0,
+            target_call_budget_charge=0,
+        )
+    receipt = {**body, "receipt_sha256": _qualified(body).removeprefix("sha256:")}
+    projection = "target_ui_transition_receipts" if error else "target_evidence_receipts"
+    obligations = extract_target_reobservation_obligations(
+        campaign_id=campaign_id,
+        session_id=session_id,
+        target_id=target_id,
+        source_schedule_id="placeholder",
+        source_wave=0,
+        task_ids=(task_id,),
+        evidence={task_id: {projection: {call_id: receipt}}},
+    )
+    assert len(obligations) == 1
+    return obligations[0].observed_payload(campaign_id, target_id)
+
+
+def _target_admission(
+    *,
+    campaign_id: str,
+    session_id: str,
+    schedule_id: str,
+    target_id: str,
+    assignment_id: str,
+    target_session_id: str | None = None,
+    strategy_id: str = "direct",
+    generation_id: str | None = None,
+    event_set_digest: str | None = None,
+    start_decision_id: str | None = None,
+    target_exchange_tool_ids: tuple[str, ...] = ("browser_chat_exchange",),
+    target_effect_tool_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    effect_tool_ids = (
+        target_exchange_tool_ids if target_effect_tool_ids is None else target_effect_tool_ids
+    )
+    return {
+        "schema": "merlin.target-admission.v1",
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "schedule_id": schedule_id,
+        "node_id": f"worker:{assignment_id}",
+        "target_id": target_id,
+        "assignment_id": assignment_id,
+        "target_session_id": target_session_id,
+        "strategy_id": strategy_id,
+        "reviewed_adapter_digest": "sha256:" + "8" * 64,
+        "target_effect_tool_ids": effect_tool_ids,
+        "target_exchange_tool_ids": target_exchange_tool_ids,
+        "generation_id": generation_id,
+        "event_set_digest": event_set_digest,
+        "target_reobservation_start_decision_id": start_decision_id,
+    }
+
+
+def _persisted_worker_context(
+    *,
+    assignment_id: str,
+    target_id: str,
+    tool_ids: tuple[str, ...],
+    strategy_id: str,
+    strategy_contract: list[list[object]],
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        "assignment_id": assignment_id,
+        "profile": {},
+        "guidance": [],
+        "skills": [],
+        "tool_ids": list(tool_ids),
+        "target": {"id": target_id},
+        "authority_ids": [],
+        "strategy_id": strategy_id,
+        "strategy_contract": strategy_contract,
+    }
+    return {**values, "digest": _qualified(values)}
+
+
+def _target_effect_intent(
+    *,
+    session_id: str,
+    campaign_id: str,
+    target_id: str,
+    assignment_id: str,
+    attempt_id: str,
+    call_id: str,
+    tool_name: str = "browser_chat_exchange",
+) -> dict[str, object]:
+    arguments = {"message": "bounded target probe"}
+    return ToolEffectRecord(
+        idempotency_key=f"effect/{attempt_id}/{call_id}",
+        session_id=session_id,
+        call_id=call_id,
+        agent_id=assignment_id,
+        attempt_id=attempt_id,
+        campaign_id=campaign_id,
+        target_id=target_id,
+        tool_name=tool_name,
+        effect="target_network",
+        arguments_digest=_qualified(arguments),
+        arguments_payload=arguments,
+        state=ToolEffectState.INTENT,
+    ).model_dump(mode="json")
 
 
 def test_adaptive_observation_validates_current_target_authority_binding() -> None:
@@ -224,6 +387,2479 @@ def test_pg0_scheduler_fences_stale_attempt_and_commits_reducer_atomically(
             store.verify(schedule_id)
 
 
+def _prepare_target_transition_campaign(connection, session_id: str):
+    campaign_id = "campaign/target-latch"
+    target_id = "target-1"
+    target_tasks = (
+        f"{campaign_id}/wave-0/first",
+        f"{campaign_id}/wave-0/already-leased",
+        f"{campaign_id}/wave-0/late",
+    )
+    offline_task = f"{campaign_id}/wave-0/offline"
+    assignments = [
+        {
+            "id": task_id,
+            "target_profile_id": target_id,
+            "tool_ids": ["browser_chat_exchange"],
+            "strategy_id": "direct",
+            "strategy_contract": [],
+            "reviewed_adapter_digest": "sha256:" + "8" * 64,
+        }
+        for task_id in target_tasks
+    ] + [
+        {
+            "id": offline_task,
+            "target_profile_id": target_id,
+            "tool_ids": ["offline_analysis"],
+            "strategy_id": "direct",
+            "strategy_contract": [],
+        }
+    ]
+    store = DurableSchedulerStore(connection)
+    schedule_id = store.create_schedule(
+        session_id,
+        {"assignments": assignments, "worker_contexts": {}},
+        {"nodes": {}},
+        [*(f"worker:{task_id}" for task_id in target_tasks), f"worker:{offline_task}"],
+        ready_nodes=[
+            *(f"worker:{task_id}" for task_id in target_tasks),
+            f"worker:{offline_task}",
+        ],
+    )
+    campaigns = CampaignStore(connection)
+    campaigns.prepare(
+        campaign_id,
+        session_id,
+        {"manifest": {"id": campaign_id, "target": {"id": target_id}}},
+        "sha256:reviewed",
+    )
+    campaigns.begin_execution(campaign_id, "sha256:reviewed", schedule_id)
+    return store, campaigns, schedule_id, campaign_id, target_id, target_tasks, offline_task
+
+
+def _persist_legacy_transition_upgrade_case(connection, session_id: str, *, error: bool):
+    store, campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+        _prepare_target_transition_campaign(connection, session_id)
+    )
+    task_id = tasks[0]
+    node_id = f"worker:{task_id}"
+    lease = store.claim(
+        schedule_id,
+        node_id,
+        "legacy-transition-worker",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": error,
+        "before_digest": "sha256:" + "1" * 64,
+        "after_digest": "sha256:" + "2" * 64,
+        "changed_dimensions": ["controls"],
+        "added_controls": [{"role": "button", "name": "Continue", "frame_ref": "main"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser-snapshot:legacy-transition"],
+        "reobservation_recommended": True,
+    }
+    normalized = normalize_target_ui_transition(transition)
+    assert normalized is not None
+    canonical_transition, transition_digest = normalized
+    target_session_id = "browser:legacy-context"
+    call_id = "legacy-error-call" if error else "legacy-success-call"
+    tool_name = "browser_chat_exchange"
+    arguments = {"message": "advance the reviewed target"}
+    request_body = json.dumps(
+        {"name": tool_name, "arguments": arguments},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    content = "surface changed" if error else "level complete"
+    metadata = {
+        "target_session_id": target_session_id,
+        "target_ui_transition": transition,
+        "target_effect_attempted": not error,
+        "interaction_count": 0 if error else 1,
+        "limit_interaction_count": 0 if error else 1,
+        "target_call_budget_charge": 0 if error else 1,
+    }
+    receipt_body = {
+        "call_id": call_id,
+        "tool_name": tool_name,
+        "reference": f"target-call:{call_id}",
+        "campaign_id": campaign_id,
+        "assignment_id": task_id,
+        "attempt_id": lease.id,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "request_sha256": hashlib.sha256(request_body).hexdigest(),
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "metadata_sha256": _qualified(metadata).removeprefix("sha256:"),
+        "is_error": error,
+        "acknowledged": not error,
+        "target_ui_transition": transition,
+    }
+    receipt = {
+        **receipt_body,
+        "receipt_sha256": _qualified(receipt_body).removeprefix("sha256:"),
+    }
+    effect = ToolEffectRecord(
+        idempotency_key=f"legacy-effect/{lease.id}/{call_id}",
+        session_id=session_id,
+        call_id=call_id,
+        agent_id=task_id,
+        attempt_id=lease.id,
+        campaign_id=campaign_id,
+        target_id=target_id,
+        tool_name=tool_name,
+        effect="target_network",
+        arguments_digest=_qualified(arguments),
+        arguments_payload=arguments,
+        state=ToolEffectState.INTENT,
+    )
+    effects = ToolEffectRepository(connection)
+    effects.begin(effect)
+    result = {
+        "content": content,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "worker_checkpoint": {"target_evidence": [receipt]},
+    }
+    # This fixture represents a daemon that committed its terminal effect and
+    # scheduler result before target-admission migration 097 existed. Use the
+    # pre-097 schema directly: current repository methods intentionally consult
+    # the permit/latch tables introduced by that migration.
+    result_digest = _qualified(result).removeprefix("sha256:")
+    with connection.transaction():
+        updated_effect = connection.execute(
+            """UPDATE merlin_storage.tool_effects
+               SET state = 'acknowledged', result_content = %s,
+                   result_is_error = %s, result_metadata = %s,
+                   updated_at = now()
+               WHERE idempotency_key = %s AND state = 'intent'
+               RETURNING idempotency_key""",
+            (content, error, Jsonb(metadata), effect.idempotency_key),
+        ).fetchone()
+        assert updated_effect == {"idempotency_key": effect.idempotency_key}
+        connection.execute(
+            """INSERT INTO merlin_storage.scheduler_results
+                   (attempt_id, schedule_id, node_id, generation, schema_id,
+                    payload, payload_digest)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                lease.id,
+                schedule_id,
+                node_id,
+                lease.generation,
+                "schema/partial-result" if error else "schema/result",
+                Jsonb(result),
+                result_digest,
+            ),
+        )
+        updated_attempt = connection.execute(
+            """UPDATE merlin_storage.scheduler_attempts
+               SET state = %s, error = %s, completed_at = now(),
+                   target_session_id = %s, failure_kind = %s
+               WHERE id = %s AND generation = %s AND state = 'running'""",
+            (
+                "failed" if error else "completed",
+                "target_surface_disrupted" if error else None,
+                target_session_id,
+                "unknown" if error else None,
+                lease.id,
+                lease.generation,
+            ),
+        )
+        assert updated_attempt.rowcount == 1
+        if error:
+            updated_node = connection.execute(
+                """UPDATE merlin_storage.scheduler_nodes
+                   SET state = 'failed', failed_attempts = failed_attempts + 1
+                   WHERE schedule_id = %s AND node_id = %s
+                     AND lease_generation = %s AND state = 'leased'""",
+                (schedule_id, node_id, lease.generation),
+            )
+        else:
+            updated_node = connection.execute(
+                """UPDATE merlin_storage.scheduler_nodes
+                   SET state = 'completed', result_digest = %s
+                   WHERE schedule_id = %s AND node_id = %s
+                     AND lease_generation = %s AND state = 'leased'""",
+                (result_digest, schedule_id, node_id, lease.generation),
+            )
+        assert updated_node.rowcount == 1
+    old_event_digest = _qualified(
+        [campaign_id, task_id, call_id, receipt["receipt_sha256"], transition_digest]
+    )
+    legacy_payload = {
+        "kind": "target_surface_transition_observed",
+        "schema": "merlin.target-surface-transition-observed.v1",
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "target_id": target_id,
+        "obligation_id": "target-reobservation:" + old_event_digest.removeprefix("sha256:"),
+        "event_digest": old_event_digest,
+        "transition_digest": transition_digest,
+        "source_schedule_id": schedule_id,
+        "source_wave": 0,
+        "source_task_id": task_id,
+        "target_call_id": call_id,
+        "target_receipt_sha256": receipt["receipt_sha256"],
+        "receipt_projection": (
+            "target_ui_transition_receipts" if error else "target_evidence_receipts"
+        ),
+        "target_ui_transition": canonical_transition,
+    }
+    campaigns.commit_lead_decision(
+        campaign_id,
+        0,
+        "target-surface-transition-observed/" + old_event_digest.removeprefix("sha256:"),
+        legacy_payload,
+        (),
+    )
+    return {
+        "store": store,
+        "campaigns": campaigns,
+        "schedule_id": schedule_id,
+        "campaign_id": campaign_id,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "task_id": task_id,
+        "call_id": call_id,
+        "receipt_sha256": receipt["receipt_sha256"],
+        "transition_digest": transition_digest,
+    }
+
+
+def _journal_reviewed_refresh(
+    campaigns: CampaignStore,
+    *,
+    campaign_id: str,
+    session_id: str,
+    target_id: str,
+    target_session_id: str,
+) -> dict[str, str]:
+    rows = campaigns.list_lead(campaign_id)
+    projection = project_target_reobservations(
+        rows, campaign_id=campaign_id, session_id=session_id, target_id=target_id
+    )
+    generation = projection.current_generation
+    assert generation is not None
+    event_set_digest = _qualified({"event_digests": generation.event_digests})
+    reobserve_schedule = target_reobservation_schedule_id(campaign_id, generation.generation_id, 1)
+    start = {
+        "kind": "target_reobservation_started",
+        "schema": "merlin.target-reobservation-started.v1",
+        "wave_kind": "objective_prerequisite",
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_digests": list(generation.event_digests),
+        "event_set_digest": event_set_digest,
+        "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+        "source_wave": generation.source_wave,
+        "attempt": 1,
+        "schedule_id": reobserve_schedule,
+    }
+    start_decision_id = (
+        "target-reobservation-started/" + generation.generation_id.removeprefix("sha256:") + "/1"
+    )
+    campaigns.commit_lead_decision(
+        campaign_id,
+        generation.source_wave,
+        start_decision_id,
+        start,
+        (),
+    )
+    evidence_refs = ["browser-snapshot:current"]
+    settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+        "sha256:"
+    )
+    settlement = {
+        "kind": "target_reobservation_settled",
+        "schema": "merlin.target-reobservation-settlement.v1",
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "target_id": target_id,
+        "target_session_id": target_session_id,
+        "generation_id": generation.generation_id,
+        "obligation_id": generation.obligation_id,
+        "event_digests": list(generation.event_digests),
+        "event_set_digest": event_set_digest,
+        "event_count": len(generation.event_digests),
+        "observation_cutoff_sequence": generation.observation_cutoff_sequence,
+        "source_wave": generation.source_wave,
+        "status": "refreshed",
+        "attempt": 1,
+        "schedule_id": reobserve_schedule,
+        "settlement_id": settlement_id,
+        "current_surface_digest": "sha256:" + "6" * 64,
+        "surface_evidence_digest": _qualified({"evidence_refs": evidence_refs}),
+        "surface_evidence_refs": evidence_refs,
+        "recon_handoff_id": "handoff-current",
+        "compiled_adapter_digest": "sha256:" + "7" * 64,
+        "reviewed_adapter_digest": "sha256:" + "8" * 64,
+        "result_reference": "task-result:reobserve",
+        "result_digest": "sha256:" + "9" * 64,
+    }
+    campaigns.commit_lead_decision(
+        campaign_id, generation.source_wave, settlement_id, settlement, ()
+    )
+    lead_payload = {
+        "schema": "merlin.campaign-lead-decision.v1",
+        "campaign_id": campaign_id,
+        "wave": generation.source_wave,
+        "source_message_ids": (),
+        "summary": "continue from the refreshed target surface",
+        "coverage_complete": False,
+        "finish_current_work": False,
+        "followups": [],
+        "validation_finding_ids": [],
+        "actions": [],
+        "plan_update": None,
+        "automation_requests": [],
+        "usage": {},
+        "target_reobservation_generations": [
+            {
+                "generation_id": generation.generation_id,
+                "settlement_id": settlement_id,
+                "target_session_id": target_session_id,
+            }
+        ],
+    }
+    identity = json.dumps(
+        {
+            "campaign_id": campaign_id,
+            "wave": generation.source_wave,
+            "source_message_ids": (),
+            "payload": lead_payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    lead_decision_id = "lead-decision:" + hashlib.sha256(identity.encode()).hexdigest()
+    campaigns.commit_lead_decision(
+        campaign_id,
+        generation.source_wave,
+        lead_decision_id,
+        lead_payload,
+        (),
+    )
+    return {
+        "generation_id": generation.generation_id,
+        "event_set_digest": event_set_digest,
+        "settlement_id": settlement_id,
+        "lead_decision_id": lead_decision_id,
+        "reobserve_schedule_id": reobserve_schedule,
+        "start_decision_id": start_decision_id,
+        "current_surface_digest": settlement["current_surface_digest"],
+        "compiled_adapter_digest": settlement["compiled_adapter_digest"],
+        "reviewed_adapter_digest": settlement["reviewed_adapter_digest"],
+    }
+
+
+@pytest.mark.parametrize("error", (False, True), ids=("success", "error"))
+def test_legacy_transition_upgrade_adopts_one_exact_durable_session_without_replay(
+    tmp_path: Path, error: bool
+) -> None:
+    data_dir = tmp_path / f"postgres-legacy-{error}"
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply(migrations[:96])
+            session = SessionRepository(connection).create("legacy transition adoption")
+            case = _persist_legacy_transition_upgrade_case(connection, str(session.id), error=error)
+            session_id = str(session.id)
+            before_effects = connection.execute(
+                "SELECT count(*) AS count FROM merlin_storage.tool_effects"
+            ).fetchone()["count"]
+            before_results = connection.execute(
+                "SELECT count(*) AS count FROM merlin_storage.scheduler_results"
+            ).fetchone()["count"]
+
+    with Database(DatabaseConfig(data_dir=data_dir)) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply(migrations[96:])
+            store = DurableSchedulerStore(connection)
+            campaigns = CampaignStore(connection)
+            upgraded = store.upgrade_legacy_target_admission(
+                str(case["campaign_id"]), session_id, str(case["target_id"])
+            )
+
+            assert upgraded == {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": "upgraded",
+                "scanned_count": 1,
+                "upgraded_count": 1,
+                "unresolved_count": 0,
+                "overflow": False,
+            }
+            lead = campaigns.list_lead(str(case["campaign_id"]))
+            assert [row["payload"]["schema"] for row in lead] == [
+                "merlin.target-surface-transition-observed.v1",
+                "merlin.target-surface-transition-observed.v2",
+            ]
+            v2 = lead[-1]["payload"]
+            assert v2["target_session_id"] == case["target_session_id"]
+            assert v2["event_digest"] == _qualified(
+                [
+                    case["campaign_id"],
+                    case["target_session_id"],
+                    case["task_id"],
+                    case["call_id"],
+                    case["receipt_sha256"],
+                    case["transition_digest"],
+                ]
+            )
+            assert (
+                project_target_reobservations(
+                    lead,
+                    campaign_id=str(case["campaign_id"]),
+                    session_id=session_id,
+                    target_id=str(case["target_id"]),
+                )
+                .pending[0]
+                .event_digest
+                == v2["event_digest"]
+            )
+            current = store.current_target_admission_latches(
+                str(case["campaign_id"]), session_id, str(case["target_id"])
+            )
+            assert current[0]["target_session_id"] == case["target_session_id"]
+
+            replay = store.upgrade_legacy_target_admission(
+                str(case["campaign_id"]), session_id, str(case["target_id"])
+            )
+            assert replay["status"] == "clear"
+            assert replay["upgraded_count"] == replay["unresolved_count"] == 0
+            assert (
+                connection.execute(
+                    "SELECT count(*) AS count FROM merlin_storage.tool_effects"
+                ).fetchone()["count"]
+                == before_effects
+            )
+            assert (
+                connection.execute(
+                    "SELECT count(*) AS count FROM merlin_storage.scheduler_results"
+                ).fetchone()["count"]
+                == before_results
+            )
+            assert len(campaigns.list_lead(str(case["campaign_id"]))) == 2
+
+
+def test_legacy_transition_upgrade_ambiguous_session_stays_globally_latched(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-legacy-ambiguous")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply(migrations[:96])
+            session = SessionRepository(connection).create("ambiguous legacy transition")
+            case = _persist_legacy_transition_upgrade_case(connection, str(session.id), error=False)
+            connection.execute(
+                """UPDATE merlin_storage.tool_effects
+                   SET result_metadata = jsonb_set(
+                       result_metadata, '{target_session_id}', '"browser:other-context"'
+                   )
+                   WHERE call_id = %s""",
+                (case["call_id"],),
+            )
+            legacy = case["campaigns"].list_lead(str(case["campaign_id"]))[0]["payload"]
+            forged_event_digest = _qualified(
+                [
+                    case["campaign_id"],
+                    case["target_session_id"],
+                    case["task_id"],
+                    case["call_id"],
+                    case["receipt_sha256"],
+                    case["transition_digest"],
+                ]
+            )
+            forged_v2 = {
+                **legacy,
+                "schema": "merlin.target-surface-transition-observed.v2",
+                "target_session_id": case["target_session_id"],
+                "event_digest": forged_event_digest,
+                "obligation_id": "target-reobservation:"
+                + forged_event_digest.removeprefix("sha256:"),
+            }
+            case["campaigns"].commit_lead_decision(
+                str(case["campaign_id"]),
+                0,
+                "target-surface-transition-observed/" + forged_event_digest.removeprefix("sha256:"),
+                forged_v2,
+                (),
+            )
+            MigrationRunner(connection).apply(migrations[96:])
+            store = case["store"]
+            assert isinstance(store, DurableSchedulerStore)
+
+            blocked = store.upgrade_legacy_target_admission(
+                str(case["campaign_id"]), str(session.id), str(case["target_id"])
+            )
+
+            assert blocked == {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": "blocked",
+                "scanned_count": 1,
+                "upgraded_count": 0,
+                "unresolved_count": 1,
+                "overflow": False,
+            }
+            assert [
+                row["payload"]["schema"]
+                for row in case["campaigns"].list_lead(str(case["campaign_id"]))
+            ] == [
+                "merlin.target-surface-transition-observed.v1",
+                "merlin.target-surface-transition-observed.v2",
+            ]
+            head = connection.execute(
+                """SELECT state, transition_count, latched_session_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = ''""",
+                (case["campaign_id"], case["target_id"]),
+            ).fetchone()
+            assert head == {
+                "state": "latched",
+                "transition_count": 2,
+                "latched_session_count": 2,
+            }
+
+
+def test_legacy_transition_upgrade_overflow_remains_bounded_and_globally_latched(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-legacy-overflow")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply(migrations[:96])
+            session = SessionRepository(connection).create("legacy transition overflow")
+            store, campaigns, _schedule, campaign_id, target_id, _tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            for index in range(257):
+                event_digest = "sha256:" + f"{index:064x}"
+                campaigns.commit_lead_decision(
+                    campaign_id,
+                    0,
+                    "target-surface-transition-observed/" + event_digest.removeprefix("sha256:"),
+                    {
+                        "kind": "target_surface_transition_observed",
+                        "schema": "merlin.target-surface-transition-observed.v1",
+                        "campaign_id": campaign_id,
+                        "session_id": str(session.id),
+                        "target_id": target_id,
+                        "event_digest": event_digest,
+                    },
+                    (),
+                )
+
+            MigrationRunner(connection).apply(migrations[96:])
+            blocked = store.upgrade_legacy_target_admission(campaign_id, str(session.id), target_id)
+
+            assert blocked == {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": "blocked",
+                "scanned_count": 256,
+                "upgraded_count": 0,
+                "unresolved_count": 256,
+                "overflow": True,
+            }
+            head = connection.execute(
+                """SELECT state, transition_count, latched_session_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = ''""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert head["state"] == "latched"
+            assert head["transition_count"] >= 257
+            assert head["latched_session_count"] >= 1
+
+
+def test_pg0_transition_commit_latches_claim_and_already_leased_effect_atomically(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-latch")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target transition admission")
+            (
+                store,
+                campaigns,
+                schedule_id,
+                campaign_id,
+                target_id,
+                target_tasks,
+                offline_task,
+            ) = _prepare_target_transition_campaign(connection, str(session.id))
+            admissions = {
+                task_id: _target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=task_id,
+                )
+                for task_id in target_tasks
+            }
+            first = store.claim(
+                schedule_id,
+                f"worker:{target_tasks[0]}",
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admissions[target_tasks[0]],
+            )
+            already_leased = store.claim(
+                schedule_id,
+                f"worker:{target_tasks[1]}",
+                "worker:already-leased",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            )
+            with pytest.raises(
+                scheduler_store_module.TargetAdmissionLatchedError,
+                match="durable lane",
+            ):
+                store.claim(
+                    schedule_id,
+                    f"worker:{target_tasks[2]}",
+                    "worker:parallel",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=admissions[target_tasks[2]],
+                )
+            transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-1",
+                task_id=target_tasks[0],
+                call_id="call-success-transition",
+            )
+
+            store.commit_reducer(
+                first.id,
+                first.generation,
+                schema_id="schema/result",
+                result={"content": "level complete"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-1",
+                target_surface_transition=transition,
+            )
+
+            journal = campaigns.list_lead(campaign_id)
+            assert [row["payload"]["event_digest"] for row in journal] == [
+                transition["event_digest"]
+            ]
+            with pytest.raises(
+                scheduler_store_module.TargetAdmissionLatchedError,
+                match="requires passive re-observation",
+            ):
+                store.claim(
+                    schedule_id,
+                    f"worker:{target_tasks[2]}",
+                    "worker:late",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=admissions[target_tasks[2]],
+                )
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.final_target_effect_admitted(
+                    schedule_id,
+                    f"worker:{target_tasks[1]}",
+                    already_leased.id,
+                    already_leased.generation,
+                    tool_name="browser_chat_exchange",
+                    call_id="call-legacy-final-effect",
+                    target_admission=admissions[target_tasks[1]],
+                    effect_intent=_target_effect_intent(
+                        session_id=str(session.id),
+                        campaign_id=campaign_id,
+                        target_id=target_id,
+                        assignment_id=target_tasks[1],
+                        attempt_id=already_leased.id,
+                        call_id="call-legacy-final-effect",
+                    ),
+                )
+            offline = store.claim(
+                schedule_id,
+                f"worker:{offline_task}",
+                "worker:offline",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            )
+            assert offline.node_id == f"worker:{offline_task}"
+            assert not any(
+                row["node_id"] == f"worker:{target_tasks[2]}"
+                for row in store.list_attempts(schedule_id)
+            )
+
+
+def test_pg0_transition_error_rolls_back_result_and_latch_together(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-transition-error")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target transition error")
+            store, campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-1",
+                task_id=tasks[0],
+                call_id="call-error-transition",
+                error=True,
+            )
+            forged = {**transition, "event_digest": "sha256:" + "f" * 64}
+            terminal_result = {
+                "content": "surface changed before delivery",
+                "error": "target_surface_disrupted",
+                "worker_checkpoint": {"target_evidence": []},
+            }
+            with pytest.raises(ValueError, match="not canonical"):
+                store.settle_attempt(
+                    lease.id,
+                    lease.generation,
+                    "failed",
+                    reason="target_surface_disrupted",
+                    checkpoint={"nodes": {}},
+                    target_session_id="browser:context-1",
+                    failure_kind="unknown",
+                    terminal_result=terminal_result,
+                    target_surface_transition=forged,
+                )
+            assert campaigns.list_lead(campaign_id) == []
+            assert store.list_results(schedule_id) == []
+            assert store.list_attempts(schedule_id)[0]["state"] == "running"
+
+            store.settle_attempt(
+                lease.id,
+                lease.generation,
+                "failed",
+                reason="target_surface_disrupted",
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-1",
+                failure_kind="unknown",
+                terminal_result=terminal_result,
+                target_surface_transition=transition,
+            )
+            assert (
+                campaigns.list_lead(campaign_id)[0]["payload"]["event_digest"]
+                == transition["event_digest"]
+            )
+            assert store.list_results(schedule_id)[0]["payload"] == terminal_result
+            assert store.list_attempts(schedule_id)[0]["state"] == "failed"
+
+
+@pytest.mark.parametrize("lifecycle_action", ("expire", "pause"))
+def test_pg0_expired_target_lane_requires_exact_effect_recovery(
+    tmp_path: Path,
+    lifecycle_action: str,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-lane-recovery")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target lane recovery")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            if lifecycle_action == "expire":
+                connection.execute(
+                    """UPDATE merlin_storage.scheduler_attempts
+                       SET lease_expires_at = now() - interval '1 second'
+                       WHERE id = %s""",
+                    (first.id,),
+                )
+                connection.commit()
+                store.expire(first.id, first.generation)
+            else:
+                store.pause_schedule(schedule_id, reason="operator pause")
+                store.resume_schedule(schedule_id)
+
+            with pytest.raises(
+                scheduler_store_module.TargetLaneRecoveryRequiredError,
+                match="reconciliation",
+            ):
+                store.claim(
+                    schedule_id,
+                    f"worker:{tasks[1]}",
+                    "worker:sibling",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=schedule_id,
+                        target_id=target_id,
+                        assignment_id=tasks[1],
+                    ),
+                )
+
+            replacement = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:replacement",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            assert replacement.replaced_attempt_id == first.id
+            assert replacement.lane_recovery_required is True
+            physical_admission = {
+                **admission,
+                "target_session_id": "browser:context-1",
+            }
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.final_target_effect_admitted(
+                    schedule_id,
+                    f"worker:{tasks[0]}",
+                    replacement.id,
+                    replacement.generation,
+                    tool_name="browser_chat_exchange",
+                    call_id="call-before-recovery",
+                    target_admission=physical_admission,
+                    effect_intent=_target_effect_intent(
+                        session_id=str(session.id),
+                        campaign_id=campaign_id,
+                        target_id=target_id,
+                        assignment_id=tasks[0],
+                        attempt_id=replacement.id,
+                        call_id="call-before-recovery",
+                    ),
+                )
+            recovery_body = {
+                "schema": "merlin.target-lane-recovery.v1",
+                "prior_attempt_id": first.id,
+                "effect_ids": [],
+                "outcome": "no_material_transition",
+            }
+            store.resolve_target_lane_recovery(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                replacement.id,
+                replacement.generation,
+                target_admission=admission,
+                recovery={
+                    **recovery_body,
+                    "recovery_digest": _qualified(recovery_body),
+                },
+            )
+            store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                replacement.id,
+                replacement.generation,
+                tool_name="browser_chat_exchange",
+                call_id="call-after-recovery",
+                target_admission=physical_admission,
+                effect_intent=_target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=replacement.id,
+                    call_id="call-after-recovery",
+                ),
+            )
+
+
+@pytest.mark.asyncio
+async def test_pg0_target_effect_permit_adopts_finishes_and_releases_lane(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-permit")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target effect permit")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:permit",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id="call-permitted",
+                )
+            )
+            effect_admission = {**admission, "target_session_id": "browser:permit"}
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission=effect_admission,
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            adopted, first_adoption = await effects.adopt_permitted(intent, permit_digest)
+            assert first_adoption is True
+            replayed, second_adoption = await effects.adopt_permitted(intent, permit_digest)
+            assert replayed == adopted
+            assert second_adoption is False
+            with pytest.raises(KeyError):
+                await effects.adopt_permitted(intent, "sha256:" + "f" * 64)
+            await effects.finish(
+                adopted.model_copy(
+                    update={
+                        "state": ToolEffectState.ACKNOWLEDGED,
+                        "result_content": "target replied",
+                        "result_is_error": False,
+                        "result_metadata": {"target_session_id": "browser:permit"},
+                    }
+                )
+            )
+            permit = connection.execute(
+                """SELECT state FROM merlin_storage.target_effect_permits
+                   WHERE permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert permit == {"state": "terminal"}
+            store.commit_reducer(
+                lease.id,
+                lease.generation,
+                schema_id="schema/result",
+                result={"content": "target replied"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:permit",
+            )
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
+async def test_pg0_target_effect_reuses_quiescent_physical_session_latch(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-session-reuse")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("reuse physical target session")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            physical_session_id = "browser:reused-session"
+
+            first_admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first_lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:first-session-user",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=first_admission,
+            )
+            first_intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=first_lease.id,
+                    call_id="call-first-session-use",
+                )
+            )
+            first_permit = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                first_lease.id,
+                first_lease.generation,
+                tool_name=first_intent.tool_name,
+                call_id=first_intent.call_id,
+                target_admission={
+                    **first_admission,
+                    "target_session_id": physical_session_id,
+                },
+                effect_intent=first_intent.model_dump(mode="json"),
+            )
+            adopted, adopted_now = await effects.adopt_permitted(first_intent, first_permit)
+            assert adopted_now is True
+            await effects.finish(
+                adopted.model_copy(
+                    update={
+                        "state": ToolEffectState.ACKNOWLEDGED,
+                        "result_content": "first reply",
+                        "result_is_error": False,
+                        "result_metadata": {"target_session_id": physical_session_id},
+                    }
+                )
+            )
+            store.commit_reducer(
+                first_lease.id,
+                first_lease.generation,
+                schema_id="schema/result",
+                result={"content": "first reply"},
+                checkpoint={"nodes": {}},
+                target_session_id=physical_session_id,
+            )
+
+            physical_latch = connection.execute(
+                """SELECT state, lane_attempt_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s""",
+                (campaign_id, target_id, physical_session_id),
+            ).fetchone()
+            assert physical_latch == {"state": "open", "lane_attempt_id": None}
+
+            second_admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[1],
+            )
+            second_lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:second-session-user",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=second_admission,
+            )
+            aggregate_lane = connection.execute(
+                """SELECT lane_attempt_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = ''""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert str(aggregate_lane["lane_attempt_id"]) == second_lease.id
+
+            second_intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                    attempt_id=second_lease.id,
+                    call_id="call-second-session-use",
+                )
+            )
+            second_permit = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                second_lease.id,
+                second_lease.generation,
+                tool_name=second_intent.tool_name,
+                call_id=second_intent.call_id,
+                target_admission={
+                    **second_admission,
+                    "target_session_id": physical_session_id,
+                },
+                effect_intent=second_intent.model_dump(mode="json"),
+            )
+            rebound_latch = connection.execute(
+                """SELECT lane_attempt_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = %s""",
+                (campaign_id, target_id, physical_session_id),
+            ).fetchone()
+            assert str(rebound_latch["lane_attempt_id"]) == second_lease.id
+            _, adopted_now = await effects.adopt_permitted(second_intent, second_permit)
+            assert adopted_now is True
+
+
+@pytest.mark.asyncio
+async def test_pg0_cancel_revokes_undispatched_target_permit_and_releases_lane(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-cancel")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("cancel target permit")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:cancel",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            intent = _target_effect_intent(
+                session_id=str(session.id),
+                campaign_id=campaign_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+                attempt_id=lease.id,
+                call_id="call-cancelled-before-dispatch",
+            )
+            effect_admission = {**admission, "target_session_id": "browser:cancel"}
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                lease.id,
+                lease.generation,
+                tool_name="browser_chat_exchange",
+                call_id="call-cancelled-before-dispatch",
+                target_admission=effect_admission,
+                effect_intent=intent,
+            )
+            assert store.cancel_node(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                reason="operator cancelled",
+                checkpoint={"nodes": {}},
+            )
+            permit = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state,
+                          effect.result_metadata
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert permit["permit_state"] == "revoked"
+            assert permit["effect_state"] == "reconciled"
+            assert permit["result_metadata"]["target_effect_dispatch_status"] == (
+                "revoked_before_dispatch"
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            with pytest.raises(TargetEffectPermitLatchedError):
+                await effects.adopt_permitted(
+                    ToolEffectRecord.model_validate(intent), permit_digest
+                )
+            assert (
+                connection.execute(
+                    """SELECT 1 FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id = %s""",
+                    (lease.id,),
+                ).fetchone()
+                is None
+            )
+            assert store.reconcile_cancelled_target_lanes(schedule_id) == {
+                "released": (),
+                "held": (),
+                "latched": (),
+            }
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
+async def test_pg0_cancel_keeps_adopted_unfinished_target_effect_held(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-cancel-held")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("cancel adopted target effect")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:cancel-adopted",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id="call-adopted-before-cancel",
+                )
+            )
+            effect_admission = {
+                **admission,
+                "target_session_id": "browser:cancel-adopted",
+            }
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission=effect_admission,
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            _adopted, created = await effects.adopt_permitted(intent, permit_digest)
+            assert created is True
+            assert store.cancel_node(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                reason="operator cancelled",
+                checkpoint={"nodes": {}},
+            )
+            assert store.reconcile_cancelled_target_lanes(schedule_id) == {
+                "released": (),
+                "held": (lease.id,),
+                "latched": (),
+            }
+            with pytest.raises(
+                scheduler_store_module.TargetLaneRecoveryRequiredError,
+                match="reconciliation",
+            ):
+                store.claim(
+                    schedule_id,
+                    f"worker:{tasks[1]}",
+                    "worker:sibling",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=schedule_id,
+                        target_id=target_id,
+                        assignment_id=tasks[1],
+                    ),
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_action", ("pause", "expire"))
+async def test_pg0_pause_or_expire_revokes_undispatched_target_permit(
+    tmp_path: Path,
+    lifecycle_action: str,
+) -> None:
+    with Database(
+        DatabaseConfig(data_dir=tmp_path / f"postgres-target-{lifecycle_action}-intent")
+    ) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create(
+                f"{lifecycle_action} undispatched target effect"
+            )
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                f"worker:{lifecycle_action}-intent",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id=f"call-{lifecycle_action}-before-dispatch",
+                )
+            )
+            physical_session_id = f"browser:{lifecycle_action}-before-dispatch"
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={
+                    **admission,
+                    "target_session_id": physical_session_id,
+                },
+                effect_intent=intent.model_dump(mode="json"),
+            )
+
+            if lifecycle_action == "pause":
+                store.pause_schedule(schedule_id, reason="operator pause")
+            else:
+                connection.execute(
+                    """UPDATE merlin_storage.scheduler_attempts
+                       SET lease_expires_at = now() - interval '1 second'
+                       WHERE id = %s""",
+                    (lease.id,),
+                )
+                connection.commit()
+                store.expire(lease.id, lease.generation)
+
+            terminal = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state,
+                          effect.result_metadata
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert terminal["permit_state"] == "revoked"
+            assert terminal["effect_state"] == "reconciled"
+            assert terminal["result_metadata"] == {
+                "target_effect_dispatch_status": "revoked_before_dispatch",
+                "target_session_id": physical_session_id,
+                "target_effect_attempted": False,
+                "interaction_count": 0,
+                "limit_interaction_count": 0,
+                "target_call_budget_charge": 0,
+            }
+            assert (
+                connection.execute(
+                    """SELECT 1 FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id = %s""",
+                    (lease.id,),
+                ).fetchone()
+                is None
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            with pytest.raises(TargetEffectPermitLatchedError):
+                await effects.adopt_permitted(intent, permit_digest)
+
+            if lifecycle_action == "pause":
+                store.resume_schedule(schedule_id)
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                f"worker:{lifecycle_action}-sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_action", ("pause", "expire"))
+async def test_pg0_pause_or_expire_keeps_adopted_target_effect_held(
+    tmp_path: Path,
+    lifecycle_action: str,
+) -> None:
+    with Database(
+        DatabaseConfig(data_dir=tmp_path / f"postgres-target-{lifecycle_action}-adopted")
+    ) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create(
+                f"{lifecycle_action} adopted target effect"
+            )
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                f"worker:{lifecycle_action}-adopted",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id=f"call-{lifecycle_action}-after-adoption",
+                )
+            )
+            physical_session_id = f"browser:{lifecycle_action}-after-adoption"
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={
+                    **admission,
+                    "target_session_id": physical_session_id,
+                },
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            _adopted, adopted_now = await effects.adopt_permitted(intent, permit_digest)
+            assert adopted_now is True
+
+            if lifecycle_action == "pause":
+                store.pause_schedule(schedule_id, reason="operator pause")
+                store.resume_schedule(schedule_id)
+            else:
+                connection.execute(
+                    """UPDATE merlin_storage.scheduler_attempts
+                       SET lease_expires_at = now() - interval '1 second'
+                       WHERE id = %s""",
+                    (lease.id,),
+                )
+                connection.commit()
+                store.expire(lease.id, lease.generation)
+
+            held = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state,
+                          latch.lane_attempt_id::text AS lane_attempt_id,
+                          latch.lane_recovery_required
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   JOIN merlin_storage.target_admission_latches AS latch
+                     ON latch.lane_attempt_id = permit.attempt_id
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert held == {
+                "permit_state": "adopted",
+                "effect_state": "intent",
+                "lane_attempt_id": lease.id,
+                "lane_recovery_required": True,
+            }
+            with pytest.raises(
+                scheduler_store_module.TargetLaneRecoveryRequiredError,
+                match="reconciliation",
+            ):
+                store.claim(
+                    schedule_id,
+                    f"worker:{tasks[1]}",
+                    f"worker:{lifecycle_action}-sibling",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=schedule_id,
+                        target_id=target_id,
+                        assignment_id=tasks[1],
+                    ),
+                )
+
+
+def test_pg0_cancel_and_target_permit_adoption_are_one_atomic_race(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-cancel-race")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("cancel target permit race")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            node_id = f"worker:{tasks[0]}"
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                node_id,
+                "worker:cancel-race",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            target_session_id = "browser:cancel-race"
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id="call-cancel-adopt-race",
+                )
+            )
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                node_id,
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={
+                    **admission,
+                    "target_session_id": target_session_id,
+                },
+                effect_intent=intent.model_dump(mode="json"),
+            )
+
+        ready = Barrier(2)
+
+        def cancel() -> tuple[str, object]:
+            with database.connect() as cancel_connection:
+                ready.wait(timeout=10)
+                try:
+                    cancelled = DurableSchedulerStore(cancel_connection).cancel_node(
+                        schedule_id,
+                        node_id,
+                        reason="operator cancelled during permit adoption",
+                        checkpoint={"nodes": {}},
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    return "error", exc
+                return "cancelled", cancelled
+
+        def adopt() -> tuple[str, object]:
+            with database.connect() as adopt_connection:
+                ready.wait(timeout=10)
+                effects = PostgresToolEffectStore(ToolEffectRepository(adopt_connection))
+                try:
+                    adopted = asyncio.run(effects.adopt_permitted(intent, permit_digest))
+                except TargetEffectPermitLatchedError as exc:
+                    return "latched", exc
+                except Exception as exc:  # pragma: no cover - asserted below
+                    return "error", exc
+                return "adopted", adopted
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cancel_future = executor.submit(cancel)
+            adopt_future = executor.submit(adopt)
+            cancel_outcome = cancel_future.result(timeout=15)
+            adopt_outcome = adopt_future.result(timeout=15)
+
+        assert cancel_outcome == ("cancelled", True)
+        assert adopt_outcome[0] in {"adopted", "latched"}
+        assert adopt_outcome[0] != "error"
+
+        with database.connect() as connection:
+            permit = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state,
+                          effect.result_metadata
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            lane = connection.execute(
+                """SELECT lane_recovery_required
+                   FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id = %s""",
+                (lease.id,),
+            ).fetchone()
+
+            if adopt_outcome[0] == "latched":
+                assert permit["permit_state"] == "revoked"
+                assert permit["effect_state"] == "reconciled"
+                assert permit["result_metadata"]["target_effect_dispatch_status"] == (
+                    "revoked_before_dispatch"
+                )
+                assert lane is None
+            else:
+                assert permit["permit_state"] == "adopted"
+                assert permit["effect_state"] == "intent"
+                assert lane == {"lane_recovery_required": True}
+                adopted_record, adopted_now = adopt_outcome[1]
+                assert adopted_now is True
+                effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+                asyncio.run(
+                    effects.finish(
+                        adopted_record.model_copy(
+                            update={
+                                "state": ToolEffectState.ACKNOWLEDGED,
+                                "result_content": "",
+                                "result_is_error": True,
+                                "result_metadata": {
+                                    "target_session_id": target_session_id,
+                                    "target_effect_attempted": False,
+                                    "interaction_count": 0,
+                                    "limit_interaction_count": 0,
+                                    "target_call_budget_charge": 0,
+                                },
+                            }
+                        )
+                    )
+                )
+                assert DurableSchedulerStore(connection).reconcile_cancelled_target_lanes(
+                    schedule_id
+                ) == {
+                    "released": (lease.id,),
+                    "held": (),
+                    "latched": (),
+                }
+
+            final = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert final["permit_state"] in {"revoked", "terminal"}
+            assert final["effect_state"] in {"reconciled", "acknowledged"}
+            assert (
+                connection.execute(
+                    """SELECT 1 FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id = %s""",
+                    (lease.id,),
+                ).fetchone()
+                is None
+            )
+
+
+@pytest.mark.parametrize("lifecycle_action", ("pause", "expire"))
+def test_pg0_pause_or_expire_and_target_permit_adoption_are_one_atomic_race(
+    tmp_path: Path,
+    lifecycle_action: str,
+) -> None:
+    with Database(
+        DatabaseConfig(data_dir=tmp_path / f"postgres-target-{lifecycle_action}-race")
+    ) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create(f"{lifecycle_action} target permit race")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            node_id = f"worker:{tasks[0]}"
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                node_id,
+                f"worker:{lifecycle_action}-race",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            target_session_id = f"browser:{lifecycle_action}-race"
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=lease.id,
+                    call_id=f"call-{lifecycle_action}-adopt-race",
+                )
+            )
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                node_id,
+                lease.id,
+                lease.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={
+                    **admission,
+                    "target_session_id": target_session_id,
+                },
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            if lifecycle_action == "expire":
+                connection.execute(
+                    """UPDATE merlin_storage.scheduler_attempts
+                       SET lease_expires_at = now() - interval '1 second'
+                       WHERE id = %s""",
+                    (lease.id,),
+                )
+                connection.commit()
+
+        ready = Barrier(2)
+
+        def fence_lifecycle() -> tuple[str, object]:
+            with database.connect() as lifecycle_connection:
+                ready.wait(timeout=10)
+                lifecycle_store = DurableSchedulerStore(lifecycle_connection)
+                try:
+                    if lifecycle_action == "pause":
+                        lifecycle_store.pause_schedule(
+                            schedule_id, reason="operator pause during permit adoption"
+                        )
+                    else:
+                        lifecycle_store.expire(lease.id, lease.generation)
+                except Exception as exc:  # pragma: no cover - asserted below
+                    return "error", exc
+                return lifecycle_action, True
+
+        def adopt() -> tuple[str, object]:
+            with database.connect() as adopt_connection:
+                ready.wait(timeout=10)
+                effects = PostgresToolEffectStore(ToolEffectRepository(adopt_connection))
+                try:
+                    adopted = asyncio.run(effects.adopt_permitted(intent, permit_digest))
+                except TargetEffectPermitLatchedError as exc:
+                    return "latched", exc
+                except Exception as exc:  # pragma: no cover - asserted below
+                    return "error", exc
+                return "adopted", adopted
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            lifecycle_future = executor.submit(fence_lifecycle)
+            adopt_future = executor.submit(adopt)
+            lifecycle_outcome = lifecycle_future.result(timeout=15)
+            adopt_outcome = adopt_future.result(timeout=15)
+
+        assert lifecycle_outcome == (lifecycle_action, True)
+        assert adopt_outcome[0] in {"adopted", "latched"}
+        assert adopt_outcome[0] != "error"
+
+        with database.connect() as connection:
+            store = DurableSchedulerStore(connection)
+            permit = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state,
+                          effect.result_metadata
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            lane = connection.execute(
+                """SELECT lane_recovery_required
+                   FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id = %s""",
+                (lease.id,),
+            ).fetchone()
+
+            if adopt_outcome[0] == "latched":
+                assert permit["permit_state"] == "revoked"
+                assert permit["effect_state"] == "reconciled"
+                assert permit["result_metadata"]["target_effect_dispatch_status"] == (
+                    "revoked_before_dispatch"
+                )
+                assert lane is None
+                if lifecycle_action == "pause":
+                    store.resume_schedule(schedule_id)
+            else:
+                assert permit["permit_state"] == "adopted"
+                assert permit["effect_state"] == "intent"
+                assert lane == {"lane_recovery_required": True}
+                adopted_record, adopted_now = adopt_outcome[1]
+                assert adopted_now is True
+                effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+                asyncio.run(
+                    effects.finish(
+                        adopted_record.model_copy(
+                            update={
+                                "state": ToolEffectState.ACKNOWLEDGED,
+                                "result_content": "",
+                                "result_is_error": True,
+                                "result_metadata": {
+                                    "target_session_id": target_session_id,
+                                    "target_effect_attempted": False,
+                                    "interaction_count": 0,
+                                    "limit_interaction_count": 0,
+                                    "target_call_budget_charge": 0,
+                                },
+                            }
+                        )
+                    )
+                )
+                if lifecycle_action == "pause":
+                    store.resume_schedule(schedule_id)
+                recovery_admission = {
+                    **admission,
+                    "target_session_id": target_session_id,
+                }
+                replacement = store.claim(
+                    schedule_id,
+                    node_id,
+                    f"worker:{lifecycle_action}-recovery",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=recovery_admission,
+                )
+                assert replacement.replaced_attempt_id == lease.id
+                assert replacement.lane_recovery_required is True
+                recovery_body = {
+                    "schema": "merlin.target-lane-recovery.v1",
+                    "prior_attempt_id": lease.id,
+                    "effect_ids": [intent.idempotency_key],
+                    "outcome": "no_material_transition",
+                }
+                store.resolve_target_lane_recovery(
+                    schedule_id,
+                    node_id,
+                    replacement.id,
+                    replacement.generation,
+                    target_admission=recovery_admission,
+                    recovery={
+                        **recovery_body,
+                        "recovery_digest": _qualified(recovery_body),
+                    },
+                )
+                assert store.cancel_node(
+                    schedule_id,
+                    node_id,
+                    reason="race cleanup",
+                    checkpoint={"nodes": {}},
+                )
+
+            final = connection.execute(
+                """SELECT permit.state AS permit_state, effect.state AS effect_state
+                   FROM merlin_storage.target_effect_permits AS permit
+                   JOIN merlin_storage.tool_effects AS effect
+                     ON effect.idempotency_key = permit.idempotency_key
+                   WHERE permit.permit_digest = %s""",
+                (permit_digest,),
+            ).fetchone()
+            assert final["permit_state"] in {"revoked", "terminal"}
+            assert final["effect_state"] in {"reconciled", "acknowledged"}
+            assert (
+                connection.execute(
+                    """SELECT 1 FROM merlin_storage.target_admission_latches
+                   WHERE lane_attempt_id IS NOT NULL AND campaign_id = %s
+                     AND target_id = %s""",
+                    (campaign_id, target_id),
+                ).fetchone()
+                is None
+            )
+
+
+def test_pg0_reviewed_refresh_can_resolve_terminal_without_authorizing_schedule(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-terminal")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target terminal resolution")
+            store, campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            lease = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-terminal",
+                task_id=tasks[0],
+                call_id="call-terminal-transition",
+            )
+            store.commit_reducer(
+                lease.id,
+                lease.generation,
+                schema_id="schema/result",
+                result={"content": "level complete"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-terminal",
+                target_surface_transition=transition,
+            )
+            authority = _journal_reviewed_refresh(
+                campaigns,
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-terminal",
+            )
+            resolution = {
+                key: value
+                for key, value in {
+                    "campaign_id": campaign_id,
+                    "session_id": str(session.id),
+                    "target_id": target_id,
+                    "target_session_id": "browser:context-terminal",
+                    "generation_id": authority["generation_id"],
+                    "event_set_digest": authority["event_set_digest"],
+                    "settlement_id": authority["settlement_id"],
+                    "lead_decision_id": authority["lead_decision_id"],
+                }.items()
+            }
+            resolution_id = store.resolve_target_admission_terminal(resolution)
+            assert resolution_id == store.resolve_target_admission_terminal(resolution)
+            state = connection.execute(
+                """SELECT state, authorized_schedule_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s""",
+                (campaign_id, target_id, "browser:context-terminal"),
+            ).fetchone()
+            assert state == {"state": "resolved", "authorized_schedule_id": None}
+            head = connection.execute(
+                """SELECT state, latched_session_count
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = ''""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert head == {"state": "open", "latched_session_count": 0}
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.claim(
+                    schedule_id,
+                    f"worker:{tasks[1]}",
+                    "worker:after-terminal",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=schedule_id,
+                        target_id=target_id,
+                        assignment_id=tasks[1],
+                        target_session_id="browser:context-terminal",
+                    ),
+                )
+
+
+def test_pg0_activation_supersedes_all_reviewed_latched_target_sessions(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-transition-activation")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("target transition activation")
+            store, campaigns, source_schedule, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            source_admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=source_schedule,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            source = store.claim(
+                source_schedule,
+                f"worker:{tasks[0]}",
+                "worker:source",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=source_admission,
+            )
+            transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-1",
+                task_id=tasks[0],
+                call_id="call-activation-transition",
+            )
+            store.commit_reducer(
+                source.id,
+                source.generation,
+                schema_id="schema/result",
+                result={"content": "level complete"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-1",
+                target_surface_transition=transition,
+            )
+            authority = _journal_reviewed_refresh(
+                campaigns,
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-1",
+            )
+            sibling_transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-sibling",
+                task_id=tasks[2],
+                call_id="call-sibling-transition",
+            )
+            with connection.transaction():
+                store._commit_target_surface_transition_locked(
+                    source_schedule,
+                    f"worker:{tasks[2]}",
+                    sibling_transition,
+                )
+            sibling_authority = _journal_reviewed_refresh(
+                campaigns,
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-sibling",
+            )
+
+            passive_task = (
+                f"{campaign_id}/target-reobservation/"
+                f"{authority['generation_id'].removeprefix('sha256:')}/recon"
+            )
+            passive_contract = [
+                ["schema", "merlin.target-reobservation.v1"],
+                ["generation_id", authority["generation_id"]],
+                ["event_set_digest", authority["event_set_digest"]],
+                ["target_session_id", "browser:context-1"],
+                [
+                    "target_reobservation_start_decision_id",
+                    authority["start_decision_id"],
+                ],
+            ]
+            store.create_schedule(
+                str(session.id),
+                {
+                    "assignments": [
+                        {
+                            "id": passive_task,
+                            "target_profile_id": target_id,
+                            "tool_ids": ["browser_snapshot", "browser_record_api_handoff"],
+                            "technique_ids": [],
+                            "strategy_id": "target-reobservation/v1",
+                            "strategy_contract": passive_contract,
+                            "reviewed_adapter_digest": "sha256:" + "8" * 64,
+                        }
+                    ],
+                    "worker_contexts": {},
+                },
+                {"nodes": {}},
+                [f"worker:{passive_task}"],
+                ready_nodes=[f"worker:{passive_task}"],
+                schedule_id=authority["reobserve_schedule_id"],
+            )
+            passive_admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=authority["reobserve_schedule_id"],
+                target_id=target_id,
+                assignment_id=passive_task,
+                target_session_id="browser:context-1",
+                strategy_id="target-reobservation/v1",
+                generation_id=authority["generation_id"],
+                event_set_digest=authority["event_set_digest"],
+                start_decision_id=authority["start_decision_id"],
+                target_exchange_tool_ids=(),
+            )
+            passive = store.claim(
+                authority["reobserve_schedule_id"],
+                f"worker:{passive_task}",
+                "worker:passive",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=passive_admission,
+            )
+            store.commit_reducer(
+                passive.id,
+                passive.generation,
+                schema_id="schema/result",
+                result={"content": "refreshed"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-1",
+            )
+
+            rebound_task = f"{campaign_id}/wave-1/rebound"
+            rebound_next_task = f"{campaign_id}/wave-1/rebound-next"
+            rebound_contract = [
+                ["target_session_id", "browser:context-1"],
+                [
+                    "initial_state_equivalence_digest",
+                    authority["current_surface_digest"],
+                ],
+                ["compiled_adapter_digest", authority["compiled_adapter_digest"]],
+                ["reviewed_adapter_digest", authority["reviewed_adapter_digest"]],
+                ["target_reobservation_generation_id", authority["generation_id"]],
+                [
+                    "target_reobservation_event_set_digest",
+                    authority["event_set_digest"],
+                ],
+            ]
+            rebound_schedule = store.create_schedule(
+                str(session.id),
+                {
+                    "assignments": [
+                        {
+                            "id": rebound_task,
+                            "target_profile_id": target_id,
+                            "tool_ids": ["browser_chat_exchange"],
+                            "strategy_id": "direct",
+                            "strategy_contract": rebound_contract,
+                            "reviewed_adapter_digest": authority["reviewed_adapter_digest"],
+                        },
+                        {
+                            "id": rebound_next_task,
+                            "target_profile_id": target_id,
+                            "tool_ids": ["browser_chat_exchange"],
+                            "strategy_id": "direct",
+                            "strategy_contract": rebound_contract,
+                            "reviewed_adapter_digest": authority["reviewed_adapter_digest"],
+                        },
+                    ],
+                    "worker_contexts": {
+                        rebound_task: _persisted_worker_context(
+                            assignment_id=rebound_task,
+                            target_id=target_id,
+                            tool_ids=("browser_chat_exchange",),
+                            strategy_id="direct",
+                            strategy_contract=rebound_contract,
+                        ),
+                        rebound_next_task: _persisted_worker_context(
+                            assignment_id=rebound_next_task,
+                            target_id=target_id,
+                            tool_ids=("browser_chat_exchange",),
+                            strategy_id="direct",
+                            strategy_contract=rebound_contract,
+                        ),
+                    },
+                },
+                {"nodes": {}},
+                [f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
+                ready_nodes=[f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
+                initial_status="paused",
+            )
+            campaigns.add_wave(campaign_id, 1, "followup", rebound_schedule)
+            transition_claim = campaigns.claim_frontier_transition(
+                campaign_id, "test:target-activation", 60
+            )
+            assert transition_claim is not None
+            current_latches = {
+                str(row["target_session_id"]): row
+                for row in store.current_target_admission_latches(
+                    campaign_id, str(session.id), target_id
+                )
+            }
+            latch_revision = current_latches["browser:context-1"]["revision"]
+            activation = {
+                "campaign_id": campaign_id,
+                "session_id": str(session.id),
+                "target_id": target_id,
+                "target_session_id": "browser:context-1",
+                "claim_id": transition_claim,
+                "claimant_id": "test:target-activation",
+                "latch_revision": latch_revision,
+                "generation_id": authority["generation_id"],
+                "event_set_digest": authority["event_set_digest"],
+                "settlement_id": authority["settlement_id"],
+                "lead_decision_id": authority["lead_decision_id"],
+                "schedule_id": rebound_schedule,
+                "current_surface_digest": authority["current_surface_digest"],
+                "compiled_adapter_digest": authority["compiled_adapter_digest"],
+                "reviewed_adapter_digest": authority["reviewed_adapter_digest"],
+                "wave": 1,
+                "kind": "followup",
+                "source_schedule_id": None,
+                "frontier_batch_id": None,
+                "target_assignment_tools": {
+                    rebound_task: ["browser_chat_exchange"],
+                    rebound_next_task: ["browser_chat_exchange"],
+                },
+                "superseded_generations": (
+                    {
+                        "target_session_id": "browser:context-sibling",
+                        "generation_id": sibling_authority["generation_id"],
+                        "event_set_digest": sibling_authority["event_set_digest"],
+                        "settlement_id": sibling_authority["settlement_id"],
+                        "lead_decision_id": sibling_authority["lead_decision_id"],
+                        "latch_revision": current_latches["browser:context-sibling"]["revision"],
+                    },
+                ),
+            }
+            forged = {**activation, "compiled_adapter_digest": "sha256:" + "f" * 64}
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission(forged)
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission({**activation, "superseded_generations": ()})
+            extra_generation = {
+                "target_session_id": "browser:forged-extra",
+                "generation_id": "sha256:" + "a" * 64,
+                "event_set_digest": "sha256:" + "b" * 64,
+                "settlement_id": "target-reobservation-settled/" + "a" * 64,
+                "lead_decision_id": "lead-decision:" + "c" * 64,
+                "latch_revision": 1,
+            }
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission(
+                    {
+                        **activation,
+                        "superseded_generations": (
+                            *activation["superseded_generations"],
+                            extra_generation,
+                        ),
+                    }
+                )
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission({**activation, "claimant_id": "forged:claimant"})
+            activation_id = store.activate_target_admission(activation)
+            assert activation_id == store.activate_target_admission(activation)
+            sibling_latch = connection.execute(
+                """SELECT state, authorized_schedule_id
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND target_session_id = 'browser:context-sibling'""",
+                (campaign_id, target_id),
+            ).fetchone()
+            assert sibling_latch == {"state": "resolved", "authorized_schedule_id": None}
+            current = store.current_target_admission_latches(
+                campaign_id, str(session.id), target_id
+            )
+            assert len(current) == 1
+            assert current[0]["state"] == "activated"
+            assert current[0]["authorized_schedule_id"] == rebound_schedule
+            activation_rows_before = connection.execute(
+                """SELECT count(*) AS count
+                   FROM merlin_storage.campaign_lead_journal
+                   WHERE campaign_id = %s
+                     AND payload->>'kind' = 'target_admission_generation_activated'""",
+                (campaign_id,),
+            ).fetchone()["count"]
+            compact_replay = {
+                **activation,
+                "latch_revision": current[0]["revision"],
+                "superseded_generations": (),
+            }
+            assert store.activate_target_admission(compact_replay) == activation_id
+            replayed = store.current_target_admission_latches(
+                campaign_id, str(session.id), target_id
+            )
+            assert replayed == current
+            assert (
+                connection.execute(
+                    """SELECT count(*) AS count
+                       FROM merlin_storage.campaign_lead_journal
+                       WHERE campaign_id = %s
+                         AND payload->>'kind' =
+                             'target_admission_generation_activated'""",
+                    (campaign_id,),
+                ).fetchone()["count"]
+                == activation_rows_before
+            )
+
+            connection.execute(
+                """UPDATE merlin_storage.campaign_frontier_transition_leases
+                   SET expires_at = now() - interval '1 second'
+                   WHERE campaign_id = %s AND claim_id = %s""",
+                (campaign_id, transition_claim),
+            )
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission(compact_replay)
+            takeover_claimant = "test:target-activation-takeover"
+            takeover_claim = campaigns.claim_frontier_transition(campaign_id, takeover_claimant, 60)
+            assert takeover_claim is not None
+            compact_replay = {
+                **compact_replay,
+                "claim_id": takeover_claim,
+                "claimant_id": takeover_claimant,
+            }
+            assert store.activate_target_admission(compact_replay) == activation_id
+
+            campaigns.pause(campaign_id)
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission(compact_replay)
+            campaigns.resume(campaign_id)
+            assert store.activate_target_admission(compact_replay) == activation_id
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.activate_target_admission({**compact_replay, "wave": 2})
+            activation = {
+                **activation,
+                "claim_id": takeover_claim,
+                "claimant_id": takeover_claimant,
+            }
+            store.reject_schedule(rebound_schedule, reason="reviewed follow-up completed")
+            rebound_graph = store.load_schedule(rebound_schedule)["graph"]
+            next_rebound_schedule = store.create_schedule(
+                str(session.id),
+                rebound_graph,
+                {"nodes": {}},
+                [f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
+                ready_nodes=[f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
+                initial_status="paused",
+            )
+            campaigns.add_wave(campaign_id, 2, "followup", next_rebound_schedule)
+            next_activation = {
+                **activation,
+                "schedule_id": next_rebound_schedule,
+                "wave": 2,
+                "latch_revision": current[0]["revision"],
+                "superseded_generations": (),
+            }
+            next_activation_id = store.activate_target_admission(next_activation)
+            assert next_activation_id == store.activate_target_admission(next_activation)
+            assert next_activation_id != activation_id
+            rebound_schedule = next_rebound_schedule
+
+            rebound_admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=rebound_schedule,
+                target_id=target_id,
+                assignment_id=rebound_task,
+                target_session_id="browser:context-1",
+            )
+            rebound = store.claim(
+                rebound_schedule,
+                f"worker:{rebound_task}",
+                "worker:rebound",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=rebound_admission,
+            )
+            store.final_target_effect_admitted(
+                rebound_schedule,
+                f"worker:{rebound_task}",
+                rebound.id,
+                rebound.generation,
+                tool_name="browser_chat_exchange",
+                call_id="call-rebound",
+                target_admission=rebound_admission,
+                effect_intent=_target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=rebound_task,
+                    attempt_id=rebound.id,
+                    call_id="call-rebound",
+                ),
+            )
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.claim(
+                    source_schedule,
+                    f"worker:{tasks[2]}",
+                    "worker:stale-source",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=source_schedule,
+                        target_id=target_id,
+                        assignment_id=tasks[2],
+                    ),
+                )
+
+            next_transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-1",
+                task_id=rebound_task,
+                call_id="call-next-level-same-modal",
+            )
+            assert next_transition["transition_digest"] == transition["transition_digest"]
+            assert next_transition["event_digest"] != transition["event_digest"]
+            store.commit_reducer(
+                rebound.id,
+                rebound.generation,
+                schema_id="schema/result",
+                result={"content": "next level complete"},
+                checkpoint={"nodes": {}},
+                target_session_id="browser:context-1",
+                target_surface_transition=next_transition,
+            )
+            latch = connection.execute(
+                """SELECT state, transition_count, pending_event_digests
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s""",
+                (campaign_id, target_id, "browser:context-1"),
+            ).fetchone()
+            assert latch == {
+                "state": "latched",
+                "transition_count": 2,
+                "pending_event_digests": [next_transition["event_digest"]],
+            }
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store.claim(
+                    rebound_schedule,
+                    f"worker:{rebound_next_task}",
+                    "worker:stale-rebound",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=rebound_schedule,
+                        target_id=target_id,
+                        assignment_id=rebound_next_task,
+                        target_session_id="browser:context-1",
+                    ),
+                )
+
+
 def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
     tmp_path: Path,
 ) -> None:
@@ -371,9 +3007,10 @@ def test_pg0_swarm_snapshot_rows_are_batched_and_session_campaign_scoped(
             assert len(rows) == 2
             assert {row["session_id"] for row in rows} == {str(first_session.id)}
             assert {row["campaign_id"] for row in rows} == {"campaign/first"}
-            assert {
-                row["assignment"]["id"]: row["campaign_wave"] for row in rows
-            } == {"task-first": 0, "task-followup": 1}
+            assert {row["assignment"]["id"]: row["campaign_wave"] for row in rows} == {
+                "task-first": 0,
+                "task-followup": 1,
+            }
             assert {row["assignment"]["id"] for row in rows} == {
                 "task-first",
                 "task-followup",
@@ -1847,9 +4484,7 @@ def test_pg0_nonready_completion_report_error_is_rediscovered(tmp_path: Path) ->
                 },
                 "sha256:reviewed",
             )
-            campaigns.begin_execution(
-                "campaign/nonready-report", "sha256:reviewed", schedule_id
-            )
+            campaigns.begin_execution("campaign/nonready-report", "sha256:reviewed", schedule_id)
             campaigns.finish("campaign/nonready-report", "completed")
             campaigns.append_lead(
                 "campaign/nonready-report",

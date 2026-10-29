@@ -22,14 +22,17 @@ from merlin_agents import (
     compile_attack_campaign,
 )
 from merlin_agents.campaign_service import (
+    _FrontierTransitionLease,
     _json_value,
     _target_reobservation_review_bindings,
+    _target_reobservation_superseded_generations,
     _TargetReobservationBlocked,
     _TargetReobservationReviewRequired,
 )
 from merlin_agents.target_reobservation import (
     TargetReobservationGeneration,
     TargetReobservationObligation,
+    TargetReobservationProjection,
     normalize_target_ui_transition,
     target_reobservation_generation,
 )
@@ -92,6 +95,10 @@ def _campaign() -> tuple[CampaignManifest, AssignmentContext]:
     return manifest, context
 
 
+def _transition_lease() -> _FrontierTransitionLease:
+    return _FrontierTransitionLease("claim-1", "claimant-1")
+
+
 def _digest(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
@@ -126,6 +133,7 @@ def _obligation() -> TargetReobservationObligation:
     event_digest = _digest(
         [
             "campaign-1",
+            "browser:browser-context-1",
             "source-task",
             "target-call",
             receipt_sha256,
@@ -136,6 +144,7 @@ def _obligation() -> TargetReobservationObligation:
         campaign_id="campaign-1",
         session_id="session-1",
         target_id="target-1",
+        target_session_id="browser:browser-context-1",
         event_digest=event_digest,
         transition_digest=transition_digest,
         source_schedule_id="source-schedule",
@@ -152,6 +161,32 @@ def _generation(obligation: TargetReobservationObligation) -> TargetReobservatio
     generation = target_reobservation_generation((obligation,), {obligation.event_digest: 1})
     assert generation is not None
     return generation
+
+
+def _legacy_observation_row(
+    obligation: TargetReobservationObligation, *, claimed_session: bool = False
+) -> dict[str, object]:
+    payload = obligation.observed_payload(obligation.campaign_id, obligation.target_id)
+    payload["schema"] = "merlin.target-surface-transition-observed.v1"
+    if not claimed_session:
+        payload.pop("target_session_id")
+    event_digest = _digest(
+        [
+            obligation.campaign_id,
+            obligation.source_task_id,
+            obligation.target_call_id,
+            obligation.receipt_sha256,
+            obligation.transition_digest,
+        ]
+    )
+    payload["event_digest"] = event_digest
+    payload["obligation_id"] = "target-reobservation:" + event_digest.removeprefix("sha256:")
+    return {
+        "wave": obligation.source_wave,
+        "decision_id": "target-surface-transition-observed/" + event_digest.removeprefix("sha256:"),
+        "payload": payload,
+        "payload_digest": _digest(payload),
+    }
 
 
 def _signed_transition_receipt(
@@ -294,6 +329,12 @@ class _JournalStore:
         self.waves.append((wave, kind, schedule_id))
         self.order.append(("wave", schedule_id))
 
+    def list_waves(self, _campaign_id: str):
+        return tuple(
+            {"wave": wave, "kind": kind, "schedule_id": schedule_id, "status": "running"}
+            for wave, kind, schedule_id in self.waves
+        )
+
     def pause(self, _campaign_id: str) -> None:
         self.pauses += 1
 
@@ -314,6 +355,9 @@ class _Agents:
         self.schedules: dict[str, SimpleNamespace] = {}
         self.statuses: dict[str, str] = {}
         self.tasks: dict[str, tuple[AgentTask, ...]] = {}
+        self.target_admission_activations: list[dict[str, object]] = []
+        self.target_admission_resolutions: list[dict[str, object]] = []
+        self.rejections: list[tuple[str, str]] = []
 
     def target_exchange_tool_ids(self, tool_ids: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(tool_id for tool_id in tool_ids if tool_id in self._TARGET_TOOLS)
@@ -374,6 +418,15 @@ class _Agents:
     async def stop_local_schedule(self, schedule_id: str) -> None:
         self.schedules.pop(schedule_id, None)
 
+    async def reject_persisted_schedule(self, schedule_id: str, *, reason: str) -> None:
+        self.rejections.append((schedule_id, reason))
+
+    async def activate_target_admission(self, activation: dict[str, object]) -> None:
+        self.target_admission_activations.append(dict(activation))
+
+    async def resolve_target_admission_terminal(self, resolution: dict[str, object]) -> None:
+        self.target_admission_resolutions.append(dict(resolution))
+
 
 class _GateService(CampaignService):
     def __init__(self, store: _JournalStore, agents: _Agents) -> None:
@@ -385,6 +438,46 @@ class _GateService(CampaignService):
         self.recovered_completion: bool | None = None
         self.recovery_manifest: CampaignManifest | None = None
         self.recovery_lead_target_surface: dict[str, object] | None = None
+
+    async def _current_target_admission_latches(
+        self, campaign_id: str, _manifest: CampaignManifest
+    ) -> tuple[dict[str, object], ...]:
+        projection = await self._target_reobservation_projection(campaign_id)
+        latest_by_session: dict[str, dict[str, object]] = {}
+        for generation_id, settlement in projection.refreshed.items():
+            generation = projection.generations.get(generation_id)
+            if generation is None or generation_id not in projection.reviewed:
+                continue
+            latest_by_session[generation.target_session_id] = {
+                "target_session_id": generation.target_session_id,
+                "state": "latched",
+                "revision": 1,
+                "authorized_schedule_id": None,
+                "pending_event_digests": generation.event_digests,
+                "pending_event_count": len(generation.event_digests),
+                "event_set_digest": settlement["event_set_digest"],
+                "generation_id": generation_id,
+                "settlement_id": settlement["settlement_id"],
+                "lead_decision_id": projection.reviewed[generation_id],
+            }
+        if self._agents.target_admission_activations:
+            activation = self._agents.target_admission_activations[-1]
+            generation_id = activation.get("generation_id")
+            target_session_id = activation.get("target_session_id")
+            authorized_schedule_id = activation.get("schedule_id")
+            activated = latest_by_session.get(str(target_session_id))
+            if (
+                activated is not None
+                and activated.get("generation_id") == generation_id
+                and isinstance(authorized_schedule_id, str)
+            ):
+                activated.update(
+                    state="activated",
+                    revision=int(activation["latch_revision"]) + 1,
+                    authorized_schedule_id=authorized_schedule_id,
+                )
+                return (activated,)
+        return tuple(latest_by_session[key] for key in sorted(latest_by_session))
 
     async def _settle_target_reobservation_attempt(
         self,
@@ -401,6 +494,7 @@ class _GateService(CampaignService):
             "campaign_id": campaign_id,
             "session_id": manifest.session_id,
             "target_id": manifest.target.id,
+            "target_session_id": generation.target_session_id,
             "generation_id": generation.generation_id,
             "obligation_id": generation.obligation_id,
             "event_digests": generation.event_digests,
@@ -457,8 +551,12 @@ class _GateService(CampaignService):
         )
 
     async def _resolve_target_reobservation_handoff(
-        self, manifest: CampaignManifest, _handoff_id: str
+        self,
+        manifest: CampaignManifest,
+        _handoff_id: str,
+        target_session_id: str,
     ) -> tuple[ContextDocument, str, str, str]:
+        assert target_session_id.startswith("browser:")
         if self.resolved_handoff is not None:
             return self.resolved_handoff
         document = next(
@@ -551,6 +649,7 @@ def _append_started(
                 "campaign_id": generation.campaign_id,
                 "session_id": generation.session_id,
                 "target_id": generation.target_id,
+                "target_session_id": generation.target_session_id,
                 "generation_id": generation.generation_id,
                 "obligation_id": generation.obligation_id,
                 "event_digests": generation.event_digests,
@@ -572,6 +671,7 @@ def _append_started(
                     "campaign_id": generation.campaign_id,
                     "session_id": generation.session_id,
                     "target_id": generation.target_id,
+                    "target_session_id": generation.target_session_id,
                     "generation_id": generation.generation_id,
                     "obligation_id": generation.obligation_id,
                     "event_digests": generation.event_digests,
@@ -587,22 +687,38 @@ def _append_started(
 
 
 def _append_reviewed(store: _JournalStore, generation: TargetReobservationGeneration) -> None:
+    wave = generation.source_wave
+    payload: dict[str, object] = {
+        "schema": "merlin.campaign-lead-decision.v1",
+        "campaign_id": generation.campaign_id,
+        "wave": wave,
+        "source_message_ids": [],
+        "target_reobservation_generations": [
+            {
+                "generation_id": generation.generation_id,
+                "settlement_id": (
+                    "target-reobservation-settled/"
+                    + generation.generation_id.removeprefix("sha256:")
+                ),
+                "target_session_id": generation.target_session_id,
+            }
+        ],
+    }
+    identity = json.dumps(
+        {
+            "campaign_id": generation.campaign_id,
+            "wave": wave,
+            "source_message_ids": (),
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     store.lead.append(
         {
-            "wave": generation.source_wave,
-            "decision_id": "lead-decision:"
-            + hashlib.sha256(generation.generation_id.encode()).hexdigest(),
-            "payload": {
-                "target_reobservation_generations": [
-                    {
-                        "generation_id": generation.generation_id,
-                        "settlement_id": (
-                            "target-reobservation-settled/"
-                            + generation.generation_id.removeprefix("sha256:")
-                        ),
-                    }
-                ]
-            },
+            "wave": wave,
+            "decision_id": "lead-decision:" + hashlib.sha256(identity.encode()).hexdigest(),
+            "payload": payload,
         }
     )
 
@@ -628,9 +744,15 @@ async def test_start_wave_runs_passive_reobservation_before_target_schedule() ->
     )
     _append_reviewed(store, generation)
     live = await service._start_wave(  # noqa: SLF001
-        manifest.id, manifest, 2, "custom", target_compilation
+        manifest.id,
+        manifest,
+        2,
+        "custom",
+        target_compilation,
+        transition_lease=_transition_lease(),
     )
-    target_id = service._campaign_wave_schedule_id(manifest.id, 2)  # noqa: SLF001
+    target_id = live.id
+    assert target_id != service._campaign_wave_schedule_id(manifest.id, 2)  # noqa: SLF001
     assert [str(options["schedule_id"]) for _, options in agents.submissions] == [
         reobserve_id,
         target_id,
@@ -640,6 +762,470 @@ async def test_start_wave_runs_passive_reobservation_before_target_schedule() ->
     assert agents.submissions[0][0][0].strategy_id == "target-reobservation/v1"
     assert live.id == target_id
     assert store.waves == [(2, "custom", target_id)]
+
+
+async def test_same_wave_refresh_submits_generation_bound_rebound_and_cas_authority() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation()
+    order: list[tuple[str, str]] = []
+    store = _JournalStore(manifest, context, obligation, order)
+    agents = _Agents(order)
+    service = _GateService(store, agents)
+    service.settlement_outcomes.append("refreshed")
+    compilation = compile_attack_campaign(manifest, context)
+
+    with pytest.raises(_TargetReobservationReviewRequired):
+        await service._start_wave(  # noqa: SLF001
+            manifest.id, manifest, 2, "custom", compilation
+        )
+    generation = _generation(obligation)
+    _append_reviewed(store, generation)
+    stale_schedule_id = service._campaign_wave_schedule_id(manifest.id, 2)  # noqa: SLF001
+    store.waves.append((2, "custom", stale_schedule_id))
+
+    live = await service._start_wave(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        2,
+        "custom",
+        compilation,
+        transition_lease=_transition_lease(),
+    )
+
+    assert live.id != stale_schedule_id
+    assert store.waves == [(2, "custom", stale_schedule_id)]
+    assert agents.started[-1] == live.id
+    assert len(agents.target_admission_activations) == 1
+    activation = agents.target_admission_activations[0]
+    assert activation["schedule_id"] == live.id
+    assert activation["source_schedule_id"] == stale_schedule_id
+    assert activation["wave"] == 2
+    assert activation["kind"] == "custom"
+    assert activation["claim_id"] == "claim-1"
+    assert activation["claimant_id"] == "claimant-1"
+    assert activation["generation_id"] == generation.generation_id
+    assert activation["event_set_digest"] == _digest({"event_digests": generation.event_digests})
+    assert agents.rejections == [
+        (
+            stale_schedule_id,
+            "superseded by reviewed target-surface generation " + generation.generation_id,
+        )
+    ]
+
+    # Crash/retry before the store CAS returns submits the same exact replacement,
+    # never a fresh UUID and never the stale source schedule.
+    replay = await service._start_wave(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        2,
+        "custom",
+        compilation,
+        transition_lease=_transition_lease(),
+    )
+    assert replay.id == live.id
+    assert [str(options["schedule_id"]) for _, options in agents.submissions[-2:]] == [
+        live.id,
+        live.id,
+    ]
+    assert len(agents.target_admission_activations) == 2
+    assert len(agents.rejections) == 2
+
+    later = await service._start_wave(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        3,
+        "frontier",
+        compilation,
+        transition_lease=_transition_lease(),
+    )
+    assert later.id not in {stale_schedule_id, live.id}
+    assert agents.target_admission_activations[-1]["schedule_id"] == later.id
+    assert agents.target_admission_activations[-1]["generation_id"] == generation.generation_id
+
+
+async def test_two_physical_sessions_are_reviewed_before_one_atomic_rebound() -> None:
+    manifest, context = _campaign()
+    first = _obligation()
+    second_session_id = "browser:browser-context-2"
+    second_receipt_sha256 = "5" * 64
+    second_call_id = "target-call-2"
+    second = replace(
+        first,
+        target_session_id=second_session_id,
+        target_call_id=second_call_id,
+        receipt_sha256=second_receipt_sha256,
+        event_digest=_digest(
+            [
+                first.campaign_id,
+                second_session_id,
+                first.source_task_id,
+                second_call_id,
+                second_receipt_sha256,
+                first.transition_digest,
+            ]
+        ),
+    )
+    order: list[tuple[str, str]] = []
+    store = _JournalStore(manifest, context, first, order)
+    store.lead.append(
+        {
+            "wave": second.source_wave,
+            "payload": second.observed_payload(manifest.id, manifest.target.id),
+        }
+    )
+    agents = _Agents(order)
+    service = _GateService(store, agents)
+    service.settlement_outcomes.extend(("refreshed", "refreshed"))
+    compilation = compile_attack_campaign(manifest, context)
+
+    with pytest.raises(_TargetReobservationReviewRequired):
+        await service._start_wave(  # noqa: SLF001
+            manifest.id, manifest, 2, "frontier", compilation
+        )
+
+    projection = await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
+    generations = {
+        generation.target_session_id: generation for generation in projection.generations.values()
+    }
+    assert set(generations) == {first.target_session_id, second.target_session_id}
+    _append_reviewed(store, generations[first.target_session_id])
+    _append_reviewed(store, generations[second.target_session_id])
+    reviewed_projection = await service._target_reobservation_projection(  # noqa: SLF001
+        manifest.id
+    )
+
+    live = await service._start_wave(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        2,
+        "frontier",
+        compilation,
+        transition_lease=_transition_lease(),
+    )
+
+    assert live.id == agents.started[-1]
+    activation = agents.target_admission_activations[-1]
+    assert activation["target_session_id"] == second.target_session_id
+    assert activation["generation_id"] == generations[second.target_session_id].generation_id
+    assert activation["latch_revision"] == 1
+    assert activation["superseded_generations"] == (
+        {
+            "target_session_id": first.target_session_id,
+            "generation_id": generations[first.target_session_id].generation_id,
+            "event_set_digest": _digest(
+                {"event_digests": generations[first.target_session_id].event_digests}
+            ),
+            "settlement_id": (
+                "target-reobservation-settled/"
+                + generations[first.target_session_id].generation_id.removeprefix("sha256:")
+            ),
+            "lead_decision_id": reviewed_projection.reviewed[
+                generations[first.target_session_id].generation_id
+            ],
+            "latch_revision": 1,
+        },
+    )
+
+
+def test_supersession_candidates_join_only_current_durable_latches() -> None:
+    refreshed: dict[str, dict[str, object]] = {}
+    reviewed: dict[str, str] = {}
+    for index in range(300):
+        generation_id = _digest({"generation": index})
+        event_digest = _digest({"event": index})
+        refreshed[generation_id] = {
+            "generation_id": generation_id,
+            "target_session_id": f"browser:historical-{index:03d}",
+            "event_set_digest": _digest({"event_digests": (event_digest,)}),
+            "settlement_id": (
+                "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+            ),
+        }
+        reviewed[generation_id] = "lead-decision:" + f"{index:064x}"
+    generation_ids = tuple(refreshed)
+    selected_generation_id = generation_ids[-1]
+    projection = TargetReobservationProjection(
+        pending=(),
+        observation_sequences={},
+        generations={},
+        starts={},
+        blocked=frozenset(),
+        retry_authorizations={},
+        overflow=None,
+        refreshed=refreshed,
+        reviewed=reviewed,
+    )
+
+    selected_revision, candidates = _target_reobservation_superseded_generations(
+        projection,
+        selected_generation_id,
+        (
+            {
+                "target_session_id": "browser:historical-298",
+                "state": "activated",
+                "revision": 7,
+                "authorized_schedule_id": "00000000-0000-0000-0000-000000000007",
+                "pending_event_digests": (_digest({"event": 298}),),
+                "pending_event_count": 1,
+                "event_set_digest": None,
+                "generation_id": None,
+                "settlement_id": None,
+                "lead_decision_id": None,
+            },
+            {
+                "target_session_id": "browser:historical-299",
+                "state": "latched",
+                "revision": 8,
+                "authorized_schedule_id": None,
+                "pending_event_digests": (_digest({"event": 299}),),
+                "pending_event_count": 1,
+                "event_set_digest": None,
+                "generation_id": None,
+                "settlement_id": None,
+                "lead_decision_id": None,
+            },
+        ),
+    )
+
+    assert selected_revision == 8
+    assert candidates == (
+        {
+            "target_session_id": "browser:historical-298",
+            "generation_id": generation_ids[-2],
+            "event_set_digest": refreshed[generation_ids[-2]]["event_set_digest"],
+            "settlement_id": refreshed[generation_ids[-2]]["settlement_id"],
+            "lead_decision_id": reviewed[generation_ids[-2]],
+            "latch_revision": 7,
+        },
+    )
+
+
+def test_supersession_candidates_reject_missing_or_forged_current_latches() -> None:
+    generation = _generation(_obligation())
+    event_set_digest = _digest({"event_digests": generation.event_digests})
+    settlement_id = "target-reobservation-settled/" + generation.generation_id.removeprefix(
+        "sha256:"
+    )
+    projection = TargetReobservationProjection(
+        pending=(),
+        observation_sequences={},
+        generations={generation.generation_id: generation},
+        starts={},
+        blocked=frozenset(),
+        retry_authorizations={},
+        overflow=None,
+        refreshed={
+            generation.generation_id: {
+                "generation_id": generation.generation_id,
+                "target_session_id": generation.target_session_id,
+                "event_set_digest": event_set_digest,
+                "settlement_id": settlement_id,
+            }
+        },
+        reviewed={generation.generation_id: "lead-decision:" + "a" * 64},
+    )
+
+    with pytest.raises(RuntimeError, match="unbounded"):
+        _target_reobservation_superseded_generations(projection, generation.generation_id, ())
+    with pytest.raises(RuntimeError, match="lacks reviewed refresh authority"):
+        _target_reobservation_superseded_generations(
+            projection,
+            generation.generation_id,
+            (
+                {
+                    "target_session_id": "browser:forged",
+                    "state": "latched",
+                    "revision": 1,
+                    "authorized_schedule_id": None,
+                    "pending_event_digests": generation.event_digests,
+                    "pending_event_count": len(generation.event_digests),
+                    "event_set_digest": None,
+                    "generation_id": None,
+                    "settlement_id": None,
+                    "lead_decision_id": None,
+                },
+            ),
+        )
+    with pytest.raises(RuntimeError, match="unbounded"):
+        _target_reobservation_superseded_generations(
+            projection,
+            generation.generation_id,
+            tuple({"target_session_id": f"browser:{index}"} for index in range(257)),
+        )
+
+
+def test_supersession_candidate_uses_exact_current_repeated_session_generation() -> None:
+    old_generation = _digest({"generation": "old"})
+    current_generation = _digest({"generation": "current"})
+    selected_generation = _digest({"generation": "selected"})
+    old_event = _digest({"event": "old"})
+    current_event = _digest({"event": "current"})
+    selected_event = _digest({"event": "selected"})
+
+    def settlement(generation_id: str, target_session_id: str, event: str) -> dict[str, str]:
+        return {
+            "generation_id": generation_id,
+            "target_session_id": target_session_id,
+            "event_set_digest": _digest({"event_digests": (event,)}),
+            "settlement_id": (
+                "target-reobservation-settled/" + generation_id.removeprefix("sha256:")
+            ),
+        }
+
+    refreshed = {
+        old_generation: settlement(old_generation, "browser:repeated", old_event),
+        current_generation: settlement(current_generation, "browser:repeated", current_event),
+        selected_generation: settlement(selected_generation, "browser:selected", selected_event),
+    }
+    reviewed = {
+        generation_id: "lead-decision:" + f"{index:064x}"
+        for index, generation_id in enumerate(refreshed, 1)
+    }
+    projection = TargetReobservationProjection(
+        pending=(),
+        observation_sequences={},
+        generations={},
+        starts={},
+        blocked=frozenset(),
+        retry_authorizations={},
+        overflow=None,
+        refreshed=refreshed,
+        reviewed=reviewed,
+    )
+
+    selected_revision, candidates = _target_reobservation_superseded_generations(
+        projection,
+        selected_generation,
+        (
+            {
+                "target_session_id": "browser:repeated",
+                "state": "latched",
+                "revision": 4,
+                "authorized_schedule_id": None,
+                "pending_event_digests": (current_event,),
+                "pending_event_count": 1,
+                "event_set_digest": None,
+                "generation_id": None,
+                "settlement_id": None,
+                "lead_decision_id": None,
+            },
+            {
+                "target_session_id": "browser:selected",
+                "state": "latched",
+                "revision": 5,
+                "authorized_schedule_id": None,
+                "pending_event_digests": (selected_event,),
+                "pending_event_count": 1,
+                "event_set_digest": None,
+                "generation_id": None,
+                "settlement_id": None,
+                "lead_decision_id": None,
+            },
+        ),
+    )
+
+    assert selected_revision == 5
+    assert candidates[0]["generation_id"] == current_generation
+    assert candidates[0]["generation_id"] != old_generation
+
+
+async def test_legacy_target_admission_is_upgraded_before_lead_projection() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation()
+    order: list[tuple[str, str]] = []
+
+    class LegacyStore(_JournalStore):
+        def __init__(self) -> None:
+            super().__init__(manifest, context, obligation, order)
+            self.canonical_row = self.lead.pop()
+            self.lead.append(_legacy_observation_row(obligation))
+
+        def upgrade_legacy_target_admission(
+            self, campaign_id: str, session_id: str, target_id: str
+        ) -> dict[str, object]:
+            assert (campaign_id, session_id, target_id) == (
+                manifest.id,
+                manifest.session_id,
+                manifest.target.id,
+            )
+            order.append(("legacy-upgrade", campaign_id))
+            self.lead.append(self.canonical_row)
+            return {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": "upgraded",
+                "scanned_count": 1,
+                "upgraded_count": 1,
+                "unresolved_count": 0,
+                "overflow": False,
+            }
+
+        def list_lead(self, campaign_id: str):
+            order.append(("list-lead", campaign_id))
+            return super().list_lead(campaign_id)
+
+    store = LegacyStore()
+    service = _GateService(store, _Agents(order))
+
+    projection = await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
+
+    assert order[:2] == [
+        ("legacy-upgrade", manifest.id),
+        ("list-lead", manifest.id),
+    ]
+    assert tuple(item.event_digest for item in projection.pending) == (obligation.event_digest,)
+
+
+async def test_legacy_target_admission_block_survives_restart_and_prevents_finish() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation()
+    order: list[tuple[str, str]] = []
+
+    class BlockedLegacyStore(_JournalStore):
+        def __init__(self) -> None:
+            super().__init__(manifest, context, obligation, order)
+            self.lead[:] = [_legacy_observation_row(obligation, claimed_session=True)]
+            self.upgrades = 0
+
+        def upgrade_legacy_target_admission(
+            self, campaign_id: str, session_id: str, target_id: str
+        ) -> dict[str, object]:
+            assert (campaign_id, session_id, target_id) == (
+                manifest.id,
+                manifest.session_id,
+                manifest.target.id,
+            )
+            self.upgrades += 1
+            return {
+                "schema": "merlin.target-admission-legacy-upgrade.v1",
+                "status": "blocked",
+                "scanned_count": 1,
+                "upgraded_count": 0,
+                "unresolved_count": 1,
+                "overflow": False,
+            }
+
+    store = BlockedLegacyStore()
+    for _restart in range(2):
+        service = _GateService(store, _Agents(order))
+        with pytest.raises(_TargetReobservationBlocked, match="authenticated session adoption"):
+            await service._finish_campaign(  # noqa: SLF001
+                manifest.id, "completed", "objectives_completed"
+            )
+
+    assert store.upgrades == 2
+    assert store.finishes == []
+
+
+async def test_missing_legacy_upgrader_blocks_canonical_v1_projection() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation()
+    order: list[tuple[str, str]] = []
+    store = _JournalStore(manifest, context, obligation, order)
+    store.lead[:] = [_legacy_observation_row(obligation)]
+    service = _GateService(store, _Agents(order))
+
+    with pytest.raises(_TargetReobservationBlocked, match="authenticated session adoption"):
+        await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
 
 
 async def test_restart_reopens_exact_started_reobservation_without_duplicate_submit() -> None:
@@ -687,10 +1273,16 @@ async def test_paused_auxiliary_resumes_same_attempt_before_target_path_continue
         )
     _append_reviewed(store, generation)
     target_live = await service._start_wave(  # noqa: SLF001
-        manifest.id, manifest, 2, "custom", target_compilation
+        manifest.id,
+        manifest,
+        2,
+        "custom",
+        target_compilation,
+        transition_lease=_transition_lease(),
     )
 
-    target_id = service._campaign_wave_schedule_id(manifest.id, 2)  # noqa: SLF001
+    target_id = target_live.id
+    assert target_id != service._campaign_wave_schedule_id(manifest.id, 2)  # noqa: SLF001
     assert agents.resumes == [schedule_id]
     assert agents.reopens == []
     assert [str(options["schedule_id"]) for _, options in agents.submissions] == [target_id]
@@ -785,6 +1377,7 @@ async def test_blocked_journal_restart_pauses_until_unique_resume_and_settles() 
         "schema": "merlin.target-reobservation-recovery-state.v1",
         "phase": "reobserve",
         "generation_id": generation.generation_id,
+        "target_session_id": generation.target_session_id,
         "event_set_digest": _digest({"event_digests": generation.event_digests}),
         "source_wave": generation.source_wave,
         "schedule_id": first_schedule,
@@ -794,6 +1387,7 @@ async def test_blocked_journal_restart_pauses_until_unique_resume_and_settles() 
     claimed = SimpleNamespace(
         phase="reobserve",
         generation_id=generation.generation_id,
+        target_session_id=generation.target_session_id,
         event_set_digest=_digest({"event_digests": generation.event_digests}),
         source_wave=generation.source_wave,
         schedule_id=first_schedule,
@@ -858,6 +1452,7 @@ async def test_target_reobservation_overflow_pauses_and_blocks_target_work() -> 
         event_digest = _digest(
             [
                 manifest.id,
+                seed.target_session_id,
                 seed.source_task_id,
                 call_id,
                 receipt_sha256,
@@ -1043,8 +1638,12 @@ async def test_real_settlement_rejects_same_session_receipt_for_another_target()
 
 def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools() -> None:
     manifest, context = _campaign()
+    generation = _generation(_obligation())
     compilation = CampaignService._target_reobservation_compilation(  # noqa: SLF001
-        manifest, context, _generation(_obligation())
+        manifest,
+        context,
+        generation,
+        ("target-reobservation-started/" + generation.generation_id.removeprefix("sha256:") + "/1"),
     )
     assignment = compilation.assignments[0]
     allowed = {
@@ -1126,6 +1725,7 @@ async def test_pass_modal_refresh_requires_fresh_lead_review_before_completion()
     assert set(refreshed) == {
         "generation_id",
         "settlement_id",
+        "target_session_id",
         "event_count",
         "event_set_digest",
         "status",
@@ -1284,6 +1884,7 @@ async def test_special_continuations_review_refresh_before_resuming_caller(
     claimed = SimpleNamespace(
         phase="reobserve",
         generation_id=generation.generation_id,
+        target_session_id=generation.target_session_id,
         event_set_digest=_digest({"event_digests": generation.event_digests}),
         source_wave=generation.source_wave,
         schedule_id=refresh_schedule_id,
@@ -1419,6 +2020,7 @@ async def test_refreshed_adapter_is_overlaid_on_target_assignment_and_context() 
                 "campaign_id": manifest.id,
                 "session_id": manifest.session_id,
                 "target_id": manifest.target.id,
+                "target_session_id": generation.target_session_id,
                 "generation_id": generation.generation_id,
                 "obligation_id": generation.obligation_id,
                 "event_digests": generation.event_digests,
@@ -1478,6 +2080,16 @@ async def test_refreshed_adapter_is_overlaid_on_target_assignment_and_context() 
     assert validation_contract["compiled_adapter"] == source_adapter
     assert validation_contract["compiled_adapter_digest"] == source_compiled_digest
     assert validation_contract["initial_state_equivalence_digest"] != current_surface_digest
+
+    reproduction_live = await service._start_wave(  # noqa: SLF001
+        manifest.id, manifest, 3, "reproduction", original
+    )
+    reproduction_assignment = reproduction_live.assignments[0]
+    reproduction_contract = dict(reproduction_assignment.strategy_contract)
+    assert reproduction_assignment.reviewed_adapter_digest == source_reviewed_digest
+    assert reproduction_contract["compiled_adapter"] == source_adapter
+    assert reproduction_contract["compiled_adapter_digest"] == source_compiled_digest
+    assert "target_reobservation_generation_id" not in reproduction_contract
 
 
 async def test_post_effect_transition_receipt_journals_exactly_once_across_replay() -> None:
@@ -1784,7 +2396,7 @@ async def test_sole_zero_effect_surface_disruption_refreshes_before_failure_deci
         "success",
     }.isdisjoint(observed[0])
     assert service.infrastructure_pause_checks == 0
-    assert service.frontier_counts == {"queued": 1}
+    assert service.frontier_counts is None
     assert service.arm_outcome_calls == 0
     assert agents.cancellations == []
     assert not execution.done()
@@ -1990,6 +2602,7 @@ async def test_lead_surface_projection_rejects_foreign_reobservation_chain(
         {
             "generation_id": correct_generation.generation_id,
             "settlement_id": settlement_id,
+            "target_session_id": correct_generation.target_session_id,
         },
     )
 

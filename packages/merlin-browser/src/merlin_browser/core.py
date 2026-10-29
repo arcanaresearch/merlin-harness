@@ -377,8 +377,16 @@ def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
         _useful_visual_label(candidate.get(field))
         for field in ("alt", "aria_label", "title", "caption")
     )
+    has_label = any(
+        " ".join(str(candidate.get(field) or "").split())
+        for field in ("alt", "aria_label", "title", "caption")
+    )
     in_figure = bool(candidate.get("in_figure"))
     viewport_coverage = float(candidate.get("viewport_coverage") or 0)
+    if viewport_coverage >= 0.7:
+        return False
+    if has_label and not useful_label:
+        return False
     if candidate.get("source_kind") != "css_background":
         explicitly_decorative = bool(candidate.get("aria_hidden")) or role in {
             "none",
@@ -388,8 +396,7 @@ def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
             in_figure and _useful_visual_label(candidate.get("caption"))
         ):
             return False
-        semantic = in_figure or role == "img" or useful_label
-        return viewport_coverage < 0.7 or semantic
+        return True
     explicitly_decorative = bool(candidate.get("aria_hidden")) or role in {
         "none",
         "presentation",
@@ -406,7 +413,7 @@ def _visual_candidate_admitted(candidate: Mapping[str, object]) -> bool:
         return False
     if not useful_label:
         return False
-    return viewport_coverage < 0.7 or (useful_label and (role == "img" or tag == "figure"))
+    return True
 
 
 async def _page_contains_sensitive_rendered_control(page: Page) -> bool:
@@ -727,6 +734,38 @@ def _write_private_visual_capture(
     path = directory / f"{digest}.jpg"
     _write_private_visual_file(path, payload)
     return path
+
+
+def _private_visual_capture_matches(path: Path, digest: str, byte_length: int) -> bool:
+    descriptor = -1
+    try:
+        before = os.lstat(path)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != byte_length
+        ):
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            opened = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != byte_length
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                return False
+            payload = source.read(byte_length + 1)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return len(payload) == byte_length and hashlib.sha256(payload).hexdigest() == digest
 
 
 def _json_string_paths(value: object, prefix: str = "") -> tuple[tuple[str, str], ...]:
@@ -1416,13 +1455,35 @@ class BrowserSession:
         *,
         identity_source: str,
         directory_name: str,
+        reemit_trusted_duplicate: bool = False,
     ) -> tuple[dict[str, object] | None, str | None]:
         if not payload or len(payload) > _VISUAL_MAX_BYTES:
             return None, "attachment_size_out_of_bounds"
         digest = hashlib.sha256(payload).hexdigest()
         identity = (identity_source, digest)
         if identity in self._visual_evidence_seen:
-            return None, "duplicate"
+            if not reemit_trusted_duplicate:
+                return None, "duplicate"
+            path = self._visual_digest_paths.get(digest)
+            if path is None or str(path) not in self._visual_trusted_digest_paths:
+                return None, "duplicate_untrusted"
+            if not await asyncio.to_thread(
+                _private_visual_capture_matches,
+                path,
+                digest,
+                len(payload),
+            ):
+                self._visual_trusted_digest_paths.discard(str(path))
+                return None, "duplicate_untrusted"
+            return (
+                {
+                    "media_type": "image/jpeg",
+                    "path": str(path),
+                    "sha256": digest,
+                    "byte_length": len(payload),
+                },
+                None,
+            )
         rejection = self._visual_retention_rejection()
         if rejection is not None:
             return None, rejection
@@ -1538,6 +1599,8 @@ class BrowserSession:
         self,
         tab_ref: str,
         frame_ref: str | None = None,
+        *,
+        reemit_trusted_duplicates: bool = False,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
         """Capture one bounded viewport plus supplemental visible content images."""
         root_state = self._visual_root_state()
@@ -1547,12 +1610,18 @@ class BrowserSession:
                 rejection = self._visual_retention_rejection()
                 if rejection is not None:
                     return (), (f"visual_capture:{rejection}",)
-                return await self._capture_visual_evidence(tab_ref, frame_ref)
+                return await self._capture_visual_evidence(
+                    tab_ref,
+                    frame_ref,
+                    reemit_trusted_duplicates=reemit_trusted_duplicates,
+                )
 
     async def _capture_visual_evidence(
         self,
         tab_ref: str,
         frame_ref: str | None = None,
+        *,
+        reemit_trusted_duplicates: bool = False,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
         page = self._page(tab_ref)
         await self._enforce_page(page)
@@ -1572,6 +1641,7 @@ class BrowserSession:
                 payload,
                 identity_source=identity_source,
                 directory_name="browser-evidence",
+                reemit_trusted_duplicate=reemit_trusted_duplicates,
             )
             if attachment is None:
                 if rejection not in {None, "duplicate"}:

@@ -197,6 +197,7 @@ from .target_enumeration import (
 from .target_progress import project_target_progress
 from .tools import (
     LEGACY_TARGET_EXCHANGE_TOOL_IDS,
+    MAX_TARGET_SESSION_ID_LENGTH,
     TargetDeliveryClass,
     Tool,
     ToolContext,
@@ -310,6 +311,7 @@ __all__ = [
     "LanguageEvidenceStatus",
     "LegacyTerminalMapping",
     "LEGACY_TARGET_EXCHANGE_TOOL_IDS",
+    "MAX_TARGET_SESSION_ID_LENGTH",
     "MessageRecord",
     "MessageLineage",
     "LeadDecision",

@@ -59,6 +59,7 @@ from merlin_agents.runtime import (
     _hydra_select_contract,
     _merge_strategy_evaluation_uncertainties,
     _runtime_admitted_tool_names,
+    _target_exchange_tool_names,
     _visual_review_batch,
     _VisualEvidenceCandidate,
 )
@@ -2874,6 +2875,68 @@ async def test_target_inject_session_is_checkpointed() -> None:
     assert result.checkpoint["target_evidence"][0]["tool_name"] == "target_inject"
 
 
+async def test_custom_typed_target_exchange_uses_target_stall_semantics() -> None:
+    tool_name = "partner_chat_exchange"
+
+    class CustomTargetTools(Tools):
+        def __init__(self) -> None:
+            super().__init__(effect="target_network")
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name=tool_name,
+                    description="Custom target exchange",
+                    input_schema={"type": "object"},
+                    interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                ),
+            )
+
+        async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
+            self.calls.append(name)
+            return ToolResult(
+                content='{"response":"same refusal"}',
+                metadata={
+                    "target_session_id": "custom:session-1",
+                    "limit_interaction_count": 1,
+                    "target_exchanges": [
+                        {
+                            "interaction": True,
+                            "cleanup": False,
+                            "request": arguments,
+                            "response": {"reply": "same refusal"},
+                        }
+                    ],
+                },
+            )
+
+    def call(index: int) -> list[ModelEvent]:
+        return [
+            ToolCall(
+                call_id=f"custom-{index}",
+                name=tool_name,
+                arguments={"input": "same"},
+            ),
+            ModelCompleted(finish_reason="tool_calls"),
+        ]
+
+    provider = Provider([call(1), call(2), call(3)])
+    tools = CustomTargetTools()
+
+    result = await WorkerRuntime(provider, tools, max_model_turns=4).run(
+        handoff(tools=(tool_name,))
+    )
+
+    assert _target_exchange_tool_names(tools.describe()) == frozenset({tool_name})
+    assert result.status == "failed"
+    assert "repeated target request produced no new authoritative state" in (result.error or "")
+    assert tools.calls == [tool_name, tool_name]
+    assert [item["call_id"] for item in result.checkpoint["target_evidence"]] == [
+        "custom-1",
+        "custom-2",
+    ]
+
+
 async def test_browser_observation_does_not_replace_api_target_session() -> None:
     class HybridTools(Tools):
         def describe(self):
@@ -2982,6 +3045,9 @@ async def test_delivery_session_drift_quarantines_buffered_worker() -> None:
         async def invoke(self, name: str, context: object, arguments: object) -> ToolResult:
             self.calls.append(name)
             self.sequence += 1
+            assert context.expected_target_session_id == (
+                None if self.sequence == 1 else "api:session-1"
+            )
             return ToolResult(
                 content="target reply",
                 metadata={"target_session_id": f"api:session-{self.sequence}"},
@@ -3560,6 +3626,72 @@ async def test_routed_vision_worker_receives_attributed_visual_recon_evidence(tm
     )
 
 
+async def test_visual_evidence_from_browser_open_tab_is_delivered_once(tmp_path) -> None:
+    image = tmp_path / "viewport.png"
+    _write_viewport_png(image)
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+    class VisualTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_open_tab",
+                    description="Open target",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert name == "browser_open_tab"
+            assert context.visual_evidence_enabled is True
+            return ToolResult(
+                content="opened target with retained viewport evidence",
+                metadata={
+                    "visual_evidence": [
+                        {
+                            "evidence_ref": "sha256:" + "e" * 64,
+                            "source_kind": "viewport",
+                            "untrusted_target_evidence": True,
+                            "attachment": {
+                                "media_type": "image/png",
+                                "path": str(image),
+                                "sha256": digest,
+                                "byte_length": image.stat().st_size,
+                            },
+                        }
+                    ]
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="open-1", name="browser_open_tab", arguments={}),
+                ModelCompleted(),
+            ],
+            [TextDelta(text='{"finding":"viewport inspected"}'), ModelCompleted()],
+        ],
+        vision=True,
+    )
+
+    result = await WorkerRuntime(provider, VisualTools()).run(handoff(tools=("browser_open_tab",)))
+
+    assert result.status == "completed"
+    assert [
+        sum(len(message.image_attachments) for message in request.messages)
+        for request in provider.requests
+    ] == [0, 1]
+    visual_message = next(
+        message for message in provider.requests[1].messages if message.image_attachments
+    )
+    assert visual_message.image_attachments[0].sha256 == digest
+    assert "browser_open_tab.visual_evidence" in visual_message.content
+    assert "attempted:one_logical_provider_request" in json.dumps(
+        result.checkpoint,
+        sort_keys=True,
+    )
+
+
 async def test_visual_evidence_is_included_once_then_persists_as_text_manifest(tmp_path) -> None:
     image = tmp_path / "content.png"
     _write_viewport_png(image)
@@ -3631,7 +3763,7 @@ async def test_visual_evidence_is_included_once_then_persists_as_text_manifest(t
     )
 
 
-async def test_visual_evidence_context_keeps_prioritized_content_image(tmp_path) -> None:
+async def test_visual_evidence_context_keeps_viewport_before_content_images(tmp_path) -> None:
     viewport = tmp_path / "viewport.png"
     content_paths = [tmp_path / f"content-{index}.png" for index in range(3)]
     _write_viewport_png(viewport)
@@ -3707,15 +3839,20 @@ async def test_visual_evidence_context_keeps_prioritized_content_image(tmp_path)
     delivered_digests = [attachment.sha256 for attachment in visual_attachments]
     assert delivered_digests
     assert len(delivered_digests) < 4
-    assert delivered_digests == content_digests[: len(delivered_digests)]
-    assert viewport_digest not in delivered_digests
+    assert delivered_digests[0] == viewport_digest
+    assert delivered_digests[1:] == content_digests[: len(delivered_digests) - 1]
     visual_message = next(
         message for message in provider.requests[1].messages if message.image_attachments
     )
-    assert f"skipped:context_bound:sha256:{viewport_digest}" in visual_message.content
+    skipped_digests = [digest for digest in content_digests if digest not in delivered_digests]
+    assert skipped_digests
+    assert all(
+        f"skipped:context_bound:sha256:{digest}" in visual_message.content
+        for digest in skipped_digests
+    )
     assert all(digest in visual_message.content for digest in delivered_digests)
     checkpoint = json.dumps(result.checkpoint, sort_keys=True)
-    assert f"context_bound:sha256:{viewport_digest}" in checkpoint
+    assert all(f"context_bound:sha256:{digest}" in checkpoint for digest in skipped_digests)
     assert str(viewport) not in checkpoint
     assert all(str(path) not in checkpoint for path in content_paths)
 
@@ -6550,6 +6687,125 @@ def test_worker_compaction_preserves_injection_lifecycle_identity() -> None:
     assert '"content_digest":"sha256:' in summary
 
 
+async def test_custom_typed_target_exchange_preserves_semantics_across_projection() -> None:
+    tool_name = "partner_chat_exchange"
+    followup_tool_name = "partner_chat_followup"
+    tool_names = _target_exchange_tool_names(
+        tuple(
+            ToolSpec(
+                name=name,
+                description="Custom target exchange",
+                input_schema={"type": "object"},
+                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+            )
+            for name in (tool_name, followup_tool_name)
+        )
+    )
+    refusal = json.dumps({"response": "I cannot assist " + "x" * 512})
+    messages = [
+        ChatMessage(role="system", content="identity"),
+        ChatMessage(role="user", content="objective"),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "custom-1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": '{"input":"same"}'},
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            content=refusal,
+            name=tool_name,
+            tool_call_id="custom-1",
+        ),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "custom-2",
+                    "type": "function",
+                    "function": {
+                        "name": followup_tool_name,
+                        "arguments": '{"input":"same"}',
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            content=refusal,
+            name=followup_tool_name,
+            tool_call_id="custom-2",
+        ),
+    ]
+
+    projection, projected, _ = WorkerRuntime._project_messages(  # noqa: SLF001
+        messages,
+        context_window_tokens=1_500,
+        exchange_window=1,
+        target_exchange_tool_names=tool_names,
+        tokenizer=lambda text: max(1, len(text.encode("utf-8")) // 4),
+    )
+    assert projection.compacted_receipts is not None
+    receipt = projection.compacted_receipts.recent_semantic_receipts[0]
+    assert receipt.tool_name == tool_name
+    assert '"kind":"target_observation"' in receipt.summary
+    assert any(
+        message.role == "system" and '"tool_name":"partner_chat_exchange"' in message.content
+        for message in projected
+    )
+
+    prune_messages = [
+        *messages[:3],
+        ChatMessage(
+            role="tool",
+            content=json.dumps({"response": "I cannot assist " + "x" * 4_000}),
+            name=tool_name,
+            tool_call_id="custom-1",
+        ),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "custom-2",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": '{"input":"same"}'},
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            content=json.dumps({"response": "I cannot assist " + "x" * 4_000}),
+            name=tool_name,
+            tool_call_id="custom-2",
+        ),
+    ]
+    pruned = WorkerRuntime._prune_superseded_tool_results(  # noqa: SLF001
+        prune_messages,
+        before=len(messages),
+        target_exchange_tool_names=tool_names,
+    )
+    pruned_receipt = json.loads(pruned[3].content)
+    assert pruned_receipt["reference"] == "target-call:custom-1"
+    assert pruned_receipt["semantic_projection"]["kind"] == "target_observation"
+
+    runtime = WorkerRuntime(Provider([]), Tools())
+    assert (
+        await runtime._stall_pivot_hint(  # noqa: SLF001
+            [messages[3]],
+            (),
+            target_exchange_tool_names=tool_names,
+        )
+        is not None
+    )
+
+
 def test_worker_compaction_provenances_dropped_reasoning_and_keeps_retained_verbatim() -> None:
     dropped = "audit the response for refusal  " * 8
     messages = [
@@ -6917,6 +7173,7 @@ def test_target_evidence_receipts_survive_long_run_checkpoint_compaction() -> No
     assert checkpoint["target_evidence"] == next_checkpoint["target_evidence"]
     receipt = checkpoint["target_evidence"][0]
     assert receipt["reference"] == "target-call:target-call-1"
+    assert receipt["session_id"] == "session-1"
     assert receipt["acknowledged"] is True
     assert receipt["content_sha256"] == hashlib.sha256(result.content.encode()).hexdigest()
     assert receipt["request_sha256"] == WorkerRuntime._action_fingerprint(  # noqa: SLF001
@@ -11945,9 +12202,7 @@ async def test_incomplete_compiled_response_stops_without_fabricating_exchange(
     assert receipt["target_call_budget_charge"] == 1
     assert receipt["target_ui_transition"] == _unknown_after_browser_effect_transition()
 
-    replacement_provider = Provider(
-        [[forbidden, ModelCompleted(finish_reason="tool_calls")]]
-    )
+    replacement_provider = Provider([[forbidden, ModelCompleted(finish_reason="tool_calls")]])
     replacement_tools = BrowserIncompleteResponseTools()
     restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
         reviewed,
@@ -12336,9 +12591,12 @@ def _unknown_after_browser_effect_transition() -> dict[str, object]:
 
 def _unchanged_browser_effect_transition() -> dict[str, object]:
     digest = _test_digest("unchanged-reviewed-surface")
-    transition_digest = "sha256:" + hashlib.sha256(
-        json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    transition_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     return {
         "schema": "merlin.target-ui-transition.v1",
         "material": False,
@@ -12632,9 +12890,7 @@ class BrowserIncompleteResponseTools(BrowserAttemptedTransitionTools):
         assert name == "browser_chat_exchange"
         self.calls.append(name)
         return ToolResult(
-            content=(
-                "compiled_browser_response_incomplete: passive re-observation is required"
-            ),
+            content=("compiled_browser_response_incomplete: passive re-observation is required"),
             is_error=True,
             metadata={
                 "target_effect_attempted": True,
@@ -12646,6 +12902,7 @@ class BrowserIncompleteResponseTools(BrowserAttemptedTransitionTools):
                 "target_ui_transition": _unknown_after_browser_effect_transition(),
             },
         )
+
 
 def _assert_successful_transition_receipt(result, call_id: str) -> Mapping[str, object]:
     assert result.status == "completed", result.error
@@ -13093,9 +13350,7 @@ async def test_generic_effect_reconciliation_checkpoint_blocks_live_and_restored
     assert marker["tool_name"] == transition_tool
     assert result.checkpoint["generic_effect_reconciliation_required"] == marker
 
-    replacement_provider = Provider(
-        [[forbidden, ModelCompleted(finish_reason="tool_calls")]]
-    )
+    replacement_provider = Provider([[forbidden, ModelCompleted(finish_reason="tool_calls")]])
     replacement_tools = GenericBrowserTransitionTools()
     restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
         reviewed,

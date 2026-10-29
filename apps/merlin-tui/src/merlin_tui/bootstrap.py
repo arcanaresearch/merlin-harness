@@ -3764,6 +3764,9 @@ def _register_browser_tools(
     state_scope_store: object | None = None,
     checkpoint_store: object | None = None,
     checkpoint_vault: object | None = None,
+    assignment_adapter_resolver: (
+        Callable[[object], Awaitable[Mapping[str, object] | None]] | None
+    ) = None,
 ) -> tuple[str, ...]:
     from merlin_browser import browser_tools
 
@@ -3774,6 +3777,7 @@ def _register_browser_tools(
         state_scope_store=state_scope_store,
         checkpoint_store=checkpoint_store,
         checkpoint_vault=checkpoint_vault,
+        assignment_adapter_resolver=assignment_adapter_resolver,
     )
     for tool in tools:
         broker.register(tool)  # type: ignore[attr-defined]
@@ -5162,6 +5166,65 @@ def build_backend(
                 return None
             return _persisted_reviewed_api_adapter(row)
 
+        async def resolve_reviewed_browser_adapter(
+            context: ToolContext,
+        ) -> Mapping[str, object] | None:
+            """Resolve a rebound adapter only from this persisted assignment authority."""
+
+            campaign_id = context.campaign_id
+            if campaign_id is None:
+                return None
+            resolved = await verified_campaign_assignment(
+                campaign_id,
+                context.session_id,
+                context.agent_id,
+                context.permission_grant_digest,
+            )
+            if resolved is None:
+                return None
+            assignment, _grants = resolved
+            raw_contract = assignment.get("strategy_contract")
+            if not isinstance(raw_contract, (list, tuple)):
+                return None
+            try:
+                contract = dict(raw_contract)
+            except (TypeError, ValueError):
+                return None
+            generation_id = contract.get("target_reobservation_generation_id")
+            event_set_digest = contract.get("target_reobservation_event_set_digest")
+            if generation_id is None and event_set_digest is None:
+                return resolve_reviewed_api_adapter(campaign_id)
+            reviewed_adapter_json = contract.get("reviewed_adapter")
+            if (
+                not isinstance(generation_id, str)
+                or not generation_id.startswith("sha256:")
+                or not isinstance(event_set_digest, str)
+                or not event_set_digest.startswith("sha256:")
+                or not isinstance(reviewed_adapter_json, str)
+                or not reviewed_adapter_json
+                or len(reviewed_adapter_json) > 1_000_000
+                or context.target_reobservation_generation_id != generation_id
+                or context.target_reobservation_event_set_digest != event_set_digest
+                or contract.get("compiled_adapter") != context.compiled_adapter
+                or contract.get("compiled_adapter_digest") != context.compiled_adapter_digest
+                or contract.get("target_session_id") != context.expected_target_session_id
+                or assignment.get("target_profile_id") != context.target_id
+            ):
+                return None
+            try:
+                reviewed_adapter = json.loads(reviewed_adapter_json)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(reviewed_adapter, Mapping):
+                return None
+            reviewed_digest = assignment.get("reviewed_adapter_digest")
+            if (
+                not isinstance(reviewed_digest, str)
+                or executable_adapter_digest(reviewed_adapter) != reviewed_digest
+            ):
+                return None
+            return dict(reviewed_adapter)
+
         async def browser_bounds(_session_id: str) -> BrowserBounds:
             selected = next(
                 (item for item in await assessments.list_targets() if item["selected"]),
@@ -5237,6 +5300,7 @@ def build_backend(
             browser,
             browser_store,
             adapter_resolver=resolve_reviewed_api_adapter,
+            assignment_adapter_resolver=resolve_reviewed_browser_adapter,
             state_scope_store=api_sessions,
             checkpoint_store=campaign_store,
             checkpoint_vault=CredentialCheckpointVault(),
@@ -10337,7 +10401,18 @@ def build_backend(
                 not isinstance(expected_target_id, str) or not expected_target_id
             ):
                 raise ValueError("expected reviewed target identity is invalid")
-            adapter = {key: value for key, value in adapter.items() if key != "expected_target_id"}
+            expected_target_session_id = adapter.get("expected_target_session_id")
+            if expected_target_session_id is not None and (
+                not isinstance(expected_target_session_id, str)
+                or not expected_target_session_id
+                or len(expected_target_session_id) > 256
+            ):
+                raise ValueError("expected reviewed target session identity is invalid")
+            adapter = {
+                key: value
+                for key, value in adapter.items()
+                if key not in {"expected_target_id", "expected_target_session_id"}
+            }
             revalidated_after_restart = False
             if not _has_durable_handoff(adapter):
                 candidate = _compile_current_reviewed_adapter_state(adapter)
@@ -10349,6 +10424,13 @@ def build_backend(
                     raise ValueError("reviewed reconnaissance handoff is unavailable")
                 if expected_target_id is not None and handoff.target_id != expected_target_id:
                     raise ValueError("reviewed reconnaissance handoff belongs to another target")
+                if (
+                    expected_target_session_id is not None
+                    and f"browser:{handoff.context_id}" != expected_target_session_id
+                ):
+                    raise ValueError(
+                        "reviewed reconnaissance handoff belongs to another target session"
+                    )
                 if not _handoff_context_is_current(browser, handoff):
                     revalidated_after_restart = await _revalidate_handoff_cross_session(
                         browser, session_id, handoff

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from merlin_contracts import (
     LEGACY_TARGET_EXCHANGE_TOOL_IDS,
+    MAX_TARGET_SESSION_ID_LENGTH,
     AgentProgress,
     AgentSummary,
     AgentTask,
@@ -37,8 +38,11 @@ from merlin_contracts import (
     SwarmRequest,
     TextDelta,
     ToolCall,
+    ToolContext,
+    ToolEffectRecord,
     ToolInteractionRole,
     ToolResult,
+    ToolSpec,
     candidate_evidence_digest,
     candidate_id_for_identity,
     project_candidate_outcome,
@@ -133,6 +137,7 @@ from .swarm_snapshot import (
     SwarmSnapshot,
     project_swarm_snapshots,
 )
+from .target_reobservation import extract_target_reobservation_obligations
 from .telemetry import emit_judgment
 
 _MAX_PREDECESSOR_HANDOFF_BYTES = 24_000
@@ -329,9 +334,13 @@ def _canonical_agenda_unit(
     return tuple(ordered)
 
 
-def _uses_target_session(assignment: WorkerAssignment) -> bool:
+def _uses_target_session(
+    assignment: WorkerAssignment,
+    typed_target_tools: Collection[str] = (),
+) -> bool:
     return (
-        assignment.target_session_policy == "same-reviewed-session"
+        bool(typed_target_tools)
+        or assignment.target_session_policy == "same-reviewed-session"
         or any("browser" in tool for tool in assignment.tool_ids)
         or any(
             tool in {"target_chat", "target_request", "target_inject"}
@@ -340,8 +349,260 @@ def _uses_target_session(assignment: WorkerAssignment) -> bool:
     )
 
 
+def _target_admission_context(
+    live: _LiveSchedule,
+    assignment: WorkerAssignment,
+    target_effect_tools: Collection[str] = (),
+    target_exchange_tools: Collection[str] = (),
+) -> dict[str, object]:
+    """Project the bounded immutable assignment identity used by store admission fences."""
+
+    contract = dict(assignment.strategy_contract)
+    optional = {
+        key: value
+        for key in (
+            "target_session_id",
+            "generation_id",
+            "event_set_digest",
+            "compiled_adapter_digest",
+            "initial_state_equivalence_digest",
+            "target_reobservation_start_decision_id",
+            "target_reobservation_generation_id",
+            "target_reobservation_event_set_digest",
+        )
+        if isinstance((value := contract.get(key)), str) and value
+    }
+    return {
+        "schema": "merlin.target-admission.v1",
+        "campaign_id": _campaign_id_for_assignment(assignment.id),
+        "session_id": live.session_id,
+        "schedule_id": live.id,
+        "node_id": f"worker:{assignment.id}",
+        "assignment_id": assignment.id,
+        "target_id": assignment.target_profile_id,
+        "strategy_id": assignment.strategy_id,
+        "reviewed_adapter_digest": assignment.reviewed_adapter_digest,
+        "target_effect_tool_ids": tuple(sorted(set(target_effect_tools))),
+        "target_exchange_tool_ids": tuple(sorted(set(target_exchange_tools))),
+        **optional,
+    }
+
+
+_TARGET_SURFACE_MUTATION_TOOLS = frozenset({"browser_navigate", "browser_open_tab"})
+
+
+class _TargetAdmissionFencedTools:
+    """Apply the durable latch immediately before every target-effect invocation."""
+
+    def __init__(
+        self,
+        delegate: WorkerTools,
+        target_tools: Collection[str],
+        admit: Callable[[ToolEffectRecord, str | None], Awaitable[str]],
+    ) -> None:
+        self._delegate = delegate
+        self._target_tools = frozenset(target_tools)
+        self._admit = admit
+
+    def describe(self) -> Sequence[ToolSpec]:
+        return self._delegate.describe()
+
+    async def invoke(
+        self,
+        name: str,
+        context: ToolContext,
+        arguments: Mapping[str, object],
+    ) -> ToolResult:
+        effect_intent: ToolEffectRecord | None = None
+        effective_session_id: str | None = None
+        classifier = getattr(self._delegate, "effect", None)
+        effect = classifier(name) if callable(classifier) else None
+        if (
+            name in self._target_tools
+            or effect == "target_network"
+            or name in _TARGET_SURFACE_MUTATION_TOOLS
+        ):
+            try:
+                resolver = getattr(self._delegate, "resolve_target_session_id", None)
+                resolved_session_id: str | None = None
+                session_resolution_invalid = False
+                if callable(resolver):
+                    try:
+                        resolved_session_id = await resolver(name, context)
+                    except (TypeError, ValueError):
+                        session_resolution_invalid = True
+                expected_session_id = context.expected_target_session_id
+                for session_id in (resolved_session_id, expected_session_id):
+                    if session_id is not None and (
+                        not session_id
+                        or session_id != session_id.strip()
+                        or len(session_id) > MAX_TARGET_SESSION_ID_LENGTH
+                        or "\x00" in session_id
+                    ):
+                        session_resolution_invalid = True
+                if session_resolution_invalid or (
+                    resolved_session_id is None and expected_session_id is None
+                ):
+                    return ToolResult(
+                        content=("target session identity is unavailable before effect delivery"),
+                        is_error=True,
+                        metadata={
+                            "failure_code": "target_session_identity_unavailable",
+                            "retryable": False,
+                            "effect_applied": False,
+                            "target_effect_attempted": False,
+                            "interaction_count": 0,
+                            "target_call_budget_charge": 0,
+                            "limit_interaction_count": 0,
+                            "identity_field": "target_session_id",
+                        },
+                    )
+                if (
+                    resolved_session_id is not None
+                    and expected_session_id is not None
+                    and resolved_session_id != expected_session_id
+                ):
+                    return ToolResult(
+                        content="target session identity changed before effect delivery",
+                        is_error=True,
+                        metadata={
+                            "failure_code": "target_session_identity_mismatch",
+                            "retryable": False,
+                            "effect_applied": False,
+                            "target_effect_attempted": False,
+                            "interaction_count": 0,
+                            "target_call_budget_charge": 0,
+                            "limit_interaction_count": 0,
+                            "identity_field": "target_session_id",
+                            "expected_target_session_id": expected_session_id,
+                            "target_session_id": resolved_session_id,
+                        },
+                    )
+                effective_session_id = resolved_session_id or expected_session_id
+                context = context.model_copy(
+                    update={"expected_target_session_id": effective_session_id}
+                )
+                invoke_with_admission = getattr(self._delegate, "invoke_with_admission", None)
+                if not callable(invoke_with_admission):
+                    raise RuntimeError("target-effect tools require atomic broker admission")
+
+                async def admit_with_session(intent: ToolEffectRecord) -> str:
+                    nonlocal effect_intent
+                    effect_intent = intent
+                    return await self._admit(
+                        intent,
+                        effective_session_id,
+                    )
+
+                return await invoke_with_admission(
+                    name,
+                    context,
+                    arguments,
+                    admit_with_session,
+                )
+            except Exception as error:
+                if getattr(error, "target_admission_latched", False) is not True:
+                    raise
+                if (
+                    effect_intent is None
+                    or not isinstance(context.agent_id, str)
+                    or not context.agent_id
+                    or not isinstance(context.attempt_id, str)
+                    or not context.attempt_id
+                    or not isinstance(context.call_id, str)
+                    or not context.call_id
+                    or not isinstance(effective_session_id, str)
+                    or not effective_session_id
+                    or effect_intent.session_id != context.session_id
+                    or effect_intent.agent_id != context.agent_id
+                    or effect_intent.attempt_id != context.attempt_id
+                    or effect_intent.call_id != context.call_id
+                    or effect_intent.tool_name != name
+                ):
+                    raise RuntimeError(
+                        "target admission hold could not be attributed before dispatch"
+                    ) from error
+                raise _TargetAdmissionHeld(
+                    assignment_id=context.agent_id,
+                    attempt_id=context.attempt_id,
+                    technique_attempt_id=context.technique_attempt_id,
+                    tool_name=effect_intent.tool_name,
+                    call_id=context.call_id,
+                    failure_code="target_session_resolution_unavailable",
+                    target_session_id=effective_session_id,
+                ) from error
+        return await self._delegate.invoke(name, context, arguments)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+
+class _TargetAdmissionHeld(Exception):
+    """Attributed pre-dispatch hold after a target lane loses admission authority."""
+
+    def __init__(
+        self,
+        *,
+        assignment_id: str,
+        attempt_id: str | None,
+        technique_attempt_id: str | None,
+        tool_name: str,
+        call_id: str,
+        failure_code: str,
+        target_session_id: str,
+    ) -> None:
+        super().__init__("target admission held before effect dispatch")
+        self.assignment_id = assignment_id
+        self.attempt_id = attempt_id
+        self.technique_attempt_id = technique_attempt_id
+        self.tool_name = tool_name
+        self.call_id = call_id
+        self.failure_code = failure_code
+        self.target_session_id = target_session_id
+
+
+def _target_control_hold_marker(hold: _TargetAdmissionHeld) -> dict[str, object]:
+    """Authenticate the exact pre-dispatch identity consumed by runtime restoration."""
+
+    body: dict[str, object] = {
+        "schema": "merlin.target-control-hold.v1",
+        "assignment_id": hold.assignment_id,
+        "attempt_id": hold.attempt_id,
+        "technique_attempt_id": hold.technique_attempt_id,
+        "tool_name": hold.tool_name,
+        "call_id": hold.call_id,
+        "failure_code": hold.failure_code,
+        "target_session_id": hold.target_session_id,
+    }
+    return {
+        **body,
+        "receipt_sha256": WorkerRuntime._json_fingerprint(body),  # noqa: SLF001
+    }
+
+
+def _target_control_hold_projection(
+    hold: _TargetAdmissionHeld,
+    marker: Mapping[str, object],
+) -> dict[str, object]:
+    """Project a typed zero-dispatch result for scheduler and campaign reducers."""
+
+    return {
+        **dict(marker),
+        "task_id": hold.assignment_id,
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "target_call_ids": [],
+        "target_evidence": [],
+        "target_ui_transitions": [],
+    }
+
+
 def _target_session_lane_edges(
     assignments: Sequence[WorkerAssignment],
+    target_effect_tool_ids: Callable[[Collection[str]], Collection[str]],
 ) -> tuple[GraphEdge, ...]:
     """Build one canonical whole-lifetime resource graph per reviewed target."""
     target_assignments = tuple(
@@ -349,7 +610,10 @@ def _target_session_lane_edges(
         for assignment in assignments
         # A throwaway local scope is not proof of an independent physical
         # session. Probes own the same reviewed target resource until cleanup.
-        if _uses_target_session(assignment)
+        if _uses_target_session(
+            assignment,
+            target_effect_tool_ids(assignment.tool_ids),
+        )
     )
     edges: list[GraphEdge] = []
     for target_id in sorted({item.target_profile_id for item in target_assignments}):
@@ -461,7 +725,32 @@ class DurableSchedulerStore(Protocol):
         *,
         lease_expires_at: datetime,
         attempt_id: str | None = None,
+        target_admission: Mapping[str, object] | None = None,
     ) -> Any: ...
+
+    def final_target_effect_admitted(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        tool_name: str,
+        call_id: str,
+        target_admission: Mapping[str, object],
+        effect_intent: Mapping[str, object],
+    ) -> str: ...
+
+    def resolve_target_lane_recovery(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        target_admission: Mapping[str, object],
+        recovery: Mapping[str, object],
+    ) -> None: ...
 
     def heartbeat(self, attempt_id: str, generation: int, *, lease_expires_at: datetime) -> Any: ...
 
@@ -475,6 +764,8 @@ class DurableSchedulerStore(Protocol):
         checkpoint: dict[str, object],
         target_session_id: str | None = None,
         failure_kind: str | None = None,
+        terminal_result: Mapping[str, object] | None = None,
+        target_surface_transition: Mapping[str, object] | None = None,
     ) -> None: ...
 
     def retry_failed(
@@ -516,6 +807,7 @@ class DurableSchedulerStore(Protocol):
         messages: Sequence[tuple[str, str, str, dict[str, object]]] = (),
         applied_message_ids: Sequence[str] = (),
         target_session_id: str | None = None,
+        target_surface_transition: Mapping[str, object] | None = None,
     ) -> str: ...
     def commit_partial(
         self,
@@ -569,6 +861,8 @@ class DurableSchedulerStore(Protocol):
     ) -> None: ...
 
     def reject_schedule(self, schedule_id: str, *, reason: str) -> None: ...
+
+    def reconcile_cancelled_target_lanes(self, schedule_id: str) -> dict[str, tuple[str, ...]]: ...
 
     def pause_schedule(self, schedule_id: str, *, reason: str) -> None: ...
 
@@ -773,6 +1067,21 @@ class DurableAgentService:
         # Compatibility for test doubles and third-party tools authored before roles.
         return tuple(
             name for name in names if name in declared or name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+        )
+
+    def target_effect_tool_ids(self, names: Collection[str]) -> tuple[str, ...]:
+        """Resolve every tool that can mutate or dispatch to the reviewed target."""
+
+        candidates = tuple(names)
+        exchanges = frozenset(self.target_exchange_tool_ids(candidates))
+        classifier = getattr(self._tools, "effect", None)
+        return tuple(
+            name
+            for name in candidates
+            if name in exchanges
+            or name in _TARGET_SURFACE_MUTATION_TOOLS
+            or callable(classifier)
+            and classifier(name) == "target_network"
         )
 
     async def detach(self) -> None:
@@ -1039,6 +1348,29 @@ class DurableAgentService:
             await self._execute(live, max_workers)
 
         live.execution = asyncio.create_task(start())
+
+    async def activate_target_admission(self, value: Mapping[str, object]) -> str:
+        activator = getattr(self._store, "activate_target_admission", None)
+        if not callable(activator):
+            raise RuntimeError("scheduler store cannot activate refreshed target admission")
+        return str(await self._call(activator, value))
+
+    async def current_target_admission_latches(
+        self, campaign_id: str, session_id: str, target_id: str
+    ) -> tuple[Mapping[str, object], ...]:
+        loader = getattr(self._store, "current_target_admission_latches", None)
+        if not callable(loader):
+            raise RuntimeError("scheduler store cannot project target admission latches")
+        rows = await self._call(loader, campaign_id, session_id, target_id)
+        if not isinstance(rows, (list, tuple)) or any(not isinstance(row, Mapping) for row in rows):
+            raise RuntimeError("scheduler returned an invalid target admission projection")
+        return tuple(rows)
+
+    async def resolve_target_admission_terminal(self, value: Mapping[str, object]) -> str:
+        resolver = getattr(self._store, "resolve_target_admission_terminal", None)
+        if not callable(resolver):
+            raise RuntimeError("scheduler store cannot resolve refreshed target admission")
+        return str(await self._call(resolver, value))
 
     async def reopen(self, schedule_id: str, *, resume_execution: bool = True) -> _LiveSchedule:
         existing = self._live.get(schedule_id)
@@ -1534,12 +1866,24 @@ class DurableAgentService:
                         "retryable": False,
                     }
                     effects = ()
+        schedule = await self._call(self._store.load_schedule, schedule_id)
+        # The authoritative projection must fail closed if its schedule lost
+        # the session binding. Static callers may still omit the expectation
+        # when validating isolated historical fixtures.
+        expected_session_id = (
+            str(schedule["session_id"])
+            if isinstance(schedule, Mapping)
+            and isinstance(schedule.get("session_id"), str)
+            and str(schedule["session_id"]).strip()
+            else ""
+        )
         evidence = self._committed_task_evidence(
             schedule_id,
             task,
             row,
             durable_effects=effects,
             evidence_attempt_ids=evidence_attempt_ids,
+            expected_session_id=expected_session_id,
         )
         if evidence is None or effect_projection_error is None:
             return evidence
@@ -1550,9 +1894,7 @@ class DurableAgentService:
         # infrastructure limitation instead of making incomplete history look
         # like an ordinary effect-free completion.
         non_authoritative = {
-            key: value
-            for key, value in evidence.items()
-            if key not in {"digest", "reference"}
+            key: value for key, value in evidence.items() if key not in {"digest", "reference"}
         }
         return {
             **non_authoritative,
@@ -1571,6 +1913,7 @@ class DurableAgentService:
         *,
         durable_effects: Sequence[object] = (),
         evidence_attempt_ids: Sequence[str] = (),
+        expected_session_id: str | None = None,
     ) -> Mapping[str, object] | None:
         node_id = f"worker:{task.id}"
         if row is None or _result_text(row) != task.result:
@@ -1617,8 +1960,7 @@ class DurableAgentService:
             and not any(
                 later_result_index > result_index
                 and (
-                    later_tool
-                    in (LEGACY_TARGET_EXCHANGE_TOOL_IDS | _GENERIC_BROWSER_EFFECT_TOOLS)
+                    later_tool in (LEGACY_TARGET_EXCHANGE_TOOL_IDS | _GENERIC_BROWSER_EFFECT_TOOLS)
                     or later_call_id in durable_typed_target_ids
                 )
                 for later_call_id, (_, later_result_index, later_tool) in ordered_tool_pairs.items()
@@ -1714,6 +2056,8 @@ class DurableAgentService:
             content_bytes=content_bytes,
             compacted_content_hashes=compacted_content_hashes,
             compacted_content_bytes=compacted_content_bytes,
+            durable_effects=durable_effects,
+            expected_session_id=expected_session_id,
         )
         target_ui_transition_receipts = {
             call_id: receipt
@@ -1866,6 +2210,7 @@ class DurableAgentService:
                 receipt_transition is not None
                 and (
                     getattr(effect, "effect", None) != "target_network"
+                    or getattr(effect, "session_id", None) != receipt.get("session_id")
                     or not isinstance(metadata, Mapping)
                     or metadata.get("target_session_id") != receipt.get("target_session_id")
                     or normalize_target_ui_transition(metadata) != receipt_transition
@@ -1938,6 +2283,7 @@ class DurableAgentService:
                 or getattr(effect, "agent_id", None) != task.id
                 or str(getattr(effect, "attempt_id", "")) != receipt.get("attempt_id")
                 or getattr(effect, "campaign_id", None) != receipt.get("campaign_id")
+                or getattr(effect, "session_id", None) != receipt.get("session_id")
                 or getattr(effect, "target_id", None) != receipt.get("target_id")
                 or getattr(effect, "tool_name", None) != receipt.get("tool_name")
                 or not isinstance(arguments, Mapping)
@@ -2067,6 +2413,9 @@ class DurableAgentService:
         )
         if isinstance(infrastructure_category, str) and infrastructure_category:
             evidence["infrastructure_failure_category"] = infrastructure_category
+        error_code = payload.get("error_code") if isinstance(payload, Mapping) else None
+        if isinstance(error_code, str) and error_code:
+            evidence["error_code"] = error_code
         structured_result = payload.get("structured") if isinstance(payload, Mapping) else None
         if isinstance(structured_result, Mapping):
             evidence["structured_result"] = dict(structured_result)
@@ -2585,19 +2934,20 @@ class DurableAgentService:
         state = live.scheduler.status(node_id)
         if state in {NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.CANCELED}:
             raise ValueError(f"task is already terminal: {task_id}")
-        if control := live.controls.get(node_id):
-            control.cancel()
-            return node_id
         checkpoint = live.scheduler.checkpoint()
         tick = int(checkpoint.get("last_tick", 0)) + 1
         live.scheduler.cancel(node_id, "operator-task-cancel", tick)
-        await self._call(
+        applied = await self._call(
             self._store.cancel_node,
             schedule_id,
             node_id,
             reason="operator-task-cancel",
             checkpoint=live.scheduler.checkpoint(),
         )
+        if not applied:
+            return node_id
+        if control := live.controls.get(node_id):
+            control.cancel()
         await self._ready(live, live.scheduler.ready_nodes())
         live.circuit_wake.set()
         return node_id
@@ -2805,11 +3155,42 @@ class DurableAgentService:
             execution.cancel()
             await asyncio.gather(execution, return_exceptions=True)
             live.execution = None
+        await self._reconcile_cancelled_target_lanes(live.id)
         await self._run_cleanup(live, tick + 1)
 
     async def reject_persisted_schedule(self, schedule_id: str, *, reason: str) -> None:
         """Terminalize an unreadable schedule without hydrating obsolete runtime objects."""
         await self._call(self._store.reject_schedule, schedule_id, reason=reason)
+        await self._reconcile_cancelled_target_lanes(schedule_id)
+
+    async def _reconcile_cancelled_target_lanes(
+        self, schedule_id: str
+    ) -> dict[str, tuple[str, ...]]:
+        """Adopt or retain cancelled target lanes from durable permit/effect authority."""
+
+        reconciler = getattr(self._store, "reconcile_cancelled_target_lanes", None)
+        if not callable(reconciler):
+            raise RuntimeError("scheduler store cannot reconcile cancelled target-effect lanes")
+        raw = await self._call(reconciler, schedule_id)
+        categories = ("released", "held", "latched")
+        if not isinstance(raw, Mapping) or set(raw) != set(categories):
+            raise RuntimeError("cancelled target-lane reconciliation is malformed")
+        projected: dict[str, tuple[str, ...]] = {}
+        seen: set[str] = set()
+        for category in categories:
+            values = raw[category]
+            if not isinstance(values, (list, tuple)):
+                raise RuntimeError("cancelled target-lane reconciliation is malformed")
+            normalized = tuple(values)
+            if any(not isinstance(value, str) or not value for value in normalized):
+                raise RuntimeError("cancelled target-lane reconciliation is malformed")
+            if len(set(normalized)) != len(normalized) or seen.intersection(normalized):
+                raise RuntimeError("cancelled target-lane reconciliation is ambiguous")
+            seen.update(normalized)
+            projected[category] = normalized
+        if len(seen) > 256:
+            raise RuntimeError("cancelled target-lane reconciliation exceeds its bound")
+        return projected
 
     async def request_child(self, request: ChildSwarmRequest) -> ScheduleProjection:
         parent = self._live.get(request.parent_schedule_id)
@@ -3609,34 +3990,41 @@ class DurableAgentService:
             concurrency.record_other_outcome()
         if result.status == "completed":
             live.scheduler.complete(handle, result.content, tick)
+            committed_payload = {
+                "content": result.content,
+                "structured": result.structured,
+                "evaluation_uncertainties": result.evaluation_uncertainties,
+                "reasoning": result.reasoning,
+                "warnings": result.warnings,
+                "usage": result.usage,
+                "target_session_id": result.target_session_id,
+                "target_id": assignment.target_profile_id,
+                "turns_completed": (result.checkpoint or {}).get("turns_completed", 0),
+                "terminal_prompt_digest": (result.checkpoint or {}).get("terminal_prompt_digest"),
+                "terminal_prompt_state": (result.checkpoint or {}).get(
+                    "terminal_prompt_state", "incomplete"
+                ),
+                "provider_id": assignment.provider_id,
+                "provider_model": assignment.provider_model or self._model,
+                "provider_capabilities": _assignment_capability_pin(assignment, self._provider),
+                "provider_pricing": _assignment_pricing_pin(assignment),
+                "worker_checkpoint": result.checkpoint,
+                "infrastructure_failure_category": result.infrastructure_failure_category,
+            }
+            target_surface_transition = await self._authenticated_target_surface_transition(
+                live,
+                assignment,
+                lease,
+                payload=committed_payload,
+                result_text=result.content,
+            )
             digest = await self._commit(
                 live,
                 lease,
-                {
-                    "content": result.content,
-                    "structured": result.structured,
-                    "evaluation_uncertainties": result.evaluation_uncertainties,
-                    "reasoning": result.reasoning,
-                    "warnings": result.warnings,
-                    "usage": result.usage,
-                    "target_session_id": result.target_session_id,
-                    "target_id": assignment.target_profile_id,
-                    "turns_completed": (result.checkpoint or {}).get("turns_completed", 0),
-                    "terminal_prompt_digest": (result.checkpoint or {}).get(
-                        "terminal_prompt_digest"
-                    ),
-                    "terminal_prompt_state": (result.checkpoint or {}).get(
-                        "terminal_prompt_state", "incomplete"
-                    ),
-                    "provider_id": assignment.provider_id,
-                    "provider_model": assignment.provider_model or self._model,
-                    "provider_capabilities": _assignment_capability_pin(assignment, self._provider),
-                    "provider_pricing": _assignment_pricing_pin(assignment),
-                    "worker_checkpoint": result.checkpoint,
-                    "infrastructure_failure_category": (result.infrastructure_failure_category),
-                },
+                committed_payload,
                 "schema/result",
                 applied_message_ids=applied_message_ids,
+                target_surface_transition=target_surface_transition,
             )
             if digest is None:
                 return
@@ -3720,6 +4108,10 @@ class DurableAgentService:
                 reason = result.error or (
                     "material target surface transition requires Lead/operator re-observation"
                 )
+            elif result.error_code == "target_admission_latched":
+                reason = result.error or (
+                    "target-effect delivery is held pending authenticated surface recovery"
+                )
             elif result.infrastructure_failure_category is not None:
                 reason = (
                     "infrastructure unavailable "
@@ -3731,12 +4123,13 @@ class DurableAgentService:
                 # provider rejection, not a bare ambiguous gate.
                 reason = f"provider rejected the request ({result.error_code}): {reason}"
             commit_partial = getattr(self._store, "commit_partial", None)
+            terminal_result: dict[str, object] | None = None
             if commit_partial is not None and (
                 result.content
                 or result.reasoning
                 or result.usage
                 or result.infrastructure_failure_category
-                or result.error_code == "target_surface_disrupted"
+                or result.error_code in {"target_surface_disrupted", "target_admission_latched"}
             ):
                 stored_worker_checkpoint = await self._latest_worker_checkpoint(
                     live.id, handle.node_id
@@ -3761,35 +4154,36 @@ class DurableAgentService:
                     # rows. The terminal worker result still carries the exact
                     # receipt/evaluation checkpoint that must survive settlement.
                     worker_checkpoint = result.checkpoint
-                try:
-                    await self._call(
-                        commit_partial,
-                        lease.id,
-                        lease.generation,
-                        result={
-                            "content": result.content,
-                            "structured": result.structured,
-                            "reasoning": result.reasoning,
-                            "warnings": result.warnings,
-                            "evaluation_uncertainties": result.evaluation_uncertainties,
-                            "usage": result.usage,
-                            "error": reason,
-                            "partial": True,
-                            "target_id": assignment.target_profile_id,
-                            "target_session_id": result.target_session_id,
-                            "infrastructure_failure_category": (
-                                result.infrastructure_failure_category
-                            ),
-                            "retry_failure_kind": failure_kind.value,
-                            "worker_checkpoint": worker_checkpoint,
-                        },
-                    )
-                except Exception as error:
-                    # Durable cancellation is authoritative. A late partial
-                    # commit for a cancelled attempt is already superseded by
-                    # the cancellation journal and must not fail the schedule.
-                    if not await self._attempt_was_cancelled(live.id, lease, error):
-                        raise
+                terminal_result = {
+                    "content": result.content,
+                    "structured": result.structured,
+                    "reasoning": result.reasoning,
+                    "warnings": result.warnings,
+                    "evaluation_uncertainties": result.evaluation_uncertainties,
+                    "usage": result.usage,
+                    "error": reason,
+                    "partial": True,
+                    "target_id": assignment.target_profile_id,
+                    "target_session_id": result.target_session_id,
+                    "error_code": result.error_code,
+                    "infrastructure_failure_category": result.infrastructure_failure_category,
+                    "retry_failure_kind": failure_kind.value,
+                    "worker_checkpoint": worker_checkpoint,
+                }
+                if result.error_code != "target_surface_disrupted":
+                    try:
+                        await self._call(
+                            commit_partial,
+                            lease.id,
+                            lease.generation,
+                            result=terminal_result,
+                        )
+                    except Exception as error:
+                        # Durable cancellation is authoritative. A late partial
+                        # commit for a cancelled attempt is already superseded by
+                        # the cancellation journal and must not fail the schedule.
+                        if not await self._attempt_was_cancelled(live.id, lease, error):
+                            raise
             retry_class = RetryClass(result.retry_class or RetryClass.FRESH_WORKER)
             if (
                 result.status == "failed"
@@ -3847,6 +4241,17 @@ class DurableAgentService:
                 if retry is handle:
                     live.scheduler.fail(handle, reason, tick)
                 outcome = "failed"
+            target_surface_transition = (
+                await self._authenticated_target_surface_transition(
+                    live,
+                    assignment,
+                    lease,
+                    payload=terminal_result,
+                    result_text=result.content,
+                )
+                if terminal_result is not None and result.error_code == "target_surface_disrupted"
+                else None
+            )
             await self._call(
                 self._store.settle_attempt,
                 lease.id,
@@ -3856,6 +4261,20 @@ class DurableAgentService:
                 checkpoint=live.scheduler.checkpoint(),
                 target_session_id=result.target_session_id,
                 failure_kind=failure_kind.value,
+                **(
+                    {"terminal_result": terminal_result}
+                    if terminal_result is not None
+                    and result.error_code == "target_admission_latched"
+                    else {}
+                ),
+                **(
+                    {
+                        "terminal_result": terminal_result,
+                        "target_surface_transition": target_surface_transition,
+                    }
+                    if target_surface_transition is not None
+                    else {}
+                ),
             )
             await self._deliver_settlement(
                 live,
@@ -3888,6 +4307,16 @@ class DurableAgentService:
                     )
                 await self._retry_failed_node(live, handle.node_id)
             elif technique_attempt_id is not None:
+                if result.error_code == "target_admission_latched":
+                    terminalizer = getattr(self._store, "terminalize_technique_attempt", None)
+                    if terminalizer is not None:
+                        await self._call(
+                            terminalizer,
+                            technique_attempt_id,
+                            "cancelled",
+                            reason=reason,
+                        )
+                    return
                 receipt_projection = _nonvalid_attempt_receipt_projection(
                     worker_checkpoint or {}, technique_attempt_id
                 )
@@ -4251,9 +4680,7 @@ class DurableAgentService:
                             ),
                             error_code="target_effect_ambiguous",
                             retry_class=RetryClass.TERMINAL.value,
-                            infrastructure_failure_category=(
-                                "effect_reconciliation_required"
-                            ),
+                            infrastructure_failure_category=("effect_reconciliation_required"),
                         ),
                         None,
                     )
@@ -4511,7 +4938,10 @@ class DurableAgentService:
         concurrency = _AdaptiveConcurrency(max_workers)
         target_capacities: dict[str, int] = {}
         for assignment in live.assignments:
-            if _uses_target_session(assignment):
+            if _uses_target_session(
+                assignment,
+                self.target_effect_tool_ids(assignment.tool_ids),
+            ):
                 capacity = assignment.target_session_capacity or 1
                 target_capacities[assignment.target_profile_id] = min(
                     target_capacities.get(assignment.target_profile_id, capacity), capacity
@@ -4535,8 +4965,37 @@ class DurableAgentService:
                     return None
                 handle = live.scheduler.claim(node_id, node_id, next_tick())
                 try:
-                    lease = await self._claim(live, handle)
+                    lease = await self._claim(live, handle, assignment)
                 except Exception as error:
+                    if getattr(error, "target_lane_recovery_required", False) is True:
+                        # A cancelled/expired predecessor still owns an
+                        # unresolved target-effect intent. Storage performs
+                        # the authoritative reconciliation on each claim; the
+                        # successor remains READY and retries only after a
+                        # bounded control-plane wait. This is not an attack or
+                        # infrastructure outcome.
+                        await asyncio.sleep(max(0.01, min(0.25, self._lease_seconds / 3)))
+                        return None
+                    if getattr(error, "target_admission_latched", False) is True:
+                        reason = "stale target assignment retired after a surface transition"
+                        live.scheduler.cancel(node_id, reason, next_tick())
+                        cancel_node = getattr(self._store, "cancel_node", None)
+                        if not callable(cancel_node):
+                            raise RuntimeError(
+                                "target admission latch requires durable node retirement"
+                            ) from error
+                        await self._call(
+                            cancel_node,
+                            live.id,
+                            node_id,
+                            reason=reason,
+                            checkpoint=live.scheduler.checkpoint(),
+                            idempotency_key=(
+                                "target-admission-retired/"
+                                + hashlib.sha256(f"{live.id}\n{node_id}".encode()).hexdigest()
+                            ),
+                        )
+                        return None
                     # A drain may win between local selection and the durable
                     # claim. This worker never owned an attempt; keep siblings
                     # running instead of failing the entire executor.
@@ -4889,9 +5348,54 @@ class DurableAgentService:
                             else min(worker_seconds, remaining_seconds)
                         )
 
+                    target_admission = _target_admission_context(
+                        live,
+                        assignment,
+                        self.target_effect_tool_ids(assignment.tool_ids),
+                        self.target_exchange_tool_ids(assignment.tool_ids),
+                    )
+
+                    async def admit_target_effect(
+                        effect_intent: ToolEffectRecord,
+                        expected_target_session_id: str | None,
+                    ) -> str:
+                        admitter = getattr(self._store, "final_target_effect_admitted", None)
+                        if not callable(admitter):
+                            raise RuntimeError(
+                                "target-capable execution requires a durable final-effect fence"
+                            )
+                        admission = dict(target_admission)
+                        if expected_target_session_id is not None:
+                            admission["target_session_id"] = expected_target_session_id
+                        return str(
+                            await self._call(
+                                admitter,
+                                live.id,
+                                f"worker:{assignment.id}",
+                                str(lease.id),
+                                int(lease.generation),
+                                tool_name=effect_intent.tool_name,
+                                call_id=effect_intent.call_id,
+                                target_admission=admission,
+                                effect_intent=effect_intent.model_dump(mode="json"),
+                            )
+                        )
+
+                    runtime_tools: WorkerTools = (
+                        _TargetAdmissionFencedTools(
+                            self._tools,
+                            self.target_effect_tool_ids(assignment.tool_ids),
+                            admit_target_effect,
+                        )
+                        if _uses_target_session(
+                            assignment,
+                            self.target_effect_tool_ids(assignment.tool_ids),
+                        )
+                        else self._tools
+                    )
                     runtime = WorkerRuntime(
                         self._provider,
-                        self._tools,
+                        runtime_tools,
                         heartbeat=heartbeat,
                         authorize_provider=authorize_provider,
                         max_model_turns=(
@@ -5248,21 +5752,27 @@ class DurableAgentService:
                             )
                         )
                     )
-                    if len(replacement_lineage) > _DURABLE_EFFECT_LINEAGE_LIMIT:
+                    replacement_lineage = tuple(
+                        str(attempt_id) for attempt_id in replacement_lineage
+                    )
+                    lineage_invalid = (
+                        not replacement_lineage
+                        or replacement_lineage[-1] != str(lease.id)
+                        or len(set(replacement_lineage)) != len(replacement_lineage)
+                    )
+                    if lineage_invalid or len(replacement_lineage) > _DURABLE_EFFECT_LINEAGE_LIMIT:
                         inherited_transition = (
                             None,
                             WorkerResult(
                                 task_id=assignment.id,
                                 status="quarantined",
                                 error=(
-                                    "durable effect replacement lineage exceeds the recovery "
-                                    "bound"
+                                    "durable effect replacement lineage is incomplete, cyclic, "
+                                    "or exceeds the recovery bound"
                                 ),
                                 error_code="target_effect_reconciliation_overflow",
                                 retry_class=RetryClass.TERMINAL.value,
-                                infrastructure_failure_category=(
-                                    "effect_reconciliation_required"
-                                ),
+                                infrastructure_failure_category=("effect_reconciliation_required"),
                             ),
                             None,
                         )
@@ -5299,8 +5809,70 @@ class DurableAgentService:
                             (),
                             inherited_technique_attempt_id,
                         )
+                    recovered_target_lane = False
+                    if getattr(lease, "lane_recovery_required", False) is True:
+                        prior_attempt_id = getattr(lease, "replaced_attempt_id", None)
+                        if (
+                            not isinstance(prior_attempt_id, str)
+                            or not prior_attempt_id
+                            or tuple(str(item) for item in replacement_lineage)[-1:]
+                            != (str(lease.id),)
+                            or prior_attempt_id not in replacement_lineage[:-1]
+                        ):
+                            raise RuntimeError(
+                                "target lane recovery has no exact replacement lineage"
+                            )
+                        effect_loader = getattr(self._tools, "list_effects_for_attempt", None)
+                        resolver = getattr(self._store, "resolve_target_lane_recovery", None)
+                        if not callable(effect_loader) or not callable(resolver):
+                            raise RuntimeError(
+                                "target lane recovery requires durable effect adoption"
+                            )
+                        recovery_effect_ids: list[str] = []
+                        for ancestor_attempt_id in replacement_lineage[:-1]:
+                            for effect in await effect_loader(ancestor_attempt_id):
+                                effect_id = getattr(effect, "idempotency_key", None)
+                                if not isinstance(effect_id, str) or not effect_id:
+                                    raise RuntimeError(
+                                        "target lane recovery found an unbound durable effect"
+                                    )
+                                recovery_effect_ids.append(effect_id)
+                                if len(recovery_effect_ids) > 256:
+                                    raise RuntimeError(
+                                        "target lane recovery effect history exceeds the "
+                                        "durable bound"
+                                    )
+                        recovery_body: dict[str, object] = {
+                            "schema": "merlin.target-lane-recovery.v1",
+                            "prior_attempt_id": prior_attempt_id,
+                            "effect_ids": sorted(set(recovery_effect_ids)),
+                            "outcome": "no_material_transition",
+                        }
+                        recovery = {
+                            **recovery_body,
+                            "recovery_digest": "sha256:"
+                            + hashlib.sha256(
+                                json.dumps(
+                                    recovery_body,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode()
+                            ).hexdigest(),
+                        }
+                        await self._call(
+                            resolver,
+                            live.id,
+                            node_id,
+                            str(lease.id),
+                            int(lease.generation),
+                            target_admission=target_admission,
+                            recovery=recovery,
+                        )
+                        recovered_target_lane = True
                     effect_attempt_lineage = (
-                        ()
+                        replacement_lineage
+                        if recovered_target_lane
+                        else ()
                         if assignment.execution_stage is None
                         and assignment.strategy_id not in {"crescendo", "goat", "hydra-select"}
                         and not _is_capability_probe(assignment)
@@ -5323,32 +5895,62 @@ class DurableAgentService:
                         # broker's generic different-action replacement guard mistake
                         # earlier acknowledged GOAT turns for this new fixed-K turn.
                         effect_attempt_lineage = (lease.id,)
-                    result = await runtime.run(
-                        WorkerHandoff(
-                            live.session_id,
-                            self._workspace_root,
-                            pinned_model,
-                            profile,
-                            assignment,
-                            portable_memory,
-                            worker_context,
-                            str(lease.id),
-                            expected_tool,
-                            expected_digest,
-                            expected_sequence,
-                            target_effects_blocked,
-                            effect_attempt_lineage,
-                            technique_attempt_id,
-                            (
-                                CompletionCandidateIdentity(**candidate_identity)
-                                if candidate_identity is not None
-                                else None
+                    try:
+                        result = await runtime.run(
+                            WorkerHandoff(
+                                live.session_id,
+                                self._workspace_root,
+                                pinned_model,
+                                profile,
+                                assignment,
+                                portable_memory,
+                                worker_context,
+                                str(lease.id),
+                                expected_tool,
+                                expected_digest,
+                                expected_sequence,
+                                target_effects_blocked,
+                                effect_attempt_lineage,
+                                technique_attempt_id,
+                                (
+                                    CompletionCandidateIdentity(**candidate_identity)
+                                    if candidate_identity is not None
+                                    else None
+                                ),
+                                schedule_id=live.id,
                             ),
-                            schedule_id=live.id,
-                        ),
-                        control,
-                        checkpoint=restored_checkpoint,
-                    )
+                            control,
+                            checkpoint=restored_checkpoint,
+                        )
+                    except _TargetAdmissionHeld as hold:
+                        # The lease was valid when the worker started, but a
+                        # sibling then authenticated a material target-surface
+                        # transition.  This is a typed control-plane hold: it is
+                        # neither an attack outcome nor infrastructure failure,
+                        # and the stale worker must not be retried.
+                        hold_marker = _target_control_hold_marker(hold)
+                        hold_checkpoint = dict(restored_checkpoint or {})
+                        hold_checkpoint["target_session_id"] = hold.target_session_id
+                        hold_checkpoint["target_control_hold"] = hold_marker
+                        await checkpoint_writer(hold_checkpoint, ())
+                        result = WorkerResult(
+                            task_id=assignment.id,
+                            status="cancelled",
+                            structured={
+                                "control_plane_hold": _target_control_hold_projection(
+                                    hold,
+                                    hold_marker,
+                                )
+                            },
+                            error=(
+                                "target admission held after an authenticated surface transition"
+                            ),
+                            error_code="target_admission_latched",
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category=None,
+                            checkpoint=hold_checkpoint,
+                            target_session_id=hold.target_session_id,
+                        )
                     if delivery_tools and circuit_scope is not None:
                         if result.error_code == "target_adapter_unhealthy":
                             await self._call(
@@ -5442,7 +6044,12 @@ class DurableAgentService:
                     break
                 target_id = assignment.target_profile_id
                 capacity = (
-                    target_capacities.get(target_id) if _uses_target_session(assignment) else None
+                    target_capacities.get(target_id)
+                    if _uses_target_session(
+                        assignment,
+                        self.target_effect_tool_ids(assignment.tool_ids),
+                    )
+                    else None
                 )
                 if capacity is not None and occupied_lanes.get(target_id, 0) >= capacity:
                     # Also protect restored graphs created before probes used
@@ -5661,7 +6268,26 @@ class DurableAgentService:
             return None
         return checkpoint if isinstance(checkpoint, dict) else None
 
-    async def _claim(self, live: _LiveSchedule, handle: Any) -> Any:
+    async def _claim(
+        self,
+        live: _LiveSchedule,
+        handle: Any,
+        assignment: WorkerAssignment | None = None,
+    ) -> Any:
+        target_admission = (
+            _target_admission_context(
+                live,
+                assignment,
+                self.target_effect_tool_ids(assignment.tool_ids),
+                self.target_exchange_tool_ids(assignment.tool_ids),
+            )
+            if assignment is not None
+            and _uses_target_session(
+                assignment,
+                self.target_effect_tool_ids(assignment.tool_ids),
+            )
+            else None
+        )
         try:
             lease = await self._call(
                 self._store.claim,
@@ -5669,6 +6295,7 @@ class DurableAgentService:
                 handle.node_id,
                 handle.owner_id,
                 lease_expires_at=self._expiry(),
+                **({"target_admission": target_admission} if target_admission is not None else {}),
             )
         except Exception:
             # The durable claim never landed, so the in-memory claim must not
@@ -5686,6 +6313,7 @@ class DurableAgentService:
         schema: str,
         *,
         applied_message_ids: Sequence[str] = (),
+        target_surface_transition: Mapping[str, object] | None = None,
     ) -> str | None:
         try:
             return await self._call(
@@ -5699,11 +6327,84 @@ class DurableAgentService:
                 target_session_id=result.get("target_session_id")
                 if isinstance(result.get("target_session_id"), str)
                 else None,
+                **(
+                    {"target_surface_transition": target_surface_transition}
+                    if target_surface_transition is not None
+                    else {}
+                ),
             )
         except Exception as error:
             if not await self._attempt_was_cancelled(live.id, lease, error):
                 raise
+            try:
+                await self._reconcile_cancelled_target_lanes(live.id)
+            except Exception:
+                # Cancellation already fenced the attempt. Reconciliation is
+                # fail-closed in storage, so a transient control-plane failure
+                # must not turn this late result into an attack/infra outcome.
+                pass
             return None
+
+    async def _authenticated_target_surface_transition(
+        self,
+        live: _LiveSchedule,
+        assignment: WorkerAssignment,
+        lease: Any,
+        *,
+        payload: Mapping[str, object],
+        result_text: str,
+    ) -> Mapping[str, object] | None:
+        """Authenticate one transition before the atomic terminal store mutation."""
+
+        lineage = (str(lease.id),)
+        lineage_loader = getattr(self._store, "replacement_attempt_lineage", None)
+        if callable(lineage_loader):
+            loaded = tuple(str(item) for item in await self._call(lineage_loader, lease.id))
+            if loaded and loaded[-1] == str(lease.id):
+                lineage = loaded
+        effect_loader = getattr(self._tools, "list_effects_for_attempt", None)
+        if not callable(effect_loader):
+            return None
+        effects: list[object] = []
+        for attempt_id in lineage:
+            effects.extend(await effect_loader(attempt_id))
+        task = AgentTask(
+            id=assignment.id,
+            objective=assignment.objective,
+            status="completed",
+            agent_id=f"worker:{assignment.id}",
+            result=result_text,
+            technique_ids=assignment.technique_ids,
+        )
+        evidence = self._committed_task_evidence(
+            live.id,
+            task,
+            {
+                "attempt_id": str(lease.id),
+                "payload_digest": "sha256:" + hashlib.sha256(result_text.encode()).hexdigest(),
+                "payload": dict(payload),
+            },
+            durable_effects=tuple(effects),
+            evidence_attempt_ids=lineage,
+        )
+        if evidence is None:
+            return None
+        obligations = extract_target_reobservation_obligations(
+            campaign_id=_campaign_id_for_assignment(assignment.id),
+            session_id=live.session_id,
+            target_id=assignment.target_profile_id,
+            source_schedule_id=live.id,
+            source_wave=0,
+            task_ids=(assignment.id,),
+            evidence={assignment.id: evidence},
+        )
+        if len(obligations) > 1:
+            raise RuntimeError("one terminal target effect produced multiple transition events")
+        return (
+            obligations[0].observed_payload(obligations[0].campaign_id, obligations[0].target_id)
+            if obligations
+            else None
+        )
 
     async def _attempt_was_cancelled(self, schedule_id: str, lease: Any, error: Exception) -> bool:
         if type(error).__name__ != "StaleLeaseError":
@@ -6750,7 +7451,10 @@ class DurableAgentService:
             for item in baseline_assignments
             if item.predecessor_assignment_id is not None
         )
-        target_session_serialization = _target_session_lane_edges(assignments)
+        target_session_serialization = _target_session_lane_edges(
+            assignments,
+            self.target_effect_tool_ids,
+        )
         # Serialization chains are computed independently, so the same worker
         # pair can be claimed twice (e.g. an adaptive API-session worker that
         # is also a browser specialist). Parallel edges carry no extra
@@ -8171,6 +8875,8 @@ def _validated_target_evidence_receipts(
     content_bytes: Mapping[str, int | None],
     compacted_content_hashes: Mapping[str, str] | None = None,
     compacted_content_bytes: Mapping[str, int | None] | None = None,
+    durable_effects: Sequence[object] = (),
+    expected_session_id: str | None = None,
 ) -> dict[str, Mapping[str, object]]:
     """Authenticate compact target-effect receipts against their durable assignment."""
     # The runtime may append bounded-finalization or loop guidance to the tool
@@ -8184,7 +8890,7 @@ def _validated_target_evidence_receipts(
         if task.id.startswith("campaign/")
         else task.id.rsplit("/", 1)[0]
     )
-    expected_session_id = payload.get("target_session_id")
+    expected_target_session_id = payload.get("target_session_id")
     checkpoint = payload.get("worker_checkpoint")
     expected_technique_attempt_id = (
         checkpoint.get("technique_attempt_id") if isinstance(checkpoint, Mapping) else None
@@ -8235,7 +8941,7 @@ def _validated_target_evidence_receipts(
             or item.get("attempt_id") not in valid_attempt_ids
             or item.get("technique_attempt_id") != expected_technique_attempt_id
             or item.get("target_id") != payload.get("target_id")
-            or item.get("target_session_id") != expected_session_id
+            or item.get("target_session_id") != expected_target_session_id
             or not isinstance(item.get("content_bytes"), int)
             or isinstance(item.get("content_bytes"), bool)
             or int(item["content_bytes"]) < 0
@@ -8249,6 +8955,48 @@ def _validated_target_evidence_receipts(
             and request_hashes[call_id] != item.get("request_sha256")
         ):
             continue
+        receipt_session_id = item.get("session_id")
+        if isinstance(receipt_session_id, str) and receipt_session_id.strip():
+            if expected_session_id is not None and receipt_session_id != expected_session_id:
+                continue
+        elif "session_id" in item or expected_session_id is None:
+            continue
+        else:
+            matching_effects = [
+                effect
+                for effect in durable_effects
+                if str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
+                and getattr(effect, "session_id", None) == expected_session_id
+                and getattr(effect, "call_id", None) == call_id
+                and getattr(effect, "agent_id", None) == task.id
+                and str(getattr(effect, "attempt_id", "")) == item.get("attempt_id")
+                and getattr(effect, "campaign_id", None) == expected_campaign_id
+                and getattr(effect, "target_id", None) == payload.get("target_id")
+                and getattr(effect, "tool_name", None) == item.get("tool_name")
+                and getattr(effect, "result_is_error", None) is item.get("is_error")
+                and isinstance(getattr(effect, "arguments_payload", None), Mapping)
+                and WorkerRuntime._action_fingerprint(  # noqa: SLF001
+                    str(effect.tool_name), effect.arguments_payload
+                )
+                == item.get("request_sha256")
+                and isinstance(getattr(effect, "result_content", None), str)
+                and hashlib.sha256(str(effect.result_content).encode()).hexdigest()
+                == item.get("content_sha256")
+                and isinstance(getattr(effect, "result_metadata", None), Mapping)
+                and effect.result_metadata.get("target_session_id") == item.get("target_session_id")
+                and WorkerRuntime._json_fingerprint(  # noqa: SLF001
+                    WorkerRuntime._semantic_value(effect.result_metadata)  # noqa: SLF001
+                )
+                == item.get("metadata_sha256")
+            ]
+            if len(matching_effects) != 1:
+                continue
+            adopted_body = {**body, "session_id": expected_session_id}
+            item = {
+                **adopted_body,
+                "receipt_sha256": WorkerRuntime._json_fingerprint(adopted_body),  # noqa: SLF001
+            }
+        raw_transition = item.get("target_ui_transition")
         if raw_transition is not None:
             verbatim_content_matches = content_hashes.get(call_id) == item.get(
                 "content_sha256"

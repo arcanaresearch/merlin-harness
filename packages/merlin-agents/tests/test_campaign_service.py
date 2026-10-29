@@ -74,6 +74,7 @@ from merlin_agents.campaign_service import (
     _bind_recon_applicability_evidence,
     _bind_validation_equivalence,
     _bounded_frontier_projection,
+    _campaign_digest,
     _campaign_list_projection,
     _candidate_identity,
     _canonical_committed_attempt_outcome,
@@ -97,6 +98,8 @@ from merlin_agents.campaign_service import (
     _hypothesis_task_outcome,
     _inapplicable_evidence_is_trusted,
     _incremental_objective_contract_projection,
+    _independent_session_finding_projection,
+    _independent_session_limitation_id,
     _initial_capability_probe_plan,
     _json_value,
     _latest_saturation_decision_state,
@@ -123,6 +126,7 @@ from merlin_agents.campaign_service import (
     _sealed_candidate_identities,
     _service_objective_projection,
     _status_result,
+    _target_admission_deferred_task_ids,
     _technique_attempt_outcomes,
     _technique_attempt_partial_signals,
     _transport_attribution_uncertainty,
@@ -180,6 +184,44 @@ def _receipt_oracle(pointer: str = "/reply") -> dict[str, object]:
         "modality": "text",
         "turn": "single",
         "language": "und",
+    }
+
+
+def _target_control_hold(
+    task_id: str,
+    *,
+    attempt_id: str = "attempt-held",
+    target_session_id: str = "browser:context-held",
+) -> dict[str, object]:
+    marker = {
+        "schema": "merlin.target-control-hold.v1",
+        "assignment_id": task_id,
+        "attempt_id": attempt_id,
+        "technique_attempt_id": "technique-attempt-held",
+        "tool_name": "browser_chat_exchange",
+        "call_id": "call-held",
+        "failure_code": "target_session_identity_mismatch",
+        "target_session_id": target_session_id,
+    }
+    return {
+        **marker,
+        "task_id": task_id,
+        "receipt_sha256": hashlib.sha256(
+            json.dumps(
+                marker,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest(),
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "interaction_count": 0,
+        "limit_interaction_count": 0,
+        "target_call_budget_charge": 0,
+        "target_call_ids": [],
+        "target_evidence": [],
+        "target_ui_transitions": [],
     }
 
 
@@ -3176,9 +3218,7 @@ def test_campaign_list_projection_includes_stable_elapsed_duration() -> None:
             "status": "completed",
             "stop_reason": "frontier_exhausted",
             "manifest_digest": "sha256:abc",
-            "manifest": {
-                "manifest": {"objective": "Assess", "profile": "exploration"}
-            },
+            "manifest": {"manifest": {"objective": "Assess", "profile": "exploration"}},
             "created_at": datetime(2026, 10, 25, 10, 0, tzinfo=UTC),
             "updated_at": datetime(2026, 10, 25, 22, 24, tzinfo=UTC),
         }
@@ -14532,6 +14572,209 @@ async def test_lead_admits_validator_then_bounded_followup_wave() -> None:
     assert "initial" in agents.evidence_requests
 
 
+async def test_post_transition_reproduction_without_fresh_session_fails_closed() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    class SupervisionStore:
+        def __init__(self) -> None:
+            self.waves = []
+            self.lead = []
+            self.terminal = None
+            self.decisions = {}
+
+        def finish_wave(self, _campaign_id, wave, status, summary):
+            self.waves.append((wave, "finished", status, summary))
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.lead.append((wave, payload))
+
+        def commit_lead_decision(
+            self,
+            _campaign_id,
+            wave,
+            decision_id,
+            payload,
+            _directives,
+            **_kwargs,
+        ):
+            existing = self.decisions.get(decision_id)
+            if existing is not None:
+                assert existing["payload"] == payload
+                return existing
+            record = {
+                "wave": wave,
+                "payload": dict(payload),
+                "payload_digest": _campaign_digest(dict(payload)),
+                "decision_id": decision_id,
+            }
+            self.decisions[decision_id] = record
+            self.lead.append((wave, record["payload"]))
+            return record
+
+        def finish(self, _campaign_id, status):
+            self.terminal = status
+
+    class SupervisionAgents:
+        def __init__(self) -> None:
+            self.submit_count = 0
+            self.evidence_requests = []
+
+        async def list_schedule_tasks(self, schedule_id):
+            assert schedule_id == "initial"
+            return (
+                AgentTask(
+                    id="candidate",
+                    objective="initial",
+                    status="completed",
+                    result='{"finding":{"id":"F-1"}}',
+                    technique_ids=("prompt",),
+                ),
+            )
+
+        async def completion_projection(self, schedule_id):
+            self.evidence_requests.append(schedule_id)
+            return {
+                "evidence": {
+                    "candidate": {
+                        "digest": "sha256:" + "a" * 64,
+                        "reference": "merlin-result://initial/candidate",
+                    }
+                }
+            }
+
+        async def submit(self, *_args, **_kwargs):
+            self.submit_count += 1
+            raise AssertionError("post-transition reproduction must not start a worker")
+
+    class TransitionAwareCampaignService(CampaignService):
+        async def _target_reobservation_projection(self, _campaign_id):
+            # A settled historical material transition is sufficient to make the source
+            # physical session ineligible for independent reproduction.  No pending barrier
+            # remains; this regression covers the later validation branch specifically.
+            return SimpleNamespace(
+                observation_sequences={"sha256:" + "1" * 64: 1},
+                pending=(),
+                review_pending=(),
+                latest_refreshed=None,
+            )
+
+    decisions = iter(
+        (
+            LeadAssessment(
+                "candidate needs independent reproduction",
+                False,
+                validation_finding_ids=("F-1",),
+            ),
+            LeadAssessment("finish with the finding provisional", True),
+        )
+    )
+
+    async def lead(*_args):
+        return next(decisions, LeadAssessment("done", True))
+
+    async def findings(_session_id):
+        return (
+            {
+                "id": "F-1",
+                "creator": "candidate",
+                "validation": "unvalidated",
+                "severity": "high",
+                "evidence_references": ("target-call:1",),
+            },
+        )
+
+    store = SupervisionStore()
+    agents = SupervisionAgents()
+    service = TransitionAwareCampaignService(  # type: ignore[arg-type]
+        store, agents, preparation, lead, finding_reader=findings
+    )
+    execution = asyncio.get_running_loop().create_future()
+    execution.set_result(None)
+    initial = SimpleNamespace(id="initial", execution=execution)
+
+    await service._supervise(  # noqa: SLF001 - lifecycle regression
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        initial,
+    )
+
+    restarted = TransitionAwareCampaignService(  # type: ignore[arg-type]
+        store, agents, preparation, lead, finding_reader=findings
+    )
+    assert await restarted._record_unavailable_independent_session(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        0,
+        ("F-1",),
+    )
+
+    assert agents.submit_count == 0
+    limitations = [
+        payload
+        for _wave, payload in store.lead
+        if payload.get("kind") == "independent_session_acquisition_unavailable"
+    ]
+    assert len(limitations) == 1
+    limitation = next(
+        (
+            payload
+            for payload in limitations
+            if payload.get("kind") == "independent_session_acquisition_unavailable"
+        ),
+        None,
+    )
+    assert limitation is not None, store.lead
+    finding_ids, finding_count, finding_set_digest = _independent_session_finding_projection(
+        ("F-1",)
+    )
+    assert limitation == {
+        "kind": "independent_session_acquisition_unavailable",
+        "schema": "merlin.independent-session-acquisition-unavailable.v1",
+        "limitation_id": _independent_session_limitation_id(
+            prepared.manifest.id,
+            0,
+            finding_count=finding_count,
+            finding_set_digest=finding_set_digest,
+        ),
+        "status": "unavailable",
+        "campaign_id": prepared.manifest.id,
+        "session_id": prepared.manifest.session_id,
+        "target_id": prepared.manifest.target.id,
+        "source_wave": 0,
+        "finding_ids": list(finding_ids),
+        "finding_count": finding_count,
+        "finding_set_digest": finding_set_digest,
+        "validation_mode": "reproduction",
+        "reason_code": "authoritative_distinct_session_not_prebound",
+        "reason": (
+            "Independent reproduction was not attempted because no daemon-authenticated "
+            "distinct fresh target session was available after the source surface changed."
+        ),
+        "reproduction_provider_attempted": False,
+        "target_effect_attempted": False,
+        "retryable": False,
+        "outcome_classification": "validation_limitation",
+    }
+    assert {
+        "attempt_disposition",
+        "candidate_outcome_projection",
+        "infrastructure_failure",
+        "attack_quality",
+        "arm_outcome",
+    }.isdisjoint(limitation)
+    assert store.terminal == "completed"
+    assert "initial" in agents.evidence_requests
+    sample, total, digest = _independent_session_finding_projection(
+        tuple(f"F-{index:04d}" for index in range(257))
+    )
+    assert len(sample) == 32
+    assert total == 257
+    assert digest.startswith("sha256:")
+
+
 @pytest.mark.parametrize("qualified_negative", (False, True))
 async def test_nonpositive_baseline_caps_provisional_without_dispatch(
     qualified_negative: bool,
@@ -16970,6 +17213,7 @@ async def test_incremental_review_context_preserves_signed_ui_transition_receipt
         "tool_name": "browser_chat_exchange",
         "reference": f"target-call:{call_id}",
         "campaign_id": prepared.manifest.id,
+        "session_id": "session-1",
         "assignment_id": task.id,
         "attempt_id": attempt_id,
         "technique_attempt_id": None,
@@ -17048,6 +17292,7 @@ async def test_incremental_review_context_preserves_signed_ui_transition_receipt
                 agent_id=task.id,
                 attempt_id=attempt_id,
                 campaign_id=prepared.manifest.id,
+                session_id="session-1",
                 target_id=prepared.manifest.target.id,
                 tool_name="browser_chat_exchange",
                 effect="target_network",
@@ -17060,12 +17305,8 @@ async def test_incremental_review_context_preserves_signed_ui_transition_receipt
     )
     assert committed is not None
     assert committed["target_call_ids"] == (() if is_error else (call_id,))
-    assert committed["target_evidence_receipts"] == (
-        {} if is_error else {call_id: receipt}
-    )
-    assert committed["target_ui_transition_receipts"] == (
-        {call_id: receipt} if is_error else {}
-    )
+    assert committed["target_evidence_receipts"] == ({} if is_error else {call_id: receipt})
+    assert committed["target_ui_transition_receipts"] == ({call_id: receipt} if is_error else {})
 
     class Store:
         def list_lead(self, _campaign_id):
@@ -17517,6 +17758,172 @@ async def test_staged_attack_recovery_completes_partial_recon_recipe_fanout_once
         recon_applicability=applicability,
     )
     assert staged_agents.started is True
+
+
+@pytest.mark.parametrize("kind", ("followup", "validation", "operator-continuation"))
+async def test_start_wave_acquires_transition_fence_before_schedule_submission(
+    kind: str,
+) -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[tuple[object, ...]] = []
+
+    class Store:
+        def claim_frontier_transition(self, campaign_id, claimant_id, _lease_seconds):
+            events.append(("claim", campaign_id, claimant_id))
+            return "claim-start-wave"
+
+        def renew_frontier_transition(self, *_args):
+            return True
+
+        def validate_frontier_transition(self, claim_id, claimant_id):
+            events.append(("validate", claim_id, claimant_id))
+            return True
+
+        def release_frontier_transition(self, claim_id, claimant_id):
+            events.append(("release", claim_id, claimant_id))
+            return True
+
+        def add_wave_fenced(
+            self,
+            campaign_id,
+            wave,
+            wave_kind,
+            schedule_id,
+            *,
+            claim_id,
+            claimant_id,
+        ):
+            events.append(
+                (
+                    "add-wave",
+                    campaign_id,
+                    wave,
+                    wave_kind,
+                    schedule_id,
+                    claim_id,
+                    claimant_id,
+                )
+            )
+
+    class Agents:
+        async def submit(self, _session_id, assignments, **options):
+            assert events and events[0][0] == "claim"
+            events.append(("submit", options["schedule_id"]))
+            return SimpleNamespace(
+                id=options["schedule_id"],
+                assignments=tuple(assignments),
+                worker_contexts=dict(options["worker_contexts"]),
+                execution=None,
+            )
+
+        def start_execution(self, _live, **_options):
+            events.append(("start",))
+
+    service = CampaignService(Store(), Agents(), preparation)  # type: ignore[arg-type]
+    compiled = compile_attack_campaign(prepared.manifest, prepared.assignment_context)
+    live = await service._start_wave(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        3,
+        kind,
+        compiled,
+    )
+
+    claimant_id = str(events[0][2])
+    assert live.id == service._campaign_wave_schedule_id(  # noqa: SLF001
+        prepared.manifest.id, 3
+    )
+    assert events == [
+        ("claim", prepared.manifest.id, claimant_id),
+        ("validate", "claim-start-wave", claimant_id),
+        ("submit", live.id),
+        (
+            "add-wave",
+            prepared.manifest.id,
+            3,
+            kind,
+            live.id,
+            "claim-start-wave",
+            claimant_id,
+        ),
+        ("start",),
+        ("release", "claim-start-wave", claimant_id),
+    ]
+
+
+async def test_start_wave_does_not_submit_without_transition_fence() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    class Store:
+        def claim_frontier_transition(self, *_args):
+            return None
+
+        def release_frontier_transition(self, *_args):
+            raise AssertionError("an unclaimed transition must not be released")
+
+    class Agents:
+        async def submit(self, *_args, **_kwargs):
+            raise AssertionError("schedule submission must remain behind the transition fence")
+
+    service = CampaignService(Store(), Agents(), preparation)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        RuntimeError,
+        match="frontier transition lease is unavailable before schedule submission",
+    ):
+        await service._start_wave(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            3,
+            "followup",
+            CampaignCompilation((), ()),
+        )
+
+
+async def test_start_wave_does_not_submit_with_expired_transition_fence() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    released: list[tuple[str, str]] = []
+
+    class Store:
+        def claim_frontier_transition(self, _campaign_id, _claimant_id, _lease_seconds):
+            return "claim-expired"
+
+        def renew_frontier_transition(self, *_args):
+            return True
+
+        def validate_frontier_transition(self, _claim_id, _claimant_id):
+            return False
+
+        def release_frontier_transition(self, claim_id, claimant_id):
+            released.append((claim_id, claimant_id))
+            return True
+
+    class Agents:
+        async def submit(self, *_args, **_kwargs):
+            raise AssertionError("an expired transition must not submit a schedule")
+
+    service = CampaignService(Store(), Agents(), preparation)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        RuntimeError,
+        match="frontier transition lease expired before schedule submission",
+    ):
+        await service._start_wave(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            3,
+            "validation",
+            CampaignCompilation((), ()),
+        )
+
+    assert len(released) == 1
+    assert released[0][0] == "claim-expired"
 
 
 async def test_successful_lead_replacement_recovers_failed_initial_wave() -> None:
@@ -21501,6 +21908,229 @@ async def test_dynamic_specialist_terminal_retirement_removes_active_routing() -
     assert records[0].assignment.id == compiled.assignments[0].id
 
 
+def test_target_admission_deferred_tasks_require_authenticated_zero_effect_hold() -> None:
+    task = AgentTask(
+        id="campaign/held/worker",
+        objective="probe after the refreshed target is reviewed",
+        status="cancelled",
+        result="",
+    )
+    evidence = {
+        "attempt_id": "attempt-held",
+        "error_code": "target_admission_latched",
+        "target_call_ids": (),
+        "target_evidence_receipts": {},
+        "target_ui_transition_receipts": {},
+        "target_delivery_receipts": {},
+        "probe_effect_calls": {},
+        "structured_result": {"control_plane_hold": _target_control_hold(task.id)},
+    }
+    assert _target_admission_deferred_task_ids((task,), {task.id: evidence}) == frozenset({task.id})
+
+    mutations = (
+        {"structured_result": {}},
+        {
+            "structured_result": {
+                "control_plane_hold": {
+                    **_target_control_hold(task.id),
+                    "target_effect_attempted": True,
+                }
+            }
+        },
+        {
+            "structured_result": {
+                "control_plane_hold": {
+                    **_target_control_hold(task.id),
+                    "interaction_count": 1,
+                }
+            }
+        },
+        {
+            "structured_result": {
+                "control_plane_hold": {
+                    **_target_control_hold(task.id),
+                    "target_session_id": "browser:forged",
+                }
+            }
+        },
+        {"target_evidence_receipts": {"call-held": {"acknowledged": True}}},
+        {"probe_effect_calls": {"call-held": "browser_chat_exchange"}},
+    )
+    for mutation in mutations:
+        tampered = {**evidence, **mutation}
+        assert not _target_admission_deferred_task_ids((task,), {task.id: tampered})
+
+
+async def test_target_admission_held_specialist_rebounds_without_replaying_transition() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    class ReboundStore(DynamicJournalStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waves: list[dict[str, object]] = []
+            self.active_batch: dict[str, object] | None = None
+
+        def list_waves(self, _campaign_id):
+            return tuple(dict(item) for item in self.waves)
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return None if self.active_batch is None else dict(self.active_batch)
+
+    generation_id = "sha256:" + "b" * 64
+
+    class ReboundService(CampaignService):
+        def __init__(self, store) -> None:
+            super().__init__(store, SimpleNamespace(target_calls=0), preparation)
+            self.rebounds: list[tuple[tuple[str, ...], str | None]] = []
+
+        async def _target_reobservation_projection(self, _campaign_id):
+            return SimpleNamespace(
+                pending=(),
+                review_pending=(),
+                latest_refreshed={"generation_id": generation_id},
+                reviewed={generation_id: "lead-decision:" + "c" * 64},
+            )
+
+        async def _start_wave(
+            self,
+            _campaign_id,
+            _manifest,
+            _wave,
+            _kind,
+            compiled,
+            **_kwargs,
+        ):
+            batch_id = _kwargs.get("frontier_batch_id")
+            self.rebounds.append(
+                (
+                    tuple(item.id for item in compiled.assignments),
+                    batch_id if isinstance(batch_id, str) else None,
+                )
+            )
+            store.waves[0] = {**store.waves[0], "schedule_id": "rebound-schedule"}
+            return SimpleNamespace(id="rebound-schedule")
+
+    store = ReboundStore()
+    service = ReboundService(store)
+    source = dynamic_source_task()
+    source_evidence = {source.id: {"digest": "sha256:" + "a" * 64, "reference": "receipt:source"}}
+    proposals = (
+        dynamic_lead_followup(
+            proposal={"label": "dynamic-transition-maker", "objective": "Observe drift"}
+        ),
+        dynamic_lead_followup(
+            proposal={"label": "dynamic-held-sibling", "objective": "Probe after refresh"}
+        ),
+        dynamic_lead_followup(
+            proposal={"label": "dynamic-ordinary-cancel", "objective": "Ordinary cancelled"}
+        ),
+    )
+    compiled = await service._admit_dynamic_specialists(  # noqa: SLF001
+        "campaign-1",
+        prepared.manifest,
+        prepared.assignment_context,
+        1,
+        proposals,
+        source_tasks=(source,),
+        source_evidence=source_evidence,
+    )
+    store.waves = [
+        {
+            "wave": 1,
+            "kind": "frontier",
+            "status": "completed",
+            "schedule_id": "source-schedule",
+        }
+    ]
+    store.active_batch = {
+        "id": "frontier-batch-1",
+        "wave": 1,
+        "schedule_id": "source-schedule",
+    }
+    maker_id, held_id, ordinary_id = (item.id for item in compiled.assignments)
+    tasks = (
+        dynamic_source_task(id=maker_id, status="failed"),
+        dynamic_source_task(id=held_id, status="cancelled"),
+        dynamic_source_task(id=ordinary_id, status="cancelled"),
+    )
+    committed = {
+        maker_id: {
+            "target_ui_transition_receipts": {"call-transition": {"target_effect_attempted": True}}
+        },
+        held_id: {
+            "attempt_id": "attempt-held",
+            "error_code": "target_admission_latched",
+            "target_call_ids": (),
+            "target_evidence_receipts": {},
+            "target_ui_transition_receipts": {},
+            "target_delivery_receipts": {},
+            "probe_effect_calls": {},
+            "structured_result": {"control_plane_hold": _target_control_hold(held_id)},
+        },
+        ordinary_id: {"error_code": "operator_cancelled"},
+    }
+    held_ids = _target_admission_deferred_task_ids(tasks, committed)
+    assert held_ids == frozenset({held_id})
+
+    await service._retire_terminal_dynamic_specialists(  # noqa: SLF001
+        "campaign-1",
+        1,
+        tasks,
+        held_ids,
+    )
+    records = await service._durable_dynamic_specialists("campaign-1")  # noqa: SLF001
+    states = {record.assignment.id: record.state for record in records}
+    assert states == {maker_id: "retired", held_id: "active", ordinary_id: "retired"}
+
+    first = await service._rebound_deferred_dynamic_specialists(  # noqa: SLF001
+        "campaign-1",
+        prepared.manifest,
+        prepared.assignment_context,
+        wave=1,
+        source_schedule_id="source-schedule",
+        deferred_task_ids=frozenset({held_id}),
+        frontier_batch=store.active_batch,
+    )
+    replay = await service._rebound_deferred_dynamic_specialists(  # noqa: SLF001
+        "campaign-1",
+        prepared.manifest,
+        prepared.assignment_context,
+        wave=1,
+        source_schedule_id="source-schedule",
+        deferred_task_ids=frozenset({held_id}),
+        frontier_batch=store.active_batch,
+    )
+
+    assert first.id == "rebound-schedule"
+    assert replay is None
+    assert service.rebounds == [((held_id,), "frontier-batch-1")]
+    assert service._agents.target_calls == 0  # noqa: SLF001
+
+    class ArmStore:
+        def __init__(self) -> None:
+            self.observations = 0
+
+        def record_arm_observation(self, _observation) -> None:
+            self.observations += 1
+
+    arm_store = ArmStore()
+    arm_service = CampaignService(
+        store,
+        SimpleNamespace(),
+        preparation,
+        arm_store=arm_store,
+    )  # type: ignore[arg-type]
+    await arm_service._record_arm_outcomes(  # noqa: SLF001
+        "campaign-1",
+        (tasks[1],),
+        {held_id: committed[held_id]},
+        wave=1,
+    )
+    assert arm_store.observations == 0
+
+
 def test_lead_automation_request_rejects_kinds_without_a_runtime() -> None:
     base = {
         "owning_attempt_id": "attempt/1",
@@ -21836,7 +22466,68 @@ async def test_limited_completion_enumerates_limitations_and_unsearched_frontier
             ]
 
         def list_lead(self, campaign_id):
-            return []
+            finding_ids = ("F-1",)
+            finding_sample, finding_count, finding_set_digest = (
+                _independent_session_finding_projection(finding_ids)
+            )
+            limitation_id = _independent_session_limitation_id(
+                campaign_id,
+                0,
+                finding_count=finding_count,
+                finding_set_digest=finding_set_digest,
+            )
+            limitation_payload = {
+                "kind": "independent_session_acquisition_unavailable",
+                "schema": "merlin.independent-session-acquisition-unavailable.v1",
+                "limitation_id": limitation_id,
+                "status": "unavailable",
+                "campaign_id": campaign_id,
+                "session_id": prepared.manifest.session_id,
+                "target_id": prepared.manifest.target.id,
+                "source_wave": 0,
+                "finding_ids": list(finding_sample),
+                "finding_count": finding_count,
+                "finding_set_digest": finding_set_digest,
+                "validation_mode": "reproduction",
+                "reason_code": "authoritative_distinct_session_not_prebound",
+                "reason": (
+                    "Independent reproduction was not attempted because no "
+                    "daemon-authenticated distinct fresh target session was available "
+                    "after the source surface changed."
+                ),
+                "reproduction_provider_attempted": False,
+                "target_effect_attempted": False,
+                "retryable": False,
+                "outcome_classification": "validation_limitation",
+            }
+            return [
+                {
+                    "decision_id": limitation_id,
+                    "payload": limitation_payload,
+                    "payload_digest": _campaign_digest(limitation_payload),
+                },
+                {
+                    "decision_id": "malformed",
+                    "payload": {
+                        "kind": "independent_session_acquisition_unavailable",
+                        "schema": "merlin.independent-session-acquisition-unavailable.v1",
+                        "status": "unavailable",
+                        "campaign_id": campaign_id,
+                        "session_id": prepared.manifest.session_id,
+                        "target_id": prepared.manifest.target.id,
+                        "source_wave": 0,
+                        "finding_ids": ["F-ignored"],
+                        "finding_count": 1,
+                        "finding_set_digest": "not-a-digest",
+                        "validation_mode": "reproduction",
+                        "reason_code": "authoritative_distinct_session_not_prebound",
+                        "reproduction_provider_attempted": False,
+                        "target_effect_attempted": False,
+                        "retryable": False,
+                        "outcome_classification": "validation_limitation",
+                    },
+                },
+            ]
 
     class StatusAgents:
         async def completion_projection(self, schedule_id):
@@ -21879,12 +22570,33 @@ async def test_limited_completion_enumerates_limitations_and_unsearched_frontier
 
     document = projected["completion_document"]
     limitations = {
-        (item["task_id"], item["technique_id"]): item for item in document["limitations"]
+        (item["task_id"], item["technique_id"]): item
+        for item in document["limitations"]
+        if "task_id" in item and "technique_id" in item
     }
     assert limitations[("w0-a", "prompt")]["outcome"] == "unclear"
     assert "ledger" in limitations[("w0-a", "prompt")]["reason"]
     assert limitations[("w0-b", "blocked-cell")]["outcome"] == "blocked"
     assert "ledger" in limitations[("w0-b", "blocked-cell")]["reason"]
+    validation_limitations = tuple(
+        item
+        for item in document["limitations"]
+        if item.get("reason_code") == "independent_session_acquisition_unavailable"
+    )
+    assert validation_limitations == (
+        {
+            "scope": "validation",
+            "outcome": "blocked",
+            "reason_code": "independent_session_acquisition_unavailable",
+            "finding_ids": ("F-1",),
+            "finding_count": 1,
+            "finding_set_digest": _independent_session_finding_projection(("F-1",))[2],
+            "reason": (
+                "Independent reproduction was not attempted because no daemon-authenticated "
+                "distinct fresh target session was available after the source surface changed."
+            ),
+        },
+    )
     assert document["unsearched_frontier"] == (
         {
             "technique_id": "never-tried",
