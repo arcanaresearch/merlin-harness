@@ -1,6 +1,6 @@
 [project]
 name = "merlin-harness"
-version = "0.2.24"
+version = "0.2.25"
 description = "A lean, TUI-first harness for AI security assessments"
 requires-python = ">=3.13"
 license = "Apache-2.0"
