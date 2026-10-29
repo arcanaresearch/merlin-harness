@@ -117,6 +117,7 @@ from merlin_agents.campaign_service import (
     _progress_snapshot_from_status,
     _receipt_refusal_negatives,
     _recon_applicability_partition,
+    _recon_handoff_repair_metadata,
     _resolved_candidate_keys,
     _retryable_supervision_error,
     _reviewed_preparation_digest_values,
@@ -175,6 +176,53 @@ from merlin_contracts import (
 )
 from merlin_contracts.generation import GeneratorExecutionContract
 from merlin_contracts.target_capabilities import StateSelector
+
+
+def test_recon_handoff_repair_metadata_routes_only_repairable_failures() -> None:
+    browser = _recon_handoff_repair_metadata(
+        {
+            "interface": "browser",
+            "execution_mode": "browser",
+            "browser_steps": [{"step_id": "send"}],
+        },
+        "browser/hybrid preparation requires adapter.recon_handoff_id from a durable "
+        "reconnaissance handoff",
+    )
+    hybrid = _recon_handoff_repair_metadata(
+        {"interface": "browser", "execution_mode": "hybrid", "api_steps": [{}]},
+        "browser/hybrid preparation requires adapter.recon_handoff_id from a durable "
+        "reconnaissance handoff",
+    )
+
+    assert browser == {
+        "retryable": True,
+        "repair_reason": "recon_handoff_required",
+        "preferred_next_tool": "browser_record_api_handoff",
+        "preferred_next_tool_mode": "strict",
+    }
+    assert hybrid["preferred_next_tool"] == "browser_compile_api_handoff"
+    assert (
+        _recon_handoff_repair_metadata(
+            {"interface": "browser"},
+            "reviewed reconnaissance handoff belongs to another target session",
+        )
+        == {}
+    )
+    assert (
+        _recon_handoff_repair_metadata(
+            {"interface": "browser"},
+            "browser adapter requires interaction_contract.input_locator",
+        )
+        == {}
+    )
+    assert (
+        _recon_handoff_repair_metadata(
+            {"interface": "browser"},
+            "target/session integrity failure: browser/hybrid preparation requires "
+            "adapter.recon_handoff_id from a durable reconnaissance handoff",
+        )
+        == {}
+    )
 
 
 def _receipt_oracle(pointer: str = "/reply") -> dict[str, object]:
@@ -13839,6 +13887,48 @@ async def test_prepare_tool_seals_explicit_campaign_budget() -> None:
 
     assert result.is_error is False
     assert captured[0][4] == AssignmentBudget(50, 100_000, 3_600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_tool"),
+    [
+        ("reviewed reconnaissance handoff is unavailable", None),
+        ("reviewed reconnaissance handoff belongs to another target", None),
+    ],
+)
+async def test_prepare_tool_routes_only_repairable_handoff_resolution_failures(
+    message: str, expected_tool: str | None
+) -> None:
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, _adapter):
+            raise ValueError(message)
+
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("failed handoff must not reach campaign preparation")
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": {"recon_handoff_id": "handoff:missing"},
+        },
+    )
+
+    assert result.is_error is True
+    if expected_tool is None:
+        assert "preferred_next_tool" not in result.metadata
+    else:
+        assert result.metadata == {
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": expected_tool,
+            "preferred_next_tool_mode": "strict",
+            "repair_scope_objective_digest": (
+                "sha256:" + hashlib.sha256(b"Assess target").hexdigest()
+            ),
+        }
 
 
 async def test_prepare_tool_hydrates_compacted_adapter_from_durable_handoff() -> None:

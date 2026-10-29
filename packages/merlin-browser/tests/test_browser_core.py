@@ -10778,6 +10778,8 @@ async def test_dom_fallback_without_probe_linked_evidence_still_seals_dom() -> N
     assert handoff is not None
     assert handoff.adapter is None
     assert handoff.dom_fallback_reason == "browser write path never settles after submit"
+    assert result.metadata["preferred_next_tool"] == "assessment_prepare"
+    assert result.metadata["preferred_next_tool_mode"] == "strict"
     assert result.metadata["api_candidate_observed"].endswith("/api/bank/message")
 
 

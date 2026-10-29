@@ -17,6 +17,8 @@ from rich.console import Group
 from rich.live import Live
 from rich.text import Text
 
+from .operator_tools import campaign_submit_envelope, new_campaign_request_id
+
 _STREAM_TEARDOWN_TIMEOUT_SECONDS = 1.0
 _CAMPAIGN_POLL_TIMEOUT_SECONDS = 5.0
 _STREAM_CLIENT_OVERRIDE: ContextVar[object | None] = ContextVar(
@@ -896,6 +898,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
     if strict_objective and not approve:
         raise SystemExit("--strict-objective requires --approve")
     objective = " ".join(objective_parts)
+    campaign_request_id = new_campaign_request_id()
+    campaign_envelope = campaign_submit_envelope(objective, campaign_request_id=campaign_request_id)
     # A submitted campaign is a new reviewed workflow. Reusing whatever
     # conversation happened to be active can leak stale permission failures,
     # target assumptions, or an interrupted manifest into its reconnaissance.
@@ -936,16 +940,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
             "(orthogonal to the coverage profile); pass "
             f"specialist_composition={composition!r} to assessment_prepare; do not ask again."
         )
-    submit_envelope = json.dumps(
-        {
-            "schema_version": "merlin.cli-campaign-submit.v1",
-            "operator_objective": objective,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
     preparation_prompt = (
-        f"{objective}\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n{submit_envelope}\n"
+        f"{objective}\n{campaign_envelope}\n"
         f"The operator explicitly selected campaign profile: {profile}; "
         "do not ask for the profile again. Any max_* values below are provider/model "
         f"campaign budgets, not target chat/message limits.{budget_instruction}"
@@ -998,9 +994,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     )
                     + (
                         ". Keep the exact previously selected budget: "
-                        + ", ".join(
-                            f"max_{name}={value}" for name, value in sorted(limits.items())
-                        )
+                        + ", ".join(f"max_{name}={value}" for name, value in sorted(limits.items()))
                         if limits
                         else ". Keep all provider/model budget limits unset"
                     )
@@ -1033,6 +1027,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     "operator-required setup or normal-play phase_gate before preparing. Do not "
                     "ask for confirmation."
                 )
+            if campaign_envelope not in preparation_prompt:
+                preparation_prompt = f"{preparation_prompt}\n{campaign_envelope}"
             preparation = asyncio.create_task(
                 _print_stream_on(
                     campaign_client,
@@ -1299,9 +1295,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
             execution = _plain(await campaign_client.execute_campaign(campaign_id, digest))
         except RuntimeError as error:
             raise SystemExit(f"campaign {campaign_id} execution was rejected: {error}") from None
-        campaign_active = (
-            isinstance(execution, dict) and execution.get("status") == "executing"
-        )
+        campaign_active = isinstance(execution, dict) and execution.get("status") == "executing"
         final = _plain(await campaign_client.campaign_status(campaign_id))
         if not isinstance(final, dict) or final.get("status") == "prepared":
             raise SystemExit(

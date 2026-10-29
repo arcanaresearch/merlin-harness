@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from merlin_contracts import (
 )
 from merlin_tui.configuration import ProviderConfiguration
 from merlin_tui.kernel_backend import KernelBackend, KernelSettings, event_to_stream
+from merlin_tui.operator_tools import campaign_submit_envelope
 
 
 class FakeKernel:
@@ -459,6 +461,8 @@ async def test_campaign_profile_gate_precedes_provider_and_preserves_objective()
     assert "1. Recommended [default]" in choices[0].text
     assert "3. Exhaustive" in choices[0].text
     assert "4. Exploration / learning" in choices[0].text
+    campaign_request_id = backend._pending_campaign_request_id
+    assert campaign_request_id is not None
 
     events = [event async for event in backend.stream("1")]
 
@@ -469,7 +473,11 @@ async def test_campaign_profile_gate_precedes_provider_and_preserves_objective()
         "do not ask for the profile again."
         " Pass the operator objective text verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; "
-        "Merlin anchors the reviewed target itself."
+        "Merlin anchors the reviewed target itself.\n"
+        + campaign_submit_envelope(
+            "Run a Merlin scan on https://target.test for policy override",
+            campaign_request_id=campaign_request_id,
+        )
     ]
 
 
@@ -478,6 +486,8 @@ async def test_campaign_profile_gate_accepts_exploration_number() -> None:
     kernel = FakeKernel([])
     backend = KernelBackend(kernel)  # type: ignore[arg-type]
     _ = [event async for event in backend.stream("Run a merlin scan on https://target.test")]
+    campaign_request_id = backend._pending_campaign_request_id
+    assert campaign_request_id is not None
 
     events = [event async for event in backend.stream("4")]
 
@@ -488,8 +498,28 @@ async def test_campaign_profile_gate_accepts_exploration_number() -> None:
         "do not ask for the profile again."
         " Pass the operator objective text verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; "
-        "Merlin anchors the reviewed target itself."
+        "Merlin anchors the reviewed target itself.\n"
+        + campaign_submit_envelope(
+            "Run a merlin scan on https://target.test",
+            campaign_request_id=campaign_request_id,
+        )
     ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_profile_campaign_request_still_emits_typed_boundary() -> None:
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+    prompt = "Assess https://target.test for prompt injection with campaign profile exhaustive"
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    submitted = kernel.submissions[0]
+    assert submitted.startswith(prompt + "\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n")
+    envelope = json.loads(submitted.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1])
+    assert envelope["schema_version"] == "merlin.cli-campaign-submit.v2"
+    assert envelope["operator_objective"] == prompt
+    assert envelope["campaign_request_id"]
 
 
 @pytest.mark.asyncio
@@ -505,6 +535,8 @@ async def test_campaign_route_preflight_blocks_before_provider_and_retries() -> 
 
     backend = KernelBackend(kernel, route_preflight=preflight)  # type: ignore[arg-type]
     _ = [event async for event in backend.stream("Run a merlin scan on https://target.test")]
+    campaign_request_id = backend._pending_campaign_request_id
+    assert campaign_request_id is not None
 
     blocked = [event async for event in backend.stream("1")]
     assert kernel.submissions == []
@@ -519,7 +551,11 @@ async def test_campaign_route_preflight_blocks_before_provider_and_retries() -> 
         "do not ask for the profile again."
         " Pass the operator objective text verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; "
-        "Merlin anchors the reviewed target itself."
+        "Merlin anchors the reviewed target itself.\n"
+        + campaign_submit_envelope(
+            "Run a merlin scan on https://target.test",
+            campaign_request_id=campaign_request_id,
+        )
     ]
 
 
@@ -547,6 +583,7 @@ async def test_campaign_profile_applies_lead_route_without_persisting() -> None:
     assert await settings.get_model() == "gpt-daybreak-blue-latest"
     _ = [event async for event in backend.stream("/new")]
     assert await settings.get_model() == "deepseek-v4-flash"
+    assert backend._pending_campaign_request_id is None
 
 
 @pytest.mark.asyncio
@@ -561,6 +598,8 @@ async def test_chat_campaign_prompt_honors_configured_autonomous_composition() -
     backend = KernelBackend(kernel, settings=settings)  # type: ignore[arg-type]
 
     _ = [event async for event in backend.stream("Run a merlin scan on https://target.test")]
+    campaign_request_id = backend._pending_campaign_request_id
+    assert campaign_request_id is not None
     _ = [event async for event in backend.stream("1")]
 
     assert kernel.submissions == [
@@ -572,7 +611,11 @@ async def test_chat_campaign_prompt_honors_configured_autonomous_composition() -
         "specialist_composition='autonomous' to assessment_prepare; do not ask again."
         " Pass the operator objective text verbatim as the assessment_prepare "
         "objective: do not reword, paraphrase, or substitute the target line; "
-        "Merlin anchors the reviewed target itself."
+        "Merlin anchors the reviewed target itself.\n"
+        + campaign_submit_envelope(
+            "Run a merlin scan on https://target.test",
+            campaign_request_id=campaign_request_id,
+        )
     ]
 
 
@@ -1986,6 +2029,7 @@ async def test_preflight_cancel_clears_retained_campaign_target():
     _ = [event async for event in backend.stream("quickscan")]
     _ = [event async for event in backend.stream("cancel")]
     assert backend._pending_campaign_objective is None
+    assert backend._pending_campaign_request_id is None
     assert backend._pending_route_preflight is None
     assert not kernel.submissions
 

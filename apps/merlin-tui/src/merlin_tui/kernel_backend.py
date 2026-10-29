@@ -42,6 +42,7 @@ from .backend import (
     TargetView,
 )
 from .configuration import ProviderConfiguration
+from .operator_tools import campaign_submit_envelope, new_campaign_request_id
 
 _CAMPAIGN_PROFILE_PROMPT = (
     "Choose the campaign profile:\n"
@@ -96,13 +97,14 @@ def _campaign_profile_selection(prompt: str) -> str | None:
     return None
 
 
-def _needs_campaign_profile(prompt: str) -> bool:
+def _is_campaign_request(prompt: str) -> bool:
     normalized = " ".join(prompt.lower().split())
-    if normalized.startswith("/") or "campaign profile" in normalized:
+    if normalized.startswith(("/", "continue ", "resume ", "retry ")):
         return False
     requests_assessment = any(
         marker in normalized
         for marker in (
+            "assess ",
             "merlin scan",
             "red pen scan",
             "redpen scan",
@@ -117,6 +119,11 @@ def _needs_campaign_profile(prompt: str) -> bool:
     return requests_assessment and any(
         marker in normalized for marker in ("http://", "https://", "target")
     )
+
+
+def _needs_campaign_profile(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    return _is_campaign_request(prompt) and "campaign profile" not in normalized
 
 
 class KernelBackend:
@@ -175,6 +182,7 @@ class KernelBackend:
         self._route_preflight = route_preflight
         self._operator_controls = operator_controls
         self._pending_campaign_objective: str | None = None
+        self._pending_campaign_request_id: str | None = None
         self._pending_route_preflight: tuple[str, str, str] | None = None
         self._pending_user_input: InputRequest | None = None
         self._config_reload_status: Mapping[str, object] = {
@@ -240,8 +248,13 @@ class KernelBackend:
             response = InputResponse.model_validate_json(prompt[len(ANSWER_PREFIX) :])
             response.validate_for(pending)
         campaign_selection = False
+        operator_campaign_objective = prompt if _is_campaign_request(prompt) else None
+        operator_campaign_request_id = (
+            new_campaign_request_id() if operator_campaign_objective is not None else None
+        )
         if prompt.strip() == "/new":
             self._pending_campaign_objective = None
+            self._pending_campaign_request_id = None
             self._pending_route_preflight = None
             self._pending_user_input = None
             if self._settings is not None:
@@ -260,6 +273,7 @@ class KernelBackend:
             if choice in {"3", "cancel"}:
                 self._pending_route_preflight = None
                 self._pending_campaign_objective = None
+                self._pending_campaign_request_id = None
                 yield StreamEvent(
                     kind="content",
                     text="Campaign start cancelled before reconnaissance.",
@@ -317,6 +331,7 @@ class KernelBackend:
             )
         elif _needs_campaign_profile(prompt) and not self._operator_controls:
             self._pending_campaign_objective = prompt
+            self._pending_campaign_request_id = new_campaign_request_id()
             yield StreamEvent(kind="content", text=_CAMPAIGN_PROFILE_PROMPT)
             return
         if (
@@ -327,6 +342,19 @@ class KernelBackend:
             # A free-form correction belongs to the model, not a numeric gate.
             prompt = f"Pending assessment objective: {self._pending_campaign_objective}\n{prompt}"
             self._pending_campaign_objective = None
+            self._pending_campaign_request_id = None
+        if campaign_selection:
+            campaign_request_id = self._pending_campaign_request_id or new_campaign_request_id()
+            prompt = (
+                f"{prompt}\n"
+                f"{campaign_submit_envelope(objective, campaign_request_id=campaign_request_id)}"
+            )
+        elif operator_campaign_objective is not None:
+            assert operator_campaign_request_id is not None
+            prompt = f"{prompt}\n" + campaign_submit_envelope(
+                operator_campaign_objective,
+                campaign_request_id=operator_campaign_request_id,
+            )
         if not new_session:
             await self._recover_agents()
             if self._mcp is not None and not self._mcp_started:
@@ -347,6 +375,7 @@ class KernelBackend:
             yield StreamEvent("user_input_resolved", pending.request_id)
         if campaign_selection:
             self._pending_campaign_objective = None
+            self._pending_campaign_request_id = None
             self._pending_route_preflight = None
         review_recovery_requested = False
         preparation_failed = False

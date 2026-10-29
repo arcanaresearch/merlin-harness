@@ -1,9 +1,11 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from merlin_agents.campaign_service import AssessmentPrepareTool
 from merlin_contracts import AppEvent, ChatMessage, ToolContext, ToolResult, ToolSpec
 from merlin_tui.app import COMMAND_HINTS, COMMANDS, Composer
 from merlin_tui.backend import DemoBackend, StreamEvent
@@ -14,6 +16,8 @@ from merlin_tui.operator_tools import (
     ConfiguredCampaignTool,
     OperatorCommandTool,
     OperatorRuntimeTool,
+    _campaign_submit_payload,
+    campaign_submit_envelope,
 )
 
 
@@ -25,6 +29,37 @@ def context(**kwargs):
 
 def saved(name, payload):
     return ChatMessage(role="tool", name=name, content=json.dumps(payload))
+
+
+def test_campaign_submit_envelope_parser_requires_exact_v2_shape() -> None:
+    request_id = "00000000-0000-4000-8000-000000000001"
+    valid = campaign_submit_envelope("Assess target A", campaign_request_id=request_id)
+    assert _campaign_submit_payload(valid) == {
+        "campaign_request_id": request_id,
+        "operator_objective": "Assess target A",
+        "schema_version": "merlin.cli-campaign-submit.v2",
+    }
+    for payload in (
+        {
+            "operator_objective": "Assess target A",
+            "schema_version": "merlin.cli-campaign-submit.v2",
+        },
+        {
+            "campaign_request_id": 7,
+            "operator_objective": "Assess target A",
+            "schema_version": "merlin.cli-campaign-submit.v2",
+        },
+        {
+            "campaign_request_id": request_id,
+            "extra": True,
+            "operator_objective": "Assess target A",
+            "schema_version": "merlin.cli-campaign-submit.v2",
+        },
+    ):
+        assert (
+            _campaign_submit_payload("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" + json.dumps(payload))
+            is None
+        )
 
 
 class Delegate:
@@ -85,6 +120,162 @@ async def test_durable_profile_mode_target_applied_after_resume(profile, mode):
 
 
 @pytest.mark.asyncio
+async def test_configured_prepare_preserves_handoff_repair_metadata() -> None:
+    class RepairDelegate(Delegate):
+        async def invoke(self, ctx, args):
+            self.calls.append(dict(args))
+            return ToolResult(
+                content="durable handoff required",
+                is_error=True,
+                metadata={
+                    "retryable": True,
+                    "repair_reason": "recon_handoff_required",
+                    "preferred_next_tool": "browser_compile_api_handoff",
+                    "preferred_next_tool_mode": "strict",
+                },
+            )
+
+    campaign_request_id = "00000000-0000-4000-8000-000000000001"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                "Assess https://target.test",
+                campaign_request_id=campaign_request_id,
+            ),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "status": "configured",
+                "settings": {
+                    "objective": "Assess https://target.test",
+                    "campaign_profile": "recommended",
+                },
+            },
+        ),
+    ]
+    delegate = RepairDelegate("assessment_prepare")
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history))).invoke(
+        context(),
+        {
+            "objective": "model-authored wrong target",
+            "adapter": {"recon_handoff_id": "missing"},
+        },
+    )
+
+    assert result.is_error is True
+    assert result.metadata == {
+        "retryable": True,
+        "repair_reason": "recon_handoff_required",
+        "preferred_next_tool": "browser_compile_api_handoff",
+        "preferred_next_tool_mode": "strict",
+        "repair_scope_campaign_request_id": campaign_request_id,
+        "repair_scope_objective_digest": (
+            "sha256:" + hashlib.sha256(b"Assess https://target.test").hexdigest()
+        ),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution_mode", "expected_tool"),
+    [
+        ("browser", "browser_record_api_handoff"),
+        ("hybrid", "browser_compile_api_handoff"),
+    ],
+)
+async def test_configured_prepare_routes_missing_durable_handoff_with_v2_scope(
+    execution_mode: str, expected_tool: str
+) -> None:
+    class Service:
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("missing handoff must fail before campaign preparation")
+
+    objective = "Assess https://target.test"
+    campaign_request_id = "00000000-0000-4000-8000-000000000003"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                objective,
+                campaign_request_id=campaign_request_id,
+            ),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "recommended",
+                    "execution_mode": execution_mode,
+                },
+            },
+        ),
+    ]
+    delegate = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history))).invoke(
+        context(),
+        {
+            "objective": "model-authored wrong target",
+            "adapter": {"interface": "browser"},
+        },
+    )
+
+    assert result.is_error is True
+    assert result.content == (
+        "browser/hybrid preparation requires adapter.recon_handoff_id from a durable "
+        "reconnaissance handoff"
+    )
+    assert result.metadata == {
+        "retryable": True,
+        "repair_reason": "recon_handoff_required",
+        "preferred_next_tool": expected_tool,
+        "preferred_next_tool_mode": "strict",
+        "repair_scope_campaign_request_id": campaign_request_id,
+        "repair_scope_objective_digest": (
+            "sha256:" + hashlib.sha256(objective.encode()).hexdigest()
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_configured_prepare_rejects_request_id_bound_to_stale_settings() -> None:
+    campaign_request_id = "00000000-0000-4000-8000-000000000002"
+    history = [
+        saved(
+            "campaign_configure",
+            {
+                "status": "configured",
+                "settings": {
+                    "objective": "Assess target A",
+                    "campaign_profile": "recommended",
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                "Assess target B",
+                campaign_request_id=campaign_request_id,
+            ),
+        ),
+    ]
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"objective": "Assess target B", "adapter": {}}
+    )
+
+    assert result.is_error is True
+    assert "does not match the configured operator objective" in result.content
+    assert result.metadata == {}
+    assert delegate.calls == []
+
+
+@pytest.mark.asyncio
 async def test_settings_revision_preserves_unspecified_fields_and_new_scan_resets_them():
     initial = {
         "status": "configured",
@@ -140,8 +331,7 @@ async def test_new_campaign_defaults_to_recommended_when_profile_is_unspecified(
 @pytest.mark.asyncio
 async def test_new_campaign_preserves_operator_objective_and_rejects_inferred_profile():
     exact = (
-        "Use Merlin to test https://target.test.\n\n"
-        "Cover every tier and every available character."
+        "Use Merlin to test https://target.test.\n\nCover every tier and every available character."
     )
     history = [ChatMessage(role="user", content=exact)]
     tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
@@ -505,7 +695,18 @@ async def test_production_chat_path_does_not_require_exact_profile_keywords():
     backend = KernelBackend(kernel, operator_controls=True)
     prompt = "Run a full redpen scan on https://target.test with a self-selected team"
     assert [event async for event in backend.stream(prompt)] == []
-    assert kernel.submissions == [prompt]
+    encoded = kernel.submissions[0].split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+    envelope = json.loads(encoded)
+    assert kernel.submissions == [
+        f"{prompt}\n"
+        + campaign_submit_envelope(
+            prompt,
+            campaign_request_id=envelope["campaign_request_id"],
+        )
+    ]
+    ordinary = "Explain the current runtime status"
+    assert [event async for event in backend.stream(ordinary)] == []
+    assert kernel.submissions[-1] == ordinary
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import re
 import shlex
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -17,7 +19,91 @@ PROFILES = ("quickscan", "recommended", "exhaustive", "exploration")
 MODES = ("api", "browser", "hybrid")
 _URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 _CLI_CAMPAIGN_SUBMIT_MARKER = "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-_CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v1"
+_CLI_CAMPAIGN_SUBMIT_LEGACY_SCHEMA = "merlin.cli-campaign-submit.v1"
+_CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v2"
+_CAMPAIGN_REQUEST_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+def new_campaign_request_id() -> str:
+    """Create one durable identity for a client-owned campaign submission."""
+
+    return str(uuid.uuid4())
+
+
+def _valid_campaign_request_id(value: object) -> bool:
+    return isinstance(value, str) and _CAMPAIGN_REQUEST_ID_RE.fullmatch(value) is not None
+
+
+def campaign_submit_envelope(objective: str, *, campaign_request_id: str) -> str:
+    """Encode the operator-authoritative objective boundary for every campaign client."""
+
+    if not _valid_campaign_request_id(campaign_request_id):
+        raise ValueError("campaign_request_id must be a canonical lowercase UUID")
+    payload = json.dumps(
+        {
+            "campaign_request_id": campaign_request_id,
+            "schema_version": _CLI_CAMPAIGN_SUBMIT_SCHEMA,
+            "operator_objective": objective,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return _CLI_CAMPAIGN_SUBMIT_MARKER + payload
+
+
+def _campaign_submit_payload(content: str) -> Mapping[str, object] | None:
+    marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
+    if marker_index < 0:
+        return None
+    encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
+    try:
+        envelope, _end = json.JSONDecoder().raw_decode(encoded)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(envelope, Mapping):
+        return None
+    schema = envelope.get("schema_version")
+    if schema == _CLI_CAMPAIGN_SUBMIT_SCHEMA:
+        if set(envelope) != {
+            "campaign_request_id",
+            "operator_objective",
+            "schema_version",
+        } or not _valid_campaign_request_id(envelope.get("campaign_request_id")):
+            return None
+    elif schema == _CLI_CAMPAIGN_SUBMIT_LEGACY_SCHEMA:
+        if set(envelope) != {"operator_objective", "schema_version"}:
+            return None
+    else:
+        return None
+    if (
+        not isinstance(envelope.get("operator_objective"), str)
+        or not str(envelope["operator_objective"]).strip()
+    ):
+        return None
+    return envelope
+
+
+def _latest_campaign_request_scope(
+    messages: Sequence[ChatMessage],
+) -> tuple[str, str] | None:
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        envelope = _campaign_submit_payload(message.content)
+        if envelope is None or envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_SCHEMA:
+            continue
+        request_id = envelope.get("campaign_request_id")
+        if _valid_campaign_request_id(request_id):
+            objective = str(envelope["operator_objective"]).strip()
+            return (
+                str(request_id),
+                "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+            )
+    return None
+
+
 READ_OPERATIONS = (
     "get_runtime_status",
     "list_campaigns",
@@ -126,23 +212,13 @@ def _operator_campaign_request(
     # retries contain the same target URL but are internal orchestration, not a
     # replacement operator objective.
     for content in user_messages:
-        # The CLI appends this envelope after the exact objective. Use the final
-        # marker so operator-authored text that happens to mention the protocol
-        # token cannot shadow the authoritative envelope.
-        marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
-        if marker_index >= 0:
-            encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
-            try:
-                envelope, _end = json.JSONDecoder().raw_decode(encoded)
-            except (ValueError, TypeError):
-                envelope = None
-            if (
-                isinstance(envelope, Mapping)
-                and envelope.get("schema_version") == _CLI_CAMPAIGN_SUBMIT_SCHEMA
-                and isinstance(envelope.get("operator_objective"), str)
-                and envelope["operator_objective"].strip()
-            ):
-                return str(envelope["operator_objective"])
+        # The client appends this envelope after the exact objective. Use the
+        # final marker so operator-authored text that happens to mention the
+        # protocol token cannot shadow the authoritative envelope. Legacy v1
+        # envelopes remain objective provenance, but are not campaign boundaries.
+        envelope = _campaign_submit_payload(content)
+        if envelope is not None:
+            return str(envelope["operator_objective"])
 
     for content in user_messages:
         authored_urls = {value.rstrip(".,;:!?") for value in _URL_RE.findall(content)}
@@ -155,9 +231,7 @@ def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> 
     """Return a profile only when operator-authored text explicitly selects it."""
 
     for message in reversed(messages):
-        if message.role != "user" or not message.content.startswith(
-            "MERLIN_USER_INPUT_RESPONSE\n"
-        ):
+        if message.role != "user" or not message.content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
             continue
         try:
             response = json.loads(message.content.split("\n", 1)[1])
@@ -237,11 +311,7 @@ class CampaignConfigureTool:
         try:
             _foreground(context)
             messages = await self._load(context.session_id)
-            settings = (
-                {}
-                if arguments.get("new_campaign") is True
-                else _settings(messages)
-            )
+            settings = {} if arguments.get("new_campaign") is True else _settings(messages)
             allowed = set(self.describe().input_schema["properties"])
             if set(arguments) - allowed:
                 raise ValueError("unknown campaign setting")
@@ -270,9 +340,7 @@ class CampaignConfigureTool:
             if arguments.get("new_campaign") is True and not settings.get("objective"):
                 raise ValueError("a new campaign requires its exact objective and target")
             if arguments.get("new_campaign") is True:
-                operator_objective = _operator_campaign_request(
-                    messages, settings.get("objective")
-                )
+                operator_objective = _operator_campaign_request(messages, settings.get("objective"))
                 if operator_objective is not None:
                     settings["objective"] = operator_objective
                     settings["campaign_profile"] = (
@@ -323,6 +391,8 @@ class ConfiguredCampaignTool:
         if context.agent_id is not None or context.campaign_id is not None:
             return await self._tool.invoke(context, arguments)
         messages = await self._load(context.session_id)
+        prepare_scope_digest: str | None = None
+        prepare_scope_request_id: str | None = None
         values = dict(arguments)
         if self.describe().name == "assessment_prepare":
             settings = _settings(messages)
@@ -333,6 +403,24 @@ class ConfiguredCampaignTool:
                     is_error=True,
                 )
             values.update({k: v for k, v in settings.items() if k != "execution_mode"})
+            prepare_scope_digest = (
+                "sha256:" + hashlib.sha256(str(settings["objective"]).strip().encode()).hexdigest()
+            )
+            campaign_request_scope = _latest_campaign_request_scope(messages)
+            if (
+                campaign_request_scope is not None
+                and campaign_request_scope[1] != prepare_scope_digest
+            ):
+                return ToolResult(
+                    content=(
+                        "The latest campaign request does not match the configured operator "
+                        "objective. Call campaign_configure for that request before preparing."
+                    ),
+                    is_error=True,
+                )
+            prepare_scope_request_id = (
+                campaign_request_scope[0] if campaign_request_scope is not None else None
+            )
             if settings.get("execution_mode"):
                 values["adapter"] = {
                     **values.get("adapter", {}),
@@ -362,6 +450,20 @@ class ConfiguredCampaignTool:
                 is_error=True,
             )
         result = await self._tool.invoke(context, values)
+        if self.describe().name == "assessment_prepare":
+            result = result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        **(
+                            {"repair_scope_campaign_request_id": (prepare_scope_request_id)}
+                            if prepare_scope_request_id is not None
+                            else {}
+                        ),
+                        "repair_scope_objective_digest": prepare_scope_digest,
+                    }
+                }
+            )
         if self.describe().name == "assessment_prepare" and not result.is_error:
             # Keep the binding parseable in durable tool history even when the
             # full manifest exceeds the broker's model-facing result limit.

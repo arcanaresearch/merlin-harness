@@ -918,6 +918,7 @@ async def test_human_stream_returns_when_cleanup_suppresses_cancellation(monkeyp
 
 def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> None:
     calls = []
+    campaign_request_id = "00000000-0000-4000-8000-000000000001"
     client = _install_durable_campaign(
         monkeypatch, objective="Assess https://target.test", campaign_id="campaign/one"
     )
@@ -934,6 +935,7 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
         return None
 
     monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr("merlin_tui.cli.new_campaign_request_id", lambda: campaign_request_id)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -946,8 +948,9 @@ def test_campaign_approve_applies_to_preparation_and_execution(monkeypatch) -> N
         ("/new", False, None, False),
         (
             "Assess https://target.test\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-            '{"operator_objective": "Assess https://target.test", '
-            '"schema_version": "merlin.cli-campaign-submit.v1"}\n'
+            f'{{"campaign_request_id": "{campaign_request_id}", '
+            '"operator_objective": "Assess https://target.test", '
+            '"schema_version": "merlin.cli-campaign-submit.v2"}\n'
             "The operator explicitly selected campaign profile: "
             "recommended; do not ask for the profile again. Any max_* values below are "
             "provider/model campaign budgets, not target chat/message limits.\n"
@@ -1772,6 +1775,77 @@ async def test_campaign_approve_accepts_streamed_same_origin_paraphrase_without_
     assert len(prompts) == 1
 
 
+@pytest.mark.asyncio
+async def test_campaign_objective_repair_reuses_campaign_request_id(monkeypatch) -> None:
+    objective = "Assess https://target.test exactly."
+    request_id = "00000000-0000-4000-8000-000000000001"
+
+    class Client:
+        def __init__(self) -> None:
+            self.approved = False
+            self.cancel_calls: list[str] = []
+            self.execute_calls: list[tuple[str, str]] = []
+
+        async def list_campaigns(self):
+            return ()
+
+        async def campaign_status(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "status": "executing" if self.approved else "prepared",
+                "manifest_digest": (
+                    "sha256:exact" if campaign_id == "campaign/exact" else "sha256:drifted"
+                ),
+                "budget": {"limits": {}},
+                "specialist_composition": "opinionated",
+            }
+
+        async def cancel_campaign(self, campaign_id="*"):
+            self.cancel_calls.append(campaign_id)
+            return 1
+
+        async def execute_campaign(self, campaign_id, digest):
+            self.execute_calls.append((campaign_id, digest))
+            self.approved = True
+            return {"campaign_id": campaign_id, "status": "executing"}
+
+        async def close(self):
+            return None
+
+    client = Client()
+
+    async def build_client(*, confirmer=None):
+        assert confirmer is None
+        return client
+
+    prompts: list[str] = []
+
+    async def print_stream(prompt, **_kwargs):
+        if prompt == "/new":
+            return None
+        prompts.append(prompt)
+        exact = len(prompts) == 2
+        return {
+            "campaign_id": "campaign/exact" if exact else "campaign/drifted",
+            "manifest_digest": "sha256:exact" if exact else "sha256:drifted",
+            "objective": objective if exact else "Assess https://target.test loosely.",
+            "profile": "recommended",
+            "review": {"budget": {}},
+        }
+
+    monkeypatch.setattr("merlin_tui.cli._client", build_client)
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr("merlin_tui.cli.new_campaign_request_id", lambda: request_id)
+    from merlin_tui.cli import _submit_campaign
+
+    await _submit_campaign(["--strict-objective", "--approve", objective])
+
+    assert client.cancel_calls == ["campaign/drifted"]
+    assert client.execute_calls == [("campaign/exact", "sha256:exact")]
+    assert len(prompts) == 2
+    assert all(prompt.count(f'"campaign_request_id": "{request_id}"') == 1 for prompt in prompts)
+
+
 def test_campaign_approve_accepts_verbatim_objective_with_target_anchor(monkeypatch) -> None:
     operator_objective = "Assess https://target.test for prompt injection"
     client = _install_durable_campaign(
@@ -1842,7 +1916,7 @@ def test_campaign_approve_accepts_merlin_invocation_wrapper_omission(
         "force wins or bypass character progression and session limits."
     )
     prepared_objective = (
-        'Test my local Rizz or Rekt game at http://localhost:3100. Open that exact URL, enter '
+        "Test my local Rizz or Rekt game at http://localhost:3100. Open that exact URL, enter "
         'the game, connect using "Test Wallet," and sign the login message. Learn the rules '
         "and play normally first. Test all four tiers, Tier 1 through Tier 4, including every "
         "available character in each tier. Track coverage per tier and character. If "
@@ -2034,6 +2108,7 @@ def test_campaign_approve_retries_once_when_prepare_turn_ends_without_tool(monke
         campaign_id="campaign/one",
         composition="opinionated",
     )
+    campaign_request_id = "00000000-0000-4000-8000-000000000001"
 
     async def no_campaigns():
         return ()
@@ -2058,6 +2133,7 @@ def test_campaign_approve_retries_once_when_prepare_turn_ends_without_tool(monke
         return None
 
     monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr("merlin_tui.cli.new_campaign_request_id", lambda: campaign_request_id)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2070,6 +2146,10 @@ def test_campaign_approve_retries_once_when_prepare_turn_ends_without_tool(monke
     assert prompts[0] == "/new"
     assert prompts[1].startswith("Assess target")
     assert "ended without calling assessment_prepare" in prompts[2]
+    assert all(
+        prompt.count(f'"campaign_request_id": "{campaign_request_id}"') == 1
+        for prompt in prompts[1:]
+    )
     assert client.execute_calls == [("campaign/one", "sha256:reviewed")]
 
 
@@ -2172,11 +2252,13 @@ def test_campaign_approve_recovers_exploration_profile_prompt(monkeypatch) -> No
 
 def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch) -> None:
     calls = []
+    campaign_request_id = "00000000-0000-4000-8000-000000000001"
 
     async def print_stream(prompt, *, approve_once=False, **_kwargs):
         calls.append((prompt, approve_once))
 
     monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr("merlin_tui.cli.new_campaign_request_id", lambda: campaign_request_id)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2201,8 +2283,9 @@ def test_campaign_submit_projects_explicit_budget_into_review_prompt(monkeypatch
 
     assert calls[1] == (
         "Assess target\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-        '{"operator_objective": "Assess target", '
-        '"schema_version": "merlin.cli-campaign-submit.v1"}\n'
+        f'{{"campaign_request_id": "{campaign_request_id}", '
+        '"operator_objective": "Assess target", '
+        '"schema_version": "merlin.cli-campaign-submit.v2"}\n'
         "The operator explicitly selected campaign profile: recommended; "
         "do not ask for the profile again. Any max_* values below are provider/model "
         "campaign budgets, not target chat/message limits.\n"
@@ -2358,6 +2441,34 @@ def test_campaign_approve_accepts_exact_explicit_budget(monkeypatch) -> None:
 
     assert client.execute_calls == [("campaign/exact", "sha256:exact")]
     assert not any(prompt.startswith("Approve and execute") for prompt, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_separate_cli_submissions_get_distinct_campaign_request_ids(
+    monkeypatch,
+) -> None:
+    request_ids = iter(
+        (
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+        )
+    )
+    prompts: list[str] = []
+
+    async def print_stream(prompt, **_kwargs):
+        prompts.append(prompt)
+
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    monkeypatch.setattr("merlin_tui.cli.new_campaign_request_id", lambda: next(request_ids))
+    from merlin_tui.cli import _submit_campaign
+
+    await _submit_campaign(["Assess target"])
+    await _submit_campaign(["Assess target"])
+
+    campaign_prompts = [prompt for prompt in prompts if prompt != "/new"]
+    assert len(campaign_prompts) == 2
+    assert '"campaign_request_id": "00000000-0000-4000-8000-000000000001"' in (campaign_prompts[0])
+    assert '"campaign_request_id": "00000000-0000-4000-8000-000000000002"' in (campaign_prompts[1])
 
 
 def test_report_export_defaults_to_markdown(monkeypatch) -> None:
@@ -2591,9 +2702,7 @@ async def test_interactive_daemon_start_arms_unclaimed_shutdown(monkeypatch) -> 
         calls.append("arm")
 
     monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", ensure_daemon)
-    monkeypatch.setattr(
-        "merlin_tui.local_control._arm_unclaimed_shutdown", arm_unclaimed_shutdown
-    )
+    monkeypatch.setattr("merlin_tui.local_control._arm_unclaimed_shutdown", arm_unclaimed_shutdown)
 
     from merlin_tui.cli import _ensure_daemon_with_splash
 

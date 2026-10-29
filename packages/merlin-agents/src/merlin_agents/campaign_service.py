@@ -22303,6 +22303,47 @@ def _durable_recon_handoff_request(adapter: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+_REPAIRABLE_RECON_HANDOFF_ERRORS = (
+    "browser/hybrid preparation requires adapter.recon_handoff_id from a durable "
+    "reconnaissance handoff",
+)
+
+
+def _recon_handoff_repair_metadata(
+    adapter: object, error: str, *, objective: object = None
+) -> dict[str, object]:
+    """Route only repairable browser-handoff failures to one durable repair tool.
+
+    Target/session identity mismatches, malformed handoffs, and ordinary adapter
+    validation errors intentionally return no routing metadata. Those failures need
+    operator or implementation review rather than a blind reconstruction attempt.
+    """
+
+    normalized_error = " ".join(error.casefold().split())
+    if normalized_error not in _REPAIRABLE_RECON_HANDOFF_ERRORS:
+        return {}
+    candidate = adapter if isinstance(adapter, Mapping) else {}
+    interface = str(candidate.get("interface") or "").strip().casefold()
+    execution_mode = str(candidate.get("execution_mode") or "").strip().casefold()
+    has_api_steps = bool(candidate.get("api_steps"))
+    repair_tool = (
+        "browser_record_api_handoff"
+        if interface == "browser" and execution_mode in {"", "browser"} and not has_api_steps
+        else "browser_compile_api_handoff"
+    )
+    metadata: dict[str, object] = {
+        "retryable": True,
+        "repair_reason": "recon_handoff_required",
+        "preferred_next_tool": repair_tool,
+        "preferred_next_tool_mode": "strict",
+    }
+    if isinstance(objective, str) and objective.strip():
+        metadata["repair_scope_objective_digest"] = (
+            "sha256:" + hashlib.sha256(objective.strip().encode()).hexdigest()
+        )
+    return metadata
+
+
 class AssessmentPrepareTool:
     effect = "workspace_read"
 
@@ -22732,12 +22773,16 @@ class AssessmentPrepareTool:
             has_handoff_id = isinstance(handoff_id, str) and bool(handoff_id.strip())
             needs_handoff_resolution = requires_durable_handoff or has_handoff_id
             if requires_durable_handoff and not has_handoff_id:
+                missing_handoff_error = (
+                    "browser/hybrid preparation requires adapter.recon_handoff_id "
+                    "from a durable reconnaissance handoff"
+                )
                 return ToolResult(
-                    content=(
-                        "browser/hybrid preparation requires adapter.recon_handoff_id "
-                        "from a durable reconnaissance handoff"
-                    ),
+                    content=missing_handoff_error,
                     is_error=True,
+                    metadata=_recon_handoff_repair_metadata(
+                        adapter, missing_handoff_error, objective=objective
+                    ),
                 )
             if has_handoff_id:
                 # Every durable handoff is authoritative for executable fields.  A

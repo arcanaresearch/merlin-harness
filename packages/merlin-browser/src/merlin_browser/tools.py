@@ -3952,9 +3952,10 @@ class ApiReconHandoffTool:
             ]
         if handoff_uncertainties:
             metadata["evaluation_uncertainties"] = handoff_uncertainties
+        metadata["preferred_next_tool"] = "assessment_prepare"
+        metadata["preferred_next_tool_mode"] = "strict"
         if derived_handoff is not None:
             metadata["compiled_adapter"] = True
-            metadata["preferred_next_tool"] = "assessment_prepare"
         if fallback is not None and api_candidates and derived_handoff is None:
             candidate = api_candidates[-1]
             metadata["api_candidate_observed"] = f"{candidate['method']} {candidate['url']}"

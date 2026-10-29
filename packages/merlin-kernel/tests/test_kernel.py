@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 from types import SimpleNamespace
@@ -29,8 +30,24 @@ from merlin_kernel.kernel import (
     _automatic_recon_continuation,
     _KernelJevClient,
     _restored_automatic_recon,
+    _restored_preferred_tool_repair,
     _safe_shell_invocation,
+    _tool_content_with_automatic_marker,
 )
+
+_CAMPAIGN_REQUEST_ID_A = "00000000-0000-4000-8000-000000000001"
+_CAMPAIGN_REQUEST_ID_B = "00000000-0000-4000-8000-000000000002"
+
+
+def _campaign_scope_content(objective: str, request_id: str = _CAMPAIGN_REQUEST_ID_A) -> str:
+    return "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" + json.dumps(
+        {
+            "campaign_request_id": request_id,
+            "operator_objective": objective,
+            "schema_version": "merlin.cli-campaign-submit.v2",
+        },
+        sort_keys=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -376,9 +393,7 @@ async def test_dynamic_recon_recall_blocks_source_crawl_in_same_provider_stream(
 
     class DynamicReconProvider:
         async def stream_with_tools(self, request, handler):
-            assert "shell_command" in {
-                item["function"]["name"] for item in request.tools
-            }
+            assert "shell_command" in {item["function"]["name"] for item in request.tools}
             recalled = await handler(
                 ToolCall(
                     call_id="recall",
@@ -392,9 +407,7 @@ async def test_dynamic_recon_recall_blocks_source_crawl_in_same_provider_stream(
             )
             assert blocked.success is False
             assert "not admitted" in blocked.content
-            opened = await handler(
-                ToolCall(call_id="open", name="browser_open_tab", arguments={})
-            )
+            opened = await handler(ToolCall(call_id="open", name="browser_open_tab", arguments={}))
             assert opened.success is True
             yield TextDelta(text="Reconnaissance remains bounded.")
             yield ModelCompleted()
@@ -562,13 +575,15 @@ def test_restored_cleanup_continuation_rejects_mutated_owned_tool_set() -> None:
             role="tool",
             name="assessment_prepare",
             tool_call_id="prepare-owned",
-            content=(
-                "held\n[merlin-automatic-recon]"
-                + json.dumps(
-                    {"state": "held", "continuation": continuation},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-owned",
+                {},
+                ToolResult(
+                    content="held",
+                    is_error=True,
+                    metadata={"automatic_recon_continuation": continuation},
+                ),
             ),
         ),
     ]
@@ -600,13 +615,15 @@ def test_restored_owned_cleanup_authority_is_downgraded_to_read_only() -> None:
             role="tool",
             name="assessment_prepare",
             tool_call_id="prepare-owned",
-            content=(
-                "held\n[merlin-automatic-recon]"
-                + json.dumps(
-                    {"state": "held", "continuation": continuation},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-owned",
+                {},
+                ToolResult(
+                    content="held",
+                    is_error=True,
+                    metadata={"automatic_recon_continuation": continuation},
+                ),
             ),
         ),
     ]
@@ -2029,13 +2046,11 @@ async def test_repeated_malformed_preferred_tool_remains_advertised() -> None:
 
     assert len(provider.requests) == 5
     assert all(
-        [tool["function"]["name"] for tool in request.tools]
-        == ["assessment_prepare"]
+        [tool["function"]["name"] for tool in request.tools] == ["assessment_prepare"]
         for request in provider.requests[1:4]
     )
     assert all(
-        request.required_tool_name == "assessment_prepare"
-        for request in provider.requests[1:4]
+        request.required_tool_name == "assessment_prepare" for request in provider.requests[1:4]
     )
     assert tools.calls == ["observe", "assessment_prepare"]
 
@@ -2353,21 +2368,15 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
             self.requests.append(request)
             call_number = len(self.requests)
             if call_number == 1:
-                yield ToolCall(
-                    call_id="observe", name="browser_snapshot", arguments={}
-                )
+                yield ToolCall(call_id="observe", name="browser_snapshot", arguments={})
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
             if call_number == 2:
-                yield ToolCall(
-                    call_id="wait", name="browser_wait_for_text", arguments={}
-                )
+                yield ToolCall(call_id="wait", name="browser_wait_for_text", arguments={})
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
             if call_number == 3:
-                yield ToolCall(
-                    call_id="compile", name="browser_compile_api_handoff", arguments={}
-                )
+                yield ToolCall(call_id="compile", name="browser_compile_api_handoff", arguments={})
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
             yield TextDelta(text="compiled")
@@ -2458,8 +2467,7 @@ async def test_preferred_tool_refusal_is_uncertain_then_cooperates() -> None:
         for request in provider.requests[1:3]
     )
     assert all(
-        request.required_tool_name == "assessment_prepare"
-        for request in provider.requests[1:3]
+        request.required_tool_name == "assessment_prepare" for request in provider.requests[1:3]
     )
     assert "Durable tool evidence takes precedence" in provider.requests[2].messages[-1].content
     assert tools.calls == ["observe", "assessment_prepare"]
@@ -2623,9 +2631,7 @@ async def test_dynamic_provider_can_follow_trusted_tool_transition_in_same_reque
 
         async def stream_with_tools(self, request, handler):
             self.requests.append(request)
-            compiled = await handler(
-                ToolCall(call_id="compile", name="compile", arguments={})
-            )
+            compiled = await handler(ToolCall(call_id="compile", name="compile", arguments={}))
             assert compiled.success is True
             prepared = await handler(
                 ToolCall(
@@ -3106,9 +3112,7 @@ async def test_identical_retryable_preferred_tool_failures_are_bounded() -> None
                 yield ToolCall(
                     call_id=f"repair-{len(self.requests)}",
                     name="repair",
-                    arguments={
-                        "locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]
-                    },
+                    arguments={"locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]},
                 )
             yield ModelCompleted(finish_reason="tool_calls")
 
@@ -3250,9 +3254,7 @@ async def test_dynamic_identical_retryable_preferred_tool_failures_are_bounded()
                     arguments=(
                         {}
                         if name == "observe"
-                        else {
-                            "locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]
-                        }
+                        else {"locator": ("A", "B", "A")[(len(self.requests) - 2) % 3]}
                     ),
                 )
             )
@@ -3315,18 +3317,14 @@ async def test_dynamic_preferred_tool_rejects_stale_advertised_tool_in_same_requ
         async def stream_with_tools(self, request, handler):
             self.requests.append(request)
             if len(self.requests) == 1:
-                observed = await handler(
-                    ToolCall(call_id="observe", name="observe", arguments={})
-                )
+                observed = await handler(ToolCall(call_id="observe", name="observe", arguments={}))
                 assert observed.success is False
                 self.unrelated_result = await handler(
                     ToolCall(call_id="unrelated", name="unrelated", arguments={})
                 )
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
-            compiled = await handler(
-                ToolCall(call_id="compile", name="compile", arguments={})
-            )
+            compiled = await handler(ToolCall(call_id="compile", name="compile", arguments={}))
             assert compiled.success is True
             yield ModelCompleted(finish_reason="tool_calls")
 
@@ -4069,13 +4067,15 @@ async def test_cleanup_discovery_hold_restores_after_kernel_restart() -> None:
             role="tool",
             name="assessment_prepare",
             tool_call_id="old-prepare",
-            content=(
-                "held\n[merlin-automatic-recon]"
-                + json.dumps(
-                    {"state": "held", "continuation": continuation},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "old-prepare",
+                {},
+                ToolResult(
+                    content="held",
+                    is_error=True,
+                    metadata={"automatic_recon_continuation": continuation},
+                ),
             ),
         ),
         ChatMessage(
@@ -4137,20 +4137,1417 @@ async def test_cleanup_discovery_hold_restores_after_kernel_restart() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handoff_repair_obligation_restores_strictly_after_kernel_restart() -> None:
+    class RepairTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "unrelated",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare" and self.calls.count(name) == 1:
+                return ToolResult(
+                    content="durable browser handoff required",
+                    is_error=True,
+                    metadata={
+                        "retryable": True,
+                        "repair_reason": "recon_handoff_required",
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="handoff compiled",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="campaign prepared")
+
+    store = Store()
+    tools = RepairTools()
+    first_kernel = Kernel(Provider(), store, tools, Settings())
+    session_id = await first_kernel.start()
+    await store.append_message(
+        session_id,
+        ChatMessage(role="user", content=_campaign_scope_content("Assess target A")),
+    )
+    next_tool, *_ = await first_kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(
+                call_id="prepare-old",
+                name="assessment_prepare",
+                arguments={"objective": "Assess target A"},
+            )
+        ],
+        repair_scope_campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    assert next_tool == "browser_compile_api_handoff"
+
+    class RestartProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            index = len(self.requests)
+            if index == 1:
+                yield TextDelta(text="the compiler is unavailable")
+                yield ModelCompleted()
+            elif index == 2:
+                yield ToolCall(call_id="alternate", name="unrelated", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+            elif index == 3:
+                yield ToolCall(
+                    call_id="compile-new",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+            elif index == 4:
+                yield ToolCall(
+                    call_id="prepare-new",
+                    name="assessment_prepare",
+                    arguments={"objective": "Assess target A"},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+            else:
+                yield TextDelta(text="prepared")
+                yield ModelCompleted()
+
+    provider = RestartProvider()
+    restarted = Kernel(provider, store, tools, Settings())
+    await restarted.start(session_id)
+    await restarted.submit("resume interrupted turn")
+    await restarted.wait_for_turn()
+
+    assert [request.required_tool_name for request in provider.requests[:3]] == [
+        "browser_compile_api_handoff",
+        "browser_compile_api_handoff",
+        "browser_compile_api_handoff",
+    ]
+    assert all(
+        [tool["function"]["name"] for tool in request.tools] == ["browser_compile_api_handoff"]
+        for request in provider.requests[:3]
+    )
+    assert provider.requests[3].required_tool_name == "assessment_prepare"
+    assert [tool["function"]["name"] for tool in provider.requests[3].tools] == [
+        "assessment_prepare"
+    ]
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+        "assessment_prepare",
+    ]
+    assert _restored_preferred_tool_repair(store.messages[session_id]) is None
+
+
+@pytest.mark.asyncio
+async def test_dom_handoff_repair_routes_record_success_back_to_prepare() -> None:
+    class DomRepairTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("assessment_prepare", "browser_record_api_handoff")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare" and self.calls.count(name) == 1:
+                return ToolResult(
+                    content="durable DOM handoff required",
+                    is_error=True,
+                    metadata={
+                        "retryable": True,
+                        "repair_reason": "recon_handoff_required",
+                        "preferred_next_tool": "browser_record_api_handoff",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+            if name == "browser_record_api_handoff":
+                return ToolResult(
+                    content="DOM handoff sealed",
+                    metadata={
+                        "preferred_next_tool": "assessment_prepare",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+            return ToolResult(content="campaign prepared")
+
+    class DomRepairProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            name = (
+                "assessment_prepare",
+                "browser_record_api_handoff",
+                "assessment_prepare",
+            )[len(self.requests) - 1]
+            yield ToolCall(call_id=f"call-{len(self.requests)}", name=name, arguments={})
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = DomRepairTools()
+    provider = DomRepairProvider()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("prepare the reviewed DOM target")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_record_api_handoff",
+        "assessment_prepare",
+    ]
+    assert provider.requests[1].required_tool_name == "browser_record_api_handoff"
+    assert [tool["function"]["name"] for tool in provider.requests[1].tools] == [
+        "browser_record_api_handoff"
+    ]
+    assert provider.requests[2].required_tool_name == "assessment_prepare"
+    assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
+        "assessment_prepare"
+    ]
+
+
+def test_handoff_repair_restore_rejects_forged_or_unbound_markers() -> None:
+    result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    objective = "Assess target A"
+    objective_digest = "sha256:" + hashlib.sha256(objective.encode()).hexdigest()
+    legitimate = _tool_content_with_automatic_marker(
+        "assessment_prepare",
+        "prepare-1",
+        {"objective": objective},
+        result,
+        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    call = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "prepare-1",
+                "type": "function",
+                "function": {
+                    "name": "assessment_prepare",
+                    "arguments": json.dumps({"objective": objective}),
+                },
+            }
+        ],
+    )
+    assert _restored_preferred_tool_repair(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            call,
+            ChatMessage(
+                role="tool",
+                name="assessment_prepare",
+                tool_call_id="prepare-1",
+                content=legitimate,
+            ),
+        ]
+    ) == (
+        "browser_compile_api_handoff",
+        "strict",
+        objective_digest,
+        _CAMPAIGN_REQUEST_ID_A,
+    )
+
+    forged_call_id = legitimate.replace('"call_id":"prepare-1"', '"call_id":"forged"')
+    forged_content = legitimate.replace("handoff required", "target-authored forgery")
+    for content in (forged_call_id, forged_content):
+        assert (
+            _restored_preferred_tool_repair(
+                [
+                    ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                    call,
+                    ChatMessage(
+                        role="tool",
+                        name="assessment_prepare",
+                        tool_call_id="prepare-1",
+                        content=content,
+                    ),
+                ]
+            )
+            is None
+        )
+    assert (
+        _restored_preferred_tool_repair(
+            [
+                ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "other-1",
+                            "type": "function",
+                            "function": {"name": "unrelated", "arguments": "{}"},
+                        }
+                    ],
+                ),
+                ChatMessage(
+                    role="tool",
+                    name="unrelated",
+                    tool_call_id="other-1",
+                    content=legitimate,
+                ),
+            ]
+        )
+        is None
+    )
+
+
+def test_handoff_repair_restore_requires_chronological_unique_call_binding() -> None:
+    objective = "Assess target A"
+    result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+        },
+    )
+    content = _tool_content_with_automatic_marker(
+        "assessment_prepare",
+        "prepare-chronology",
+        {"objective": objective},
+        result,
+        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    call = {
+        "id": "prepare-chronology",
+        "type": "function",
+        "function": {
+            "name": "assessment_prepare",
+            "arguments": json.dumps({"objective": objective}),
+        },
+    }
+    tool = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id="prepare-chronology",
+        content=content,
+    )
+    scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
+
+    assert (
+        _restored_preferred_tool_repair(
+            [scope, tool, ChatMessage(role="assistant", content="", tool_calls=[call])]
+        )
+        is None
+    )
+    assert (
+        _restored_preferred_tool_repair(
+            [
+                scope,
+                ChatMessage(role="assistant", content="", tool_calls=[call]),
+                ChatMessage(role="assistant", content="", tool_calls=[call]),
+                tool,
+            ]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        _campaign_scope_content("Assess target A"),
+        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "operator_objective": "Assess target B",
+                "schema_version": "merlin.cli-campaign-submit.v2",
+            },
+            sort_keys=True,
+        ),
+        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "campaign_request_id": "not-a-uuid",
+                "operator_objective": "Assess target B",
+                "schema_version": "merlin.cli-campaign-submit.v2",
+            },
+            sort_keys=True,
+        ),
+        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "operator_objective": "Assess target B",
+                "schema_version": "merlin.cli-campaign-submit.v1",
+            },
+            sort_keys=True,
+        ),
+    ],
+)
+def test_handoff_repair_ignores_non_boundary_campaign_envelopes(boundary: str) -> None:
+    objective = "Assess target A"
+    digest = "sha256:" + hashlib.sha256(objective.encode()).hexdigest()
+    result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+        },
+    )
+    transcript = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective},
+                result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+        ChatMessage(role="user", content=boundary),
+    ]
+
+    assert _restored_preferred_tool_repair(transcript) == (
+        "browser_compile_api_handoff",
+        "strict",
+        digest,
+        _CAMPAIGN_REQUEST_ID_A,
+    )
+
+
+def test_handoff_repair_same_request_id_conflict_fails_closed() -> None:
+    objective_a = "Assess target A"
+    objective_b = "Assess target B"
+    required = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+        },
+    )
+    conflicting = ToolResult(
+        content="different objective also needs a handoff",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_record_api_handoff",
+        },
+    )
+    transcript = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective_a)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective_a}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective_a},
+                required,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            content=_campaign_scope_content(objective_b, _CAMPAIGN_REQUEST_ID_A),
+        ),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-b",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective_b}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-b",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-b",
+                {"objective": objective_b},
+                conflicting,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    assert _restored_preferred_tool_repair(transcript) is None
+
+
+def test_automatic_recon_restore_is_authenticated_and_campaign_scoped() -> None:
+    objective = "Assess target A"
+    result = ToolResult(
+        content="cleanup discovery required",
+        is_error=True,
+        metadata={"automatic_recon_continuation": _cleanup_continuation("handoff:scoped-restart")},
+    )
+    content = _tool_content_with_automatic_marker(
+        "assessment_prepare",
+        "prepare-cleanup",
+        {"objective": objective},
+        result,
+        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    call = {
+        "id": "prepare-cleanup",
+        "type": "function",
+        "function": {
+            "name": "assessment_prepare",
+            "arguments": json.dumps({"objective": objective}),
+        },
+    }
+    scope_a = ChatMessage(role="user", content=_campaign_scope_content(objective))
+    assistant = ChatMessage(role="assistant", content="", tool_calls=[call])
+    tool = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id="prepare-cleanup",
+        content=content,
+    )
+
+    restored, _ = _restored_automatic_recon([scope_a, assistant, tool])
+    assert restored is not None
+    same_scope, _ = _restored_automatic_recon(
+        [
+            scope_a,
+            assistant,
+            tool,
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ]
+    )
+    assert same_scope is not None
+    resumed, _ = _restored_automatic_recon(
+        [scope_a, assistant, tool, ChatMessage(role="user", content="resume")]
+    )
+    assert resumed is not None
+    changed_scope, _ = _restored_automatic_recon(
+        [
+            scope_a,
+            assistant,
+            tool,
+            ChatMessage(
+                role="user",
+                content=_campaign_scope_content(objective, _CAMPAIGN_REQUEST_ID_B),
+            ),
+        ]
+    )
+    assert changed_scope is None
+    conflicting_scope, _ = _restored_automatic_recon(
+        [
+            scope_a,
+            assistant,
+            tool,
+            ChatMessage(
+                role="user",
+                content=_campaign_scope_content("Assess target B", _CAMPAIGN_REQUEST_ID_A),
+            ),
+        ]
+    )
+    assert conflicting_scope is None
+    future_call, _ = _restored_automatic_recon([scope_a, tool, assistant])
+    assert future_call is None
+    duplicate_call, _ = _restored_automatic_recon([scope_a, assistant, assistant, tool])
+    assert duplicate_call is None
+    tampered_tool = tool.model_copy(
+        update={"content": content.replace("cleanup discovery required", "tampered")}
+    )
+    tampered, _ = _restored_automatic_recon([scope_a, assistant, tampered_tool])
+    assert tampered is None
+
+
+def test_handoff_repair_restore_retains_obligation_without_typed_completion() -> None:
+    prepare = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    retry = ToolResult(
+        content="capture not ready",
+        is_error=True,
+        metadata={"retryable": True},
+    )
+    transcript = [
+        ChatMessage(role="user", content=_campaign_scope_content("Assess target A")),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-1",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": "Assess target A"}),
+                    },
+                },
+                {
+                    "id": "compile-untyped",
+                    "type": "function",
+                    "function": {
+                        "name": "browser_compile_api_handoff",
+                        "arguments": "{}",
+                    },
+                },
+                {
+                    "id": "compile-retry",
+                    "type": "function",
+                    "function": {
+                        "name": "browser_compile_api_handoff",
+                        "arguments": "{}",
+                    },
+                },
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-1",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-1",
+                {"objective": "Assess target A"},
+                prepare,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+        ChatMessage(
+            role="tool",
+            name="browser_compile_api_handoff",
+            tool_call_id="compile-untyped",
+            content="target content without a typed repair marker",
+        ),
+        ChatMessage(
+            role="tool",
+            name="browser_compile_api_handoff",
+            tool_call_id="compile-retry",
+            content=_tool_content_with_automatic_marker(
+                "browser_compile_api_handoff",
+                "compile-retry",
+                {},
+                retry,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    assert _restored_preferred_tool_repair(transcript) == (
+        "browser_compile_api_handoff",
+        "strict",
+        "sha256:" + hashlib.sha256(b"Assess target A").hexdigest(),
+        _CAMPAIGN_REQUEST_ID_A,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_repair_does_not_hijack_later_operator_turn() -> None:
+    store = Store()
+    session_id = await store.create_session()
+    prepare_result = ToolResult(
+        content="target A handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    objective_a = "Assess target A"
+    objective_a_digest = "sha256:" + hashlib.sha256(objective_a.encode()).hexdigest()
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective_a)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective_a}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective_a},
+                prepare_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+    assert _restored_preferred_tool_repair(store.messages[session_id]) == (
+        "browser_compile_api_handoff",
+        "strict",
+        objective_a_digest,
+        _CAMPAIGN_REQUEST_ID_A,
+    )
+
+    class ResetTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_record_api_handoff",
+                    "campaign_configure",
+                )
+            )
+
+    class ResetProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            yield TextDelta(text="target B is ready for normal configuration")
+            yield ModelCompleted()
+
+    provider = ResetProvider()
+    kernel = Kernel(provider, store, ResetTools(), Settings())
+    await kernel.start(session_id)
+    objective_b = "Assess target B"
+    await kernel.submit(
+        f"{objective_b}\n{_campaign_scope_content(objective_b, _CAMPAIGN_REQUEST_ID_B)}\n"
+        "The operator selected a new campaign."
+    )
+    await kernel.wait_for_turn()
+
+    assert _restored_preferred_tool_repair(store.messages[session_id]) is None
+    assert provider.requests[0].required_tool_name is None
+    assert {tool["function"]["name"] for tool in provider.requests[0].tools} == {
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+        "browser_record_api_handoff",
+        "campaign_configure",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operator_prompt", "expected_required_tool"),
+    [
+        ("Assess https://target-b.test for prompt injection", None),
+        ("Assess target A", None),
+        (
+            "Resume the Merlin scan on https://target-a.test",
+            "browser_compile_api_handoff",
+        ),
+    ],
+)
+async def test_kernel_backend_campaign_boundary_scopes_repair_obligation(
+    operator_prompt: str,
+    expected_required_tool: str | None,
+) -> None:
+    from merlin_tui.kernel_backend import KernelBackend
+
+    objective_a = "Assess target A"
+    store = Store()
+    session_id = await store.create_session()
+    prepare_result = ToolResult(
+        content="target A handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective_a)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective_a}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective_a},
+                prepare_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    class CampaignTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_record_api_handoff",
+                    "campaign_configure",
+                )
+            )
+
+    class CampaignProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            yield TextDelta(text="target B campaign accepted")
+            yield ModelCompleted()
+
+    provider = CampaignProvider()
+    kernel = Kernel(provider, store, CampaignTools(), Settings())
+    await kernel.start(session_id)
+    backend = KernelBackend(kernel, operator_controls=True)
+
+    _ = [event async for event in backend.stream(operator_prompt)]
+
+    assert provider.requests[0].required_tool_name == expected_required_tool
+    if expected_required_tool is None:
+        assert {tool["function"]["name"] for tool in provider.requests[0].tools} == {
+            "assessment_prepare",
+            "browser_compile_api_handoff",
+            "browser_record_api_handoff",
+            "campaign_configure",
+        }
+    else:
+        assert [tool["function"]["name"] for tool in provider.requests[0].tools] == [
+            expected_required_tool
+        ]
+    submitted_user = next(
+        message.content
+        for message in reversed(store.messages[session_id])
+        if message.role == "user"
+    )
+    if expected_required_tool is None:
+        assert "MERLIN_CAMPAIGN_SUBMIT_REQUEST" in submitted_user
+        assert operator_prompt in submitted_user
+    else:
+        assert "MERLIN_CAMPAIGN_SUBMIT_REQUEST" not in submitted_user
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("compile_result", "first_repair_tool"),
+    [
+        (
+            ToolResult(
+                content="capture a current-session baseline",
+                is_error=True,
+                metadata={
+                    "failure_code": "state_observation_baseline_required",
+                    "retryable": True,
+                    "preferred_next_tool": "browser_network_events",
+                },
+            ),
+            "browser_network_events",
+        ),
+        (
+            ToolResult(
+                content=json.dumps(
+                    {
+                        "id": "handoff:owned-repair",
+                        "adapter": json.dumps(
+                            {
+                                "cleanup_discovery": {
+                                    "status": "required_before_target_execution",
+                                    "session_ownership": "owned",
+                                },
+                                "session_creation_transition": {
+                                    "evidence_refs": ["creation:before", "creation:after"]
+                                },
+                            }
+                        ),
+                    }
+                ),
+                metadata={
+                    "preferred_next_tool": "browser_end_owned_session",
+                    "cleanup_discovery": {
+                        "status": "required_before_target_execution",
+                        "session_ownership": "owned",
+                    },
+                },
+            ),
+            "browser_end_owned_session",
+        ),
+    ],
+)
+async def test_handoff_repair_restart_preserves_bounded_compile_successor(
+    compile_result: ToolResult,
+    first_repair_tool: str,
+) -> None:
+    objective = "Assess target A"
+    initial_result = ToolResult(
+        content="durable handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    store = Store()
+    session_id = await store.create_session()
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective}),
+                    },
+                },
+                {
+                    "id": "compile-a",
+                    "type": "function",
+                    "function": {
+                        "name": "browser_compile_api_handoff",
+                        "arguments": "{}",
+                    },
+                },
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective},
+                initial_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+        ChatMessage(
+            role="tool",
+            name="browser_compile_api_handoff",
+            tool_call_id="compile-a",
+            content=_tool_content_with_automatic_marker(
+                "browser_compile_api_handoff",
+                "compile-a",
+                {},
+                compile_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    class ChainTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_network_events",
+                    "browser_end_owned_session",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_network_events":
+                return ToolResult(content="current-session baseline captured")
+            if name == "browser_end_owned_session":
+                return ToolResult(
+                    content="owned session ended",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="handoff compiled",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="campaign prepared")
+
+    class ChainProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if first_repair_tool == "browser_end_owned_session":
+                yield TextDelta(text="owned cleanup requires fresh same-context evidence")
+                yield ModelCompleted()
+                return
+            names = (first_repair_tool, "browser_compile_api_handoff", "assessment_prepare")
+            if len(self.requests) <= len(names):
+                name = names[len(self.requests) - 1]
+                arguments = {"objective": objective} if name == "assessment_prepare" else {}
+                yield ToolCall(
+                    call_id=f"repair-{len(self.requests)}",
+                    name=name,
+                    arguments=arguments,
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="prepared")
+            yield ModelCompleted()
+
+    tools = ChainTools()
+    provider = ChainProvider()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start(session_id)
+    await kernel.submit("resume interrupted turn")
+    await kernel.wait_for_turn()
+
+    expected_first_required = (
+        None if first_repair_tool == "browser_end_owned_session" else first_repair_tool
+    )
+    first_tools = [tool["function"]["name"] for tool in provider.requests[0].tools]
+    if first_repair_tool == "browser_end_owned_session":
+        assert provider.requests[0].required_tool_name is expected_first_required
+        assert "browser_end_owned_session" not in first_tools
+        assert "browser_compile_api_handoff" in first_tools
+        assert "assessment_prepare" in first_tools
+        assert "browser_network_events" in first_tools
+        assert tools.calls == []
+        restored_continuation, _ = _restored_automatic_recon(store.messages[session_id])
+        assert restored_continuation is not None
+        assert restored_continuation["session_ownership"] == "unknown"
+    else:
+        assert [request.required_tool_name for request in provider.requests[:3]] == [
+            first_repair_tool,
+            "browser_compile_api_handoff",
+            "assessment_prepare",
+        ]
+        assert first_tools == [first_repair_tool]
+        second_tools = [tool["function"]["name"] for tool in provider.requests[1].tools]
+        assert second_tools == ["browser_compile_api_handoff"]
+        assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
+            "assessment_prepare"
+        ]
+        assert tools.calls == [
+            first_repair_tool,
+            "browser_compile_api_handoff",
+            "assessment_prepare",
+        ]
+    assert _restored_preferred_tool_repair(store.messages[session_id]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_tool"),
+    [
+        ("recorder_to_compiler", "browser_compile_api_handoff"),
+        ("compiler_terminal", None),
+        ("recorder_terminal", None),
+        ("prepare_terminal_corrected_scope", None),
+    ],
+)
+async def test_handoff_repair_restart_applies_trusted_transition_or_terminal(
+    case: str,
+    expected_tool: str | None,
+) -> None:
+    objective = "Assess target A"
+    objective_digest = "sha256:" + hashlib.sha256(objective.encode()).hexdigest()
+    initial_tool = (
+        "browser_record_api_handoff"
+        if case.startswith("recorder_")
+        else "browser_compile_api_handoff"
+    )
+    initial_result = ToolResult(
+        content="durable handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": initial_tool,
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    calls = [
+        {
+            "id": "prepare-a",
+            "type": "function",
+            "function": {
+                "name": "assessment_prepare",
+                "arguments": json.dumps({"objective": objective}),
+            },
+        }
+    ]
+    messages = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(role="assistant", content="", tool_calls=calls),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-a",
+                {"objective": objective},
+                initial_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    if case == "prepare_terminal_corrected_scope":
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "compile-a",
+                        "type": "function",
+                        "function": {
+                            "name": "browser_compile_api_handoff",
+                            "arguments": "{}",
+                        },
+                    },
+                    {
+                        "id": "prepare-terminal",
+                        "type": "function",
+                        "function": {
+                            "name": "assessment_prepare",
+                            "arguments": json.dumps({"objective": "wrong model objective"}),
+                        },
+                    },
+                ],
+            )
+        )
+        messages.extend(
+            [
+                ChatMessage(
+                    role="tool",
+                    name="browser_compile_api_handoff",
+                    tool_call_id="compile-a",
+                    content=_tool_content_with_automatic_marker(
+                        "browser_compile_api_handoff",
+                        "compile-a",
+                        {},
+                        ToolResult(
+                            content="handoff compiled",
+                            metadata={"preferred_next_tool": "assessment_prepare"},
+                        ),
+                        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+                    ),
+                ),
+                ChatMessage(
+                    role="tool",
+                    name="assessment_prepare",
+                    tool_call_id="prepare-terminal",
+                    content=_tool_content_with_automatic_marker(
+                        "assessment_prepare",
+                        "prepare-terminal",
+                        {"objective": "wrong model objective"},
+                        ToolResult(
+                            content="budget is invalid",
+                            is_error=True,
+                            metadata={"repair_scope_objective_digest": objective_digest},
+                        ),
+                        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+                    ),
+                ),
+            ]
+        )
+    else:
+        source = initial_tool
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "repair-terminal",
+                        "type": "function",
+                        "function": {"name": source, "arguments": "{}"},
+                    }
+                ],
+            )
+        )
+        result = (
+            ToolResult(
+                content="recorded DOM route needs API compilation",
+                is_error=True,
+                metadata={
+                    "retryable": True,
+                    "preferred_next_tool": "browser_compile_api_handoff",
+                },
+            )
+            if case == "recorder_to_compiler"
+            else ToolResult(content="repair cannot continue", is_error=True)
+        )
+        messages.append(
+            ChatMessage(
+                role="tool",
+                name=source,
+                tool_call_id="repair-terminal",
+                content=_tool_content_with_automatic_marker(
+                    source,
+                    "repair-terminal",
+                    {},
+                    result,
+                    campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+                ),
+            )
+        )
+
+    store = Store()
+    session_id = await store.create_session()
+    store.messages[session_id] = messages
+
+    class RestartTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_record_api_handoff",
+                )
+            )
+
+    class RestartProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            yield TextDelta(text="restart inspected")
+            yield ModelCompleted()
+
+    provider = RestartProvider()
+    kernel = Kernel(provider, store, RestartTools(), Settings(), max_provider_retries=0)
+    await kernel.start(session_id)
+    await kernel.submit("resume interrupted turn")
+    await kernel.wait_for_turn()
+
+    assert _restored_preferred_tool_repair(store.messages[session_id]) == (
+        (
+            expected_tool,
+            "strict",
+            objective_digest,
+            _CAMPAIGN_REQUEST_ID_A,
+        )
+        if expected_tool
+        else None
+    )
+    assert provider.requests[0].required_tool_name == expected_tool
+    if expected_tool is None:
+        assert len(provider.requests[0].tools) == 3
+    else:
+        assert [tool["function"]["name"] for tool in provider.requests[0].tools] == [expected_tool]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_handoff_repair_cross_tool_retry_budget_survives_transitions(
+    dynamic: bool,
+) -> None:
+    class CycleTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_network_events",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare":
+                return ToolResult(
+                    content="durable handoff required",
+                    is_error=True,
+                    metadata={
+                        "retryable": True,
+                        "repair_reason": "recon_handoff_required",
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="capture another current-session baseline",
+                    is_error=True,
+                    metadata={
+                        "failure_code": "state_observation_baseline_required",
+                        "retryable": True,
+                        "preferred_next_tool": "browser_network_events",
+                    },
+                )
+            return ToolResult(content="network baseline captured")
+
+    class CycleProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            names = (
+                "assessment_prepare",
+                "browser_compile_api_handoff",
+                "browser_network_events",
+                "browser_compile_api_handoff",
+                "browser_network_events",
+            )
+            name = names[len(self.requests) - 1]
+            yield ToolCall(
+                call_id=f"cycle-{len(self.requests)}",
+                name=name,
+                arguments={"objective": "Assess target A"} if name == "assessment_prepare" else {},
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    class DynamicCycleProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            names = (
+                "assessment_prepare",
+                "browser_compile_api_handoff",
+                "browser_network_events",
+                "browser_compile_api_handoff",
+                "browser_network_events",
+            )
+            name = names[len(self.requests) - 1]
+            await handler(
+                ToolCall(
+                    call_id=f"cycle-{len(self.requests)}",
+                    name=name,
+                    arguments=(
+                        {"objective": "Assess target A"} if name == "assessment_prepare" else {}
+                    ),
+                )
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = CycleTools()
+    provider = DynamicCycleProvider() if dynamic else CycleProvider()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings(), max_provider_retries=1)
+    await kernel.start()
+    await kernel.submit("prepare the reviewed target")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+        "browser_network_events",
+        "browser_compile_api_handoff",
+    ]
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "preferred_tool_retry_exhausted"
+    assert errors[-1].payload["attempts"] == 2
+
+
+@pytest.mark.asyncio
 async def test_cleanup_progress_plateau_persists_across_restart() -> None:
     store = Store()
     session_id = await store.create_session()
     continuation = _cleanup_continuation("handoff:persisted")
-    progress = json.dumps(
-        {
-            "progress_key": "handoff:persisted:session_not_owned",
-            "stage": "browser_snapshot",
-            "evidence_refs": ["snapshot:evidence"],
-            "superseding_handoff": None,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    progress_key = "handoff:persisted:session_not_owned"
     store.messages[session_id] = [
         ChatMessage(
             role="assistant",
@@ -4170,26 +5567,30 @@ async def test_cleanup_progress_plateau_persists_across_restart() -> None:
             role="tool",
             name="assessment_prepare",
             tool_call_id="prepare-old",
-            content=(
-                "held\n[merlin-automatic-recon]"
-                + json.dumps(
-                    {"state": "held", "continuation": continuation},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-old",
+                {},
+                ToolResult(
+                    content="held",
+                    is_error=True,
+                    metadata={"automatic_recon_continuation": continuation},
+                ),
             ),
         ),
         ChatMessage(
             role="tool",
             name="browser_snapshot",
             tool_call_id="snapshot-old",
-            content=(
-                "snapshot\n[merlin-automatic-recon]"
-                + json.dumps(
-                    {"state": "progress", "progress": progress},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            content=_tool_content_with_automatic_marker(
+                "browser_snapshot",
+                "snapshot-old",
+                {},
+                ToolResult(
+                    content="snapshot",
+                    metadata={"evidence_refs": ["snapshot:evidence"]},
+                ),
+                progress_key=progress_key,
             ),
         ),
     ]

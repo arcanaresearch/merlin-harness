@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -82,8 +83,26 @@ _PROVIDER_OWNED_TRANSPORT_RETRIES = frozenset(
     }
 )
 _AUTOMATIC_RECON_MARKER = "[merlin-automatic-recon]"
+_PREFERRED_TOOL_REPAIR_MARKER = "[merlin-preferred-tool-repair]"
+_CLI_CAMPAIGN_SUBMIT_MARKER = "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+_CLI_CAMPAIGN_SUBMIT_LEGACY_SCHEMA = "merlin.cli-campaign-submit.v1"
+_CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v2"
+_CAMPAIGN_REQUEST_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 _RECON_RECALL_TOOL = "browser_recall_reconnaissance"
 _OWNED_SESSION_CLEANUP_TOOL = "browser_end_owned_session"
+_HANDOFF_REPAIR_OBSERVATION_TOOL = "browser_network_events"
+_BROWSER_HANDOFF_REPAIR_TOOLS = frozenset(
+    {"browser_compile_api_handoff", "browser_record_api_handoff"}
+)
+_DURABLE_REPAIR_TRANSITION_TOOLS = frozenset(
+    {
+        *_BROWSER_HANDOFF_REPAIR_TOOLS,
+        "assessment_prepare",
+        _HANDOFF_REPAIR_OBSERVATION_TOOL,
+    }
+)
 _READ_ONLY_LIFECYCLE_DISCOVERY_TOOLS = (
     "browser_snapshot",
     "browser_network_events",
@@ -166,12 +185,8 @@ def _safe_shell_invocation(
                     r"\1\2[redacted]",
                     safe_item,
                 )
-                safe_item = re.sub(
-                    r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", safe_item
-                )
-                safe_item = re.sub(
-                    r"(://[^:/\s]+:)[^@/\s]+(@)", r"\1[redacted]\2", safe_item
-                )
+                safe_item = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", safe_item)
+                safe_item = re.sub(r"(://[^:/\s]+:)[^@/\s]+(@)", r"\1[redacted]\2", safe_item)
                 hide_next = bool(_SENSITIVE_SHELL_OPTION.fullmatch(item))
             safe_argv.append(safe_item)
         command = shlex.join(safe_argv)
@@ -276,6 +291,58 @@ def _automatic_recon_continuation(result: ToolResult) -> dict[str, object] | Non
     )
 
 
+def _tool_automatic_recon_continuation(
+    tool_name: str, result: ToolResult
+) -> dict[str, object] | None:
+    """Recover typed cleanup discovery emitted by the real handoff compiler."""
+
+    direct = _automatic_recon_continuation(result)
+    if direct is not None:
+        return direct
+    if (
+        tool_name != "browser_compile_api_handoff"
+        or result.is_error
+        or result.metadata.get("preferred_next_tool") != _OWNED_SESSION_CLEANUP_TOOL
+    ):
+        return None
+    try:
+        handoff = json.loads(result.content)
+        adapter = json.loads(handoff.get("adapter", ""))
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return None
+    cleanup = result.metadata.get("cleanup_discovery")
+    if not isinstance(cleanup, Mapping):
+        cleanup = adapter.get("cleanup_discovery") if isinstance(adapter, Mapping) else None
+    creation = adapter.get("session_creation_transition") if isinstance(adapter, Mapping) else None
+    ownership_refs = creation.get("evidence_refs") if isinstance(creation, Mapping) else None
+    if (
+        not isinstance(handoff, Mapping)
+        or not isinstance(handoff.get("id"), str)
+        or not isinstance(cleanup, Mapping)
+        or cleanup.get("status") != "required_before_target_execution"
+        or cleanup.get("session_ownership") != "owned"
+        or not isinstance(ownership_refs, list)
+        or not ownership_refs
+    ):
+        return None
+    cleanup_evidence_refs = cleanup.get("evidence_refs")
+    if not isinstance(cleanup_evidence_refs, list):
+        cleanup_evidence_refs = []
+    return _validated_automatic_recon_continuation(
+        {
+            "kind": "cleanup_discovery",
+            "status": "required",
+            "progress_key": f"{handoff['id']}:cleanup_discovery_required",
+            "stage": "compile_superseding_lifecycle_handoff",
+            "handoff_id": handoff["id"],
+            "session_ownership": "owned",
+            "ownership_evidence_refs": list(ownership_refs),
+            "evidence_refs": list(cleanup_evidence_refs),
+            "allowed_tools": list(_OWNED_LIFECYCLE_DISCOVERY_TOOLS),
+        }
+    )
+
+
 def _automatic_tool_progress_fingerprint(
     call: ToolCall, result: ToolResult, *, progress_key: str
 ) -> str:
@@ -319,9 +386,15 @@ def _preferred_tool_retry_exhausted(
 
 
 def _durable_automatic_recon_marker(
-    tool_name: str, result: ToolResult, *, progress_key: str | None = None
+    tool_name: str,
+    call_id: str,
+    result: ToolResult,
+    *,
+    bound_content: str,
+    campaign_request_id: str | None = None,
+    progress_key: str | None = None,
 ) -> str | None:
-    continuation = _automatic_recon_continuation(result)
+    continuation = _tool_automatic_recon_continuation(tool_name, result)
     if continuation is not None:
         payload: dict[str, object] = {"state": "held", "continuation": continuation}
     elif tool_name == "assessment_prepare":
@@ -337,39 +410,529 @@ def _durable_automatic_recon_marker(
         }
     else:
         return None
+    payload.update(
+        {
+            "call_id": call_id,
+            "campaign_request_id": (
+                campaign_request_id if _valid_campaign_request_id(campaign_request_id) else None
+            ),
+            "result_digest": ("sha256:" + hashlib.sha256(bound_content.encode()).hexdigest()),
+            "source": tool_name,
+        }
+    )
     return _AUTOMATIC_RECON_MARKER + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _objective_scope_digest(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return "sha256:" + hashlib.sha256(value.strip().encode()).hexdigest()
+
+
+def _valid_objective_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+
+
+def _valid_campaign_request_id(value: object) -> bool:
+    return isinstance(value, str) and _CAMPAIGN_REQUEST_ID_RE.fullmatch(value) is not None
+
+
+def _typed_campaign_scope(content: str) -> tuple[str, str] | None:
+    marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
+    if marker_index < 0:
+        return None
+    encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
+    try:
+        envelope, _end = json.JSONDecoder().raw_decode(encoded)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(envelope, Mapping)
+        or set(envelope) != {"campaign_request_id", "operator_objective", "schema_version"}
+        or envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_SCHEMA
+        or not _valid_campaign_request_id(envelope.get("campaign_request_id"))
+    ):
+        return None
+    objective_digest = _objective_scope_digest(envelope.get("operator_objective"))
+    if objective_digest is None:
+        return None
+    return str(envelope["campaign_request_id"]), objective_digest
+
+
+def _typed_campaign_objective_digest(content: str) -> str | None:
+    scope = _typed_campaign_scope(content)
+    if scope is not None:
+        return scope[1]
+    marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
+    if marker_index < 0:
+        return None
+    encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
+    try:
+        envelope, _end = json.JSONDecoder().raw_decode(encoded)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(envelope, Mapping)
+        or set(envelope) != {"operator_objective", "schema_version"}
+        or envelope.get("schema_version") != _CLI_CAMPAIGN_SUBMIT_LEGACY_SCHEMA
+    ):
+        return None
+    return _objective_scope_digest(envelope.get("operator_objective"))
+
+
+def _latest_typed_campaign_scope(
+    transcript: list[ChatMessage],
+) -> tuple[str, str] | None:
+    for message in reversed(transcript):
+        if message.role != "user":
+            continue
+        scope = _typed_campaign_scope(message.content)
+        if scope is not None:
+            return scope
+    return None
+
+
+def _tool_call_arguments(call: Mapping[str, object]) -> Mapping[str, object]:
+    function = call.get("function")
+    if not isinstance(function, Mapping):
+        return {}
+    raw_arguments = function.get("arguments")
+    if isinstance(raw_arguments, Mapping):
+        return raw_arguments
+    if not isinstance(raw_arguments, str):
+        return {}
+    try:
+        decoded = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, Mapping) else {}
+
+
+def _durable_preferred_tool_repair_marker(
+    tool_name: str,
+    call_id: str,
+    arguments: Mapping[str, object],
+    result: ToolResult,
+    *,
+    campaign_request_id: str | None = None,
+) -> str | None:
+    """Seal only typed browser-handoff repair transitions into tool history."""
+
+    raw_next_tool = result.metadata.get("preferred_next_tool")
+    next_tool = (
+        raw_next_tool.strip() if isinstance(raw_next_tool, str) and raw_next_tool.strip() else None
+    )
+    mode = str(result.metadata.get("preferred_next_tool_mode") or "strict")
+    observation_to_compile = (
+        tool_name == _HANDOFF_REPAIR_OBSERVATION_TOOL
+        and not result.is_error
+        and next_tool in {None, "browser_compile_api_handoff"}
+    )
+    if mode != "strict" and not (observation_to_compile and mode == "after_one_admitted_action"):
+        return None
+    argument_objective_digest = _objective_scope_digest(arguments.get("objective"))
+    metadata_objective_digest = result.metadata.get("repair_scope_objective_digest")
+    metadata_request_id = result.metadata.get("repair_scope_campaign_request_id")
+    if _valid_campaign_request_id(metadata_request_id):
+        if campaign_request_id is not None and campaign_request_id != metadata_request_id:
+            return None
+        scoped_request_id = str(metadata_request_id)
+    else:
+        scoped_request_id = campaign_request_id
+    if not _valid_campaign_request_id(scoped_request_id):
+        return None
+    result_objective_digest = _objective_scope_digest(result.metadata.get("objective"))
+    if _valid_objective_digest(metadata_objective_digest):
+        objective_digest = str(metadata_objective_digest)
+        objective_source = "result_metadata"
+    elif result_objective_digest is not None:
+        objective_digest = result_objective_digest
+        objective_source = "result_metadata"
+    else:
+        objective_digest = argument_objective_digest
+        objective_source = "call_arguments" if objective_digest is not None else None
+    marker_state = "required"
+    cleanup_continuation = _tool_automatic_recon_continuation(tool_name, result)
+    if tool_name == "assessment_prepare" and not result.is_error:
+        next_tool = "assessment_prepare"
+        marker_state = "completed"
+        valid = True
+    elif tool_name == "assessment_prepare":
+        valid = (
+            result.is_error
+            and result.metadata.get("retryable") is True
+            and result.metadata.get("repair_reason") == "recon_handoff_required"
+            and next_tool in _BROWSER_HANDOFF_REPAIR_TOOLS
+        )
+        if not valid:
+            next_tool = "assessment_prepare"
+            marker_state = "terminal"
+            valid = True
+    elif tool_name in _BROWSER_HANDOFF_REPAIR_TOOLS:
+        if result.is_error:
+            next_tool = next_tool or tool_name
+            valid = result.metadata.get("retryable") is True and (
+                next_tool == tool_name
+                or (
+                    tool_name == "browser_record_api_handoff"
+                    and next_tool == "browser_compile_api_handoff"
+                )
+                or (
+                    next_tool == _HANDOFF_REPAIR_OBSERVATION_TOOL
+                    and result.metadata.get("failure_code")
+                    in {
+                        "interaction_response_pending",
+                        "state_observation_baseline_required",
+                    }
+                )
+            )
+            if (
+                next_tool == _OWNED_SESSION_CLEANUP_TOOL
+                and cleanup_continuation is not None
+                and cleanup_continuation.get("session_ownership") == "owned"
+            ):
+                next_tool = tool_name
+                marker_state = "terminal"
+                valid = True
+        else:
+            valid = next_tool == "assessment_prepare" or (
+                tool_name == "browser_record_api_handoff"
+                and next_tool == "browser_compile_api_handoff"
+            )
+        if not valid:
+            next_tool = tool_name
+            marker_state = "terminal"
+            valid = True
+    elif tool_name == _HANDOFF_REPAIR_OBSERVATION_TOOL:
+        if result.is_error:
+            next_tool = next_tool or tool_name
+            valid = result.metadata.get("retryable") is True and next_tool == tool_name
+        else:
+            next_tool = "browser_compile_api_handoff"
+            valid = True
+        if not valid:
+            next_tool = tool_name
+            marker_state = "terminal"
+            valid = True
+    else:
+        valid = False
+    if tool_name == "assessment_prepare" and objective_digest is None:
+        return None
+    if tool_name in {
+        *_BROWSER_HANDOFF_REPAIR_TOOLS,
+        _HANDOFF_REPAIR_OBSERVATION_TOOL,
+    }:
+        objective_digest = None
+        objective_source = None
+    if not valid or next_tool not in _DURABLE_REPAIR_TRANSITION_TOOLS:
+        return None
+    payload = {
+        "campaign_request_id": scoped_request_id,
+        "call_id": call_id,
+        "mode": "strict",
+        "objective_digest": objective_digest,
+        "objective_source": objective_source,
+        "result_digest": "sha256:" + hashlib.sha256(result.content.encode()).hexdigest(),
+        "source": tool_name,
+        "state": marker_state,
+        "tool_name": next_tool,
+    }
+    return _PREFERRED_TOOL_REPAIR_MARKER + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
 def _tool_content_with_automatic_marker(
-    tool_name: str, result: ToolResult, *, progress_key: str | None = None
+    tool_name: str,
+    call_id: str,
+    arguments: Mapping[str, object],
+    result: ToolResult,
+    *,
+    campaign_request_id: str | None = None,
+    progress_key: str | None = None,
 ) -> str:
-    marker = _durable_automatic_recon_marker(tool_name, result, progress_key=progress_key)
-    return result.content if marker is None else f"{result.content}\n{marker}"
+    repair_marker = _durable_preferred_tool_repair_marker(
+        tool_name,
+        call_id,
+        arguments,
+        result,
+        campaign_request_id=campaign_request_id,
+    )
+    bound_content = (
+        result.content if repair_marker is None else f"{result.content}\n{repair_marker}"
+    )
+    automatic_marker = _durable_automatic_recon_marker(
+        tool_name,
+        call_id,
+        result,
+        bound_content=bound_content,
+        campaign_request_id=campaign_request_id,
+        progress_key=progress_key,
+    )
+    if automatic_marker is not None:
+        # Keep the legacy automatic marker last because its restore parser reads
+        # from the marker to the end of the tool result.
+        return f"{bound_content}\n{automatic_marker}"
+    return bound_content
+
+
+def _restored_preferred_tool_repair(
+    transcript: list[ChatMessage],
+) -> tuple[str, str, str, str] | None:
+    """Restore the latest unresolved, lineage-validated handoff repair transition."""
+
+    trusted_sources = set(_DURABLE_REPAIR_TRANSITION_TOOLS)
+    seen_call_ids: set[str] = set()
+    duplicate_call_ids: set[str] = set()
+    for message in transcript:
+        if message.role != "assistant":
+            continue
+        for call in message.tool_calls:
+            if not isinstance(call, Mapping):
+                continue
+            call_id = str(call.get("id") or "")
+            if not call_id:
+                continue
+            if call_id in seen_call_ids:
+                duplicate_call_ids.add(call_id)
+            seen_call_ids.add(call_id)
+    trusted_calls: dict[str, tuple[str, Mapping[str, object]]] = {}
+    required: tuple[str, str, str, str] | None = None
+    latest_typed_scope: tuple[str, str] | None = None
+    request_objectives: dict[str, str] = {}
+    invalid_request_ids: set[str] = set()
+    for message in transcript:
+        if message.role == "user":
+            typed_scope = _typed_campaign_scope(message.content)
+            if typed_scope is not None:
+                request_id, objective_digest = typed_scope
+                if request_id in invalid_request_ids:
+                    continue
+                prior_objective = request_objectives.get(request_id)
+                if prior_objective is not None and prior_objective != objective_digest:
+                    invalid_request_ids.add(request_id)
+                    if required is not None and required[3] == request_id:
+                        required = None
+                    if latest_typed_scope is not None and latest_typed_scope[0] == request_id:
+                        latest_typed_scope = None
+                    continue
+                request_objectives[request_id] = objective_digest
+                latest_typed_scope = typed_scope
+                if required is not None and required[3] != request_id:
+                    required = None
+            continue
+        if message.role == "assistant":
+            for item in message.tool_calls:
+                if not isinstance(item, Mapping) or not isinstance(item.get("function"), Mapping):
+                    continue
+                call_id = str(item.get("id") or "")
+                function = item["function"]
+                name = str(function.get("name") or "")
+                if not call_id or call_id in duplicate_call_ids or name not in trusted_sources:
+                    continue
+                trusted_calls[call_id] = (name, _tool_call_arguments(item))
+            continue
+        call = trusted_calls.pop(str(message.tool_call_id), None) if message.tool_call_id else None
+        if (
+            message.role != "tool"
+            or not message.tool_call_id
+            or call is None
+            or call[0] != message.name
+        ):
+            continue
+        lines = message.content.splitlines()
+        marker = next(
+            (
+                (len(lines) - offset - 1, line)
+                for offset, line in enumerate(reversed(lines[-2:]))
+                if line.startswith(_PREFERRED_TOOL_REPAIR_MARKER)
+            ),
+            None,
+        )
+        if marker is None:
+            continue
+        _, marker_line = marker
+        try:
+            payload = json.loads(marker_line[len(_PREFERRED_TOOL_REPAIR_MARKER) :])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "campaign_request_id",
+            "call_id",
+            "mode",
+            "objective_digest",
+            "objective_source",
+            "result_digest",
+            "source",
+            "state",
+            "tool_name",
+        }:
+            continue
+        source = payload.get("source")
+        tool_name = payload.get("tool_name")
+        campaign_request_id = payload.get("campaign_request_id")
+        objective_digest = payload.get("objective_digest")
+        objective_source = payload.get("objective_source")
+        marker_offset = message.content.rfind("\n" + marker_line)
+        if marker_offset < 0:
+            continue
+        result_content = message.content[:marker_offset]
+        expected_digest = "sha256:" + hashlib.sha256(result_content.encode()).hexdigest()
+        if (
+            payload.get("mode") != "strict"
+            or payload.get("call_id") != message.tool_call_id
+            or payload.get("result_digest") != expected_digest
+            or source != message.name
+            or tool_name not in _DURABLE_REPAIR_TRANSITION_TOOLS
+            or not _valid_campaign_request_id(campaign_request_id)
+            or campaign_request_id in invalid_request_ids
+            or (objective_digest is not None and not _valid_objective_digest(objective_digest))
+            or objective_source not in {None, "call_arguments", "result_metadata"}
+        ):
+            continue
+        if latest_typed_scope is None or campaign_request_id != latest_typed_scope[0]:
+            continue
+        call_objective_digest = _objective_scope_digest(call[1].get("objective"))
+        if (
+            source == "assessment_prepare"
+            and objective_source == "call_arguments"
+            and objective_digest != call_objective_digest
+        ) or (
+            source != "assessment_prepare"
+            and (objective_digest is not None or objective_source is not None)
+        ):
+            continue
+        state = payload.get("state")
+        if (
+            state == "completed"
+            and source == tool_name == "assessment_prepare"
+            and required is not None
+            and required[:2] == ("assessment_prepare", "strict")
+            and objective_digest == required[2]
+            and campaign_request_id == required[3]
+        ):
+            required = None
+            continue
+        if (
+            state == "terminal"
+            and required is not None
+            and source == required[0]
+            and campaign_request_id == required[3]
+            and (source != "assessment_prepare" or objective_digest == required[2])
+        ):
+            required = None
+            continue
+        valid_transition = state == "required" and (
+            (source == "assessment_prepare" and tool_name in _BROWSER_HANDOFF_REPAIR_TOOLS)
+            or (
+                source in _BROWSER_HANDOFF_REPAIR_TOOLS
+                and tool_name
+                in {
+                    source,
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    _HANDOFF_REPAIR_OBSERVATION_TOOL,
+                }
+            )
+            or (
+                source == _HANDOFF_REPAIR_OBSERVATION_TOOL
+                and tool_name in {_HANDOFF_REPAIR_OBSERVATION_TOOL, "browser_compile_api_handoff"}
+            )
+        )
+        if not valid_transition:
+            continue
+        if source == "assessment_prepare":
+            if not _valid_objective_digest(objective_digest):
+                continue
+            if latest_typed_scope[1] != objective_digest:
+                continue
+            required = (
+                str(tool_name),
+                "strict",
+                str(objective_digest),
+                str(campaign_request_id),
+            )
+        elif required is not None and source == required[0] and campaign_request_id == required[3]:
+            required = (str(tool_name), "strict", required[2], required[3])
+    return required
 
 
 def _restored_automatic_recon(
     transcript: list[ChatMessage],
 ) -> tuple[dict[str, object] | None, set[str]]:
     continuation: dict[str, object] | None = None
+    continuation_request_id: str | None = None
+    active_request_id: str | None = None
+    request_objectives: dict[str, str] = {}
+    invalid_request_ids: set[str] = set()
     progress: set[str] = set()
-    trusted_calls = {
-        str(call.get("id")): str(call["function"].get("name"))
-        for message in transcript
-        if message.role == "assistant"
-        for call in message.tool_calls
-        if isinstance(call, Mapping)
-        and isinstance(call.get("function"), Mapping)
-        and call["function"].get("name") in _LIFECYCLE_DISCOVERY_TOOLS
-    }
+    seen_call_ids: set[str] = set()
+    duplicate_call_ids: set[str] = set()
     for message in transcript:
+        if message.role != "assistant":
+            continue
+        for call in message.tool_calls:
+            if not isinstance(call, Mapping):
+                continue
+            call_id = str(call.get("id") or "")
+            if not call_id:
+                continue
+            if call_id in seen_call_ids:
+                duplicate_call_ids.add(call_id)
+            seen_call_ids.add(call_id)
+    trusted_calls: dict[str, str] = {}
+    for message in transcript:
+        if message.role == "user":
+            typed_scope = _typed_campaign_scope(message.content)
+            if typed_scope is not None:
+                request_id, objective_digest = typed_scope
+                if request_id in invalid_request_ids:
+                    continue
+                prior_objective = request_objectives.get(request_id)
+                if prior_objective is not None and prior_objective != objective_digest:
+                    invalid_request_ids.add(request_id)
+                    if continuation_request_id == request_id:
+                        continuation = None
+                        continuation_request_id = None
+                        progress.clear()
+                    if active_request_id == request_id:
+                        active_request_id = None
+                    continue
+                request_objectives[request_id] = objective_digest
+                active_request_id = request_id
+                if continuation is not None and continuation_request_id != active_request_id:
+                    continuation = None
+                    continuation_request_id = None
+                    progress.clear()
+            continue
+        if message.role == "assistant":
+            for call in message.tool_calls:
+                if not isinstance(call, Mapping) or not isinstance(call.get("function"), Mapping):
+                    continue
+                call_id = str(call.get("id") or "")
+                name = str(call["function"].get("name") or "")
+                if (
+                    call_id
+                    and call_id not in duplicate_call_ids
+                    and name in _LIFECYCLE_DISCOVERY_TOOLS
+                ):
+                    trusted_calls[call_id] = name
+            continue
+        call_name = (
+            trusted_calls.pop(str(message.tool_call_id), None) if message.tool_call_id else None
+        )
         if (
             message.role != "tool"
             or not message.tool_call_id
-            or trusted_calls.get(message.tool_call_id) != message.name
+            or call_name != message.name
             or _AUTOMATIC_RECON_MARKER not in message.content
         ):
             continue
-        encoded = message.content.rsplit(_AUTOMATIC_RECON_MARKER, 1)[-1]
+        marker_offset = message.content.rfind("\n" + _AUTOMATIC_RECON_MARKER)
+        if marker_offset < 0:
+            continue
+        bound_content = message.content[:marker_offset]
+        encoded = message.content[marker_offset + 1 + len(_AUTOMATIC_RECON_MARKER) :]
         try:
             payload = json.loads(encoded)
         except json.JSONDecodeError:
@@ -377,8 +940,36 @@ def _restored_automatic_recon(
         if not isinstance(payload, Mapping):
             continue
         state = payload.get("state")
+        expected_fields = {
+            "call_id",
+            "campaign_request_id",
+            "result_digest",
+            "source",
+            "state",
+            *(
+                {"continuation"}
+                if state == "held"
+                else {"progress"}
+                if state == "progress"
+                else set()
+            ),
+        }
+        marker_request_id = payload.get("campaign_request_id")
         if (
-            message.name == "assessment_prepare"
+            state not in {"failed", "held", "prepared", "progress"}
+            or set(payload) != expected_fields
+            or payload.get("call_id") != message.tool_call_id
+            or payload.get("source") != message.name
+            or payload.get("result_digest")
+            != "sha256:" + hashlib.sha256(bound_content.encode()).hexdigest()
+            or (marker_request_id is not None and not _valid_campaign_request_id(marker_request_id))
+            or marker_request_id in invalid_request_ids
+            or (active_request_id is not None and marker_request_id != active_request_id)
+            or (active_request_id is None and marker_request_id is not None)
+        ):
+            continue
+        if (
+            message.name in {"assessment_prepare", *_BROWSER_HANDOFF_REPAIR_TOOLS}
             and state == "held"
             and isinstance(payload.get("continuation"), Mapping)
         ):
@@ -399,10 +990,19 @@ def _restored_automatic_recon(
                 if prior_key != str(candidate["progress_key"]):
                     progress.clear()
                 continuation = candidate
+                continuation_request_id = (
+                    str(marker_request_id) if marker_request_id is not None else None
+                )
         elif message.name == "assessment_prepare" and state == "prepared":
-            continuation = None
-            progress.clear()
-        elif state == "progress" and isinstance(payload.get("progress"), str):
+            if marker_request_id == continuation_request_id:
+                continuation = None
+                continuation_request_id = None
+                progress.clear()
+        elif (
+            state == "progress"
+            and isinstance(payload.get("progress"), str)
+            and marker_request_id == continuation_request_id
+        ):
             progress.add(str(payload["progress"]))
     return continuation, progress
 
@@ -853,6 +1453,7 @@ class Kernel:
         follow_through_recoveries = 0
         preferred_tool_follow_through_failures = 0
         preferred_tool_retry_state: dict[str, object] = {}
+        repair_scope_campaign_request_id: str | None = None
         preferred_transition_observation_used = False
         automatic_recon_continuation: dict[str, object] | None = None
         automatic_no_progress_key: str | None = None
@@ -950,13 +1551,32 @@ class Kernel:
                         retryable=True,
                         preferred_tool=preferred_tool_retry_state.get("tool_name"),
                         attempts=preferred_tool_retry_state.get("attempts"),
-                        **failure_event_payload(
-                            InfrastructureFailureCategory.DELIVERY_FAILURE
-                        ),
+                        **failure_event_payload(InfrastructureFailureCategory.DELIVERY_FAILURE),
                     )
                 )
 
             while True:
+                if not automatic_state_restored:
+                    durable_messages = list(await self._store.load_messages(session_id))
+                    typed_campaign_scope = _latest_typed_campaign_scope(durable_messages)
+                    if typed_campaign_scope is not None:
+                        repair_scope_campaign_request_id = typed_campaign_scope[0]
+                    restored_continuation, restored_progress = _restored_automatic_recon(
+                        durable_messages
+                    )
+                    restored_repair = _restored_preferred_tool_repair(durable_messages)
+                    if restored_continuation is not None:
+                        automatic_recon_continuation = restored_continuation
+                        automatic_progress_key = str(restored_continuation.get("progress_key"))
+                    automatic_progress_seen.update(restored_progress)
+                    if restored_repair is not None and preferred_next_tool_name is None:
+                        (
+                            preferred_next_tool_name,
+                            preferred_next_tool_mode,
+                            _scope,
+                            repair_scope_campaign_request_id,
+                        ) = restored_repair
+                    automatic_state_restored = True
                 request_steering_version = self._steering_version
                 request_has_followup = request_steering_version != consumed_steering_version
                 consumed_steering_version = request_steering_version
@@ -989,16 +1609,6 @@ class Kernel:
                         campaign_messages.append(
                             ChatMessage(role="system", content=campaign_context)
                         )
-                if not automatic_state_restored:
-                    durable_messages = list(await self._store.load_messages(session_id))
-                    restored_continuation, restored_progress = _restored_automatic_recon(
-                        durable_messages
-                    )
-                    if restored_continuation is not None:
-                        automatic_recon_continuation = restored_continuation
-                        automatic_progress_key = str(restored_continuation.get("progress_key"))
-                    automatic_progress_seen.update(restored_progress)
-                    automatic_state_restored = True
                 model = await self._settings.get_model() or ""
                 transcript = await self._provider_transcript(session_id, model=model)
                 messages = [
@@ -1027,7 +1637,10 @@ class Kernel:
                     or spec.name == request_preferred_tool_name
                 )
                 available_tools = tuple(
-                    spec for spec in described_tools if spec.name != _OWNED_SESSION_CLEANUP_TOOL
+                    spec
+                    for spec in described_tools
+                    if spec.name != _OWNED_SESSION_CLEANUP_TOOL
+                    or spec.name == request_preferred_tool_name
                 )
                 if recon_recall_completed:
                     available_tools = tuple(
@@ -1157,6 +1770,9 @@ class Kernel:
                         spec.name for spec in described_tools
                     ),
                     _request_preferred_tool_name: str | None = request_preferred_tool_name,
+                    _repair_scope_campaign_request_id: str | None = (
+                        repair_scope_campaign_request_id
+                    ),
                 ) -> DynamicToolOutput:
                     nonlocal automatic_no_progress_key
                     nonlocal automatic_progress_fingerprint
@@ -1225,9 +1841,7 @@ class Kernel:
                         }
                         and call.name in _described_tool_names
                     )
-                    preferred_retry_exhausted = (
-                        preferred_tool_retry_state.get("exhausted") is True
-                    )
+                    preferred_retry_exhausted = preferred_tool_retry_state.get("exhausted") is True
                     if (
                         is_preferred_tool_call
                         and not duplicate_owned_cleanup
@@ -1327,7 +1941,10 @@ class Kernel:
                         call_id=call.call_id,
                         content=_tool_content_with_automatic_marker(
                             call.name,
+                            call.call_id,
+                            call.arguments,
                             result,
+                            campaign_request_id=_repair_scope_campaign_request_id,
                             progress_key=(
                                 str(automatic_recon_continuation.get("progress_key"))
                                 if automatic_recon_continuation is not None
@@ -1360,8 +1977,19 @@ class Kernel:
                         if isinstance(raw_next_tool, str) and raw_next_tool.strip()
                         else None
                     )
-                    retryable_error = (
-                        result.is_error and result.metadata.get("retryable") is True
+                    if (
+                        call.name == current_preferred_tool_name == _HANDOFF_REPAIR_OBSERVATION_TOOL
+                        and not result.is_error
+                        and next_tool is None
+                    ):
+                        next_tool = "browser_compile_api_handoff"
+                    retryable_error = result.is_error and result.metadata.get("retryable") is True
+                    cross_tool_repair_retry = (
+                        retryable_error
+                        and is_preferred_tool_call
+                        and current_preferred_tool_name in _DURABLE_REPAIR_TRANSITION_TOOLS
+                        and next_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                        and next_tool != current_preferred_tool_name
                     )
                     retained_preferred_error = (
                         result.is_error
@@ -1372,15 +2000,22 @@ class Kernel:
                             or (next_tool is None and retryable_error)
                         )
                     )
-                    if retained_preferred_error:
+                    if retained_preferred_error or cross_tool_repair_retry:
                         _preferred_tool_retry_exhausted(
                             preferred_tool_retry_state,
                             call,
                             max_retries=self._max_provider_retries,
                         )
-                    elif is_preferred_tool_call or (
+                    elif (
+                        is_preferred_tool_call
+                        and not (
+                            current_preferred_tool_name in _DURABLE_REPAIR_TRANSITION_TOOLS
+                            and next_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                        )
+                    ) or (
                         isinstance(next_tool, str)
                         and next_tool != current_preferred_tool_name
+                        and current_preferred_tool_name not in _DURABLE_REPAIR_TRANSITION_TOOLS
                     ):
                         preferred_tool_retry_state.clear()
                     if isinstance(next_tool, str):
@@ -1414,7 +2049,7 @@ class Kernel:
                         )
                         if not owned_cleanup_failed:
                             owned_cleanup_completed = True
-                    continuation = _automatic_recon_continuation(result)
+                    continuation = _tool_automatic_recon_continuation(call.name, result)
                     if continuation is not None:
                         next_key = str(continuation.get("progress_key"))
                         if automatic_progress_key != next_key:
@@ -1681,6 +2316,7 @@ class Kernel:
                         preferred_tool_name=request_preferred_tool_name,
                         preferred_tool_mode=request_preferred_tool_mode,
                         preferred_retry_state=preferred_tool_retry_state,
+                        repair_scope_campaign_request_id=(repair_scope_campaign_request_id),
                         recon_recall_completed=recon_recall_completed,
                     )
                     preferred_tool_invoked = request_preferred_tool_name is not None and any(
@@ -2013,6 +2649,7 @@ class Kernel:
         preferred_tool_name: str | None = None,
         preferred_tool_mode: str = "strict",
         preferred_retry_state: dict[str, object] | None = None,
+        repair_scope_campaign_request_id: str | None = None,
         recon_recall_completed: bool = False,
     ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
         if not events:
@@ -2071,12 +2708,8 @@ class Kernel:
                     "browser_wait_for_text",
                 }
             )
-            invocation = _safe_shell_invocation(
-                event.name, event.arguments, self._workspace_root
-            )
-            await self._emit(
-                self._event("tool", name=event.name, state="started", **invocation)
-            )
+            invocation = _safe_shell_invocation(event.name, event.arguments, self._workspace_root)
+            await self._emit(self._event("tool", name=event.name, state="started", **invocation))
             context = ToolContext(
                 session_id=session_id,
                 workspace_root=self._workspace_root,
@@ -2097,11 +2730,11 @@ class Kernel:
                 or event.name == current_preferred_tool
                 or (bounded_preferred_action and not preferred_nonpreferred_action_used)
             )
-            tool_admitted = cleanup_admitted and (
-                admitted_tool_name is None or event.name == admitted_tool_name
-            ) and preferred_action_admitted and (
-                not recon_recall_completed
-                or _tool_admitted_after_recon_recall(event.name)
+            tool_admitted = (
+                cleanup_admitted
+                and (admitted_tool_name is None or event.name == admitted_tool_name)
+                and preferred_action_admitted
+                and (not recon_recall_completed or _tool_admitted_after_recon_recall(event.name))
             )
             try:
                 if not tool_admitted:
@@ -2160,13 +2793,18 @@ class Kernel:
                         )
                     },
                 )
-            continuation = _automatic_recon_continuation(result)
+            continuation = _tool_automatic_recon_continuation(event.name, result)
             await self._append_tool_terminal(
                 session_id,
                 name=event.name,
                 call_id=event.call_id,
                 content=_tool_content_with_automatic_marker(
-                    event.name, result, progress_key=automatic_progress_key
+                    event.name,
+                    event.call_id,
+                    event.arguments,
+                    result,
+                    campaign_request_id=repair_scope_campaign_request_id,
+                    progress_key=automatic_progress_key,
                 ),
             )
             failure_category = tool_failure_category(result)
@@ -2198,25 +2836,43 @@ class Kernel:
                 if isinstance(raw_next_tool, str) and raw_next_tool.strip()
                 else None
             )
+            if (
+                event.name == current_preferred_tool == _HANDOFF_REPAIR_OBSERVATION_TOOL
+                and not result.is_error
+                and next_tool is None
+            ):
+                next_tool = "browser_compile_api_handoff"
             retryable_error = result.is_error and result.metadata.get("retryable") is True
             is_preferred_tool_call = event.name == current_preferred_tool
+            cross_tool_repair_retry = (
+                retryable_error
+                and is_preferred_tool_call
+                and current_preferred_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                and next_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                and next_tool != current_preferred_tool
+            )
             retained_preferred_error = (
                 result.is_error
                 and is_preferred_tool_call
                 and current_preferred_tool is not None
-                and (
-                    next_tool == current_preferred_tool
-                    or (next_tool is None and retryable_error)
-                )
+                and (next_tool == current_preferred_tool or (next_tool is None and retryable_error))
             )
-            if retained_preferred_error:
+            if retained_preferred_error or cross_tool_repair_retry:
                 _preferred_tool_retry_exhausted(
                     retry_state,
                     event,
                     max_retries=self._max_provider_retries,
                 )
-            elif is_preferred_tool_call or (
-                isinstance(next_tool, str) and next_tool != current_preferred_tool
+            elif (
+                is_preferred_tool_call
+                and not (
+                    current_preferred_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                    and next_tool in _DURABLE_REPAIR_TRANSITION_TOOLS
+                )
+            ) or (
+                isinstance(next_tool, str)
+                and next_tool != current_preferred_tool
+                and current_preferred_tool not in _DURABLE_REPAIR_TRANSITION_TOOLS
             ):
                 retry_state.clear()
             if isinstance(next_tool, str):
@@ -2239,9 +2895,7 @@ class Kernel:
                         session_id,
                         name=deferred.name,
                         call_id=deferred.call_id,
-                        content=(
-                            "Not executed: preferred tool retries made no durable progress."
-                        ),
+                        content=("Not executed: preferred tool retries made no durable progress."),
                     )
                 break
             if event.name == _RECON_RECALL_TOOL and not result.is_error:
