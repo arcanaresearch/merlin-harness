@@ -462,21 +462,14 @@ class _TargetAdmissionFencedTools:
                     and expected_session_id is not None
                     and resolved_session_id != expected_session_id
                 ):
-                    return ToolResult(
-                        content="target session identity changed before effect delivery",
-                        is_error=True,
-                        metadata={
-                            "failure_code": "target_session_identity_mismatch",
-                            "retryable": False,
-                            "effect_applied": False,
-                            "target_effect_attempted": False,
-                            "interaction_count": 0,
-                            "target_call_budget_charge": 0,
-                            "limit_interaction_count": 0,
-                            "identity_field": "target_session_id",
-                            "expected_target_session_id": expected_session_id,
-                            "target_session_id": resolved_session_id,
-                        },
+                    raise _TargetAdmissionHeld(
+                        assignment_id=context.agent_id,
+                        attempt_id=context.attempt_id,
+                        technique_attempt_id=context.technique_attempt_id,
+                        tool_name=name,
+                        call_id=str(context.call_id),
+                        failure_code="target_session_identity_mismatch",
+                        target_session_id=resolved_session_id,
                     )
                 effective_session_id = resolved_session_id or expected_session_id
                 context = context.model_copy(

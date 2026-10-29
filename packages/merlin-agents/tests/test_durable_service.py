@@ -411,13 +411,14 @@ async def test_target_effect_fence_binds_trusted_session_before_permit_and_rejec
     assert admitted_sessions == ["browser:context-a"]
 
     delegate.session_id = "browser:context-b"
-    conflict = await tools.invoke(
-        "browser_chat_exchange",
-        context.model_copy(update={"expected_target_session_id": "browser:context-a"}),
-        {"prompt": "must not dispatch"},
-    )
-    assert conflict.is_error is True
-    assert conflict.metadata["failure_code"] == "target_session_identity_mismatch"
+    with pytest.raises(_TargetAdmissionHeld) as raised:
+        await tools.invoke(
+            "browser_chat_exchange",
+            context.model_copy(update={"expected_target_session_id": "browser:context-a"}),
+            {"prompt": "must not dispatch"},
+        )
+    assert raised.value.failure_code == "target_session_identity_mismatch"
+    assert raised.value.target_session_id == "browser:context-b"
     assert delegate.invocations == 1
     assert admitted_sessions == ["browser:context-a"]
 

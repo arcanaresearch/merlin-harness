@@ -167,6 +167,22 @@ class StubProvider:
         yield ModelCompleted(finish_reason="tool_calls")
 
 
+class _PinnedBrowserResolver:
+    """Expose the live UAT context through the production resolver contract."""
+
+    def __init__(self, session_id: str, browser: Any) -> None:
+        self._session_id = session_id
+        self._browser = browser
+
+    def __call__(self, session_id: str) -> Any:
+        return self.existing_for_tool(session_id)
+
+    def existing_for_tool(self, session_id: str) -> Any:
+        if session_id != self._session_id:
+            raise ValueError("browser session does not belong to this UAT")
+        return self._browser
+
+
 def _goat_contract(
     *,
     target_id: str,
@@ -760,18 +776,53 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
                 for row in scheduler.list_attempts(schedule_id)
                 if row["node_id"] == f"worker:{assignment.id}"
             ]
-            assert len(worker_attempts) == 3
+            assert len(worker_attempts) == 2
             assert worker_attempts[0]["state"] == "expired"
-            assert worker_attempts[1]["state"] == "failed"
-            assert worker_attempts[1]["failure_kind"] == "worker_interrupted"
-            assert "conflicting target session identities" in str(worker_attempts[1]["error"])
-            assert worker_attempts[2]["state"] == "completed"
+            assert worker_attempts[1]["state"] == "cancelled"
+            assert worker_attempts[1]["failure_kind"] == "unknown"
+            assert worker_attempts[1]["error"] == (
+                "target admission held after an authenticated surface transition"
+            )
+            held_partial = max(
+                (
+                    row
+                    for row in scheduler.list_results(schedule_id)
+                    if row["node_id"] == f"worker:{assignment.id}"
+                    and row["schema_id"] == "schema/partial-result"
+                ),
+                key=lambda row: int(row["generation"]),
+            )
+            held_payload = held_partial["payload"]
+            assert held_payload["error_code"] == "target_admission_latched"
+            assert held_payload["infrastructure_failure_category"] is None
+            hold_marker = held_payload["worker_checkpoint"]["target_control_hold"]
+            assert hold_marker["schema"] == "merlin.target-control-hold.v1"
+            assert hold_marker["assignment_id"] == assignment.id
+            assert hold_marker["attempt_id"] == str(worker_attempts[1]["id"])
+            assert hold_marker["call_id"] == "seeded-call-1"
+            assert hold_marker["tool_name"] == "target_request"
+            assert hold_marker["failure_code"] == "target_session_identity_mismatch"
+            assert hold_marker["target_session_id"] == worker_attempts[1]["target_session_id"]
+            assert len(str(hold_marker["receipt_sha256"])) == 64
+            int(str(hold_marker["receipt_sha256"]), 16)
+            hold_projection = held_payload["structured"]["control_plane_hold"]
+            assert all(hold_projection[key] == value for key, value in hold_marker.items())
+            assert hold_projection["effect_applied"] is False
+            assert hold_projection["target_effect_attempted"] is False
+            assert hold_projection["interaction_count"] == 0
+            assert hold_projection["limit_interaction_count"] == 0
+            assert hold_projection["target_call_budget_charge"] == 0
+            assert hold_projection["target_call_ids"] == []
+            assert hold_projection["target_evidence"] == []
+            assert hold_projection["target_ui_transitions"] == []
             assert provider.calls == baseline_calls, "restart must not regenerate provider turns"
-            assert len(target.invocations("start")) - baseline_starts == 2
-            assert len(target.invocations("cleanup")) - baseline_cleanups == 2
+            assert len(target.invocations("start")) - baseline_starts == 1
+            assert len(target.invocations("cleanup")) - baseline_cleanups == 1
             gate = scheduler.goat_gate(schedule_id)
             assert gate["ambiguous"] == (assignment.id,)
             receipt = gate["strategies"][assignment.id]
+            assert receipt["execution_terminal"] == "cancelled"
+            assert receipt["execution_complete"] is False
             assert receipt["evidence_verdict"] == "ambiguous"
             assert receipt["evaluation_uncertain"] is True
             assert len(receipt["steps"]) == 1
@@ -789,8 +840,9 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
         "gate_verdict": receipt["evidence_verdict"],
         "attempts": [row["state"] for row in worker_attempts],
         "session_conflict_fenced": (
-            worker_attempts[1]["failure_kind"] == "worker_interrupted"
-            and "conflicting target session identities" in str(worker_attempts[1]["error"])
+            hold_marker["failure_code"] == "target_session_identity_mismatch"
+            and hold_projection["target_effect_attempted"] is False
+            and hold_projection["target_call_budget_charge"] == 0
         ),
         "receipt_attempt_ids": sorted(
             {str(step["scheduler_attempt_id"]) for step in receipt["steps"]}
@@ -851,12 +903,13 @@ async def run_browser_lane(workdir: Path, target: FixtureTargetServer) -> dict[s
                 BrowserBounds(target_id=target_id, allowed_origins={target.origin}),
                 owner,
             )
+            browser_resolver = _PinnedBrowserResolver(str(session.id), browser)
             try:
                 await browser.new_tab(target.origin + "/chat")
                 await browser_store.save_metadata(browser.metadata(restart=True))
                 broker = ToolBroker(
                     browser_tools(
-                        lambda _session_id: browser,
+                        browser_resolver,
                         browser_store,
                         adapter_resolver=lambda _campaign_id: adapter,
                         state_scope_store=state_scope_store,

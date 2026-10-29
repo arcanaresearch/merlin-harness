@@ -37,12 +37,12 @@ async def test_headless_api_lane_cancel_restart_compaction_replay(tmp_path: Path
         evidence = await driver.run_api_restart_lane(tmp_path / "api-restart", target)
     assert evidence["mailbox_replayed"] is True
     assert evidence["mailbox_deduped"] is True
-    assert evidence["attempts"] == ["expired", "failed", "completed"]
+    assert evidence["attempts"] == ["expired", "cancelled"]
     assert evidence["session_conflict_fenced"] is True
     assert evidence["service_replaced"] is True
     assert evidence["checkpoint_reused"] is True
     assert evidence["provider_calls"] == evidence["provider_calls_after_interruption"] == 2
-    assert evidence["message_count"] == 2
+    assert evidence["message_count"] == 1
     assert len(evidence["receipt_attempt_ids"]) == 1
     assert evidence["gate_verdict"] == "ambiguous"
 
