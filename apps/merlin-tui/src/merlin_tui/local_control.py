@@ -159,6 +159,13 @@ class RuntimeIdentity:
     mode: str
 
 
+@dataclass(frozen=True, slots=True)
+class _DaemonProcessIdentity:
+    pid: int
+    started_at: str
+    argv: tuple[str, ...]
+
+
 class DaemonCompatibility(StrEnum):
     UNREACHABLE = "unreachable"
     COMPATIBLE = "compatible"
@@ -1416,32 +1423,43 @@ def _resume_stopped_foreground(socket_path: Path) -> None:
         return
 
 
-def _verified_daemon_owner(socket_path: Path) -> bool:
-    """Require a same-user daemon identity before automatic orphan recovery."""
+def _daemon_process_identity(socket_path: Path) -> _DaemonProcessIdentity | None:
+    """Return a stable same-user Merlin identity while it still owns the lock."""
     pid = _daemon_lock_owner(socket_path)
     if pid is None or pid == os.getpid():
-        return False
+        return None
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "uid=,args="],
+            ["ps", "-p", str(pid), "-o", "uid=,lstart=,args="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-        identity = result.stdout.strip().split(maxsplit=1)
-        if len(identity) != 2 or identity[0] != str(os.getuid()):
-            return False
-        argv = shlex.split(identity[1])
+        identity = result.stdout.strip().split(maxsplit=6)
+        if len(identity) != 7 or identity[0] != str(os.getuid()):
+            return None
+        argv = shlex.split(identity[6])
         source = len(argv) == 4 and argv[1:] == ["-m", "merlin_tui.local_control", "daemon"]
         frozen = (
             len(argv) == 2
             and Path(argv[0]).name in {"merlin", "merlin-runtime"}
             and argv[1] == "daemon"
         )
-        return (source or frozen) and _daemon_lock_owner(socket_path) == pid
+        if (
+            not (source or frozen)
+            or _daemon_lock_owner(socket_path) != pid
+            or _daemon_lock_released(socket_path)
+        ):
+            return None
+        return _DaemonProcessIdentity(pid, " ".join(identity[1:6]), tuple(argv))
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return False
+        return None
+
+
+def _verified_daemon_owner(socket_path: Path) -> bool:
+    """Require a same-user daemon identity before automatic orphan recovery."""
+    return _daemon_process_identity(socket_path) is not None
 
 
 async def _recover_restart_orphan(socket_path: Path) -> None:
@@ -2061,12 +2079,14 @@ async def _arm_unclaimed_shutdown(socket_path: Path = _SOCKET) -> None:
 
 async def _terminate_locked_daemon(socket_path: Path, shutdown_seconds: float) -> bool:
     """Terminate only the verified process that currently owns the daemon lock."""
-    owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
-    if owner is None:
-        raise RuntimeError("Merlin daemon lock owner could not be verified")
+    identity = await asyncio.to_thread(_daemon_process_identity, socket_path)
+    if identity is None:
+        raise RuntimeError("Merlin daemon process identity could not be verified")
+    if await asyncio.to_thread(_daemon_process_identity, socket_path) != identity:
+        raise RuntimeError("Merlin daemon ownership changed; refusing to signal any process")
 
     try:
-        os.kill(owner, signal.SIGTERM)
+        os.kill(identity.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     deadline = asyncio.get_running_loop().time() + shutdown_seconds
@@ -2077,21 +2097,19 @@ async def _terminate_locked_daemon(socket_path: Path, shutdown_seconds: float) -
             return True
         await asyncio.sleep(0.05)
 
-    current_owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
-    if current_owner != owner:
+    if await asyncio.to_thread(_daemon_process_identity, socket_path) != identity:
         raise RuntimeError(
-            f"Merlin daemon lock ownership changed from pid {owner} to {current_owner}; "
-            "refusing to kill an unverified process"
+            "Merlin daemon ownership changed after SIGTERM; refusing to kill an unverified process"
         )
     try:
-        os.kill(owner, signal.SIGKILL)
+        os.kill(identity.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     while asyncio.get_running_loop().time() < deadline:
         if await asyncio.to_thread(_daemon_lock_released, socket_path):
             return True
         await asyncio.sleep(0.05)
-    raise TimeoutError(f"Merlin daemon owner (pid {owner}) retained its lock after SIGKILL")
+    raise TimeoutError(f"Merlin daemon owner (pid {identity.pid}) retained its lock after SIGKILL")
 
 
 async def stop_daemon(
