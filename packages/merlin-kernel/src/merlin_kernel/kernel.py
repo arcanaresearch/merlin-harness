@@ -480,15 +480,26 @@ def _typed_campaign_objective_digest(content: str) -> str | None:
     return _objective_scope_digest(envelope.get("operator_objective"))
 
 
+def _is_campaign_boundary_continuation(content: str) -> bool:
+    normalized = " ".join(content.casefold().split())
+    return (
+        content.startswith("MERLIN_USER_INPUT_RESPONSE\n")
+        or re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+        or normalized.startswith("the previous prepared campaign was cancelled")
+        or normalized.startswith("reuse the sealed reconnaissance")
+    )
+
+
 def _latest_typed_campaign_scope(
     transcript: list[ChatMessage],
 ) -> tuple[str, str] | None:
     for message in reversed(transcript):
         if message.role != "user":
             continue
+        if _is_campaign_boundary_continuation(message.content):
+            continue
         scope = _typed_campaign_scope(message.content)
-        if scope is not None:
-            return scope
+        return scope
     return None
 
 
@@ -720,6 +731,9 @@ def _restored_preferred_tool_repair(
                 latest_typed_scope = typed_scope
                 if required is not None and required[3] != request_id:
                     required = None
+            elif not _is_campaign_boundary_continuation(message.content):
+                latest_typed_scope = None
+                required = None
             continue
         if message.role == "assistant":
             for item in message.tool_calls:
@@ -904,6 +918,11 @@ def _restored_automatic_recon(
                     continuation = None
                     continuation_request_id = None
                     progress.clear()
+            elif not _is_campaign_boundary_continuation(message.content):
+                active_request_id = None
+                continuation = None
+                continuation_request_id = None
+                progress.clear()
             continue
         if message.role == "assistant":
             for call in message.tool_calls:

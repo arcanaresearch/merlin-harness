@@ -29,6 +29,7 @@ from merlin_kernel import CommandError, Kernel, parse_command
 from merlin_kernel.kernel import (
     _automatic_recon_continuation,
     _KernelJevClient,
+    _latest_typed_campaign_scope,
     _restored_automatic_recon,
     _restored_preferred_tool_repair,
     _safe_shell_invocation,
@@ -4649,37 +4650,49 @@ def test_handoff_repair_restore_requires_chronological_unique_call_binding() -> 
 
 
 @pytest.mark.parametrize(
-    "boundary",
+    ("boundary", "preserved"),
     [
-        _campaign_scope_content("Assess target A"),
-        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-        + json.dumps(
-            {
-                "operator_objective": "Assess target B",
-                "schema_version": "merlin.cli-campaign-submit.v2",
-            },
-            sort_keys=True,
+        (_campaign_scope_content("Assess target A"), True),
+        ("Continue preparing the campaign.", True),
+        ("Assess https://b.test", False),
+        ("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n{malformed", False),
+        (
+            "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+            + json.dumps(
+                {
+                    "operator_objective": "Assess target B",
+                    "schema_version": "merlin.cli-campaign-submit.v2",
+                },
+                sort_keys=True,
+            ),
+            False,
         ),
-        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-        + json.dumps(
-            {
-                "campaign_request_id": "not-a-uuid",
-                "operator_objective": "Assess target B",
-                "schema_version": "merlin.cli-campaign-submit.v2",
-            },
-            sort_keys=True,
+        (
+            "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+            + json.dumps(
+                {
+                    "campaign_request_id": "not-a-uuid",
+                    "operator_objective": "Assess target B",
+                    "schema_version": "merlin.cli-campaign-submit.v2",
+                },
+                sort_keys=True,
+            ),
+            False,
         ),
-        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
-        + json.dumps(
-            {
-                "operator_objective": "Assess target B",
-                "schema_version": "merlin.cli-campaign-submit.v1",
-            },
-            sort_keys=True,
+        (
+            "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+            + json.dumps(
+                {
+                    "operator_objective": "Assess target B",
+                    "schema_version": "merlin.cli-campaign-submit.v1",
+                },
+                sort_keys=True,
+            ),
+            False,
         ),
     ],
 )
-def test_handoff_repair_ignores_non_boundary_campaign_envelopes(boundary: str) -> None:
+def test_handoff_repair_respects_active_campaign_boundary(boundary: str, preserved: bool) -> None:
     objective = "Assess target A"
     digest = "sha256:" + hashlib.sha256(objective.encode()).hexdigest()
     result = ToolResult(
@@ -4722,11 +4735,36 @@ def test_handoff_repair_ignores_non_boundary_campaign_envelopes(boundary: str) -
         ChatMessage(role="user", content=boundary),
     ]
 
-    assert _restored_preferred_tool_repair(transcript) == (
-        "browser_compile_api_handoff",
-        "strict",
-        digest,
+    restored = _restored_preferred_tool_repair(transcript)
+    if preserved:
+        assert restored == (
+            "browser_compile_api_handoff",
+            "strict",
+            digest,
+            _CAMPAIGN_REQUEST_ID_A,
+        )
+    else:
+        assert restored is None
+
+
+def test_latest_campaign_scope_stops_at_untyped_or_malformed_boundary() -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess target A"))
+
+    assert _latest_typed_campaign_scope([scope, ChatMessage(role="user", content="Retry")]) == (
         _CAMPAIGN_REQUEST_ID_A,
+        "sha256:" + hashlib.sha256(b"Assess target A").hexdigest(),
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [scope, ChatMessage(role="user", content="Assess https://b.test")]
+        )
+        is None
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [scope, ChatMessage(role="user", content="MERLIN_CAMPAIGN_SUBMIT_REQUEST\n{")]
+        )
+        is None
     )
 
 
@@ -4860,6 +4898,19 @@ def test_automatic_recon_restore_is_authenticated_and_campaign_scoped() -> None:
         [scope_a, assistant, tool, ChatMessage(role="user", content="resume")]
     )
     assert resumed is not None
+    untyped, _ = _restored_automatic_recon(
+        [scope_a, assistant, tool, ChatMessage(role="user", content="Assess https://b.test")]
+    )
+    assert untyped is None
+    malformed, _ = _restored_automatic_recon(
+        [
+            scope_a,
+            assistant,
+            tool,
+            ChatMessage(role="user", content="MERLIN_CAMPAIGN_SUBMIT_REQUEST\n{malformed"),
+        ]
+    )
+    assert malformed is None
     changed_scope, _ = _restored_automatic_recon(
         [
             scope_a,
