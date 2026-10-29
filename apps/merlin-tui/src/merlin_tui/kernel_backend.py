@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from merlin_agents.swarm_snapshot import SwarmSnapshot
 from merlin_config import Config
-from merlin_contracts import AppEvent
+from merlin_contracts import AppEvent, ChatMessage
 from merlin_contracts.user_input import ANSWER_PREFIX, InputRequest, InputResponse, pending_input
 from merlin_kernel import Kernel
 from merlin_readiness import ResourceCloser
@@ -44,6 +45,10 @@ from .backend import (
 from .configuration import ProviderConfiguration
 from .operator_tools import (
     _campaign_submit_payload,
+    _configured_objective,
+    _has_url_candidate,
+    _latest_campaign_request_scope,
+    _primary_target,
     campaign_submit_envelope,
     new_campaign_request_id,
 )
@@ -103,8 +108,10 @@ def _campaign_profile_selection(prompt: str) -> str | None:
 
 def _is_campaign_request(prompt: str) -> bool:
     normalized = " ".join(prompt.lower().split())
-    if normalized.startswith(("/", "continue ", "resume ", "retry ")):
+    if normalized.startswith("/"):
         return False
+    if _is_campaign_continuation_prompt(prompt) and _primary_target(prompt) is not None:
+        return True
     requests_assessment = any(
         marker in normalized
         for marker in (
@@ -123,6 +130,28 @@ def _is_campaign_request(prompt: str) -> bool:
     return requests_assessment and any(
         marker in normalized for marker in ("http://", "https://", "target")
     )
+
+
+def _is_campaign_continuation_prompt(prompt: str) -> bool:
+    normalized = " ".join(prompt.casefold().split())
+    return (
+        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+        or normalized.startswith("the previous prepared campaign was cancelled")
+        or normalized.startswith("reuse the sealed reconnaissance")
+    )
+
+
+def _without_campaign_envelope(prompt: str) -> str:
+    marker_index = prompt.rfind("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n")
+    if marker_index < 0:
+        return prompt
+    encoded_start = marker_index + len("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n")
+    encoded = prompt[encoded_start:]
+    try:
+        _payload, end = json.JSONDecoder().raw_decode(encoded)
+    except (TypeError, ValueError):
+        return prompt
+    return prompt[:marker_index] + encoded[end:]
 
 
 def _needs_campaign_profile(prompt: str) -> bool:
@@ -241,10 +270,10 @@ class KernelBackend:
             yield StreamEvent(kind="status", text="Foreground interruption acknowledged.")
             return
         durable_pending = None
+        durable_messages: Sequence[ChatMessage] = ()
         if hasattr(self.kernel, "_store") and self.kernel.session_id:
-            durable_pending = pending_input(
-                await self.kernel._store.load_messages(self.kernel.session_id)
-            )
+            durable_messages = await self.kernel._store.load_messages(self.kernel.session_id)
+            durable_pending = pending_input(durable_messages)
         pending = durable_pending or self._pending_user_input
         if prompt.startswith(ANSWER_PREFIX):
             if pending is None:
@@ -253,15 +282,42 @@ class KernelBackend:
             response.validate_for(pending)
         campaign_selection = False
         existing_campaign_envelope = _campaign_submit_payload(prompt)
+        invalid_campaign_envelope = (
+            "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" in prompt and existing_campaign_envelope is None
+        )
         has_typed_campaign_envelope = (
             existing_campaign_envelope is not None
             and existing_campaign_envelope.get("schema_version") == "merlin.cli-campaign-submit.v2"
         )
+        continuation_target = _primary_target(prompt)
+        continuation_has_url = _has_url_candidate(prompt)
+        active_campaign_objective = None
+        if _is_campaign_continuation_prompt(prompt) and continuation_target is not None:
+            active_boundary = _latest_campaign_request_scope(durable_messages)
+            active_campaign_objective = (
+                active_boundary.objective
+                if active_boundary.state in {"v2", "unbound"}
+                else _configured_objective(durable_messages)
+                if active_boundary.state == "none"
+                else None
+            )
+        continuation_matches_active = _is_campaign_continuation_prompt(prompt) and (
+            not continuation_has_url
+            or (
+                active_campaign_objective is not None
+                and continuation_target == _primary_target(active_campaign_objective)
+            )
+        )
         operator_campaign_objective = (
             str(existing_campaign_envelope["operator_objective"])
-            if has_typed_campaign_envelope
+            if existing_campaign_envelope is not None
             else prompt
-            if _is_campaign_request(prompt)
+            if not invalid_campaign_envelope
+            and not continuation_matches_active
+            and (
+                _is_campaign_request(prompt)
+                or (_is_campaign_continuation_prompt(prompt) and continuation_has_url)
+            )
             else None
         )
         operator_campaign_request_id = (
@@ -271,6 +327,11 @@ class KernelBackend:
             if operator_campaign_objective is not None
             else None
         )
+        if existing_campaign_envelope is not None and not has_typed_campaign_envelope:
+            prompt = _without_campaign_envelope(prompt)
+            legacy_objective = str(existing_campaign_envelope["operator_objective"])
+            if legacy_objective not in prompt:
+                prompt = legacy_objective + prompt
         if prompt.strip() == "/new":
             self._pending_campaign_objective = None
             self._pending_campaign_request_id = None
@@ -348,9 +409,13 @@ class KernelBackend:
                 "objective: do not reword, paraphrase, or substitute the target line; "
                 "Merlin anchors the reviewed target itself."
             )
-        elif _needs_campaign_profile(prompt) and not self._operator_controls:
-            self._pending_campaign_objective = prompt
-            self._pending_campaign_request_id = new_campaign_request_id()
+        elif (
+            operator_campaign_objective is not None
+            and _needs_campaign_profile(operator_campaign_objective)
+            and not self._operator_controls
+        ):
+            self._pending_campaign_objective = operator_campaign_objective
+            self._pending_campaign_request_id = operator_campaign_request_id
             yield StreamEvent(kind="content", text=_CAMPAIGN_PROFILE_PROMPT)
             return
         if (

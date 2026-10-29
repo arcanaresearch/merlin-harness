@@ -22,6 +22,7 @@ from merlin_contracts import (
     AgentSummary,
     AppEvent,
     AttemptProjection,
+    ChatMessage,
     Finding,
     LeaseProjection,
     NodeProjection,
@@ -549,6 +550,172 @@ async def test_cli_typed_campaign_prompt_keeps_one_stable_backend_boundary() -> 
             submission.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
         )
         assert envelope["campaign_request_id"] == campaign_request_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "adds_boundary"),
+    [
+        ("Resume the assessment.", False),
+        ("Retry", False),
+        ("Please resume", False),
+        ("Retry https://a.test", False),
+        ("Continue the assessment against https://b.test", True),
+        ("Read the docs at https://b.test", False),
+    ],
+)
+async def test_backend_continuation_is_target_aware(prompt: str, adds_boundary: bool) -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000059"
+
+    class Store:
+        async def load_messages(self, session_id: str):
+            assert session_id == "session-1"
+            return (
+                ChatMessage(
+                    role="user",
+                    content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+                ),
+            )
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    submitted = kernel.submissions[0]
+    assert (submitted != prompt) is adds_boundary
+    assert ("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" in submitted) is adds_boundary
+
+
+@pytest.mark.asyncio
+async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> None:
+    objective = "Continue assessing https://c.test"
+    request_id = "00000000-0000-4000-8000-000000000060"
+    prompt = campaign_submit_envelope(objective, campaign_request_id=request_id)
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    assert kernel.submissions == [prompt]
+
+
+@pytest.mark.asyncio
+async def test_backend_upgrades_legacy_envelope_to_one_exact_v2_boundary() -> None:
+    objective = "Resume the assessment against https://b.test"
+    suffix = (
+        "\nThe operator explicitly selected campaign profile: exhaustive; "
+        "do not ask for the profile again. Budget: 12 turns. Composition: autonomous."
+    )
+    prompt = (
+        objective
+        + "\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "operator_objective": objective,
+                "schema_version": "merlin.cli-campaign-submit.v1",
+            },
+            sort_keys=True,
+        )
+        + suffix
+    )
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    submitted = kernel.submissions[0]
+    assert submitted.startswith(objective + "\n")
+    assert suffix.strip() in submitted
+    assert submitted.count("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n") == 1
+    envelope, _end = json.JSONDecoder().raw_decode(
+        submitted.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+    )
+    assert envelope["schema_version"] == "merlin.cli-campaign-submit.v2"
+    assert envelope["operator_objective"] == objective
+
+
+@pytest.mark.asyncio
+async def test_backend_normalizes_punctuation_wrapped_continuation_target() -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000064"
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (
+                ChatMessage(
+                    role="user",
+                    content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+                ),
+            )
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+    prompt = "Retry (https://a.test)."
+
+    assert [event async for event in backend.stream(prompt)] == []
+    assert kernel.submissions == [prompt]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Assess https://b.test\nMERLIN_CAMPAIGN_SUBMIT_REQUEST\n{malformed",
+        "Resume https://a.test:bad",
+        "Resume ftp://b.test",
+    ],
+)
+async def test_backend_does_not_launder_invalid_campaign_boundary(prompt: str) -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000070"
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (
+                ChatMessage(
+                    role="user",
+                    content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+                ),
+            )
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    submitted = kernel.submissions[0]
+    if "{malformed" in prompt:
+        assert submitted == prompt
+    else:
+        assert submitted != prompt
+        assert submitted.count("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n") == 1
+
+
+@pytest.mark.asyncio
+async def test_profile_gate_retains_existing_v2_identity_and_objective() -> None:
+    objective = "Assess https://target.test"
+    request_id = "00000000-0000-4000-8000-000000000071"
+    prompt = campaign_submit_envelope(objective, campaign_request_id=request_id)
+    kernel = FakeKernel([])
+    backend = KernelBackend(kernel, operator_controls=False)  # type: ignore[arg-type]
+
+    first = [event async for event in backend.stream(prompt)]
+    assert "Choose the campaign profile" in first[0].text
+    assert kernel.submissions == []
+
+    _ = [event async for event in backend.stream("exhaustive")]
+    submitted = kernel.submissions[0]
+    assert submitted.count("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n") == 1
+    envelope, _end = json.JSONDecoder().raw_decode(
+        submitted.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+    )
+    assert envelope["campaign_request_id"] == request_id
+    assert envelope["operator_objective"] == objective
 
 
 @pytest.mark.asyncio

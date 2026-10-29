@@ -22361,11 +22361,11 @@ class AssessmentPrepareTool:
     def _merge_adapter_candidate(
         self,
         session_id: str,
-        campaign_request_id: str | None,
+        cache_scope: str | None,
         adapter: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        cache_key = (session_id, campaign_request_id)
-        if campaign_request_id is not None:
+        cache_key = (session_id, cache_scope)
+        if cache_scope is not None:
             self._adapter_candidates = {
                 key: candidate
                 for key, candidate in self._adapter_candidates.items()
@@ -22396,19 +22396,19 @@ class AssessmentPrepareTool:
         self._adapter_candidates[cache_key] = merged
         return merged
 
-    async def invoke_for_campaign_request(
+    async def invoke_for_configured_scope(
         self,
         context: ToolContext,
         arguments: Mapping[str, Any],
         *,
-        campaign_request_id: str,
+        cache_scope: str,
     ) -> ToolResult:
-        """Prepare within one validated, durable operator request boundary."""
+        """Prepare within one durable wrapper-managed configuration boundary."""
 
         return await self.invoke(
             context,
             arguments,
-            _campaign_request_id=campaign_request_id,
+            _adapter_cache_scope=cache_scope,
         )
 
     def describe(self) -> ToolSpec:
@@ -22765,7 +22765,7 @@ class AssessmentPrepareTool:
         context: ToolContext,
         arguments: Mapping[str, Any],
         *,
-        _campaign_request_id: str | None = None,
+        _adapter_cache_scope: str | None = None,
     ) -> ToolResult:
         objective = arguments.get("objective")
         try:
@@ -22822,7 +22822,7 @@ class AssessmentPrepareTool:
                 # mixed API/browser repair must not replace its endpoint or actions.
                 adapter = _durable_recon_handoff_request(adapter)
             adapter = self._merge_adapter_candidate(
-                context.session_id, _campaign_request_id, adapter
+                context.session_id, _adapter_cache_scope, adapter
             )
             try:
                 resolver = getattr(self._service, "resolve_reviewed_adapter", None)
@@ -22954,7 +22954,7 @@ class AssessmentPrepareTool:
             result = await self._service.prepare(
                 context.session_id, objective, profile, adapter, budget, **prepare_kwargs
             )
-        self._adapter_candidates.pop((context.session_id, _campaign_request_id), None)
+        self._adapter_candidates.pop((context.session_id, _adapter_cache_scope), None)
         return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
 
 
