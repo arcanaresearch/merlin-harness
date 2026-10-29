@@ -111,10 +111,7 @@ class _NoPrerequisiteAuditProvider:
 
     async def stream(self, request):
         yield TextDelta(
-            text=(
-                '{"requirements":[],"gate_proposals":[],'
-                '"unresolved_requirements":[]}'
-            )
+            text=('{"requirements":[],"gate_proposals":[],"unresolved_requirements":[]}')
         )
         yield ModelCompleted()
 
@@ -159,9 +156,7 @@ def test_objective_phase_gate_audit_compiles_semantics_into_valid_structure() ->
                 {
                     "key": "normal-play-baseline",
                     "objective": "Complete one normal-play turn",
-                    "actions": [
-                        {"step_id": "play-turn", "input_text": "Play a normal turn"}
-                    ],
+                    "actions": [{"step_id": "play-turn", "input_text": "Play a normal turn"}],
                     "success_predicate": {
                         "observation_name": "turns_completed",
                         "operator": "increases",
@@ -231,9 +226,7 @@ def test_objective_phase_gate_audit_can_narrow_an_overbroad_existing_gate() -> N
                 {
                     "key": "normal-play-first",
                     "objective": "Complete one ordinary turn before attacks",
-                    "actions": [
-                        {"step_id": "play-turn", "input_text": "Play one ordinary turn"}
-                    ],
+                    "actions": [{"step_id": "play-turn", "input_text": "Play one ordinary turn"}],
                     "success_predicate": {
                         "observation_name": "turn_number",
                         "operator": "increases",
@@ -263,9 +256,7 @@ def test_objective_phase_gate_audit_rejects_identity_role_and_blank_values() -> 
         ],
     }
     audit = {
-        "requirements": [
-            {"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}
-        ],
+        "requirements": [{"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}],
         "gate_proposals": [
             {
                 "key": "auth",
@@ -313,9 +304,7 @@ def test_objective_phase_gate_audit_allows_reviewed_interaction_receipt() -> Non
         ],
     }
     audit = {
-        "requirements": [
-            {"source_quote": "Play normally first", "gate_key": "normal-play"}
-        ],
+        "requirements": [{"source_quote": "Play normally first", "gate_key": "normal-play"}],
         "gate_proposals": [
             {
                 "key": "normal-play",
@@ -379,9 +368,7 @@ def test_objective_phase_gate_audit_can_explicitly_reject_overbroad_proposal() -
             "id": "attack-methods",
             "ordinal": 0,
             "objective": "Run every suggested attack method",
-            "actions": [
-                {"id": "action-1", "step_id": "play-turn", "input_text": "attack"}
-            ],
+            "actions": [{"id": "action-1", "step_id": "play-turn", "input_text": "attack"}],
             "success_predicate": {
                 "observation_name": "target_exchange_completed",
                 "operator": "present",
@@ -422,9 +409,7 @@ def test_objective_phase_gate_audit_rejects_identity_selector_as_observation() -
         },
     }
     audit = {
-        "requirements": [
-            {"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}
-        ],
+        "requirements": [{"source_quote": "Authenticate with Test Wallet", "gate_key": "auth"}],
         "gate_proposals": [
             {
                 "key": "auth",
@@ -458,9 +443,7 @@ def test_objective_phase_gate_audit_rejects_unreviewed_adapter_bindings() -> Non
             },
             (),
             {
-                "requirements": [
-                    {"source_quote": "Play normally first", "gate_key": "baseline"}
-                ],
+                "requirements": [{"source_quote": "Play normally first", "gate_key": "baseline"}],
                 "gate_proposals": [
                     {
                         "key": "baseline",
@@ -4512,9 +4495,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                     f"api:{campaign_id}:{target_id}:scope:{node_id}"
                     f"/attempt/{attempts[stage][0]}:generation:1"
                 )
-                for stage, node_id in zip(
-                    ("control", "direct", "replay"), node_ids, strict=True
-                )
+                for stage, node_id in zip(("control", "direct", "replay"), node_ids, strict=True)
             ]
             assert len(set(target_session_ids)) == 3
             gate = scheduler.baseline_gate(schedule_id)
@@ -4802,9 +4783,7 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
                         f"api:campaign/foreign:{target_id}:scope:{node_id}/attempt/"
                     )
                     and session_id.endswith(":generation:1")
-                    for session_id, node_id in zip(
-                        forged_session_ids, forged_nodes, strict=True
-                    )
+                    for session_id, node_id in zip(forged_session_ids, forged_nodes, strict=True)
                 )
                 assert len(set(forged_session_ids)) == 3
                 forged_gate = forged_scheduler.baseline_gate(forged_schedule)

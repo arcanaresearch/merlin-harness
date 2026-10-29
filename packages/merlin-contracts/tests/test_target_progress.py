@@ -158,9 +158,12 @@ def test_target_progress_rejects_invalid_selected_value_digest() -> None:
     observation["selected_digest"] = "sha256:" + "0" * 64
     unsigned = dict(observation)
     unsigned.pop("observation_digest")
-    observation["observation_digest"] = "sha256:" + hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    observation["observation_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
 
     snapshot = project_target_progress(
         [_effect("call/1", [observation])],

@@ -39,9 +39,12 @@ def _transition(*, stale: bool = True) -> dict[str, object]:
 
 def _unchanged_transition() -> dict[str, object]:
     digest = _digest("unchanged")
-    transition_digest = "sha256:" + hashlib.sha256(
-        json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    transition_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     return {
         "schema": "merlin.target-ui-transition.v1",
         "material": False,

@@ -138,10 +138,14 @@ class ObjectiveSelector(BaseModel):
 
     @model_validator(mode="after")
     def validate_selector(self) -> ObjectiveSelector:
-        if self.quantifier in {
-            ObjectiveSelectorQuantifier.ALL_LISTED,
-            ObjectiveSelectorQuantifier.INCLUSIVE_RANGE,
-        } and not self.values:
+        if (
+            self.quantifier
+            in {
+                ObjectiveSelectorQuantifier.ALL_LISTED,
+                ObjectiveSelectorQuantifier.INCLUSIVE_RANGE,
+            }
+            and not self.values
+        ):
             raise ValueError(f"{self.quantifier.value} selectors require sealed values")
         if self.quantifier is ObjectiveSelectorQuantifier.ALL_AVAILABLE:
             if self.values:
@@ -204,9 +208,7 @@ class CampaignObjective(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["merlin.campaign-objective.v1"] = (
-        CAMPAIGN_OBJECTIVE_SCHEMA_VERSION
-    )
+    schema_version: Literal["merlin.campaign-objective.v1"] = CAMPAIGN_OBJECTIVE_SCHEMA_VERSION
     id: str = Field(min_length=1)
     description: str = Field(min_length=1)
     kind: ObjectiveKind
@@ -291,9 +293,9 @@ _EXPLICIT_LIST_PATTERN = re.compile(
     r"[ \t]+[A-Za-z]|[.!?\n]|$)",
     re.IGNORECASE,
 )
-_EXPLICIT_LIST_ITEM = re.compile(
-    r"[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+[A-Za-z][A-Za-z0-9_-]*){1,4}"
-)
+_EXPLICIT_LIST_ITEM = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+[A-Za-z][A-Za-z0-9_-]*){1,4}")
+
+
 def _singular(value: str) -> str:
     lowered = value.casefold().replace("-", "_")
     if lowered.endswith("ies") and len(lowered) > 3:
@@ -347,9 +349,7 @@ def compile_objective_contract(
             raise ObjectiveContractAmbiguity(
                 f"range {match.group(0)!r} is too large to seal safely"
             )
-        span = ObjectiveSourceSpan(
-            start=match.start(), end=match.end(), text=match.group(0)
-        )
+        span = ObjectiveSourceSpan(start=match.start(), end=match.end(), text=match.group(0))
         dimension = _singular(match.group("label"))
         values = tuple(str(item) for item in range(start, end + 1))
         ranges[dimension] = values
@@ -377,9 +377,7 @@ def compile_objective_contract(
     for match in _ALL_AVAILABLE_PATTERN.finditer(text):
         if any(start <= match.start() and match.end() <= end for start, end in occupied):
             continue
-        span = ObjectiveSourceSpan(
-            start=match.start(), end=match.end(), text=match.group(0)
-        )
+        span = ObjectiveSourceSpan(start=match.start(), end=match.end(), text=match.group(0))
         dimension = _singular(match.group("dimension"))
         scope = _singular(match.group("scope")) if match.group("scope") else None
         scope_values = ranges.get(scope or "", ())
@@ -387,8 +385,7 @@ def compile_objective_contract(
             CampaignObjective(
                 id=_objective_id(f"cover-all-{dimension}", span),
                 description=(
-                    f"Cover every available {dimension}"
-                    + (f" in each {scope}" if scope else "")
+                    f"Cover every available {dimension}" + (f" in each {scope}" if scope else "")
                 ),
                 kind=ObjectiveKind.COVERAGE,
                 temporal_semantics=ObjectiveTemporalSemantics.CUMULATIVE,
@@ -424,9 +421,7 @@ def compile_objective_contract(
             parts = [part.strip() for part in raw_items.split(",")]
             if len(parts) < 3:
                 continue
-            parts[-1] = re.sub(
-                r"^(?:and|or)[ \t]+", "", parts[-1], flags=re.IGNORECASE
-            )
+            parts[-1] = re.sub(r"^(?:and|or)[ \t]+", "", parts[-1], flags=re.IGNORECASE)
         else:
             parts = [
                 part.strip()
@@ -440,8 +435,8 @@ def compile_objective_contract(
             for part in parts
         ):
             continue
-        span_start = match.start("items") + len(match.group("items")) - len(
-            match.group("items").lstrip()
+        span_start = (
+            match.start("items") + len(match.group("items")) - len(match.group("items").lstrip())
         )
         span = ObjectiveSourceSpan(
             start=span_start,
@@ -556,20 +551,28 @@ class ObjectiveProgress(BaseModel):
     @model_validator(mode="after")
     def validate_status_evidence(self) -> ObjectiveProgress:
         unresolved_dimensions = unresolved_selector_dimensions(self.objective)
-        if self.status in {
-            ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
-            ObjectiveStatus.PREEXISTING,
-        } and unresolved_dimensions:
+        if (
+            self.status
+            in {
+                ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+                ObjectiveStatus.PREEXISTING,
+            }
+            and unresolved_dimensions
+        ):
             raise ValueError(
                 "objective cannot be discharged before all_available selectors have a "
                 f"finite denominator: {', '.join(unresolved_dimensions)}"
             )
-        if self.status in {
-            ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
-            ObjectiveStatus.PREEXISTING,
-            ObjectiveStatus.BLOCKED,
-            ObjectiveStatus.WAIVED,
-        } and not self.evidence_refs:
+        if (
+            self.status
+            in {
+                ObjectiveStatus.SATISFIED_BY_CAMPAIGN,
+                ObjectiveStatus.PREEXISTING,
+                ObjectiveStatus.BLOCKED,
+                ObjectiveStatus.WAIVED,
+            }
+            and not self.evidence_refs
+        ):
             raise ValueError(f"{self.status.value} objective status requires evidence")
         if self.status in {ObjectiveStatus.BLOCKED, ObjectiveStatus.WAIVED} and not (
             self.status_reason and self.status_reason.strip()
@@ -659,13 +662,9 @@ def project_campaign_outcome(
     required = tuple(item for item in objectives if item.objective.required)
     unresolved = tuple(item for item in required if item.status not in _DISCHARGED_STATUSES)
     campaign_satisfied = tuple(
-        item
-        for item in required
-        if item.status is ObjectiveStatus.SATISFIED_BY_CAMPAIGN
+        item for item in required if item.status is ObjectiveStatus.SATISFIED_BY_CAMPAIGN
     )
-    preexisting = tuple(
-        item for item in required if item.status is ObjectiveStatus.PREEXISTING
-    )
+    preexisting = tuple(item for item in required if item.status is ObjectiveStatus.PREEXISTING)
     waived = tuple(item for item in required if item.status is ObjectiveStatus.WAIVED)
 
     common = {
@@ -695,11 +694,7 @@ def project_campaign_outcome(
             raise ValueError("all_satisfied requires at least one required objective")
         if unresolved:
             raise ValueError("all_satisfied is invalid while required objectives remain unresolved")
-        verdict = (
-            CampaignVerdict.SATISFIED_WITH_WAIVERS
-            if waived
-            else CampaignVerdict.SATISFIED
-        )
+        verdict = CampaignVerdict.SATISFIED_WITH_WAIVERS if waived else CampaignVerdict.SATISFIED
         return CampaignOutcomeProjection(
             lifecycle=CampaignLifecycle.COMPLETED,
             verdict=verdict,

@@ -623,7 +623,9 @@ async def test_saturation_poller_reoffers_same_request_id_for_another_campaign()
 
 
 @pytest.mark.asyncio
-async def test_swarm_refresh_surfaces_pending_saturation_when_decision_poll_is_unavailable() -> None:
+async def test_swarm_refresh_surfaces_pending_saturation_when_decision_poll_is_unavailable() -> (
+    None
+):
     class SaturatedBackend(DemoBackend):
         async def list_campaigns(self):
             return (
@@ -2826,9 +2828,7 @@ async def test_model_routing_screen_keeps_exact_discovered_vision(monkeypatch) -
                     ModelCandidate("vision-recon", vision=True),
                 )
             ),
-            "openai_responses": ModelDiscovery(
-                (ModelCandidate("vision-recon", vision=None),)
-            ),
+            "openai_responses": ModelDiscovery((ModelCandidate("vision-recon", vision=None),)),
         }
 
     monkeypatch.setattr("merlin_tui.provider_catalog.discover_routing_models", discover)
@@ -7036,9 +7036,7 @@ def test_target_progress_renderer_shows_state_without_changing_swarm_summary():
             ),
             "latest_transition": {
                 "outcome": "regression",
-                "observations": (
-                    {"name": "score", "before_value": 72, "after_value": 61},
-                ),
+                "observations": ({"name": "score", "before_value": 72, "after_value": 61},),
             },
             "conflicts": (),
         }
@@ -7094,9 +7092,7 @@ async def test_live_target_progress_card_is_separate_from_agent_swarm() -> None:
                         "status": "observed",
                         "freshness": "current",
                         "target_exchange_count": 2,
-                        "current_state": (
-                            {"name": "stage", "label": "Stage", "value": 3},
-                        ),
+                        "current_state": ({"name": "stage", "label": "Stage", "value": 3},),
                         "conflicts": (),
                     },
                 ),
@@ -7298,9 +7294,7 @@ def test_live_swarm_explains_blocking_review_without_changing_target_progress():
         "frontier",
         "completed",
         target_progress={
-            "current_state": (
-                {"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},
-            ),
+            "current_state": ({"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},),
             "target_exchange_count": 19,
             "freshness": "current",
         },
@@ -7324,9 +7318,7 @@ def test_live_swarm_explains_blocking_review_without_changing_target_progress():
     assert "Progress: 3/5 review chunks complete" in rendered
     assert "Waiting: The next wave needs the reviewed objective and strategy decision." in rendered
     assert campaign.target_progress == {
-        "current_state": (
-            {"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},
-        ),
+        "current_state": ({"name": "tier", "label": "Tier", "value": 2, "maximum_value": 4},),
         "target_exchange_count": 19,
         "freshness": "current",
     }

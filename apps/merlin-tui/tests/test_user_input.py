@@ -292,9 +292,7 @@ async def test_backend_accepts_the_exact_question_it_displayed_when_durable_orde
             payload={
                 "name": "request_user_input",
                 "state": "completed",
-                "text": json.dumps(
-                    {"status": "awaiting_input", "request": request.model_dump()}
-                ),
+                "text": json.dumps({"status": "awaiting_input", "request": request.model_dump()}),
             },
         )
     ]

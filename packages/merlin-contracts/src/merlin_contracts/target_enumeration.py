@@ -50,9 +50,7 @@ class StateEnumerationReceipt(BaseModel):
             raise ValueError("flat enumerations require the '*' scope")
         if self.scope_dimension is not None and "*" in self.members_by_scope:
             if len(self.members_by_scope) != 1 or self.members_by_scope["*"]:
-                raise ValueError(
-                    "scoped '*' is reserved for an authoritative empty denominator"
-                )
+                raise ValueError("scoped '*' is reserved for an authoritative empty denominator")
         for scope, members in self.members_by_scope.items():
             if not scope:
                 raise ValueError("enumeration scope values cannot be empty")
@@ -113,17 +111,13 @@ def build_state_enumeration(
         }
     )
     complete = declaration.completeness is StateEnumerationCompleteness.COMPLETE
-    evidence_refs = tuple(
-        dict.fromkeys((*declaration.evidence_refs, *selector.evidence_refs))
-    )
+    evidence_refs = tuple(dict.fromkeys((*declaration.evidence_refs, *selector.evidence_refs)))
     if not evidence_refs:
         raise ValueError("state enumerations require reviewed evidence references")
     content = {
         "name": declaration.name,
         "scope_dimension": declaration.scope_dimension,
-        "members_by_scope": {
-            key: list(value) for key, value in sorted(members_by_scope.items())
-        },
+        "members_by_scope": {key: list(value) for key, value in sorted(members_by_scope.items())},
         "complete": complete,
         "binding_digest": binding_digest,
     }

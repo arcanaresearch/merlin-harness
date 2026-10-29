@@ -2196,9 +2196,7 @@ def _automatic_failure_summary(value: str) -> tuple[str, str] | None:
             diagnostics,
             ("origin", "target_id", "observed_at", "capture_error", "error"),
         )
-        body.extend(
-            f"{key.replace('_', ' ').title()}: {value}" for key, value in safe.items()
-        )
+        body.extend(f"{key.replace('_', ' ').title()}: {value}" for key, value in safe.items())
         evidence_count = sum(
             len(item.get("evidence_refs", ()))
             for item in diagnostics.values()
@@ -2403,9 +2401,8 @@ def _readable_lead_log(rows: Iterable[str], *, width: int) -> str:
         if kind == "incremental_task_review_completed":
             review = payload.get("review")
             review = review if isinstance(review, Mapping) else {}
-            if (
-                str(review.get("signal") or "") == "negative"
-                and index <= latest_merge_by_wave.get(wave, -1)
+            if str(review.get("signal") or "") == "negative" and index <= latest_merge_by_wave.get(
+                wave, -1
             ):
                 continue
         timestamp = str(outer.get("created_at") or "time unavailable")
@@ -4398,9 +4395,7 @@ class MerlinApp(App[None]):
                 try:
                     await release()
                 except Exception as exc:
-                    self.log.error(
-                        "foreground lease release failed: " + _scrub_secrets(str(exc))
-                    )
+                    self.log.error("foreground lease release failed: " + _scrub_secrets(str(exc)))
             self.exit(message=Text("This Merlin session was closed from another window."))
 
     async def _resolve_existing_session(self, *, recover: bool = False) -> bool:
@@ -5759,8 +5754,7 @@ class MerlinApp(App[None]):
             for campaign in session_campaigns:
                 decision = campaign.saturation_decision
                 if campaign.status == "executing" and (
-                    isinstance(decision, Mapping)
-                    and decision.get("state") == "awaiting_operator"
+                    isinstance(decision, Mapping) and decision.get("state") == "awaiting_operator"
                 ):
                     # The live refresh already owns an authoritative lightweight
                     # campaign snapshot. Surface its pending checkpoint here as
@@ -5993,18 +5987,14 @@ class MerlinApp(App[None]):
             "Stop with incomplete coverage and generate report",
         }:
             self._spawn(
-                self._decide_campaign_saturation(
-                    campaign_id, "stop", request_id=request_id
-                )
+                self._decide_campaign_saturation(campaign_id, "stop", request_id=request_id)
             )
         elif choice in {
             "Continue exhaustive assessment",
             "Replan missing coverage and continue",
         }:
             self._spawn(
-                self._decide_campaign_saturation(
-                    campaign_id, "continue", request_id=request_id
-                )
+                self._decide_campaign_saturation(campaign_id, "continue", request_id=request_id)
             )
         elif choice == "Continue with a limit…":
             self._active_saturation_request = None
@@ -7859,9 +7849,7 @@ def _render_target_progress(
         changes = tuple(
             item
             for item in transition.get("observations", ())
-            if isinstance(item, Mapping)
-            and "before_value" in item
-            and "after_value" in item
+            if isinstance(item, Mapping) and "before_value" in item and "after_value" in item
         )
         if changes:
             change = changes[0]
@@ -7871,9 +7859,7 @@ def _render_target_progress(
                 + f" {change['before_value']} → {change['after_value']}"
                 + f" · {transition.get('outcome', 'unclear')}\n",
                 style=(
-                    "green"
-                    if transition.get("outcome") in {"confirmed", "progress"}
-                    else "yellow"
+                    "green" if transition.get("outcome") in {"confirmed", "progress"} else "yellow"
                 ),
             )
     freshness = str(progress.get("freshness") or "unknown")
@@ -8808,10 +8794,7 @@ def _pending_saturation_decision(
             continue
         if payload.get("kind") == "saturation_decision":
             decided.add(request_id)
-        elif (
-            payload.get("kind") == "saturation_decision_required"
-            and request_id not in decided
-        ):
+        elif payload.get("kind") == "saturation_decision_required" and request_id not in decided:
             return payload
     return None
 

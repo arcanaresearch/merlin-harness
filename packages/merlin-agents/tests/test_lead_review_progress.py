@@ -107,7 +107,9 @@ async def test_wave_progress_omits_completed_review() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wave_progress_projects_pending_saturation_decision_without_coverage_payload() -> None:
+async def test_wave_progress_projects_pending_saturation_decision_without_coverage_payload() -> (
+    None
+):
     class Store:
         def list_waves(self, _campaign_id):
             return [

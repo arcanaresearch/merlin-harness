@@ -252,9 +252,7 @@ def test_compiler_preserves_high_confidence_explicit_method_list() -> None:
 
 
 def test_compiler_preserves_unambiguous_two_item_method_list() -> None:
-    contract = compile_objective_contract(
-        "Attempt authority impersonation and payload injection."
-    )
+    contract = compile_objective_contract("Attempt authority impersonation and payload injection.")
     selector = contract.objectives[0].selectors[0]
 
     assert contract.objectives[0].required is True

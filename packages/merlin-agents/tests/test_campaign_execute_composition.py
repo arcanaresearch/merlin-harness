@@ -99,6 +99,7 @@ class ExecuteStore:
     def list_lead(self, _campaign_id):
         return [{"wave": wave, "payload": payload} for wave, payload in self.lead]
 
+
 class ReconAgents:
     def __init__(self) -> None:
         self.submissions = []

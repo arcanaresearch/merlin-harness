@@ -33,9 +33,7 @@ def test_claude_cli_preserves_legacy_advisory_off_and_rejects_required_off(
     async def collect(request: ChatRequest) -> list[object]:
         return [event async for event in provider.stream(request)]
 
-    advisory = asyncio.run(
-        collect(ChatRequest(model="claude", messages=[], reasoning="disabled"))
-    )
+    advisory = asyncio.run(collect(ChatRequest(model="claude", messages=[], reasoning="disabled")))
     required = asyncio.run(
         collect(
             ChatRequest(

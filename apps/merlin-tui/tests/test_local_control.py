@@ -1337,9 +1337,7 @@ async def test_legacy_idle_daemon_is_replaced_before_foreground_attach(
             writer.close()
             await writer.wait_closed()
 
-    async def tracked_handle(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def tracked_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         assert task is not None
         handlers.add(task)

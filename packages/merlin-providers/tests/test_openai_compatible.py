@@ -52,6 +52,7 @@ def _write_viewport_png(path, *, width: int = 2_048, height: int = 768) -> None:
         + chunk(b"IEND", b"")
     )
 
+
 RECORDED_STREAM = "\n".join(  # noqa: FLY002 - readable recorded SSE fixture
     [
         'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
@@ -84,9 +85,7 @@ def test_request_reasoning_effort_is_native_or_explicitly_rejected() -> None:
         unsupported._payload(request)
 
     native = OpenAICompatibleProvider(
-        ProviderConfig(
-            "https://api.test", "", "model", reasoning_parameter="reasoning_effort"
-        )
+        ProviderConfig("https://api.test", "", "model", reasoning_parameter="reasoning_effort")
     )
     assert native._payload(request)["reasoning_effort"] == "high"
 
@@ -97,10 +96,10 @@ def test_required_reasoning_off_rejects_silent_noop_but_legacy_advisory_survives
     assert "reasoning_effort" not in provider._payload(advisory)
     with pytest.raises(ProviderError, match="cannot authoritatively disable reasoning"):
         provider._payload(
-            advisory.model_copy(
-                update={"workload": "worker", "reasoning_control": "required"}
-            )
+            advisory.model_copy(update={"workload": "worker", "reasoning_control": "required"})
         )
+
+
 DSML_DIRECT_JSON = (
     '<｜DSML｜tool_calls><｜DSML｜invoke name="browser_snapshot">'
     '{"context_id":"ctx-1","tab_ref":"tab:1"}'
@@ -169,9 +168,8 @@ def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) 
         sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         byte_length=image.stat().st_size,
     )
-    manifest = (
-        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
-        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    manifest = "MERLIN_VISUAL_EVIDENCE_MANIFEST=" + json.dumps(
+        {"sha256": attachment.sha256, "source": "runtime.visual_review"}
     )
     provider = OpenAICompatibleProvider(
         ProviderConfig("https://models.example/v1", "", "vision-model", vision=True)

@@ -431,18 +431,16 @@ async def test_injection_exchange_is_included_in_report(
         backend = build_backend(tmp_path / "workspace-injection")
         try:
             campaign_id = "campaign/injection-report"
-            manifest, schedule_id, _attempt_id, _effect_id, call_id = (
-                await _campaign_with_effect(
-                    backend,
-                    database,
-                    tmp_path,
-                    campaign_id=campaign_id,
-                    valid_receipt=True,
-                    objective_match=False,
-                    context_strategy_id="direct",
-                    complete_cleanup=True,
-                    target_tool_name="target_inject",
-                )
+            manifest, schedule_id, _attempt_id, _effect_id, call_id = await _campaign_with_effect(
+                backend,
+                database,
+                tmp_path,
+                campaign_id=campaign_id,
+                valid_receipt=True,
+                objective_match=False,
+                context_strategy_id="direct",
+                complete_cleanup=True,
+                target_tool_name="target_inject",
             )
             # This focused fixture does not run the scheduler daemon that normally
             # reconciles an all-terminal node set into the terminal schedule state.
@@ -457,9 +455,7 @@ async def test_injection_exchange_is_included_in_report(
             revision = backend._report_repository.list(campaign_id)[-1]  # type: ignore[attr-defined]
             report = backend._report_repository.get(revision.revision_id)  # type: ignore[attr-defined]
 
-            assert [exchange["id"] for exchange in report.exchanges] == [
-                f"{call_id}:interaction"
-            ]
+            assert [exchange["id"] for exchange in report.exchanges] == [f"{call_id}:interaction"]
             assert report.exchanges[0]["request"] == "raw escalating prompt"
             assert report.exchanges[0]["response"] == "raw target response"
         finally:

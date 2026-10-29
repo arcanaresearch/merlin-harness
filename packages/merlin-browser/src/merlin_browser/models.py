@@ -41,16 +41,15 @@ def _legacy_browser_text_contract_can_upgrade(
     persisted_interaction = persisted_executable.get("interaction")
     if not isinstance(persisted_interaction, Mapping):
         return False
-    if any(
-        field in persisted_interaction for field in ("response_witness", "state_observations")
-    ):
+    if any(field in persisted_interaction for field in ("response_witness", "state_observations")):
         return False
 
     old_executable = getattr(persisted_compilation, "executable", None)
     new_executable = getattr(compatibility_compilation, "executable", None)
-    if getattr(old_executable, "kind", None) != "browser_chat" or getattr(
-        new_executable, "kind", None
-    ) != "browser_chat":
+    if (
+        getattr(old_executable, "kind", None) != "browser_chat"
+        or getattr(new_executable, "kind", None) != "browser_chat"
+    ):
         return False
     old_payload = old_executable.model_dump(mode="json")
     new_payload = new_executable.model_dump(mode="json")
@@ -146,9 +145,7 @@ def _validate_target_surface_generation_receipt(
         if key not in {"evidence_ref", "receipt_sha256"}
     }
     receipt_sha256 = hashlib.sha256(
-        json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
+        json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
     surface = {
         "schema": "merlin.target-surface-generation-surface.v1",
@@ -162,11 +159,12 @@ def _validate_target_surface_generation_receipt(
         "surface_observation_digest": receipt["surface_observation_digest"],
         "compiled_adapter_digest": receipt["compiled_adapter_digest"],
     }
-    surface_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    ).hexdigest()
+    surface_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
     if (
         receipt["session_id"] != session_id
         or receipt["context_id"] != context_id
@@ -176,8 +174,7 @@ def _validate_target_surface_generation_receipt(
         or receipt["compiled_adapter_digest"] != compiled_adapter_digest
         or receipt["current_surface_digest"] != surface_digest
         or receipt["receipt_sha256"] != receipt_sha256
-        or receipt["evidence_ref"]
-        != f"target-surface-generation:sha256:{receipt_sha256}"
+        or receipt["evidence_ref"] != f"target-surface-generation:sha256:{receipt_sha256}"
     ):
         raise ValueError("target surface generation receipt does not match handoff")
 
@@ -221,9 +218,9 @@ class ElementRef(BrowserModel):
     disabled: bool = False
     read_only: bool = False
     occluded: bool = False
-    surface_scope: Literal[
-        "document", "transcript", "status", "dialog", "modal", "top_layer"
-    ] = "document"
+    surface_scope: Literal["document", "transcript", "status", "dialog", "modal", "top_layer"] = (
+        "document"
+    )
 
 
 class BrowserObservation(BrowserModel):
@@ -459,18 +456,25 @@ class ApiReconHandoff(BrowserModel):
             if observed_at.tzinfo is None:
                 raise ValueError("recon observation timestamp must include a timezone")
             evidence_refs = observation.get("evidence_refs")
-            if not isinstance(evidence_refs, list) or not evidence_refs or any(
-                not isinstance(reference, str)
-                or not re.fullmatch(
-                    r"browser-api-(?:request|response):sha256:[0-9a-f]{64}", reference
+            if (
+                not isinstance(evidence_refs, list)
+                or not evidence_refs
+                or any(
+                    not isinstance(reference, str)
+                    or not re.fullmatch(
+                        r"browser-api-(?:request|response):sha256:[0-9a-f]{64}", reference
+                    )
+                    for reference in evidence_refs
                 )
-                for reference in evidence_refs
             ):
                 raise ValueError("recon observation evidence references are invalid")
             core = {key: value for key, value in observation.items() if key != "digest"}
-            expected_digest = "sha256:" + hashlib.sha256(
-                json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+            expected_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            )
             if observation.get("digest") != expected_digest:
                 raise ValueError("recon observation digest does not match its content")
         return self

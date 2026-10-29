@@ -171,9 +171,7 @@ async def test_lead_decision_rejects_result_when_authoritative_tasks_change(
             monkeypatch.setattr(
                 store,
                 "list_waves",
-                lambda _campaign_id: [
-                    {"wave": 4, "schedule_id": "schedule-4", "kind": "followup"}
-                ],
+                lambda _campaign_id: [{"wave": 4, "schedule_id": "schedule-4", "kind": "followup"}],
             )
 
             async def list_schedule_tasks(_schedule_id):

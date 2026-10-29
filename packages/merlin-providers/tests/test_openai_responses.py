@@ -144,9 +144,8 @@ def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) 
         sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         byte_length=image.stat().st_size,
     )
-    manifest = (
-        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
-        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    manifest = "MERLIN_VISUAL_EVIDENCE_MANIFEST=" + json.dumps(
+        {"sha256": attachment.sha256, "source": "runtime.visual_review"}
     )
     provider = OpenAIResponsesProvider(
         OpenAIResponsesConfig(

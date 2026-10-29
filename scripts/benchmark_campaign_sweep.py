@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import subprocess
 import sys
 import time
@@ -316,9 +315,7 @@ async def run_sweep_lane(
             target_log = response.json()
         except Exception:
             pass
-    matched_any = any(
-        bool(entry.get("matched")) for entry in target_log.get("entries", ())
-    )
+    matched_any = any(bool(entry.get("matched")) for entry in target_log.get("entries", ()))
     return {
         "behavior_id": behavior_id,
         "objective": objective,
@@ -330,13 +327,14 @@ async def run_sweep_lane(
         "matched_any": matched_any,
         "target_entries": target_log.get("entries", []),
         "worker_results": [
-            {"content": str(row["payload"].get("content"))}
-            for row in worker_results
+            {"content": str(row["payload"].get("content"))} for row in worker_results
         ],
     }
 
 
-def _start_target(behavior: str, victim_model: str, judge_model: str) -> tuple[subprocess.Popen, str]:
+def _start_target(
+    behavior: str, victim_model: str, judge_model: str
+) -> tuple[subprocess.Popen, str]:
     process = subprocess.Popen(
         [
             "uv",
@@ -397,9 +395,7 @@ def main() -> int:
             continue
         process, origin = _start_target(behavior, args.victim_model, args.judge_model)
         try:
-            result = asyncio.run(
-                run_sweep_lane(args.workdir, origin, behavior, behavior_id)
-            )
+            result = asyncio.run(run_sweep_lane(args.workdir, origin, behavior, behavior_id))
         except Exception as exc:
             result = {
                 "behavior_id": behavior_id,

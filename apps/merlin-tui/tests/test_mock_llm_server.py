@@ -129,6 +129,4 @@ def test_acknowledged_target_call_is_cited_by_canonical_evidence_ref() -> None:
     )
 
     result = json.loads(response["content"])
-    assert result["attempted_techniques"][0]["evidence_refs"] == [
-        "target-call:call-fixture-1"
-    ]
+    assert result["attempted_techniques"][0]["evidence_refs"] == ["target-call:call-fixture-1"]

@@ -277,9 +277,7 @@ class Tui:
             return
         self._scan_offset += limit
         visible = _visible_text(data[:limit])
-        if self._permission_open and re.search(
-            r"Tool · [\w-]+ (?:completed|failed)", visible
-        ):
+        if self._permission_open and re.search(r"Tool · [\w-]+ (?:completed|failed)", visible):
             self._permission_open = False
         prompts = list(re.finditer(r"Permission required", visible))
         labelled = list(re.finditer(r"Effect: (\w+) · Tool: ([\w-]+)", visible))
@@ -294,9 +292,7 @@ class Tui:
                 effect, tool = explicit.group(1), explicit.group(2)
             else:
                 transcript = self.visible()
-                started = list(
-                    re.finditer(r"Tool · ([\w-]+) started", transcript)
-                )
+                started = list(re.finditer(r"Tool · ([\w-]+) started", transcript))
                 tool = started[-1].group(1) if started else "unknown"
                 effect = {
                     "browser_fill": "target_network",
@@ -539,10 +535,14 @@ def _wait_report_through_coverage_decisions(
         if request_id in handled_request_ids:
             choice_scan = len(tui.output)
             continue
-        action = "stop" if (
-            "Continue exhaustive assessment" in choices
-            or decisions.count("continue") >= max_coverage_continuations
-        ) else "continue"
+        action = (
+            "stop"
+            if (
+                "Continue exhaustive assessment" in choices
+                or decisions.count("continue") >= max_coverage_continuations
+            )
+            else "continue"
+        )
         # Exercise the modal's numbered operator action directly. Dismissing
         # with Escape can activate the focused "limit" path and prefill the
         # composer, corrupting a command typed immediately afterward.
@@ -774,9 +774,9 @@ def main() -> int:
             420,
             campaign_id=campaign_id,
         )
-        final_json = _json_of_text(
-            _cli(binary, home, workspace, "campaign", "status", campaign_id)
-        ) or {}
+        final_json = (
+            _json_of_text(_cli(binary, home, workspace, "campaign", "status", campaign_id)) or {}
+        )
         final_status = str(final_json.get("status", ""))
         check(
             "coverage A: required hypothesis work was continued instead of silently omitted",

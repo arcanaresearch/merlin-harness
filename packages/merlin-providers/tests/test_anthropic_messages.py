@@ -269,9 +269,8 @@ def test_vision_serializer_does_not_embed_retired_history_attachments(tmp_path) 
         sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         byte_length=image.stat().st_size,
     )
-    manifest = (
-        "MERLIN_VISUAL_EVIDENCE_MANIFEST="
-        + json.dumps({"sha256": attachment.sha256, "source": "runtime.visual_review"})
+    manifest = "MERLIN_VISUAL_EVIDENCE_MANIFEST=" + json.dumps(
+        {"sha256": attachment.sha256, "source": "runtime.visual_review"}
     )
     provider = AnthropicMessagesProvider(
         AnthropicMessagesConfig(
@@ -390,9 +389,7 @@ def test_anthropic_images_are_rejected_outside_user_messages(tmp_path, role) -> 
 
 def test_required_off_cannot_be_reenabled_by_anthropic_config() -> None:
     provider = AnthropicMessagesProvider(
-        AnthropicMessagesConfig(
-            "https://api.test/v1", "", "claude", reasoning_effort="high"
-        )
+        AnthropicMessagesConfig("https://api.test/v1", "", "claude", reasoning_effort="high")
     )
     payload = provider._payload(
         ChatRequest(

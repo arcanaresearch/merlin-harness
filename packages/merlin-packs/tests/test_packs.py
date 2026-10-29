@@ -206,9 +206,7 @@ def test_compliance_controls_require_reviewed_bindings_and_independent_evidence(
     assert controls["compliance.confidentiality.synthetic-canary"]["test_data_class"] == (
         "synthetic_only"
     )
-    assert controls["compliance.privacy.subject-isolation"]["test_data_class"] == (
-        "synthetic_only"
-    )
+    assert controls["compliance.privacy.subject-isolation"]["test_data_class"] == ("synthetic_only")
 
 
 def test_resource_exhaustion_frontier_is_explicit_and_safely_bounded() -> None:

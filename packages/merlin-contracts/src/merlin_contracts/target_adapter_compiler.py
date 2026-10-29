@@ -825,7 +825,7 @@ def _json_pointer_exists(value: object, pointer: str) -> bool:
 _BROWSER_LOCATOR_ROLES = frozenset({"button", "textbox", "link", "checkbox", "radio", "combobox"})
 _BROWSER_LOCATOR_ROLE_PATTERN = "|".join(sorted(_BROWSER_LOCATOR_ROLES))
 _CANONICAL_BROWSER_LOCATOR_PATTERN = re.compile(
-    rf'^(?P<role>{_BROWSER_LOCATOR_ROLE_PATTERN})\s*\[\s*name\s*=\s*'
+    rf"^(?P<role>{_BROWSER_LOCATOR_ROLE_PATTERN})\s*\[\s*name\s*=\s*"
     r'(?P<name>"(?:\\.|[^"\\])*")\s*\]$',
     flags=re.IGNORECASE,
 )
@@ -1329,9 +1329,7 @@ def _compile_browser_steps(
             continue
         raw_source_index = item.get(BROWSER_STEP_SOURCE_INDEX_KEY, index)
         source_index = (
-            raw_source_index
-            if type(raw_source_index) is int and raw_source_index >= 0
-            else None
+            raw_source_index if type(raw_source_index) is int and raw_source_index >= 0 else None
         )
         if item.get("interaction") is True and item.get("cleanup") is True:
             raise AdapterCompileError(

@@ -155,9 +155,7 @@ def _reviewed_technique_ids(corpus: str) -> list[str]:
     fallback = sorted(
         {
             technique.rstrip(".")
-            for technique in re.findall(
-                r"merlin-injection-taxonomy/cat/[\w./@=-]+", corpus
-            )
+            for technique in re.findall(r"merlin-injection-taxonomy/cat/[\w./@=-]+", corpus)
             # Adapter-excluded techniques are guidance, not reviewed coverage.
             if "crescendo-context-drift" not in technique
             and "hydra-catalogue-diversity" not in technique
@@ -234,16 +232,19 @@ class MockBrain:
             marker in system_text
             for marker in ("phase_gate_choices", "gate_proposals", "unresolved_requirements")
         ):
-            role, response = "objective-prerequisite-audit", {
-                "content": json.dumps(
-                    {
-                        "requirements": [],
-                        "gate_proposals": [],
-                        "rejected_gates": [],
-                        "unresolved_requirements": [],
-                    }
-                )
-            }
+            role, response = (
+                "objective-prerequisite-audit",
+                {
+                    "content": json.dumps(
+                        {
+                            "requirements": [],
+                            "gate_proposals": [],
+                            "rejected_gates": [],
+                            "unresolved_requirements": [],
+                        }
+                    )
+                },
+            )
         elif "Campaign Lead evidence reviewer" in system_text:
             request = json.loads(_all_user_text(messages))
             reviews = []
@@ -268,9 +269,7 @@ class MockBrain:
                         "candidate_priorities": [],
                     }
                 )
-            role, response = "incremental-reviewer", {
-                "content": json.dumps({"reviews": reviews})
-            }
+            role, response = "incremental-reviewer", {"content": json.dumps({"reviews": reviews})}
         elif "You are the Campaign Lead" in system_text:
             role, response = "lead", self._lead(messages)
         elif "Hydra-Select merlin.hydra-select.v1 proposal worker" in system_text:
@@ -393,11 +392,7 @@ class MockBrain:
             if isinstance(value, dict):
                 composition = value
                 break
-        if (
-            composition
-            and composition.get("initial_composition_request")
-            and not reviewed_rows
-        ):
+        if composition and composition.get("initial_composition_request") and not reviewed_rows:
             technique_ids = [
                 str(value)
                 for value in composition.get("sealed_technique_ids", [])

@@ -166,9 +166,7 @@ async def test_new_prompt_revision_supersedes_older_review_in_same_campaign() ->
     async def second_review() -> str:
         return "new"
 
-    first = asyncio.create_task(
-        coalescer.run("prompt-a", first_review, scope="campaign-1")
-    )
+    first = asyncio.create_task(coalescer.run("prompt-a", first_review, scope="campaign-1"))
     await first_started.wait()
     assert await coalescer.run("prompt-b", second_review, scope="campaign-1") == "new"
     assert not await coalescer.is_current("campaign-1", "prompt-a")

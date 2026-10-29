@@ -52,8 +52,7 @@ def _control(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
     fields = {
-        key: value.get(key)
-        for key in ("role", "name", "frame_ref", "input_type", "surface_scope")
+        key: value.get(key) for key in ("role", "name", "frame_ref", "input_type", "surface_scope")
     }
     limits = {
         "role": 64,
@@ -62,28 +61,27 @@ def _control(value: object) -> dict[str, object] | None:
         "input_type": 64,
         "surface_scope": 32,
     }
-    if any(
-        item is not None and (not isinstance(item, str) or len(item) > limits[key])
-        for key, item in fields.items()
-    ) or not all(fields[key] for key in ("role", "name")) or fields[
-        "surface_scope"
-    ] not in {
-        None,
-        "document",
-        "transcript",
-        "status",
-        "dialog",
-        "modal",
-        "top_layer",
-    }:
+    if (
+        any(
+            item is not None and (not isinstance(item, str) or len(item) > limits[key])
+            for key, item in fields.items()
+        )
+        or not all(fields[key] for key in ("role", "name"))
+        or fields["surface_scope"]
+        not in {
+            None,
+            "document",
+            "transcript",
+            "status",
+            "dialog",
+            "modal",
+            "top_layer",
+        }
+    ):
         return None
     result = {key: item for key, item in fields.items() if item is not None}
     result.update(
-        {
-            key: True
-            for key in ("disabled", "read_only", "occluded")
-            if value.get(key) is True
-        }
+        {key: True for key in ("disabled", "read_only", "occluded") if value.get(key) is True}
     )
     return result
 
@@ -167,10 +165,7 @@ def _exact_unchanged_proof(
     if (
         type(evidence_refs) is not list
         or not 1 <= len(evidence_refs) <= 8
-        or any(
-            not isinstance(item, str) or not item or len(item) > 256
-            for item in evidence_refs
-        )
+        or any(not isinstance(item, str) or not item or len(item) > 256 for item in evidence_refs)
     ):
         return False
     encoded = json.dumps(
@@ -190,14 +185,10 @@ def normalize_target_ui_transition(
     reobservation_recommended = raw.get("reobservation_recommended")
     adapter_stale = raw.get("adapter_stale")
     material_barrier = bool(
-        material is True
-        and reobservation_recommended is True
-        and type(adapter_stale) is bool
+        material is True and reobservation_recommended is True and type(adapter_stale) is bool
     )
     unchanged_proof = bool(
-        material is False
-        and reobservation_recommended is False
-        and adapter_stale is False
+        material is False and reobservation_recommended is False and adapter_stale is False
     )
     if not material_barrier and not unchanged_proof:
         return None
@@ -230,14 +221,10 @@ def normalize_target_ui_transition(
     title_change: dict[str, str] | None = None
     if raw_title_change is not None:
         if not isinstance(raw_title_change, Mapping) or any(
-            not isinstance(raw_title_change.get(key), str)
-            for key in ("before", "after")
+            not isinstance(raw_title_change.get(key), str) for key in ("before", "after")
         ):
             return None
-        title_change = {
-            key: str(raw_title_change[key])[:512]
-            for key in ("before", "after")
-        }
+        title_change = {key: str(raw_title_change[key])[:512] for key in ("before", "after")}
 
     changed_dimensions = strings("changed_dimensions", 12, 64)
     if "reviewed_state" in changed_dimensions and not any(

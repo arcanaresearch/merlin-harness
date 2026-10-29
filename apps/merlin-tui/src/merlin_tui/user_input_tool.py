@@ -84,8 +84,7 @@ class RequestUserInputTool:
                 request_id=f"{context.session_id}:{context.call_id}", **dict(arguments)
             )
             if any(
-                _is_campaign_execution_approval_question(question)
-                for question in request.questions
+                _is_campaign_execution_approval_question(question) for question in request.questions
             ):
                 raise ValueError(
                     "Campaign execution approval belongs to the Merlin client's sealed-review "

@@ -255,12 +255,16 @@ def _reviewed_campaign_outcome(value: object) -> CampaignOutcomeProjection | Non
         CampaignVerdict.SATISFIED_WITH_WAIVERS,
     }:
         raise ValueError("completed campaign outcome requires a satisfied verdict")
-    if outcome.lifecycle in {
-        CampaignLifecycle.COMPLETED,
-        CampaignLifecycle.INCOMPLETE,
-        CampaignLifecycle.STOPPED,
-        CampaignLifecycle.FAILED,
-    } and outcome.end_reason is None:
+    if (
+        outcome.lifecycle
+        in {
+            CampaignLifecycle.COMPLETED,
+            CampaignLifecycle.INCOMPLETE,
+            CampaignLifecycle.STOPPED,
+            CampaignLifecycle.FAILED,
+        }
+        and outcome.end_reason is None
+    ):
         raise ValueError("terminal campaign outcome requires an end reason")
     return outcome
 
@@ -423,18 +427,23 @@ class DurableReportService:
         if timestamp.tzinfo is None:
             raise ValueError("report timestamp must be timezone-aware")
         cleanup_complete = cleanup_status in {"complete", "completed"}
-        state = "incomplete" if objective_incomplete else report_state or (
-            "provisional"
-            if legacy_limited_completion and not unsearched_frontier and cleanup_complete
-            else "complete"
-            if stop_reason
-            in {
-                CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
-                CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
-            }
-            and not unsearched_frontier
-            and cleanup_complete
-            else "incomplete"
+        state = (
+            "incomplete"
+            if objective_incomplete
+            else report_state
+            or (
+                "provisional"
+                if legacy_limited_completion and not unsearched_frontier and cleanup_complete
+                else "complete"
+                if stop_reason
+                in {
+                    CampaignTerminalReason.OBJECTIVE_SATISFIED.value,
+                    CampaignTerminalReason.FRONTIER_EXHAUSTED.value,
+                }
+                and not unsearched_frontier
+                and cleanup_complete
+                else "incomplete"
+            )
         )
         if state == "complete" and (
             stop_reason
@@ -505,9 +514,11 @@ class DurableReportService:
             if completion_schema == "merlin.campaign-completion.v2":
                 self._load_frontier_snapshot(campaign_id, sealed_document)
             saturation = sealed_document.get("saturation")
-            if require_frontier_ready and (
-                not isinstance(saturation, Mapping) or saturation.get("ready") is not True
-            ) and state != "incomplete":
+            if (
+                require_frontier_ready
+                and (not isinstance(saturation, Mapping) or saturation.get("ready") is not True)
+                and state != "incomplete"
+            ):
                 raise ValueError("saturated report requires a ready completion seal")
             cleanup = sealed_document.get("cleanup")
             if not isinstance(cleanup, Mapping):

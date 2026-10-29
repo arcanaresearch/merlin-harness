@@ -56,10 +56,7 @@ def project_target_progress(
             else ()
         )
         target_exchange_count += sum(item.get("interaction") is True for item in exchanges)
-        candidates = [
-            item
-            for item in _mapping_sequence(metadata.get("state_observations"))
-        ]
+        candidates = [item for item in _mapping_sequence(metadata.get("state_observations"))]
         for exchange in exchanges:
             candidates.extend(_mapping_sequence(exchange.get("state_observations")))
         identity = next(

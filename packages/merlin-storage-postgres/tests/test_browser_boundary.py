@@ -122,13 +122,14 @@ def test_handoff_evidence_verification_is_target_bound_across_restart(
                 "outcome": "observed",
                 "success_value_matched": True,
                 "result_observed_at": now.isoformat(),
-                "evidence_refs": [
-                    "browser-api-response:sha256:" + "b" * 64
-                ],
+                "evidence_refs": ["browser-api-response:sha256:" + "b" * 64],
             }
-            recon_observation["digest"] = "sha256:" + hashlib.sha256(
-                json.dumps(recon_observation, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+            recon_observation["digest"] = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(recon_observation, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            )
             handoff = ApiReconHandoff(
                 id="handoff:verified",
                 context_id=metadata.context_id,
@@ -319,14 +320,17 @@ def test_surface_generation_evidence_is_context_bound_across_restart(
                 "surface_observation_digest": observation_digest,
                 "compiled_adapter_digest": compiled_digest,
             }
-            current_surface_digest = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    surface,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode()
-            ).hexdigest()
+            current_surface_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        surface,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+            )
             receipt_body = {
                 "schema": "merlin.target-surface-generation.v1",
                 "campaign_id": "campaign/c1",
@@ -381,9 +385,7 @@ def test_surface_generation_evidence_is_context_bound_across_restart(
                 (request_ref, "browser_api_exchange"),
                 (response_ref, "browser_api_exchange"),
             ):
-                asyncio.run(
-                    store.record_evidence("context-1", evidence_ref, kind, {"status": 200})
-                )
+                asyncio.run(store.record_evidence("context-1", evidence_ref, kind, {"status": 200}))
 
             with pytest.raises(ValueError, match="missing or belongs to another context"):
                 asyncio.run(store.record_handoff(handoff))
@@ -575,9 +577,7 @@ def test_reviewed_tab_affinity_requires_matching_sealed_actions_across_restart(
                 is None
             )
             assert (
-                asyncio.run(
-                    store.reviewed_tab_affinity(mismatched_handoff_owner_id, target_id)
-                )
+                asyncio.run(store.reviewed_tab_affinity(mismatched_handoff_owner_id, target_id))
                 is None
             )
 

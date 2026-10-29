@@ -47,9 +47,7 @@ def test_provider_configuration_rejects_obvious_remote_placeholder_key(
     paths = ConfigPaths(tmp_path / "merlin")
 
     with pytest.raises(ValueError, match="obvious placeholder"):
-        ProviderConfiguration(paths).save(
-            "https://api.deepseek.com/v1", "deepseek-chat", "secret"
-        )
+        ProviderConfiguration(paths).save("https://api.deepseek.com/v1", "deepseek-chat", "secret")
 
     assert not paths.config.exists()
     assert not paths.credentials.exists()
@@ -241,9 +239,7 @@ def test_model_route_allows_codex_worker_transport(tmp_path: Path) -> None:
 def test_model_route_keeps_distinct_openai_vision_role_explicit(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path / "merlin")
     configuration = ProviderConfiguration(paths)
-    configuration.save(
-        "https://example.test/v1", "vision-role", "secret", vision=True
-    )
+    configuration.save("https://example.test/v1", "vision-role", "secret", vision=True)
     configuration.save_model("text-worker")
 
     configuration.save_model_route("vision-role", "openai_compatible", lead_only=True)

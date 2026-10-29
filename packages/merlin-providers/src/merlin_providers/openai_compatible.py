@@ -479,9 +479,7 @@ class OpenAICompatibleProvider:
         attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(self.config.effective_total_timeout):
-                request_has_images = any(
-                    message.image_attachments for message in request.messages
-                )
+                request_has_images = any(message.image_attachments for message in request.messages)
                 max_attempts = (
                     min(self.config.max_attempts, _IMAGE_REQUEST_TRANSPORT_ATTEMPT_LIMIT)
                     if request_has_images
@@ -624,9 +622,7 @@ class OpenAICompatibleProvider:
                     assert isinstance(chunk, dict)
                     if _stream_chunk_made_progress(chunk):
                         received_output = True
-                        progress_deadline = (
-                            time.monotonic() + self.config.partial_read_timeout
-                        )
+                        progress_deadline = time.monotonic() + self.config.partial_read_timeout
                     refused = self._observe_refusal(chunk, refused)
                     chunk_events: list[ModelEvent] = []
                     if self._consume(chunk, chunk_events, tools):
@@ -713,8 +709,7 @@ class OpenAICompatibleProvider:
                 finish_reason=finish,
                 allowed_tool_names=(
                     frozenset(
-                        str(item.get("function", {}).get("name", ""))
-                        for item in request.tools
+                        str(item.get("function", {}).get("name", "")) for item in request.tools
                     )
                     if request.tools
                     else None
@@ -1016,8 +1011,7 @@ class OpenAICompatibleProvider:
                 events.append(
                     ModelError(
                         message=(
-                            "provider returned an unadmitted native tool call; "
-                            f"expected {expected}"
+                            f"provider returned an unadmitted native tool call; expected {expected}"
                         ),
                         code="malformed_tool_call",
                         retryable=True,
@@ -1414,9 +1408,7 @@ def _verified_image_data(attachments: Any) -> list[tuple[str, str]]:
     declared_sizes: list[int] = []
     for attachment in items:
         declared_bytes = attachment.get("byte_length")
-        if type(declared_bytes) is not int or not (
-            0 < declared_bytes <= _IMAGE_REQUEST_BYTE_LIMIT
-        ):
+        if type(declared_bytes) is not int or not (0 < declared_bytes <= _IMAGE_REQUEST_BYTE_LIMIT):
             raise ProviderError("image attachment has an invalid declared size")
         declared_sizes.append(declared_bytes)
     if sum(declared_sizes) > _IMAGE_REQUEST_BYTE_LIMIT:

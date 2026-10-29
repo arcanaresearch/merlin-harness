@@ -212,9 +212,7 @@ class StateEnumerationDeclaration(TargetCapabilityContract):
 
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
-        if (self.shape is StateEnumerationShape.SCOPED) != (
-            self.scope_dimension is not None
-        ):
+        if (self.shape is StateEnumerationShape.SCOPED) != (self.scope_dimension is not None):
             raise ValueError("scoped enumerations require exactly one scope_dimension")
         return self
 

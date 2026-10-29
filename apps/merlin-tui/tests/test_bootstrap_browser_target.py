@@ -68,9 +68,7 @@ def test_campaign_schedule_identity_accepts_uuid_retry_value() -> None:
 
 
 def test_campaign_provider_continues_only_during_acknowledged_settlement() -> None:
-    assert _campaign_status_allows_provider(
-        {"status": "executing"}, allow_settlement_pause=False
-    )
+    assert _campaign_status_allows_provider({"status": "executing"}, allow_settlement_pause=False)
     settlement = {
         "status": "paused",
         "lifecycle_pause_reason": "acknowledged_settlement",

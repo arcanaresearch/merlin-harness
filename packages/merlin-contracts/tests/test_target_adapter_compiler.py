@@ -834,11 +834,14 @@ def test_browser_rendered_state_auxiliary_values_are_bounded() -> None:
 
     assert isinstance(compiled.executable, BrowserChat)
     assert compiled.executable.interaction.state_observations == ()
-    assert sum(
-        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
-        and item.path.startswith("interaction_contract.state_observations[")
-        for item in compiled.advisories
-    ) >= 5
+    assert (
+        sum(
+            item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+            and item.path.startswith("interaction_contract.state_observations[")
+            for item in compiled.advisories
+        )
+        >= 5
+    )
 
 
 def test_browser_rendered_state_cannot_elevate_target_dom_authority() -> None:
@@ -986,9 +989,7 @@ def test_browser_rendered_state_rejects_malformed_semantics_nonblocking() -> Non
         item.path
         for item in compiled.advisories
         if item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
-    } >= {
-        f"interaction_contract.state_observations[{index}]" for index in range(11)
-    }
+    } >= {f"interaction_contract.state_observations[{index}]" for index in range(11)}
 
 
 def test_browser_rendered_state_accepts_finite_arbitrary_precision_integer_number() -> None:

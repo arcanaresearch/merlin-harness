@@ -257,14 +257,10 @@ async def test_reobservation_compile_seals_exact_surface_generation_receipt() ->
         if key not in {"evidence_ref", "receipt_sha256"}
     }
     receipt_sha256 = hashlib.sha256(
-        json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
+        json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
     assert receipt["receipt_sha256"] == receipt_sha256
-    assert receipt["evidence_ref"] == (
-        f"target-surface-generation:sha256:{receipt_sha256}"
-    )
+    assert receipt["evidence_ref"] == (f"target-surface-generation:sha256:{receipt_sha256}")
     assert result.metadata["target_surface_generation_evidence_ref"] == receipt["evidence_ref"]
     assert any(
         evidence_ref == receipt["evidence_ref"]
@@ -287,9 +283,7 @@ async def test_reobservation_compile_seals_exact_surface_generation_receipt() ->
     assert normalize_target_surface_generation_receipt(receipt) == receipt
 
     second = await tool.invoke(
-        context.model_copy(
-            update={"target_reobservation_generation_id": "sha256:" + "3" * 64}
-        ),
+        context.model_copy(update={"target_reobservation_generation_id": "sha256:" + "3" * 64}),
         arguments,
     )
     assert not second.is_error, second.content
@@ -364,9 +358,7 @@ async def test_reobservation_compile_rejects_partial_generation_identity() -> No
     assert result.is_error
     assert result.metadata["failure_code"] == "target_surface_generation_receipt_invalid"
 
-    missing_store = await CompiledApiReconHandoffTool(
-        lambda _: Session(), Recorder()
-    ).invoke(
+    missing_store = await CompiledApiReconHandoffTool(lambda _: Session(), Recorder()).invoke(
         ToolContext(
             session_id="s1",
             workspace_root="/tmp",
@@ -389,9 +381,7 @@ async def test_reobservation_compile_rejects_partial_generation_identity() -> No
     )
 
     assert missing_store.is_error
-    assert missing_store.metadata["failure_code"] == (
-        "target_surface_generation_receipt_invalid"
-    )
+    assert missing_store.metadata["failure_code"] == ("target_surface_generation_receipt_invalid")
     assert "durable observation and evidence storage" in missing_store.content
 
     class HistoricalOnlySession(Session):
@@ -435,9 +425,7 @@ async def test_reobservation_compile_rejects_partial_generation_identity() -> No
     )
 
     assert historical_only.is_error
-    assert historical_only.metadata["failure_code"] == (
-        "target_surface_generation_receipt_invalid"
-    )
+    assert historical_only.metadata["failure_code"] == ("target_surface_generation_receipt_invalid")
     assert "exactly one current reviewed browser tab" in historical_only.content
 
 
