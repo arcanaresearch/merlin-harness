@@ -2140,8 +2140,21 @@ async def test_stale_campaign_navigate_attests_zero_dispatch_before_session_act(
     assert events == ["created", "claimed", "paused", "released"]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "action_kind", "extra_arguments"),
+    (
+        ("browser_snapshot", "snapshot", {}),
+        ("browser_wait_for_text", "wait_for_text", {"value": "ready"}),
+        ("browser_network_events", "network_events", {}),
+    ),
+    ids=("snapshot", "wait-for-text", "network-events"),
+)
 @pytest.mark.asyncio
-async def test_target_reobservation_snapshot_rebinds_one_open_tab_and_attests_session() -> None:
+async def test_target_reobservation_passive_read_rebinds_one_open_tab_and_attests_session(
+    tool_name: str,
+    action_kind: str,
+    extra_arguments: dict[str, object],
+) -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events)
     observed_tabs: list[str] = []
@@ -2180,15 +2193,26 @@ async def test_target_reobservation_snapshot_rebinds_one_open_tab_and_attests_se
                 tab_ref=tab_ref,
                 kind="snapshot",
                 step=step,
+                text="ready",
             )
 
         async def act(self, action, *, actor_id):
             del actor_id
-            assert action.kind == "snapshot"
-            return await self.snapshot(action.tab_ref, action.frame_ref, step=action.step)
+            assert action.kind == action_kind
+            observed_tabs.append(action.tab_ref)
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id="target",
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref=action.tab_ref,
+                kind="network" if action_kind == "network_events" else "snapshot",
+                step=action.step,
+                text="[]" if action_kind == "network_events" else "ready",
+            )
 
     result = await BrowserTool(
-        "browser_snapshot",
+        tool_name,
         lambda _: Session(),
         state_scope_store=scope_store,
     ).invoke(
@@ -2204,7 +2228,7 @@ async def test_target_reobservation_snapshot_rebinds_one_open_tab_and_attests_se
             target_reobservation_generation_id="sha256:" + "a" * 64,
             target_reobservation_event_set_digest="sha256:" + "b" * 64,
         ),
-        {"tab_ref": "tab:stale", "step": 1},
+        {"tab_ref": "tab:stale", "step": 1, **extra_arguments},
     )
 
     assert result.is_error is False
@@ -2215,10 +2239,21 @@ async def test_target_reobservation_snapshot_rebinds_one_open_tab_and_attests_se
     assert observed_tabs == ["tab:current", "tab:current"]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "extra_arguments"),
+    (
+        ("browser_snapshot", {}),
+        ("browser_wait_for_text", {"value": "ready"}),
+        ("browser_network_events", {}),
+    ),
+    ids=("snapshot", "wait-for-text", "network-events"),
+)
 @pytest.mark.parametrize("open_tabs", [(), ("tab:one", "tab:two")], ids=("zero", "multiple"))
 @pytest.mark.asyncio
-async def test_target_reobservation_snapshot_does_not_guess_without_one_open_tab(
+async def test_target_reobservation_passive_read_does_not_guess_without_one_open_tab(
     open_tabs: tuple[str, ...],
+    tool_name: str,
+    extra_arguments: dict[str, object],
 ) -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events)
@@ -2252,7 +2287,7 @@ async def test_target_reobservation_snapshot_does_not_guess_without_one_open_tab
             raise BrowserBoundaryError("stale campaign tab")
 
     result = await BrowserTool(
-        "browser_snapshot",
+        tool_name,
         lambda _: Session(),
         state_scope_store=scope_store,
     ).invoke(
@@ -2268,7 +2303,7 @@ async def test_target_reobservation_snapshot_does_not_guess_without_one_open_tab
             target_reobservation_generation_id="sha256:" + "a" * 64,
             target_reobservation_event_set_digest="sha256:" + "b" * 64,
         ),
-        {"tab_ref": "tab:stale", "step": 1},
+        {"tab_ref": "tab:stale", "step": 1, **extra_arguments},
     )
 
     assert result.is_error is True
@@ -2278,8 +2313,20 @@ async def test_target_reobservation_snapshot_does_not_guess_without_one_open_tab
     assert observed_tabs == ["tab:stale"]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "extra_arguments"),
+    (
+        ("browser_snapshot", {}),
+        ("browser_wait_for_text", {"value": "ready"}),
+        ("browser_network_events", {}),
+    ),
+    ids=("snapshot", "wait-for-text", "network-events"),
+)
 @pytest.mark.asyncio
-async def test_ordinary_campaign_snapshot_does_not_rebind_one_open_tab() -> None:
+async def test_ordinary_campaign_passive_read_does_not_rebind_one_open_tab(
+    tool_name: str,
+    extra_arguments: dict[str, object],
+) -> None:
     events: list[str] = []
     scope_store = _StateScopeFixtureStore(events)
     observed_tabs: list[str] = []
@@ -2311,7 +2358,7 @@ async def test_ordinary_campaign_snapshot_does_not_rebind_one_open_tab() -> None
             raise BrowserBoundaryError("stale campaign tab")
 
     result = await BrowserTool(
-        "browser_snapshot",
+        tool_name,
         lambda _: Session(),
         state_scope_store=scope_store,
     ).invoke(
@@ -2325,7 +2372,7 @@ async def test_ordinary_campaign_snapshot_does_not_rebind_one_open_tab() -> None
             target_id="target",
             expected_target_session_id="browser:ordinary-context",
         ),
-        {"tab_ref": "tab:stale", "step": 1},
+        {"tab_ref": "tab:stale", "step": 1, **extra_arguments},
     )
 
     assert result.is_error is True
