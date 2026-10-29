@@ -4066,9 +4066,18 @@ async def test_target_admission_hold_survives_terminal_settlement_projection() -
     ]
 
 
-@pytest.mark.parametrize("target_effect_attempted", (False, True))
+@pytest.mark.parametrize(
+    ("target_effect_attempted", "failure_code", "expected_failure_kind"),
+    (
+        (False, "target_tab_unavailable", RetryFailureKind.TRANSPORT_TRANSIENT.value),
+        (False, "state_scope_before_unavailable", RetryFailureKind.TRANSPORT_TRANSIENT.value),
+        (True, None, RetryFailureKind.UNKNOWN.value),
+    ),
+)
 async def test_terminal_surface_drift_commits_transition_without_replacement(
     target_effect_attempted: bool,
+    failure_code: str | None,
+    expected_failure_kind: str,
 ) -> None:
     transition = {
         "schema": "merlin.target-ui-transition.v1",
@@ -4237,9 +4246,11 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
                 metadata={
                     **(
                         {
-                            "failure_code": "target_delivery_rejected",
-                            "target_delivery_rejected": True,
+                            "failure_code": failure_code,
                             "retryable": True,
+                            "target_effect_dispatch_status": "rejected_before_dispatch",
+                            "effect_applied": False,
+                            "interaction_count": 0,
                         }
                         if not target_effect_attempted
                         else {}
@@ -4333,6 +4344,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
     assert live.scheduler.status(node_id).value == "failed"
     assert len(attempts) == 1
     assert attempts[0].state == "failed"
+    assert attempts[0].failure_kind == expected_failure_kind
     assert store.retry_failed_calls == 0
     assert store.transition_checkpoint_failures == 1
     assert provider.calls == 1
@@ -4343,7 +4355,7 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
     checkpoint = payload["worker_checkpoint"]
     (receipt,) = checkpoint["target_evidence"]
     assert row["schema_id"] == "schema/partial-result"
-    assert payload["retry_failure_kind"] == RetryFailureKind.UNKNOWN.value
+    assert payload["retry_failure_kind"] == expected_failure_kind
     assert payload["target_id"] == "target-surface"
     assert payload["target_session_id"] == "browser:context-1"
     assert payload["infrastructure_failure_category"] is None

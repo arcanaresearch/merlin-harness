@@ -11843,8 +11843,13 @@ async def test_bound_adapter_error_missing_identity_is_not_a_target_change(obser
         assert "different reviewed target identity" in (result.error or "")
 
 
+@pytest.mark.parametrize(
+    "failure_code", ["target_tab_unavailable", "state_scope_before_unavailable"]
+)
 @pytest.mark.parametrize("dynamic", [False, True])
-async def test_pre_effect_surface_drift_stops_after_one_target_call(dynamic: bool) -> None:
+async def test_pre_effect_surface_drift_stops_after_one_target_call(
+    dynamic: bool, failure_code: str
+) -> None:
     transition = {
         "schema": "merlin.target-ui-transition.v1",
         "material": True,
@@ -11885,10 +11890,12 @@ async def test_pre_effect_surface_drift_stops_after_one_target_call(dynamic: boo
                 content="reviewed browser controls changed before delivery",
                 is_error=True,
                 metadata={
-                    "failure_code": "target_delivery_rejected",
-                    "target_delivery_rejected": True,
+                    "failure_code": failure_code,
                     "retryable": True,
+                    "target_effect_dispatch_status": "rejected_before_dispatch",
+                    "effect_applied": False,
                     "target_effect_attempted": False,
+                    "interaction_count": 0,
                     "target_call_budget_charge": 0,
                     "limit_interaction_count": 0,
                     "target_session_id": "browser:context-1",
@@ -11935,7 +11942,7 @@ async def test_pre_effect_surface_drift_stops_after_one_target_call(dynamic: boo
     assert result.status == "failed"
     assert result.error_code == "target_surface_disrupted"
     assert result.retry_class == "terminal"
-    assert result.retry_failure_kind is None
+    assert result.retry_failure_kind is RetryFailureKind.TRANSPORT_TRANSIENT
     assert result.infrastructure_failure_category is None
     assert result.target_session_id == "browser:context-1"
     assert tools.calls == ["browser_chat_exchange"]
@@ -12035,6 +12042,136 @@ async def test_pre_effect_surface_drift_stops_after_one_target_call(dynamic: boo
     # authority. Positive Lead projection is covered by broker-backed durable
     # integration tests.
     assert committed["target_ui_transition_receipts"] == {}
+
+
+def _reobservation_handoff(*, tools: tuple[str, ...]) -> WorkerHandoff:
+    base = reviewed_handoff(interface="browser", tools=tools)
+    return replace(
+        base,
+        assignment=replace(
+            base.assignment,
+            strategy_id="target-reobservation/v1",
+            strategy_contract=(
+                ("schema", "merlin.target-reobservation.v1"),
+                ("generation_id", "sha256:" + "1" * 64),
+                ("event_set_digest", "sha256:" + "2" * 64),
+            ),
+            max_target_exchanges=None,
+        ),
+    )
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_reobservation_bounds_identical_immutable_pre_dispatch_rejections(
+    dynamic: bool,
+) -> None:
+    calls = [
+        ToolCall(call_id=f"snapshot-{index}", name="browser_snapshot", arguments={})
+        for index in range(4)
+    ]
+
+    class ImmutableRejectionTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Observe browser",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(
+                content="browser state could not be observed before the target action",
+                is_error=True,
+                metadata={
+                    "failure_code": "state_scope_before_unavailable",
+                    "retryable": True,
+                    "target_effect_dispatch_status": "rejected_before_dispatch",
+                    "effect_applied": False,
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                    "target_call_budget_charge": 0,
+                    "target_session_id": "browser:immutable",
+                },
+            )
+
+    class DynamicProvider(Provider):
+        async def stream_with_tools(self, request, handler):
+            self.requests.append(request)
+            for call in calls:
+                await handler(call)
+            raise AssertionError("immutable rejection bound must terminate the dynamic stream")
+            yield ModelCompleted()
+
+    provider = (DynamicProvider if dynamic else Provider)(
+        [[call, ModelCompleted()] for call in calls]
+    )
+    tools = ImmutableRejectionTools()
+    result = await WorkerRuntime(provider, tools, max_model_turns=20).run(
+        _reobservation_handoff(tools=("browser_snapshot",))
+    )
+
+    assert result.status == "failed"
+    assert "immutable pre-dispatch rejection repeated" in (result.error or "")
+    assert tools.calls == ["browser_snapshot"] * 3
+
+
+async def test_reobservation_immutable_rejection_bound_resets_on_changed_receipt() -> None:
+    class ChangedRejectionTools(Tools):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_snapshot",
+                    description="Observe browser",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            self.index += 1
+            return ToolResult(
+                content="browser state could not be observed before the target action",
+                is_error=True,
+                metadata={
+                    "failure_code": "state_scope_before_unavailable",
+                    "retryable": True,
+                    "target_effect_dispatch_status": "rejected_before_dispatch",
+                    "effect_applied": False,
+                    "target_effect_attempted": False,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                    "target_call_budget_charge": 0,
+                    "target_session_id": (
+                        "browser:recovered" if self.index == 3 else "browser:immutable"
+                    ),
+                },
+            )
+
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id=f"snapshot-{index}", name="browser_snapshot", arguments={}),
+                ModelCompleted(),
+            ]
+            for index in range(3)
+        ]
+        + [[TextDelta(text='{"finding":"changed observation inspected"}'), ModelCompleted()]]
+    )
+    tools = ChangedRejectionTools()
+    result = await WorkerRuntime(provider, tools, max_model_turns=20).run(
+        _reobservation_handoff(tools=("browser_snapshot",))
+    )
+
+    assert result.status == "completed"
+    assert tools.calls == ["browser_snapshot"] * 3
 
 
 async def test_restored_surface_transition_from_unrelated_attempt_fails_closed() -> None:

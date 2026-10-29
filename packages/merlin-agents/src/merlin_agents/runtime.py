@@ -582,6 +582,7 @@ def _target_surface_disrupted_result(
     *,
     target_session_id: str | None,
     checkpoint: Mapping[str, object] | None = None,
+    retry_failure_kind: RetryFailureKind | None = None,
 ) -> WorkerResult:
     return WorkerResult(
         task_id=handoff.assignment.id,
@@ -592,6 +593,7 @@ def _target_surface_disrupted_result(
         retry_class="terminal",
         checkpoint=checkpoint,
         target_session_id=target_session_id,
+        retry_failure_kind=retry_failure_kind,
     )
 
 
@@ -602,6 +604,7 @@ def _target_surface_transition_result(
     is_error: bool,
     target_session_id: str | None,
     checkpoint: Mapping[str, object] | None = None,
+    retry_failure_kind: RetryFailureKind | None = None,
 ) -> WorkerResult:
     if is_error:
         return _target_surface_disrupted_result(
@@ -609,6 +612,7 @@ def _target_surface_transition_result(
             content,
             target_session_id=target_session_id,
             checkpoint=checkpoint,
+            retry_failure_kind=retry_failure_kind,
         )
     return WorkerResult(
         task_id=handoff.assignment.id,
@@ -642,6 +646,14 @@ def _target_surface_transition_decision(
             infrastructure_failure_category="adapter_state_integrity",
         )
     strict_pre_effect = _strict_target_surface_transition(result)
+    retry_failure_kind = (
+        RetryFailureKind.TRANSPORT_TRANSIENT
+        if strict_pre_effect is not None
+        and result.metadata.get("retryable") is True
+        and result.metadata.get("failure_code")
+        in {"target_tab_unavailable", "state_scope_before_unavailable"}
+        else None
+    )
     result_session_id = result.metadata.get("target_session_id")
     disposition_valid = bool(
         isinstance(target_session_id, str)
@@ -680,6 +692,42 @@ def _target_surface_transition_decision(
         result.content,
         is_error=result.is_error,
         target_session_id=target_session_id,
+        retry_failure_kind=retry_failure_kind,
+    )
+
+
+def _immutable_pre_dispatch_rejection_fingerprint(result: ToolResult) -> str | None:
+    metadata = result.metadata
+    failure_code = metadata.get("failure_code")
+    strict_transition = _strict_target_surface_transition(result)
+    broker_attested = bool(
+        metadata.get("target_effect_dispatch_status") == "rejected_before_dispatch"
+        and metadata.get("effect_applied") is False
+        and metadata.get("target_effect_attempted") is False
+        and type(metadata.get("interaction_count")) is int
+        and metadata.get("interaction_count") == 0
+        and type(metadata.get("limit_interaction_count")) is int
+        and metadata.get("limit_interaction_count") == 0
+        and type(metadata.get("target_call_budget_charge")) is int
+        and metadata.get("target_call_budget_charge") == 0
+    )
+    if not (
+        result.is_error
+        and failure_code in {"target_tab_unavailable", "state_scope_before_unavailable"}
+        and metadata.get("retryable") is True
+        and (strict_transition is not None or broker_attested)
+    ):
+        return None
+    payload = {
+        "failure_code": failure_code,
+        "target_session_id": metadata.get("target_session_id"),
+        "target_ui_transition": strict_transition,
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
     )
 
 
@@ -6044,6 +6092,9 @@ class WorkerRuntime:
                     "call_semantic": call_semantic,
                     "result_semantic": self._semantic_text_signature(result.content),
                 }
+                immutable_rejection = _immutable_pre_dispatch_rejection_fingerprint(result)
+                if immutable_rejection is not None:
+                    history_entry["immutable_pre_dispatch_rejection"] = immutable_rejection
                 if (
                     is_target_exchange_call
                     or _target_interaction_count(result)
@@ -6084,6 +6135,19 @@ class WorkerRuntime:
                     )
                 action_history.append(history_entry)
                 action_count += 1
+                if (
+                    handoff.assignment.strategy_id == "target-reobservation/v1"
+                    and self._has_repeated_immutable_pre_dispatch_rejection(action_history)
+                ):
+                    raise _DynamicToolTerminated(
+                        self._failed(
+                            handoff,
+                            "stuck loop detected: identical immutable pre-dispatch rejection "
+                            "repeated after one authorized retry",
+                            content_so_far,
+                            retry_class="terminal",
+                        )
+                    )
                 target_decision: WorkerResult | None = (
                     session_isolation_failure or generic_session_failure
                 )
@@ -7303,6 +7367,9 @@ class WorkerRuntime:
                         "call_semantic": call_semantic,
                         "result_semantic": self._semantic_text_signature(result.content),
                     }
+                    immutable_rejection = _immutable_pre_dispatch_rejection_fingerprint(result)
+                    if immutable_rejection is not None:
+                        history_entry["immutable_pre_dispatch_rejection"] = immutable_rejection
                     if (
                         is_target_exchange_call
                         or _target_interaction_count(result)
@@ -7349,6 +7416,17 @@ class WorkerRuntime:
                         )
                     action_history.append(history_entry)
                     action_count += 1
+                    if (
+                        handoff.assignment.strategy_id == "target-reobservation/v1"
+                        and self._has_repeated_immutable_pre_dispatch_rejection(action_history)
+                    ):
+                        return self._failed(
+                            handoff,
+                            "stuck loop detected: identical immutable pre-dispatch rejection "
+                            "repeated after one authorized retry",
+                            content,
+                            retry_class="terminal",
+                        )
                     target_decision: WorkerResult | None = (
                         session_isolation_failure or generic_session_failure
                     )
@@ -10389,6 +10467,7 @@ class WorkerRuntime:
                 "target_scope",
                 "target_adapter_failure",
                 "target_excerpt",
+                "immutable_pre_dispatch_rejection",
                 "repeat_reason",
                 "repeat_reason_state",
                 "repeat_prior_context",
@@ -10860,6 +10939,21 @@ class WorkerRuntime:
             and WorkerRuntime._semantic_signatures_match(
                 previous.get("result_semantic"), latest.get("result_semantic")
             )
+        )
+
+    @staticmethod
+    def _has_repeated_immutable_pre_dispatch_rejection(
+        history: Sequence[Mapping[str, str]],
+    ) -> bool:
+        if len(history) < 3:
+            return False
+        recent = history[-3:]
+        rejection = recent[0].get("immutable_pre_dispatch_rejection")
+        return bool(
+            rejection
+            and all(item.get("immutable_pre_dispatch_rejection") == rejection for item in recent)
+            and len({item.get("call") for item in recent}) == 1
+            and len({item.get("result") for item in recent}) == 1
         )
 
     @staticmethod
