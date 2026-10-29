@@ -39,6 +39,8 @@ from merlin_browser.core import BrowserSession, _sanitized_visual_source_url
 from merlin_browser.tools import (
     ApiReconHandoffTool,
     BrowserTool,
+    _effective_browser_step_id,
+    _leading_browser_setup_count,
     _reviewed_cleanup_action,
     _reviewed_latest_setup_action,
     _reviewed_recon_observations,
@@ -48,6 +50,7 @@ from merlin_contracts import (
     ToolContext,
     executable_adapter_digest,
 )
+from merlin_contracts.target_adapter_compiler import compile_target_adapter
 from merlin_storage_postgres import (
     CampaignApiSessionRepository,
     CampaignStore,
@@ -9219,6 +9222,7 @@ _PROBE_MESSAGE = "Please restate the applicable refund policy."
 def _dom_fallback_session(
     exchange: dict[str, object],
     *,
+    origin: str = "https://target.test",
     input_name: str = "Message",
     submit_name: str = "Send",
     duplicate_input: bool = False,
@@ -9228,7 +9232,7 @@ def _dom_fallback_session(
         context_id = "browser-context"
         bounds = SimpleNamespace(
             target_id="target",
-            allowed_origins={"https://target.test"},
+            allowed_origins={origin},
         )
         owner = owner()
 
@@ -9271,7 +9275,7 @@ def _dom_fallback_session(
             return BrowserObservation(
                 context_id=self.context_id,
                 target_id=self.bounds.target_id,
-                origin="https://target.test",
+                origin=origin,
                 owner=self.owner,
                 tab_ref="tab-1",
                 kind="snapshot",
@@ -9313,6 +9317,552 @@ class _NativeReceiptRecorder:
             "input_pointer": input_pointer,
             "evidence_ref": "native-request:sha256:" + "f" * 64,
         }
+
+
+class _HistoricalReceiptRecorder(_NativeReceiptRecorder):
+    def __init__(
+        self,
+        actions: tuple[BrowserAction, ...],
+        observations: tuple[BrowserObservation, ...],
+    ) -> None:
+        super().__init__()
+        self.actions = actions
+        self.observations.extend(observations)
+        self.history_action_reads = 0
+        self.history_observation_reads = 0
+
+    async def list_actions(self, _context_id):
+        self.history_action_reads += 1
+        return self.actions
+
+    async def list_observations(self, _context_id):
+        self.history_observation_reads += 1
+        return tuple(self.observations)
+
+
+def _sequential_browser_adapter() -> dict[str, object]:
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "canonical-browser-step-1",
+            "tool": "browser_click",
+            "arguments": {"locator": {"role": "button", "name": "Chat"}},
+            "interaction": False,
+        },
+        {
+            "step_id": "enter-message",
+            "tool": "browser_fill",
+            "arguments": {
+                "locator": {"role": "textbox", "name": "Textbox 1"},
+                "value": "{{input}}",
+            },
+            "interaction": True,
+        },
+        {
+            "step_id": "submit-message",
+            "tool": "browser_press",
+            "arguments": {
+                "locator": {"role": "textbox", "name": "Textbox 1"},
+                "key": "Enter",
+            },
+            "interaction": True,
+        },
+    ]
+    contract = adapter["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["input_locator"] = {"role": "textbox", "name": "Textbox 1"}
+    contract["submit_action"] = {"role": "button", "name": "Button 8"}
+    return adapter
+
+
+def test_leading_setup_excludes_raw_capability_step_when_compiled_id_is_absent() -> None:
+    adapter = _sequential_browser_adapter()
+    browser_steps = adapter["browser_steps"]
+    assert isinstance(browser_steps, list)
+    assert isinstance(browser_steps[1], dict)
+    browser_steps[1]["interaction"] = False
+    browser_steps[1]["arguments"]["value"] = "PREP"
+    compilation = compile_target_adapter(adapter)
+    steps = compilation.executable.steps
+    assert steps[1].step_id is None
+    effective_ids = tuple(
+        _effective_browser_step_id(step, index, browser_steps) for index, step in enumerate(steps)
+    )
+
+    assert (
+        _leading_browser_setup_count(
+            steps,
+            effective_ids,
+            frozenset({"enter-message"}),
+        )
+        == 1
+    )
+
+
+def _historical_opener_proof(
+    *,
+    success: bool = True,
+    duplicate: bool = False,
+    context_id: str = "browser-context",
+    action_owner: BrowserOwner | None = None,
+    tab_ref: str = "tab-1",
+    origin: str = "https://target.test",
+) -> tuple[tuple[BrowserAction, ...], tuple[BrowserObservation, ...]]:
+    reviewed_owner = action_owner or owner()
+    action_at = datetime(2026, 10, 28, 11, 59, 50, tzinfo=UTC)
+    element_ref = f"{tab_ref}:chat"
+    action = BrowserAction(
+        context_id=context_id,
+        target_id="target",
+        owner=reviewed_owner,
+        kind="click",
+        tab_ref=tab_ref,
+        element_ref=element_ref,
+        step=2,
+        created_at=action_at,
+    )
+    elements = [
+        ElementRef(
+            role="button",
+            name="Chat",
+            ref=element_ref,
+            tab_ref=tab_ref,
+            frame_ref="main",
+        )
+    ]
+    if duplicate:
+        elements.append(
+            ElementRef(
+                role="button",
+                name="Chat",
+                ref=f"{tab_ref}:chat-duplicate",
+                tab_ref=tab_ref,
+                frame_ref="main",
+            )
+        )
+    before = BrowserObservation(
+        context_id=context_id,
+        target_id="target",
+        origin=origin,
+        owner=reviewed_owner,
+        tab_ref=tab_ref,
+        kind="snapshot",
+        step=1,
+        observed_at=action_at - timedelta(seconds=1),
+        elements=tuple(elements),
+    )
+    observations = [
+        before,
+        BrowserObservation(
+            context_id=context_id,
+            target_id="target",
+            origin=origin,
+            owner=reviewed_owner,
+            tab_ref=tab_ref,
+            kind="snapshot",
+            step=1,
+            observed_at=action_at - timedelta(milliseconds=100),
+            elements=(),
+        ),
+    ]
+    if success:
+        observations.append(
+            BrowserObservation(
+                context_id=context_id,
+                target_id="target",
+                origin=origin,
+                owner=reviewed_owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                step=action.step,
+                observed_at=action_at + timedelta(milliseconds=1),
+                evidence_refs=(BrowserSession._evidence(action),),  # noqa: SLF001
+            )
+        )
+    return (action,), tuple(observations)
+
+
+def _dom_fallback_arguments(adapter: dict[str, object]) -> dict[str, object]:
+    return {
+        "method": "browser",
+        "url": "https://target.test/chat",
+        "request_evidence_ref": "req",
+        "response_evidence_ref": "res",
+        "dom_fallback_reason": "no equivalent API interaction was observed",
+        "reusable_adapter": adapter,
+    }
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_accepts_successful_historical_opener_absent_from_current_dom() -> None:
+    actions, observations = _historical_opener_proof()
+    recorder = _HistoricalReceiptRecorder(actions, observations)
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(_sequential_browser_adapter()),
+    )
+
+    assert result.is_error is False, result.content
+    assert recorder.handoff is not None
+    persisted = json.loads(recorder.handoff.reusable_adapter)
+    assert [step["arguments"]["locator"] for step in persisted["browser_steps"]] == [
+        'button[name="Chat"]',
+        'textbox[name="Textbox 1"]',
+        'textbox[name="Textbox 1"]',
+    ]
+    action_ref = BrowserSession._evidence(actions[0])  # noqa: SLF001
+    assert action_ref in persisted["observed_evidence"]
+    persisted_setup_step_id = persisted["browser_steps"][0]["step_id"]
+    assert persisted["reviewed_setup_action_refs"] == {persisted_setup_step_id: [action_ref]}
+    assert recorder.history_action_reads == 1
+    assert recorder.history_observation_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_historical_dom_handoff_executes_staged_runtime_flow() -> None:
+    landing = b"""
+    <button aria-label="Chat" onclick="
+      this.hidden=true;
+      document.getElementById('composer').hidden=false;
+    ">Chat</button>
+    <div id="composer" hidden>
+      <textarea aria-label="Textbox 1" onkeydown="
+        if(event.key === 'Enter') {
+          event.preventDefault();
+          document.getElementById('reply').textContent='assistant:'+this.value;
+        }
+      "></textarea>
+    </div>
+    <div id="reply"></div>
+    """
+
+    class RuntimeRecorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        actions, observations = _historical_opener_proof(origin=origin)
+        handoff_recorder = _HistoricalReceiptRecorder(actions, observations)
+        handoff_session = _dom_fallback_session(
+            {},
+            origin=origin,
+            input_name="Textbox 1",
+            submit_name="Button 8",
+        )()
+        adapter = _sequential_browser_adapter()
+        adapter["endpoint"] = origin
+        handoff_result = await ApiReconHandoffTool(
+            lambda _: handoff_session,
+            handoff_recorder,
+        ).invoke(
+            ToolContext(session_id="s1", workspace_root="/tmp"),
+            {
+                "method": "browser",
+                "url": origin,
+                "request_evidence_ref": "req",
+                "response_evidence_ref": "res",
+                "dom_fallback_reason": "no equivalent API interaction was observed",
+                "reusable_adapter": adapter,
+            },
+        )
+
+        assert handoff_result.is_error is False, handoff_result.content
+        assert handoff_recorder.handoff is not None
+        persisted = json.loads(handoff_recorder.handoff.reusable_adapter)
+        persisted["compiled_adapter"] = handoff_recorder.handoff.compiled_adapter
+        persisted["compiled_adapter_digest"] = handoff_recorder.handoff.compiled_adapter_digest
+
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as runtime_session:
+            await runtime_session.new_tab(origin)
+            runtime_recorder = RuntimeRecorder()
+
+            async def allow(*_):
+                return True
+
+            runtime_result = await ToolBroker(
+                browser_tools(
+                    lambda _: runtime_session,
+                    runtime_recorder,
+                    lambda _: persisted,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+        assert runtime_result.is_error is False, runtime_result.content
+        assert [action.kind for action in runtime_recorder.actions] == [
+            "click",
+            "fill",
+            "press",
+        ]
+        assert runtime_result.metadata["setup_activation_completed"] is True
+        assert runtime_result.metadata["limit_interaction_count"] == 1
+        assert "assistant:hello" in runtime_result.content
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_rejects_historical_opener_without_successful_action() -> None:
+    actions, observations = _historical_opener_proof(success=False)
+    recorder = _HistoricalReceiptRecorder(actions, observations)
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(_sequential_browser_adapter()),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[0].arguments.locator"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool", "reviewed_value", "observed_value"),
+    (
+        ("browser_fill", "OPEN", "CLOSED"),
+        ("browser_press", "Enter", "Escape"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_dom_fallback_rejects_historical_setup_with_different_exact_value(
+    tool: str,
+    reviewed_value: str,
+    observed_value: str,
+) -> None:
+    reviewed_owner = owner()
+    action_at = datetime(2026, 10, 28, 11, 59, 50, tzinfo=UTC)
+    action = BrowserAction(
+        context_id="browser-context",
+        target_id="target",
+        owner=reviewed_owner,
+        kind="fill" if tool == "browser_fill" else "press",
+        tab_ref="tab-1",
+        element_ref="tab-1:launch-code",
+        value=observed_value,
+        step=2,
+        created_at=action_at,
+    )
+    source = BrowserObservation(
+        context_id="browser-context",
+        target_id="target",
+        origin="https://target.test",
+        owner=reviewed_owner,
+        tab_ref="tab-1",
+        kind="snapshot",
+        step=1,
+        observed_at=action_at - timedelta(milliseconds=1),
+        elements=(
+            ElementRef(
+                role="textbox",
+                name="Launch code",
+                ref="tab-1:launch-code",
+                tab_ref="tab-1",
+                frame_ref="main",
+            ),
+        ),
+    )
+    result_observation = BrowserObservation(
+        context_id="browser-context",
+        target_id="target",
+        origin="https://target.test",
+        owner=reviewed_owner,
+        tab_ref="tab-1",
+        kind="snapshot",
+        step=2,
+        observed_at=action_at + timedelta(milliseconds=1),
+        evidence_refs=(BrowserSession._evidence(action),),  # noqa: SLF001
+    )
+    adapter = _sequential_browser_adapter()
+    browser_steps = adapter["browser_steps"]
+    assert isinstance(browser_steps, list)
+    setup_arguments = {"locator": "textbox Launch code"}
+    setup_arguments["value" if tool == "browser_fill" else "key"] = reviewed_value
+    adapter["browser_steps"] = [
+        {
+            "step_id": "prepare-launch-code",
+            "tool": tool,
+            "arguments": setup_arguments,
+            "interaction": False,
+        },
+        *browser_steps[1:],
+    ]
+    recorder = _HistoricalReceiptRecorder((action,), (source, result_observation))
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(adapter),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[0].arguments.locator"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_rejects_ambiguous_historical_opener() -> None:
+    actions, observations = _historical_opener_proof(duplicate=True)
+    recorder = _HistoricalReceiptRecorder(actions, observations)
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(_sequential_browser_adapter()),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "browser_locator_ambiguous"
+    assert result.metadata["retryable"] is False
+    assert result.metadata["ambiguous_fields"] == [
+        "reusable_adapter.browser_steps[0].arguments.locator"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dom_fallback_rejects_reordered_historical_setup_actions() -> None:
+    reviewed_owner = owner()
+    base_time = datetime(2026, 10, 28, 11, 59, 50, tzinfo=UTC)
+
+    def click_receipt(
+        name: str,
+        *,
+        action_at: datetime,
+        step: int,
+    ) -> tuple[BrowserAction, tuple[BrowserObservation, BrowserObservation]]:
+        element_ref = f"tab-1:{name.casefold()}"
+        action = BrowserAction(
+            context_id="browser-context",
+            target_id="target",
+            owner=reviewed_owner,
+            kind="click",
+            tab_ref="tab-1",
+            element_ref=element_ref,
+            step=step,
+            created_at=action_at,
+        )
+        before = BrowserObservation(
+            context_id="browser-context",
+            target_id="target",
+            origin="https://target.test",
+            owner=reviewed_owner,
+            tab_ref="tab-1",
+            kind="snapshot",
+            step=step - 1,
+            observed_at=action_at - timedelta(milliseconds=1),
+            elements=(
+                ElementRef(
+                    role="button",
+                    name=name,
+                    ref=element_ref,
+                    tab_ref="tab-1",
+                    frame_ref="main",
+                ),
+            ),
+        )
+        after = BrowserObservation(
+            context_id="browser-context",
+            target_id="target",
+            origin="https://target.test",
+            owner=reviewed_owner,
+            tab_ref="tab-1",
+            kind="snapshot",
+            step=step,
+            observed_at=action_at + timedelta(milliseconds=1),
+            evidence_refs=(BrowserSession._evidence(action),),  # noqa: SLF001
+        )
+        return action, (before, after)
+
+    chat_action, chat_observations = click_receipt(
+        "Chat",
+        action_at=base_time,
+        step=2,
+    )
+    menu_action, menu_observations = click_receipt(
+        "Menu",
+        action_at=base_time + timedelta(seconds=1),
+        step=4,
+    )
+    adapter = _sequential_browser_adapter()
+    browser_steps = adapter["browser_steps"]
+    assert isinstance(browser_steps, list)
+    browser_steps.insert(
+        0,
+        {
+            "step_id": "open-menu",
+            "tool": "browser_click",
+            "arguments": {"locator": {"role": "button", "name": "Menu"}},
+            "interaction": False,
+        },
+    )
+    recorder = _HistoricalReceiptRecorder(
+        (chat_action, menu_action),
+        (*chat_observations, *menu_observations),
+    )
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(adapter),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[1].arguments.locator"
+    ]
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        _historical_opener_proof(context_id="other-context"),
+        _historical_opener_proof(
+            action_owner=BrowserOwner(
+                session_id="other-session", worker_id="a1", technique_id="recon"
+            )
+        ),
+        _historical_opener_proof(tab_ref="tab-other"),
+        _historical_opener_proof(origin="https://other.test"),
+    ],
+    ids=("wrong-context", "wrong-owner", "wrong-tab", "same-tab-wrong-origin"),
+)
+@pytest.mark.asyncio
+async def test_dom_fallback_rejects_historical_opener_from_other_authority(
+    history: tuple[tuple[BrowserAction, ...], tuple[BrowserObservation, ...]],
+) -> None:
+    recorder = _HistoricalReceiptRecorder(*history)
+    session = _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(_sequential_browser_adapter()),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["invalid_fields"] == [
+        "reusable_adapter.browser_steps[0].arguments.locator"
+    ]
 
 
 @pytest.mark.asyncio
@@ -11875,6 +12425,702 @@ async def test_compiled_chat_exchange_classifies_zero_compatible_tabs_for_reobse
             assert result.metadata["reobserve_required"] is True
             assert [item.tab_ref for item in recorder.observations] == [tab]
             assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_skips_visible_launcher_when_composer_is_ready() -> None:
+    chat = b"""
+    <button aria-label="Chat" onclick="
+      document.getElementById('launcher-clicked').textContent='clicked';
+    ">Chat</button>
+    <textarea aria-label="Textbox 1" onkeydown="
+      if(event.key === 'Enter') {
+        event.preventDefault();
+        document.getElementById('reply').textContent='assistant:'+this.value;
+      }
+    "></textarea>
+    <div id="reply" aria-live="polite"></div>
+    <div id="launcher-clicked"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == ["fill", "press"]
+            assert result.metadata["setup_already_satisfied"] is True
+            assert result.metadata["setup_steps_omitted"] == 1
+            assert len(result.metadata["target_exchanges"]) == 1
+            assert "assistant:hello" in result.content
+
+
+@pytest.mark.parametrize("legacy_shape", ("missing-step-id", "raw-misalignment"))
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_reobserves_without_dispatch_when_setup_is_not_stageable(
+    legacy_shape: str,
+) -> None:
+    chat = b"""
+    <button aria-label="Chat">Chat</button>
+    <textarea aria-label="Textbox 1" onkeydown="
+      if(event.key === 'Enter') {
+        event.preventDefault();
+        document.getElementById('reply').textContent='assistant:'+this.value;
+      }
+    "></textarea>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            browser_steps = adapter["browser_steps"]
+            assert isinstance(browser_steps, list)
+            assert isinstance(browser_steps[0], dict)
+            if legacy_shape == "missing-step-id":
+                browser_steps[0].pop("step_id")
+            else:
+                browser_steps.insert(
+                    0,
+                    {
+                        "step_id": "unsupported-legacy-step",
+                        "tool": "browser_snapshot",
+                        "arguments": {},
+                        "interaction": False,
+                    },
+                )
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "reviewed_setup_contract_unavailable"
+            assert result.metadata["reobserve_required"] is True
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["limit_interaction_count"] == 0
+            assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_activates_landing_then_delivers_in_one_call() -> None:
+    landing = b"""
+    <button aria-label="Chat" onclick="
+      this.hidden=true;
+      document.getElementById('composer').hidden=false;
+    ">Chat</button>
+    <div id="composer" hidden>
+      <textarea aria-label="Textbox 1" onkeydown="
+        if(event.key === 'Enter') {
+          event.preventDefault();
+          document.getElementById('reply').textContent='assistant:'+this.value;
+        }
+      "></textarea>
+    </div>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self, state_scope_store: _StateScopeFixtureStore) -> None:
+            self.actions = []
+            self.observations = []
+            self.state_scope_store = state_scope_store
+            self.events_at_action: list[tuple[str, ...]] = []
+
+        async def append_action(self, value):
+            self.events_at_action.append(tuple(self.state_scope_store.events))
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            browser_steps = adapter["browser_steps"]
+            assert isinstance(browser_steps, list)
+            browser_steps[1]["interaction"] = False
+            browser_steps[1]["arguments"].pop("value")
+            adapter["state_capabilities"] = {
+                "observations": [
+                    {
+                        "name": "messages_remaining",
+                        "role": "budget_remaining",
+                        "baseline_selector": {
+                            "step_id": "enter-message",
+                            "evaluation_root": "response_body",
+                            "pointer": "/remaining",
+                        },
+                        "result_selector": {
+                            "step_id": "submit-message",
+                            "evaluation_root": "response_body",
+                            "pointer": "/remaining",
+                        },
+                        "value_type": "integer",
+                    }
+                ],
+                "resource_ownership": [
+                    {
+                        "name": "shared_message_quota",
+                        "resource_kind": "quota",
+                        "resource_observation_name": "messages_remaining",
+                        "principal_selector": {
+                            "step_id": "enter-message",
+                            "evaluation_root": "response_body",
+                            "pointer": "/principal",
+                        },
+                    }
+                ],
+                "resource_controls": [
+                    {
+                        "ownership_name": "shared_message_quota",
+                        "step_id": "submit-message",
+                        "limit": 1,
+                        "window_key": "fixture-window",
+                        "structured_blocks": [
+                            {
+                                "status_codes": [429],
+                                "retry_after_seconds_pointer": "/retry_after_seconds",
+                                "evidence_refs": ["fixture:quota-contract"],
+                            }
+                        ],
+                    }
+                ],
+            }
+            state_scope_store = _StateScopeFixtureStore()
+            recorder = Recorder(state_scope_store)
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: adapter,
+                    state_scope_store,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == ["click", "fill", "press"]
+            assert [action.value for action in recorder.actions] == [None, "hello", "Enter"]
+            assert result.metadata["setup_activation_completed"] is True
+            assert result.metadata["activation_steps_completed"] == 1
+            assert result.metadata["steps_completed"] == 3
+            assert result.metadata["target_effect_attempted"] is True
+            assert result.metadata["target_call_budget_charge"] == 1
+            assert result.metadata["limit_interaction_count"] == 1
+            assert len(result.metadata["target_exchanges"]) == 1
+            assert "acknowledged" in recorder.events_at_action[0]
+            assert "resource_reserved" not in recorder.events_at_action[0]
+            assert state_scope_store.events == [
+                "created",
+                "claimed",
+                "revised",
+                "acknowledged",
+                "resource_reserved",
+                "resource_acknowledged",
+                "resource_settled",
+                "settled",
+                "released",
+            ]
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_preserves_setup_fill_value_and_press_key() -> None:
+    landing = b"""
+    <div id="launcher">
+      <input aria-label="Launch code" onkeydown="
+        if(event.key === 'Enter' && this.value === 'OPEN') {
+          document.getElementById('launcher').hidden=true;
+          document.getElementById('composer').hidden=false;
+        }
+      ">
+    </div>
+    <div id="composer" hidden>
+      <textarea aria-label="Textbox 1" onkeydown="
+        if(event.key === 'Enter') {
+          event.preventDefault();
+          document.getElementById('reply').textContent='assistant:'+this.value;
+        }
+      "></textarea>
+    </div>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            fill_ref = "browser-action:sha256:" + "b" * 64
+            press_ref = "browser-action:sha256:" + "c" * 64
+            adapter["observed_evidence"] = [
+                *adapter["observed_evidence"],
+                fill_ref,
+                press_ref,
+            ]
+            adapter["reviewed_setup_action_refs"] = {
+                "fill-launch-code": [fill_ref],
+                "submit-launch-code": [press_ref],
+            }
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill-launch-code",
+                    "tool": "browser_fill",
+                    "arguments": {
+                        "locator": "textbox Launch code",
+                        "value": "OPEN",
+                    },
+                    "interaction": False,
+                },
+                {
+                    "step_id": "submit-launch-code",
+                    "tool": "browser_press",
+                    "arguments": {
+                        "locator": "textbox Launch code",
+                        "key": "Enter",
+                    },
+                    "interaction": False,
+                },
+                {
+                    "step_id": "enter-message",
+                    "tool": "browser_fill",
+                    "arguments": {
+                        "locator": "textbox Textbox 1",
+                        "value": "{{input}}",
+                    },
+                    "interaction": True,
+                },
+                {
+                    "step_id": "submit-message",
+                    "tool": "browser_press",
+                    "arguments": {
+                        "locator": "textbox Textbox 1",
+                        "key": "Enter",
+                    },
+                    "interaction": True,
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Textbox 1"
+            contract["submit_action"] = "button Button 8"
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "assistant:attack"
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "attack", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == [
+                "fill",
+                "press",
+                "fill",
+                "press",
+            ]
+            assert [action.value for action in recorder.actions] == [
+                "OPEN",
+                "Enter",
+                "attack",
+                "Enter",
+            ]
+            assert result.metadata["activation_steps_completed"] == 2
+            assert result.metadata["limit_interaction_count"] == 1
+            assert len(result.metadata["target_exchanges"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_blocks_ambiguous_setup_frontier_without_dispatch() -> None:
+    landing = b"""
+    <button aria-label="Chat">Chat</button>
+    <button aria-label="Chat">Chat</button>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "target_tab_unavailable"
+            assert result.metadata["setup_frontier_required"] is False
+            assert result.metadata["setup_frontier_tab_count"] == 0
+            assert result.metadata["setup_ambiguous_tab_count"] == 1
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            transition = result.metadata["target_ui_transition"]
+            assert transition["reason"] == "reviewed_setup_ambiguous"
+            assert transition["adapter_stale"] is True
+            assert recorder.actions == []
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_activation_failure_does_not_charge_attack() -> None:
+    landing = b'<button aria-label="Chat">Chat</button>'
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            recorder = Recorder()
+            state_scope_store = _StateScopeFixtureStore()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: adapter,
+                    state_scope_store,
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "reviewed_setup_activation_incomplete"
+            assert [action.kind for action in recorder.actions] == ["click"]
+            assert result.metadata["activation_effect_attempted"] is True
+            assert result.metadata["activation_steps_completed"] == 1
+            assert result.metadata["target_effect_attempted"] is True
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["limit_interaction_count"] == 0
+            assert "target_exchanges" not in result.metadata
+            assert state_scope_store.events == [
+                "created",
+                "claimed",
+                "revised",
+                "acknowledged",
+                "settled",
+                "released",
+            ]
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_fails_when_intermediate_setup_step_vanishes() -> None:
+    landing = b"""
+    <button aria-label="Chat" onclick="this.hidden=true">Chat</button>
+    <div id="composer" hidden>
+      <textarea aria-label="Textbox 1"></textarea>
+    </div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            browser_steps = adapter["browser_steps"]
+            assert isinstance(browser_steps, list)
+            browser_steps.insert(
+                1,
+                {
+                    "step_id": "continue-to-composer",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Continue"},
+                    "interaction": False,
+                },
+            )
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "reviewed_setup_activation_missing"
+            assert [action.kind for action in recorder.actions] == ["click"]
+            assert result.metadata["activation_steps_completed"] == 1
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert result.metadata["limit_interaction_count"] == 0
+            assert "target_exchanges" not in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_requires_proof_for_skipped_mixed_setup_prefix() -> None:
+    landing = b"""
+    <button aria-label="Continue" onclick="
+      this.hidden=true;
+      document.getElementById('composer').hidden=false;
+    ">Continue</button>
+    <div id="composer" hidden>
+      <textarea aria-label="Textbox 1" onkeydown="
+        if(event.key === 'Enter') {
+          event.preventDefault();
+          document.getElementById('reply').textContent='assistant:'+this.value;
+        }
+      "></textarea>
+    </div>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(landing) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = _sequential_browser_adapter()
+            adapter["endpoint"] = origin
+            browser_steps = adapter["browser_steps"]
+            assert isinstance(browser_steps, list)
+            browser_steps.insert(
+                1,
+                {
+                    "step_id": "continue-to-composer",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Continue"},
+                    "interaction": False,
+                },
+            )
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["setup_unproven_tab_count"] == 1
+            assert result.metadata["target_ui_transition"]["reason"] == (
+                "reviewed_setup_history_unproven"
+            )
+            assert recorder.actions == []
+
+            historical_ref = "browser-action:sha256:" + "a" * 64
+            adapter["reviewed_setup_action_refs"] = {"canonical-browser-step-1": [historical_ref]}
+            adapter["observed_evidence"] = [
+                *adapter["observed_evidence"],
+                historical_ref,
+            ]
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == ["click", "fill", "press"]
+            assert result.metadata["activation_steps_completed"] == 1
+            assert result.metadata["limit_interaction_count"] == 1
 
 
 @pytest.mark.asyncio

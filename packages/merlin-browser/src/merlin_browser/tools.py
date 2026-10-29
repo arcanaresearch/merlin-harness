@@ -388,6 +388,143 @@ class BrowserRecorder(Protocol):
     ) -> tuple[ApiReconHandoff, ...]: ...
 
 
+@dataclass(frozen=True)
+class _HistoricalLocatorProof:
+    canonical_locator: str
+    action_ref: str
+    action_at: datetime
+    action_step: int
+
+
+async def _reviewed_browser_history(
+    session: BrowserSession,
+    recorder: BrowserRecorder,
+) -> tuple[tuple[BrowserAction, ...], tuple[BrowserObservation, ...]]:
+    """Load the exact same-authority browser history once for handoff validation."""
+    list_actions = getattr(recorder, "list_actions", None)
+    list_observations = getattr(recorder, "list_observations", None)
+    if not callable(list_actions) or not callable(list_observations):
+        return (), ()
+    actions_value = list_actions(session.context_id)
+    observations_value = list_observations(session.context_id)
+    actions = await actions_value if isawaitable(actions_value) else actions_value
+    observations = (
+        await observations_value if isawaitable(observations_value) else observations_value
+    )
+    return (
+        tuple(
+            action
+            for action in actions
+            if isinstance(action, BrowserAction)
+            and action.context_id == session.context_id
+            and action.target_id == session.bounds.target_id
+            and action.owner == session.owner
+        ),
+        tuple(
+            observation
+            for observation in observations
+            if isinstance(observation, BrowserObservation)
+            and observation.context_id == session.context_id
+            and observation.target_id == session.bounds.target_id
+            and observation.owner == session.owner
+        ),
+    )
+
+
+def _historically_reviewed_locator(
+    actions: Sequence[BrowserAction],
+    observations: Sequence[BrowserObservation],
+    locator: object,
+    *,
+    default_role: str,
+    tool: str,
+    tab_ref: str,
+    expected_origin: str,
+    expected_value: str | None = None,
+) -> tuple[tuple[_HistoricalLocatorProof, ...], bool]:
+    """Review vanished-step proofs without trusting stale or unattributed snapshots."""
+    expected_kind = {
+        "browser_click": "click",
+        "browser_fill": "fill",
+        "browser_press": "press",
+    }.get(tool)
+    if expected_kind is None:
+        return (), False
+    proofs: dict[str, _HistoricalLocatorProof] = {}
+    ambiguous = False
+    for action in actions:
+        if (
+            action.kind != expected_kind
+            or action.element_ref is None
+            or action.tab_ref != tab_ref
+            or (
+                expected_kind in {"fill", "press"}
+                and (expected_value is None or action.value != expected_value)
+            )
+        ):
+            continue
+        source_snapshots = tuple(
+            observation
+            for observation in observations
+            if observation.kind == "snapshot"
+            and observation.tab_ref == action.tab_ref
+            and observation.origin.casefold().rstrip("/") == expected_origin.casefold().rstrip("/")
+            and observation.observed_at <= action.created_at
+            and any(element.ref == action.element_ref for element in observation.elements)
+        )
+        if not source_snapshots:
+            continue
+        source: BrowserObservation | None = None
+        for observation in source_snapshots:
+            matches = _matching_reviewed_elements(
+                observation,
+                locator,
+                default_role=default_role,
+            )
+            if any(match.ref == action.element_ref for match in matches) and len(matches) > 1:
+                ambiguous = True
+                source = None
+                break
+            if (
+                len(matches) == 1
+                and matches[0].ref == action.element_ref
+                and (action.frame_ref is None or matches[0].frame_ref == action.frame_ref)
+                and (source is None or observation.observed_at > source.observed_at)
+            ):
+                source = observation
+        if source is None:
+            continue
+        action_ref = _browser_action_evidence(action)[0]
+        successful = any(
+            observation.kind != "blocker"
+            and observation.tab_ref == action.tab_ref
+            and observation.origin.casefold().rstrip("/") == expected_origin.casefold().rstrip("/")
+            and observation.step == action.step
+            and observation.observed_at >= action.created_at
+            and action_ref in observation.evidence_refs
+            for observation in observations
+        )
+        if not successful:
+            continue
+        canonical = _canonical_reviewed_locator(source, locator, default_role=default_role)
+        if canonical is not None:
+            proofs[action_ref] = _HistoricalLocatorProof(
+                canonical_locator=canonical,
+                action_ref=action_ref,
+                action_at=action.created_at,
+                action_step=action.step,
+            )
+    return (
+        tuple(
+            sorted(
+                proofs.values(),
+                key=lambda proof: (proof.action_at, proof.action_step, proof.action_ref),
+            )
+        ),
+        ambiguous,
+    )
+
+
 def _canonical_compilation(
     adapter: Mapping[str, object],
     *,
@@ -2597,6 +2734,7 @@ class ApiReconHandoffTool:
             assert reusable_adapter is not None
             assert reusable_adapter_value is not None
             reviewed_browser = reusable_adapter_value
+            reviewed_browser.pop("reviewed_setup_action_refs", None)
             reviewed_contract = reviewed_browser["interaction_contract"]
             probe = reviewed_contract.get("probe")
             probe_message = (
@@ -2621,6 +2759,16 @@ class ApiReconHandoffTool:
                 )
             current = await session.snapshot(open_tabs[0])
             surface_observation = current
+            endpoint_parts = urlsplit(compilation.executable.endpoint)
+            expected_endpoint_origin = (
+                f"{endpoint_parts.scheme.casefold()}://{endpoint_parts.netloc.casefold()}"
+            )
+            history_actions, history_observations = await _reviewed_browser_history(
+                session,
+                self._recorder,
+            )
+            last_historical_action: tuple[datetime, int, str] | None = None
+            historical_action_refs: list[str] = []
             input_matches = _matching_reviewed_elements(
                 current,
                 reviewed_contract["input_locator"],
@@ -2683,7 +2831,22 @@ class ApiReconHandoffTool:
             ]
             canonical_steps: list[dict[str, object]] = []
             assert isinstance(compilation.executable, BrowserChat)
+            capability_step_ids = _browser_capability_step_ids(compilation.executable)
+            raw_reviewed_steps = reviewed_browser.get("browser_steps")
+            effective_step_ids = tuple(
+                _effective_browser_step_id(step, index, raw_reviewed_steps)
+                for index, step in enumerate(compilation.executable.steps)
+            )
+            leading_setup_count = _leading_browser_setup_count(
+                compilation.executable.steps,
+                effective_step_ids,
+                capability_step_ids,
+            )
+            leading_setup_indexes = list(range(leading_setup_count))
+            historical_setup_indexes = frozenset(leading_setup_indexes)
+            historical_setup_action_refs: dict[str, list[str]] = {}
             for index, step in enumerate(compilation.executable.steps):
+                effective_step_id = effective_step_ids[index]
                 step_arguments = deepcopy(step.arguments)
                 default_role = "button" if step.tool == "browser_click" else "textbox"
                 step_locator = step_arguments.get("locator")
@@ -2711,19 +2874,65 @@ class ApiReconHandoffTool:
                     step_locator,
                     default_role=default_role,
                 )
+                historical_step: str | None = None
+                historical_proofs: tuple[_HistoricalLocatorProof, ...] = ()
+                historical_ambiguous = False
+                if (
+                    index in historical_setup_indexes
+                    and not step_matches
+                    and not step_irreducibly_ambiguous
+                ):
+                    step_value = step.arguments.get("value")
+                    reviewed_proofs, historical_ambiguous = _historically_reviewed_locator(
+                        history_actions,
+                        history_observations,
+                        step_locator,
+                        default_role=default_role,
+                        tool=step.tool,
+                        tab_ref=current.tab_ref,
+                        expected_origin=expected_endpoint_origin,
+                        expected_value=(step_value if isinstance(step_value, str) else None),
+                    )
+                    eligible_proofs = tuple(
+                        proof
+                        for proof in reviewed_proofs
+                        if last_historical_action is None
+                        or (proof.action_at, proof.action_step, proof.action_ref)
+                        > last_historical_action
+                    )
+                    historical_proofs = eligible_proofs[: step.repeat]
+                    historical_locators = {proof.canonical_locator for proof in historical_proofs}
+                    if len(historical_proofs) == step.repeat and len(historical_locators) == 1:
+                        historical_step = next(iter(historical_locators))
                 source_index = step.source_index if step.source_index is not None else index
                 field = f"reusable_adapter.browser_steps[{source_index}].arguments.locator"
-                if step_irreducibly_ambiguous:
+                if step_irreducibly_ambiguous or historical_ambiguous:
                     if not locator_repeats_contract_failure:
                         ambiguous_fields.append(field)
                     continue
-                if not step_matches or len(step_matches) > 1 or canonical_step is None:
+                if (
+                    (not step_matches and historical_step is None)
+                    or len(step_matches) > 1
+                    or (canonical_step is None and historical_step is None)
+                ):
                     if not locator_repeats_contract_failure:
                         invalid_fields.append(field)
                     continue
-                step_arguments["locator"] = canonical_step
+                step_arguments["locator"] = canonical_step or historical_step
+                if historical_step is not None:
+                    selected = historical_proofs[-1]
+                    last_historical_action = (
+                        selected.action_at,
+                        selected.action_step,
+                        selected.action_ref,
+                    )
+                    historical_action_refs.extend(proof.action_ref for proof in historical_proofs)
+                    proof_step_id = effective_step_id or f"canonical-browser-step-{index + 1}"
+                    historical_setup_action_refs[proof_step_id] = [
+                        proof.action_ref for proof in historical_proofs
+                    ]
                 canonical_step_payload: dict[str, object] = {
-                    "step_id": step.step_id or f"canonical-browser-step-{index + 1}",
+                    "step_id": effective_step_id or f"canonical-browser-step-{index + 1}",
                     "tool": step.tool,
                     "arguments": step_arguments,
                     "interaction": step.role.value == "interaction",
@@ -2767,6 +2976,21 @@ class ApiReconHandoffTool:
             reviewed_contract["input_locator"] = canonical_input
             reviewed_contract["submit_action"] = canonical_submit
             reviewed_browser["browser_steps"] = canonical_steps
+            if historical_setup_action_refs:
+                reviewed_browser["reviewed_setup_action_refs"] = {
+                    step_id: historical_setup_action_refs[step_id]
+                    for step_id in sorted(historical_setup_action_refs)
+                }
+            if historical_action_refs:
+                observed_evidence = reviewed_browser.get("observed_evidence")
+                retained_evidence = (
+                    [str(value) for value in observed_evidence if isinstance(value, str) and value]
+                    if isinstance(observed_evidence, list)
+                    else []
+                )
+                reviewed_browser["observed_evidence"] = list(
+                    dict.fromkeys([*retained_evidence, *historical_action_refs])
+                )
             reusable_adapter = json.dumps(
                 reusable_adapter_value, sort_keys=True, separators=(",", ":")
             )
@@ -3466,6 +3690,55 @@ def _browser_capability_step_ids(adapter: BrowserChat) -> frozenset[str]:
 
     visit(capabilities.model_dump(mode="json"))
     return frozenset(step_ids)
+
+
+def _effective_browser_step_id(
+    step: object,
+    index: int,
+    raw_steps: object,
+) -> str | None:
+    """Recover a durable step id from either compiled or compatibility state."""
+    compiled_step_id = getattr(step, "step_id", None)
+    if isinstance(compiled_step_id, str) and compiled_step_id:
+        return compiled_step_id
+    if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, (str, bytes)):
+        return None
+    source_index = getattr(step, "source_index", None)
+    raw_index = source_index if type(source_index) is int else index
+    if raw_index < 0 or raw_index >= len(raw_steps):
+        return None
+    raw_step = raw_steps[raw_index]
+    if not isinstance(raw_step, Mapping) or raw_step.get("tool") != getattr(step, "tool", None):
+        return None
+    raw_step_id = raw_step.get("step_id")
+    if isinstance(raw_step_id, str) and raw_step_id.strip():
+        return raw_step_id.strip()
+    return None
+
+
+def _leading_browser_setup_count(
+    steps: Sequence[object],
+    effective_step_ids: Sequence[str | None],
+    capability_step_ids: frozenset[str],
+) -> int:
+    """Bound preparatory activation before capability/checkpoint work begins."""
+    count = 0
+    for index, step in enumerate(steps):
+        role = getattr(getattr(step, "role", None), "value", None)
+        if role != "setup" or effective_step_ids[index] in capability_step_ids:
+            break
+        tool = getattr(step, "tool", None)
+        arguments = getattr(step, "arguments", None)
+        if tool in {"browser_fill", "browser_press"}:
+            fixed_value = arguments.get("value") if isinstance(arguments, Mapping) else None
+            if (
+                not isinstance(fixed_value, str)
+                or not fixed_value
+                or fixed_value in {"{{input}}", "{{prompt}}", "{{user_input}}"}
+            ):
+                break
+        count += 1
+    return count
 
 
 def _browser_checkpoint_gate_succeeded(
@@ -4674,6 +4947,8 @@ class _BrowserChatEffectGuard:
         self.before_url = ""
         self.before_ref = ""
         self.action_ref = ""
+        self.activation_before_refs: tuple[str, ...] = ()
+        self.activation_action_refs: tuple[str, ...] = ()
         self.adapter: BrowserChat | None = None
         self.adapter_metadata: dict[str, object] = {}
         self.session: BrowserSession | None = None
@@ -4764,14 +5039,30 @@ class BrowserChatExchangeTool:
                             await scope.release_resources(guard.resource_reservations)
                     finally:
                         if not scope.lifecycle.finished:
+                            before_refs = tuple(
+                                dict.fromkeys(
+                                    [
+                                        *guard.activation_before_refs,
+                                        *((guard.before_ref,) if guard.before_ref else ()),
+                                    ]
+                                )
+                            )
+                            action_refs = tuple(
+                                dict.fromkeys(
+                                    [
+                                        *guard.activation_action_refs,
+                                        *((guard.action_ref,) if guard.action_ref else ()),
+                                    ]
+                                )
+                            )
                             await scope.pause(
                                 (
                                     MissingEvidenceReason.CAPTURE_INCOMPLETE
                                     if guard.dispatched
                                     else MissingEvidenceReason.TRANSPORT_FAILED
                                 ),
-                                before_refs=((guard.before_ref,) if guard.before_ref else ()),
-                                action_refs=((guard.action_ref,) if guard.action_ref else ()),
+                                before_refs=before_refs,
+                                action_refs=action_refs,
                             )
 
                 await _browser_finish_scope_despite_cancellation(finish_scope())
@@ -5064,8 +5355,113 @@ class BrowserChatExchangeTool:
         ]
         open_tab_urls = {tab.tab_ref: tab.url for tab in open_tabs}
         endpoint_identity = _browser_endpoint_identity(executable_adapter.endpoint)
+        capability_step_ids = _browser_capability_step_ids(executable_adapter)
+        raw_browser_steps_value = adapter.get("browser_steps")
+        raw_browser_steps = (
+            raw_browser_steps_value
+            if isinstance(raw_browser_steps_value, Sequence)
+            and not isinstance(raw_browser_steps_value, (str, bytes))
+            else ()
+        )
+        effective_step_ids = tuple(
+            _effective_browser_step_id(step, index, raw_browser_steps)
+            for index, step in enumerate(executable_adapter.steps)
+        )
+        leading_setup_count = _leading_browser_setup_count(
+            executable_adapter.steps,
+            effective_step_ids,
+            capability_step_ids,
+        )
+        candidate_setup_steps = executable_adapter.steps[:leading_setup_count]
+        raw_steps_align = len(raw_browser_steps) == len(executable_adapter.steps) and all(
+            isinstance(raw_step, Mapping) and raw_step.get("tool") == compiled_step.tool
+            for raw_step, compiled_step in zip(
+                raw_browser_steps,
+                executable_adapter.steps,
+                strict=True,
+            )
+        )
+        candidate_setup_step_ids = effective_step_ids[:leading_setup_count]
+        setup_prefix_reviewed = (
+            bool(candidate_setup_steps)
+            and raw_steps_align
+            and all(bool(step_id) for step_id in candidate_setup_step_ids)
+        )
+        if candidate_setup_steps and not setup_prefix_reviewed:
+            await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
+            return ToolResult(
+                content=(
+                    "reviewed setup activation contract is unavailable; passive "
+                    "re-observation is required before target delivery"
+                ),
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    "failure_code": "reviewed_setup_contract_unavailable",
+                    "retryable": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "reobserve_required": True,
+                    "setup_step_count": len(candidate_setup_steps),
+                    "preferred_next_tool": "browser_snapshot",
+                    "preferred_next_tool_mode": "strict",
+                },
+            )
+        if setup_prefix_reviewed:
+            leading_setup_steps = candidate_setup_steps
+            leading_setup_step_ids = candidate_setup_step_ids
+            exchange_steps = executable_adapter.steps[leading_setup_count:]
+        else:
+            leading_setup_steps = ()
+            leading_setup_step_ids = ()
+            exchange_steps = executable_adapter.steps
+        reviewed_setup_action_refs_value = adapter.get("reviewed_setup_action_refs")
+        reviewed_setup_action_refs = (
+            reviewed_setup_action_refs_value
+            if isinstance(reviewed_setup_action_refs_value, Mapping)
+            else {}
+        )
+        observed_evidence_value = adapter.get("observed_evidence")
+        observed_evidence = {
+            value
+            for value in (
+                observed_evidence_value
+                if isinstance(observed_evidence_value, Sequence)
+                and not isinstance(observed_evidence_value, (str, bytes))
+                else ()
+            )
+            if isinstance(value, str) and value
+        }
+
+        def skipped_setup_prefix_is_proven(frontier_index: int) -> bool:
+            for prior_index in range(frontier_index):
+                step_id = leading_setup_step_ids[prior_index]
+                raw_refs = reviewed_setup_action_refs.get(step_id)
+                refs = (
+                    tuple(
+                        reference
+                        for reference in raw_refs
+                        if isinstance(reference, str) and reference
+                    )
+                    if isinstance(raw_refs, Sequence) and not isinstance(raw_refs, (str, bytes))
+                    else ()
+                )
+                required = leading_setup_steps[prior_index].repeat
+                if (
+                    len(refs) != required
+                    or len(set(refs)) != required
+                    or any(reference not in observed_evidence for reference in refs)
+                ):
+                    return False
+            return True
+
         observed_tabs: list[tuple[object, BrowserObservation]] = []
         compatible_tabs: list[tuple[str, BrowserObservation]] = []
+        setup_frontier_tabs: set[str] = set()
+        setup_ambiguous_tabs: set[str] = set()
+        setup_unproven_tabs: set[str] = set()
+        setup_frontier_indexes: dict[str, int] = {}
         for tab in open_tabs:
             observation = await session.snapshot(tab.tab_ref)
             await self._recorder.append_observation(observation)
@@ -5077,9 +5473,50 @@ class BrowserChatExchangeTool:
                     default_role=("button" if compiled_step.tool == "browser_click" else "textbox"),
                 )
                 is not None
-                for compiled_step in executable_adapter.steps
+                for compiled_step in exchange_steps
             ):
                 compatible_tabs.append((tab.tab_ref, observation))
+                continue
+            setup_matches = [
+                _matching_reviewed_elements(
+                    observation,
+                    compiled_step.arguments.get("locator"),
+                    default_role=("button" if compiled_step.tool == "browser_click" else "textbox"),
+                )
+                for compiled_step in leading_setup_steps
+            ]
+            if any(len(matches) > 1 for matches in setup_matches):
+                setup_ambiguous_tabs.add(tab.tab_ref)
+                continue
+            visible_setup_indexes = [
+                index
+                for index, (compiled_step, matches) in enumerate(
+                    zip(leading_setup_steps, setup_matches, strict=True)
+                )
+                if len(matches) == 1
+                and _resolve_reviewed_element(
+                    observation,
+                    compiled_step.arguments.get("locator"),
+                    default_role=("button" if compiled_step.tool == "browser_click" else "textbox"),
+                )
+                is not None
+            ]
+            if visible_setup_indexes:
+                frontier_index = min(visible_setup_indexes)
+                if not skipped_setup_prefix_is_proven(frontier_index):
+                    setup_unproven_tabs.add(tab.tab_ref)
+                    continue
+                setup_frontier_tabs.add(tab.tab_ref)
+                setup_frontier_indexes[tab.tab_ref] = frontier_index
+        activation_required = not compatible_tabs and bool(setup_frontier_indexes)
+        if activation_required:
+            compatible_tabs = [
+                (tab_ref, observation)
+                for tab_ref, observation in (
+                    (tab.tab_ref, observation) for tab, observation in observed_tabs
+                )
+                if tab_ref in setup_frontier_indexes
+            ]
         tab_resolution = "unique_compatible_tab"
         reviewed_affinity_status = "not_available"
         if len(compatible_tabs) > 1:
@@ -5217,15 +5654,19 @@ class BrowserChatExchangeTool:
                 if observed_url and observed_url != executable_adapter.endpoint
                 else None
             )
+            if setup_ambiguous_tabs:
+                transition_reason = "reviewed_setup_ambiguous"
+            elif setup_unproven_tabs:
+                transition_reason = "reviewed_setup_history_unproven"
+            elif not compatible_tabs:
+                transition_reason = "reviewed_controls_missing"
+            else:
+                transition_reason = "multiple_matching_surfaces"
             ui_transition = {
                 "schema": "merlin.target-ui-transition.v1",
                 "material": True,
                 "adapter_stale": True,
-                "reason": (
-                    "reviewed_controls_missing"
-                    if not compatible_tabs
-                    else "multiple_matching_surfaces"
-                ),
+                "reason": transition_reason,
                 "before_digest": reviewed_surface_digest,
                 "after_digest": observed_surface_digest,
                 "transition_digest": _digest_json(
@@ -5277,6 +5718,10 @@ class BrowserChatExchangeTool:
                     "target_session_id": f"browser:{session.context_id}",
                     "compatible_tab_count": compatible_tab_count,
                     "reviewed_tab_affinity": reviewed_affinity_status,
+                    "setup_frontier_required": False,
+                    "setup_frontier_tab_count": len(setup_frontier_tabs),
+                    "setup_ambiguous_tab_count": len(setup_ambiguous_tabs),
+                    "setup_unproven_tab_count": len(setup_unproven_tabs),
                     "reobserve_required": True,
                     "target_ui_transition": ui_transition,
                     "preferred_next_tool": "browser_snapshot",
@@ -5285,7 +5730,193 @@ class BrowserChatExchangeTool:
             )
         tab_ref, current = compatible_tabs[0]
         adapter_identity_metadata["tab_resolution"] = tab_resolution
-        before_url = next(tab.url for tab in open_tabs if tab.tab_ref == tab_ref)
+        timeout_ms = int(arguments.get("timeout_ms", 30_000))
+        activation_steps_completed = 0
+        activation_evidence_refs: list[str] = []
+        if leading_setup_steps and not activation_required:
+            adapter_identity_metadata["setup_already_satisfied"] = True
+            adapter_identity_metadata["setup_steps_omitted"] = len(leading_setup_steps)
+        if activation_required:
+            activation_before_url = next(tab.url for tab in open_tabs if tab.tab_ref == tab_ref)
+            activation_before_ref = _browser_evidence_ref("activation-before", current)
+            activation_action_ref = _browser_evidence_ref(
+                "activation-action",
+                {
+                    "adapter_digest": compiled_adapter_digest,
+                    "tab_ref": tab_ref,
+                    "setup_step_ids": list(leading_setup_step_ids),
+                },
+            )
+            guard.before = current
+            guard.before_url = activation_before_url
+            guard.before_ref = activation_before_ref
+            guard.action_ref = activation_action_ref
+            guard.activation_before_refs = (activation_before_ref,)
+            await state_scope.lifecycle.ensure_authoritative_before((activation_before_ref,))
+            activation_acknowledged = False
+
+            async def activation_failure(
+                content: str,
+                *,
+                failure_code: str,
+                result_metadata: Mapping[str, object] | None = None,
+            ) -> ToolResult:
+                attempted = bool(
+                    activation_steps_completed
+                    or activation_evidence_refs
+                    or result_metadata is not None
+                    and result_metadata.get("target_effect_attempted") is True
+                )
+                await state_scope.pause(
+                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    before_refs=(activation_before_ref,),
+                    action_refs=tuple(
+                        dict.fromkeys([activation_action_ref, *activation_evidence_refs])
+                    ),
+                )
+                return ToolResult(
+                    content=content,
+                    is_error=True,
+                    metadata={
+                        **(dict(result_metadata) if result_metadata is not None else {}),
+                        **adapter_identity_metadata,
+                        "failure_code": failure_code,
+                        "retryable": True,
+                        "activation_effect_attempted": attempted,
+                        "activation_steps_completed": activation_steps_completed,
+                        "activation_evidence_refs": list(dict.fromkeys(activation_evidence_refs)),
+                        "target_effect_attempted": attempted,
+                        "target_call_budget_charge": 0,
+                        "limit_interaction_count": 0,
+                        "reobserve_required": True,
+                        "target_session_id": f"browser:{session.context_id}",
+                        "preferred_next_tool": "browser_snapshot",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+
+            activation_start_index = setup_frontier_indexes[tab_ref]
+            for compiled_step, _setup_step_id in zip(
+                leading_setup_steps[activation_start_index:],
+                leading_setup_step_ids[activation_start_index:],
+                strict=True,
+            ):
+                fixed_value = compiled_step.arguments.get("value")
+                if compiled_step.tool in {"browser_fill", "browser_press"} and (
+                    not isinstance(fixed_value, str)
+                    or not fixed_value
+                    or fixed_value in {"{{input}}", "{{prompt}}", "{{user_input}}"}
+                ):
+                    return await activation_failure(
+                        "reviewed setup activation lacks one exact fixed fill/key value",
+                        failure_code="reviewed_setup_activation_contract",
+                    )
+                for _ in range(compiled_step.repeat):
+                    default_role = "button" if compiled_step.tool == "browser_click" else "textbox"
+                    locator = compiled_step.arguments.get("locator")
+                    matches = _matching_reviewed_elements(
+                        current,
+                        locator,
+                        default_role=default_role,
+                    )
+                    resolved = _resolve_reviewed_element(
+                        current,
+                        locator,
+                        default_role=default_role,
+                    )
+                    if resolved is None:
+                        return await activation_failure(
+                            (
+                                "reviewed setup activation locator is no longer unique"
+                                if len(matches) > 1
+                                else "reviewed setup activation step is unavailable"
+                            ),
+                            failure_code=(
+                                "reviewed_setup_activation_ambiguous"
+                                if len(matches) > 1
+                                else "reviewed_setup_activation_missing"
+                            ),
+                        )
+                    step_arguments = dict(compiled_step.arguments)
+                    step_arguments["element_ref"], step_arguments["frame_ref"] = resolved
+                    step_arguments.pop("locator", None)
+                    step_arguments["tab_ref"] = tab_ref
+                    step_arguments["step"] = activation_steps_completed + 1
+                    step_arguments["timeout_ms"] = timeout_ms
+                    if not activation_acknowledged:
+                        guard.activation_action_refs = (activation_action_ref,)
+                        await state_scope.lifecycle.acknowledge(
+                            before_refs=guard.activation_before_refs,
+                            action_refs=guard.activation_action_refs,
+                        )
+                        activation_acknowledged = True
+                    result = await BrowserTool(
+                        compiled_step.tool,
+                        self._resolver,
+                        self._recorder,
+                        self._failures,
+                    ).invoke(context, step_arguments)
+                    browser_action = result.metadata.get("browser_action")
+                    if isinstance(browser_action, Mapping):
+                        evidence_refs = browser_action.get("evidence_refs")
+                        if isinstance(evidence_refs, Sequence) and not isinstance(
+                            evidence_refs, (str, bytes)
+                        ):
+                            activation_evidence_refs.extend(
+                                str(reference)
+                                for reference in evidence_refs
+                                if isinstance(reference, str) and reference
+                            )
+                            guard.activation_action_refs = tuple(
+                                dict.fromkeys(
+                                    [
+                                        *guard.activation_action_refs,
+                                        *activation_evidence_refs,
+                                    ]
+                                )
+                            )
+                    if result.is_error:
+                        return await activation_failure(
+                            result.content,
+                            failure_code="reviewed_setup_activation_failed",
+                            result_metadata=result.metadata,
+                        )
+                    activation_steps_completed += 1
+                    current = await session.snapshot(
+                        tab_ref,
+                        step=activation_steps_completed,
+                    )
+                    await self._recorder.append_observation(current)
+                    activation_evidence_refs.append(
+                        _browser_evidence_ref("activation-after", current)
+                    )
+            if not all(
+                _resolve_reviewed_element(
+                    current,
+                    exchange_step.arguments.get("locator"),
+                    default_role=("button" if exchange_step.tool == "browser_click" else "textbox"),
+                )
+                is not None
+                for exchange_step in exchange_steps
+            ):
+                return await activation_failure(
+                    "reviewed setup activation completed without exposing the delivery controls",
+                    failure_code="reviewed_setup_activation_incomplete",
+                )
+            adapter_identity_metadata["setup_activation_completed"] = True
+            adapter_identity_metadata["activation_steps_completed"] = activation_steps_completed
+            adapter_identity_metadata["activation_evidence_refs"] = list(
+                dict.fromkeys(activation_evidence_refs)
+            )
+            adapter_identity_metadata["activation_effect_attempted"] = True
+            adapter_identity_metadata["target_effect_attempted"] = True
+            adapter_identity_metadata["target_call_budget_charge"] = 0
+            adapter_identity_metadata["limit_interaction_count"] = 0
+        before_url = _browser_tab_url(
+            session,
+            tab_ref,
+            next(tab.url for tab in open_tabs if tab.tab_ref == tab_ref),
+        )
         before_ref = _browser_evidence_ref("before", current)
         guard.before = current
         guard.before_url = before_url
@@ -5295,24 +5926,32 @@ class BrowserChatExchangeTool:
         except BaseException:
             await state_scope.pause(
                 MissingEvidenceReason.SELECTOR_UNAVAILABLE,
-                before_refs=(before_ref,),
+                before_refs=tuple(dict.fromkeys([*guard.activation_before_refs, before_ref])),
+                action_refs=guard.activation_action_refs,
             )
             raise
         action_ref = _browser_evidence_ref(
             "action", {"adapter_digest": compiled_adapter_digest, "prompt": prompt}
         )
         guard.action_ref = action_ref
+        scope_before_refs = tuple(dict.fromkeys([*guard.activation_before_refs, before_ref]))
+        activation_scope_action_refs = guard.activation_action_refs
+        scope_action_refs = tuple(dict.fromkeys([*activation_scope_action_refs, action_ref]))
         checkpoint_contract = (
             executable_adapter.state_capabilities.checkpoint
             if executable_adapter.state_capabilities is not None
             else None
         )
+        exchange_step_ids = effective_step_ids[
+            leading_setup_count if setup_prefix_reviewed else 0 :
+        ]
         try:
             checkpoint_context = _checkpoint_context(context)
         except ValueError as error:
             await state_scope.pause(
                 MissingEvidenceReason.NOT_APPLICABLE,
-                before_refs=(before_ref,),
+                before_refs=scope_before_refs,
+                action_refs=activation_scope_action_refs,
                 retryable=False,
             )
             return ToolResult(
@@ -5321,10 +5960,14 @@ class BrowserChatExchangeTool:
                 metadata={**adapter_identity_metadata, "failure_code": "checkpoint_contract"},
             )
         executable: list[tuple[str, dict[str, object], str | None, str]] = []
-        for compiled_step in executable_adapter.steps:
+        for compiled_step, effective_step_id in zip(
+            exchange_steps,
+            exchange_step_ids,
+            strict=True,
+        ):
             if (
                 checkpoint_contract is not None
-                and compiled_step.step_id == checkpoint_contract.restore_step_id
+                and effective_step_id == checkpoint_contract.restore_step_id
                 and (checkpoint_context is None or checkpoint_context[0] != "restore")
             ):
                 continue
@@ -5340,7 +5983,8 @@ class BrowserChatExchangeTool:
             if resolved is None:
                 await state_scope.pause(
                     MissingEvidenceReason.SELECTOR_UNAVAILABLE,
-                    before_refs=(before_ref,),
+                    before_refs=scope_before_refs,
+                    action_refs=activation_scope_action_refs,
                 )
                 return ToolResult(
                     content=(
@@ -5361,7 +6005,7 @@ class BrowserChatExchangeTool:
                 (
                     str(name),
                     dict(step_arguments),
-                    compiled_step.step_id,
+                    effective_step_id,
                     compiled_step.role.value,
                 )
                 for _ in range(compiled_step.repeat)
@@ -5372,7 +6016,8 @@ class BrowserChatExchangeTool:
         ):
             await state_scope.pause(
                 MissingEvidenceReason.NOT_APPLICABLE,
-                before_refs=(before_ref,),
+                before_refs=scope_before_refs,
+                action_refs=activation_scope_action_refs,
                 retryable=False,
             )
             return ToolResult(
@@ -5380,7 +6025,6 @@ class BrowserChatExchangeTool:
                 is_error=True,
                 metadata=adapter_identity_metadata,
             )
-        timeout_ms = int(arguments.get("timeout_ms", 30_000))
         response_witness = executable_adapter.interaction.response_witness or ""
         probe = contract.get("probe") if isinstance(contract, Mapping) else None
         response_witness_declared = isinstance(probe, Mapping) and "response_witness" in probe
@@ -5440,7 +6084,8 @@ class BrowserChatExchangeTool:
             ):
                 await state_scope.pause(
                     MissingEvidenceReason.NOT_APPLICABLE,
-                    before_refs=(before_ref,),
+                    before_refs=scope_before_refs,
+                    action_refs=activation_scope_action_refs,
                     retryable=False,
                 )
                 return ToolResult(
@@ -5483,7 +6128,8 @@ class BrowserChatExchangeTool:
                 except (KeyError, ValueError) as error:
                     await state_scope.pause(
                         MissingEvidenceReason.NOT_YET_OBSERVED,
-                        before_refs=(before_ref,),
+                        before_refs=scope_before_refs,
+                        action_refs=activation_scope_action_refs,
                     )
                     return ToolResult(
                         content=str(error),
@@ -5492,7 +6138,7 @@ class BrowserChatExchangeTool:
                             **adapter_identity_metadata,
                             "failure_code": "checkpoint_restore_unavailable",
                             "retryable": True,
-                            "target_effect_attempted": False,
+                            "target_effect_attempted": bool(activation_steps_completed),
                             "target_call_budget_charge": 0,
                         },
                     )
@@ -5525,7 +6171,8 @@ class BrowserChatExchangeTool:
                     await release_unacknowledged_restore()
                     await state_scope.pause(
                         MissingEvidenceReason.NOT_APPLICABLE,
-                        before_refs=(before_ref,),
+                        before_refs=scope_before_refs,
+                        action_refs=activation_scope_action_refs,
                         retryable=False,
                     )
                     return ToolResult(
@@ -5534,7 +6181,7 @@ class BrowserChatExchangeTool:
                         metadata={
                             **adapter_identity_metadata,
                             "failure_code": "checkpoint_contract",
-                            "target_effect_attempted": False,
+                            "target_effect_attempted": bool(activation_steps_completed),
                             "target_call_budget_charge": 0,
                         },
                     )
@@ -5551,7 +6198,8 @@ class BrowserChatExchangeTool:
             await release_unacknowledged_restore()
             await state_scope.pause(
                 MissingEvidenceReason.NOT_YET_OBSERVED,
-                before_refs=(before_ref,),
+                before_refs=scope_before_refs,
+                action_refs=activation_scope_action_refs,
             )
             return ToolResult(
                 content="reviewed browser target resource is unavailable before delivery",
@@ -5560,7 +6208,7 @@ class BrowserChatExchangeTool:
                     **adapter_identity_metadata,
                     "failure_code": "target_resource_blocked",
                     "retryable": True,
-                    "target_effect_attempted": False,
+                    "target_effect_attempted": bool(activation_steps_completed),
                     "target_call_budget_charge": 0,
                     "resource_state": error.status.get("state"),
                     "resource_available": error.status.get("available"),
@@ -5601,6 +6249,7 @@ class BrowserChatExchangeTool:
             ]
         submit_step_index = max(submit_step_indices)
         for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
+            is_submit_boundary = step - 1 == submit_step_index
             if role == "interaction" and isolation_plan.isolated and not isolation_bound:
                 equivalence_key, isolation_error = _browser_isolation_baseline(
                     executable_adapter,
@@ -5620,7 +6269,8 @@ class BrowserChatExchangeTool:
                     await release_unacknowledged_restore()
                     await state_scope.pause(
                         MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                        before_refs=(before_ref,),
+                        before_refs=scope_before_refs,
+                        action_refs=activation_scope_action_refs,
                     )
                     return ToolResult(
                         content=(
@@ -5632,7 +6282,7 @@ class BrowserChatExchangeTool:
                             "failure_code": "physical_state_unavailable",
                             "attempt_disposition": "contaminated",
                             "retryable": True,
-                            "target_effect_attempted": False,
+                            "target_effect_attempted": bool(activation_steps_completed),
                             "target_call_budget_charge": 0,
                         },
                     )
@@ -5648,8 +6298,8 @@ class BrowserChatExchangeTool:
                     await release_unacknowledged_restore()
                     await state_scope.pause(
                         MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                        before_refs=(before_ref,),
-                        action_refs=(action_ref,),
+                        before_refs=scope_before_refs,
+                        action_refs=scope_action_refs,
                     )
                     return ToolResult(
                         content=str(error),
@@ -5738,23 +6388,23 @@ class BrowserChatExchangeTool:
                     )
                 else:
                     rendered_state_evidence_refs["baseline"] = baseline_evidence_ref
-            if name in {"browser_click", "browser_press"}:
+            if is_submit_boundary:
                 await state_scope.acknowledge_resources(resource_reservations)
                 resources_acknowledged = True
                 guard.resources_acknowledged = True
                 await state_scope.lifecycle.acknowledge(
-                    before_refs=(before_ref,),
-                    action_refs=(action_ref,),
+                    before_refs=scope_before_refs,
+                    action_refs=scope_action_refs,
                 )
-            step_arguments["step"] = step
+            step_arguments["step"] = activation_steps_completed + step
             step_arguments["timeout_ms"] = timeout_ms
-            if name in {"browser_click", "browser_press"}:
+            if is_submit_boundary:
                 submit_started = time.monotonic()
                 guard.dispatched = True
             result = await BrowserTool(name, self._resolver, self._recorder, self._failures).invoke(
                 context, step_arguments
             )
-            if name in {"browser_click", "browser_press"}:
+            if is_submit_boundary:
                 submit_completed = time.monotonic()
             results.append(result)
             if result.is_error:
@@ -5765,8 +6415,8 @@ class BrowserChatExchangeTool:
                     await release_unacknowledged_restore()
                 await state_scope.pause(
                     MissingEvidenceReason.TRANSPORT_FAILED,
-                    before_refs=(before_ref,),
-                    action_refs=(action_ref,),
+                    before_refs=scope_before_refs,
+                    action_refs=scope_action_refs,
                 )
                 return result.model_copy(
                     update={
@@ -5785,7 +6435,11 @@ class BrowserChatExchangeTool:
             if name == "browser_fill":
                 fill_completed = time.monotonic()
             if step_id is not None and step_id in capability_step_ids:
-                state_observation = await session.snapshot(tab_ref, response_frame, step=step)
+                state_observation = await session.snapshot(
+                    tab_ref,
+                    response_frame,
+                    step=activation_steps_completed + step,
+                )
                 step_document = state_observation.model_dump(mode="json")
                 durable_observation = state_observation
                 if (
@@ -5825,7 +6479,7 @@ class BrowserChatExchangeTool:
                     _string(step_arguments.get("frame_ref")),
                     str(step_arguments.get("value", "")),
                 )
-            if name in {"browser_click", "browser_press"}:
+            if is_submit_boundary:
                 await state_scope.settle_resources(resource_reservations)
                 guard.resource_reservations = []
                 guard.resources_acknowledged = False
@@ -5862,7 +6516,11 @@ class BrowserChatExchangeTool:
                     captured_checkpoint_evidence_digest = _checkpoint_evidence_digest(
                         response_document
                     )
-        submitted = await session.snapshot(tab_ref, response_frame, step=len(executable) + 1)
+        submitted = await session.snapshot(
+            tab_ref,
+            response_frame,
+            step=activation_steps_completed + len(executable) + 1,
+        )
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
         after = submitted
         submitted_url = next(
@@ -5911,7 +6569,11 @@ class BrowserChatExchangeTool:
         response_settle_seconds = min(0.6, max(0.2, timeout_ms / 4_000))
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.2)
-            candidate = await session.snapshot(tab_ref, response_frame, step=len(executable) + 2)
+            candidate = await session.snapshot(
+                tab_ref,
+                response_frame,
+                step=activation_steps_completed + len(executable) + 2,
+            )
             candidate_url = next(
                 (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
                 after_observed_url,
@@ -5974,13 +6636,17 @@ class BrowserChatExchangeTool:
                 )
             )
         final_step_document = after.model_dump(mode="json")
-        for compiled_step in executable_adapter.steps:
+        for compiled_step, effective_step_id in zip(
+            executable_adapter.steps,
+            effective_step_ids,
+            strict=True,
+        ):
             if (
                 compiled_step.role.value == "interaction"
-                and compiled_step.step_id is not None
-                and compiled_step.step_id in capability_step_ids
+                and effective_step_id is not None
+                and effective_step_id in capability_step_ids
             ):
-                checkpoint_step_documents[compiled_step.step_id] = final_step_document
+                checkpoint_step_documents[effective_step_id] = final_step_document
         await self._recorder.append_observation(public_after)
         final_browser_metadata = session.metadata(restart=True)
         await self._recorder.save_metadata(final_browser_metadata)
@@ -6206,8 +6872,8 @@ class BrowserChatExchangeTool:
             await release_unacknowledged_restore()
             state_scope.isolation_disposition = "contaminated"
             await state_scope.settle(
-                before_refs=(before_ref,),
-                action_refs=(action_ref,),
+                before_refs=scope_before_refs,
+                action_refs=scope_action_refs,
                 response_refs=(after_ref,),
                 after_refs=(after_ref,),
                 transition_disposition="ambiguous",
@@ -6232,8 +6898,8 @@ class BrowserChatExchangeTool:
             await release_unacknowledged_restore()
             await state_scope.pause(
                 MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                before_refs=(before_ref,),
-                action_refs=(action_ref,),
+                before_refs=scope_before_refs,
+                action_refs=scope_action_refs,
             )
             return ToolResult(
                 content=(
@@ -6279,8 +6945,8 @@ class BrowserChatExchangeTool:
             ):
                 await state_scope.pause(
                     MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                    before_refs=(before_ref,),
-                    action_refs=(action_ref,),
+                    before_refs=scope_before_refs,
+                    action_refs=scope_action_refs,
                 )
                 return ToolResult(
                     content=(
@@ -6307,8 +6973,8 @@ class BrowserChatExchangeTool:
                 ):
                     await state_scope.pause(
                         MissingEvidenceReason.CAPTURE_INCOMPLETE,
-                        before_refs=(before_ref,),
-                        action_refs=(action_ref,),
+                        before_refs=scope_before_refs,
+                        action_refs=scope_action_refs,
                     )
                     return ToolResult(
                         content="reviewed checkpoint capture selector produced no handle",
@@ -6383,8 +7049,8 @@ class BrowserChatExchangeTool:
             captured_checkpoint_secret = None
             restore_secret = None
         await state_scope.settle(
-            before_refs=(before_ref,),
-            action_refs=(action_ref,),
+            before_refs=scope_before_refs,
+            action_refs=scope_action_refs,
             response_refs=(after_ref,),
             after_refs=(after_ref,),
             transition_disposition=("unchanged" if response_boundary_complete else "ambiguous"),
@@ -6396,7 +7062,7 @@ class BrowserChatExchangeTool:
                 **adapter_identity_metadata,
                 **state_metadata,
                 "compiled_flow": "merlin.browser-flow.v1",
-                "steps_completed": len(results),
+                "steps_completed": activation_steps_completed + len(results),
                 "input_value_verified": True,
                 "response_witness": response_witness,
                 "response_boundary_observed": response_boundary_observed,
@@ -6405,6 +7071,9 @@ class BrowserChatExchangeTool:
                 "attempt_disposition": "valid" if response_boundary_complete else "uncertain",
                 "target": session.bounds.target_id,
                 "target_session_id": f"browser:{session.context_id}",
+                "target_effect_attempted": True,
+                "target_call_budget_charge": 1,
+                "limit_interaction_count": 1,
                 "target_exchanges": [exchange],
                 **(
                     {
