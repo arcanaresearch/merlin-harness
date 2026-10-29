@@ -20336,6 +20336,152 @@ async def test_response_witness_baseline_is_captured_after_setup_steps() -> None
 
 
 @pytest.mark.asyncio
+async def test_static_page_witness_accepts_stable_change_after_prompt_echo() -> None:
+    chat = b"""
+    <div>Score: 0</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      const transcript = document.getElementById('transcript');
+      transcript.textContent = document.querySelector('textarea').value;
+      setTimeout(() => {
+        transcript.textContent += ' Target reply rendered.';
+      }, 400);
+    ">Send</button>
+    <div id="transcript"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            # A recon model can mistakenly nominate a singleton page-level label.
+            # Runtime must not let that stale witness hide a later target reply.
+            probe["response_witness"] = "Score:"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["response_boundary_observed"] is True
+            assert result.metadata["response_boundary_complete"] is True
+            assert result.metadata["response_boundary_fallback"] is True
+            assert result.metadata["attempt_disposition"] == "valid"
+            assert any(
+                item["source"] == "browser.response_witness.static_fallback"
+                for item in result.metadata["evaluation_uncertainties"]
+            )
+
+
+@pytest.mark.asyncio
+async def test_static_page_witness_does_not_accept_prompt_echo_alone() -> None:
+    chat = b"""
+    <div>Score: 0</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('transcript').textContent =
+        document.querySelector('textarea').value;
+    ">Send</button>
+    <div id="transcript"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Score:"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "echo me", "timeout_ms": 1_000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "compiled_response_boundary_incomplete"
+            assert result.metadata["response_boundary_observed"] is False
+            assert result.metadata["response_boundary_complete"] is False
+            assert result.metadata["response_boundary_fallback"] is False
+            assert "target_exchanges" not in result.metadata
+
+
+@pytest.mark.asyncio
 async def test_invalid_declared_witness_stays_uncertain_but_legacy_fallback_remains_valid() -> None:
     chat = b"""
     <textarea aria-label="Message" maxlength="500"></textarea>

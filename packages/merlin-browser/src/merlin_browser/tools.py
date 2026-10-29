@@ -3189,9 +3189,9 @@ class ApiReconHandoffTool:
                             "maxLength": BROWSER_TEXT_CAPTURE_MAX_LENGTH,
                             "description": (
                                 "Exact case-sensitive visible text whose occurrence count "
-                                "increases only when a new target response is rendered. Use "
-                                "an invariant marker such as 'Score:', not a value such as "
-                                "'Score: 0' that can change between replies."
+                                "increases only when a new target response is rendered. Use an "
+                                "invariant marker repeated inside every target reply, not a "
+                                "singleton page-level status label such as 'Score:'."
                             ),
                         },
                     },
@@ -6924,9 +6924,14 @@ class BrowserChatExchangeTool:
             _string(contract.get("frame_context")) if isinstance(contract, Mapping) else None
         )
         response_witness_count_before: int | None = 0 if not response_witness else None
-        legacy_prompt_count_before: int | None = None if legacy_response_fallback else 0
+        prompt_count_before: int | None = None
         response_count_unavailable = False
         response_count_uncertainties: list[dict[str, object]] = []
+        prompt_count_source = (
+            "browser.legacy_prompt_echo.count"
+            if legacy_response_fallback
+            else "browser.prompt_echo.count"
+        )
 
         async def safe_text_occurrences(value: str, *, source: str) -> int | None:
             nonlocal response_count_unavailable
@@ -7242,13 +7247,19 @@ class BrowserChatExchangeTool:
                     source="browser.response_witness.count",
                 )
             if (
-                legacy_response_fallback
-                and legacy_prompt_count_before is None
+                prompt_count_before is None
                 and step - 1 == submit_step_index
+                and (
+                    legacy_response_fallback
+                    or (
+                        response_witness_count_before is not None
+                        and response_witness_count_before > 0
+                    )
+                )
             ):
-                legacy_prompt_count_before = await safe_text_occurrences(
+                prompt_count_before = await safe_text_occurrences(
                     prompt,
-                    source="browser.legacy_prompt_echo.count",
+                    source=prompt_count_source,
                 )
             if (
                 executable_adapter.interaction.state_observations
@@ -7460,6 +7471,8 @@ class BrowserChatExchangeTool:
             response_witness_conflicted or response_witness_invalid or response_count_unavailable
         )
         legacy_prompt_echo_only = False
+        static_witness_fallback_armed = False
+        static_witness_fallback_observed = False
         if response_boundary_unprovable:
             response_boundary_observed = False
         elif response_witness:
@@ -7476,13 +7489,13 @@ class BrowserChatExchangeTool:
         else:
             submitted_prompt_count = await safe_text_occurrences(
                 prompt,
-                source="browser.legacy_prompt_echo.count",
+                source=prompt_count_source,
             )
             legacy_prompt_echo_only = bool(
                 legacy_response_fallback
-                and legacy_prompt_count_before is not None
+                and prompt_count_before is not None
                 and submitted_prompt_count is not None
-                and submitted_prompt_count > legacy_prompt_count_before
+                and submitted_prompt_count > prompt_count_before
             )
             response_boundary_observed = (
                 submitted.text != current.text
@@ -7490,6 +7503,24 @@ class BrowserChatExchangeTool:
                 and not response_count_unavailable
             )
             response_boundary_unprovable = response_count_unavailable
+        if (
+            response_witness
+            and not response_witness_conflicted
+            and response_witness_count_before is not None
+            and response_witness_count_before > 0
+            and not response_boundary_observed
+            and prompt_count_before is not None
+        ):
+            submitted_prompt_count = await safe_text_occurrences(
+                prompt,
+                source=prompt_count_source,
+            )
+            static_witness_fallback_armed = bool(
+                submitted_prompt_count is not None and submitted_prompt_count > prompt_count_before
+            )
+            response_boundary_unprovable = (
+                response_boundary_unprovable or response_count_unavailable
+            )
         response_boundary_complete = False
         last_response_change = asyncio.get_running_loop().time()
         response_settle_seconds = min(0.6, max(0.2, timeout_ms / 4_000))
@@ -7527,6 +7558,37 @@ class BrowserChatExchangeTool:
             if witness_just_observed:
                 last_response_change = asyncio.get_running_loop().time()
             if candidate.text != after.text or candidate_signature != after_signature:
+                visible_text_changed = candidate.text != after.text
+                fallback_just_observed = False
+                if (
+                    visible_text_changed
+                    and static_witness_fallback_armed
+                    and not response_boundary_observed
+                ):
+                    static_witness_fallback_observed = True
+                    fallback_just_observed = True
+                    response_boundary_observed = True
+                elif (
+                    visible_text_changed
+                    and response_witness
+                    and not response_witness_conflicted
+                    and response_witness_count_before is not None
+                    and response_witness_count_before > 0
+                    and not response_boundary_observed
+                    and prompt_count_before is not None
+                ):
+                    candidate_prompt_count = await safe_text_occurrences(
+                        prompt,
+                        source=prompt_count_source,
+                    )
+                    if (
+                        candidate_prompt_count is not None
+                        and candidate_prompt_count > prompt_count_before
+                    ):
+                        # Arm only after the exact submitted prompt is visible. A later
+                        # text mutation is then independent evidence of target output;
+                        # the prompt echo itself is never accepted as a response.
+                        static_witness_fallback_armed = True
                 after = candidate
                 after_observed_url = candidate_url
                 after_signature = candidate_signature
@@ -7537,7 +7599,11 @@ class BrowserChatExchangeTool:
                 ):
                     response_boundary_observed = True
                     legacy_prompt_echo_only = False
-                if response_boundary_observed or response_boundary_unprovable:
+                if (
+                    response_boundary_observed
+                    or response_boundary_unprovable
+                    or fallback_just_observed
+                ):
                     last_response_change = asyncio.get_running_loop().time()
                 continue
             if (
@@ -7624,6 +7690,19 @@ class BrowserChatExchangeTool:
                         "unscoped visible-text count increase cannot prove a target reply."
                     ),
                     "confidence": 0.0,
+                }
+            )
+        if static_witness_fallback_observed:
+            evaluation_uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "browser.response_witness.static_fallback",
+                    "reason": (
+                        "The declared response witness was already present and did not increase; "
+                        "a distinct stable visible-text transition after the exact submitted "
+                        "prompt echo established the response boundary instead."
+                    ),
+                    "confidence": 0.5,
                 }
             )
         if not response_boundary_complete:
@@ -7841,6 +7920,7 @@ class BrowserChatExchangeTool:
                     "retryable": True,
                     "response_boundary_observed": response_boundary_observed,
                     "response_boundary_complete": False,
+                    "response_boundary_fallback": static_witness_fallback_observed,
                     **submit_timing,
                     "attempt_disposition": "uncertain",
                     "target_effect_attempted": True,
@@ -7993,6 +8073,7 @@ class BrowserChatExchangeTool:
                 "response_witness": response_witness,
                 "response_boundary_observed": response_boundary_observed,
                 "response_boundary_complete": response_boundary_complete,
+                "response_boundary_fallback": static_witness_fallback_observed,
                 **submit_timing,
                 "attempt_disposition": "valid" if response_boundary_complete else "uncertain",
                 "target": session.bounds.target_id,
