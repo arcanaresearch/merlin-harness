@@ -496,6 +496,28 @@ def _is_campaign_boundary_continuation(content: str) -> bool:
     )
 
 
+def _is_recon_handback_coordination(content: str) -> bool:
+    """Recognize only completed-auth browser handback coordination."""
+
+    normalized = " ".join(content.casefold().split())
+    continues = re.search(r"\b(?:continue|resume|proceed)\b", normalized) is not None
+    auth_completed = (
+        re.search(r"\b(?:signed|logged)\s+in\b", normalized) is not None
+        or re.search(
+            r"\b(?:login|auth|authentication|mfa|captcha)\b.{0,40}"
+            r"\b(?:complete|completed|done)\b",
+            normalized,
+        )
+        is not None
+        or re.search(
+            r"\b(?:hand|give|return|take)\b.{0,40}\bbrowser\b.{0,20}\bback\b",
+            normalized,
+        )
+        is not None
+    )
+    return continues and auth_completed
+
+
 def _campaign_primary_target(content: str) -> str | None:
     """Match AssessmentService's first-valid-objective-URL canonicalization."""
 
@@ -575,15 +597,20 @@ def _advance_campaign_boundary(
                 "unbound", primary_target=_typed_campaign_primary_target(content)
             ), True
         return _CampaignBoundaryState("invalid"), True
-    if _is_campaign_boundary_continuation(content):
-        target_token = _CAMPAIGN_URL_TOKEN_RE.search(content)
+    continuation = _is_campaign_boundary_continuation(content)
+    handback = _is_recon_handback_coordination(content)
+    target_token = _CAMPAIGN_URL_TOKEN_RE.search(content)
+    if continuation or handback:
         if target_token is None:
             return state, False
         continuation_target = _campaign_primary_target(content)
         if continuation_target is not None and continuation_target == state.primary_target:
             return state, False
         return _CampaignBoundaryState("unbound", primary_target=continuation_target), True
-    return _CampaignBoundaryState("unbound", primary_target=_campaign_primary_target(content)), True
+    return _CampaignBoundaryState(
+        "unbound",
+        primary_target=_campaign_primary_target(content) if target_token is not None else None,
+    ), True
 
 
 def _latest_typed_campaign_scope(

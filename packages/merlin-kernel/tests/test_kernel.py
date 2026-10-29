@@ -4766,6 +4766,85 @@ def test_latest_campaign_scope_stops_at_untyped_or_malformed_boundary() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "handback",
+    [
+        "Signed in. Hand the browser back and continue reconnaissance.",
+        "Logged in successfully; resume reconnaissance.",
+        "MFA is complete. Proceed with reconnaissance.",
+    ],
+)
+def test_latest_campaign_scope_ignores_targetless_browser_handback_coordination(
+    handback: str,
+) -> None:
+    objective = "Assess https://a.test/chat"
+    transcript = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(role="user", content=handback),
+    ]
+
+    assert _latest_typed_campaign_scope(transcript) == (
+        _CAMPAIGN_REQUEST_ID_A,
+        "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [
+                ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Run a new security assessment of https://a.test/chat "
+                        "for a different objective"
+                    ),
+                ),
+            ]
+        )
+        is None
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [*transcript, ChatMessage(role="user", content="Assess target B")]
+        )
+        is None
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [
+                ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                ChatMessage(
+                    role="user",
+                    content=f"{handback} Continue at https://b.test/chat.",
+                ),
+            ]
+        )
+        is None
+    )
+    assert (
+        _latest_typed_campaign_scope(
+            [
+                ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                ChatMessage(role="user", content="Explain current runtime status"),
+            ]
+        )
+        is None
+    )
+
+    objective_b = "Assess https://b.test/chat"
+    assert _latest_typed_campaign_scope(
+        [
+            ChatMessage(
+                role="user",
+                content=_campaign_scope_content(objective_b, _CAMPAIGN_REQUEST_ID_B),
+            ),
+            ChatMessage(role="user", content=handback),
+        ]
+    ) == (
+        _CAMPAIGN_REQUEST_ID_B,
+        "sha256:" + hashlib.sha256(objective_b.encode()).hexdigest(),
+    )
+
+
 @pytest.mark.parametrize("prefix", ["Resume", "Retry", "Continue"])
 @pytest.mark.parametrize("target", ["", " https://c.test/chat"])
 def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
@@ -5098,6 +5177,100 @@ def test_repair_delayed_result_survives_identical_scope_but_not_new_boundary() -
     )
 
 
+@pytest.mark.parametrize(
+    "handback",
+    [
+        "Signed in. Hand the browser back and continue reconnaissance.",
+        "Logged in successfully; resume reconnaissance.",
+        "CAPTCHA done. Proceed with reconnaissance.",
+    ],
+)
+def test_repair_restore_survives_targetless_browser_handback_coordination(
+    handback: str,
+) -> None:
+    objective = "Assess https://a.test/chat"
+    result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+        },
+    )
+    transcript = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "handback-repair",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="handback-repair",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "handback-repair",
+                {"objective": objective},
+                result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+        ChatMessage(role="user", content=handback),
+    ]
+
+    restored = _restored_preferred_tool_repair(transcript)
+    assert restored is not None
+    assert restored[3] == _CAMPAIGN_REQUEST_ID_A
+    assert (
+        _restored_preferred_tool_repair(
+            [
+                *transcript[:-1],
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Run a new security assessment of https://a.test/chat "
+                        "for a different objective"
+                    ),
+                ),
+            ]
+        )
+        is None
+    )
+    assert (
+        _restored_preferred_tool_repair(
+            [
+                *transcript[:-1],
+                ChatMessage(role="user", content=f"{handback} Continue at https://b.test/chat."),
+            ]
+        )
+        is None
+    )
+    assert (
+        _restored_preferred_tool_repair(
+            [*transcript[:-1], ChatMessage(role="user", content="Explain current runtime status")]
+        )
+        is None
+    )
+    delayed = [
+        transcript[0],
+        transcript[1],
+        ChatMessage(role="user", content="Explain current runtime status"),
+        transcript[2],
+    ]
+    assert _restored_preferred_tool_repair(delayed) is None
+
+
 def test_automatic_recon_restore_is_authenticated_and_campaign_scoped() -> None:
     objective = "Assess target A"
     result = ToolResult(
@@ -5314,6 +5487,95 @@ def test_automatic_recon_delayed_results_respect_identical_and_new_boundaries() 
         ]
     )
     assert legacy_cleared is None
+
+
+@pytest.mark.parametrize(
+    "handback",
+    [
+        "Signed in. Hand the browser back and continue reconnaissance.",
+        "Logged in successfully; resume reconnaissance.",
+        "Authentication completed. Proceed with reconnaissance.",
+    ],
+)
+def test_automatic_recon_survives_targetless_browser_handback_coordination(
+    handback: str,
+) -> None:
+    objective = "Assess https://a.test/chat"
+    result = ToolResult(
+        content="cleanup discovery required",
+        is_error=True,
+        metadata={"automatic_recon_continuation": _cleanup_continuation("handoff:handback")},
+    )
+    call = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "handback-recon",
+                "type": "function",
+                "function": {
+                    "name": "assessment_prepare",
+                    "arguments": json.dumps({"objective": objective}),
+                },
+            }
+        ],
+    )
+    tool = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id="handback-recon",
+        content=_tool_content_with_automatic_marker(
+            "assessment_prepare",
+            "handback-recon",
+            {"objective": objective},
+            result,
+            campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+        ),
+    )
+    restored, _ = _restored_automatic_recon(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            call,
+            tool,
+            ChatMessage(role="user", content=handback),
+        ]
+    )
+    assert restored is not None
+
+    same_target_campaign, _ = _restored_automatic_recon(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            call,
+            tool,
+            ChatMessage(
+                role="user",
+                content=(
+                    "Run a new security assessment of https://a.test/chat for a different objective"
+                ),
+            ),
+        ]
+    )
+    assert same_target_campaign is None
+
+    changed_target, _ = _restored_automatic_recon(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            call,
+            tool,
+            ChatMessage(role="user", content=f"{handback} Continue at https://b.test/chat."),
+        ]
+    )
+    assert changed_target is None
+
+    delayed, _ = _restored_automatic_recon(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            call,
+            ChatMessage(role="user", content="Explain current runtime status"),
+            tool,
+        ]
+    )
+    assert delayed is None
 
 
 def test_legacy_automatic_recon_marker_rejects_future_call() -> None:
