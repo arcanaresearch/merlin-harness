@@ -745,6 +745,17 @@ class DurableSchedulerStore(Protocol):
         recovery: Mapping[str, object],
     ) -> None: ...
 
+    def adopt_goat_target_lane(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        target_admission: Mapping[str, object],
+        recovery: Mapping[str, object],
+    ) -> str: ...
+
     def heartbeat(self, attempt_id: str, generation: int, *, lease_expires_at: datetime) -> Any: ...
 
     def settle_attempt(
@@ -5464,6 +5475,7 @@ class DurableAgentService:
                         if isinstance(item, Mapping) and isinstance(item.get("receipt_sha256"), str)
                     )
                     recovered_state: Mapping[str, object] | None = None
+                    goat_target_lane_adopted = False
                     strategy_execution_mode = str(
                         dict(assignment.strategy_contract).get("strategy_execution_mode", "native")
                     )
@@ -5540,6 +5552,71 @@ class DurableAgentService:
                         if recovered_state is not None:
                             recovered_state = dict(recovered_state)
                             recovery = recovered_state.pop("recovery", {})
+                            pending_call_id = recovered_state.get("pending_call_id")
+                            if isinstance(pending_call_id, str) and pending_call_id:
+                                adopter = getattr(self._store, "adopt_goat_target_lane", None)
+                                target_session_id = recovered_state.get("target_session_id")
+                                prior_attempt_id = recovery.get("prior_attempt_id")
+                                checkpoint_attempt_id = recovery.get("checkpoint_attempt_id")
+                                effect_ids = recovery.get("effect_ids")
+                                receipt_digests = recovery.get("receipt_digests")
+                                pending_arguments_digest = recovered_state.get(
+                                    "pending_arguments_digest"
+                                )
+                                if (
+                                    not callable(adopter)
+                                    or not isinstance(target_session_id, str)
+                                    or not target_session_id
+                                    or not isinstance(prior_attempt_id, str)
+                                    or not prior_attempt_id
+                                    or not isinstance(checkpoint_attempt_id, str)
+                                    or not checkpoint_attempt_id
+                                    or not isinstance(effect_ids, (list, tuple))
+                                    or not isinstance(receipt_digests, (list, tuple))
+                                    or not isinstance(pending_arguments_digest, str)
+                                    or not pending_arguments_digest
+                                ):
+                                    raise RuntimeError(
+                                        "GOAT pending recovery lacks durable lane adoption "
+                                        "authority"
+                                    )
+                                adoption_body: dict[str, object] = {
+                                    "schema": "merlin.goat-target-lane-adoption.v1",
+                                    "prior_attempt_id": prior_attempt_id,
+                                    "checkpoint_attempt_id": checkpoint_attempt_id,
+                                    "effect_ids": sorted(set(str(item) for item in effect_ids)),
+                                    "receipt_digests": list(receipt_digests),
+                                    "pending_call_id": pending_call_id,
+                                    "pending_arguments_digest": pending_arguments_digest,
+                                }
+                                adoption = {
+                                    **adoption_body,
+                                    "recovery_digest": "sha256:"
+                                    + hashlib.sha256(
+                                        json.dumps(
+                                            adoption_body,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ).encode()
+                                    ).hexdigest(),
+                                }
+                                adopted_session_id = await self._call(
+                                    adopter,
+                                    live.id,
+                                    node_id,
+                                    str(lease.id),
+                                    int(lease.generation),
+                                    target_admission={
+                                        **target_admission,
+                                        "target_session_id": target_session_id,
+                                    },
+                                    recovery=adoption,
+                                )
+                                if adopted_session_id != target_session_id:
+                                    raise RuntimeError(
+                                        "GOAT target lane adoption returned a different session"
+                                    )
+                                goat_target_lane_adopted = True
                             restored_checkpoint = dict(restored_checkpoint or {})
                             restored_checkpoint["strategy_state"] = recovered_state
                             if recovered_state.get("steps"):
@@ -5803,7 +5880,10 @@ class DurableAgentService:
                             inherited_technique_attempt_id,
                         )
                     recovered_target_lane = False
-                    if getattr(lease, "lane_recovery_required", False) is True:
+                    if (
+                        getattr(lease, "lane_recovery_required", False) is True
+                        and not goat_target_lane_adopted
+                    ):
                         prior_attempt_id = getattr(lease, "replaced_attempt_id", None)
                         if (
                             not isinstance(prior_attempt_id, str)

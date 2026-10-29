@@ -424,18 +424,59 @@ class ReviewedApiTargetTool:
             target_delivery_from_reviewed_adapter=True,
         )
 
+    async def _session_scope_id(
+        self,
+        context: ToolContext,
+        adapter: _ApiAdapter,
+    ) -> str | None:
+        """Select the current scope or an exact durable predecessor session."""
+
+        assert context.campaign_id is not None and context.agent_id is not None
+        current_scope_id = _reviewed_session_scope_id(
+            context.agent_id,
+            attempt_id=context.attempt_id,
+        )
+        expected_target_session_id = context.expected_target_session_id
+        if expected_target_session_id is None:
+            return current_scope_id
+        predecessor = await asyncio.to_thread(
+            self._sessions.load_target_session,
+            context.campaign_id,
+            target_id=adapter.target_id,
+            target_session_id=expected_target_session_id,
+        )
+        assignment_scope_prefix = f"{context.agent_id}/attempt/"
+        same_assignment_scope = bool(
+            predecessor is not None
+            and (
+                predecessor.session_scope_id == context.agent_id
+                or predecessor.session_scope_id.startswith(assignment_scope_prefix)
+                and len(predecessor.session_scope_id) > len(assignment_scope_prefix)
+            )
+        )
+        if (
+            predecessor is None
+            or predecessor.state != "active"
+            or predecessor.pending_step is not None
+            or predecessor.target_id != adapter.target_id
+            or predecessor.adapter_digest != adapter.compiled_digest
+            or predecessor.target_session_id != expected_target_session_id
+            or not same_assignment_scope
+        ):
+            return None
+        return predecessor.session_scope_id
+
     async def resolve_target_session_id(self, context: ToolContext) -> str | None:
-        """Resolve one sealed API-session generation without creating target state."""
+        """Reserve one sealed API-session generation without creating remote target state."""
 
         if context.campaign_id is None or context.target_id is None or context.agent_id is None:
             return None
         adapter = self._adapter(context.campaign_id, context.target_id)
         if _context_adapter_identity_failure(context, adapter) is not None:
             return None
-        session_scope_id = _reviewed_session_scope_id(
-            context.agent_id,
-            attempt_id=context.attempt_id,
-        )
+        session_scope_id = await self._session_scope_id(context, adapter)
+        if session_scope_id is None:
+            return None
         state = await asyncio.to_thread(
             self._sessions.load,
             context.campaign_id,
@@ -443,7 +484,14 @@ class ReviewedApiTargetTool:
             session_scope_id=session_scope_id,
         )
         if state is None:
-            generation = 1
+            state = await asyncio.to_thread(
+                self._sessions.create,
+                context.campaign_id,
+                adapter.target_id,
+                adapter.compiled_digest,
+                session_scope_id=session_scope_id,
+            )
+            generation = state.generation
         else:
             if (
                 state.target_id != adapter.target_id
@@ -486,14 +534,38 @@ class ReviewedApiTargetTool:
             return ToolResult(
                 content="target_request requires a stable assignment scope", is_error=True
             )
-        session_scope_id = _reviewed_session_scope_id(
-            context.agent_id,
-            attempt_id=context.attempt_id,
-        )
         try:
             adapter = self._adapter(context.campaign_id, context.target_id)
         except ValueError as error:
             return ToolResult(content=str(error), is_error=True)
+        session_scope_id = await self._session_scope_id(context, adapter)
+        if session_scope_id is None:
+            current = await asyncio.to_thread(
+                self._sessions.load,
+                context.campaign_id,
+                target_id=context.target_id,
+                session_scope_id=_reviewed_session_scope_id(
+                    context.agent_id,
+                    attempt_id=context.attempt_id,
+                ),
+            )
+            return ToolResult(
+                content="reviewed API target session is unavailable for this assignment",
+                is_error=True,
+                metadata={
+                    "failure_code": "target_session_identity_mismatch",
+                    "retryable": False,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "limit_interaction_count": 0,
+                    "expected_target_session_id": context.expected_target_session_id,
+                    **(
+                        {"target_session_id": current.target_session_id}
+                        if current is not None
+                        else {}
+                    ),
+                },
+            )
 
         def resolved(result: ToolResult) -> ToolResult:
             identified = _with_adapter_identity(result, adapter)

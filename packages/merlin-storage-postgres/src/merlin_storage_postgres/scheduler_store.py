@@ -201,6 +201,29 @@ def _goat_checkpoint_digest(value: object) -> str:
     return "sha256:" + sha256(encoded.encode()).hexdigest()
 
 
+def _goat_receipt_steps(rows: Sequence[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
+    """Project immutable GOAT receipts into their canonical checkpoint steps."""
+
+    return tuple(
+        {
+            "index": row["step_index"],
+            "call_id": row["call_id"],
+            "telemetry_digest": row["telemetry_digest"],
+            "strategy_ids": tuple(row["strategy_ids"]),  # type: ignore[arg-type]
+            "response_digest": row["response_digest"],
+            "arguments_digest": _as_qualified_digest(str(row["arguments_digest"])),
+            "exchange_digest": row["exchange_digest"],
+            "objective_observation_digest": row["objective_observation_digest"],
+            "objective_matched": row["objective_matched"],
+            "plan": dict(row["strategy_plan"]),  # type: ignore[arg-type]
+            "target_reply": row["target_reply"],
+            "target_reply_digest": row["target_reply_digest"],
+            "tool_content": row["tool_content"],
+        }
+        for row in rows
+    )
+
+
 def _hydra_checkpoint_digest(value: object) -> str:
     """Match the canonical digest written and validated by ``HydraPlan``."""
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -1342,32 +1365,77 @@ class DurableSchedulerStore:
                WHERE schedule_id = %s AND assignment_id = %s""",
             (schedule_id, assignment_id),
         ).fetchone()
-        receipt_steps = tuple(
-            {
-                "index": row["step_index"],
-                "call_id": row["call_id"],
-                "telemetry_digest": row["telemetry_digest"],
-                "strategy_ids": tuple(row["strategy_ids"]),
-                "response_digest": row["response_digest"],
-                "arguments_digest": _as_qualified_digest(row["arguments_digest"]),
-                "exchange_digest": row["exchange_digest"],
-                "objective_observation_digest": row["objective_observation_digest"],
-                "objective_matched": row["objective_matched"],
-                "plan": dict(row["strategy_plan"]),
-                "target_reply": row["target_reply"],
-                "target_reply_digest": row["target_reply_digest"],
-                "tool_content": row["tool_content"],
-            }
-            for row in rows
-        )
+        receipt_steps = _goat_receipt_steps(rows)
         adopted_pending: dict[str, object] = {}
+        adoption_recovery: dict[str, object] = {}
         if terminal is None and isinstance(pending_state, Mapping):
             pending_call_id = pending_state.get("pending_call_id")
             pending_arguments = pending_state.get("pending_arguments")
             pending_digest = pending_state.get("pending_arguments_digest")
             checkpoint_steps = pending_state.get("steps")
             old_attempt_id = pending_state.get("attempt_id")
-            replacement_lineage = self.replacement_attempt_lineage(current_attempt_id)
+            replacement_lineage = self.replacement_attempt_lineage(current_attempt_id, limit=257)
+            checkpoint_lineage_index = (
+                replacement_lineage.index(old_attempt_id)
+                if isinstance(old_attempt_id, str) and old_attempt_id in replacement_lineage[:-1]
+                else None
+            )
+            intervening_attempt_ids = (
+                replacement_lineage[checkpoint_lineage_index + 1 : -1]
+                if checkpoint_lineage_index is not None
+                else ()
+            )
+            intervening_attempts = (
+                self.connection.execute(
+                    """SELECT id, schedule_id, node_id, state
+                       FROM merlin_storage.scheduler_attempts
+                       WHERE id = ANY(%s)""",
+                    (list(intervening_attempt_ids),),
+                ).fetchall()
+                if intervening_attempt_ids
+                else ()
+            )
+            intervening_effect = (
+                self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.tool_effects
+                       WHERE attempt_id = ANY(%s) LIMIT 1""",
+                    (list(intervening_attempt_ids),),
+                ).fetchone()
+                if intervening_attempt_ids
+                else None
+            )
+            intervening_permit = (
+                self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.target_effect_permits
+                       WHERE attempt_id = ANY(%s) LIMIT 1""",
+                    (list(intervening_attempt_ids),),
+                ).fetchone()
+                if intervening_attempt_ids
+                else None
+            )
+            intervening_result = (
+                self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.scheduler_results
+                       WHERE attempt_id = ANY(%s) LIMIT 1""",
+                    (list(intervening_attempt_ids),),
+                ).fetchone()
+                if intervening_attempt_ids
+                else None
+            )
+            bounded_checkpoint_ancestor = bool(
+                checkpoint_lineage_index is not None
+                and len(replacement_lineage) <= 256
+                and len(intervening_attempts) == len(intervening_attempt_ids)
+                and all(
+                    str(row["schedule_id"]) == schedule_id
+                    and row["node_id"] == f"worker:{assignment_id}"
+                    and row["state"] == "expired"
+                    for row in intervening_attempts
+                )
+                and intervening_effect is None
+                and intervening_permit is None
+                and intervening_result is None
+            )
             normalized_checkpoint_steps = (
                 tuple(
                     {
@@ -1436,8 +1504,7 @@ class DurableSchedulerStore:
             if (
                 pending_state.get("schema") == "merlin.goat-state.v1"
                 and isinstance(old_attempt_id, str)
-                and replacement_lineage[:-1]
-                and old_attempt_id == replacement_lineage[-2]
+                and bounded_checkpoint_ancestor
                 and pending_state.get("contract_digest") == _qualified_digest(contract)
                 and pending_state.get("semantic_technique_id") == contract["semantic_technique_id"]
                 and normalized_checkpoint_steps == receipt_steps
@@ -1457,6 +1524,12 @@ class DurableSchedulerStore:
                     "pending_arguments": dict(pending_arguments),
                     "pending_arguments_digest": pending_digest,
                 }
+                adoption_recovery = {
+                    "prior_attempt_id": replacement_lineage[-2],
+                    "checkpoint_attempt_id": old_attempt_id,
+                    "effect_ids": tuple(sorted(str(row["effect_id"]) for row in rows)),
+                    "receipt_digests": tuple(str(row["receipt_digest"]) for row in rows),
+                }
         return {
             "schema": "merlin.goat-state.v1",
             "contract_digest": _qualified_digest(contract),
@@ -1475,8 +1548,413 @@ class DurableSchedulerStore:
             "recovery": {
                 "decision": "not-started" if not rows else "acknowledged-target-turn",
                 "exchange_digest": None if not rows else rows[-1]["exchange_digest"],
+                **adoption_recovery,
             },
         }
+
+    @_serialized
+    def adopt_goat_target_lane(
+        self,
+        schedule_id: str,
+        node_id: str,
+        attempt_id: str,
+        generation: int,
+        *,
+        target_admission: Mapping[str, object],
+        recovery: Mapping[str, object],
+    ) -> str:
+        """Adopt one receipt-authenticated GOAT prefix onto its replacement attempt."""
+
+        body = {key: value for key, value in recovery.items() if key != "recovery_digest"}
+        effect_ids = recovery.get("effect_ids")
+        receipt_digests = recovery.get("receipt_digests")
+        prior_attempt_id = recovery.get("prior_attempt_id")
+        checkpoint_attempt_id = recovery.get("checkpoint_attempt_id")
+        pending_call_id = recovery.get("pending_call_id")
+        pending_arguments_digest = recovery.get("pending_arguments_digest")
+        if (
+            set(recovery)
+            != {
+                "schema",
+                "prior_attempt_id",
+                "checkpoint_attempt_id",
+                "effect_ids",
+                "receipt_digests",
+                "pending_call_id",
+                "pending_arguments_digest",
+                "recovery_digest",
+            }
+            or recovery.get("schema") != "merlin.goat-target-lane-adoption.v1"
+            or not isinstance(prior_attempt_id, str)
+            or not prior_attempt_id
+            or not isinstance(checkpoint_attempt_id, str)
+            or not checkpoint_attempt_id
+            or not isinstance(effect_ids, (list, tuple))
+            or not effect_ids
+            or len(effect_ids) > 256
+            or any(not isinstance(item, str) or not item for item in effect_ids)
+            or tuple(effect_ids) != tuple(sorted(set(effect_ids)))
+            or not isinstance(receipt_digests, (list, tuple))
+            or len(receipt_digests) != len(effect_ids)
+            or any(
+                not isinstance(item, str) or not item.startswith("sha256:") or len(item) != 71
+                for item in receipt_digests
+            )
+            or not isinstance(pending_call_id, str)
+            or not pending_call_id
+            or len(pending_call_id) > 256
+            or not isinstance(pending_arguments_digest, str)
+            or not pending_arguments_digest.startswith("sha256:")
+            or len(pending_arguments_digest) != 71
+            or recovery.get("recovery_digest") != _qualified_digest(body)
+        ):
+            raise ValueError("GOAT target lane adoption receipt is invalid")
+        with self.connection.transaction():
+            campaign, assignment, _schedule = self._target_admission_scope_locked(
+                schedule_id, node_id, target_admission
+            )
+            contract = _goat_contract_value(assignment)
+            target_session_id = target_admission.get("target_session_id")
+            if (
+                assignment.get("strategy_id") != "goat"
+                or contract is None
+                or contract.get("session_policy") != "same-reviewed-session"
+                or not isinstance(target_session_id, str)
+                or not target_session_id
+            ):
+                raise TargetAdmissionLatchedError(
+                    "GOAT target lane adoption lacks exact session authority"
+                )
+            attempt = self._lock_attempt(attempt_id, generation)
+            current = self.connection.execute(
+                """SELECT replaced_attempt_id
+                   FROM merlin_storage.scheduler_attempts WHERE id = %s""",
+                (attempt_id,),
+            ).fetchone()
+            lineage = self.connection.execute(
+                """WITH RECURSIVE lineage AS (
+                       SELECT id, schedule_id, node_id, generation, state,
+                              replaced_attempt_id, 1 AS depth
+                       FROM merlin_storage.scheduler_attempts WHERE id = %s
+                       UNION ALL
+                       SELECT prior.id, prior.schedule_id, prior.node_id, prior.generation,
+                              prior.state, prior.replaced_attempt_id, lineage.depth + 1
+                       FROM merlin_storage.scheduler_attempts AS prior
+                       JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                       WHERE lineage.depth < 256
+                   )
+                   SELECT * FROM lineage ORDER BY depth""",
+                (prior_attempt_id,),
+            ).fetchall()
+            lineage_ids = tuple(str(row["id"]) for row in lineage)
+            adoption_attempt_ids = (*lineage_ids, attempt_id)
+            lineage_generation = {str(row["id"]): int(row["generation"]) for row in lineage}
+            checkpoint_lineage_index = (
+                lineage_ids.index(checkpoint_attempt_id)
+                if checkpoint_attempt_id in lineage_ids
+                else None
+            )
+            intervening_attempt_ids = (
+                lineage_ids[:checkpoint_lineage_index]
+                if checkpoint_lineage_index is not None
+                else ()
+            )
+            intervening_authority = (
+                self.connection.execute(
+                    """SELECT 1 FROM merlin_storage.tool_effects
+                       WHERE attempt_id = ANY(%s)
+                       UNION ALL
+                       SELECT 1 FROM merlin_storage.target_effect_permits
+                       WHERE attempt_id = ANY(%s)
+                       UNION ALL
+                       SELECT 1 FROM merlin_storage.scheduler_results
+                       WHERE attempt_id = ANY(%s)
+                       LIMIT 1""",
+                    (
+                        list(intervening_attempt_ids),
+                        list(intervening_attempt_ids),
+                        list(intervening_attempt_ids),
+                    ),
+                ).fetchone()
+                if intervening_attempt_ids
+                else None
+            )
+            blank_lane = self._target_admission_latch_locked(
+                str(campaign["id"]), str(target_admission["target_id"]), None
+            )
+            physical_lane = self._target_admission_latch_locked(
+                str(campaign["id"]), str(target_admission["target_id"]), target_session_id
+            )
+            terminal = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.goat_terminal_receipts
+                   WHERE schedule_id = %s AND assignment_id = %s""",
+                (schedule_id, assignment["id"]),
+            ).fetchone()
+            receipts = self.connection.execute(
+                """SELECT * FROM merlin_storage.goat_step_receipts
+                   WHERE schedule_id = %s AND assignment_id = %s
+                   ORDER BY step_index""",
+                (schedule_id, assignment["id"]),
+            ).fetchall()
+            receipt_effect_ids = tuple(str(row["effect_id"]) for row in receipts)
+            receipt_by_effect = {str(row["effect_id"]): row for row in receipts}
+            effects = self.connection.execute(
+                """SELECT attempt_id, idempotency_key, state, session_id, agent_id,
+                          campaign_id, target_id, tool_name, effect, arguments_digest,
+                          call_id, result_is_error, result_metadata
+                   FROM merlin_storage.tool_effects
+                   WHERE attempt_id = ANY(%s) AND effect = 'target_network'
+                   ORDER BY idempotency_key""",
+                (list(adoption_attempt_ids),),
+            ).fetchall()
+            permits = self.connection.execute(
+                """SELECT attempt_id, idempotency_key, state, campaign_id, session_id,
+                          target_id, target_session_id, schedule_id, node_id, assignment_id,
+                          generation, call_id, tool_name, arguments_digest
+                   FROM merlin_storage.target_effect_permits
+                   WHERE attempt_id = ANY(%s)
+                   ORDER BY idempotency_key FOR UPDATE""",
+                (list(adoption_attempt_ids),),
+            ).fetchall()
+            permit_by_effect = {str(row["idempotency_key"]): row for row in permits}
+            predecessor_checkpoint = self.connection.execute(
+                """SELECT payload #> '{worker_checkpoint,strategy_state}' AS state
+                   FROM merlin_storage.scheduler_results
+                   WHERE attempt_id = %s AND schema_id = 'schema/partial-result'""",
+                (checkpoint_attempt_id,),
+            ).fetchone()
+            checkpoint_state = (
+                predecessor_checkpoint["state"]
+                if predecessor_checkpoint is not None
+                and isinstance(predecessor_checkpoint["state"], Mapping)
+                else None
+            )
+            checkpoint_steps = (
+                tuple(
+                    {
+                        **dict(item),
+                        "strategy_ids": tuple(item.get("strategy_ids", ())),
+                    }
+                    for item in checkpoint_state.get("steps", ())
+                )
+                if isinstance(checkpoint_state, Mapping)
+                and isinstance(checkpoint_state.get("steps"), Sequence)
+                and not isinstance(checkpoint_state.get("steps"), (str, bytes))
+                and all(isinstance(item, Mapping) for item in checkpoint_state.get("steps", ()))
+                else None
+            )
+            pending_arguments = (
+                checkpoint_state.get("pending_arguments")
+                if isinstance(checkpoint_state, Mapping)
+                else None
+            )
+            receipt_steps = _goat_receipt_steps(receipts)
+            pending_effect = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.tool_effects
+                   WHERE attempt_id = ANY(%s) AND call_id = %s LIMIT 1""",
+                (list(adoption_attempt_ids), pending_call_id),
+            ).fetchone()
+            pending_permit = self.connection.execute(
+                """SELECT 1 FROM merlin_storage.target_effect_permits
+                   WHERE attempt_id = ANY(%s) AND call_id = %s LIMIT 1""",
+                (list(adoption_attempt_ids), pending_call_id),
+            ).fetchone()
+
+            def exact_terminal_effect(row: Mapping[str, object]) -> bool:
+                effect_id = str(row["idempotency_key"])
+                receipt = receipt_by_effect.get(effect_id)
+                permit = permit_by_effect.get(effect_id)
+                metadata = row.get("result_metadata")
+                return bool(
+                    receipt is not None
+                    and permit is not None
+                    and str(receipt["scheduler_attempt_id"]) == str(row["attempt_id"])
+                    and receipt["target_session_id"] == target_session_id
+                    and receipt["arguments_digest"] == row["arguments_digest"]
+                    and row["state"] in {"acknowledged", "reconciled"}
+                    and row["result_is_error"] is False
+                    and row["session_id"] == campaign["session_id"]
+                    and row["agent_id"] == assignment["id"]
+                    and row["campaign_id"] == campaign["id"]
+                    and row["target_id"] == target_admission["target_id"]
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("target_session_id") == target_session_id
+                    and permit["state"] == "terminal"
+                    and permit["attempt_id"] == row["attempt_id"]
+                    and permit["campaign_id"] == campaign["id"]
+                    and permit["session_id"] == campaign["session_id"]
+                    and permit["target_id"] == target_admission["target_id"]
+                    and permit["target_session_id"] == target_session_id
+                    and str(permit["schedule_id"]) == schedule_id
+                    and permit["node_id"] == node_id
+                    and permit["assignment_id"] == assignment["id"]
+                    and permit["generation"] == lineage_generation.get(str(row["attempt_id"]))
+                    and permit["call_id"] == row["call_id"]
+                    and permit["tool_name"] == row["tool_name"]
+                    and permit["arguments_digest"] == row["arguments_digest"]
+                )
+
+            if (
+                str(attempt["schedule_id"]) != schedule_id
+                or attempt["node_id"] != node_id
+                or current is None
+                or str(current["replaced_attempt_id"]) != prior_attempt_id
+                or not lineage
+                or checkpoint_lineage_index is None
+                or intervening_authority is not None
+                or len(lineage) >= 256
+                and lineage[-1]["replaced_attempt_id"] is not None
+                or any(
+                    str(row["schedule_id"]) != schedule_id
+                    or row["node_id"] != node_id
+                    or row["state"] != "expired"
+                    for row in lineage
+                )
+                or blank_lane is None
+                or blank_lane.get("state") != "open"
+                or str(blank_lane.get("lane_schedule_id")) != schedule_id
+                or blank_lane.get("lane_node_id") != node_id
+                or blank_lane.get("lane_assignment_id") != assignment["id"]
+                or str(blank_lane.get("lane_attempt_id")) != attempt_id
+                or blank_lane.get("lane_generation") != generation
+                or blank_lane.get("lane_recovery_required") != bool(intervening_attempt_ids)
+                or (
+                    str(blank_lane.get("lane_recovery_root_attempt_id"))
+                    if intervening_attempt_ids
+                    else blank_lane.get("lane_recovery_root_attempt_id")
+                )
+                != (intervening_attempt_ids[-1] if intervening_attempt_ids else None)
+                or physical_lane is None
+                or physical_lane.get("state") != "open"
+                or str(physical_lane.get("lane_schedule_id")) != schedule_id
+                or physical_lane.get("lane_node_id") != node_id
+                or physical_lane.get("lane_assignment_id") != assignment["id"]
+                or str(physical_lane.get("lane_attempt_id")) != checkpoint_attempt_id
+                or physical_lane.get("lane_generation")
+                != lineage_generation.get(checkpoint_attempt_id)
+                or physical_lane.get("lane_recovery_required") is not True
+                or str(physical_lane.get("lane_recovery_root_attempt_id")) != lineage_ids[-1]
+                or not isinstance(checkpoint_state, Mapping)
+                or checkpoint_state.get("schema") != "merlin.goat-state.v1"
+                or checkpoint_state.get("attempt_id") != checkpoint_attempt_id
+                or checkpoint_state.get("target_session_id") != target_session_id
+                or checkpoint_steps != receipt_steps
+                or checkpoint_state.get("pending_call_id") != pending_call_id
+                or checkpoint_state.get("pending_arguments_digest") != pending_arguments_digest
+                or not isinstance(pending_arguments, Mapping)
+                or _goat_checkpoint_digest(dict(pending_arguments)) != pending_arguments_digest
+                or terminal is not None
+                or not receipts
+                or len(receipts) >= int(contract["target_turns"])
+                or tuple(int(row["step_index"]) for row in receipts) != tuple(range(len(receipts)))
+                or len({str(row["target_session_id"]) for row in receipts}) != 1
+                or receipts[-1]["target_session_id"] != target_session_id
+                or any(str(row["scheduler_attempt_id"]) not in lineage_ids for row in receipts)
+                or tuple(sorted(receipt_effect_ids)) != tuple(effect_ids)
+                or tuple(str(row["receipt_digest"]) for row in receipts) != tuple(receipt_digests)
+                or tuple(str(row["idempotency_key"]) for row in effects) != tuple(effect_ids)
+                or tuple(str(row["idempotency_key"]) for row in permits) != tuple(effect_ids)
+                or any(not exact_terminal_effect(row) for row in effects)
+                or pending_effect is not None
+                or pending_permit is not None
+            ):
+                raise TargetAdmissionLatchedError(
+                    "GOAT target lane adoption does not match durable receipt authority"
+                )
+            cleared = self.connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_schedule_id = NULL, lane_node_id = NULL,
+                       lane_assignment_id = NULL, lane_attempt_id = NULL,
+                       lane_generation = NULL, lane_recovery_required = false,
+                       lane_recovery_root_attempt_id = NULL,
+                       revision = revision + 1, updated_at = now()
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = ''
+                     AND lane_attempt_id = %s AND lane_generation = %s
+                     AND lane_recovery_required = %s
+                     AND lane_recovery_root_attempt_id IS NOT DISTINCT FROM %s""",
+                (
+                    campaign["id"],
+                    target_admission["target_id"],
+                    attempt_id,
+                    generation,
+                    bool(intervening_attempt_ids),
+                    intervening_attempt_ids[-1] if intervening_attempt_ids else None,
+                ),
+            )
+            rebound = self.connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_attempt_id = %s, lane_generation = %s,
+                       lane_recovery_required = false,
+                       revision = revision + 1, updated_at = now()
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s
+                     AND lane_attempt_id = %s AND lane_recovery_required = true""",
+                (
+                    attempt_id,
+                    generation,
+                    campaign["id"],
+                    target_admission["target_id"],
+                    target_session_id,
+                    checkpoint_attempt_id,
+                ),
+            )
+            if cleared.rowcount != 1 or rebound.rowcount != 1:
+                raise TargetAdmissionLatchedError(
+                    "GOAT target lane ownership changed during adoption"
+                )
+            rebound_state = {
+                "schema": "merlin.goat-state.v1",
+                "contract_digest": _qualified_digest(contract),
+                "semantic_technique_id": contract["semantic_technique_id"],
+                "attempt_id": attempt_id,
+                "target_session_id": target_session_id,
+                "steps": receipt_steps,
+                "pending_call_id": pending_call_id,
+                "pending_arguments": dict(pending_arguments),
+                "pending_arguments_digest": pending_arguments_digest,
+                "terminal_reason": None,
+            }
+            rebound_payload = {
+                "worker_checkpoint": {
+                    "strategy_state": rebound_state,
+                    "effect_observed": True,
+                }
+            }
+            rebound_jsonb, rebound_digest = _bounded_schedule_jsonb(
+                rebound_payload, artifact="result"
+            )
+            checkpoint_inserted = self.connection.execute(
+                """INSERT INTO merlin_storage.scheduler_results
+                       (attempt_id, schedule_id, node_id, generation, schema_id,
+                        payload, payload_digest)
+                   VALUES (%s, %s, %s, %s, 'schema/partial-result', %s, %s)
+                   ON CONFLICT (attempt_id) DO NOTHING RETURNING attempt_id""",
+                (
+                    attempt_id,
+                    schedule_id,
+                    node_id,
+                    generation,
+                    rebound_jsonb,
+                    rebound_digest,
+                ),
+            ).fetchone()
+            if checkpoint_inserted is None:
+                raise TargetAdmissionLatchedError(
+                    "GOAT target lane adoption found an existing replacement result"
+                )
+            self._append_event(
+                schedule_id,
+                "goat_target_lane_adopted",
+                {
+                    "node_id": node_id,
+                    "attempt_id": attempt_id,
+                    "generation": generation,
+                    "prior_attempt_id": prior_attempt_id,
+                    "checkpoint_attempt_id": checkpoint_attempt_id,
+                    "target_session_id": target_session_id,
+                    "recovery_digest": recovery["recovery_digest"],
+                },
+            )
+            return target_session_id
 
     def _persist_hydra_select_plan(
         self,

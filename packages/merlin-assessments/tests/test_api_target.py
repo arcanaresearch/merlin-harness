@@ -567,6 +567,66 @@ async def test_reviewed_api_resolver_drives_initial_permitted_delivery(
 
 
 @pytest.mark.asyncio
+async def test_reviewed_api_resolver_rejects_predecessor_session_from_other_assignment(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    compilation = compile_target_adapter(adapter)
+    campaign_id = "campaign/api-session-resolution-foreign-assignment"
+    calls: list[str] = []
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            sessions = _prepare(connection, campaign_id)
+            predecessor = sessions.create(
+                campaign_id,
+                "target-refund",
+                compiled_target_adapter_digest(compilation),
+                session_scope_id=_reviewed_session_scope_id(
+                    f"{campaign_id}/other-assignment",
+                    attempt_id="attempt-1",
+                ),
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: (
+                        calls.append(request.url.path)
+                        or httpx.Response(500, text="must not be called")
+                    )
+                )
+            ) as client:
+                tool = ReviewedApiTargetTool(
+                    sessions,
+                    lambda _campaign_id: adapter,
+                    {"target-token": "opaque-secret"},
+                    client=client,
+                )
+                context = _sealed_context(campaign_id, adapter).model_copy(
+                    update={
+                        "attempt_id": "attempt-2",
+                        "expected_target_session_id": predecessor.target_session_id,
+                    }
+                )
+                resolved = await tool.resolve_target_session_id(context)
+                result = await tool.invoke(context, {"input": "must not dispatch"})
+                current = sessions.load(
+                    campaign_id,
+                    target_id="target-refund",
+                    session_scope_id=_reviewed_session_scope_id(
+                        str(context.agent_id),
+                        attempt_id=context.attempt_id,
+                    ),
+                )
+
+    assert resolved is None
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert result.metadata["expected_target_session_id"] == predecessor.target_session_id
+    assert current is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_reviewed_api_resolver_rejects_cleaned_generation_drift_before_http(
     tmp_path: Path,
 ) -> None:

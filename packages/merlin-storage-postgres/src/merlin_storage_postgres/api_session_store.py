@@ -115,6 +115,39 @@ class CampaignApiSessionRepository(StateScopeRepository):
             raise ValueError("campaign API session target identity is ambiguous")
         return None if not rows else self._record(rows[0])
 
+    def load_target_session(
+        self,
+        campaign_id: str,
+        *,
+        target_id: str,
+        target_session_id: str,
+    ) -> CampaignApiSession | None:
+        """Load one exact durable target-session identity without changing ownership."""
+
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT * FROM merlin_storage.campaign_api_sessions
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND CASE
+                         WHEN session_scope_id = %s
+                         THEN 'api:' || campaign_id || ':' || target_id
+                              || ':generation:' || generation::text
+                         ELSE 'api:' || campaign_id || ':' || target_id
+                              || ':scope:' || session_scope_id
+                              || ':generation:' || generation::text
+                     END = %s
+                   LIMIT 2""",
+                (
+                    campaign_id,
+                    target_id,
+                    LEGACY_API_SESSION_SCOPE_ID,
+                    target_session_id,
+                ),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("campaign API target-session identity is ambiguous")
+        return None if not rows else self._record(rows[0])
+
     def list_for_campaign(
         self,
         campaign_id: str,

@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from merlin_agents.goat import (
     GOAT_TOOLBOX_CATALOG_DIGEST,
     GoatContract,
@@ -11,13 +12,17 @@ from merlin_agents.goat import (
 )
 from merlin_contracts import ToolEffectRecord, ToolEffectState
 from merlin_storage_postgres import (
+    CampaignStore,
     Database,
     DatabaseConfig,
     DurableSchedulerStore,
     MigrationRunner,
+    PostgresToolEffectStore,
     SessionRepository,
     ToolEffectRepository,
 )
+from merlin_storage_postgres.scheduler_store import TargetAdmissionLatchedError
+from psycopg.types.json import Jsonb
 
 
 def digest(value: object) -> str:
@@ -92,6 +97,439 @@ def _observation(review: GoatContract, matched: bool) -> dict[str, object]:
     }
     value["observation_digest"] = digest(value)
     return value
+
+
+def _goat_target_admission(
+    *,
+    campaign_id: str,
+    session_id: str,
+    schedule_id: str,
+    assignment_id: str,
+    adapter_digest: str,
+) -> dict[str, object]:
+    return {
+        "schema": "merlin.target-admission.v1",
+        "campaign_id": campaign_id,
+        "session_id": session_id,
+        "schedule_id": schedule_id,
+        "node_id": f"worker:{assignment_id}",
+        "assignment_id": assignment_id,
+        "target_id": "target-1",
+        "strategy_id": "goat",
+        "reviewed_adapter_digest": adapter_digest,
+        "target_effect_tool_ids": ("target_request",),
+        "target_exchange_tool_ids": ("target_request",),
+    }
+
+
+def _goat_adoption_receipt(recovered: dict[str, object]) -> dict[str, object]:
+    recovery = recovered["recovery"]
+    assert isinstance(recovery, dict)
+    body = {
+        "schema": "merlin.goat-target-lane-adoption.v1",
+        "prior_attempt_id": recovery["prior_attempt_id"],
+        "checkpoint_attempt_id": recovery["checkpoint_attempt_id"],
+        "effect_ids": list(recovery["effect_ids"]),
+        "receipt_digests": list(recovery["receipt_digests"]),
+        "pending_call_id": recovered["pending_call_id"],
+        "pending_arguments_digest": recovered["pending_arguments_digest"],
+    }
+    return {**body, "recovery_digest": digest(body)}
+
+
+def _expire_attempt(store: DurableSchedulerStore, connection, attempt) -> None:
+    connection.execute(
+        "UPDATE merlin_storage.scheduler_attempts "
+        "SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+        (attempt.id,),
+    )
+    connection.commit()
+    store.expire(attempt.id, attempt.generation)
+
+
+async def _prepare_goat_lane_adoption_case(connection) -> dict[str, object]:
+    review, values = _contract()
+    campaign_id = "campaign/goat-lane-adoption"
+    assignment_id = f"{campaign_id}/goat/one"
+    assignment = {
+        "id": assignment_id,
+        "strategy_id": "goat",
+        "strategy_contract": sorted(values.items()),
+        "technique_ids": ["case:goat"],
+        "target_profile_id": "target-1",
+        "tool_ids": ["target_request"],
+        "reviewed_adapter_digest": review.reviewed_adapter_digest,
+        "comparison_supported": True,
+        "provider_id": "test",
+        "provider_model": "test",
+    }
+    session = SessionRepository(connection).create("GOAT lane adoption")
+    store = DurableSchedulerStore(connection)
+    node_id = f"worker:{assignment_id}"
+    schedule_id = store.create_schedule(
+        session.id,
+        {"assignments": [assignment]},
+        {"completed": []},
+        [node_id],
+        ready_nodes=[node_id],
+    )
+    CampaignStore(connection).prepare(
+        campaign_id,
+        str(session.id),
+        {"manifest": {"id": campaign_id, "target": {"id": "target-1"}}},
+        "sha256:reviewed",
+    )
+    admission = _goat_target_admission(
+        campaign_id=campaign_id,
+        session_id=str(session.id),
+        schedule_id=schedule_id,
+        assignment_id=assignment_id,
+        adapter_digest=review.reviewed_adapter_digest,
+    )
+    first = store.claim(
+        schedule_id,
+        node_id,
+        "agent-one",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        target_admission=admission,
+    )
+    plan = {
+        "observation": "first observation",
+        "thought": "first thought",
+        "strategy": ["hypothetical"],
+        "response": "first response",
+    }
+    arguments = {
+        "input": plan["response"],
+        "strategy_plan": plan,
+        "strategy_turn_index": 0,
+    }
+    effect = ToolEffectRecord(
+        idempotency_key=sha256(b"goat-lane-first-effect").hexdigest(),
+        session_id=str(session.id),
+        call_id="call-first",
+        agent_id=assignment_id,
+        attempt_id=first.id,
+        campaign_id=campaign_id,
+        target_id="target-1",
+        tool_name="target_request",
+        effect="target_network",
+        arguments_digest=sha256(
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        arguments_payload=arguments,
+        state=ToolEffectState.INTENT,
+    )
+    target_session_id = "api:goat-lane"
+    physical_admission = {**admission, "target_session_id": target_session_id}
+    permit_digest = store.final_target_effect_admitted(
+        schedule_id,
+        node_id,
+        first.id,
+        first.generation,
+        tool_name=effect.tool_name,
+        call_id=effect.call_id,
+        target_admission=physical_admission,
+        effect_intent=effect.model_dump(mode="json"),
+    )
+    effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+    adopted, adopted_now = await effects.adopt_permitted(effect, permit_digest)
+    assert adopted_now is True
+    await effects.finish(
+        adopted.model_copy(
+            update={
+                "state": ToolEffectState.ACKNOWLEDGED,
+                "result_content": "first reply",
+                "result_is_error": False,
+                "result_metadata": {
+                    "campaign_id": campaign_id,
+                    "target_profile_id": "target-1",
+                    "target_session_id": target_session_id,
+                    "target_exchanges": [
+                        {
+                            "id": "exchange-first",
+                            "interaction": True,
+                            "cleanup": False,
+                            "response": {"reply": "first reply"},
+                            "oracle_observations": [_observation(review, False)],
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    durable = store.goat_state(schedule_id, assignment_id, first.id)
+    assert durable is not None
+    pending_arguments = {
+        "input": "pending response",
+        "strategy_plan": {
+            "observation": "pending observation",
+            "thought": "pending thought",
+            "strategy": ["hypothetical"],
+            "response": "pending response",
+        },
+        "strategy_turn_index": 1,
+    }
+    pending = GoatState.restore(durable, review, first.id).with_pending(
+        review, "call-pending", pending_arguments
+    )
+    store.commit_partial(
+        first.id,
+        first.generation,
+        result={"worker_checkpoint": {"strategy_state": pending.dump()}},
+    )
+    _expire_attempt(store, connection, first)
+    replacement = store.claim(
+        schedule_id,
+        node_id,
+        "agent-two",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        target_admission=admission,
+    )
+    recovered = store.goat_state(
+        schedule_id,
+        assignment_id,
+        replacement.id,
+        pending.dump(),
+    )
+    assert recovered is not None
+    return {
+        "store": store,
+        "schedule_id": schedule_id,
+        "node_id": node_id,
+        "assignment_id": assignment_id,
+        "campaign_id": campaign_id,
+        "session_id": str(session.id),
+        "admission": admission,
+        "physical_admission": physical_admission,
+        "first": first,
+        "replacement": replacement,
+        "recovered": recovered,
+    }
+
+
+@pytest.mark.asyncio
+async def test_goat_lane_adoption_rebinds_checkpoint_across_two_consecutive_crashes(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-goat-lane-rebind")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            case = await _prepare_goat_lane_adoption_case(connection)
+            store = case["store"]
+            assert isinstance(store, DurableSchedulerStore)
+            current = case["replacement"]
+            recovered = case["recovered"]
+            assert isinstance(recovered, dict)
+
+            generic_body = {
+                "schema": "merlin.target-lane-recovery.v1",
+                "prior_attempt_id": case["first"].id,
+                "effect_ids": list(recovered["recovery"]["effect_ids"]),
+                "outcome": "no_material_transition",
+            }
+            with pytest.raises(TargetAdmissionLatchedError):
+                store.resolve_target_lane_recovery(
+                    case["schedule_id"],
+                    case["node_id"],
+                    current.id,
+                    current.generation,
+                    target_admission=case["physical_admission"],
+                    recovery={**generic_body, "recovery_digest": digest(generic_body)},
+                )
+
+            for crash_index in range(2):
+                adopted_session = store.adopt_goat_target_lane(
+                    case["schedule_id"],
+                    case["node_id"],
+                    current.id,
+                    current.generation,
+                    target_admission=case["physical_admission"],
+                    recovery=_goat_adoption_receipt(recovered),
+                )
+                assert adopted_session == case["physical_admission"]["target_session_id"]
+                checkpoint = connection.execute(
+                    """SELECT payload #> '{worker_checkpoint,strategy_state}' AS state
+                       FROM merlin_storage.scheduler_results WHERE attempt_id = %s""",
+                    (current.id,),
+                ).fetchone()
+                assert checkpoint is not None
+                rebound_state = checkpoint["state"]
+                assert rebound_state["attempt_id"] == current.id
+                assert rebound_state["pending_call_id"] == "call-pending"
+
+                _expire_attempt(store, connection, current)
+                current = store.claim(
+                    case["schedule_id"],
+                    case["node_id"],
+                    f"agent-after-adoption-{crash_index}",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=case["admission"],
+                )
+                recovered = store.goat_state(
+                    case["schedule_id"],
+                    case["assignment_id"],
+                    current.id,
+                    rebound_state,
+                )
+                assert recovered is not None
+                assert recovered["attempt_id"] == current.id
+                assert recovered["pending_call_id"] == "call-pending"
+
+
+@pytest.mark.asyncio
+async def test_goat_lane_adoption_crosses_two_consecutive_pre_adoption_crashes(
+    tmp_path: Path,
+) -> None:
+    with Database(
+        DatabaseConfig(data_dir=tmp_path / "postgres-goat-lane-pre-adoption")
+    ) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            case = await _prepare_goat_lane_adoption_case(connection)
+            store = case["store"]
+            assert isinstance(store, DurableSchedulerStore)
+            current = case["replacement"]
+            recovered = case["recovered"]
+            assert isinstance(recovered, dict)
+            original = connection.execute(
+                """SELECT payload #> '{worker_checkpoint,strategy_state}' AS state
+                   FROM merlin_storage.scheduler_results WHERE attempt_id = %s""",
+                (case["first"].id,),
+            ).fetchone()
+            assert original is not None
+            original_state = original["state"]
+
+            for crash_index in range(2):
+                assert recovered["recovery"]["checkpoint_attempt_id"] == case["first"].id
+                assert recovered["recovery"]["prior_attempt_id"] == current.replaced_attempt_id
+                _expire_attempt(store, connection, current)
+                current = store.claim(
+                    case["schedule_id"],
+                    case["node_id"],
+                    f"agent-before-adoption-{crash_index}",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=case["admission"],
+                )
+                recovered = store.goat_state(
+                    case["schedule_id"],
+                    case["assignment_id"],
+                    current.id,
+                    original_state,
+                )
+                assert recovered is not None
+                assert recovered["pending_call_id"] == "call-pending"
+
+            adopted_session = store.adopt_goat_target_lane(
+                case["schedule_id"],
+                case["node_id"],
+                current.id,
+                current.generation,
+                target_admission=case["physical_admission"],
+                recovery=_goat_adoption_receipt(recovered),
+            )
+            assert adopted_session == case["physical_admission"]["target_session_id"]
+            checkpoint = connection.execute(
+                """SELECT payload #> '{worker_checkpoint,strategy_state}' AS state
+                   FROM merlin_storage.scheduler_results WHERE attempt_id = %s""",
+                (current.id,),
+            ).fetchone()
+            assert checkpoint is not None
+            assert checkpoint["state"]["attempt_id"] == current.id
+            assert checkpoint["state"]["pending_call_id"] == "call-pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["pending_digest", "current_effect_and_permit"])
+async def test_goat_lane_adoption_rejects_forged_or_extra_effect_authority(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    with Database(
+        DatabaseConfig(data_dir=tmp_path / f"postgres-goat-lane-reject-{tamper}")
+    ) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            case = await _prepare_goat_lane_adoption_case(connection)
+            store = case["store"]
+            assert isinstance(store, DurableSchedulerStore)
+            replacement = case["replacement"]
+            recovery = _goat_adoption_receipt(case["recovered"])
+            if tamper == "pending_digest":
+                recovery["pending_arguments_digest"] = "sha256:" + "f" * 64
+                recovery["recovery_digest"] = digest(
+                    {key: value for key, value in recovery.items() if key != "recovery_digest"}
+                )
+            else:
+                extra_arguments = {"input": "unreceipted current effect"}
+                extra = ToolEffectRecord(
+                    idempotency_key=sha256(b"goat-current-extra-effect").hexdigest(),
+                    session_id=case["session_id"],
+                    call_id="call-extra-current",
+                    agent_id=case["assignment_id"],
+                    attempt_id=replacement.id,
+                    campaign_id=case["campaign_id"],
+                    target_id="target-1",
+                    tool_name="target_request",
+                    effect="target_network",
+                    arguments_digest=digest(extra_arguments),
+                    arguments_payload=extra_arguments,
+                    state=ToolEffectState.INTENT,
+                )
+                stored, created = ToolEffectRepository(connection).begin(extra)
+                assert created is True
+                connection.execute(
+                    """INSERT INTO merlin_storage.target_effect_permits
+                           (permit_digest, campaign_id, session_id, target_id,
+                            target_session_id, schedule_id, node_id, assignment_id,
+                            attempt_id, generation, call_id, tool_name, effect,
+                            arguments_digest, arguments_payload, idempotency_key, state)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, 'intent')""",
+                    (
+                        digest("extra-current-permit"),
+                        case["campaign_id"],
+                        case["session_id"],
+                        "target-1",
+                        case["physical_admission"]["target_session_id"],
+                        case["schedule_id"],
+                        case["node_id"],
+                        case["assignment_id"],
+                        replacement.id,
+                        replacement.generation,
+                        stored.call_id,
+                        stored.tool_name,
+                        stored.effect,
+                        stored.arguments_digest,
+                        Jsonb(extra_arguments),
+                        stored.idempotency_key,
+                    ),
+                )
+                connection.commit()
+
+            with pytest.raises(TargetAdmissionLatchedError):
+                store.adopt_goat_target_lane(
+                    case["schedule_id"],
+                    case["node_id"],
+                    replacement.id,
+                    replacement.generation,
+                    target_admission=case["physical_admission"],
+                    recovery=recovery,
+                )
+            lanes = {
+                str(row["target_session_id"]): row
+                for row in connection.execute(
+                    """SELECT target_session_id, lane_attempt_id::text,
+                              lane_recovery_required
+                       FROM merlin_storage.target_admission_latches
+                       WHERE campaign_id = %s AND target_id = 'target-1'""",
+                    (case["campaign_id"],),
+                ).fetchall()
+            }
+            assert lanes[""]["lane_attempt_id"] == replacement.id
+            physical = lanes[str(case["physical_admission"]["target_session_id"])]
+            assert physical["lane_attempt_id"] == case["first"].id
+            assert physical["lane_recovery_required"] is True
 
 
 def test_goat_fixed_k_receipts_and_exact_history_survive_restart(tmp_path: Path) -> None:
