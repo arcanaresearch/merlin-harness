@@ -1080,6 +1080,99 @@ def test_campaign_approve_does_not_wait_for_open_preparation_stream(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_campaign_approve_polls_durability_on_detached_observer(monkeypatch) -> None:
+    """An open serialized preparation channel must not hide a durable review."""
+    objective = "Assess detached observer target"
+    digest = "sha256:reviewed"
+    stream_open = asyncio.Event()
+
+    class Observer:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def list_campaigns(self):
+            await stream_open.wait()
+            return (
+                SimpleNamespace(
+                    id="campaign/detached-observer",
+                    objective=objective,
+                    profile="recommended",
+                    status="prepared",
+                    manifest_digest=digest,
+                ),
+            )
+
+        async def campaign_status(self, campaign_id):
+            assert campaign_id == "campaign/detached-observer"
+            return {
+                "campaign_id": campaign_id,
+                "status": "prepared",
+                "manifest_digest": digest,
+                "budget": {"reviewed_limits": {}},
+                "specialist_composition": "opinionated",
+            }
+
+        async def close(self):
+            self.closed = True
+
+    observer = Observer()
+
+    class Client:
+        def __init__(self) -> None:
+            self.approved = False
+            self.execute_calls: list[tuple[str, str]] = []
+
+        def detached_observer(self):
+            return observer
+
+        async def list_campaigns(self):
+            if not stream_open.is_set():
+                return ()
+            await asyncio.Event().wait()
+
+        async def campaign_status(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "status": "executing" if self.approved else "prepared",
+                "manifest_digest": digest,
+                "budget": {"reviewed_limits": {}},
+                "specialist_composition": "opinionated",
+            }
+
+        async def execute_campaign(self, campaign_id, manifest_digest):
+            self.execute_calls.append((campaign_id, manifest_digest))
+            self.approved = True
+            return {"campaign_id": campaign_id, "status": "executing"}
+
+        async def close(self):
+            return None
+
+        async def release_foreground_lease(self):
+            return None
+
+    client = Client()
+
+    async def build_client(*, confirmer=None):
+        assert confirmer is None
+        return client
+
+    async def print_stream(prompt, **_kwargs):
+        if prompt == "/new":
+            return None
+        stream_open.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("merlin_tui.cli._client", build_client)
+    monkeypatch.setattr("merlin_tui.cli._print_stream", print_stream)
+    from merlin_tui.cli import _submit_campaign
+
+    await asyncio.wait_for(_submit_campaign(["--approve", objective]), timeout=0.5)
+
+    assert client.execute_calls == [("campaign/detached-observer", digest)]
+    assert observer.closed is True
+
+
+@pytest.mark.asyncio
 async def test_campaign_approve_uses_durable_reviewed_budget_when_runtime_turns_are_telemetry_only(
     monkeypatch,
 ) -> None:

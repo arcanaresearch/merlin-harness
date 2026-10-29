@@ -1468,6 +1468,10 @@ class LocalControlClient:
         self._lease_id: str | None = None
         self._lease_heartbeat: asyncio.Task[None] | None = None
 
+    def detached_observer(self) -> LocalControlClient:
+        """Return a read-only sibling channel that cannot stop the daemon."""
+        return LocalControlClient(socket_path=self._socket_path)
+
     async def acquire_foreground_lease(self, *, close_notifications: bool = False) -> None:
         """Keep the daemon alive only while this foreground TUI exists."""
         if self._lease_writer is not None:

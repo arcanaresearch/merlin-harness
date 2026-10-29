@@ -976,6 +976,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
     campaign_poll: asyncio.Task[object] | None = None
     campaign_poll_error: BaseException | None = None
     objective_repair_needed: tuple[str, str] | None = None
+    observer_factory = getattr(campaign_client, "detached_observer", None)
+    campaign_observer = observer_factory() if callable(observer_factory) else campaign_client
     try:
         # The preparing model can end a turn before calling assessment_prepare,
         # including after advancing a durable browser-handoff repair obligation.
@@ -1052,7 +1054,11 @@ async def _submit_campaign(arguments: list[str]) -> None:
             campaign_poll_error = None
             while True:
                 if campaign_poll_error is None:
-                    campaign_poll = asyncio.create_task(campaign_client.list_campaigns())
+                    # LocalControlClient serializes one request stream per channel.
+                    # Poll through a detached channel so a provider stream that
+                    # remains open after assessment_prepare cannot hide the durable
+                    # prepared campaign behind itself.
+                    campaign_poll = asyncio.create_task(campaign_observer.list_campaigns())
                     watched = {campaign_poll, preparation}
                     timeout = _CAMPAIGN_POLL_TIMEOUT_SECONDS
                 else:
@@ -1179,7 +1185,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
                         raise SystemExit(
                             "durable prepared campaign omitted its ID or manifest digest"
                         )
-                    status = _plain(await campaign_client.campaign_status(campaign_id))
+                    status = _plain(await campaign_observer.campaign_status(campaign_id))
                     if not isinstance(status, dict) or status.get("status") != "prepared":
                         raise SystemExit("durable campaign left prepared state before approval")
                     status_digest = status.get("manifest_digest")
@@ -1237,6 +1243,8 @@ async def _submit_campaign(arguments: list[str]) -> None:
     finally:
         if campaign_poll is not None and not campaign_poll.done():
             await _bounded_task_teardown(campaign_poll)
+        if campaign_observer is not campaign_client:
+            await _bounded_stream_teardown(campaign_observer.close())
         if not preparation.done():
             await _bounded_task_teardown(preparation)
         # Keep the client that owns the preparation daemon alive through direct
