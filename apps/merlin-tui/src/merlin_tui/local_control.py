@@ -137,6 +137,7 @@ class LocalStorageExhaustedError(RuntimeError):
 
 _BATCHABLE_STREAM_KINDS = frozenset({"status", "content", "thinking"})
 _STARTER_EXIT_GRACE_SECONDS = 0.5
+_LOCAL_CONTROL_CLOSE_TIMEOUT_SECONDS = 1.0
 _RECOVERY_WATCHDOG_SECONDS = 5.0
 _IDLE_SHUTDOWN_CONFIRM_SECONDS = 0.25
 _FOREGROUND_HEARTBEAT_SECONDS = 1.0
@@ -645,8 +646,7 @@ async def serve(
                 reader, writer = await asyncio.open_unix_connection(
                     socket_path, limit=_MAX_FRAME_BYTES + 1
                 )
-                writer.close()
-                await writer.wait_closed()
+                await _close_writer(writer)
                 raise RuntimeError("Merlin daemon is already running")
             except (ConnectionError, OSError):
                 await asyncio.to_thread(socket_path.unlink, missing_ok=True)
@@ -1174,11 +1174,7 @@ async def serve(
                 except (BrokenPipeError, ConnectionError):
                     pass
             finally:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except (BrokenPipeError, ConnectionError):
-                    pass
+                await _close_writer(writer)
 
         server = await asyncio.start_unix_server(handle, socket_path, limit=_MAX_FRAME_BYTES + 1)
         owns_socket = True
@@ -1857,11 +1853,13 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
     """Close a local-control socket without leaking expected peer shutdown errors."""
     writer.close()
     try:
-        await writer.wait_closed()
-    except (BrokenPipeError, ConnectionError, OSError):
+        async with asyncio.timeout(_LOCAL_CONTROL_CLOSE_TIMEOUT_SECONDS):
+            await writer.wait_closed()
+    except (BrokenPipeError, ConnectionError, OSError, TimeoutError):
         # The daemon may have already closed or restarted after delivering the
-        # durable stream cursor. Closing that stale client pipe is cleanup, not
-        # a provider failure and must not abort the operator's turn.
+        # durable stream cursor, or the local transport may never acknowledge
+        # closure. Closing that stale client pipe is bounded cleanup, not a
+        # provider failure and must not abort the operator's turn.
         pass
 
 

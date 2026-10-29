@@ -327,6 +327,90 @@ async def test_client_socket_cleanup_suppresses_peer_broken_pipe() -> None:
     assert writer.closed is True
 
 
+@pytest.mark.asyncio
+async def test_client_socket_cleanup_propagates_unexpected_wait_closed_error() -> None:
+    class FailingWriter:
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            raise RuntimeError("unexpected close failure")
+
+    with pytest.raises(RuntimeError, match="unexpected close failure"):
+        await _close_writer(FailingWriter())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_client_socket_cleanup_preserves_external_cancellation(monkeypatch) -> None:
+    class HangingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.wait_started = asyncio.Event()
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.wait_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr("merlin_tui.local_control._LOCAL_CONTROL_CLOSE_TIMEOUT_SECONDS", 10.0)
+    writer = HangingWriter()
+    cleanup = asyncio.create_task(_close_writer(writer))  # type: ignore[arg-type]
+    await writer.wait_started.wait()
+    cleanup.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+
+    assert writer.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_call_returns_response_when_socket_close_never_finishes(monkeypatch) -> None:
+    class HangingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.wait_started = asyncio.Event()
+            self.wait_cancelled = False
+
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.wait_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.wait_cancelled = True
+                raise
+
+    writer = HangingWriter()
+
+    async def connect(*_args, **_kwargs):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"result","value":"automatic"}\n')
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_unix_connection", connect)
+    monkeypatch.setattr("merlin_tui.local_control._LOCAL_CONTROL_CLOSE_TIMEOUT_SECONDS", 0.01)
+    client = LocalControlClient(socket_path=Path("/tmp/merlin-close-timeout-test.sock"))
+
+    async with asyncio.timeout(0.2):
+        result = await client.get_permission_mode()
+
+    assert result == "automatic"
+    assert writer.closed is True
+    assert writer.wait_started.is_set()
+    assert writer.wait_cancelled is True
+
+
 def test_daemon_lifecycle_deadlines_use_valid_config_and_safe_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         "merlin_config.load_config",
