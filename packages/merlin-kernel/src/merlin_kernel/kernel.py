@@ -486,11 +486,51 @@ def _typed_campaign_objective_digest(content: str) -> str | None:
     return _objective_scope_digest(envelope.get("operator_objective"))
 
 
+def _is_explicit_campaign_launch(content: str) -> bool:
+    normalized = " ".join(content.casefold().split())
+    requests_assessment = any(
+        marker in normalized
+        for marker in (
+            "assess ",
+            "assessment against ",
+            "run merlin",
+            "use merlin",
+            "merlin scan",
+            "campaign profile",
+            "red pen scan",
+            "redpen scan",
+            "red-team scan",
+            "red team scan",
+            "red-team assessment",
+            "red team assessment",
+            "security assessment",
+            "security evaluation",
+        )
+    )
+    explicit_fresh_launch = (
+        re.search(
+            r"\b(?:new|fresh|another)\b.*\b(?:campaign|scan|assessment)\b",
+            normalized,
+        )
+        is not None
+    )
+    continuation_prefix = (
+        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+    )
+    has_target = _campaign_primary_target(content) is not None or "target" in normalized
+    return requests_assessment and has_target and (not continuation_prefix or explicit_fresh_launch)
+
+
 def _is_campaign_boundary_continuation(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
+    if _is_explicit_campaign_launch(content):
+        return False
+    continuation_prefix = (
+        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+    )
     return (
         content.startswith("MERLIN_USER_INPUT_RESPONSE\n")
-        or re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+        or continuation_prefix
         or normalized.startswith("the previous prepared campaign was cancelled")
         or normalized.startswith("reuse the sealed reconnaissance")
     )
@@ -597,8 +637,9 @@ def _advance_campaign_boundary(
                 "unbound", primary_target=_typed_campaign_primary_target(content)
             ), True
         return _CampaignBoundaryState("invalid"), True
+    explicit_campaign_launch = _is_explicit_campaign_launch(content)
     continuation = _is_campaign_boundary_continuation(content)
-    handback = _is_recon_handback_coordination(content)
+    handback = not explicit_campaign_launch and _is_recon_handback_coordination(content)
     target_token = _CAMPAIGN_URL_TOKEN_RE.search(content)
     if continuation or handback:
         if target_token is None:

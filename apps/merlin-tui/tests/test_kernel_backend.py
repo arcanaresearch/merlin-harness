@@ -560,7 +560,9 @@ async def test_cli_typed_campaign_prompt_keeps_one_stable_backend_boundary() -> 
         ("Retry", False),
         ("Please resume", False),
         ("Retry https://a.test", False),
+        ("Continue the assessment against https://a.test", False),
         ("Continue the assessment against https://b.test", True),
+        ("Continue with a new security assessment of https://a.test", True),
         ("Read the docs at https://b.test", False),
     ],
 )
@@ -623,6 +625,11 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
             "Assess https://a.test while logged in and continue testing for authorization bypass.",
             True,
         ),
+        (
+            "Run Merlin against https://a.test while logged in and continue testing.",
+            True,
+        ),
+        ("I'm logged in; continue the security assessment.", False),
     ],
 )
 async def test_backend_handback_continuation_is_target_aware(

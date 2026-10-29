@@ -4971,6 +4971,7 @@ def test_latest_campaign_scope_stops_at_untyped_or_malformed_boundary() -> None:
         "Signed in. Hand the browser back and continue reconnaissance.",
         "Logged in successfully; resume reconnaissance.",
         "MFA is complete. Proceed with reconnaissance.",
+        "I'm logged in; continue the security assessment.",
     ],
 )
 def test_latest_campaign_scope_ignores_targetless_browser_handback_coordination(
@@ -5054,6 +5055,34 @@ def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
 
     assert _latest_typed_campaign_scope(
         [scope, ChatMessage(role="user", content=f"{prefix}{target}")]
+    ) == (
+        _CAMPAIGN_REQUEST_ID_A,
+        "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "Assess https://a.test while logged in and continue testing for authorization bypass.",
+        "Run Merlin against https://a.test while logged in and continue testing.",
+        "Continue with a new security assessment of https://a.test",
+    ],
+)
+def test_latest_campaign_scope_treats_explicit_same_target_launch_as_fresh(
+    boundary: str,
+) -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess https://a.test"))
+
+    assert _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=boundary)]) is None
+
+
+def test_latest_campaign_scope_retains_same_target_prefixed_assessment() -> None:
+    objective = "Assess https://a.test"
+    scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
+
+    assert _latest_typed_campaign_scope(
+        [scope, ChatMessage(role="user", content="Continue the assessment against https://a.test")]
     ) == (
         _CAMPAIGN_REQUEST_ID_A,
         "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
@@ -5382,6 +5411,7 @@ def test_repair_delayed_result_survives_identical_scope_but_not_new_boundary() -
         "Signed in. Hand the browser back and continue reconnaissance.",
         "Logged in successfully; resume reconnaissance.",
         "CAPTCHA done. Proceed with reconnaissance.",
+        "I'm logged in; continue the security assessment.",
     ],
 )
 def test_repair_restore_survives_targetless_browser_handback_coordination(
@@ -5694,6 +5724,7 @@ def test_automatic_recon_delayed_results_respect_identical_and_new_boundaries() 
         "Signed in. Hand the browser back and continue reconnaissance.",
         "Logged in successfully; resume reconnaissance.",
         "Authentication completed. Proceed with reconnaissance.",
+        "I'm logged in; continue the security assessment.",
     ],
 )
 def test_automatic_recon_survives_targetless_browser_handback_coordination(

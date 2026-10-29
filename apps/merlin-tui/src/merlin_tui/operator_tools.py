@@ -165,6 +165,16 @@ class _CampaignBoundary:
 
 def _looks_like_campaign_request(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
+    continuation_prefix = (
+        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+    )
+    explicit_fresh_launch = (
+        re.search(
+            r"\b(?:new|fresh|another)\b.*\b(?:campaign|scan|assessment)\b",
+            normalized,
+        )
+        is not None
+    )
     requests_assessment = any(
         marker in normalized
         for marker in (
@@ -178,11 +188,17 @@ def _looks_like_campaign_request(content: str) -> bool:
             "redpen scan",
             "red-team scan",
             "red team scan",
+            "red-team assessment",
+            "red team assessment",
             "security assessment",
             "security evaluation",
         )
     )
-    return requests_assessment and (_primary_target(content) is not None or "target" in normalized)
+    return (
+        requests_assessment
+        and (not continuation_prefix or explicit_fresh_launch)
+        and (_primary_target(content) is not None or "target" in normalized)
+    )
 
 
 def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _CampaignBoundary:
@@ -239,16 +255,16 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
             else:
                 boundary = _CampaignBoundary("unbound", objective=objective, message_index=index)
             continue
+        if _looks_like_campaign_request(message.content):
+            active_objective = message.content.strip()
+            boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
+            continue
         if _is_internal_campaign_continuation(message.content):
             target = _primary_target(message.content)
             if target is None and not _has_url_candidate(message.content):
                 continue
             if active_objective is not None and target == _primary_target(active_objective):
                 continue
-            active_objective = message.content.strip()
-            boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
-            continue
-        if _looks_like_campaign_request(message.content):
             active_objective = message.content.strip()
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue

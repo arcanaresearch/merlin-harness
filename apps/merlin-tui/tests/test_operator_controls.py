@@ -490,11 +490,18 @@ async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
 
 
 @pytest.mark.asyncio
-async def test_explicit_campaign_intent_outranks_same_target_handback_cues() -> None:
+@pytest.mark.parametrize(
+    "objective_b",
+    [
+        "Assess https://a.test while logged in and continue testing for authorization bypass.",
+        "Run Merlin against https://a.test while logged in and continue testing.",
+        "Continue with a new security assessment of https://a.test",
+    ],
+)
+async def test_explicit_campaign_intent_outranks_same_target_handback_cues(
+    objective_b: str,
+) -> None:
     objective_a = "Assess https://a.test"
-    objective_b = (
-        "Assess https://a.test while logged in and continue testing for authorization bypass."
-    )
     history = (
         saved(
             "campaign_configure",
@@ -519,7 +526,41 @@ async def test_explicit_campaign_intent_outranks_same_target_handback_cues() -> 
 
 
 @pytest.mark.asyncio
-async def test_typed_request_then_handback_retains_typed_boundary() -> None:
+async def test_same_target_prefixed_assessment_retains_configured_campaign() -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000079"
+    history = (
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_id,
+                "status": "configured",
+                "settings": {"objective": objective, "campaign_profile": "exhaustive"},
+            },
+        ),
+        ChatMessage(role="user", content="Continue the assessment against https://a.test"),
+    )
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(context(), {})
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == request_id
+    assert receipt["settings"] == {
+        "objective": objective,
+        "campaign_profile": "exhaustive",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handback",
+    [
+        "Logged in. Return the browser back and continue the work.",
+        "I'm logged in; continue the security assessment.",
+    ],
+)
+async def test_typed_request_then_handback_retains_typed_boundary(handback: str) -> None:
     objective = "Signed in. Hand browser back and continue assessment of https://b.test"
     request_id = "00000000-0000-4000-8000-000000000076"
     history = (
@@ -527,10 +568,7 @@ async def test_typed_request_then_handback_retains_typed_boundary() -> None:
             role="user",
             content=campaign_submit_envelope(objective, campaign_request_id=request_id),
         ),
-        ChatMessage(
-            role="user",
-            content="Logged in. Return the browser back and continue the work.",
-        ),
+        ChatMessage(role="user", content=handback),
     )
 
     result = await CampaignConfigureTool(AsyncMock(return_value=history)).invoke(context(), {})

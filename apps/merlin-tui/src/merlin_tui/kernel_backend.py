@@ -112,26 +112,7 @@ def _is_campaign_request(prompt: str) -> bool:
     normalized = " ".join(prompt.lower().split())
     if normalized.startswith("/"):
         return False
-    if _is_campaign_continuation_prompt(prompt) and _primary_target(prompt) is not None:
-        return True
-    requests_assessment = any(
-        marker in normalized
-        for marker in (
-            "assess ",
-            "merlin scan",
-            "red pen scan",
-            "redpen scan",
-            "red-team scan",
-            "red team scan",
-            "red-team assessment",
-            "red team assessment",
-            "security assessment",
-            "security evaluation",
-        )
-    )
-    return requests_assessment and any(
-        marker in normalized for marker in ("http://", "https://", "target")
-    )
+    return _looks_like_campaign_request(prompt)
 
 
 def _is_campaign_continuation_prompt(prompt: str) -> bool:
