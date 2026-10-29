@@ -417,6 +417,7 @@ async def test_prepare_continuation_is_target_aware(message: str, rejected: bool
     "message",
     [
         "Signed in. Hand the browser back and continue reconnaissance.",
+        "Signed in at https://a.test. Hand the browser back and continue reconnaissance.",
         "MFA complete; give the browser back and proceed with the scan.",
         "Authentication done. Continue the assessment.",
     ],
@@ -457,6 +458,8 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
     "message",
     [
         "Signed in at https://b.test. Hand the browser back and continue reconnaissance.",
+        "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
+        "Signed in at ftp://a.test. Hand the browser back and continue reconnaissance.",
         "Explain current runtime status",
     ],
 )

@@ -241,9 +241,14 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
             active_objective = message.content.strip()
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
-        if not _has_url_candidate(message.content) and _is_recon_handback_continuation(
-            message.content
-        ):
+        if _is_recon_handback_continuation(message.content):
+            target = _primary_target(message.content)
+            if not _has_url_candidate(message.content) or (
+                active_objective is not None and target == _primary_target(active_objective)
+            ):
+                continue
+            active_objective = message.content.strip()
+            boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
         if _looks_like_campaign_request(message.content):
             active_objective = message.content.strip()

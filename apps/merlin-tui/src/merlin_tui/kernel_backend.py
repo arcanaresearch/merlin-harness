@@ -47,6 +47,7 @@ from .operator_tools import (
     _campaign_submit_payload,
     _configured_objective,
     _has_url_candidate,
+    _is_recon_handback_continuation,
     _latest_campaign_request_scope,
     _primary_target,
     campaign_submit_envelope,
@@ -138,6 +139,7 @@ def _is_campaign_continuation_prompt(prompt: str) -> bool:
         re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
         or normalized.startswith("the previous prepared campaign was cancelled")
         or normalized.startswith("reuse the sealed reconnaissance")
+        or _is_recon_handback_continuation(prompt)
     )
 
 

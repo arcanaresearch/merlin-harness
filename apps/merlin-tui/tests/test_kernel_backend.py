@@ -603,6 +603,58 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "fresh_boundary"),
+    [
+        ("Signed in. Hand the browser back and continue reconnaissance.", False),
+        (
+            "Signed in at https://a.test. Hand the browser back and continue reconnaissance.",
+            False,
+        ),
+        (
+            "Signed in at https://b.test. Hand the browser back and continue reconnaissance.",
+            True,
+        ),
+        (
+            "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
+            True,
+        ),
+    ],
+)
+async def test_backend_handback_continuation_is_target_aware(
+    prompt: str, fresh_boundary: bool
+) -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000077"
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (
+                ChatMessage(
+                    role="user",
+                    content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+                ),
+            )
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+
+    submitted = kernel.submissions[0]
+    assert ("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" in submitted) is fresh_boundary
+    if fresh_boundary:
+        envelope, _end = json.JSONDecoder().raw_decode(
+            submitted.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
+        )
+        assert envelope["campaign_request_id"] != request_id
+        assert envelope["operator_objective"] == prompt
+    else:
+        assert submitted == prompt
+
+
+@pytest.mark.asyncio
 async def test_backend_upgrades_legacy_envelope_to_one_exact_v2_boundary() -> None:
     objective = "Resume the assessment against https://b.test"
     suffix = (
