@@ -1,6 +1,6 @@
 [project]
 name = "merlin-kernel"
-version = "0.2.27"
+version = "0.2.28"
 description = "Session orchestration and command routing for Merlin"
 requires-python = ">=3.13"
 dependencies = ["merlin-contracts"]
