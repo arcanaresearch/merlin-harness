@@ -3514,11 +3514,21 @@ def test_adaptive_compilers_record_native_execution_mode(
         (_hydra_browser_technique, "hydra-select"),
     ),
 )
-def test_adaptive_compilers_preserve_requested_strategy_when_metadata_is_unavailable(
-    technique_factory, strategy_id: str
+@pytest.mark.parametrize(
+    "strategy_contract",
+    (
+        (),
+        (("version", "malformed"),),
+    ),
+    ids=("absent", "malformed"),
+)
+def test_adaptive_compilers_degrade_when_controller_metadata_is_unavailable(
+    technique_factory,
+    strategy_id: str,
+    strategy_contract: tuple[tuple[str, str], ...],
 ) -> None:
     prepared, adapter_digest = _browser_adaptive_manifest()
-    technique = replace(technique_factory(adapter_digest), strategy_contract=())
+    technique = replace(technique_factory(adapter_digest), strategy_contract=strategy_contract)
     context = _adaptive_context(prepared, technique)
 
     assignment = _compile_adaptive(prepared, context, strategy_id)
@@ -3526,10 +3536,12 @@ def test_adaptive_compilers_preserve_requested_strategy_when_metadata_is_unavail
     contract = dict(assignment.strategy_contract)
     assert assignment.strategy_id == strategy_id
     assert assignment.semantic_technique_id == technique.resolved_semantic_id
-    assert contract["strategy_execution_mode"] == "unavailable"
+    assert contract["strategy_execution_mode"] == "degraded"
     assert contract["strategy_execution_reason"]
-    assert "UNAVAILABLE" in assignment.objective
-    assert "without a target effect" in assignment.objective
+    assert "DEGRADED; DIRECT OBSERVATION ONLY" in assignment.objective
+    assert "one authorized direct observation" in assignment.objective
+    uncertainties = json.loads(contract["evaluation_uncertainties_json"])
+    assert any("metadata was" in item["reason"] for item in uncertainties)
 
 
 @pytest.mark.parametrize("transport", ("codex_app_server", "claude_cli", "kimi_acp"))

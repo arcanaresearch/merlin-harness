@@ -2412,7 +2412,7 @@ def compile_crescendo_agenda(
                 fallback_reason = (
                     f"Crescendo metadata did not match the reviewed {interface_label} adapter"
                 )
-            strategy_execution_mode = "native" if supported else "unavailable"
+            strategy_execution_mode = "native" if supported else "degraded"
             strategy_execution_reason = (
                 "reviewed Crescendo contract and executable target transport are available"
                 if supported
@@ -2432,10 +2432,11 @@ def compile_crescendo_agenda(
                 f"{technique.objective}"
             )
             fallback_objective = (
-                "CRESCENDO UNAVAILABLE. The requested adaptive controller cannot execute "
-                f"({fallback_reason or 'evaluation uncertainty'}). Record this as retryable "
-                "infrastructure work without a target effect. Do not report an adaptive or "
-                f"direct result.\n\n{technique.objective}"
+                "CRESCENDO DEGRADED; DIRECT OBSERVATION ONLY. The native Crescendo "
+                f"controller cannot execute ({fallback_reason or 'evaluation uncertainty'}). "
+                "Execute one authorized direct observation, retain exact telemetry, and "
+                "attribute the result as degraded rather than native."
+                f"\n\n{technique.objective}"
             )
             contract_values = dict(technique.strategy_contract)
             contract_values.update(
@@ -2459,10 +2460,16 @@ def compile_crescendo_agenda(
                         "language": contract.language,
                     }
                 )
-            if metadata_uncertainties:
+            compiler_reasons = (
+                metadata_uncertainties
+                if supported
+                else [fallback_reason or "adaptive controller metadata was unavailable"]
+            )
+            if compiler_reasons:
                 contract_values["evaluation_uncertainties_json"] = _merge_contract_uncertainties(
-                    contract_values, "crescendo", metadata_uncertainties
+                    contract_values, "crescendo", compiler_reasons
                 )
+            if metadata_uncertainties:
                 adaptive_objective += _uncertainty_notice(metadata_uncertainties)
             assignment = replace(
                 parent,
@@ -2619,9 +2626,7 @@ def compile_goat_agenda(
                 fallback_reason = (
                     f"GOAT metadata did not match the reviewed {interface_label} adapter"
                 )
-            strategy_execution_mode = (
-                "native" if supported else "degraded" if contract is not None else "unavailable"
-            )
+            strategy_execution_mode = "native" if supported else "degraded"
             strategy_execution_reason = (
                 "reviewed GOAT contract and buffered target transport are available"
                 if supported
@@ -2867,9 +2872,7 @@ def compile_hydra_select_agenda(
                 fallback_reason = (
                     f"Hydra-Select metadata did not match the reviewed {interface_label} adapter"
                 )
-            strategy_execution_mode = (
-                "native" if supported else "degraded" if contract is not None else "unavailable"
-            )
+            strategy_execution_mode = "native" if supported else "degraded"
             strategy_execution_reason = (
                 "reviewed Hydra-Select contract and buffered candidate transport are available"
                 if supported

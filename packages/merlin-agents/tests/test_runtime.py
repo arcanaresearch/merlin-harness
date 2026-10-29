@@ -906,15 +906,21 @@ async def test_unavailable_adaptive_strategy_is_terminal_without_provider_or_tar
 
 
 @pytest.mark.asyncio
-async def test_degraded_adaptive_strategy_runs_direct_with_explicit_provenance() -> None:
+@pytest.mark.parametrize("strategy_id", ("goat", "crescendo", "hydra-select"))
+async def test_degraded_adaptive_strategy_runs_direct_with_explicit_provenance(
+    strategy_id: str,
+) -> None:
     base = reviewed_handoff(interface="http_api", tools=("target_request",))
     assignment = replace(
         base.assignment,
-        strategy_id="goat",
-        semantic_technique_id="semantic:goat",
+        strategy_id=strategy_id,
+        semantic_technique_id=f"semantic:{strategy_id}",
         strategy_contract=(
             ("strategy_execution_mode", "degraded"),
-            ("strategy_execution_reason", "provider-native route lacks GOAT turn callbacks"),
+            (
+                "strategy_execution_reason",
+                f"provider-native route lacks {strategy_id} controller callbacks",
+            ),
         ),
     )
     candidate = CompletionCandidateIdentity(
@@ -922,8 +928,8 @@ async def test_degraded_adaptive_strategy_runs_direct_with_explicit_provenance()
         target_id=assignment.target_profile_id,
         target_generation="generation-1",
         scenario_fingerprint="scenario-1",
-        technique_id="semantic:goat",
-        controller_id="goat",
+        technique_id=f"semantic:{strategy_id}",
+        controller_id=strategy_id,
         payload_family="baseline",
         requested_language="en",
         mutation_id="baseline",
@@ -960,16 +966,16 @@ async def test_degraded_adaptive_strategy_runs_direct_with_explicit_provenance()
     assert (result.checkpoint or {}).get("effect_observed") is True
     assert isinstance(result.structured, Mapping)
     assert result.structured["strategy_execution"] == {
-        "requested_controller": "goat",
+        "requested_controller": strategy_id,
         "actual_controller": "direct",
         "execution_mode": "degraded",
-        "reason": "provider-native route lacks GOAT turn callbacks",
+        "reason": f"provider-native route lacks {strategy_id} controller callbacks",
     }
     assert result.structured["evaluation_uncertainties"] == [
         {
             "kind": "evaluation_uncertain",
             "source": "runtime.strategy_execution",
-            "reason": "provider-native route lacks GOAT turn callbacks",
+            "reason": f"provider-native route lacks {strategy_id} controller callbacks",
             "confidence": 1.0,
             "affects": ["execution", "evaluation"],
         }
@@ -981,7 +987,7 @@ async def test_degraded_adaptive_strategy_runs_direct_with_explicit_provenance()
     assert result.checkpoint["strategy_state"]["_strategy_plugin"]["provenance"] == {
         "candidate": candidate.projection(),
         "attempt_id": reviewed.attempt_id,
-        "requested_controller": "goat",
+        "requested_controller": strategy_id,
         "actual_controller": "direct",
         "requested_mode": "native",
         "actual_mode": "degraded",
