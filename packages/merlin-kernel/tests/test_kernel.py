@@ -6400,6 +6400,346 @@ async def test_steering_revalidates_durable_campaign_tool_authority(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("blocked_append", ["assistant", "terminal"])
+async def test_steering_serializes_tool_admission_and_terminal_append(
+    dynamic: bool,
+    blocked_append: str,
+) -> None:
+    blocked, release = asyncio.Event(), asyncio.Event()
+
+    class BlockingStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked_once = False
+
+        async def append_message(self, session_id, message):
+            is_delayed_assistant = message.role == "assistant" and any(
+                call.get("id") == "serialized-tool" for call in message.tool_calls
+            )
+            is_delayed_terminal = (
+                message.role == "tool" and message.tool_call_id == "serialized-tool"
+            )
+            should_block = (blocked_append == "assistant" and is_delayed_assistant) or (
+                blocked_append == "terminal" and is_delayed_terminal
+            )
+            if should_block and not self.blocked_once:
+                self.blocked_once = True
+                blocked.set()
+                await release.wait()
+            await super().append_message(session_id, message)
+
+    class RecordingTools(Tools):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return (ToolSpec(name="browser_snapshot", description="snapshot", input_schema={}),)
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            return ToolResult(content="snapshot complete")
+
+    class DelayedProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+            self.dynamic_outputs: list[DynamicToolOutput] = []
+
+        async def stream(self, request):
+            self.requests += 1
+            if self.requests == 1:
+                yield ToolCall(call_id="serialized-tool", name="browser_snapshot", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="current campaign acknowledged")
+            yield ModelCompleted()
+
+        async def dynamic_stream(self, request, handler):
+            self.requests += 1
+            if self.requests == 1:
+                self.dynamic_outputs.append(
+                    await handler(
+                        ToolCall(
+                            call_id="serialized-tool",
+                            name="browser_snapshot",
+                            arguments={},
+                        )
+                    )
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="current campaign acknowledged")
+            yield ModelCompleted()
+
+    store = BlockingStore()
+    provider = DelayedProvider()
+    if dynamic:
+        provider.stream_with_tools = provider.dynamic_stream
+    tools = RecordingTools()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await blocked.wait()
+    steer_task = asyncio.create_task(
+        kernel.steer(_campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    assert await steer_task
+    await kernel.wait_for_turn()
+
+    expected_calls = [] if blocked_append == "assistant" else ["browser_snapshot"]
+    assert tools.calls == expected_calls
+    messages = store.messages[kernel.session_id]
+    terminal_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.role == "tool" and message.tool_call_id == "serialized-tool"
+    )
+    boundary_b_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.role == "user" and _CAMPAIGN_REQUEST_ID_B in message.content
+    )
+    terminal = messages[terminal_index]
+    if blocked_append == "assistant":
+        assert boundary_b_index < terminal_index
+        assert _CAMPAIGN_REQUEST_ID_A not in terminal.content
+    else:
+        assert terminal_index < boundary_b_index
+    if dynamic:
+        assert provider.dynamic_outputs[0].success is (blocked_append == "terminal")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_ending", ["completion", "malformed_tool", "nonretryable_error"])
+async def test_steering_revalidates_before_no_tool_recovery_state(
+    provider_ending: str,
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    objective = "Assess https://a.test"
+    store = Store()
+    session_id = await store.create_session()
+    prepare_result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+        },
+    )
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-no-tool-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-no-tool-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-no-tool-a",
+                {"objective": objective},
+                prepare_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    class CampaignTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("assessment_prepare", "browser_compile_api_handoff")
+            )
+
+    class DelayedProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                started.set()
+                await release.wait()
+                if provider_ending == "malformed_tool":
+                    yield ModelError(
+                        message="malformed delayed A tool",
+                        code="malformed_tool_call",
+                        retryable=True,
+                        tool_name="browser_compile_api_handoff",
+                    )
+                elif provider_ending == "nonretryable_error":
+                    yield ModelError(
+                        message="delayed campaign A failure",
+                        code="fatal_provider_error",
+                        retryable=False,
+                    )
+                else:
+                    yield ModelCompleted()
+                return
+            yield TextDelta(text="campaign B is unconstrained")
+            yield ModelCompleted()
+
+    provider = DelayedProvider()
+    kernel = Kernel(provider, store, CampaignTools(), Settings())
+    await kernel.start(session_id)
+    await kernel.submit("Continue")
+    await started.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release.set()
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) >= 2
+    assert provider.requests[1].required_tool_name is None
+    assert {tool["function"]["name"] for tool in provider.requests[1].tools} == {
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+    }
+    assert not any(
+        "previous provider attempt ended" in message.content.lower()
+        or "previous provider response did not invoke" in message.content.lower()
+        for message in provider.requests[1].messages
+        if message.role == "system"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_campaign_epoch_clears_recon_recall_tool_filter() -> None:
+    request_two_started, release_request_two = asyncio.Event(), asyncio.Event()
+
+    class RecallTools(Tools):
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "browser_recall_reconnaissance",
+                    "assessment_prepare",
+                    "read_file",
+                    "shell_command",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            return ToolResult(content="recalled")
+
+    class RecallProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(
+                    call_id="recall-a",
+                    name="browser_recall_reconnaissance",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if len(self.requests) == 2:
+                request_two_started.set()
+                await release_request_two.wait()
+                yield ModelCompleted()
+                return
+            yield TextDelta(text="campaign B can use its full tool set")
+            yield ModelCompleted()
+
+    provider = RecallProvider()
+    kernel = Kernel(provider, Store(), RecallTools(), Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await request_two_started.wait()
+    assert await kernel.steer(
+        _campaign_scope_content("Assess https://b.test", _CAMPAIGN_REQUEST_ID_B)
+    )
+    release_request_two.set()
+    await kernel.wait_for_turn()
+
+    request_three_tools = {tool["function"]["name"] for tool in provider.requests[2].tools}
+    assert {"read_file", "shell_command"} <= request_three_tools
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_buffered_post_invoke_authority_keeps_pairing_order() -> None:
+    authority_blocked, release_authority = asyncio.Event(), asyncio.Event()
+
+    class BlockingAuthorityStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_next_load = False
+
+        async def load_messages(self, session_id):
+            if self.block_next_load:
+                self.block_next_load = False
+                authority_blocked.set()
+                await release_authority.wait()
+            return await super().load_messages(session_id)
+
+    class BlockingTools(Tools):
+        def __init__(self, store: BlockingAuthorityStore) -> None:
+            self.store = store
+
+        def describe(self):
+            return (ToolSpec(name="browser_snapshot", description="snapshot", input_schema={}),)
+
+        async def invoke(self, name, context, arguments):
+            self.store.block_next_load = True
+            return ToolResult(content="snapshot complete")
+
+    class BufferedProvider:
+        async def stream(self, request):
+            yield TextDelta(text="Buffered assistant text")
+            yield ToolCall(
+                call_id="cancelled-buffered-tool",
+                name="browser_snapshot",
+                arguments={},
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    store = BlockingAuthorityStore()
+    kernel = Kernel(BufferedProvider(), store, BlockingTools(store), Settings())
+    await kernel.start()
+    await kernel.submit(_campaign_scope_content("Assess https://a.test"))
+    await authority_blocked.wait()
+    assert kernel._turn is not None
+    kernel._turn.cancel()
+    release_authority.set()
+    await kernel.wait_for_turn()
+
+    messages = store.messages[kernel.session_id]
+    assistant_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.role == "assistant"
+        and any(call.get("id") == "cancelled-buffered-tool" for call in message.tool_calls)
+    )
+    terminal_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.role == "tool" and message.tool_call_id == "cancelled-buffered-tool"
+    )
+    assert messages[assistant_index].content == "Buffered assistant text"
+    assert terminal_index == assistant_index + 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operator_prompt", "expected_required_tool"),
     [

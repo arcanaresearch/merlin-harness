@@ -1715,9 +1715,6 @@ class Kernel:
                 request_user_boundaries: int,
                 request_campaign_epoch: int,
                 request_campaign_scope: tuple[str, str] | None,
-                request_preferred_tool: str | None,
-                request_preferred_mode: str,
-                request_automatic_recon: Mapping[str, object] | None,
             ) -> tuple[bool, str | None]:
                 """Refresh durable authority before admitting a delayed provider tool."""
 
@@ -1731,6 +1728,7 @@ class Kernel:
                 nonlocal preferred_next_tool_mode
                 nonlocal recovery_reasoning
                 nonlocal recovery_tool_name
+                nonlocal recon_recall_completed
                 nonlocal repair_messages
                 nonlocal repair_scope_campaign_request_id
                 nonlocal restored_steering_version
@@ -1779,9 +1777,6 @@ class Kernel:
                 authority_valid = (
                     current_campaign_epoch == request_campaign_epoch
                     and current_campaign_scope == request_campaign_scope
-                    and current_preferred_tool == request_preferred_tool
-                    and current_preferred_mode == request_preferred_mode
-                    and restored_continuation == request_automatic_recon
                 )
                 if not authority_valid:
                     recovery_tool_name = None
@@ -1791,6 +1786,7 @@ class Kernel:
                     preferred_tool_follow_through_failures = 0
                     preferred_transition_observation_used = False
                     automatic_recon_stalled = False
+                    recon_recall_completed = False
                 return authority_valid, repair_scope_campaign_request_id
 
             def campaign_epoch(
@@ -1875,11 +1871,6 @@ class Kernel:
                 )
                 request_campaign_epoch, request_campaign_scope = campaign_epoch(
                     request_durable_messages
-                )
-                request_automatic_recon = (
-                    dict(automatic_recon_continuation)
-                    if automatic_recon_continuation is not None
-                    else None
                 )
                 if self._permissions is not None and not await self._permissions.authorize_provider(
                     session_id, self._workspace_root
@@ -2055,11 +2046,6 @@ class Kernel:
                     _request_user_boundaries: int = request_user_boundaries,
                     _request_campaign_epoch: int = request_campaign_epoch,
                     _request_campaign_scope: tuple[str, str] | None = request_campaign_scope,
-                    _request_preferred_tool: str | None = request_preferred_tool_name,
-                    _request_preferred_mode: str = request_preferred_tool_mode,
-                    _request_automatic_recon: Mapping[str, object] | None = (
-                        request_automatic_recon
-                    ),
                 ) -> tuple[bool, str | None]:
                     nonlocal request_authority_revoked
                     valid, current_scope = await refresh_request_authority(
@@ -2067,9 +2053,6 @@ class Kernel:
                         request_user_boundaries=_request_user_boundaries,
                         request_campaign_epoch=_request_campaign_epoch,
                         request_campaign_scope=_request_campaign_scope,
-                        request_preferred_tool=_request_preferred_tool,
-                        request_preferred_mode=_request_preferred_mode,
-                        request_automatic_recon=_request_automatic_recon,
                     )
                     if not valid:
                         request_authority_revoked = True
@@ -2101,23 +2084,37 @@ class Kernel:
                         request_authority_valid,
                         current_repair_scope,
                     ) = await revalidate_request_authority()
-                    await self._store.append_message(
-                        session_id,
-                        ChatMessage(
-                            role="assistant",
-                            content="",
-                            tool_calls=[
-                                {
-                                    "id": call.call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.name,
-                                        "arguments": json.dumps(call.arguments),
-                                    },
-                                }
-                            ],
-                        ),
+                    assistant_append = asyncio.create_task(
+                        self._store.append_message(
+                            session_id,
+                            ChatMessage(
+                                role="assistant",
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "id": call.call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": json.dumps(call.arguments),
+                                        },
+                                    }
+                                ],
+                            ),
+                        )
                     )
+                    try:
+                        await asyncio.shield(assistant_append)
+                    except asyncio.CancelledError:
+                        with suppress(asyncio.CancelledError):
+                            await assistant_append
+                        await self._append_tool_terminal(
+                            session_id,
+                            name=call.name,
+                            call_id=call.call_id,
+                            content="tool call interrupted before admission",
+                        )
+                        raise
                     invocation = _safe_shell_invocation(
                         call.name, call.arguments, self._workspace_root
                     )
@@ -2197,14 +2194,24 @@ class Kernel:
                         and not duplicate_owned_cleanup
                         and not preferred_retry_exhausted
                     )
-                    admitted_owned_cleanup = tool_admitted and is_active_owned_cleanup
-                    if admitted_owned_cleanup:
-                        owned_cleanup_attempted_in_turn.add(call.call_id)
-                    if bounded_preferred_observation:
-                        preferred_transition_observation_used = True
+                    admitted_owned_cleanup = False
                     try:
+                        # Steering and final admission are one transaction. Once this
+                        # lock is released with admission granted, the invocation is
+                        # considered started even if steering is accepted immediately after.
+                        async with self._steering_lock:
+                            (
+                                final_authority_valid,
+                                current_repair_scope,
+                            ) = await revalidate_request_authority()
+                            tool_admitted = tool_admitted and final_authority_valid
                         if not tool_admitted:
                             raise PermissionError("tool is not admitted for this provider request")
+                        admitted_owned_cleanup = is_active_owned_cleanup
+                        if admitted_owned_cleanup:
+                            owned_cleanup_attempted_in_turn.add(call.call_id)
+                        if bounded_preferred_observation:
+                            preferred_transition_observation_used = True
                         async with asyncio.timeout(self._tool_timeout_seconds):
                             result = await self._tools.invoke(call.name, context, call.arguments)
                     except asyncio.CancelledError:
@@ -2250,32 +2257,56 @@ class Kernel:
                                 )
                             },
                         )
-                    (
-                        post_invoke_authority_valid,
-                        current_repair_scope,
-                    ) = await revalidate_request_authority()
-                    stale_result = not request_authority_valid or not post_invoke_authority_valid
-                    await self._append_tool_terminal(
-                        session_id,
-                        name=call.name,
-                        call_id=call.call_id,
-                        content=(
-                            result.content
-                            if stale_result
-                            else _tool_content_with_automatic_marker(
-                                call.name,
-                                call.call_id,
-                                call.arguments,
-                                result,
-                                campaign_request_id=current_repair_scope,
-                                progress_key=(
-                                    str(automatic_recon_continuation.get("progress_key"))
-                                    if automatic_recon_continuation is not None
-                                    else None
-                                ),
+                    try:
+                        # Result validation and its durable receipt are ordered
+                        # atomically against steering. A later steer therefore lands
+                        # after this receipt; an earlier steer forces a plain receipt.
+                        async with self._steering_lock:
+                            (
+                                post_invoke_authority_valid,
+                                current_repair_scope,
+                            ) = await revalidate_request_authority()
+                            stale_result = (
+                                not request_authority_valid or not post_invoke_authority_valid
                             )
-                        ),
-                    )
+                            terminal_append = asyncio.create_task(
+                                self._append_tool_terminal(
+                                    session_id,
+                                    name=call.name,
+                                    call_id=call.call_id,
+                                    content=(
+                                        result.content
+                                        if stale_result
+                                        else _tool_content_with_automatic_marker(
+                                            call.name,
+                                            call.call_id,
+                                            call.arguments,
+                                            result,
+                                            campaign_request_id=current_repair_scope,
+                                            progress_key=(
+                                                str(
+                                                    automatic_recon_continuation.get("progress_key")
+                                                )
+                                                if automatic_recon_continuation is not None
+                                                else None
+                                            ),
+                                        )
+                                    ),
+                                )
+                            )
+                            await asyncio.shield(terminal_append)
+                    except asyncio.CancelledError:
+                        if "terminal_append" in locals():
+                            with suppress(asyncio.CancelledError):
+                                await terminal_append
+                        else:
+                            await self._append_tool_terminal(
+                                session_id,
+                                name=call.name,
+                                call_id=call.call_id,
+                                content="tool call interrupted before authority commit",
+                            )
+                        raise
                     failure_category = tool_failure_category(result)
                     await self._emit(
                         self._event(
@@ -2447,6 +2478,15 @@ class Kernel:
                     elif isinstance(event, ModelCompleted):
                         completed = event
                     elif isinstance(event, ModelError):
+                        async with self._steering_lock:
+                            (
+                                model_error_authority_valid,
+                                _current_repair_scope,
+                            ) = await revalidate_request_authority()
+                        if not model_error_authority_valid:
+                            assistant = ""
+                            reasoning = ""
+                            break
                         failure_category = provider_failure_category(event.code)
                         provider_already_retried_transport = (
                             not event.partial and event.code in _PROVIDER_OWNED_TRANSPORT_RETRIES
@@ -2656,7 +2696,16 @@ class Kernel:
                         request_authority_valid=request_authority_valid,
                         authority_check=revalidate_request_authority,
                     )
-                    if not request_authority_valid or request_authority_revoked:
+                    async with self._steering_lock:
+                        (
+                            returned_authority_valid,
+                            _current_repair_scope,
+                        ) = await revalidate_request_authority()
+                    if (
+                        not request_authority_valid
+                        or not returned_authority_valid
+                        or request_authority_revoked
+                    ):
                         assistant = ""
                         reasoning = ""
                         continue
@@ -2796,6 +2845,15 @@ class Kernel:
                             )
                         )
                         return
+                    async with self._steering_lock:
+                        (
+                            completion_authority_valid,
+                            _current_repair_scope,
+                        ) = await revalidate_request_authority()
+                    if not completion_authority_valid:
+                        assistant = ""
+                        reasoning = ""
+                        continue
                     if (
                         request_preferred_tool_name is not None
                         and not preferred_tool_invoked_dynamically
@@ -3021,34 +3079,51 @@ class Kernel:
         owned_cleanup_invoked = bool(cleanup_attempts)
         preferred_nonpreferred_action_used = False
         signatures = getattr(self._provider, "tool_call_signatures", None)
-        await self._store.append_message(
-            session_id,
-            ChatMessage(
-                role="assistant",
-                content=content,
-                tool_calls=[
-                    {
-                        "id": event.call_id,
-                        "type": "function",
-                        "function": {
-                            "name": event.name,
-                            "arguments": json.dumps(event.arguments),
-                        },
-                        **(
-                            {"thought_signature": signatures[event.call_id]}
-                            if signatures and event.call_id in signatures
-                            else {}
-                        ),
-                    }
-                    for event in events
-                ],
-                reasoning_content=reasoning_content,
-            ),
-        )
-        for position, event in enumerate(events):
-            current_repair_scope = repair_scope_campaign_request_id
+        async with self._steering_lock:
             if authority_check is not None:
-                request_authority_valid, current_repair_scope = await authority_check()
+                request_authority_valid, repair_scope_campaign_request_id = await authority_check()
+            assistant_append = asyncio.create_task(
+                self._store.append_message(
+                    session_id,
+                    ChatMessage(
+                        role="assistant",
+                        content=content,
+                        tool_calls=[
+                            {
+                                "id": event.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": event.name,
+                                    "arguments": json.dumps(event.arguments),
+                                },
+                                **(
+                                    {"thought_signature": signatures[event.call_id]}
+                                    if signatures and event.call_id in signatures
+                                    else {}
+                                ),
+                            }
+                            for event in events
+                        ],
+                        reasoning_content=reasoning_content,
+                    ),
+                )
+            )
+            try:
+                await asyncio.shield(assistant_append)
+            except asyncio.CancelledError:
+                with suppress(asyncio.CancelledError):
+                    await assistant_append
+                for interrupted in events:
+                    await self._append_tool_terminal(
+                        session_id,
+                        name=interrupted.name,
+                        call_id=interrupted.call_id,
+                        content="tool call interrupted before admission",
+                    )
+                raise
+        for position, event in enumerate(events):
+            terminal_append: asyncio.Task[None] | None = None
+            current_repair_scope = repair_scope_campaign_request_id
             current_preferred_tool = preferred_next_tool
             bounded_preferred_action = (
                 current_preferred_tool == "browser_compile_api_handoff"
@@ -3090,6 +3165,10 @@ class Kernel:
                 and (not recon_recall_completed or _tool_admitted_after_recon_recall(event.name))
             )
             try:
+                async with self._steering_lock:
+                    if authority_check is not None:
+                        request_authority_valid, current_repair_scope = await authority_check()
+                    tool_admitted = tool_admitted and request_authority_valid
                 if not tool_admitted:
                     raise PermissionError("tool is not admitted for this provider request")
                 if bounded_preferred_action:
@@ -3147,30 +3226,52 @@ class Kernel:
                         )
                     },
                 )
-            post_invoke_authority_valid = request_authority_valid
-            if authority_check is not None:
-                post_invoke_authority_valid, current_repair_scope = await authority_check()
-            stale_result = not request_authority_valid or not post_invoke_authority_valid
-            continuation = (
-                None if stale_result else _tool_automatic_recon_continuation(event.name, result)
-            )
-            await self._append_tool_terminal(
-                session_id,
-                name=event.name,
-                call_id=event.call_id,
-                content=(
-                    result.content
-                    if stale_result
-                    else _tool_content_with_automatic_marker(
-                        event.name,
-                        event.call_id,
-                        event.arguments,
-                        result,
-                        campaign_request_id=current_repair_scope,
-                        progress_key=automatic_progress_key,
+            try:
+                async with self._steering_lock:
+                    post_invoke_authority_valid = request_authority_valid
+                    if authority_check is not None:
+                        post_invoke_authority_valid, current_repair_scope = await authority_check()
+                    stale_result = not request_authority_valid or not post_invoke_authority_valid
+                    continuation = (
+                        None
+                        if stale_result
+                        else _tool_automatic_recon_continuation(event.name, result)
                     )
-                ),
-            )
+                    terminal_append = asyncio.create_task(
+                        self._append_tool_terminal(
+                            session_id,
+                            name=event.name,
+                            call_id=event.call_id,
+                            content=(
+                                result.content
+                                if stale_result
+                                else _tool_content_with_automatic_marker(
+                                    event.name,
+                                    event.call_id,
+                                    event.arguments,
+                                    result,
+                                    campaign_request_id=current_repair_scope,
+                                    progress_key=automatic_progress_key,
+                                )
+                            ),
+                        )
+                    )
+                    await asyncio.shield(terminal_append)
+            except asyncio.CancelledError:
+                if terminal_append is not None:
+                    with suppress(asyncio.CancelledError):
+                        await terminal_append
+                    interrupted_events = events[position + 1 :]
+                else:
+                    interrupted_events = events[position:]
+                for interrupted in interrupted_events:
+                    await self._append_tool_terminal(
+                        session_id,
+                        name=interrupted.name,
+                        call_id=interrupted.call_id,
+                        content="tool call interrupted before authority commit",
+                    )
+                raise
             failure_category = tool_failure_category(result)
             await self._emit(
                 self._event(
