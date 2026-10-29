@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1119,6 +1120,112 @@ async def test_daemon_lock_records_owner_pid_and_force_stop_terminates_orphan() 
     finally:
         orphan.kill()
         orphan.wait()
+
+
+@pytest.mark.asyncio
+async def test_force_stop_escalates_acknowledged_shutdown_timeout_to_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from merlin_tui.local_control import _daemon_lock_owner
+
+    socket_path = Path(f"/tmp/merlin-stubborn-ack-{os.getpid()}.sock")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    await asyncio.to_thread(socket_path.with_suffix(".lock").unlink, missing_ok=True)
+    fixture = (
+        "import signal, time; "
+        "from pathlib import Path; "
+        "from merlin_tui.local_control import _acquire_daemon_lock; "
+        f"lock = _acquire_daemon_lock(Path({str(socket_path)!r})); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    owner = subprocess.Popen(  # noqa: ASYNC220 -- intentional process-lifecycle fixture
+        [sys.executable, "-c", fixture]
+    )
+
+    class AcknowledgingWriter:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def connect(*_args, **_kwargs):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"result","value":"stopping"}\n')
+        return reader, AcknowledgingWriter()
+
+    monkeypatch.setattr(asyncio, "open_unix_connection", connect)
+
+    try:
+        for _ in range(100):
+            if _daemon_lock_owner(socket_path) == owner.pid:
+                break
+            await asyncio.sleep(0.05)
+        assert _daemon_lock_owner(socket_path) == owner.pid
+
+        assert await stop_daemon(socket_path, force=True, shutdown_seconds=0.2)
+        assert owner.wait() == -signal.SIGKILL
+        assert await asyncio.to_thread(_daemon_lock_released, socket_path)
+    finally:
+        owner.kill()
+        owner.wait()
+
+
+@pytest.mark.asyncio
+async def test_force_stop_escalates_unreachable_locked_owner_to_sigkill() -> None:
+    from merlin_tui.local_control import _daemon_lock_owner
+
+    socket_path = Path(f"/tmp/merlin-stubborn-orphan-{os.getpid()}.sock")
+    await asyncio.to_thread(socket_path.unlink, missing_ok=True)
+    await asyncio.to_thread(socket_path.with_suffix(".lock").unlink, missing_ok=True)
+    fixture = (
+        "import signal, time; "
+        "from pathlib import Path; "
+        "from merlin_tui.local_control import _acquire_daemon_lock; "
+        f"lock = _acquire_daemon_lock(Path({str(socket_path)!r})); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    owner = subprocess.Popen(  # noqa: ASYNC220 -- intentional process-lifecycle fixture
+        [sys.executable, "-c", fixture]
+    )
+    try:
+        for _ in range(100):
+            if _daemon_lock_owner(socket_path) == owner.pid:
+                break
+            await asyncio.sleep(0.05)
+        assert _daemon_lock_owner(socket_path) == owner.pid
+
+        assert await stop_daemon(socket_path, force=True, shutdown_seconds=0.2)
+        assert owner.wait() == -signal.SIGKILL
+        assert await asyncio.to_thread(_daemon_lock_released, socket_path)
+    finally:
+        owner.kill()
+        owner.wait()
+
+
+@pytest.mark.asyncio
+async def test_force_stop_refuses_sigkill_when_lock_owner_changes(monkeypatch, tmp_path) -> None:
+    from merlin_tui import local_control
+
+    socket_path = tmp_path / "daemon.sock"
+    owners = iter((111, 222))
+    kills: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(local_control, "_daemon_lock_released", lambda _path: False)
+    monkeypatch.setattr(local_control, "_daemon_lock_owner", lambda _path: next(owners))
+    monkeypatch.setattr(local_control.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    with pytest.raises(RuntimeError, match="ownership changed.*refusing to kill"):
+        await stop_daemon(socket_path, force=True, shutdown_seconds=0.1)
+
+    assert kills == [(111, signal.SIGTERM)]
 
 
 @pytest.mark.asyncio

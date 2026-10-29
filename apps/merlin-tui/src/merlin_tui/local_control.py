@@ -2059,6 +2059,41 @@ async def _arm_unclaimed_shutdown(socket_path: Path = _SOCKET) -> None:
         await _close_writer(writer)
 
 
+async def _terminate_locked_daemon(socket_path: Path, shutdown_seconds: float) -> bool:
+    """Terminate only the verified process that currently owns the daemon lock."""
+    owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
+    if owner is None:
+        raise RuntimeError("Merlin daemon lock owner could not be verified")
+
+    try:
+        os.kill(owner, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = asyncio.get_running_loop().time() + shutdown_seconds
+    term_grace_seconds = min(1.0, shutdown_seconds / 2)
+    term_deadline = min(deadline, asyncio.get_running_loop().time() + term_grace_seconds)
+    while asyncio.get_running_loop().time() < term_deadline:
+        if await asyncio.to_thread(_daemon_lock_released, socket_path):
+            return True
+        await asyncio.sleep(0.05)
+
+    current_owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
+    if current_owner != owner:
+        raise RuntimeError(
+            f"Merlin daemon lock ownership changed from pid {owner} to {current_owner}; "
+            "refusing to kill an unverified process"
+        )
+    try:
+        os.kill(owner, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    while asyncio.get_running_loop().time() < deadline:
+        if await asyncio.to_thread(_daemon_lock_released, socket_path):
+            return True
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"Merlin daemon owner (pid {owner}) retained its lock after SIGKILL")
+
+
 async def stop_daemon(
     socket_path: Path = _SOCKET,
     *,
@@ -2079,17 +2114,7 @@ async def stop_daemon(
             if force and "foreground owner" in error:
                 # Upgrade/install path: a live foreground lease must not strand
                 # `stop --force`; terminate the owner pid like an orphaned runtime.
-                owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
-                if owner is not None:
-                    os.kill(owner, signal.SIGTERM)
-                    deadline = asyncio.get_running_loop().time() + shutdown_seconds
-                    while asyncio.get_running_loop().time() < deadline:
-                        if await asyncio.to_thread(_daemon_lock_released, socket_path):
-                            return True
-                        await asyncio.sleep(0.05)
-                    raise TimeoutError(
-                        f"Merlin daemon owner (pid {owner}) ignored termination"
-                    ) from None
+                return await _terminate_locked_daemon(socket_path, shutdown_seconds)
             raise RuntimeError(error)
         if response.get("value") != "stopping":
             return False
@@ -2102,6 +2127,8 @@ async def stop_daemon(
             if ownership_released:
                 return True
             await asyncio.sleep(0.05)
+        if force:
+            return await _terminate_locked_daemon(socket_path, shutdown_seconds)
         raise TimeoutError("Merlin daemon acknowledged shutdown but did not finish cleanup")
     except (OSError, ConnectionError, ValueError):
         # A missing socket means "already stopped" only when no process still
@@ -2109,17 +2136,11 @@ async def stop_daemon(
         # repeated restart/install commands accumulate detached runtimes.
         if await asyncio.to_thread(_daemon_lock_released, socket_path):
             return False
-        owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
-        if force and owner is not None:
+        if force:
             # Orphaned runtime: alive enough to hold the lock, dead on the
             # socket. Terminate it so a fresh daemon can start.
-            os.kill(owner, signal.SIGTERM)
-            deadline = asyncio.get_running_loop().time() + shutdown_seconds
-            while asyncio.get_running_loop().time() < deadline:
-                if await asyncio.to_thread(_daemon_lock_released, socket_path):
-                    return True
-                await asyncio.sleep(0.05)
-            raise TimeoutError(f"Merlin daemon owner (pid {owner}) ignored termination") from None
+            return await _terminate_locked_daemon(socket_path, shutdown_seconds)
+        owner = await asyncio.to_thread(_daemon_lock_owner, socket_path)
         detail = (
             "Merlin daemon is unreachable but still owns its process lock; "
             "refusing to start another runtime"
