@@ -12,9 +12,11 @@ import urllib.request
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from merlin_contracts import (
     AppCommand,
@@ -90,6 +92,10 @@ _CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v2"
 _CAMPAIGN_REQUEST_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
+_CAMPAIGN_TARGET_URL_RE = re.compile(
+    r"https?://(?:\[[0-9a-f:.]+\]|[^\s<>\]\[(){}\"'])+", re.IGNORECASE
+)
+_CAMPAIGN_URL_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>()]+", re.IGNORECASE)
 _RECON_RECALL_TOOL = "browser_recall_reconnaissance"
 _OWNED_SESSION_CLEANUP_TOOL = "browser_end_owned_session"
 _HANDOFF_REPAIR_OBSERVATION_TOOL = "browser_network_events"
@@ -490,17 +496,109 @@ def _is_campaign_boundary_continuation(content: str) -> bool:
     )
 
 
+def _campaign_primary_target(content: str) -> str | None:
+    """Match AssessmentService's first-valid-objective-URL canonicalization."""
+
+    match = _CAMPAIGN_TARGET_URL_RE.search(content)
+    if match is None:
+        return None
+    raw_url = match.group(0).rstrip(".,;:!?")
+    parsed = urlsplit(raw_url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return None
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname.lower()
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunsplit((parsed.scheme.lower(), f"{host}{port}", parsed.path or "/", "", ""))
+
+
+def _typed_campaign_primary_target(content: str) -> str | None:
+    marker_index = content.rfind(_CLI_CAMPAIGN_SUBMIT_MARKER)
+    if marker_index < 0:
+        return None
+    encoded = content[marker_index + len(_CLI_CAMPAIGN_SUBMIT_MARKER) :]
+    try:
+        envelope, _end = json.JSONDecoder().raw_decode(encoded)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, Mapping):
+        return None
+    return _campaign_primary_target(str(envelope.get("operator_objective") or ""))
+
+
+@dataclass(frozen=True)
+class _CampaignBoundaryState:
+    kind: Literal["bound", "invalid", "unbound"] = "unbound"
+    scope: tuple[str, str] | None = None
+    primary_target: str | None = None
+
+
+def _advance_campaign_boundary(
+    content: str,
+    state: _CampaignBoundaryState,
+    request_objectives: dict[str, str],
+    invalid_request_ids: set[str],
+) -> tuple[_CampaignBoundaryState, bool]:
+    """Advance one user-authored boundary without permitting scope resurrection."""
+
+    if content.startswith("MERLIN_USER_INPUT_RESPONSE\n"):
+        return state, False
+    typed_scope = _typed_campaign_scope(content)
+    if typed_scope is not None:
+        request_id, objective_digest = typed_scope
+        prior_objective = request_objectives.get(request_id)
+        if request_id in invalid_request_ids or (
+            prior_objective is not None and prior_objective != objective_digest
+        ):
+            invalid_request_ids.add(request_id)
+            return _CampaignBoundaryState("invalid"), True
+        request_objectives[request_id] = objective_digest
+        if state.kind == "bound" and state.scope == typed_scope:
+            return state, False
+        return (
+            _CampaignBoundaryState("bound", typed_scope, _typed_campaign_primary_target(content)),
+            True,
+        )
+    if _CLI_CAMPAIGN_SUBMIT_MARKER in content:
+        legacy_objective = _typed_campaign_objective_digest(content)
+        if legacy_objective is not None:
+            return _CampaignBoundaryState(
+                "unbound", primary_target=_typed_campaign_primary_target(content)
+            ), True
+        return _CampaignBoundaryState("invalid"), True
+    if _is_campaign_boundary_continuation(content):
+        target_token = _CAMPAIGN_URL_TOKEN_RE.search(content)
+        if target_token is None:
+            return state, False
+        continuation_target = _campaign_primary_target(content)
+        if continuation_target is not None and continuation_target == state.primary_target:
+            return state, False
+        return _CampaignBoundaryState("unbound", primary_target=continuation_target), True
+    return _CampaignBoundaryState("unbound", primary_target=_campaign_primary_target(content)), True
+
+
 def _latest_typed_campaign_scope(
     transcript: list[ChatMessage],
 ) -> tuple[str, str] | None:
-    for message in reversed(transcript):
+    state = _CampaignBoundaryState()
+    request_objectives: dict[str, str] = {}
+    invalid_request_ids: set[str] = set()
+    for message in transcript:
         if message.role != "user":
             continue
-        if _is_campaign_boundary_continuation(message.content):
-            continue
-        scope = _typed_campaign_scope(message.content)
-        return scope
-    return None
+        state, _new_boundary = _advance_campaign_boundary(
+            message.content, state, request_objectives, invalid_request_ids
+        )
+    return state.scope if state.kind == "bound" else None
 
 
 def _tool_call_arguments(call: Mapping[str, object]) -> Mapping[str, object]:
@@ -709,31 +807,20 @@ def _restored_preferred_tool_repair(
             seen_call_ids.add(call_id)
     trusted_calls: dict[str, tuple[str, Mapping[str, object]]] = {}
     required: tuple[str, str, str, str] | None = None
-    latest_typed_scope: tuple[str, str] | None = None
+    boundary_state = _CampaignBoundaryState()
     request_objectives: dict[str, str] = {}
     invalid_request_ids: set[str] = set()
     for message in transcript:
         if message.role == "user":
-            typed_scope = _typed_campaign_scope(message.content)
-            if typed_scope is not None:
-                request_id, objective_digest = typed_scope
-                if request_id in invalid_request_ids:
-                    continue
-                prior_objective = request_objectives.get(request_id)
-                if prior_objective is not None and prior_objective != objective_digest:
-                    invalid_request_ids.add(request_id)
-                    if required is not None and required[3] == request_id:
-                        required = None
-                    if latest_typed_scope is not None and latest_typed_scope[0] == request_id:
-                        latest_typed_scope = None
-                    continue
-                request_objectives[request_id] = objective_digest
-                latest_typed_scope = typed_scope
-                if required is not None and required[3] != request_id:
-                    required = None
-            elif not _is_campaign_boundary_continuation(message.content):
-                latest_typed_scope = None
+            boundary_state, new_boundary = _advance_campaign_boundary(
+                message.content,
+                boundary_state,
+                request_objectives,
+                invalid_request_ids,
+            )
+            if new_boundary:
                 required = None
+                trusted_calls.clear()
             continue
         if message.role == "assistant":
             for item in message.tool_calls:
@@ -804,6 +891,7 @@ def _restored_preferred_tool_repair(
             or objective_source not in {None, "call_arguments", "result_metadata"}
         ):
             continue
+        latest_typed_scope = boundary_state.scope
         if latest_typed_scope is None or campaign_request_id != latest_typed_scope[0]:
             continue
         call_objective_digest = _objective_scope_digest(call[1].get("objective"))
@@ -876,7 +964,7 @@ def _restored_automatic_recon(
 ) -> tuple[dict[str, object] | None, set[str]]:
     continuation: dict[str, object] | None = None
     continuation_request_id: str | None = None
-    active_request_id: str | None = None
+    boundary_state = _CampaignBoundaryState()
     request_objectives: dict[str, str] = {}
     invalid_request_ids: set[str] = set()
     progress: set[str] = set()
@@ -897,32 +985,17 @@ def _restored_automatic_recon(
     trusted_calls: dict[str, str] = {}
     for message in transcript:
         if message.role == "user":
-            typed_scope = _typed_campaign_scope(message.content)
-            if typed_scope is not None:
-                request_id, objective_digest = typed_scope
-                if request_id in invalid_request_ids:
-                    continue
-                prior_objective = request_objectives.get(request_id)
-                if prior_objective is not None and prior_objective != objective_digest:
-                    invalid_request_ids.add(request_id)
-                    if continuation_request_id == request_id:
-                        continuation = None
-                        continuation_request_id = None
-                        progress.clear()
-                    if active_request_id == request_id:
-                        active_request_id = None
-                    continue
-                request_objectives[request_id] = objective_digest
-                active_request_id = request_id
-                if continuation is not None and continuation_request_id != active_request_id:
-                    continuation = None
-                    continuation_request_id = None
-                    progress.clear()
-            elif not _is_campaign_boundary_continuation(message.content):
-                active_request_id = None
+            boundary_state, new_boundary = _advance_campaign_boundary(
+                message.content,
+                boundary_state,
+                request_objectives,
+                invalid_request_ids,
+            )
+            if new_boundary:
                 continuation = None
                 continuation_request_id = None
                 progress.clear()
+                trusted_calls.clear()
             continue
         if message.role == "assistant":
             for call in message.tool_calls:
@@ -959,6 +1032,7 @@ def _restored_automatic_recon(
         if not isinstance(payload, Mapping):
             continue
         state = payload.get("state")
+        active_request_id = boundary_state.scope[0] if boundary_state.scope is not None else None
         if set(payload) == {"continuation", "state"}:
             if (
                 active_request_id is not None
@@ -1510,6 +1584,7 @@ class Kernel:
         owned_cleanup_failed = False
         owned_cleanup_evidence_failed = False
         owned_cleanup_completed = False
+        owned_cleanup_attempted_in_turn = False
         consumed_steering_version = self._steering_version
         try:
             skill_messages: list[ChatMessage] = []
@@ -1805,7 +1880,6 @@ class Kernel:
                 reasoning = ""
                 retry_provider = False
                 preferred_tool_invoked_dynamically = False
-                owned_cleanup_attempted_in_callback = False
 
                 async def handle_dynamic_tool(
                     call: ToolCall,
@@ -1826,7 +1900,7 @@ class Kernel:
                     nonlocal owned_cleanup_failed
                     nonlocal owned_cleanup_evidence_failed
                     nonlocal owned_cleanup_completed
-                    nonlocal owned_cleanup_attempted_in_callback
+                    nonlocal owned_cleanup_attempted_in_turn
                     nonlocal preferred_next_tool_name
                     nonlocal preferred_next_tool_mode
                     nonlocal preferred_tool_follow_through_failures
@@ -1866,7 +1940,7 @@ class Kernel:
                         active_owned_cleanup_key
                     )
                     duplicate_owned_cleanup = (
-                        is_active_owned_cleanup and owned_cleanup_attempted_in_callback
+                        is_active_owned_cleanup and owned_cleanup_attempted_in_turn
                     )
                     current_preferred_tool_name = preferred_next_tool_name
                     is_preferred_tool_call = call.name == current_preferred_tool_name
@@ -1930,7 +2004,7 @@ class Kernel:
                     )
                     admitted_owned_cleanup = tool_admitted and is_active_owned_cleanup
                     if admitted_owned_cleanup:
-                        owned_cleanup_attempted_in_callback = True
+                        owned_cleanup_attempted_in_turn = True
                     if bounded_preferred_observation:
                         preferred_transition_observation_used = True
                     try:

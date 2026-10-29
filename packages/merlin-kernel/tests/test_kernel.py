@@ -27,7 +27,9 @@ from merlin_contracts import (
 )
 from merlin_kernel import CommandError, Kernel, parse_command
 from merlin_kernel.kernel import (
+    _advance_campaign_boundary,
     _automatic_recon_continuation,
+    _CampaignBoundaryState,
     _KernelJevClient,
     _latest_typed_campaign_scope,
     _restored_automatic_recon,
@@ -3994,7 +3996,7 @@ async def test_dynamic_owned_cleanup_created_mid_request_runs_once() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("split_callback", [False, True])
-async def test_dynamic_owned_cleanup_limit_is_per_provider_callback(
+async def test_dynamic_owned_cleanup_limit_is_per_outer_turn(
     split_callback: bool,
 ) -> None:
     class RotatingHandoffTools(Tools):
@@ -4075,25 +4077,21 @@ async def test_dynamic_owned_cleanup_limit_is_per_provider_callback(
             )
             yield ModelCompleted(finish_reason="tool_calls")
 
+    store = Store()
     tools = RotatingHandoffTools()
     provider = RotatingHandoffProvider()
-    kernel = Kernel(provider, Store(), tools, Settings())
+    kernel = Kernel(provider, store, tools, Settings())
     await kernel.start()
     await kernel.submit("rotate owned handoffs")
     await kernel.wait_for_turn()
 
-    expected_cleanup_calls = 2 if split_callback else 1
-    assert tools.calls.count("browser_end_owned_session") == expected_cleanup_calls
-    assert provider.second_cleanup == (
-        DynamicToolOutput(content="owned session ended", success=True)
-        if split_callback
-        else DynamicToolOutput(
-            content=(
-                "browser_end_owned_session failed: tool is not admitted for this provider request"
-            ),
-            success=False,
-        )
+    assert tools.calls.count("browser_end_owned_session") == 1
+    assert provider.second_cleanup == DynamicToolOutput(
+        content="browser_end_owned_session failed: tool is not admitted for this provider request",
+        success=False,
     )
+    errors = [event for event in store.events if event.type == "error"]
+    assert errors[-1].payload["code"] == "owned_session_cleanup_evidence_incomplete"
 
 
 @pytest.mark.asyncio
@@ -4768,6 +4766,145 @@ def test_latest_campaign_scope_stops_at_untyped_or_malformed_boundary() -> None:
     )
 
 
+@pytest.mark.parametrize("prefix", ["Resume", "Retry", "Continue"])
+@pytest.mark.parametrize("target", ["", " https://c.test/chat"])
+def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
+    prefix: str, target: str
+) -> None:
+    objective = "Assess https://c.test/chat"
+    scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
+
+    assert _latest_typed_campaign_scope(
+        [scope, ChatMessage(role="user", content=f"{prefix}{target}")]
+    ) == (
+        _CAMPAIGN_REQUEST_ID_A,
+        "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "Resume https://b.test/chat",
+        "Retry https://c.test:443/chat",
+        "Continue https://c.test/chat/",
+        "Resume https://user:secret@c.test/chat",
+        "Resume ftp://c.test/chat",
+    ],
+)
+def test_latest_campaign_scope_unbinds_different_or_unknown_primary_target(
+    continuation: str,
+) -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess https://c.test/chat"))
+
+    assert (
+        _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=continuation)])
+        is None
+    )
+
+
+def test_latest_campaign_scope_is_forward_only_and_typed_envelope_outranks_prefix() -> None:
+    scope_c = ChatMessage(
+        role="user", content=_campaign_scope_content("Assess https://c.test/chat")
+    )
+    lost = [
+        scope_c,
+        ChatMessage(role="user", content="Resume https://b.test/chat"),
+        ChatMessage(role="user", content="Resume https://c.test/chat"),
+    ]
+    assert _latest_typed_campaign_scope(lost) is None
+
+    prefixed_envelope = ChatMessage(
+        role="user",
+        content=(
+            "Resume https://b.test/chat\n"
+            + _campaign_scope_content("Assess https://c.test/chat", _CAMPAIGN_REQUEST_ID_B)
+        ),
+    )
+    assert _latest_typed_campaign_scope([scope_c, prefixed_envelope]) == (
+        _CAMPAIGN_REQUEST_ID_B,
+        "sha256:" + hashlib.sha256(b"Assess https://c.test/chat").hexdigest(),
+    )
+
+
+def test_campaign_boundary_state_retains_unbound_and_invalid_epochs_without_resurrection() -> None:
+    objectives: dict[str, str] = {}
+    invalid_ids: set[str] = set()
+    state, changed = _advance_campaign_boundary(
+        _campaign_scope_content("Assess https://c.test/chat"),
+        _CampaignBoundaryState(),
+        objectives,
+        invalid_ids,
+    )
+    assert state.kind == "bound" and changed
+
+    state, changed = _advance_campaign_boundary(
+        "Resume https://b.test/chat", state, objectives, invalid_ids
+    )
+    assert state == _CampaignBoundaryState("unbound", primary_target="https://b.test/chat")
+    assert changed
+    same_unbound, changed = _advance_campaign_boundary(
+        "Retry https://b.test/chat", state, objectives, invalid_ids
+    )
+    assert same_unbound == state
+    assert not changed
+    targetless_unbound, changed = _advance_campaign_boundary(
+        "Continue", state, objectives, invalid_ids
+    )
+    assert targetless_unbound == state
+    assert not changed
+    state, changed = _advance_campaign_boundary(
+        "Continue https://c.test/chat", state, objectives, invalid_ids
+    )
+    assert state == _CampaignBoundaryState("unbound", primary_target="https://c.test/chat")
+    assert changed
+
+    invalid = _CampaignBoundaryState("invalid")
+    retained_invalid, changed = _advance_campaign_boundary(
+        "Resume", invalid, objectives, invalid_ids
+    )
+    assert retained_invalid == invalid
+    assert not changed
+
+
+def test_campaign_boundary_v1_retains_primary_target_without_binding_request_id() -> None:
+    v1 = "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n" + json.dumps(
+        {
+            "operator_objective": "Assess https://c.test/chat",
+            "schema_version": "merlin.cli-campaign-submit.v1",
+        },
+        sort_keys=True,
+    )
+    state, changed = _advance_campaign_boundary(v1, _CampaignBoundaryState(), {}, set())
+    assert state == _CampaignBoundaryState("unbound", primary_target="https://c.test/chat")
+    assert changed
+    for continuation in ("Resume", "Retry https://c.test/chat"):
+        retained, changed = _advance_campaign_boundary(continuation, state, {}, set())
+        assert retained == state
+        assert not changed
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n{malformed",
+        "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
+        + json.dumps(
+            {
+                "operator_objective": "Assess https://c.test/chat",
+                "schema_version": "merlin.cli-campaign-submit.v1",
+            },
+            sort_keys=True,
+        ),
+    ],
+)
+def test_latest_campaign_scope_treats_v1_as_unbound_and_malformed_as_invalid(
+    boundary: str,
+) -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess https://c.test/chat"))
+    assert _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=boundary)]) is None
+
+
 def test_handoff_repair_same_request_id_conflict_fails_closed() -> None:
     objective_a = "Assess target A"
     objective_b = "Assess target B"
@@ -4850,6 +4987,115 @@ def test_handoff_repair_same_request_id_conflict_fails_closed() -> None:
     ]
 
     assert _restored_preferred_tool_repair(transcript) is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_stamp_conflicting_request_id_as_typed_scope() -> None:
+    objective_a = "Assess https://a.test/chat"
+    objective_b = "Assess https://b.test/chat"
+
+    class ConflictingScopeTools(Tools):
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="assessment_prepare",
+                    description="Prepare",
+                    input_schema={},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            assert name == "assessment_prepare"
+            return ToolResult(content="prepared")
+
+    class ConflictingScopeProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def stream(self, request):
+            self.requests += 1
+            if self.requests == 1:
+                yield ToolCall(
+                    call_id="conflicting-scope-prepare",
+                    name="assessment_prepare",
+                    arguments={"objective": objective_b},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="scope remained unbound")
+            yield ModelCompleted()
+
+    store = Store()
+    session_id = await store.create_session()
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective_a)),
+        ChatMessage(
+            role="user",
+            content=_campaign_scope_content(objective_b, _CAMPAIGN_REQUEST_ID_A),
+        ),
+    ]
+    kernel = Kernel(ConflictingScopeProvider(), store, ConflictingScopeTools(), Settings())
+    await kernel.start(session_id)
+    await kernel.submit("Continue")
+    await kernel.wait_for_turn()
+
+    stamped = next(
+        message
+        for message in store.messages[session_id]
+        if message.role == "tool" and message.tool_call_id == "conflicting-scope-prepare"
+    )
+    assert "[merlin-preferred-tool-repair]" not in stamped.content
+    assert '"campaign_request_id":null' in stamped.content
+    assert "[merlin-automatic-recon]" in stamped.content
+
+
+def test_repair_delayed_result_survives_identical_scope_but_not_new_boundary() -> None:
+    objective = "Assess https://c.test/chat"
+    result = ToolResult(
+        content="handoff required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+        },
+    )
+    call = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "delayed-repair",
+                "type": "function",
+                "function": {
+                    "name": "assessment_prepare",
+                    "arguments": json.dumps({"objective": objective}),
+                },
+            }
+        ],
+    )
+    tool = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id="delayed-repair",
+        content=_tool_content_with_automatic_marker(
+            "assessment_prepare",
+            "delayed-repair",
+            {"objective": objective},
+            result,
+            campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+        ),
+    )
+    scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
+    identical = ChatMessage(role="user", content=_campaign_scope_content(objective))
+
+    assert _restored_preferred_tool_repair([scope, call, identical, tool]) is not None
+    assert (
+        _restored_preferred_tool_repair(
+            [scope, call, ChatMessage(role="user", content="Resume https://b.test/chat"), tool]
+        )
+        is None
+    )
 
 
 def test_automatic_recon_restore_is_authenticated_and_campaign_scoped() -> None:
@@ -5011,6 +5257,63 @@ def test_legacy_automatic_recon_marker_is_cleared_by_later_v2_boundary() -> None
     )
 
     assert restored is None
+
+
+def test_automatic_recon_delayed_results_respect_identical_and_new_boundaries() -> None:
+    objective = "Assess https://c.test/chat"
+    result = ToolResult(
+        content="cleanup discovery required",
+        is_error=True,
+        metadata={"automatic_recon_continuation": _cleanup_continuation("handoff:delayed")},
+    )
+    content = _tool_content_with_automatic_marker(
+        "assessment_prepare",
+        "delayed-modern",
+        {"objective": objective},
+        result,
+        campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    call = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "delayed-modern",
+                "type": "function",
+                "function": {
+                    "name": "assessment_prepare",
+                    "arguments": json.dumps({"objective": objective}),
+                },
+            }
+        ],
+    )
+    tool = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id="delayed-modern",
+        content=content,
+    )
+    scope = ChatMessage(role="user", content=_campaign_scope_content(objective))
+    identical = ChatMessage(role="user", content=_campaign_scope_content(objective))
+
+    restored, _ = _restored_automatic_recon([scope, call, identical, tool])
+    assert restored is not None
+    cleared, _ = _restored_automatic_recon(
+        [scope, call, ChatMessage(role="user", content="Retry https://b.test/chat"), tool]
+    )
+    assert cleared is None
+
+    legacy_call, legacy_result = _legacy_automatic_recon_messages(
+        "handoff:legacy-delayed", "legacy-delayed"
+    )
+    legacy_cleared, _ = _restored_automatic_recon(
+        [
+            legacy_call,
+            ChatMessage(role="user", content="Continue https://b.test/chat"),
+            legacy_result,
+        ]
+    )
+    assert legacy_cleared is None
 
 
 def test_legacy_automatic_recon_marker_rejects_future_call() -> None:
@@ -5228,7 +5531,7 @@ async def test_kernel_backend_campaign_boundary_scopes_repair_obligation(
 ) -> None:
     from merlin_tui.kernel_backend import KernelBackend
 
-    objective_a = "Assess target A"
+    objective_a = "Assess https://target-a.test"
     store = Store()
     session_id = await store.create_session()
     prepare_result = ToolResult(
