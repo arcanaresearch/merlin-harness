@@ -14298,82 +14298,250 @@ async def test_prepare_tool_replaces_cached_candidate_when_handoff_id_changes() 
 
 
 @pytest.mark.parametrize(
-    ("identity_field", "wrong_identity", "error_message"),
+    ("identity_field", "wrong_identity"),
     [
-        (
-            "expected_target_id",
-            "target:wrong",
-            "reviewed reconnaissance handoff belongs to another target",
-        ),
-        (
-            "expected_target_session_id",
-            "browser:wrong-context",
-            "reviewed reconnaissance handoff belongs to another target session",
-        ),
+        ("expected_target_id", "target:wrong"),
+        ("expected_target_session_id", "browser:wrong-context"),
     ],
 )
-async def test_prepare_tool_drops_rejected_handoff_identity_claim_before_retry(
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "value_error",
+        "resolver_unavailable",
+        "different_handoff",
+        "reviewed_adapter_validation",
+        "budget",
+        "phase_gates",
+        "bounded_regeneration",
+        "service_exception",
+    ],
+)
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["direct_legacy", "configured", "configured_untyped"],
+)
+async def test_prepare_tool_discards_identity_claims_after_every_post_merge_failure(
     identity_field: str,
     wrong_identity: str,
-    error_message: str,
+    failure_mode: str,
+    scope_kind: str,
 ) -> None:
     requests: list[Mapping[str, object]] = []
     prepared: list[Mapping[str, object]] = []
     handoff_id = "handoff:reviewed"
+    fail_prepare = failure_mode == "service_exception"
     hydrated = {
         **_reviewed_browser_adapter(),
         "recon_handoff_id": handoff_id,
     }
 
     class Service:
-        async def resolve_reviewed_adapter(self, _session_id, adapter):
-            requests.append(dict(adapter))
-            if adapter.get(identity_field) == wrong_identity:
-                raise ValueError(error_message)
-            return hydrated
-
         async def prepare(self, _session_id, _objective, _profile, adapter, **_kwargs):
+            nonlocal fail_prepare
             prepared.append(adapter)
+            if fail_prepare:
+                fail_prepare = False
+                raise RuntimeError("prepare failed")
             return {"campaign_id": "campaign-1"}
 
-    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    service = Service()
+
+    async def resolve_reviewed_adapter(_session_id, adapter):
+        requests.append(dict(adapter))
+        if adapter.get(identity_field) == wrong_identity:
+            if failure_mode == "value_error":
+                raise ValueError("identity claim rejected")
+            if failure_mode == "different_handoff":
+                return {"recon_handoff_id": "handoff:different"}
+            if failure_mode == "reviewed_adapter_validation":
+                return {"recon_handoff_id": handoff_id}
+        return hydrated
+
+    if failure_mode != "resolver_unavailable":
+        service.resolve_reviewed_adapter = resolve_reviewed_adapter  # type: ignore[attr-defined]
+    tool = AssessmentPrepareTool(service)  # type: ignore[arg-type]
     context = ToolContext(session_id="session-1", workspace_root="/workspace")
     base_arguments = {
         "objective": "Assess target",
         "campaign_profile": "recommended",
     }
 
-    rejected = await tool.invoke_for_configured_scope(
-        context,
-        {
-            **base_arguments,
-            "adapter": {
-                "recon_handoff_id": handoff_id,
-                identity_field: wrong_identity,
-            },
+    async def invoke(arguments):
+        if scope_kind == "direct_legacy":
+            return await tool.invoke(context, arguments)
+        cache_scope = (
+            "00000000-0000-4000-8000-000000000040"
+            if scope_kind == "configured"
+            else "configure-tool-call:untyped"
+        )
+        return await tool.invoke_for_configured_scope(
+            context,
+            arguments,
+            cache_scope=cache_scope,
+        )
+
+    rejected_arguments = {
+        **base_arguments,
+        "adapter": {
+            "recon_handoff_id": handoff_id,
+            identity_field: wrong_identity,
         },
-        cache_scope="00000000-0000-4000-8000-000000000040",
-    )
-    retried = await tool.invoke_for_configured_scope(
-        context,
+    }
+    if failure_mode == "budget":
+        rejected_arguments["budget"] = "invalid"
+    elif failure_mode == "phase_gates":
+        rejected_arguments["phase_gates"] = "invalid"
+    elif failure_mode == "bounded_regeneration":
+        rejected_arguments["bounded_regeneration"] = "invalid"
+
+    if failure_mode == "service_exception":
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            await invoke(rejected_arguments)
+        rejected = None
+    else:
+        rejected = await invoke(rejected_arguments)
+        assert rejected.is_error is True
+
+    if failure_mode == "resolver_unavailable":
+        service.resolve_reviewed_adapter = resolve_reviewed_adapter  # type: ignore[attr-defined]
+    retried = await invoke(
         {
             **base_arguments,
             "adapter": {"recon_handoff_id": handoff_id},
-        },
-        cache_scope="00000000-0000-4000-8000-000000000040",
+        }
     )
 
-    assert rejected.is_error is True
-    assert rejected.content == error_message
     assert retried.is_error is False
+    assert requests[-1] == {"recon_handoff_id": handoff_id}
+    assert prepared[-1]["recon_handoff_id"] == handoff_id
+    assert prepared[-1]["adapter_identity_version"] == "merlin.executable-adapter.v1"
+    assert identity_field not in prepared[-1]
+
+
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["direct_legacy", "configured", "configured_untyped"],
+)
+async def test_prepare_tool_success_clears_the_full_cache_scope(scope_kind: str) -> None:
+    requests: list[Mapping[str, object]] = []
+    handoff_id = "handoff:reviewed"
+    hydrated = {**_reviewed_browser_adapter(), "recon_handoff_id": handoff_id}
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            return hydrated
+
+        async def prepare(self, *_args, **_kwargs):
+            return {"campaign_id": "campaign-1"}
+
+    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    context = ToolContext(session_id="session-1", workspace_root="/workspace")
+
+    async def invoke(adapter):
+        arguments = {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": adapter,
+        }
+        if scope_kind == "direct_legacy":
+            return await tool.invoke(context, arguments)
+        cache_scope = (
+            "00000000-0000-4000-8000-000000000040"
+            if scope_kind == "configured"
+            else "configure-tool-call:untyped"
+        )
+        return await tool.invoke_for_configured_scope(
+            context,
+            arguments,
+            cache_scope=cache_scope,
+        )
+
+    first = await invoke(
+        {
+            "recon_handoff_id": handoff_id,
+            "expected_target_id": "target:reviewed",
+        }
+    )
+    second = await invoke({"recon_handoff_id": handoff_id})
+
+    assert first.is_error is False
+    assert second.is_error is False
     assert requests == [
-        {"recon_handoff_id": handoff_id, identity_field: wrong_identity},
+        {
+            "recon_handoff_id": handoff_id,
+            "expected_target_id": "target:reviewed",
+        },
         {"recon_handoff_id": handoff_id},
     ]
-    assert len(prepared) == 1
-    assert prepared[0]["recon_handoff_id"] == handoff_id
-    assert prepared[0]["adapter_identity_version"] == "merlin.executable-adapter.v1"
-    assert identity_field not in prepared[0]
+
+
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["direct_legacy", "configured", "configured_untyped"],
+)
+async def test_prepare_tool_identity_eviction_preserves_unrelated_candidate_fields(
+    scope_kind: str,
+) -> None:
+    requests: list[Mapping[str, object]] = []
+    api_steps = [
+        {
+            "step_id": "message",
+            "endpoint": "/chat",
+            "method": "POST",
+            "request_template": {"message": "{{input}}"},
+            "interaction": True,
+            "cleanup": False,
+        }
+    ]
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            raise ValueError("candidate remains incomplete")
+
+    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    context = ToolContext(session_id="session-1", workspace_root="/workspace")
+
+    async def invoke(adapter):
+        arguments = {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": adapter,
+        }
+        if scope_kind == "direct_legacy":
+            return await tool.invoke(context, arguments)
+        cache_scope = (
+            "00000000-0000-4000-8000-000000000040"
+            if scope_kind == "configured"
+            else "configure-tool-call:untyped"
+        )
+        return await tool.invoke_for_configured_scope(
+            context,
+            arguments,
+            cache_scope=cache_scope,
+        )
+
+    await invoke(
+        {
+            "interface": "http_api",
+            "execution_mode": "api",
+            "endpoint": "https://target.test/chat",
+            "api_steps": api_steps,
+            "expected_target_id": "target:wrong",
+        }
+    )
+    await invoke(
+        {
+            "interface": "http_api",
+            "execution_mode": "api",
+            "endpoint": "https://target.test/chat",
+        }
+    )
+
+    assert requests[1]["api_steps"] == api_steps
+    assert "expected_target_id" not in requests[1]
 
 
 def test_prepare_tool_schema_admits_handoff_id_only_adapter() -> None:

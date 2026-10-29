@@ -22396,6 +22396,17 @@ class AssessmentPrepareTool:
         self._adapter_candidates[cache_key] = merged
         return merged
 
+    def _discard_adapter_identity_claims(self, cache_key: tuple[str, str | None] | None) -> None:
+        if cache_key is None:
+            return
+        cached_candidate = self._adapter_candidates.get(cache_key)
+        if cached_candidate is not None:
+            self._adapter_candidates[cache_key] = {
+                key: value
+                for key, value in cached_candidate.items()
+                if key not in {"expected_target_id", "expected_target_session_id"}
+            }
+
     async def invoke_for_configured_scope(
         self,
         context: ToolContext,
@@ -22767,6 +22778,12 @@ class AssessmentPrepareTool:
         *,
         _adapter_cache_scope: str | None = None,
     ) -> ToolResult:
+        candidate_cache_key: tuple[str, str | None] | None = None
+
+        def failed_after_merge(content: str, **kwargs: Any) -> ToolResult:
+            self._discard_adapter_identity_claims(candidate_cache_key)
+            return ToolResult(content=content, is_error=True, **kwargs)
+
         objective = arguments.get("objective")
         try:
             profile = CampaignProfile(str(arguments.get("campaign_profile")))
@@ -22824,17 +22841,15 @@ class AssessmentPrepareTool:
             adapter = self._merge_adapter_candidate(
                 context.session_id, _adapter_cache_scope, adapter
             )
+            candidate_cache_key = (context.session_id, _adapter_cache_scope)
             try:
                 resolver = getattr(self._service, "resolve_reviewed_adapter", None)
                 if resolver is not None:
                     adapter = await resolver(context.session_id, adapter)
                 elif needs_handoff_resolution:
-                    return ToolResult(
-                        content=(
-                            "browser/hybrid preparation cannot verify the durable "
-                            "reconnaissance handoff"
-                        ),
-                        is_error=True,
+                    return failed_after_merge(
+                        "browser/hybrid preparation cannot verify the durable "
+                        "reconnaissance handoff"
                     )
             except ValueError as error:
                 if getattr(error, "cleanup_discovery_required", False) is True:
@@ -22863,31 +22878,20 @@ class AssessmentPrepareTool:
                         )
                         adapter["evaluation_uncertainties"] = uncertainties
                 else:
-                    cache_key = (context.session_id, _adapter_cache_scope)
-                    cached_candidate = self._adapter_candidates.get(cache_key)
-                    if cached_candidate is not None:
-                        self._adapter_candidates[cache_key] = {
-                            key: value
-                            for key, value in cached_candidate.items()
-                            if key not in {"expected_target_id", "expected_target_session_id"}
-                        }
-                    return ToolResult(content=str(error), is_error=True)
+                    return failed_after_merge(str(error))
             if isinstance(handoff_id, str) and handoff_id.strip():
                 resolved_handoff_id = (
                     adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None
                 )
                 if resolved_handoff_id != handoff_id:
-                    return ToolResult(
-                        content=(
-                            "browser/hybrid preparation resolved a different durable "
-                            "reconnaissance handoff"
-                        ),
-                        is_error=True,
+                    return failed_after_merge(
+                        "browser/hybrid preparation resolved a different durable "
+                        "reconnaissance handoff"
                     )
             adapter = _normalize_adapter_evaluation_metadata(adapter, profile=profile)
         error = _validate_reviewed_adapter(adapter, profile=profile)
         if error is not None:
-            return ToolResult(content=error, is_error=True)
+            return failed_after_merge(error)
         assert isinstance(adapter, Mapping)
         observability_error = _validate_objective_state_observability(objective, adapter)
         if observability_error is not None:
@@ -22914,7 +22918,7 @@ class AssessmentPrepareTool:
             objective = f"{objective.strip()}\nTarget: {target_anchor}"
         budget_value = arguments.get("budget")
         if budget_value is not None and not isinstance(budget_value, Mapping):
-            return ToolResult(content="budget must be an object", is_error=True)
+            return failed_after_merge("budget must be an object")
         try:
             budget = (
                 None
@@ -22927,18 +22931,18 @@ class AssessmentPrepareTool:
                 )
             )
         except (TypeError, ValueError):
-            return ToolResult(content="budget limits must be positive numbers", is_error=True)
+            return failed_after_merge("budget limits must be positive numbers")
         phase_gates_value = arguments.get("phase_gates")
         if phase_gates_value is None:
             phase_gates_value = []
         if not isinstance(phase_gates_value, list):
-            return ToolResult(content="phase_gates must be an array", is_error=True)
+            return failed_after_merge("phase_gates must be an array")
         try:
             phase_gates = tuple(
                 objective_phase_gate_from_mapping(value) for value in phase_gates_value
             )
         except (KeyError, TypeError, ValueError) as error:
-            return ToolResult(content=f"invalid phase_gates: {error}", is_error=True)
+            return failed_after_merge(f"invalid phase_gates: {error}")
         regeneration_value = arguments.get("bounded_regeneration")
         try:
             regeneration = (
@@ -22947,21 +22951,25 @@ class AssessmentPrepareTool:
                 else None
             )
         except (TypeError, ValueError) as error:
-            return ToolResult(content=f"invalid bounded_regeneration: {error}", is_error=True)
+            return failed_after_merge(f"invalid bounded_regeneration: {error}")
         composition_kwargs = {} if composition is None else {"specialist_composition": composition}
         prepare_kwargs = {
             **composition_kwargs,
             **({"objective_phase_gates": phase_gates} if phase_gates else {}),
             **({"bounded_regeneration": regeneration} if regeneration is not None else {}),
         }
-        if budget is None:
-            result = await self._service.prepare(
-                context.session_id, objective, profile, adapter, **prepare_kwargs
-            )
-        else:
-            result = await self._service.prepare(
-                context.session_id, objective, profile, adapter, budget, **prepare_kwargs
-            )
+        try:
+            if budget is None:
+                result = await self._service.prepare(
+                    context.session_id, objective, profile, adapter, **prepare_kwargs
+                )
+            else:
+                result = await self._service.prepare(
+                    context.session_id, objective, profile, adapter, budget, **prepare_kwargs
+                )
+        except BaseException:
+            self._discard_adapter_identity_claims(candidate_cache_key)
+            raise
         self._adapter_candidates.pop((context.session_id, _adapter_cache_scope), None)
         return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
 
