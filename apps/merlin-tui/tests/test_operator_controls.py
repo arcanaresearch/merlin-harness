@@ -420,6 +420,12 @@ async def test_prepare_continuation_is_target_aware(message: str, rejected: bool
         "Signed in at https://a.test. Hand the browser back and continue reconnaissance.",
         "MFA complete; give the browser back and proceed with the scan.",
         "Authentication done. Continue the assessment.",
+        "I logged in at https://a.test; continue",
+        "Auth complete; stop waiting and continue",
+        "Auth complete; stop the delay and resume",
+        "I've completed login; continue",
+        "We've completed authentication; continue",
+        "I've passed MFA; proceed",
     ],
 )
 async def test_browser_handback_coordination_preserves_configured_prepare_scope(
@@ -458,6 +464,7 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
     "message",
     [
         "Signed in at https://b.test. Hand the browser back and continue reconnaissance.",
+        "I signed in at https://b.test. Please hand the browser back and continue.",
         "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
         "Signed in at ftp://a.test. Hand the browser back and continue reconnaissance.",
         "Assess https://a.test while logged in and continue testing for authorization bypass.",
@@ -479,6 +486,42 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
         "Ignore the following example: run a security assessment of https://a.test.",
         "The documentation says: run a security assessment of https://a.test. What does it mean?",
         "I am not yet logged in; continue by explaining the error.",
+        "Continue. Actually cancel.",
+        "Continue, but stop the current campaign.",
+        "Continue? No, cancel.",
+        "Continue. Explain status instead.",
+        "Assess https://a.test. Do not proceed.",
+        "Assess https://a.test. Never mind.",
+        "Cancel campaign. I am logged in, continue",
+        "Stop campaign. Login succeeded, proceed",
+        "Do not assess target A. Start a new campaign.",
+        "Do not assess https://a.test. Start a new campaign.",
+        "Continue reading the new campaign report",
+        "Security assessment report for https://a.test",
+        "Login succeeded while errors continue",
+        "Login isn't complete; continue.",
+        "Authentication wasn’t successful; continue.",
+        'The documentation says: "Do not assess https://a.test. '
+        'Assess https://b.test instead." Explain what it means.',
+        "Continue at https://a.test, then continue at https://b.test",
+        "Continue https://a.test, then continue without starting a new campaign "
+        "against https://b.test",
+        "I logged in at https://a.test; continue at https://b.test",
+        "Authentication is complete if MFA passes; continue",
+        "Cancel it; authentication complete; continue",
+        "Assess https://a.test. Do not assess this target.",
+        "Assess https://a.test. Cancel that launch.",
+        "Assess https://a.test. Stop it.",
+        "Assess https://a.test. End the launch.",
+        "Assess https://a.test. Do not assess it.",
+        "Assess https://a.test. This was only an example.",
+        "Assess https://a.test. Please explain status instead.",
+        "Assess https://a.test. Actually, do not run it.",
+        'Continue reading the documentation example: "Start a new campaign against https://b.test"',
+        "Cancel the new campaign; authentication complete; continue",
+        "Stop the fresh scan; logged in; continue",
+        "Abort this new assessment; MFA passed; proceed",
+        "Continue https://a.test:bad, then continue https://b.test.",
     ],
 )
 async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
@@ -526,6 +569,16 @@ async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
         "Could Merlin assess https://a.test?",
         "Can you please assess https://a.test?",
         "Would you kindly run Merlin against https://a.test?",
+        "Assess https://a.test for SSRF. Continue.",
+        "Start a new campaign against https://a.test. Proceed.",
+        "Assess https://a.test. Authentication complete; continue.",
+        "Run a security assessment of https://a.test",
+        "Please run the security assessment against https://a.test",
+        "Assess https://a.test/chat;jsessionid=ABC123",
+        "Run a new campaign against https://a.test",
+        "Please run another scan against https://a.test",
+        "Run a fresh assessment of https://a.test",
+        "Run another security evaluation of https://a.test",
     ],
 )
 async def test_explicit_campaign_intent_outranks_same_target_handback_cues(
@@ -561,6 +614,8 @@ async def test_explicit_campaign_intent_outranks_same_target_handback_cues(
     [
         "Continue the assessment against https://a.test",
         "Continue without starting a new campaign against https://a.test.",
+        "Don't cancel; continue",
+        "Do not stop; resume",
     ],
 )
 async def test_same_target_prefixed_assessment_retains_configured_campaign(
@@ -602,6 +657,10 @@ async def test_same_target_prefixed_assessment_retains_configured_campaign(
         (
             "Cancel old campaign. Start a new campaign against https://b.test",
             "Start a new campaign against https://b.test",
+        ),
+        (
+            "Cancel the campaign and start a new campaign against https://b.test",
+            "start a new campaign against https://b.test",
         ),
     ],
 )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -48,7 +47,6 @@ from .operator_tools import (
     _campaign_submit_payload,
     _configured_objective,
     _has_url_candidate,
-    _is_recon_handback_continuation,
     _latest_campaign_request_scope,
     _looks_like_campaign_request,
     _primary_target,
@@ -119,10 +117,9 @@ def _is_campaign_request(prompt: str) -> bool:
 def _is_campaign_continuation_prompt(prompt: str) -> bool:
     normalized = " ".join(prompt.casefold().split())
     return (
-        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
+        campaign_coordination_intent(prompt).kind in {"continuation", "handback"}
         or normalized.startswith("the previous prepared campaign was cancelled")
         or normalized.startswith("reuse the sealed reconnaissance")
-        or _is_recon_handback_continuation(prompt)
     )
 
 
@@ -274,9 +271,10 @@ class KernelBackend:
             existing_campaign_envelope is not None
             and existing_campaign_envelope.get("schema_version") == "merlin.cli-campaign-submit.v2"
         )
-        continuation_target = _primary_target(prompt)
-        continuation_has_url = _has_url_candidate(prompt)
         coordination_intent = campaign_coordination_intent(prompt)
+        coordination_target_clause = coordination_intent.target_clause or coordination_intent.clause
+        continuation_target = _primary_target(coordination_target_clause)
+        continuation_has_url = _has_url_candidate(coordination_target_clause)
         active_campaign_objective = None
         if _is_campaign_continuation_prompt(prompt) and continuation_target is not None:
             active_boundary = _latest_campaign_request_scope(durable_messages)
@@ -304,7 +302,9 @@ class KernelBackend:
             str(existing_campaign_envelope["operator_objective"])
             if existing_campaign_envelope is not None
             else (
-                prompt
+                coordination_intent.clause
+                if typed_continuation and continuation_has_url
+                else prompt
                 if not explicit_campaign_request
                 or (
                     not coordination_intent.clause_only

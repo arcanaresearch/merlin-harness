@@ -17,7 +17,6 @@ from merlin_contracts import ChatMessage, ToolContext, ToolResult, ToolSpec
 from merlin_contracts.campaign_coordination import (
     campaign_coordination_intent,
     has_url_candidate,
-    is_explicit_campaign_launch,
     is_recon_handback_coordination,
 )
 
@@ -94,11 +93,9 @@ def _campaign_submit_payload(content: str) -> Mapping[str, object] | None:
 
 def _is_internal_campaign_continuation(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
-    return (
-        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
-        or normalized.startswith("the previous prepared campaign was cancelled")
-        or normalized.startswith("reuse the sealed reconnaissance")
-    )
+    return normalized.startswith(
+        "the previous prepared campaign was cancelled"
+    ) or normalized.startswith("reuse the sealed reconnaissance")
 
 
 def _is_recon_handback_continuation(content: str) -> bool:
@@ -155,10 +152,12 @@ class _CampaignBoundary:
 
 
 def _looks_like_campaign_request(content: str) -> bool:
-    normalized = " ".join(content.casefold().split())
-    return is_explicit_campaign_launch(content) and (
-        _primary_target(campaign_coordination_intent(content).clause) is not None
-        or re.search(r"\btarget\b", normalized) is not None
+    intent = campaign_coordination_intent(content)
+    target_clause = intent.target_clause or intent.clause
+    normalized_clause = " ".join(target_clause.casefold().split())
+    return intent.kind == "launch" and (
+        _primary_target(target_clause) is not None
+        or re.search(r"\btarget\b", normalized_clause) is not None
     )
 
 
@@ -217,25 +216,26 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
                 boundary = _CampaignBoundary("unbound", objective=objective, message_index=index)
             continue
         intent = campaign_coordination_intent(message.content)
+        target_clause = intent.target_clause or intent.clause
         if _looks_like_campaign_request(message.content):
             active_objective = (
                 message.content.strip()
                 if not intent.clause_only
-                and _primary_target(message.content) == _primary_target(intent.clause)
+                and _primary_target(message.content) == _primary_target(target_clause)
                 else intent.clause
             )
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
         if intent.kind == "targeted_barrier":
-            target = _primary_target(intent.clause)
+            target = _primary_target(target_clause)
             if active_objective is not None and target == _primary_target(active_objective):
                 continue
             active_objective = None
             boundary = _CampaignBoundary("unbound", message_index=index)
             continue
         if intent.kind == "continuation" or _is_internal_campaign_continuation(message.content):
-            target = _primary_target(message.content)
-            if target is None and not _has_url_candidate(message.content):
+            target = _primary_target(target_clause)
+            if target is None and not _has_url_candidate(target_clause):
                 continue
             if active_objective is not None and target == _primary_target(active_objective):
                 continue
@@ -243,8 +243,8 @@ def _latest_campaign_request_scope(messages: Sequence[ChatMessage]) -> _Campaign
             boundary = _CampaignBoundary("unbound", objective=active_objective, message_index=index)
             continue
         if intent.kind == "handback":
-            target = _primary_target(message.content)
-            if not _has_url_candidate(message.content) or (
+            target = _primary_target(target_clause)
+            if not _has_url_candidate(target_clause) or (
                 active_objective is not None and target == _primary_target(active_objective)
             ):
                 continue

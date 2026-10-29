@@ -29,6 +29,7 @@ from merlin_contracts import (
     NodeProjection,
     ScheduleProjection,
 )
+from merlin_contracts.campaign_coordination import campaign_coordination_intent
 from merlin_kernel.kernel import _latest_typed_campaign_scope
 from merlin_tui.configuration import ProviderConfiguration
 from merlin_tui.kernel_backend import KernelBackend, KernelSettings, event_to_stream
@@ -620,6 +621,10 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
             True,
         ),
         (
+            "I signed in at https://b.test. Please hand the browser back and continue.",
+            True,
+        ),
+        (
             "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
             True,
         ),
@@ -646,6 +651,12 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
         ("Can you please assess https://a.test?", True),
         ("Would you kindly run Merlin against https://a.test?", True),
         ("Continue without starting a new campaign against https://a.test.", False),
+        ("Continue at https://a.test, then continue at https://b.test", True),
+        ("Continue https://a.test:bad, then continue https://b.test.", True),
+        ("I logged in at https://a.test; continue at https://b.test", True),
+        ("Assess https://a.test for SSRF. Continue.", True),
+        ("Start a new campaign against https://a.test. Proceed.", True),
+        ("Assess https://a.test. Authentication complete; continue.", True),
         ("I'm logged in; continue the security assessment.", False),
         (
             "Continue after a new login; I'm logged in for the current security "
@@ -682,7 +693,11 @@ async def test_backend_handback_continuation_is_target_aware(
             submitted.split("MERLIN_CAMPAIGN_SUBMIT_REQUEST\n", 1)[1]
         )
         assert envelope["campaign_request_id"] != request_id
-        assert envelope["operator_objective"] == prompt
+        intent = campaign_coordination_intent(prompt)
+        expected_objective = (
+            prompt if intent.kind == "launch" and not intent.clause_only else intent.clause
+        )
+        assert envelope["operator_objective"] == expected_objective
     else:
         assert submitted == prompt
 
@@ -754,6 +769,13 @@ async def test_backend_and_kernel_share_denied_fresh_continuation_boundary(
     [
         "Authentication for the selected operator account is complete; continue.",
         "Hand " + ("x" * 35) + " browser back and continue.",
+        "Don't cancel; continue",
+        "Do not stop; resume",
+        "I logged in at https://a.test; continue",
+        "Auth complete; stop the delay and resume",
+        "I've completed login; continue",
+        "We've completed authentication; continue",
+        "I've passed MFA; proceed",
     ],
 )
 async def test_backend_and_kernel_share_long_authenticated_handback_grammar(
@@ -809,6 +831,39 @@ async def test_backend_and_kernel_share_long_authenticated_handback_grammar(
         "I have not successfully signed in; proceed with the report.",
         "I am unsigned in; continue.",
         "The task was assigned in chat; continue.",
+        "Continue. Actually cancel.",
+        "Continue, but stop the current campaign.",
+        "Continue? No, cancel.",
+        "Continue. Explain status instead.",
+        "Assess https://a.test. Do not proceed.",
+        "Assess https://a.test. Never mind.",
+        "Cancel campaign. I am logged in, continue",
+        "Stop campaign. Login succeeded, proceed",
+        "Do not assess target A. Start a new campaign.",
+        "Do not assess https://a.test. Start a new campaign.",
+        "Continue reading the new campaign report",
+        "Security assessment report for https://a.test",
+        "Login succeeded while errors continue",
+        "Login isn't complete; continue.",
+        "Authentication wasn’t successful; continue.",
+        'The documentation says: "Do not assess https://a.test. '
+        'Assess https://b.test instead." Explain what it means.',
+        "Continue https://a.test, then continue without starting a new campaign "
+        "against https://b.test",
+        "Authentication is complete if MFA passes; continue",
+        "Cancel it; authentication complete; continue",
+        "Cancel the new campaign; authentication complete; continue",
+        "Stop the fresh scan; logged in; continue",
+        "Abort this new assessment; MFA passed; proceed",
+        "Assess https://a.test. Do not assess this target.",
+        "Assess https://a.test. Cancel that launch.",
+        "Assess https://a.test. Stop it.",
+        "Assess https://a.test. End the launch.",
+        "Assess https://a.test. Do not assess it.",
+        "Assess https://a.test. This was only an example.",
+        "Assess https://a.test. Please explain status instead.",
+        "Assess https://a.test. Actually, do not run it.",
+        'Continue reading the documentation example: "Start a new campaign against https://b.test"',
     ],
 )
 async def test_backend_and_kernel_reject_failed_or_cancelled_auth_handback(

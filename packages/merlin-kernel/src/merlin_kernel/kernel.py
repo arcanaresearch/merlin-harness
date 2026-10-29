@@ -42,7 +42,6 @@ from merlin_contracts import (
 from merlin_contracts.campaign_coordination import (
     campaign_coordination_intent,
     has_url_candidate,
-    is_explicit_campaign_launch,
     is_recon_handback_coordination,
 )
 from merlin_contracts.storage_failures import storage_failure_category
@@ -492,21 +491,20 @@ def _typed_campaign_objective_digest(content: str) -> str | None:
 
 
 def _is_explicit_campaign_launch(content: str) -> bool:
-    normalized = " ".join(content.casefold().split())
-    has_target = _campaign_primary_target(content) is not None or "target" in normalized
-    return is_explicit_campaign_launch(content) and has_target
+    intent = campaign_coordination_intent(content)
+    target_clause = intent.target_clause or intent.clause
+    normalized_clause = " ".join(target_clause.casefold().split())
+    has_target = (
+        _campaign_primary_target(target_clause) is not None
+        or re.search(r"\btarget\b", normalized_clause) is not None
+    )
+    return intent.kind == "launch" and has_target
 
 
 def _is_campaign_boundary_continuation(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
-    if _is_explicit_campaign_launch(content):
-        return False
-    continuation_prefix = (
-        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
-    )
     return (
         content.startswith("MERLIN_USER_INPUT_RESPONSE\n")
-        or continuation_prefix
         or normalized.startswith("the previous prepared campaign was cancelled")
         or normalized.startswith("reuse the sealed reconnaissance")
     )
@@ -603,7 +601,7 @@ def _advance_campaign_boundary(
     intent = campaign_coordination_intent(content)
     continuation = intent.kind == "continuation" or _is_campaign_boundary_continuation(content)
     handback = intent.kind == "handback"
-    target_text = content if continuation or handback else intent.clause
+    target_text = intent.target_clause or intent.clause
     target_token = has_url_candidate(target_text)
     if intent.kind == "targeted_barrier":
         continuation_target = _campaign_primary_target(target_text)

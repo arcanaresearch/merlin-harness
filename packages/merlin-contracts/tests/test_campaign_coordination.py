@@ -230,3 +230,255 @@ def test_ordered_authentication_and_contextual_cancellation_matrix() -> None:
         "Continue until the stop condition",
     ):
         assert campaign_coordination_intent(content).kind == "continuation"
+
+
+def test_later_barrier_or_retraction_revokes_continuation_and_launch() -> None:
+    for content in (
+        "Continue. Actually cancel.",
+        "Continue, but stop the current campaign.",
+        "Continue? No, cancel.",
+        "Continue. Explain status instead.",
+        "Assess https://a.test. Do not proceed.",
+        "Assess https://a.test. Never mind.",
+        "Assess https://a.test. Don't continue.",
+        "Assess https://a.test. Forget it.",
+        "Assess https://a.test. Scratch that.",
+        "Assess https://a.test. Disregard that.",
+        "Assess https://a.test. Explain status instead.",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+
+
+def test_later_continuation_or_handback_does_not_replace_launch() -> None:
+    for content in (
+        "Assess https://a.test for SSRF. Continue.",
+        "Start a new campaign against https://a.test. Proceed.",
+        "Assess https://a.test. Authentication complete; continue.",
+    ):
+        intent = campaign_coordination_intent(content)
+        assert intent.kind == "launch", content
+        assert intent.clause.startswith(("Assess ", "Start "))
+
+    assert (
+        campaign_coordination_intent(
+            "Assess https://a.test. Never mind. Assess https://b.test instead."
+        ).kind
+        == "launch"
+    )
+
+
+def test_monotonic_cancellation_and_object_aware_wait_commands() -> None:
+    for content in (
+        "Cancel campaign. I am logged in, continue",
+        "Stop campaign. Login succeeded, proceed",
+        "Cancel A. Continue without new assessment of same A",
+        "Cancel current campaign and inspect abort handling",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+    for content in (
+        "Don't cancel; continue",
+        "Do not stop; resume",
+    ):
+        assert campaign_coordination_intent(content).kind == "continuation", content
+    for content in (
+        "Auth complete; stop waiting and continue",
+        "Auth complete; end the wait and proceed",
+        "Auth complete; stop the delay and resume",
+    ):
+        assert campaign_coordination_intent(content).kind == "handback", content
+
+
+def test_launch_target_and_command_evidence_are_clause_local() -> None:
+    for content in (
+        "Do not assess target A. Start a new campaign.",
+        "Do not assess https://a.test. Start a new campaign.",
+        "Continue reading the new campaign report",
+        "Resume fresh scan documentation",
+        "Retry parsing another assessment result",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+    for content in (
+        "Continue with a new assessment of https://a.test",
+        "Continue with another assessment of https://a.test",
+        "Retry a fresh scan of target A",
+        "When ready, please assess https://a.test",
+    ):
+        assert campaign_coordination_intent(content).kind == "launch", content
+
+
+def test_narrative_campaign_evidence_never_launches() -> None:
+    for content in (
+        "Security assessment report for https://a.test",
+        "Security assessment results for https://a.test",
+        "Security assessment summary for https://a.test",
+        "Security evaluation status for https://a.test",
+        "Security evaluation report for https://a.test",
+        "Merlin scan status for https://a.test",
+        "Merlin scan results for https://a.test",
+        "Red-team scan report for https://a.test",
+        "Red-team assessment status for https://a.test",
+        "Security assessment was cancelled for https://a.test",
+        "Security evaluation not needed for https://a.test",
+        "Merlin scan should not run against https://a.test",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+
+
+def test_auth_requires_operator_state_and_command_continuation() -> None:
+    for content in (
+        "Logged in users continue to see errors",
+        "Login succeeded while errors continue",
+        "Login succeeded and tests continue",
+        "MFA passed so checks continue",
+        "Authentication successful and users proceed",
+        "Login succeeded maybe",
+        "MFA passed in this example",
+        "Login isn't complete; continue.",
+        "Authentication wasn't successful; continue.",
+        "MFA isn't done; proceed.",
+        "CAPTCHA wasn't solved; resume.",
+        "Authentication isn’t finished; continue.",
+        "I am not quite yet logged in; continue",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+    for content in (
+        "I logged in; continue",
+        "We logged in; continue",
+        "Okay, I'm signed in; continue",
+        "Thanks, I'm signed in; continue",
+        "I authenticated successfully; continue",
+        "Done with MFA; proceed",
+        "The browser is yours again; continue",
+        "Signed in at https://b.test. Hand the browser back and continue reconnaissance.",
+        "Login failed earlier and now logged in; continue",
+        "Authentication complete and continue",
+        "Authentication complete and proceed",
+    ):
+        assert campaign_coordination_intent(content).kind == "handback", content
+    signed_target = campaign_coordination_intent(
+        "Signed in at https://b.test. Hand the browser back and continue reconnaissance."
+    )
+    assert signed_target.target_clause == "Signed in at https://b.test."
+
+
+def test_quotes_and_ordered_target_evidence_are_authoritative() -> None:
+    quoted = (
+        'The documentation says: "Do not assess https://a.test. '
+        'Assess https://b.test instead." Explain what it means.'
+    )
+    assert campaign_coordination_intent(quoted).kind == "barrier"
+    unquoted = 'Docs say "Assess https://b.test". Now assess https://c.test.'
+    assert campaign_coordination_intent(unquoted).kind == "launch"
+    assert campaign_coordination_intent(unquoted).target_clause == "Now assess https://c.test."
+
+    ordered = campaign_coordination_intent(
+        "Continue at https://a.test, then continue at https://b.test"
+    )
+    assert ordered.kind == "continuation"
+    assert ordered.target_clause == "continue at https://b.test"
+    denied = campaign_coordination_intent(
+        "Continue https://a.test, then continue without starting a new campaign "
+        "against https://b.test"
+    )
+    assert denied.kind == "targeted_barrier"
+    assert denied.target_clause is not None and "https://b.test" in denied.target_clause
+
+    auth_target = campaign_coordination_intent(
+        "I logged in at https://a.test; continue at https://b.test"
+    )
+    assert auth_target.kind == "handback"
+    assert auth_target.target_clause == "continue at https://b.test"
+    auth_fallback = campaign_coordination_intent("I logged in at https://a.test; continue")
+    assert auth_fallback.target_clause == "I logged in at https://a.test"
+
+
+def test_conditional_auth_pronoun_cancellation_and_same_sentence_relaunch() -> None:
+    for content in (
+        "Authentication is complete if MFA passes; continue",
+        "Authentication is complete unless the session expires; continue",
+        "Authentication is complete when MFA passes; continue",
+        "Cancel it; authentication complete; continue",
+        "Stop it; authentication complete; continue",
+        "End it; authentication complete; continue",
+        "Cancel the new campaign; authentication complete; continue",
+        "Stop the fresh scan; logged in; continue",
+        "Abort this new assessment; MFA passed; proceed",
+    ):
+        assert campaign_coordination_intent(content).kind == "barrier", content
+    relaunched = campaign_coordination_intent(
+        "Cancel the campaign and start a new campaign against https://b.test"
+    )
+    assert relaunched.kind == "launch"
+    assert relaunched.target_clause == "start a new campaign against https://b.test"
+
+
+def test_post_launch_target_denial_and_restored_run_directives() -> None:
+    for verb in ("assess", "scan", "evaluate", "run"):
+        assert (
+            campaign_coordination_intent(f"Assess https://a.test. Do not {verb} this target.").kind
+            == "barrier"
+        )
+    for content in (
+        "Run a security assessment of https://a.test",
+        "Please run the security assessment against https://a.test",
+        "Run a security assessment of target A",
+        "Please run the security assessment against target A",
+        "Run a new campaign against https://a.test",
+        "Please run another scan against https://a.test",
+        "Run a fresh assessment of https://a.test",
+        "Run another security evaluation of https://a.test",
+    ):
+        assert campaign_coordination_intent(content).kind == "launch", content
+
+
+def test_launch_reference_retractions_and_latest_continuation_target() -> None:
+    for retraction in (
+        "Cancel that launch",
+        "Stop it",
+        "End the launch",
+        "Do not assess it",
+        "This was only an example",
+        "Please explain status instead",
+        "Actually, do not run it",
+    ):
+        content = f"Assess https://a.test. {retraction}"
+        assert campaign_coordination_intent(content).kind == "barrier", content
+    intent = campaign_coordination_intent(
+        "Continue https://a.test:bad, then continue https://b.test."
+    )
+    assert intent.kind == "continuation"
+    assert intent.clause == "continue https://b.test."
+    assert intent.target_clause == "continue https://b.test."
+
+
+def test_polite_targeted_browser_handback_preserves_auth_provenance() -> None:
+    intent = campaign_coordination_intent(
+        "I signed in at https://b.test. Please hand the browser back and continue."
+    )
+    assert intent.kind == "handback"
+    assert intent.target_clause == "I signed in at https://b.test."
+
+
+def test_first_person_perfect_auth_and_quoted_documentation_example() -> None:
+    for content in (
+        "I've completed login; continue",
+        "We've completed authentication; continue",
+        "I've passed MFA; proceed",
+    ):
+        assert campaign_coordination_intent(content).kind == "handback", content
+    quoted = (
+        'Continue reading the documentation example: "Start a new campaign against https://b.test"'
+    )
+    assert campaign_coordination_intent(quoted).kind == "barrier"
+
+
+def test_url_punctuation_is_not_a_clause_boundary() -> None:
+    for objective in (
+        "Assess https://a.test/chat;jsessionid=ABC123",
+        "Assess https://a.test/chat?next=/a;b&mode=full",
+    ):
+        intent = campaign_coordination_intent(objective)
+        assert intent.kind == "launch"
+        assert intent.clause == objective
+        assert intent.target_clause == objective
+    assert campaign_coordination_intent("Assess https://a.test; cancel campaign").kind == "barrier"
