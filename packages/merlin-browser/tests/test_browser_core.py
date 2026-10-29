@@ -13353,6 +13353,79 @@ async def test_compiled_chat_exchange_fills_submits_and_observes_in_one_tool_cal
 
 
 @pytest.mark.asyncio
+async def test_compiled_chat_exchange_resolves_submit_after_fill_enables_it() -> None:
+    chat = b"""
+    <textarea aria-label="Message" oninput="
+      document.getElementById('send').disabled = !this.value;
+    "></textarea>
+    <button id="send" aria-label="Send" disabled onclick="
+      document.getElementById('reply').textContent=
+        'assistant:'+document.querySelector('textarea').value;
+    ">Send</button>
+    <div id="reply" aria-live="polite"></div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            interaction_contract = adapter["interaction_contract"]
+            assert isinstance(interaction_contract, dict)
+            probe_contract = interaction_contract["probe"]
+            assert isinstance(probe_contract, dict)
+            probe_contract["response_witness"] = "assistant:"
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False
+            assert [item.kind for item in recorder.actions] == ["fill", "click"]
+            assert result.metadata["target_effect_attempted"] is True
+            assert "assistant:hello" in result.content
+
+
+@pytest.mark.asyncio
 async def test_compiled_chat_exchange_uses_reviewed_affinity_among_identical_tabs() -> None:
     chat = b"""
     <textarea aria-label="Message" maxlength="500"></textarea>

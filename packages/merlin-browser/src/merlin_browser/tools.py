@@ -48,6 +48,7 @@ from merlin_contracts.target_adapter_compiler import (
     AdapterCompileError,
     AdapterCompileFailureKind,
     BrowserChat,
+    BrowserStep,
     BrowserTextCapture,
     compile_target_adapter,
     compiled_target_adapter_digest,
@@ -271,6 +272,45 @@ def _resolve_reviewed_element(
     if element.disabled or element.occluded or (default_role == "textbox" and element.read_only):
         return None
     return element.ref, element.frame_ref
+
+
+def _reviewed_step_sequence_matches(
+    observation: BrowserObservation,
+    steps: Sequence[BrowserStep],
+) -> bool:
+    """Match a reviewed sequence without requiring future controls to be actionable yet.
+
+    A later control can legitimately be disabled or occluded until an earlier reviewed
+    step changes the page (for example, a submit button enabled by filling its input).
+    The first step must be actionable now; every later locator must still identify one
+    exact reviewed control so this does not broaden tab selection.
+    """
+
+    for index, step in enumerate(steps):
+        default_role = "button" if step.tool == "browser_click" else "textbox"
+        locator = step.arguments.get("locator")
+        if (
+            len(
+                _matching_reviewed_elements(
+                    observation,
+                    locator,
+                    default_role=default_role,
+                )
+            )
+            != 1
+        ):
+            return False
+        if (
+            index == 0
+            and _resolve_reviewed_element(
+                observation,
+                locator,
+                default_role=default_role,
+            )
+            is None
+        ):
+            return False
+    return True
 
 
 def _locator_retry_metadata(
@@ -6322,15 +6362,7 @@ class BrowserChatExchangeTool:
             observation = await session.snapshot(tab.tab_ref)
             await self._recorder.append_observation(observation)
             observed_tabs.append((tab, observation))
-            if all(
-                _resolve_reviewed_element(
-                    observation,
-                    compiled_step.arguments.get("locator"),
-                    default_role=("button" if compiled_step.tool == "browser_click" else "textbox"),
-                )
-                is not None
-                for compiled_step in exchange_steps
-            ):
+            if _reviewed_step_sequence_matches(observation, exchange_steps):
                 compatible_tabs.append((tab.tab_ref, observation))
                 continue
             setup_matches = [
@@ -6746,15 +6778,7 @@ class BrowserChatExchangeTool:
                     activation_evidence_refs.append(
                         _browser_evidence_ref("activation-after", current)
                     )
-            if not all(
-                _resolve_reviewed_element(
-                    current,
-                    exchange_step.arguments.get("locator"),
-                    default_role=("button" if exchange_step.tool == "browser_click" else "textbox"),
-                )
-                is not None
-                for exchange_step in exchange_steps
-            ):
+            if not _reviewed_step_sequence_matches(current, exchange_steps):
                 return await activation_failure(
                     "reviewed setup activation completed without exposing the delivery controls",
                     failure_code="reviewed_setup_activation_incomplete",
@@ -6816,6 +6840,7 @@ class BrowserChatExchangeTool:
                 metadata={**adapter_identity_metadata, "failure_code": "checkpoint_contract"},
             )
         executable: list[tuple[str, dict[str, object], str | None, str]] = []
+        runtime_step_locators: dict[int, tuple[object, str]] = {}
         for compiled_step, effective_step_id in zip(
             exchange_steps,
             exchange_step_ids,
@@ -6837,19 +6862,27 @@ class BrowserChatExchangeTool:
                 default_role=default_role,
             )
             if resolved is None:
-                await state_scope.pause(
-                    MissingEvidenceReason.SELECTOR_UNAVAILABLE,
-                    before_refs=scope_before_refs,
-                    action_refs=activation_scope_action_refs,
+                matches = _matching_reviewed_elements(
+                    current,
+                    locator,
+                    default_role=default_role,
                 )
-                return ToolResult(
-                    content=(
-                        "reviewed browser flow locator does not identify exactly one current "
-                        f"{default_role}: {locator!r}"
-                    ),
-                    is_error=True,
-                    metadata={**adapter_identity_metadata, "retryable": False},
-                )
+                if len(matches) != 1 or not executable:
+                    await state_scope.pause(
+                        MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                        before_refs=scope_before_refs,
+                        action_refs=activation_scope_action_refs,
+                    )
+                    return ToolResult(
+                        content=(
+                            "reviewed browser flow locator does not identify exactly one current "
+                            f"{default_role}: {locator!r}"
+                        ),
+                        is_error=True,
+                        metadata={**adapter_identity_metadata, "retryable": False},
+                    )
+                element = matches[0]
+                resolved = (element.ref, element.frame_ref)
             step_arguments["element_ref"], step_arguments["frame_ref"] = resolved
             step_arguments.pop("locator", None)
             step_arguments["tab_ref"] = tab_ref
@@ -6857,15 +6890,16 @@ class BrowserChatExchangeTool:
                 compiled_step.role.value == "interaction" or "value" not in step_arguments
             ):
                 step_arguments["value"] = prompt
-            executable.extend(
-                (
-                    str(name),
-                    dict(step_arguments),
-                    effective_step_id,
-                    compiled_step.role.value,
+            for _ in range(compiled_step.repeat):
+                runtime_step_locators[len(executable)] = (locator, default_role)
+                executable.append(
+                    (
+                        str(name),
+                        dict(step_arguments),
+                        effective_step_id,
+                        compiled_step.role.value,
+                    )
                 )
-                for _ in range(compiled_step.repeat)
-            )
         names = tuple(name for name, _, _, _ in executable)
         if "browser_fill" not in names or not any(
             name in {"browser_click", "browser_press"} for name in names
@@ -7106,6 +7140,42 @@ class BrowserChatExchangeTool:
         submit_step_index = max(submit_step_indices)
         for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
             is_submit_boundary = step - 1 == submit_step_index
+            if step > 1:
+                current = await session.snapshot(
+                    tab_ref,
+                    step=activation_steps_completed + step - 1,
+                )
+                await self._recorder.append_observation(current)
+            runtime_locator, runtime_default_role = runtime_step_locators[step - 1]
+            runtime_resolved = _resolve_reviewed_element(
+                current,
+                runtime_locator,
+                default_role=runtime_default_role,
+            )
+            if runtime_resolved is None:
+                await state_scope.release_resources(resource_reservations)
+                await release_unacknowledged_restore()
+                await state_scope.pause(
+                    MissingEvidenceReason.SELECTOR_UNAVAILABLE,
+                    before_refs=scope_before_refs,
+                    action_refs=activation_scope_action_refs,
+                )
+                return ToolResult(
+                    content=(
+                        "reviewed browser flow step remained unavailable after prior reviewed "
+                        f"steps: {runtime_default_role} {runtime_locator!r}"
+                    ),
+                    is_error=True,
+                    metadata={
+                        **adapter_identity_metadata,
+                        "failure_code": "reviewed_step_unavailable",
+                        "retryable": True,
+                        "target_effect_attempted": bool(activation_steps_completed),
+                        "target_call_budget_charge": 0,
+                        "reobserve_required": True,
+                    },
+                )
+            step_arguments["element_ref"], step_arguments["frame_ref"] = runtime_resolved
             if role == "interaction" and isolation_plan.isolated and not isolation_bound:
                 equivalence_key, isolation_error = _browser_isolation_baseline(
                     executable_adapter,
