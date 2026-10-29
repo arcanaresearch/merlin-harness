@@ -22276,6 +22276,33 @@ class AssessmentListTool:
         return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
 
 
+def _adapter_requires_durable_recon_handoff(adapter: Mapping[str, Any]) -> bool:
+    """Return whether executable browser state must come from a sealed handoff."""
+    interface = str(adapter.get("interface") or "").strip().casefold()
+    execution_mode = str(adapter.get("execution_mode") or "").strip().casefold()
+    if interface == "browser" or execution_mode in {"browser", "hybrid"}:
+        return True
+    if interface in {"http_api", "open_ai_compatible"}:
+        return False
+    browser_steps = adapter.get("browser_steps")
+    if isinstance(browser_steps, (list, tuple)) and bool(browser_steps):
+        return True
+    return isinstance(adapter.get("interaction_contract"), Mapping)
+
+
+def _durable_recon_handoff_request(adapter: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only identity claims that a durable handoff resolver can verify."""
+    return {
+        key: adapter[key]
+        for key in (
+            "recon_handoff_id",
+            "expected_target_id",
+            "expected_target_session_id",
+        )
+        if key in adapter
+    }
+
+
 class AssessmentPrepareTool:
     effect = "workspace_read"
 
@@ -22303,6 +22330,7 @@ class AssessmentPrepareTool:
         same_identity = (
             previous.get("interface") in {None, current.get("interface")}
             and current.get("interface") in {None, previous.get("interface")}
+            and bool(previous_handoff) == bool(current_handoff)
             and not (previous_handoff and current_handoff and previous_handoff != current_handoff)
             and not (
                 previous_fallback and current_fallback and previous_fallback != current_fallback
@@ -22326,13 +22354,12 @@ class AssessmentPrepareTool:
                 "otherwise record browser navigation, the stable message input, the exact "
                 "submit action, a post-submit delivery witness, authentication/session limits, "
                 "and cleanup. Never fabricate adapter fields from a URL or target catalogue."
-                " Browser execution requires the durable reconnaissance handoff ID and exact "
-                "recorded DOM fallback reason. After browser_compile_api_handoff compiles and "
-                "seals captured JSON setup/message/cleanup exchanges, pass only "
-                "adapter.recon_handoff_id here; Merlin "
-                "hydrates "
-                "the immutable adapter from durable evidence. Do not regenerate or duplicate the "
-                "sealed adapter JSON."
+                " Browser or hybrid execution requires a durable reconnaissance handoff. After "
+                "browser_compile_api_handoff compiles and seals captured setup/message/cleanup "
+                "exchanges, pass adapter.recon_handoff_id rather than regenerating or duplicating "
+                "the sealed adapter JSON; Merlin hydrates the immutable adapter and its recorded "
+                "DOM fallback reason from durable evidence. A directly reviewed inline adapter is "
+                "accepted only for API-only execution."
             ),
             input_schema={
                 "type": "object",
@@ -22505,6 +22532,12 @@ class AssessmentPrepareTool:
                                 ),
                             },
                             "recon_handoff_id": {"type": "string", "minLength": 1},
+                            "expected_target_id": {"type": "string", "minLength": 1},
+                            "expected_target_session_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                            },
                             "dom_fallback_reason": {"type": "string", "minLength": 1},
                             "session_constraint": {"type": "string"},
                             "session_cardinality": {
@@ -22632,7 +22665,18 @@ class AssessmentPrepareTool:
                             },
                         },
                         "anyOf": [
-                            {"required": ["recon_handoff_id"]},
+                            {
+                                "properties": {
+                                    "recon_handoff_id": {"type": "string", "minLength": 1},
+                                    "expected_target_id": {"type": "string", "minLength": 1},
+                                    "expected_target_session_id": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 256,
+                                    },
+                                },
+                                "required": ["recon_handoff_id"],
+                            },
                             {
                                 "required": [
                                     "interface",
@@ -22683,11 +22727,35 @@ class AssessmentPrepareTool:
             if isinstance(decoded_adapter, Mapping):
                 adapter = decoded_adapter
         if isinstance(adapter, Mapping):
+            requires_durable_handoff = _adapter_requires_durable_recon_handoff(adapter)
+            handoff_id = adapter.get("recon_handoff_id")
+            has_handoff_id = isinstance(handoff_id, str) and bool(handoff_id.strip())
+            needs_handoff_resolution = requires_durable_handoff or has_handoff_id
+            if requires_durable_handoff and not has_handoff_id:
+                return ToolResult(
+                    content=(
+                        "browser/hybrid preparation requires adapter.recon_handoff_id "
+                        "from a durable reconnaissance handoff"
+                    ),
+                    is_error=True,
+                )
+            if has_handoff_id:
+                # Every durable handoff is authoritative for executable fields.  A
+                # mixed API/browser repair must not replace its endpoint or actions.
+                adapter = _durable_recon_handoff_request(adapter)
             adapter = self._merge_adapter_candidate(context.session_id, adapter)
             try:
                 resolver = getattr(self._service, "resolve_reviewed_adapter", None)
                 if resolver is not None:
                     adapter = await resolver(context.session_id, adapter)
+                elif needs_handoff_resolution:
+                    return ToolResult(
+                        content=(
+                            "browser/hybrid preparation cannot verify the durable "
+                            "reconnaissance handoff"
+                        ),
+                        is_error=True,
+                    )
             except ValueError as error:
                 if getattr(error, "cleanup_discovery_required", False) is True:
                     # Advisory only: cleanup/ownership evidence never blocks
@@ -22716,6 +22784,18 @@ class AssessmentPrepareTool:
                         adapter["evaluation_uncertainties"] = uncertainties
                 else:
                     return ToolResult(content=str(error), is_error=True)
+            if isinstance(handoff_id, str) and handoff_id.strip():
+                resolved_handoff_id = (
+                    adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None
+                )
+                if resolved_handoff_id != handoff_id:
+                    return ToolResult(
+                        content=(
+                            "browser/hybrid preparation resolved a different durable "
+                            "reconnaissance handoff"
+                        ),
+                        is_error=True,
+                    )
             adapter = _normalize_adapter_evaluation_metadata(adapter, profile=profile)
         error = _validate_reviewed_adapter(adapter, profile=profile)
         if error is not None:

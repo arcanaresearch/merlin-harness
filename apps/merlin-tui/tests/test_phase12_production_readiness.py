@@ -918,6 +918,19 @@ async def test_prepare_records_unresolved_cleanup_advisory_for_every_ownership(
                         for item in uncertainties
                     )
 
+            with pytest.raises(
+                ValueError,
+                match="browser/hybrid preparation requires adapter.recon_handoff_id",
+            ):
+                await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
+                    session_id,
+                    {
+                        "interface": "browser",
+                        "endpoint": "https://target.test/chat",
+                        "browser_steps": [],
+                    },
+                )
+
             compatible = await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
                 session_id,
                 {"recon_handoff_id": "handoff:cleanup-owned"},

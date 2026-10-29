@@ -223,11 +223,15 @@ async def test_prepare_tool_forwards_and_validates_composition() -> None:
     captured: list[dict] = []
 
     class Service:
+        async def resolve_reviewed_adapter(self, session_id, adapter):
+            assert session_id == "session-1"
+            assert adapter == {"recon_handoff_id": "handoff:browser"}
+            return _browser_adapter()
+
         async def prepare(self, session_id, objective, profile, adapter, **kwargs):
             captured.append(kwargs)
             return {"campaign_id": "campaign-1"}
 
-    adapter = _browser_adapter()
     context = ToolContext(session_id="session-1", workspace_root="/workspace")
     tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
 
@@ -236,7 +240,7 @@ async def test_prepare_tool_forwards_and_validates_composition() -> None:
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": adapter,
+            "adapter": {"recon_handoff_id": "handoff:browser"},
             "specialist_composition": "autonomous",
         },
     )
@@ -248,7 +252,7 @@ async def test_prepare_tool_forwards_and_validates_composition() -> None:
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": adapter,
+            "adapter": {"recon_handoff_id": "handoff:browser"},
             "specialist_composition": "freeform",
         },
     )
@@ -267,6 +271,11 @@ async def test_prepare_tool_anchors_objective_to_the_reviewed_target() -> None:
     captured: list[str] = []
 
     class Service:
+        async def resolve_reviewed_adapter(self, session_id, adapter):
+            assert session_id == "session-1"
+            assert adapter == {"recon_handoff_id": "handoff:browser"}
+            return _browser_adapter()
+
         async def prepare(self, session_id, objective, profile, adapter, **kwargs):
             captured.append(objective)
             return {"campaign_id": "campaign-1"}
@@ -279,7 +288,7 @@ async def test_prepare_tool_anchors_objective_to_the_reviewed_target() -> None:
         {
             "objective": "Assess the refund policy bot",
             "campaign_profile": "recommended",
-            "adapter": _browser_adapter(),
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
     assert result.is_error is False
@@ -290,7 +299,7 @@ async def test_prepare_tool_anchors_objective_to_the_reviewed_target() -> None:
         {
             "objective": "Assess https://target.test for refund policy overclaim",
             "campaign_profile": "recommended",
-            "adapter": _browser_adapter(),
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
     assert result.is_error is False

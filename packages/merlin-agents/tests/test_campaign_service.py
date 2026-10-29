@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from jsonschema import Draft202012Validator
 from merlin_agents import (
     MAX_CAMPAIGN_DYNAMIC_SPECIALISTS,
     MAX_CONCURRENT_DYNAMIC_SPECIALISTS,
@@ -185,6 +186,53 @@ def _receipt_oracle(pointer: str = "/reply") -> dict[str, object]:
         "turn": "single",
         "language": "und",
     }
+
+
+def _prepare_tool_with_browser_handoff(
+    service: object,
+    adapter: Mapping[str, object],
+    *,
+    handoff_id: str = "handoff:browser",
+    requests: list[Mapping[str, object]] | None = None,
+) -> AssessmentPrepareTool:
+    hydrated = {**copy.deepcopy(dict(adapter)), "recon_handoff_id": handoff_id}
+
+    async def resolve_reviewed_adapter(
+        session_id: str, request: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        assert session_id == "session-1"
+        assert request == {"recon_handoff_id": handoff_id}
+        if requests is not None:
+            requests.append(dict(request))
+        return hydrated
+
+    service.resolve_reviewed_adapter = resolve_reviewed_adapter  # type: ignore[attr-defined]
+    return AssessmentPrepareTool(service)  # type: ignore[arg-type]
+
+
+def _reviewed_browser_adapter(**overrides: object) -> dict[str, object]:
+    adapter: dict[str, object] = {
+        "interface": "browser",
+        "endpoint": "https://target.test",
+        "authentication": "browser_session",
+        "dom_fallback_reason": "no stable stateful API was observed",
+        "observed_evidence": ["snapshot:before", "snapshot:after"],
+        "browser_steps": [
+            {
+                "step_id": "message",
+                "tool": "browser_fill",
+                "arguments": {"locator": "textbox"},
+            }
+        ],
+        "interaction_contract": {
+            "input_locator": "textbox",
+            "submit_action": "press Enter",
+            "success_indicator": "new response",
+            "probe": {"response_witness": "assistant response"},
+        },
+    }
+    adapter.update(overrides)
+    return adapter
 
 
 def _target_control_hold(
@@ -13239,21 +13287,21 @@ async def test_prepare_tool_refuses_browser_manifest_without_recon_contract() ->
         async def prepare(self, *_args):
             raise AssertionError("unreviewed adapter must not reach campaign preparation")
 
-    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    adapter = {
+        "interface": "browser",
+        "endpoint": "https://target.test",
+        "authentication": "browser_session",
+        "dom_fallback_reason": "no stable stateful API was observed",
+        "observed_evidence": ["browser snapshot call-1"],
+        "browser_steps": [{"step_id": "open", "tool": "browser_navigate", "arguments": {}}],
+    }
+    tool = _prepare_tool_with_browser_handoff(Service(), adapter)
     result = await tool.invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "recon_handoff_id": "handoff:browser",
-                "dom_fallback_reason": "no stable stateful API was observed",
-                "observed_evidence": ["browser snapshot call-1"],
-                "browser_steps": [{"step_id": "open", "tool": "browser_navigate", "arguments": {}}],
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13275,12 +13323,12 @@ async def test_prepare_tool_decodes_complete_json_string_adapter_before_validati
         "observed_evidence": ["browser snapshot call-1"],
         "browser_steps": [{"step_id": "open", "tool": "browser_navigate", "arguments": {}}],
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": json.dumps(adapter),
+            "adapter": json.dumps({"recon_handoff_id": "handoff:browser"}),
         },
     )
 
@@ -13296,31 +13344,13 @@ async def test_prepare_tool_reports_invalid_observed_surface_without_crashing() 
             captured.append(adapter)
             return {"campaign_id": "campaign-1"}
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter(observed_surfaces=[{"delivery": "document-embedded"}])
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "observed_surfaces": [{"delivery": "document-embedded"}],
-                "browser_steps": [
-                    {
-                        "step_id": "send",
-                        "tool": "browser_fill",
-                        "arguments": {"locator": "textbox"},
-                    }
-                ],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13366,12 +13396,12 @@ async def test_prepare_tool_falls_back_to_configured_composition(monkeypatch) ->
             "probe": {"response_witness": "assistant response"},
         },
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": adapter,
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13414,12 +13444,12 @@ async def test_prepare_tool_explicit_composition_overrides_config(monkeypatch) -
             "probe": {"response_witness": "assistant response"},
         },
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": adapter,
+            "adapter": {"recon_handoff_id": "handoff:browser"},
             "specialist_composition": "opinionated",
         },
     )
@@ -13436,30 +13466,13 @@ async def test_prepare_tool_passes_structured_objective_phase_gates() -> None:
             captured.append(kwargs["objective_phase_gates"])
             return {"campaign_id": "campaign-1"}
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter()
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "browser_steps": [
-                    {
-                        "step_id": "message",
-                        "tool": "browser_fill",
-                        "arguments": {"locator": "textbox"},
-                    }
-                ],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
             "phase_gates": [
                 {
                     "id": "baseline",
@@ -13498,32 +13511,15 @@ async def test_prepare_tool_preserves_missing_state_coverage_as_uncertainty() ->
             captured.append(adapter)
             return {"campaign_id": "campaign-1"}
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter()
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": (
                 "Test Tier 1 through Tier 4, including every available character in each tier."
             ),
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "browser_steps": [
-                    {
-                        "step_id": "message",
-                        "tool": "browser_fill",
-                        "arguments": {"locator": "textbox"},
-                    }
-                ],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13551,48 +13547,32 @@ async def test_prepare_tool_accepts_state_coverage_with_reviewed_observations() 
         "evaluation_root": "response_body",
         "pointer": "/value",
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter(
+        state_capabilities={
+            "observations": [
+                {
+                    "name": "tier",
+                    "role": "progress_ordinal",
+                    "baseline_selector": selector,
+                    "result_selector": selector,
+                },
+                {
+                    "name": "character",
+                    "role": "custom",
+                    "baseline_selector": selector,
+                    "result_selector": selector,
+                },
+            ]
+        }
+    )
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": (
                 "Test Tier 1 through Tier 4, including every available character in each tier."
             ),
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "browser_steps": [
-                    {
-                        "step_id": "message",
-                        "tool": "browser_fill",
-                        "arguments": {"locator": "textbox"},
-                    }
-                ],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-                "state_capabilities": {
-                    "observations": [
-                        {
-                            "name": "tier",
-                            "role": "progress_ordinal",
-                            "baseline_selector": selector,
-                            "result_selector": selector,
-                        },
-                        {
-                            "name": "character",
-                            "role": "custom",
-                            "baseline_selector": selector,
-                            "result_selector": selector,
-                        },
-                    ]
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13608,30 +13588,13 @@ async def test_prepare_tool_passes_reviewed_bounded_regeneration_contract() -> N
             captured.append(kwargs["bounded_regeneration"])
             return {"campaign_id": "campaign-1"}
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter()
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "browser_steps": [
-                    {
-                        "step_id": "message",
-                        "tool": "browser_fill",
-                        "arguments": {"locator": "textbox"},
-                    }
-                ],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
             "bounded_regeneration": {
                 "schema_version": "merlin.generator-execution.v1",
                 "generator_id": "reviewed-semantic-rewrite",
@@ -13720,12 +13683,12 @@ async def test_prepare_tool_passes_evidence_backed_browser_contract() -> None:
             "evidence_refs": ["snapshot call-1", "post-submit snapshot call-2"],
         },
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": adapter,
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13751,30 +13714,19 @@ async def test_prepare_tool_rejects_unobserved_scenario_identity() -> None:
             captured.append(adapter)
             return {"campaign_id": "campaign-1"}
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter(
+        observed_evidence=["snapshot call-1"],
+        scenario_identity={
+            "tenant": "tenant-a",
+            "evidence_refs": ["invented observation"],
+        },
+    )
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "recon_handoff_id": "handoff:browser",
-                "dom_fallback_reason": "no stable API observed",
-                "observed_evidence": ["snapshot call-1"],
-                "scenario_identity": {
-                    "tenant": "tenant-a",
-                    "evidence_refs": ["invented observation"],
-                },
-                "browser_steps": [{"step_id": "send", "tool": "browser_fill", "arguments": {}}],
-                "interaction_contract": {
-                    "input_locator": "textbox",
-                    "submit_action": "press Enter",
-                    "success_indicator": "new response",
-                    "probe": {"response_witness": "assistant response"},
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13790,21 +13742,22 @@ async def test_prepare_tool_requires_executable_browser_steps() -> None:
         async def prepare(self, *_args):
             raise AssertionError("unsealed browser adapter must not reach preparation")
 
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = {
+        "interface": "browser",
+        "endpoint": "https://target.test/chat",
+        "authentication": "browser_session",
+        "observed_evidence": ["snapshot call-1"],
+        "scenario_identity": {
+            "tenant": "tenant-a",
+            "evidence_refs": ["invented observation"],
+        },
+    }
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test/chat",
-                "authentication": "browser_session",
-                "observed_evidence": ["snapshot call-1"],
-                "scenario_identity": {
-                    "tenant": "tenant-a",
-                    "evidence_refs": ["invented observation"],
-                },
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -13822,9 +13775,9 @@ async def test_prepare_tool_seals_explicit_campaign_budget() -> None:
 
     adapter = {
         "interface": "http_api",
+        "execution_mode": "api",
         "endpoint": "https://target.test/message",
         "authentication": "reviewed bearer handle",
-        "recon_handoff_id": "handoff:api",
         "observed_evidence": ["request receipt", "response receipt"],
         "api_validation": {
             "status": "passed",
@@ -14026,6 +13979,7 @@ async def test_prepare_tool_treats_typed_cleanup_discovery_as_advisory() -> None
 
 async def test_prepare_tool_seals_executable_browser_contract_without_handoff_retry() -> None:
     captured = []
+    resolver_requests: list[Mapping[str, object]] = []
     fallback = "no reviewed message API was observed"
     adapter = {
         "interface": "browser",
@@ -14070,16 +14024,11 @@ async def test_prepare_tool_seals_executable_browser_contract_without_handoff_re
     }
 
     class Service:
-        async def resolve_reviewed_adapter(self, session_id, value):
-            assert session_id == "session-1"
-            assert value in (adapter, {**adapter, "recon_handoff_id": "handoff:browser"})
-            return value
-
         async def prepare(self, session_id, objective, profile, value, **_kwargs):
             captured.append((session_id, objective, profile, value))
             return {"campaign_id": "campaign-1"}
 
-    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    tool = _prepare_tool_with_browser_handoff(Service(), adapter, requests=resolver_requests)
     first = await tool.invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
@@ -14088,20 +14037,210 @@ async def test_prepare_tool_seals_executable_browser_contract_without_handoff_re
             "adapter": adapter,
         },
     )
-    assert first.is_error is False
+    assert first.is_error is True
+    assert "recon_handoff_id" in first.content
+    assert resolver_requests == []
+    assert captured == []
+
+    second = await tool.invoke(
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": {"recon_handoff_id": "handoff:browser"},
+        },
+    )
+    assert second.is_error is False
+    assert resolver_requests == [{"recon_handoff_id": "handoff:browser"}]
     assert captured[0][3]["interface"] == "browser"
     assert captured[0][3]["interaction_contract"] == adapter["interaction_contract"]
-    assert "handoff ID" in " ".join(
-        item["reason"] for item in captured[0][3]["evaluation_uncertainties"]
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        _reviewed_browser_adapter(),
+        {
+            "interface": "http_api",
+            "execution_mode": "hybrid",
+            "endpoint": "https://target.test/api",
+        },
+    ],
+)
+async def test_prepare_tool_rejects_inline_browser_and_hybrid_adapters(
+    adapter: Mapping[str, object],
+) -> None:
+    class Service:
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("inline browser execution must not reach preparation")
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": adapter,
+        },
     )
+
+    assert result.is_error is True
+    assert "recon_handoff_id" in result.content
+
+
+async def test_prepare_tool_rejects_resolved_handoff_identity_mismatch() -> None:
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, _adapter):
+            return {"recon_handoff_id": "handoff:different"}
+
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("mismatched handoff must not reach preparation")
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": {"recon_handoff_id": "handoff:requested"},
+        },
+    )
+
+    assert result.is_error is True
+    assert "different durable reconnaissance handoff" in result.content
+
+
+async def test_prepare_tool_cannot_overlay_sealed_browser_handoff_with_api_fields() -> None:
+    captured: list[Mapping[str, object]] = []
+    sealed = {
+        **_reviewed_browser_adapter(endpoint="https://sealed.test/chat"),
+        "recon_handoff_id": "handoff:sealed-browser",
+    }
+
+    class Service:
+        async def resolve_reviewed_adapter(self, session_id, adapter):
+            assert session_id == "session-1"
+            assert adapter == {"recon_handoff_id": "handoff:sealed-browser"}
+            return sealed
+
+        async def prepare(self, _session_id, _objective, _profile, adapter, **_kwargs):
+            captured.append(adapter)
+            return {"campaign_id": "campaign-1"}
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": {
+                "recon_handoff_id": "handoff:sealed-browser",
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://override.test/message",
+                "api_steps": [{"step_id": "override"}],
+            },
+        },
+    )
+
+    assert result.is_error is False
+    assert captured[0]["interface"] == "browser"
+    assert captured[0]["endpoint"] == "https://sealed.test/chat"
+    assert "api_steps" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "resolver_error",
+    [
+        "reviewed reconnaissance handoff is unavailable",
+        "durable reconnaissance handoff adapter is malformed",
+        "reviewed reconnaissance handoff belongs to another target",
+        "reviewed browser context restarted after this reconnaissance handoff was sealed",
+    ],
+)
+async def test_prepare_tool_fails_closed_when_handoff_resolution_is_invalid(
+    resolver_error: str,
+) -> None:
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, _adapter):
+            raise ValueError(resolver_error)
+
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("invalid handoff must not reach preparation")
+
+    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Assess target",
+            "campaign_profile": "recommended",
+            "adapter": {"recon_handoff_id": "handoff:requested"},
+        },
+    )
+
+    assert result.is_error is True
+    assert result.content == resolver_error
+
+
+async def test_prepare_tool_replaces_cached_candidate_when_handoff_id_changes() -> None:
+    requests: list[Mapping[str, object]] = []
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            raise ValueError("handoff unavailable")
+
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("unavailable handoff must not reach preparation")
+
+    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    for handoff_id in ("handoff:first", "handoff:second"):
+        result = await tool.invoke(
+            ToolContext(session_id="session-1", workspace_root="/workspace"),
+            {
+                "objective": "Assess target",
+                "campaign_profile": "recommended",
+                "adapter": {"recon_handoff_id": handoff_id},
+            },
+        )
+        assert result.is_error is True
+
+    assert requests == [
+        {"recon_handoff_id": "handoff:first"},
+        {"recon_handoff_id": "handoff:second"},
+    ]
 
 
 def test_prepare_tool_schema_admits_handoff_id_only_adapter() -> None:
     schema = AssessmentPrepareTool(object()).describe().input_schema
     adapter_schema = schema["properties"]["adapter"]
 
-    assert {"required": ["recon_handoff_id"]} in adapter_schema["anyOf"]
+    assert any(branch.get("required") == ["recon_handoff_id"] for branch in adapter_schema["anyOf"])
     assert "immutable adapter" in AssessmentPrepareTool(object()).describe().description
+    validator = Draft202012Validator(adapter_schema)
+    assert validator.is_valid({"recon_handoff_id": "handoff:browser"})
+    assert validator.is_valid(
+        {"interface": "http_api", "execution_mode": "api", "endpoint": "https://target.test"}
+    )
+    assert validator.is_valid({"interface": "browser", "endpoint": "https://target.test"})
+    assert validator.is_valid(
+        {
+            "recon_handoff_id": "handoff:browser",
+            "interface": "browser",
+            "endpoint": "https://target.test",
+        }
+    )
+    assert validator.is_valid(
+        {
+            "recon_handoff_id": "handoff:api",
+            "interface": "http_api",
+            "execution_mode": "api",
+            "endpoint": "https://target.test",
+        }
+    )
+    assert validator.is_valid(
+        {
+            "interface": "http_api",
+            "execution_mode": "hybrid",
+            "endpoint": "https://target.test",
+        }
+    )
 
 
 async def test_prepare_tool_accepts_executable_connectivity_probe() -> None:
@@ -14139,21 +14278,13 @@ async def test_prepare_tool_accepts_executable_connectivity_probe() -> None:
         "success_indicator": "reply appeared",
         "evidence_refs": ["snapshot:before", "snapshot:after"],
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter(interaction_contract=contract)
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "recon_handoff_id": "handoff:browser",
-                "dom_fallback_reason": "no stable stateful API was observed",
-                "observed_evidence": ["snapshot:before", "snapshot:after"],
-                "browser_steps": [{"step_id": "open", "tool": "browser_navigate", "arguments": {}}],
-                "interaction_contract": contract,
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -14196,21 +14327,13 @@ async def test_prepare_tool_accepts_explicitly_unobserved_optional_browser_lifec
         "success_indicator": "completed target response appears after operator message",
         "evidence_refs": ["snapshot:before", "snapshot:after"],
     }
-    result = await AssessmentPrepareTool(Service()).invoke(  # type: ignore[arg-type]
+    adapter = _reviewed_browser_adapter(interaction_contract=contract)
+    result = await _prepare_tool_with_browser_handoff(Service(), adapter).invoke(
         ToolContext(session_id="session-1", workspace_root="/workspace"),
         {
             "objective": "Assess target",
             "campaign_profile": "recommended",
-            "adapter": {
-                "interface": "browser",
-                "endpoint": "https://target.test",
-                "authentication": "browser_session",
-                "recon_handoff_id": "handoff:browser",
-                "dom_fallback_reason": "no stable stateful API was observed",
-                "observed_evidence": ["snapshot:before", "snapshot:after"],
-                "browser_steps": [{"step_id": "open", "tool": "browser_navigate", "arguments": {}}],
-                "interaction_contract": contract,
-            },
+            "adapter": {"recon_handoff_id": "handoff:browser"},
         },
     )
 
@@ -14230,9 +14353,9 @@ async def test_prepare_tool_requires_complete_api_lifecycle_contract() -> None:
             "campaign_profile": "recommended",
             "adapter": {
                 "interface": "http_api",
+                "execution_mode": "api",
                 "endpoint": "https://target.test/api",
                 "authentication": "bearer credential handle",
-                "recon_handoff_id": "handoff:api",
                 "observed_evidence": ["request receipt call-1"],
                 "api_steps": [{"step_id": "start", "endpoint": "/start", "method": "POST"}],
             },
@@ -14253,9 +14376,9 @@ async def test_prepare_tool_accepts_observed_api_lifecycle_and_cleanup() -> None
 
     adapter = {
         "interface": "http_api",
+        "execution_mode": "api",
         "endpoint": "https://target.test/api",
         "authentication": "bearer credential handle",
-        "recon_handoff_id": "handoff:api",
         "session_constraint": "one active session per game and level",
         "observed_evidence": ["start call-1", "message call-2", "abandon call-3"],
         "api_validation": {

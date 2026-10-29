@@ -4267,6 +4267,7 @@ def build_backend(
         CampaignLeadDecisionError,
         CandidatePriorityRecommendation,
         IncrementalTaskReview,
+        _adapter_requires_durable_recon_handoff,
         _dynamic_specialist_proposal,
         _json_value,
     )
@@ -10415,6 +10416,11 @@ def build_backend(
             }
             revalidated_after_restart = False
             if not _has_durable_handoff(adapter):
+                if _adapter_requires_durable_recon_handoff(adapter):
+                    raise ValueError(
+                        "browser/hybrid preparation requires adapter.recon_handoff_id "
+                        "from a durable reconnaissance handoff"
+                    )
                 candidate = _compile_current_reviewed_adapter_state(adapter)
                 handoff_id = str(adapter.get("recon_handoff_id") or "inline:reviewed-adapter")
             else:
