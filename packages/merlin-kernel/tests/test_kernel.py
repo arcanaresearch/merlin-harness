@@ -3992,6 +3992,110 @@ async def test_dynamic_owned_cleanup_created_mid_request_runs_once() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("split_callback", [False, True])
+async def test_dynamic_owned_cleanup_limit_is_per_provider_callback(
+    split_callback: bool,
+) -> None:
+    class RotatingHandoffTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_end_owned_session",
+                    "browser_compile_api_handoff",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare":
+                return ToolResult(
+                    content="first owned cleanup required",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:callback-one",
+                            ownership="owned",
+                            ownership_evidence_refs=["creation:one:before", "creation:one:after"],
+                        )
+                    },
+                )
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="second owned cleanup required",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:callback-two",
+                            ownership="owned",
+                            ownership_evidence_refs=["creation:two:before", "creation:two:after"],
+                        ),
+                        "preferred_next_tool": "browser_end_owned_session",
+                        "preferred_next_tool_mode": "strict",
+                    },
+                )
+            return ToolResult(
+                content="owned session ended",
+                metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+            )
+
+    class RotatingHandoffProvider:
+        def __init__(self) -> None:
+            self.requests = 0
+            self.second_cleanup = None
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            self.requests += 1
+            if self.requests == 1:
+                await handler(ToolCall(call_id="prepare", name="assessment_prepare", arguments={}))
+                await handler(
+                    ToolCall(call_id="cleanup-one", name="browser_end_owned_session", arguments={})
+                )
+                if split_callback:
+                    yield ModelCompleted(finish_reason="tool_calls")
+                    return
+            await handler(
+                ToolCall(
+                    call_id="compile-two",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+            )
+            self.second_cleanup = await handler(
+                ToolCall(call_id="cleanup-two", name="browser_end_owned_session", arguments={})
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = RotatingHandoffTools()
+    provider = RotatingHandoffProvider()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("rotate owned handoffs")
+    await kernel.wait_for_turn()
+
+    expected_cleanup_calls = 2 if split_callback else 1
+    assert tools.calls.count("browser_end_owned_session") == expected_cleanup_calls
+    assert provider.second_cleanup == (
+        DynamicToolOutput(content="owned session ended", success=True)
+        if split_callback
+        else DynamicToolOutput(
+            content=(
+                "browser_end_owned_session failed: tool is not admitted for this provider request"
+            ),
+            success=False,
+        )
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("second_handoff", ["handoff:repeated-hold", "handoff:superseding"])
 async def test_repeated_owned_cleanup_hold_fails_evidence_without_repeating_cleanup(
     second_handoff: str,

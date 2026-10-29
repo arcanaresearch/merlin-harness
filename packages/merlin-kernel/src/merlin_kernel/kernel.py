@@ -1491,7 +1491,6 @@ class Kernel:
         owned_cleanup_failed = False
         owned_cleanup_evidence_failed = False
         owned_cleanup_completed = False
-        owned_cleanup_attempted_keys: set[str] = set()
         consumed_steering_version = self._steering_version
         try:
             skill_messages: list[ChatMessage] = []
@@ -1787,6 +1786,7 @@ class Kernel:
                 reasoning = ""
                 retry_provider = False
                 preferred_tool_invoked_dynamically = False
+                owned_cleanup_attempted_in_callback = False
 
                 async def handle_dynamic_tool(
                     call: ToolCall,
@@ -1807,6 +1807,7 @@ class Kernel:
                     nonlocal owned_cleanup_failed
                     nonlocal owned_cleanup_evidence_failed
                     nonlocal owned_cleanup_completed
+                    nonlocal owned_cleanup_attempted_in_callback
                     nonlocal preferred_next_tool_name
                     nonlocal preferred_next_tool_mode
                     nonlocal preferred_tool_follow_through_failures
@@ -1846,8 +1847,7 @@ class Kernel:
                         active_owned_cleanup_key
                     )
                     duplicate_owned_cleanup = (
-                        is_active_owned_cleanup
-                        and active_owned_cleanup_key in owned_cleanup_attempted_keys
+                        is_active_owned_cleanup and owned_cleanup_attempted_in_callback
                     )
                     current_preferred_tool_name = preferred_next_tool_name
                     is_preferred_tool_call = call.name == current_preferred_tool_name
@@ -1911,7 +1911,7 @@ class Kernel:
                     )
                     admitted_owned_cleanup = tool_admitted and is_active_owned_cleanup
                     if admitted_owned_cleanup:
-                        owned_cleanup_attempted_keys.add(active_owned_cleanup_key)
+                        owned_cleanup_attempted_in_callback = True
                     if bounded_preferred_observation:
                         preferred_transition_observation_used = True
                     try:
