@@ -1,6 +1,6 @@
 [project]
 name = "merlin-packs"
-version = "0.2.26"
+version = "0.2.27"
 description = "Declarative attack-pack discovery and loading for Merlin"
 requires-python = ">=3.13"
 dependencies = ["cryptography>=46", "merlin-contracts"]

@@ -1,6 +1,6 @@
 [project]
 name = "merlin-readiness"
-version = "0.2.26"
+version = "0.2.27"
 description = "Production diagnostics and lifecycle seams for Merlin"
 requires-python = ">=3.13"
 dependencies = []
