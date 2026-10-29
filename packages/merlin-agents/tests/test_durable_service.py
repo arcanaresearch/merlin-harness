@@ -4353,6 +4353,9 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
     assert task.status == "failed"
     assert task.failure_kind == expected_failure_kind
     assert session_task.failure_kind == expected_failure_kind
+    projection = await service.completion_projection(live.id)
+    projected_task = next(item for item in projection["tasks"] if item.id == assignment.id)
+    assert projected_task.failure_kind == expected_failure_kind
     assert store.nodes[live.id][node_id]["state"] == "failed"
     assert live.scheduler.status(node_id).value == "failed"
     assert len(attempts) == 1

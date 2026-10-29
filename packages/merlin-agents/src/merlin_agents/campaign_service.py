@@ -20151,6 +20151,7 @@ class CampaignService:
                         "id": task.id,
                         "status": task.status,
                         "result": _status_result(task.result or ""),
+                        "failure_kind": getattr(task, "failure_kind", None),
                         "technique_ids": task.technique_ids,
                         "technique_outcomes": outcomes,
                         "partial_signals": {

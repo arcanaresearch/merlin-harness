@@ -2453,12 +2453,12 @@ class DurableAgentService:
         )
 
     async def completion_projection(self, schedule_id: str) -> Mapping[str, object]:
-        """Load schedule completion authority with one nodes/results snapshot.
+        """Load schedule completion authority with one nodes/results/attempts snapshot.
 
-        This is the polling seam used by campaign status.  Keeping result loading here
-        prevents an Exhaustive status refresh from issuing one full result query per
-        worker while also ensuring tasks, cleanup state, and receipt references come
-        from the same durable snapshot.
+        This is the polling seam used by campaign status. Keeping durable row loading
+        here prevents an Exhaustive status refresh from issuing one full query per
+        worker while also ensuring task failures, cleanup state, and receipt references
+        come from the same bounded projection.
         """
         schedule = await self._call(self._store.load_schedule, schedule_id)
         if schedule is None:
@@ -2470,6 +2470,10 @@ class DurableAgentService:
         results = {
             str(row["node_id"]): row
             for row in await self._call(self._store.list_results, schedule_id)
+        }
+        attempts = {
+            str(row["node_id"]): row
+            for row in await self._call(self._store.list_attempts, schedule_id)
         }
         tasks: list[AgentTask] = []
         evidence: dict[str, Mapping[str, object]] = {}
@@ -2484,6 +2488,7 @@ class DurableAgentService:
                 status=_contract_status(nodes.get(node_id, {}).get("state", "pending")),
                 agent_id=node_id,
                 result=_result_text(results.get(node_id)),
+                failure_kind=_optional_text(attempts.get(node_id, {}).get("failure_kind")),
                 technique_ids=assignment.technique_ids,
             )
             tasks.append(task)

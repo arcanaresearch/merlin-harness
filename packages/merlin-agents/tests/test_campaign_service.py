@@ -23008,19 +23008,20 @@ async def test_status_projects_wave_pace_and_lower_bound() -> None:
     wave0_end = datetime(2026, 1, 1, 10, 4, 0, tzinfo=UTC)
     wave1_start = datetime(2026, 1, 1, 10, 4, 0, tzinfo=UTC)
 
-    def task(task_id, status):
+    def task(task_id, status, failure_kind=None):
         return SimpleNamespace(
             id=task_id,
             objective="Test prompt injection",
             status=status,
             agent_id=f"worker:{task_id}",
             result=None,
+            failure_kind=failure_kind,
             technique_ids=("prompt",),
         )
 
     projections = {
         "schedule-0": {
-            "tasks": (task("w0-a", "completed"),),
+            "tasks": (task("w0-a", "failed", "adapter_timeout"),),
             "evidence": {},
             "strategies": {},
             "progress": (),
@@ -23083,6 +23084,7 @@ async def test_status_projects_wave_pace_and_lower_bound() -> None:
 
     projected = await service.status("campaign-1")
 
+    assert projected["waves"][0]["tasks"][0]["failure_kind"] == "adapter_timeout"
     pace = projected["pace"]
     assert pace["waves_completed"] == 1
     assert pace["avg_wave_seconds"] == 240.0
