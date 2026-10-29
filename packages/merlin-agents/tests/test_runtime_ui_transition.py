@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 
 from merlin_agents.runtime_ui_transition import (
@@ -36,6 +37,35 @@ def _transition(*, stale: bool = True) -> dict[str, object]:
     }
 
 
+def _unchanged_transition() -> dict[str, object]:
+    digest = _digest("unchanged")
+    transition_digest = "sha256:" + hashlib.sha256(
+        json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": False,
+        "adapter_stale": False,
+        "before_digest": digest,
+        "after_digest": digest,
+        "transition_digest": transition_digest,
+        "changed_dimensions": [],
+        "url_change": None,
+        "title_change": None,
+        "frame_change": None,
+        "observation_kind_change": None,
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "reviewed_control_state_changes": [],
+        "added_visible_text": [],
+        "evidence_refs": ["browser:unchanged"],
+        "reobservation_recommended": False,
+    }
+
+
 def test_normalize_target_ui_transition_accepts_pre_and_post_shapes() -> None:
     pre = normalize_target_ui_transition({"target_ui_transition": _transition()})
     post = normalize_target_ui_transition({"target_ui_transition": _transition(stale=False)})
@@ -43,6 +73,65 @@ def test_normalize_target_ui_transition_accepts_pre_and_post_shapes() -> None:
     assert pre is not None and pre["adapter_stale"] is True
     assert post is not None and post["adapter_stale"] is False
     assert pre["added_controls"] == _transition()["added_controls"]
+
+
+def test_normalize_target_ui_transition_accepts_only_exact_unchanged_proof() -> None:
+    unchanged = _unchanged_transition()
+
+    normalized = normalize_target_ui_transition({"target_ui_transition": unchanged})
+    assert normalized is not None
+    assert normalized["material"] is False
+    assert normalized["before_digest"] == normalized["after_digest"]
+    assert normalized["reobservation_recommended"] is False
+
+    invalid = (
+        {**unchanged, "adapter_stale": True},
+        {**unchanged, "reobservation_recommended": True},
+        {**unchanged, "after_digest": _digest("different")},
+        {**unchanged, "changed_dimensions": ["controls"]},
+        {**unchanged, "added_controls": [{"role": "button", "name": "Next"}]},
+        {**unchanged, "removed_controls": [{"role": "textbox", "name": "Message"}]},
+        {
+            **unchanged,
+            "reviewed_state_changes": [
+                {"name": "level", "role": "progress_ordinal", "before": 1, "after": 2}
+            ],
+        },
+        {**unchanged, "title_change": {"before": "old", "after": "new"}},
+        {**unchanged, "url_change": {"before": "/one", "after": "/two"}},
+        {**unchanged, "frame_change": {"added": ["child"], "removed": []}},
+        {
+            **unchanged,
+            "observation_kind_change": {"before": "page", "after": "blocker"},
+        },
+        {
+            **unchanged,
+            "reviewed_control_state_changes": [
+                {
+                    "name": "Message",
+                    "before": {"disabled": False},
+                    "after": {"disabled": True},
+                }
+            ],
+        },
+        {**unchanged, "added_visible_text": ["Level complete"]},
+        {**unchanged, "controls_truncated": True},
+        {**unchanged, "state_changes_truncated": True},
+        {**unchanged, "controls_truncated": 0},
+        {**unchanged, "state_changes_truncated": 0},
+        {**unchanged, "changed_dimensions": ""},
+        {**unchanged, "added_controls": {}},
+        {**unchanged, "removed_controls": ()},
+        {**unchanged, "reviewed_state_changes": None},
+        {**unchanged, "reviewed_control_state_changes": ""},
+        {**unchanged, "added_visible_text": {}},
+        {**unchanged, "evidence_refs": []},
+        {**unchanged, "evidence_refs": ["x" * 257]},
+        {**unchanged, "transition_digest": _digest("wrong-transition")},
+        {**unchanged, "unreviewed_field": "ignored-before-this-fix"},
+    )
+    for candidate in invalid:
+        assert normalize_target_ui_transition({"target_ui_transition": candidate}) is None
 
 
 def test_normalize_target_ui_transition_bounds_durable_evidence() -> None:

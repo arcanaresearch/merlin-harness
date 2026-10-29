@@ -42,6 +42,10 @@ from merlin_agents.durable_service import (
     _worker_context,
 )
 from merlin_agents.graph import EdgeKind as GraphEdgeKind
+from merlin_agents.target_reobservation import (
+    extract_target_reobservation_obligations,
+    project_target_reobservations,
+)
 from merlin_contracts import (
     AgentTask,
     CapabilityGrant,
@@ -53,6 +57,7 @@ from merlin_contracts import (
     TextDelta,
     ToolCall,
     ToolContext,
+    ToolEffectState,
     ToolInteractionRole,
     ToolResult,
     ToolSpec,
@@ -544,6 +549,7 @@ def test_retry_progress_ignores_fresh_receipt_and_session_identifiers() -> None:
         WorkerRuntime._record_target_evidence(  # noqa: SLF001
             evidence,
             SimpleNamespace(
+                    session_id=session_id,
                 assignment=SimpleNamespace(
                     id="campaign/retry-progress/worker",
                     target_profile_id="target",
@@ -1602,6 +1608,89 @@ async def test_committed_task_result_evidence_projects_completed_target_tool_rec
     assert str(evidence["reference"]).startswith("merlin-result://schedule/schedule-1")
 
 
+@pytest.mark.parametrize(
+    ("projection", "count", "overflow"),
+    (
+        ("lineage", 32, False),
+        ("lineage", 33, True),
+        ("effects", 256, False),
+        ("effects", 257, True),
+    ),
+)
+async def test_committed_evidence_fails_closed_on_bounded_effect_projection_overflow(
+    projection: str,
+    count: int,
+    overflow: bool,
+) -> None:
+    attempt_id = "attempt-current"
+
+    class ProjectionStore(Store):
+        def replacement_attempt_lineage(self, loaded_attempt_id, *, limit=None):
+            assert loaded_attempt_id == attempt_id
+            values = (
+                tuple(f"attempt-ancestor-{index}" for index in range(count - 1))
+                + (attempt_id,)
+                if projection == "lineage"
+                else (attempt_id,)
+            )
+            return values if limit is None else values[-limit:]
+
+    class ProjectionTools(Tools):
+        async def list_effects_for_attempt(self, loaded_attempt_id, *, limit=None):
+            if projection == "effects":
+                assert loaded_attempt_id == attempt_id
+            values = tuple(
+                SimpleNamespace() for _ in range(count if projection == "effects" else 0)
+            )
+            return values if limit is None else values[-limit:]
+
+    store = ProjectionStore()
+    store.results["schedule-1"] = {
+        "worker:campaign/overflow": {
+            "node_id": "worker:campaign/overflow",
+            "attempt_id": attempt_id,
+            "payload_digest": "a" * 64,
+            "schema_id": "schema/result",
+            "payload": {
+                "content": "completed worker result",
+                "worker_checkpoint": {"messages": []},
+            },
+        }
+    }
+    service = DurableAgentService(Provider(), ProjectionTools(), store)
+
+    evidence = await service.committed_task_result_evidence(
+        "schedule-1",
+        AgentTask(
+            id="campaign/overflow",
+            objective="exercise bounded durable evidence",
+            status="completed",
+            result="completed worker result",
+        ),
+    )
+
+    assert evidence is not None
+    if not overflow:
+        assert str(evidence["digest"]).startswith("sha256:")
+        assert str(evidence["reference"]).startswith("merlin-result://")
+        assert "durable_effect_projection_error" not in evidence
+        return
+    expected_code = (
+        "replacement_lineage_overflow" if projection == "lineage" else "effect_history_overflow"
+    )
+    assert evidence["durable_effect_projection_error"] == {
+        "schema": "merlin.durable-effect-projection-error.v1",
+        "code": expected_code,
+        "retryable": False,
+    }
+    assert "digest" not in evidence
+    assert "reference" not in evidence
+    assert evidence["attempt_disposition"] == "uncertain"
+    assert evidence["outcome_authority"] == "none"
+    assert evidence["target_authoritative_outcome"] == "unclear"
+    assert evidence["infrastructure_failure_category"] == "effect_reconciliation_required"
+
+
 async def test_committed_task_evidence_selects_exact_final_schema_result() -> None:
     from merlin_agents.capability_probe_execution import probe_result_from_committed_receipt
     from merlin_agents.capability_probes import ProbeOutcome, plan_capability_probes
@@ -1638,9 +1727,9 @@ async def test_committed_task_evidence_selects_exact_final_schema_result() -> No
     )
 
     class EvidenceTools(Tools):
-        async def list_effects_for_attempt(self, attempt_id):
+        async def list_effects_for_attempt(self, attempt_id, *, limit=None):
             assert attempt_id == "attempt-final"
-            return effects
+            return effects if limit is None else effects[-limit:]
 
     class HistoricalStore(Store):
         def list_results(self, schedule_id):
@@ -2105,9 +2194,10 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
     )
 
     class EvidenceTools(Tools):
-        async def list_effects_for_attempt(self, value):
+        async def list_effects_for_attempt(self, value, *, limit=None):
             assert value == attempt_id
-            return (effect,)
+            values = (effect,)
+            return values if limit is None else values[-limit:]
 
     store = Store()
     store.results["schedule-1"] = {
@@ -2149,6 +2239,123 @@ async def test_compacted_target_document_resolves_from_durable_effect_after_rest
     assert unmatched is not None
     assert unmatched["target_call_ids"] == ()
     assert unmatched["target_evidence_receipts"] == {}
+
+
+@pytest.mark.parametrize(
+    ("effect_role", "credited"),
+    (
+        (ToolInteractionRole.TARGET_EXCHANGE.value, True),
+        (ToolInteractionRole.AUXILIARY.value, False),
+    ),
+)
+def test_custom_typed_target_exchange_requires_matching_durable_effect_role(
+    effect_role: str,
+    credited: bool,
+) -> None:
+    task_id = "campaign/custom/worker"
+    attempt_id = "attempt-custom"
+    call = ToolCall(
+        call_id="custom-call",
+        name="custom_exchange",
+        arguments={"input": "authorized probe"},
+    )
+    metadata = {
+        "interaction_role": ToolInteractionRole.TARGET_EXCHANGE.value,
+        "target_session_id": "target-session-custom",
+        "target_exchanges": [
+            {
+                "interaction": True,
+                "cleanup": False,
+                "request_id": "custom-request",
+                "status_code": 200,
+            }
+        ],
+    }
+    result = ToolResult(content='{"reply":"target observation"}', metadata=metadata)
+    target_evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        target_evidence,
+        SimpleNamespace(
+            session_id="session-custom",
+            assignment=SimpleNamespace(
+                id=task_id,
+                target_profile_id="target-custom",
+                technique_ids=(),
+            ),
+            worker_context=None,
+            attempt_id=attempt_id,
+            technique_attempt_id=None,
+            candidate_identity=None,
+        ),
+        call,
+        result,
+    )
+    receipt = target_evidence[call.call_id]
+    row = {
+        "node_id": f"worker:{task_id}",
+        "attempt_id": attempt_id,
+        "payload_digest": "a" * 64,
+        "payload": {
+            "content": result.content,
+            "target_id": "target-custom",
+            "target_session_id": "target-session-custom",
+            "worker_checkpoint": {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call.call_id,
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": json.dumps(call.arguments),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "content": result.content,
+                    },
+                ],
+                "technique_attempt_id": None,
+                "target_evidence": [receipt],
+            },
+        },
+    }
+    effect = SimpleNamespace(
+        call_id=call.call_id,
+        tool_name=call.name,
+        campaign_id="campaign/custom",
+        session_id="session-custom",
+        agent_id=task_id,
+        attempt_id=attempt_id,
+        target_id="target-custom",
+        state="acknowledged",
+        effect="target_network",
+        arguments_payload=call.arguments,
+        result_content=result.content,
+        result_metadata={**metadata, "interaction_role": effect_role},
+        result_is_error=False,
+    )
+
+    evidence = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-custom",
+        AgentTask(
+            id=task_id,
+            objective="exercise the custom target transport",
+            status="completed",
+            result=result.content,
+        ),
+        row,
+        durable_effects=(effect,),
+        evidence_attempt_ids=(attempt_id,),
+    )
+
+    assert evidence is not None
+    assert evidence["target_call_ids"] == ((call.call_id,) if credited else ())
+    assert bool(evidence["target_evidence_receipts"]) is credited
 
 
 def test_transition_receipts_require_complete_call_pair_and_canonical_payload() -> None:
@@ -2710,6 +2917,161 @@ def test_transition_receipts_require_complete_call_pair_and_canonical_payload() 
     assert later_effect["target_ui_transition_receipts"] == {}
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "effect_kind"),
+    (("browser_click", "target_network"), ("browser_navigate", "target_read")),
+)
+def test_generic_browser_transition_projects_to_lead_reobservation_without_attack_credit(
+    tool_name: str,
+    effect_kind: str,
+) -> None:
+    assignment_id = "campaign/generic-projection/worker"
+    campaign_id = "campaign/generic-projection"
+    session_id = "session-generic-projection"
+    attempt_id = "attempt-generic-projection"
+    target_id = "target-generic-projection"
+    target_session_id = "browser:generic-projection"
+    compiled_adapter_digest = "sha256:" + hashlib.sha256(b"compiled-adapter").hexdigest()
+    transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": False,
+        "before_digest": "sha256:" + hashlib.sha256(b"generic-before").hexdigest(),
+        "after_digest": "sha256:" + hashlib.sha256(b"generic-after").hexdigest(),
+        "changed_dimensions": ["dialog"],
+        "added_controls": [{"role": "dialog", "name": "Level complete"}],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:generic-after"],
+        "reobservation_recommended": True,
+    }
+    arguments = (
+        {"tab_ref": "tab:1", "url": "https://target.test/level-2"}
+        if tool_name == "browser_navigate"
+        else {"tab_ref": "tab:1", "element_ref": "button:next-level"}
+    )
+    call = ToolCall(call_id=f"generic-{tool_name}", name=tool_name, arguments=arguments)
+    metadata = {
+        "interaction_role": ToolInteractionRole.AUXILIARY.value,
+        "effect": effect_kind,
+        "campaign_id": campaign_id,
+        "target_profile_id": target_id,
+        "compiled_adapter_digest": compiled_adapter_digest,
+        "target_effect_attempted": True,
+        "target_call_budget_charge": 1,
+        "target_session_id": target_session_id,
+        "target_ui_transition": transition,
+    }
+    result = ToolResult(content="reviewed browser surface changed", metadata=metadata)
+    target_evidence: dict[str, dict[str, object]] = {}
+    WorkerRuntime._record_target_evidence(  # noqa: SLF001
+        target_evidence,
+        SimpleNamespace(
+            session_id=session_id,
+            assignment=SimpleNamespace(
+                id=assignment_id,
+                target_profile_id=target_id,
+                technique_ids=(),
+            ),
+            worker_context=None,
+            attempt_id=attempt_id,
+            technique_attempt_id=None,
+            candidate_identity=None,
+        ),
+        call,
+        result,
+    )
+    receipt = target_evidence[call.call_id]
+    task = AgentTask(
+        id=assignment_id,
+        objective="Advance the reviewed browser surface.",
+        status="completed",
+        result=result.content,
+    )
+    committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
+        "schedule-generic-projection",
+        task,
+        {
+            "node_id": f"worker:{assignment_id}",
+            "attempt_id": attempt_id,
+            "payload_digest": "d" * 64,
+            "payload": {
+                "content": result.content,
+                "target_id": target_id,
+                "target_session_id": target_session_id,
+                "worker_checkpoint": {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": call.call_id,
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.call_id,
+                            "content": result.content,
+                        },
+                    ],
+                    "technique_attempt_id": None,
+                    "target_evidence": [receipt],
+                },
+            },
+        },
+        durable_effects=(
+            SimpleNamespace(
+                call_id=call.call_id,
+                state="acknowledged",
+                session_id=session_id,
+                agent_id=assignment_id,
+                attempt_id=attempt_id,
+                campaign_id=campaign_id,
+                target_id=target_id,
+                tool_name=tool_name,
+                effect=effect_kind,
+                arguments_payload=arguments,
+                result_content=result.content,
+                result_is_error=False,
+                result_metadata=metadata,
+            ),
+        ),
+        evidence_attempt_ids=(attempt_id,),
+    )
+
+    assert committed is not None
+    assert committed["target_call_ids"] == ()
+    assert committed["target_evidence_receipts"] == {}
+    assert committed["target_ui_transition_receipts"] == {call.call_id: receipt}
+    obligations = extract_target_reobservation_obligations(
+        campaign_id=campaign_id,
+        session_id=session_id,
+        target_id=target_id,
+        source_schedule_id="schedule-generic-projection",
+        source_wave=1,
+        task_ids=(assignment_id,),
+        evidence={assignment_id: committed},
+    )
+    assert len(obligations) == 1
+    assert obligations[0].target_call_id == call.call_id
+    assert obligations[0].receipt_projection == "target_ui_transition_receipts"
+    projection = project_target_reobservations(
+        [
+            {
+                "sequence": index,
+                "payload": obligation.observed_payload(campaign_id, target_id),
+            }
+            for index, obligation in enumerate(obligations, 1)
+        ]
+    )
+    assert projection.lead_projection()["generation"]["status"] == "ready"  # type: ignore[index]
+
+
 @pytest.mark.parametrize("target_effect_attempted", (False, True))
 async def test_terminal_surface_drift_commits_transition_without_replacement(
     target_effect_attempted: bool,
@@ -2831,10 +3193,9 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
                 and (tool_name is None or item.tool_name == tool_name)
             ]
 
-        async def list_for_attempt(self, attempt_id):
-            return [
-                item for item in self.records.values() if item.attempt_id == attempt_id
-            ]
+        async def list_for_attempt(self, attempt_id, *, limit=None):
+            values = [item for item in self.records.values() if item.attempt_id == attempt_id]
+            return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
             records = [
@@ -3058,10 +3419,9 @@ async def test_crash_after_durable_material_transition_does_not_replace_worker(
                 and (tool_name is None or item.tool_name == tool_name)
             ]
 
-        async def list_for_attempt(self, attempt_id):
-            return [
-                item for item in self.records.values() if item.attempt_id == attempt_id
-            ]
+        async def list_for_attempt(self, attempt_id, *, limit=None):
+            values = [item for item in self.records.values() if item.attempt_id == attempt_id]
+            return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
             records = [
@@ -3328,17 +3688,19 @@ async def test_replacement_result_inherits_authenticated_ancestor_evidence_after
     )
 
     class ReplacementStore(Store):
-        def replacement_attempt_lineage(self, attempt_id):
+        def replacement_attempt_lineage(self, attempt_id, *, limit=None):
             assert attempt_id == replacement_attempt_id
-            return (ancestor_attempt_id, replacement_attempt_id)
+            values = (ancestor_attempt_id, replacement_attempt_id)
+            return values if limit is None else values[-limit:]
 
     class LineageTools(Tools):
         def __init__(self) -> None:
             self.loaded_attempt_ids: list[str] = []
 
-        async def list_effects_for_attempt(self, attempt_id):
+        async def list_effects_for_attempt(self, attempt_id, *, limit=None):
             self.loaded_attempt_ids.append(attempt_id)
-            return (ancestor_effect,) if attempt_id == ancestor_attempt_id else ()
+            values = (ancestor_effect,) if attempt_id == ancestor_attempt_id else ()
+            return values if limit is None else values[-limit:]
 
     store = ReplacementStore()
     store.results["schedule-1"] = {
@@ -6722,14 +7084,15 @@ async def test_capability_probe_server_error_runs_bounded_replacement(
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
 
-        def replacement_attempt_lineage(self, attempt_id):
+        def replacement_attempt_lineage(self, attempt_id, *, limit=None):
             values = []
             current = self.attempts[attempt_id]
             while current is not None:
                 values.append(current.id)
                 replaced = getattr(current, "replaced_attempt_id", None)
                 current = self.attempts.get(replaced)
-            return tuple(reversed(values))
+            values = tuple(reversed(values))
+            return values if limit is None else values[-limit:]
 
         def settle_attempt(
             self,
@@ -6951,13 +7314,14 @@ async def test_retryable_delivery_failure_retries_with_fresh_worker_before_excha
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
 
-        def replacement_attempt_lineage(self, attempt_id):
+        def replacement_attempt_lineage(self, attempt_id, *, limit=None):
             values = []
             current = self.attempts[attempt_id]
             while current is not None:
                 values.append(current.id)
                 current = self.attempts.get(getattr(current, "replaced_attempt_id", None))
-            return tuple(reversed(values))
+            values = tuple(reversed(values))
+            return values if limit is None else values[-limit:]
 
         def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
             lease = self.attempts[attempt_id]
@@ -7106,13 +7470,14 @@ async def test_repeated_capability_probe_http_failure_is_bounded_and_exact_args_
             lease.replaced_attempt_id = prior[-1].id if prior else None
             return lease
 
-        def replacement_attempt_lineage(self, attempt_id):
+        def replacement_attempt_lineage(self, attempt_id, *, limit=None):
             values = []
             current = self.attempts[attempt_id]
             while current is not None:
                 values.append(current.id)
                 current = self.attempts.get(getattr(current, "replaced_attempt_id", None))
-            return tuple(reversed(values))
+            values = tuple(reversed(values))
+            return values if limit is None else values[-limit:]
 
         def commit_partial(self, attempt_id, generation, *, result, applied_message_ids=()):
             lease = self.attempts[attempt_id]
@@ -10067,11 +10432,26 @@ class FencingStore(Store):
         "continued",
         "wrong_session",
         "unauthorized_tool",
+        "generic_click",
+        "generic_navigate",
+        "generic_nonmaterial",
+        "generic_intent",
+        "generic_ambiguous",
+        "generic_missing_transition",
+        "generic_fill_submit",
+        "generic_invalid_prior",
     ),
 )
 async def test_restart_adopts_durable_material_transition_before_provider_or_target_call(
     transition_case: str,
 ) -> None:
+    generic_case = transition_case.startswith("generic_")
+    generic_tool_name = (
+        "browser_navigate" if transition_case == "generic_navigate" else "browser_click"
+        if generic_case
+        else None
+    )
+    compiled_adapter_digest = "sha256:" + hashlib.sha256(b"restart-compiled").hexdigest()
     transition = {
         "schema": "merlin.target-ui-transition.v1",
         "material": True,
@@ -10093,13 +10473,67 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         "reobservation_recommended": True,
         "transition_digest": "sha256:" + hashlib.sha256(b"raw-restart").hexdigest(),
         "url_change": None,
+        "title_change": None,
         "frame_change": None,
+        "observation_kind_change": None,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "reviewed_control_state_changes": [],
         "added_visible_text": ["Congratulations! You pass the level."],
     }
     if transition_case in {"pre_effect", "malformed"}:
         transition["adapter_stale"] = True
     if transition_case == "malformed":
         transition["after_digest"] = transition["before_digest"]
+    if transition_case == "generic_nonmaterial":
+        transition.update(
+            {
+                "material": False,
+                "after_digest": transition["before_digest"],
+                "changed_dimensions": [],
+                "added_controls": [],
+                "added_visible_text": [],
+                "reobservation_recommended": False,
+                "transition_digest": "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        [transition["before_digest"], transition["before_digest"]],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
+        )
+    unchanged_digest = "sha256:" + hashlib.sha256(b"restart-unchanged").hexdigest()
+    unchanged_transition = {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": False,
+        "adapter_stale": False,
+        "before_digest": unchanged_digest,
+        "after_digest": unchanged_digest,
+        "transition_digest": "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                [unchanged_digest, unchanged_digest],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+        "changed_dimensions": [],
+        "url_change": None,
+        "title_change": None,
+        "frame_change": None,
+        "observation_kind_change": None,
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "reviewed_control_state_changes": [],
+        "added_visible_text": [],
+        "evidence_refs": ["browser:restart-unchanged"],
+        "reobservation_recommended": False,
+    }
 
     class EffectStore:
         def __init__(self) -> None:
@@ -10124,10 +10558,9 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
                 and (tool_name is None or item.tool_name == tool_name)
             ]
 
-        async def list_for_attempt(self, attempt_id):
-            return [
-                item for item in self.records.values() if item.attempt_id == attempt_id
-            ]
+        async def list_for_attempt(self, attempt_id, *, limit=None):
+            values = [item for item in self.records.values() if item.attempt_id == attempt_id]
+            return values if limit is None else values[-limit:]
 
         async def list_for_campaign(self, campaign_id, *, limit=None):
             records = [
@@ -10136,23 +10569,48 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             return records if limit is None else records[-limit:]
 
     class SurfaceTool:
-        effect = "target_network"
+        effect = "target_read" if generic_tool_name == "browser_navigate" else "target_network"
 
         def __init__(self) -> None:
             self.calls = 0
 
         def describe(self):
             return ToolSpec(
-                name="browser_chat_exchange",
+                name=generic_tool_name or "browser_chat_exchange",
                 description="Reviewed browser exchange",
                 input_schema={"type": "object"},
-                interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                interaction_role=(
+                    ToolInteractionRole.AUXILIARY
+                    if generic_tool_name is not None
+                    else ToolInteractionRole.TARGET_EXCHANGE
+                ),
             )
+
+        async def resolve_target_session_id(self, _context):
+            return "browser:restart-context"
 
         async def invoke(self, context, arguments):
             del context, arguments
             self.calls += 1
             assert self.calls <= (2 if transition_case in {"ambiguous", "continued"} else 1)
+            if generic_tool_name is not None:
+                return ToolResult(
+                    content="generic reviewed browser surface changed",
+                    metadata={
+                        "effect": self.effect,
+                        "campaign_id": "campaign/restart-transition",
+                        "target_profile_id": "target-surface",
+                        "compiled_adapter_digest": compiled_adapter_digest,
+                        "target_effect_attempted": True,
+                        "target_call_budget_charge": 1,
+                        "target_session_id": "browser:restart-context",
+                        **(
+                            {}
+                            if transition_case == "generic_missing_transition"
+                            else {"target_ui_transition": transition}
+                        ),
+                    },
+                )
             if self.calls == 2 and transition_case == "continued":
                 return ToolResult(
                     content="stale worker continued after the transition",
@@ -10197,6 +10655,44 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
                     "target_call_budget_charge": 0 if pre_effect_error else 1,
                     "limit_interaction_count": 0 if pre_effect_error else 1,
                     "target_ui_transition": transition,
+                },
+            )
+
+    class PriorSurfaceTool:
+        effect = "target_network"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return ToolSpec(
+                name="browser_fill",
+                description="Reviewed browser fill",
+                input_schema={"type": "object"},
+                interaction_role=ToolInteractionRole.AUXILIARY,
+            )
+
+        async def resolve_target_session_id(self, _context):
+            return "browser:restart-context"
+
+        async def invoke(self, context, arguments):
+            del context, arguments
+            self.calls += 1
+            return ToolResult(
+                content="generic reviewed fill settled unchanged",
+                metadata={
+                    "effect": self.effect,
+                    "campaign_id": "campaign/restart-transition",
+                    "target_profile_id": "target-surface",
+                    "compiled_adapter_digest": (
+                        "sha256:" + "0" * 64
+                        if transition_case == "generic_invalid_prior"
+                        else compiled_adapter_digest
+                    ),
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "target_session_id": "browser:restart-context",
+                    "target_ui_transition": unchanged_transition,
                 },
             )
 
@@ -10249,14 +10745,15 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             lease.replaced_attempt_id = prior.id if prior is not None else None
             return lease
 
-        def replacement_attempt_lineage(self, attempt_id):
+        def replacement_attempt_lineage(self, attempt_id, *, limit=None):
             lineage = []
             current = self.attempts[attempt_id]
             while current is not None:
                 lineage.append(current.id)
                 replaced = getattr(current, "replaced_attempt_id", None)
                 current = self.attempts.get(replaced) if replaced is not None else None
-            return tuple(reversed(lineage))
+            lineage = tuple(reversed(lineage))
+            return lineage if limit is None else lineage[-limit:]
 
     class NoWorkerProvider(Provider):
         def __init__(self) -> None:
@@ -10278,7 +10775,11 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         target_profile_id="target-surface",
         technique_ids=("surface-transition",),
         guidance_ids=(),
-        tool_ids=("browser_chat_exchange",),
+        tool_ids=(
+            ("browser_fill", "browser_click")
+            if transition_case in {"generic_fill_submit", "generic_invalid_prior"}
+            else ((generic_tool_name or "browser_chat_exchange"),)
+        ),
         skill_ids=(),
         provider_id="provider",
         authority_ids=("target:reviewed",),
@@ -10287,6 +10788,11 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         input_schema='{"type":"object"}',
         output_schema='{"type":"object"}',
         strategy_id="direct",
+        strategy_contract=(
+            (("compiled_adapter_digest", compiled_adapter_digest),)
+            if generic_tool_name is not None
+            else ()
+        ),
     )
     profile = ContextDocument.create("profile:recon@1", "Observe the reviewed surface.")
     target = ReviewedTargetAdapter(
@@ -10304,6 +10810,8 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         tool_ids=assignment.tool_ids,
         target=target,
         authority_ids=assignment.authority_ids,
+        strategy_id=assignment.strategy_id,
+        strategy_contract=assignment.strategy_contract,
         digest=_digest(
             {
                 "assignment_id": assignment.id,
@@ -10314,14 +10822,19 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
                 "target": asdict(target),
                 "authority_ids": assignment.authority_ids,
                 "strategy_id": "direct",
-                "strategy_contract": (),
+                "strategy_contract": assignment.strategy_contract,
             }
         ),
     )
     surface_tool = SurfaceTool()
+    prior_surface_tool = PriorSurfaceTool()
     effect_store = EffectStore()
     broker = ToolBroker(
-        (surface_tool,),
+        (
+            (prior_surface_tool, surface_tool)
+            if transition_case in {"generic_fill_submit", "generic_invalid_prior"}
+            else (surface_tool,)
+        ),
         confirmer=allow,
         effect_store=effect_store,
     )
@@ -10348,8 +10861,23 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
     worker_lease = await first._claim(live, worker_handle)  # noqa: SLF001
     store.schedules[live.id]["checkpoint"] = live.scheduler.checkpoint()
 
+    if transition_case in {"generic_fill_submit", "generic_invalid_prior"}:
+        await broker.invoke(
+            "browser_fill",
+            ToolContext(
+                session_id=live.session_id,
+                workspace_root=".",
+                call_id="restart-fill",
+                agent_id=assignment.id,
+                attempt_id=worker_lease.id,
+                campaign_id="campaign/restart-transition",
+                target_id=assignment.target_profile_id,
+                compiled_adapter_digest=compiled_adapter_digest,
+            ),
+            {"tab_ref": "tab:1", "element_ref": "textbox:message", "value": "probe"},
+        )
     await broker.invoke(
-        "browser_chat_exchange",
+        generic_tool_name or "browser_chat_exchange",
         ToolContext(
             session_id=live.session_id,
             workspace_root=".",
@@ -10358,9 +10886,29 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             attempt_id=worker_lease.id,
             campaign_id="campaign/restart-transition",
             target_id=assignment.target_profile_id,
+            compiled_adapter_digest=(
+                compiled_adapter_digest if generic_tool_name is not None else None
+            ),
         ),
-        {"prompt": "authorized probe"},
+        (
+            {"tab_ref": "tab:1", "url": "https://target.test/level-2"}
+            if generic_tool_name == "browser_navigate"
+            else {"tab_ref": "tab:1", "element_ref": "button:next"}
+            if generic_tool_name == "browser_click"
+            else {"prompt": "authorized probe"}
+        ),
     )
+    if transition_case in {"generic_intent", "generic_ambiguous"}:
+        key, effect = next(iter(effect_store.records.items()))
+        effect_store.records[key] = effect.model_copy(
+            update={
+                "state": (
+                    ToolEffectState.INTENT
+                    if transition_case == "generic_intent"
+                    else ToolEffectState.AMBIGUOUS
+                )
+            }
+        )
     if transition_case in {"ambiguous", "continued"}:
         await broker.invoke(
             "browser_chat_exchange",
@@ -10407,14 +10955,27 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         "continued": "quarantined",
         "wrong_session": "quarantined",
         "unauthorized_tool": "quarantined",
+        "generic_click": "completed",
+        "generic_navigate": "completed",
+        "generic_nonmaterial": "completed",
+        "generic_intent": "quarantined",
+        "generic_ambiguous": "quarantined",
+        "generic_missing_transition": "quarantined",
+        "generic_fill_submit": "completed",
+        "generic_invalid_prior": "quarantined",
     }[transition_case]
     assert provider.calls == 0
     assert surface_tool.calls == (
         2 if transition_case in {"ambiguous", "continued"} else 1
     )
     assert len(effect_store.records) == (
-        2 if transition_case in {"ambiguous", "continued"} else 1
+        2
+        if transition_case
+        in {"ambiguous", "continued", "generic_fill_submit", "generic_invalid_prior"}
+        else 1
     )
+    if transition_case in {"generic_fill_submit", "generic_invalid_prior"}:
+        assert prior_surface_tool.calls == 1
     assert any(
         event_type == "worker_restart_transition_recovered"
         for _, event_type, _ in store.lifecycle_events
@@ -10424,7 +10985,13 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         for item in await replacement.list_schedule_tasks(live.id)
         if item.id == assignment.id
     )
-    if transition_case == "success":
+    if transition_case in {
+        "success",
+        "generic_click",
+        "generic_navigate",
+        "generic_nonmaterial",
+        "generic_fill_submit",
+    }:
         committed = await replacement.committed_task_result_evidence(live.id, task)
     else:
         row = next(
@@ -10433,6 +11000,18 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
             if item.get("node_id") == node_id
             and item.get("schema_id") == "schema/partial-result"
         )
+        if transition_case in {
+            "generic_intent",
+            "generic_ambiguous",
+            "generic_missing_transition",
+            "generic_invalid_prior",
+        }:
+            expected_category = (
+                "adapter_state_integrity"
+                if transition_case == "generic_invalid_prior"
+                else "effect_reconciliation_required"
+            )
+            assert row["payload"]["infrastructure_failure_category"] == expected_category
         committed = DurableAgentService._committed_task_evidence(  # noqa: SLF001
             live.id,
             task,
@@ -10458,6 +11037,46 @@ async def test_restart_adopts_durable_material_transition_before_provider_or_tar
         assert receipt["attempt_id"] == attempts[0].id
         assert receipt["acknowledged"] is True
         assert receipt["candidate_outcome_projection"]["outcome"] == "unclear"
+    elif transition_case in {"generic_click", "generic_navigate", "generic_fill_submit"}:
+        assert committed["target_evidence_receipts"] == {}
+        assert tuple(committed["target_ui_transition_receipts"]) == (
+            "restart-transition",
+        )
+        receipt = committed["target_ui_transition_receipts"]["restart-transition"]
+        assert receipt["tool_name"] == generic_tool_name
+        assert receipt["generic_browser_effect"] is True
+        assert receipt["generic_browser_effect_class"] == surface_tool.effect
+        assert receipt["interaction_count"] == 0
+        assert receipt["limit_interaction_count"] == 0
+        assert receipt["target_call_budget_charge"] == 1
+        assert committed["target_call_ids"] == ()
+        obligations = extract_target_reobservation_obligations(
+            campaign_id="campaign/restart-transition",
+            session_id=live.session_id,
+            target_id=assignment.target_profile_id,
+            source_schedule_id=live.id,
+            source_wave=1,
+            task_ids=(assignment.id,),
+            evidence={assignment.id: committed},
+        )
+        assert len(obligations) == 1
+        assert obligations[0].target_call_id == "restart-transition"
+        projection = project_target_reobservations(
+            [
+                {
+                    "sequence": 1,
+                    "payload": obligations[0].observed_payload(
+                        "campaign/restart-transition",
+                        assignment.target_profile_id,
+                    ),
+                }
+            ]
+        )
+        assert projection.lead_projection()["generation"]["status"] == "ready"  # type: ignore[index]
+    elif transition_case == "generic_nonmaterial":
+        assert committed["target_call_ids"] == ()
+        assert committed["target_evidence_receipts"] == {}
+        assert committed["target_ui_transition_receipts"] == {}
     elif transition_case == "pre_effect":
         assert committed["target_evidence_receipts"] == {}
         assert tuple(committed["target_ui_transition_receipts"]) == (

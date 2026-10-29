@@ -75,6 +75,9 @@ from .mailbox import (
 )
 from .memory import PortableMemoryProvider, PortableMemoryQuery, PortableMemoryScope
 from .runtime import (
+    _GENERIC_BROWSER_EFFECT_TOOLS,
+    _GENERIC_BROWSER_MUTATION_TOOLS,
+    _GENERIC_BROWSER_NAVIGATION_TOOLS,
     WorkerControl,
     WorkerHandoff,
     WorkerResult,
@@ -137,6 +140,8 @@ _MAX_SCHEDULE_JSONB_BYTES = 16 * 1024 * 1024
 _LEASE_EXPIRY_GRACE_SECONDS = 0.05
 _READY_STALE_LEASE_RETRIES = 6
 _TRANSPORT_RETRY_JITTER = 0.25
+_DURABLE_EFFECT_LINEAGE_LIMIT = 32
+_DURABLE_EFFECT_SCAN_LIMIT = 256
 _JEV_SEVERITY_LEVELS: tuple[FindingSeverity, ...] = (
     "informational",
     "low",
@@ -163,6 +168,37 @@ class ScheduleArtifactTooLarge(ValueError):
             f"{limit_bytes:,}-byte safety limit; reduce the execution batch and reference "
             "shared immutable context instead of copying it per worker"
         )
+
+
+class DurableEffectProjectionOverflow(RuntimeError):
+    """Durable effect authority exceeded its bounded recovery projection."""
+
+
+async def _bounded_attempt_effects(
+    loader: Callable[..., Awaitable[Sequence[object]]],
+    attempt_ids: Sequence[str],
+) -> tuple[object, ...]:
+    """Load a bounded chronological effect suffix with explicit overflow."""
+
+    unique_attempt_ids = tuple(dict.fromkeys(str(item) for item in attempt_ids if str(item)))
+    if len(unique_attempt_ids) > _DURABLE_EFFECT_LINEAGE_LIMIT:
+        raise DurableEffectProjectionOverflow(
+            "durable effect replacement lineage exceeds the recovery bound"
+        )
+    loaded: list[object] = []
+    for attempt_id in unique_attempt_ids:
+        remaining_with_overflow = _DURABLE_EFFECT_SCAN_LIMIT + 1 - len(loaded)
+        if remaining_with_overflow <= 0:
+            raise DurableEffectProjectionOverflow(
+                "durable effect projection exceeds the recovery bound"
+            )
+        values = tuple(await loader(attempt_id, limit=remaining_with_overflow))
+        loaded.extend(values)
+        if len(loaded) > _DURABLE_EFFECT_SCAN_LIMIT:
+            raise DurableEffectProjectionOverflow(
+                "durable effect projection exceeds the recovery bound"
+            )
+    return tuple(loaded)
 
 
 def _bounded_schedule_json(value: object, *, artifact: str) -> int:
@@ -1465,24 +1501,67 @@ class DurableAgentService:
         evidence_attempt_ids: tuple[str, ...] = ()
         lineage_loader = getattr(self._store, "replacement_attempt_lineage", None)
         effect_loader = getattr(self._tools, "list_effects_for_attempt", None)
+        effect_projection_error: dict[str, object] | None = None
         if isinstance(attempt_id, str) and attempt_id:
             evidence_attempt_ids = (attempt_id,)
             if callable(lineage_loader):
-                loaded_lineage = tuple(await self._call(lineage_loader, attempt_id))
+                loaded_lineage = tuple(
+                    await self._call(
+                        lineage_loader,
+                        attempt_id,
+                        limit=_DURABLE_EFFECT_LINEAGE_LIMIT + 1,
+                    )
+                )
+                if len(loaded_lineage) > _DURABLE_EFFECT_LINEAGE_LIMIT:
+                    effect_projection_error = {
+                        "schema": "merlin.durable-effect-projection-error.v1",
+                        "code": "replacement_lineage_overflow",
+                        "retryable": False,
+                    }
+                    loaded_lineage = ()
                 if loaded_lineage and loaded_lineage[-1] == attempt_id:
                     evidence_attempt_ids = loaded_lineage
-            if callable(effect_loader):
-                loaded_effects: list[object] = []
-                for lineage_attempt_id in evidence_attempt_ids:
-                    loaded_effects.extend(await effect_loader(lineage_attempt_id))
-                effects = tuple(loaded_effects)
-        return self._committed_task_evidence(
+            if callable(effect_loader) and effect_projection_error is None:
+                try:
+                    effects = await _bounded_attempt_effects(
+                        effect_loader,
+                        evidence_attempt_ids,
+                    )
+                except DurableEffectProjectionOverflow:
+                    effect_projection_error = {
+                        "schema": "merlin.durable-effect-projection-error.v1",
+                        "code": "effect_history_overflow",
+                        "retryable": False,
+                    }
+                    effects = ()
+        evidence = self._committed_task_evidence(
             schedule_id,
             task,
             row,
             durable_effects=effects,
             evidence_attempt_ids=evidence_attempt_ids,
         )
+        if evidence is None or effect_projection_error is None:
+            return evidence
+        # The stored worker result remains useful for operator diagnostics, but
+        # an overflow means this bounded projection cannot prove which target
+        # effects belong to it.  Remove the references that downstream reducers
+        # use as candidate-retirement authority and expose one typed, retryable
+        # infrastructure limitation instead of making incomplete history look
+        # like an ordinary effect-free completion.
+        non_authoritative = {
+            key: value
+            for key, value in evidence.items()
+            if key not in {"digest", "reference"}
+        }
+        return {
+            **non_authoritative,
+            "durable_effect_projection_error": effect_projection_error,
+            "attempt_disposition": "uncertain",
+            "outcome_authority": "none",
+            "target_authoritative_outcome": "unclear",
+            "infrastructure_failure_category": "effect_reconciliation_required",
+        }
 
     @staticmethod
     def _committed_task_evidence(
@@ -1515,14 +1594,34 @@ class DurableAgentService:
         )
         messages = checkpoint.get("messages") if isinstance(checkpoint, Mapping) else None
         ordered_tool_pairs = _ordered_checkpoint_tool_pairs(messages)
+        durable_typed_target_ids = {
+            str(effect.call_id)
+            for effect in durable_effects
+            if isinstance(getattr(effect, "call_id", None), str)
+            and str(effect.call_id)
+            and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
+            and getattr(effect, "effect", None) == "target_network"
+            and getattr(effect, "agent_id", None) == task.id
+            and str(getattr(effect, "attempt_id", "")) in valid_attempt_id_set
+            and isinstance(getattr(effect, "result_metadata", None), Mapping)
+            and effect.result_metadata.get("interaction_role")
+            == ToolInteractionRole.TARGET_EXCHANGE.value
+        }
         terminal_ordered_target_ids = {
             call_id
             for call_id, (_, result_index, tool_name) in ordered_tool_pairs.items()
-            if tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+            if (
+                tool_name in (LEGACY_TARGET_EXCHANGE_TOOL_IDS | _GENERIC_BROWSER_EFFECT_TOOLS)
+                or call_id in durable_typed_target_ids
+            )
             and not any(
                 later_result_index > result_index
-                and later_tool in LEGACY_TARGET_EXCHANGE_TOOL_IDS
-                for _, (_, later_result_index, later_tool) in ordered_tool_pairs.items()
+                and (
+                    later_tool
+                    in (LEGACY_TARGET_EXCHANGE_TOOL_IDS | _GENERIC_BROWSER_EFFECT_TOOLS)
+                    or later_call_id in durable_typed_target_ids
+                )
+                for later_call_id, (_, later_result_index, later_tool) in ordered_tool_pairs.items()
             )
         }
         target_call_ids: set[str] = set()
@@ -1626,21 +1725,43 @@ class DurableAgentService:
             )
             is not None
             and receipt.get("target_ui_transition") == transition
+            and transition["material"] is True
             and call_id in terminal_ordered_target_ids
             and call_id in request_hashes
             and call_id in completed_call_ids
-            and receipt.get("is_error") is True
             and (
-                receipt.get("target_effect_attempted") is True
+                receipt.get("generic_browser_effect") is True
+                and receipt.get("tool_name") in _GENERIC_BROWSER_EFFECT_TOOLS
+                and receipt.get("generic_browser_effect_class")
+                == (
+                    "target_network"
+                    if receipt.get("tool_name") in _GENERIC_BROWSER_MUTATION_TOOLS
+                    else "target_read"
+                )
+                and isinstance(receipt.get("compiled_adapter_digest"), str)
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt["compiled_adapter_digest"]))
+                is not None
+                and type(receipt.get("is_error")) is bool
+                and receipt.get("target_effect_attempted") is True
+                and receipt.get("interaction_count") == 0
+                and receipt.get("limit_interaction_count") == 0
+                and receipt.get("target_call_budget_charge") == 1
                 or (
-                    transition["adapter_stale"] is True
-                    and receipt.get("target_effect_attempted") is False
-                    and type(receipt.get("interaction_count")) is int
-                    and receipt.get("interaction_count") == 0
-                    and type(receipt.get("limit_interaction_count")) is int
-                    and receipt.get("limit_interaction_count") == 0
-                    and type(receipt.get("target_call_budget_charge")) is int
-                    and receipt.get("target_call_budget_charge") == 0
+                    receipt.get("generic_browser_effect") is not True
+                    and receipt.get("is_error") is True
+                    and (
+                        receipt.get("target_effect_attempted") is True
+                        or (
+                            transition["adapter_stale"] is True
+                            and receipt.get("target_effect_attempted") is False
+                            and type(receipt.get("interaction_count")) is int
+                            and receipt.get("interaction_count") == 0
+                            and type(receipt.get("limit_interaction_count")) is int
+                            and receipt.get("limit_interaction_count") == 0
+                            and type(receipt.get("target_call_budget_charge")) is int
+                            and receipt.get("target_call_budget_charge") == 0
+                        )
+                    )
                 )
             )
         }
@@ -1648,6 +1769,7 @@ class DurableAgentService:
             call_id: receipt
             for call_id, receipt in validated_target_evidence_receipts.items()
             if receipt.get("is_error") is False
+            and receipt.get("generic_browser_effect") is not True
         }
         for call_id, document in compact_receipt_shaped_documents.items():
             receipt = validated_target_evidence_receipts.get(call_id)
@@ -1678,6 +1800,21 @@ class DurableAgentService:
                 is_target_exchange = (
                     getattr(effect, "tool_name", None) in LEGACY_TARGET_EXCHANGE_TOOL_IDS
                 )
+            tool_name = getattr(effect, "tool_name", None)
+            expected_generic_effect = (
+                "target_network"
+                if tool_name in _GENERIC_BROWSER_MUTATION_TOOLS
+                else "target_read"
+                if tool_name in _GENERIC_BROWSER_NAVIGATION_TOOLS
+                else None
+            )
+            is_generic_browser_effect = bool(
+                expected_generic_effect is not None
+                and not is_target_exchange
+                and interaction_role in {None, ToolInteractionRole.AUXILIARY.value}
+                and getattr(effect, "effect", None) == expected_generic_effect
+            )
+            is_transition_effect = is_target_exchange or is_generic_browser_effect
             if isinstance(call_id, str) and call_id and is_target_exchange:
                 target_call_ids.add(call_id)
             elif (
@@ -1689,15 +1826,13 @@ class DurableAgentService:
             if (
                 isinstance(call_id, str)
                 and call_id
-                and is_target_exchange
+                and is_transition_effect
                 and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
                 and getattr(effect, "agent_id", None) == task.id
                 and str(getattr(effect, "attempt_id", "")) in valid_attempt_id_set
             ):
                 target_effect_indices.append(effect_index)
-                target_effect_call_counts[call_id] = (
-                    target_effect_call_counts.get(call_id, 0) + 1
-                )
+                target_effect_call_counts[call_id] = target_effect_call_counts.get(call_id, 0) + 1
             if (
                 isinstance(call_id, str)
                 and call_id
@@ -1715,7 +1850,7 @@ class DurableAgentService:
                 probe_effect_calls[call_id] = str(effect.tool_name)
             receipt = target_evidence_receipts.get(call_id) if is_target_exchange else None
             transition_receipt = (
-                target_ui_transition_receipts.get(call_id) if is_target_exchange else None
+                target_ui_transition_receipts.get(call_id) if is_transition_effect else None
             )
             arguments = getattr(effect, "arguments_payload", None)
             content = getattr(effect, "result_content", None)
@@ -1732,8 +1867,7 @@ class DurableAgentService:
                 and (
                     getattr(effect, "effect", None) != "target_network"
                     or not isinstance(metadata, Mapping)
-                    or metadata.get("target_session_id")
-                    != receipt.get("target_session_id")
+                    or metadata.get("target_session_id") != receipt.get("target_session_id")
                     or normalize_target_ui_transition(metadata) != receipt_transition
                     or receipt.get("acknowledged") is not True
                     or receipt.get("interaction_count") != 1
@@ -1751,20 +1885,23 @@ class DurableAgentService:
                 transition_receipt is not None
                 and str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
                 and getattr(effect, "agent_id", None) == task.id
-                and str(getattr(effect, "attempt_id", ""))
-                == transition_receipt.get("attempt_id")
-                and getattr(effect, "campaign_id", None)
-                == transition_receipt.get("campaign_id")
+                and str(getattr(effect, "attempt_id", "")) == transition_receipt.get("attempt_id")
+                and getattr(effect, "campaign_id", None) == transition_receipt.get("campaign_id")
+                and getattr(effect, "session_id", None) == transition_receipt.get("session_id")
                 and getattr(effect, "target_id", None) == transition_receipt.get("target_id")
                 and getattr(effect, "tool_name", None) == transition_receipt.get("tool_name")
-                and getattr(effect, "effect", None) == "target_network"
+                and getattr(effect, "effect", None)
+                == (expected_generic_effect if is_generic_browser_effect else "target_network")
                 and isinstance(arguments, Mapping)
                 and isinstance(content, str)
                 and isinstance(metadata, Mapping)
-                and getattr(effect, "result_is_error", None)
-                is transition_receipt.get("is_error")
-                and metadata.get("target_session_id")
-                == transition_receipt.get("target_session_id")
+                and getattr(effect, "result_is_error", None) is transition_receipt.get("is_error")
+                and (
+                    transition_receipt.get("interaction_role") is None
+                    or transition_receipt.get("interaction_role")
+                    == metadata.get("interaction_role")
+                )
+                and metadata.get("target_session_id") == transition_receipt.get("target_session_id")
                 and WorkerRuntime._action_fingerprint(  # noqa: SLF001
                     str(effect.tool_name), arguments
                 )
@@ -1778,6 +1915,21 @@ class DurableAgentService:
                 and normalize_target_ui_transition(metadata)
                 == transition_receipt.get("target_ui_transition")
                 and _effect_receipt_counters_match(effect, transition_receipt)
+                and (
+                    not is_generic_browser_effect
+                    or transition_receipt.get("generic_browser_effect") is True
+                    and transition_receipt.get("generic_browser_effect_class")
+                    == expected_generic_effect
+                    and metadata.get("campaign_id") == transition_receipt.get("campaign_id")
+                    and metadata.get("target_profile_id") == transition_receipt.get("target_id")
+                    and metadata.get("compiled_adapter_digest")
+                    == transition_receipt.get("compiled_adapter_digest")
+                    and metadata.get("target_effect_attempted") is True
+                    and metadata.get("target_call_budget_charge") == 1
+                    and transition_receipt.get("interaction_count") == 0
+                    and transition_receipt.get("limit_interaction_count") == 0
+                    and transition_receipt.get("target_call_budget_charge") == 1
+                )
             ):
                 transition_effect_indices[str(call_id)] = effect_index
             if (
@@ -1792,6 +1944,8 @@ class DurableAgentService:
                 or not isinstance(content, str)
                 or not isinstance(metadata, Mapping)
                 or getattr(effect, "result_is_error", None) is not False
+                or receipt.get("interaction_role") is not None
+                and receipt.get("interaction_role") != metadata.get("interaction_role")
                 or transition_success_binding_invalid
                 or WorkerRuntime._action_fingerprint(  # noqa: SLF001
                     str(effect.tool_name), arguments
@@ -1805,9 +1959,12 @@ class DurableAgentService:
             ):
                 continue
             durably_acknowledged_receipt_ids.add(str(call_id))
-            if normalize_target_ui_transition(
-                {"target_ui_transition": receipt.get("target_ui_transition")}
-            ) is not None:
+            if (
+                normalize_target_ui_transition(
+                    {"target_ui_transition": receipt.get("target_ui_transition")}
+                )
+                is not None
+            ):
                 transition_effect_indices[str(call_id)] = effect_index
             try:
                 target_call_documents[str(call_id)] = json.loads(content)
@@ -3958,14 +4115,23 @@ class DurableAgentService:
         effect_loader = getattr(self._tools, "list_effects_for_attempt", None)
         if not callable(effect_loader):
             return None
-        loaded_effects: list[object] = []
-        for attempt_id in dict.fromkeys(attempt_ids):
-            loaded_effects.extend(await effect_loader(attempt_id))
-        effects = tuple(loaded_effects)
+        try:
+            effects = await _bounded_attempt_effects(effect_loader, attempt_ids)
+        except DurableEffectProjectionOverflow as error:
+            return (
+                None,
+                WorkerResult(
+                    task_id=assignment.id,
+                    status="quarantined",
+                    error=str(error),
+                    error_code="target_effect_reconciliation_overflow",
+                    retry_class=RetryClass.TERMINAL.value,
+                    infrastructure_failure_category="effect_reconciliation_required",
+                ),
+                None,
+            )
         worker_context = live.worker_contexts.get(assignment.id)
-        profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or live.profiles.get(
-            assignment.id
-        )
+        profile = CORE_PROFILES_BY_ID.get(assignment.profile_id) or live.profiles.get(assignment.id)
         if profile is None and worker_context is not None:
             profile = WorkerProfile(
                 assignment.profile_id,
@@ -3988,6 +4154,7 @@ class DurableAgentService:
         )
         target_effects: list[object] = []
         projected_effects: list[tuple[object, WorkerResult, str | None]] = []
+        resolved_nonmaterial_effects: list[tuple[object, WorkerResult, str | None]] = []
         for effect in effects:
             metadata = getattr(effect, "result_metadata", None)
             interaction_role = (
@@ -3999,9 +4166,99 @@ class DurableAgentService:
                 or interaction_role is None
                 and tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
             )
-            if getattr(effect, "effect", None) != "target_network" or not is_target_exchange:
+            expected_generic_effect = _expected_generic_browser_effect(tool_name)
+            is_generic_browser_effect = bool(
+                expected_generic_effect is not None
+                and not is_target_exchange
+                and interaction_role in {None, ToolInteractionRole.AUXILIARY.value}
+                and getattr(effect, "effect", None) == expected_generic_effect
+            )
+            if not (
+                is_target_exchange
+                and getattr(effect, "effect", None) == "target_network"
+                or is_generic_browser_effect
+            ):
                 continue
             target_effects.append(effect)
+            effect_state = str(getattr(effect, "state", ""))
+            generic_identity_valid = bool(
+                is_generic_browser_effect
+                and getattr(effect, "session_id", None) == live.session_id
+                and getattr(effect, "agent_id", None) == assignment.id
+                and str(getattr(effect, "attempt_id", "")) in set(attempt_ids)
+                and getattr(effect, "campaign_id", None)
+                == _campaign_id_for_assignment(assignment.id)
+                and getattr(effect, "target_id", None) == assignment.target_profile_id
+                and tool_name in assignment.tool_ids
+            )
+            if is_generic_browser_effect and effect_state in {"intent", "ambiguous"}:
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error=(
+                                "durable generic browser effect intent is unresolved and "
+                                "requires control-plane reconciliation"
+                                if generic_identity_valid
+                                else "durable generic browser effect intent lacks exact identity"
+                            ),
+                            error_code=(
+                                "target_effect_ambiguous"
+                                if generic_identity_valid
+                                else "target_effect_reconciliation_invalid"
+                            ),
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category=(
+                                "effect_reconciliation_required"
+                                if generic_identity_valid
+                                else "adapter_state_integrity"
+                            ),
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if is_generic_browser_effect and not generic_identity_valid:
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error="durable generic browser effect lacks exact identity",
+                            error_code="target_effect_reconciliation_invalid",
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category="adapter_state_integrity",
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if is_generic_browser_effect and (
+                not isinstance(metadata, Mapping) or "target_ui_transition" not in metadata
+            ):
+                projected_effects.append(
+                    (
+                        effect,
+                        WorkerResult(
+                            task_id=assignment.id,
+                            status="quarantined",
+                            error=(
+                                "durable generic browser effect completed without a transition "
+                                "receipt and requires control-plane reconciliation"
+                            ),
+                            error_code="target_effect_ambiguous",
+                            retry_class=RetryClass.TERMINAL.value,
+                            infrastructure_failure_category=(
+                                "effect_reconciliation_required"
+                            ),
+                        ),
+                        None,
+                    )
+                )
+                continue
             if not isinstance(metadata, Mapping) or "target_ui_transition" not in metadata:
                 continue
             if normalize_target_ui_transition(metadata) is None:
@@ -4081,7 +4338,18 @@ class DurableAgentService:
                     )
                 )
             else:
-                projected_effects.append((effect, *projected))
+                normalized_transition = normalize_target_ui_transition(metadata)
+                if (
+                    is_generic_browser_effect
+                    and normalized_transition is not None
+                    and normalized_transition["material"] is False
+                    and normalized_transition["reobservation_recommended"] is False
+                    and projected[0].status == "completed"
+                    and projected[0].error is None
+                ):
+                    resolved_nonmaterial_effects.append((effect, *projected))
+                else:
+                    projected_effects.append((effect, *projected))
         if len(projected_effects) > 1:
             return (
                 None,
@@ -4109,7 +4377,19 @@ class DurableAgentService:
                 ),
                 None,
             )
-        return projected_effects[0] if projected_effects else None
+        if projected_effects:
+            return projected_effects[0]
+        if (
+            resolved_nonmaterial_effects
+            and target_effects[-1] is resolved_nonmaterial_effects[-1][0]
+        ):
+            # Positive material=false evidence proves the latest generic effect
+            # settled on the reviewed surface. Commit it as a non-credit worker
+            # outcome rather than replaying it after the crash. Earlier
+            # unchanged fill/click receipts do not compete with a later material
+            # submit transition.
+            return resolved_nonmaterial_effects[-1]
+        return None
 
     async def _crashed_worker_outcome(
         self,
@@ -4960,17 +5240,42 @@ class DurableAgentService:
                     replacement_lineage = (
                         (lease.id,)
                         if lineage_loader is None
-                        else tuple(await self._call(lineage_loader, lease.id))
+                        else tuple(
+                            await self._call(
+                                lineage_loader,
+                                lease.id,
+                                limit=_DURABLE_EFFECT_LINEAGE_LIMIT + 1,
+                            )
+                        )
                     )
-                    inherited_transition = await self._material_transition_effect_outcome(
-                        live,
-                        assignment,
-                        tuple(
-                            attempt_id
-                            for attempt_id in replacement_lineage
-                            if str(attempt_id) != str(lease.id)
-                        ),
-                    )
+                    if len(replacement_lineage) > _DURABLE_EFFECT_LINEAGE_LIMIT:
+                        inherited_transition = (
+                            None,
+                            WorkerResult(
+                                task_id=assignment.id,
+                                status="quarantined",
+                                error=(
+                                    "durable effect replacement lineage exceeds the recovery "
+                                    "bound"
+                                ),
+                                error_code="target_effect_reconciliation_overflow",
+                                retry_class=RetryClass.TERMINAL.value,
+                                infrastructure_failure_category=(
+                                    "effect_reconciliation_required"
+                                ),
+                            ),
+                            None,
+                        )
+                    else:
+                        inherited_transition = await self._material_transition_effect_outcome(
+                            live,
+                            assignment,
+                            tuple(
+                                attempt_id
+                                for attempt_id in replacement_lineage
+                                if str(attempt_id) != str(lease.id)
+                            ),
+                        )
                     if inherited_transition is not None:
                         effect, transition_result, inherited_technique_attempt_id = (
                             inherited_transition
@@ -7639,9 +7944,7 @@ def _ordered_checkpoint_tool_pairs(
             group_tools: dict[str, str] = {}
             for raw_call in raw_calls:
                 call_id = raw_call.get("id") if isinstance(raw_call, Mapping) else None
-                function = (
-                    raw_call.get("function") if isinstance(raw_call, Mapping) else None
-                )
+                function = raw_call.get("function") if isinstance(raw_call, Mapping) else None
                 tool_name = function.get("name") if isinstance(function, Mapping) else None
                 if not isinstance(call_id, str) or not call_id:
                     continue
@@ -7688,11 +7991,7 @@ def _ordered_checkpoint_tool_pairs(
             active_index = -1
     if active_pending:
         invalidate_active()
-    return {
-        call_id: pair
-        for call_id, pair in ordered.items()
-        if call_id not in ambiguous
-    }
+    return {call_id: pair for call_id, pair in ordered.items() if call_id not in ambiguous}
 
 
 def _effect_receipt_counters_match(
@@ -7905,6 +8204,16 @@ def _validated_target_evidence_receipts(
                 continue
             seen_call_ids.add(call_id)
         body = {key: value for key, value in item.items() if key != "receipt_sha256"}
+        raw_transition = item.get("target_ui_transition")
+        tool_name = item.get("tool_name")
+        generic_transition_receipt = bool(
+            tool_name in _GENERIC_BROWSER_EFFECT_TOOLS
+            and raw_transition is not None
+            and item.get("generic_browser_effect") is True
+        )
+        typed_target_exchange_receipt = (
+            item.get("interaction_role") == ToolInteractionRole.TARGET_EXCHANGE.value
+        )
         hashes = (
             item.get("request_sha256"),
             item.get("content_sha256"),
@@ -7915,7 +8224,11 @@ def _validated_target_evidence_receipts(
             not isinstance(call_id, str)
             or not call_id
             or item.get("reference") != f"target-call:{call_id}"
-            or item.get("tool_name") not in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+            or (
+                tool_name not in LEGACY_TARGET_EXCHANGE_TOOL_IDS
+                and not generic_transition_receipt
+                and not typed_target_exchange_receipt
+            )
             or item.get("assignment_id") != task.id
             or item.get("campaign_id") != expected_campaign_id
             or not isinstance(item.get("attempt_id"), str)
@@ -7936,12 +8249,10 @@ def _validated_target_evidence_receipts(
             and request_hashes[call_id] != item.get("request_sha256")
         ):
             continue
-        raw_transition = item.get("target_ui_transition")
         if raw_transition is not None:
-            verbatim_content_matches = (
-                content_hashes.get(call_id) == item.get("content_sha256")
-                and content_bytes.get(call_id) == item.get("content_bytes")
-            )
+            verbatim_content_matches = content_hashes.get(call_id) == item.get(
+                "content_sha256"
+            ) and content_bytes.get(call_id) == item.get("content_bytes")
             compacted_content_matches = (
                 compacted_content_hashes is not None
                 and compacted_content_bytes is not None
@@ -7964,6 +8275,14 @@ def _validated_target_evidence_receipts(
     }
 
 
+def _expected_generic_browser_effect(tool_name: object) -> str | None:
+    if tool_name in _GENERIC_BROWSER_MUTATION_TOOLS:
+        return "target_network"
+    if tool_name in _GENERIC_BROWSER_NAVIGATION_TOOLS:
+        return "target_read"
+    return None
+
+
 def _material_transition_effect_result(
     handoff: WorkerHandoff,
     effect: object,
@@ -7980,9 +8299,7 @@ def _material_transition_effect_result(
     if not isinstance(metadata, Mapping):
         return None
     raw_transition = metadata.get("target_ui_transition")
-    transition = normalize_target_ui_transition(
-        {"target_ui_transition": raw_transition}
-    )
+    transition = normalize_target_ui_transition({"target_ui_transition": raw_transition})
     if transition is None:
         return None
     interaction_role = metadata.get("interaction_role")
@@ -7990,7 +8307,18 @@ def _material_transition_effect_result(
     is_target_exchange = interaction_role == ToolInteractionRole.TARGET_EXCHANGE.value or (
         interaction_role is None and tool_name in LEGACY_TARGET_EXCHANGE_TOOL_IDS
     )
-    if getattr(effect, "effect", None) != "target_network" or not is_target_exchange:
+    expected_generic_effect = _expected_generic_browser_effect(tool_name)
+    is_generic_browser_effect = bool(
+        expected_generic_effect is not None
+        and not is_target_exchange
+        and interaction_role in {None, ToolInteractionRole.AUXILIARY.value}
+        and getattr(effect, "effect", None) == expected_generic_effect
+    )
+    if not (
+        is_target_exchange
+        and getattr(effect, "effect", None) == "target_network"
+        or is_generic_browser_effect
+    ):
         return None
 
     content = getattr(effect, "result_content", None)
@@ -8001,6 +8329,9 @@ def _material_transition_effect_result(
     assignment = handoff.assignment
     attempt_id = str(handoff.attempt_id or "")
     expected_campaign_id = _campaign_id_for_assignment(assignment.id)
+    sealed_compiled_adapter_digest = dict(assignment.strategy_contract).get(
+        "compiled_adapter_digest"
+    )
     binding_valid = bool(
         str(getattr(effect, "state", "")) in {"acknowledged", "reconciled"}
         and getattr(effect, "session_id", None) == handoff.session_id
@@ -8018,6 +8349,15 @@ def _material_transition_effect_result(
         and type(is_error) is bool
         and isinstance(target_session_id, str)
         and bool(target_session_id.strip())
+        and (
+            not is_generic_browser_effect
+            or isinstance(sealed_compiled_adapter_digest, str)
+            and metadata.get("compiled_adapter_digest") == sealed_compiled_adapter_digest
+            and metadata.get("campaign_id") == expected_campaign_id
+            and metadata.get("target_profile_id") == assignment.target_profile_id
+            and metadata.get("target_effect_attempted") is True
+            and metadata.get("target_call_budget_charge") == 1
+        )
     )
     if not binding_valid:
         return (
@@ -8058,10 +8398,25 @@ def _material_transition_effect_result(
         and receipt.get("limit_interaction_count") == 0
         and receipt.get("target_call_budget_charge") == 0
     )
+    generic_disposition_valid = bool(
+        is_generic_browser_effect
+        and receipt.get("generic_browser_effect") is True
+        and receipt.get("generic_browser_effect_class") == expected_generic_effect
+        and receipt.get("compiled_adapter_digest") == sealed_compiled_adapter_digest
+        and receipt.get("target_effect_attempted") is True
+        and receipt.get("interaction_count") == 0
+        and receipt.get("limit_interaction_count") == 0
+        and receipt.get("target_call_budget_charge") == 1
+    )
     disposition_valid = bool(
-        is_error is False and receipt.get("acknowledged") is True
-        or is_error is True
-        and (metadata.get("target_effect_attempted") is True or strict_pre_effect)
+        generic_disposition_valid
+        or not is_generic_browser_effect
+        and (
+            is_error is False
+            and receipt.get("acknowledged") is True
+            or is_error is True
+            and (metadata.get("target_effect_attempted") is True or strict_pre_effect)
+        )
     )
     if not disposition_valid:
         return (
@@ -8116,7 +8471,7 @@ def _material_transition_effect_result(
             content=content,
             structured=(
                 None
-                if is_error
+                if is_error or is_generic_browser_effect
                 else {"attempted_techniques": list(assignment.technique_ids)}
             ),
             error=(

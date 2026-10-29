@@ -594,6 +594,27 @@ def test_uncommitted_forged_or_noncompleted_claims_stay_inconclusive(
     assert result.outcome is ProbeOutcome.INCONCLUSIVE
 
 
+def test_durable_effect_projection_overflow_keeps_capability_probe_inconclusive() -> None:
+    probe = plan_capability_probes().probes[0]
+    report = _report(probe.id, evidence_ids=["call-1"])
+    committed = {
+        **_receipt("call-1"),
+        "durable_effect_projection_error": {
+            "schema": "merlin.durable-effect-projection-error.v1",
+            "code": "effect_history_overflow",
+            "retryable": False,
+        },
+    }
+
+    result = probe_result_from_committed_receipt(
+        probe,
+        _task(probe.id, report),
+        committed,
+    )
+
+    assert result.outcome is ProbeOutcome.INCONCLUSIVE
+
+
 def test_committed_unavailable_transport_report_stays_explicit() -> None:
     probe = plan_capability_probes().probes[0]
     report = _report(

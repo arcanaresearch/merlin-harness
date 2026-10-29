@@ -696,6 +696,62 @@ def test_pg0_retry_lineage_survives_postgres_restart(tmp_path: Path) -> None:
     assert attempts[1]["replaced_attempt_id"] == first.id
 
 
+def test_pg0_replacement_lineage_is_exactly_bounded_and_cycle_safe(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-lineage-bounds")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("bounded retry lineage")
+            store = DurableSchedulerStore(connection)
+            schedule_id = store.create_schedule(
+                session.id,
+                {"nodes": ["worker"]},
+                {},
+                ["worker"],
+                ready_nodes=["worker"],
+            )
+            attempts = []
+            for generation in range(33):
+                attempt = store.claim(
+                    schedule_id,
+                    "worker",
+                    f"agent-{generation}",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                )
+                attempts.append(attempt)
+                if generation == 32:
+                    break
+                store.settle_attempt(
+                    attempt.id,
+                    attempt.generation,
+                    "failed",
+                    reason="bounded lineage fixture",
+                    checkpoint={"worker": "failed"},
+                )
+                event_count = store.load_schedule(schedule_id)["event_count"]
+                store.retry_failed(
+                    schedule_id,
+                    "worker",
+                    checkpoint={"worker": "ready"},
+                    expected_event_count=event_count,
+                )
+
+            latest = attempts[-1]
+            assert store.replacement_attempt_lineage(latest.id, limit=32) == tuple(
+                attempt.id for attempt in attempts[-32:]
+            )
+            assert store.replacement_attempt_lineage(latest.id, limit=33) == tuple(
+                attempt.id for attempt in attempts
+            )
+
+            connection.execute(
+                """UPDATE merlin_storage.scheduler_attempts
+                   SET replaced_attempt_id = %s WHERE id = %s""",
+                (latest.id, attempts[0].id),
+            )
+            with pytest.raises(ValueError, match="lineage contains a cycle"):
+                store.replacement_attempt_lineage(latest.id)
+
+
 @pytest.mark.asyncio
 async def test_pg0_replacement_result_resolves_persisted_ancestor_evidence_after_reopen(
     tmp_path: Path,

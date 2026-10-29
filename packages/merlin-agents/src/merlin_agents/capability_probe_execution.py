@@ -722,6 +722,11 @@ def _validated_receipt(
 ):
     if committed is None:
         return None
+    if committed.get("durable_effect_projection_error") is not None:
+        # A bounded projection overflow cannot prove which durable target
+        # effects belong to this result.  Preserve it as an inconclusive probe
+        # instead of interpreting missing effects as a negative capability.
+        return None
     digest = committed.get("digest")
     reference = committed.get("reference")
     target_call_ids = _string_sequence(committed.get("target_call_ids"))

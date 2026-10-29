@@ -229,6 +229,13 @@ def extract_target_reobservation_obligations(
                         continue
                 else:
                     attempted = receipt.get("target_effect_attempted")
+                    generic_browser_transition = bool(
+                        receipt.get("generic_browser_effect") is True
+                        and isinstance(receipt.get("compiled_adapter_digest"), str)
+                        and _DIGEST.fullmatch(str(receipt["compiled_adapter_digest"])) is not None
+                        and receipt.get("generic_browser_effect_class")
+                        in {"target_network", "target_read"}
+                    )
                     strict_zero_effect = attempted is False and all(
                         type(receipt.get(name)) is int and receipt.get(name) == 0
                         for name in (
@@ -237,9 +244,20 @@ def extract_target_reobservation_obligations(
                             "target_call_budget_charge",
                         )
                     )
-                    if receipt.get("is_error") is not True or not (
-                        attempted is True or strict_zero_effect
-                    ):
+                    generic_effect_valid = bool(
+                        generic_browser_transition
+                        and type(receipt.get("is_error")) is bool
+                        and attempted is True
+                        and receipt.get("interaction_count") == 0
+                        and receipt.get("limit_interaction_count") == 0
+                        and receipt.get("target_call_budget_charge") == 1
+                    )
+                    legacy_error_valid = bool(
+                        not generic_browser_transition
+                        and receipt.get("is_error") is True
+                        and (attempted is True or strict_zero_effect)
+                    )
+                    if not (generic_effect_valid or legacy_error_valid):
                         continue
                 normalized = normalize_target_ui_transition(receipt.get("target_ui_transition"))
                 if normalized is None:

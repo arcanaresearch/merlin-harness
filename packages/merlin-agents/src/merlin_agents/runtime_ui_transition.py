@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -16,6 +18,28 @@ _STATE_ROLES = {
     "custom",
 }
 _STATE_BOUNDARIES = {"stage", "success", "failure"}
+_UNCHANGED_TRANSITION_FIELDS = {
+    "schema",
+    "material",
+    "adapter_stale",
+    "before_digest",
+    "after_digest",
+    "transition_digest",
+    "changed_dimensions",
+    "url_change",
+    "title_change",
+    "frame_change",
+    "observation_kind_change",
+    "added_controls",
+    "removed_controls",
+    "controls_truncated",
+    "reviewed_state_changes",
+    "state_changes_truncated",
+    "reviewed_control_state_changes",
+    "added_visible_text",
+    "evidence_refs",
+    "reobservation_recommended",
+}
 
 
 def _items(value: object, limit: int) -> tuple[object, ...]:
@@ -109,21 +133,84 @@ def _state_change(value: object) -> dict[str, object] | None:
     }
 
 
+def _exact_unchanged_proof(
+    raw: Mapping[str, object],
+    *,
+    before_digest: str,
+    after_digest: str,
+) -> bool:
+    """Accept only the bounded, contradiction-free receipt emitted by BrowserTool."""
+
+    if set(raw) != _UNCHANGED_TRANSITION_FIELDS:
+        return False
+    empty_list_fields = (
+        "changed_dimensions",
+        "added_controls",
+        "removed_controls",
+        "reviewed_state_changes",
+        "reviewed_control_state_changes",
+        "added_visible_text",
+    )
+    if any(type(raw.get(key)) is not list or raw.get(key) for key in empty_list_fields):
+        return False
+    if any(
+        raw.get(key) is not None
+        for key in ("url_change", "title_change", "frame_change", "observation_kind_change")
+    ):
+        return False
+    if (
+        raw.get("controls_truncated") is not False
+        or raw.get("state_changes_truncated") is not False
+    ):
+        return False
+    evidence_refs = raw.get("evidence_refs")
+    if (
+        type(evidence_refs) is not list
+        or not 1 <= len(evidence_refs) <= 8
+        or any(
+            not isinstance(item, str) or not item or len(item) > 256
+            for item in evidence_refs
+        )
+    ):
+        return False
+    encoded = json.dumps(
+        [before_digest, after_digest], sort_keys=True, separators=(",", ":")
+    ).encode()
+    expected_transition_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return raw.get("transition_digest") == expected_transition_digest
+
+
 def normalize_target_ui_transition(
     metadata: Mapping[str, object],
 ) -> dict[str, object] | None:
     raw = metadata.get("target_ui_transition")
-    if not isinstance(raw, Mapping) or (
-        raw.get("schema") != _TRANSITION_SCHEMA
-        or raw.get("material") is not True
-        or raw.get("reobservation_recommended") is not True
-        or type(raw.get("adapter_stale")) is not bool
-    ):
+    if not isinstance(raw, Mapping) or raw.get("schema") != _TRANSITION_SCHEMA:
+        return None
+    material = raw.get("material")
+    reobservation_recommended = raw.get("reobservation_recommended")
+    adapter_stale = raw.get("adapter_stale")
+    material_barrier = bool(
+        material is True
+        and reobservation_recommended is True
+        and type(adapter_stale) is bool
+    )
+    unchanged_proof = bool(
+        material is False
+        and reobservation_recommended is False
+        and adapter_stale is False
+    )
+    if not material_barrier and not unchanged_proof:
         return None
     before, after = raw.get("before_digest"), raw.get("after_digest")
     if not all(isinstance(item, str) and _DIGEST.fullmatch(item) for item in (before, after)):
         return None
-    if before == after:
+    if material_barrier and before == after or unchanged_proof and before != after:
+        return None
+    if unchanged_proof and not _exact_unchanged_proof(
+        raw,
+        before_digest=before,
+        after_digest=after,
+    ):
         return None
 
     def strings(key: str, count: int, length: int) -> list[str]:
@@ -159,18 +246,54 @@ def normalize_target_ui_transition(
     ):
         return None
 
+    added_controls = controls("added_controls")
+    removed_controls = controls("removed_controls")
+    if unchanged_proof and (
+        changed_dimensions
+        or added_controls
+        or removed_controls
+        or reviewed_state_changes
+        or raw_title_change is not None
+        or raw.get("controls_truncated") is True
+        or raw.get("state_changes_truncated") is True
+    ):
+        return None
+    if unchanged_proof:
+        return {
+            "schema": _TRANSITION_SCHEMA,
+            "material": False,
+            "adapter_stale": False,
+            "before_digest": before,
+            "after_digest": after,
+            "transition_digest": raw["transition_digest"],
+            "changed_dimensions": [],
+            "url_change": None,
+            "title_change": None,
+            "frame_change": None,
+            "observation_kind_change": None,
+            "added_controls": [],
+            "removed_controls": [],
+            "controls_truncated": False,
+            "reviewed_state_changes": [],
+            "state_changes_truncated": False,
+            "reviewed_control_state_changes": [],
+            "added_visible_text": [],
+            "evidence_refs": strings("evidence_refs", 8, 256),
+            "reobservation_recommended": False,
+        }
+
     normalized: dict[str, object] = {
         "schema": _TRANSITION_SCHEMA,
-        "material": True,
-        "adapter_stale": raw["adapter_stale"],
+        "material": material,
+        "adapter_stale": adapter_stale,
         "before_digest": before,
         "after_digest": after,
         "changed_dimensions": changed_dimensions,
-        "added_controls": controls("added_controls"),
-        "removed_controls": controls("removed_controls"),
+        "added_controls": added_controls,
+        "removed_controls": removed_controls,
         "controls_truncated": raw.get("controls_truncated") is True,
         "evidence_refs": strings("evidence_refs", 8, 256),
-        "reobservation_recommended": True,
+        "reobservation_recommended": reobservation_recommended,
     }
     if reviewed_state_changes:
         normalized["reviewed_state_changes"] = [

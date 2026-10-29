@@ -765,19 +765,29 @@ class DurableSchedulerStore:
         ]
 
     @_serialized
-    def replacement_attempt_lineage(self, attempt_id: str) -> tuple[str, ...]:
+    def replacement_attempt_lineage(
+        self, attempt_id: str, *, limit: int | None = None
+    ) -> tuple[str, ...]:
+        bounded_limit = max(1, limit) if limit is not None else None
         rows = self.connection.execute(
             """WITH RECURSIVE lineage AS (
-                   SELECT id, replaced_attempt_id, 0 AS depth
+                   SELECT id, replaced_attempt_id, 0 AS depth,
+                          ARRAY[id] AS visited, FALSE AS cycle
                    FROM merlin_storage.scheduler_attempts WHERE id = %s
                    UNION ALL
-                   SELECT prior.id, prior.replaced_attempt_id, lineage.depth + 1
+                   SELECT prior.id, prior.replaced_attempt_id, lineage.depth + 1,
+                          lineage.visited || prior.id,
+                          prior.id = ANY(lineage.visited) AS cycle
                    FROM merlin_storage.scheduler_attempts prior
                    JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                   WHERE NOT lineage.cycle
+                     AND (%s::integer IS NULL OR lineage.depth + 1 < %s::integer)
                )
-               SELECT id FROM lineage ORDER BY depth DESC""",
-            (attempt_id,),
+               SELECT id, cycle FROM lineage ORDER BY depth DESC""",
+            (attempt_id, bounded_limit, bounded_limit),
         ).fetchall()
+        if any(bool(row["cycle"]) for row in rows):
+            raise ValueError("replacement attempt lineage contains a cycle")
         values = tuple(str(row["id"]) for row in rows)
         if not values or values[-1] != attempt_id:
             raise KeyError(attempt_id)

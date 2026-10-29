@@ -2864,9 +2864,7 @@ async def test_target_inject_session_is_checkpointed() -> None:
             [TextDelta(text='{"finding":"ok"}'), ModelCompleted(finish_reason="stop")],
         ]
     )
-    reviewed = reviewed_handoff(
-        interface="http_api", tools=("target_request", "target_inject")
-    )
+    reviewed = reviewed_handoff(interface="http_api", tools=("target_request", "target_inject"))
 
     result = await WorkerRuntime(provider, TargetInjectTools(effect="target_network")).run(reviewed)
 
@@ -3006,7 +3004,7 @@ async def test_delivery_session_drift_quarantines_buffered_worker() -> None:
         handoff(tools=("target_request",))
     )
 
-    assert result.status == "quarantined"
+    assert result.status == "quarantined", result.error
     assert result.error_code == "target_adapter_unhealthy"
     assert "conflicting target session identities" in str(result.error)
 
@@ -3612,9 +3610,7 @@ async def test_visual_evidence_is_included_once_then_persists_as_text_manifest(t
     )
     tools = VisualTools()
 
-    result = await WorkerRuntime(provider, tools).run(
-        handoff(tools=("browser_snapshot", "read"))
-    )
+    result = await WorkerRuntime(provider, tools).run(handoff(tools=("browser_snapshot", "read")))
 
     assert result.status == "completed"
     assert [
@@ -3700,9 +3696,7 @@ async def test_visual_evidence_context_keeps_prioritized_content_image(tmp_path)
         context_window_tokens=131_072,
     )
 
-    result = await WorkerRuntime(provider, VisualTools()).run(
-        handoff(tools=("browser_snapshot",))
-    )
+    result = await WorkerRuntime(provider, VisualTools()).run(handoff(tools=("browser_snapshot",)))
 
     assert result.status == "completed"
     visual_attachments = [
@@ -4067,9 +4061,7 @@ async def test_visual_checkpoint_restart_cannot_resend_file_attachment(tmp_path)
 
     assert result.status == "completed"
     assert not any(
-        message.image_attachments
-        for request in restored.requests
-        for message in request.messages
+        message.image_attachments for request in restored.requests for message in request.messages
     )
 
 
@@ -11893,6 +11885,80 @@ async def test_post_effect_error_transition_is_not_reclassified_as_pre_effect() 
     assert evidence["target_ui_transition_receipts"] == {}
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_incomplete_compiled_response_stops_without_fabricating_exchange(
+    dynamic: bool,
+) -> None:
+    reviewed = _browser_surface_handoff(attempt_id="attempt-incomplete-compiled-response")
+    first = ToolCall(
+        call_id="incomplete-compiled-response",
+        name="browser_chat_exchange",
+        arguments={"prompt": "authorized submit with delayed response"},
+    )
+    forbidden = ToolCall(
+        call_id="incomplete-response-forbidden",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must wait for passive re-observation"},
+    )
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+                self.reached_forbidden = False
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(first)
+                self.reached_forbidden = True
+                await handler(forbidden)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [forbidden, ModelCompleted(finish_reason="tool_calls")],
+            ]
+        )
+    tools = BrowserIncompleteResponseTools()
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert result.status == "failed"
+    assert result.error_code == "target_surface_disrupted"
+    assert result.retry_class == "terminal"
+    assert tools.calls == ["browser_chat_exchange"]
+    assert len(provider.requests) == 1
+    if dynamic:
+        assert provider.reached_forbidden is False
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["interaction_count"] == 0
+    assert receipt["limit_interaction_count"] == 1
+    assert receipt["target_call_budget_charge"] == 1
+    assert receipt["target_ui_transition"] == _unknown_after_browser_effect_transition()
+
+    replacement_provider = Provider(
+        [[forbidden, ModelCompleted(finish_reason="tool_calls")]]
+    )
+    replacement_tools = BrowserIncompleteResponseTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=result.checkpoint,
+    )
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -11930,9 +11996,7 @@ async def test_restored_surface_transition_requires_exact_transcript(mutation: s
         messages[tool_index]["content"] = "tampered response"
     elif mutation == "arguments":
         raw_call = next(
-            call
-            for call in messages[assistant_index]["tool_calls"]
-            if call.get("id") == call_id
+            call for call in messages[assistant_index]["tool_calls"] if call.get("id") == call_id
         )
         raw_call["function"]["arguments"] = json.dumps({"prompt": "tampered request"})
     elif mutation == "order":
@@ -11995,9 +12059,7 @@ async def test_restored_surface_transition_requires_exact_transcript(mutation: s
 
 async def test_restored_surface_transition_accepts_bound_elided_tool_result() -> None:
     reviewed = _browser_surface_handoff(attempt_id="attempt-elided-surface-transition")
-    embedded_marker = (
-        f"[durable checkpoint elided 9 characters; sha256:{'f' * 64}; bytes:99]"
-    )
+    embedded_marker = f"[durable checkpoint elided 9 characters; sha256:{'f' * 64}; bytes:99]"
     long_content = embedded_marker + "\nreviewed target surface changed\n" + "x" * 24_000
     call = ToolCall(
         call_id="elided-surface-transition",
@@ -12124,20 +12186,20 @@ async def test_material_transition_replay_retains_restore_barrier(
     class ReplayedTransitionTools(BrowserMaterialTransitionTools):
         async def invoke(self, name, context, arguments):
             result = await super().invoke(name, context, arguments)
-            return result.model_copy(
-                update={"metadata": result.metadata | {replay_marker: True}}
-            )
+            return result.model_copy(update={"metadata": result.metadata | {replay_marker: True}})
 
     initial = await WorkerRuntime(
         Provider(
-            [[
-                ToolCall(
-                    call_id=f"transition-{replay_marker}",
-                    name="browser_chat_exchange",
-                    arguments={"prompt": "adopt acknowledged transition"},
-                ),
-                ModelCompleted(finish_reason="tool_calls"),
-            ]]
+            [
+                [
+                    ToolCall(
+                        call_id=f"transition-{replay_marker}",
+                        name="browser_chat_exchange",
+                        arguments={"prompt": "adopt acknowledged transition"},
+                    ),
+                    ModelCompleted(finish_reason="tool_calls"),
+                ]
+            ]
         ),
         ReplayedTransitionTools(),
     ).run(reviewed)
@@ -12256,6 +12318,51 @@ def _successful_stage_boundary_transition() -> dict[str, object]:
     }
 
 
+def _unknown_after_browser_effect_transition() -> dict[str, object]:
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": _test_digest("level-one-state"),
+        "after_digest": _test_digest("unknown-after-acknowledged-effect"),
+        "changed_dimensions": ["after_state_unavailable"],
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "evidence_refs": ["browser:level-one-state", "browser:generic-click"],
+        "reobservation_recommended": True,
+    }
+
+
+def _unchanged_browser_effect_transition() -> dict[str, object]:
+    digest = _test_digest("unchanged-reviewed-surface")
+    transition_digest = "sha256:" + hashlib.sha256(
+        json.dumps([digest, digest], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": False,
+        "adapter_stale": False,
+        "before_digest": digest,
+        "after_digest": digest,
+        "transition_digest": transition_digest,
+        "changed_dimensions": [],
+        "url_change": None,
+        "title_change": None,
+        "frame_change": None,
+        "observation_kind_change": None,
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "reviewed_control_state_changes": [],
+        "added_visible_text": [],
+        "evidence_refs": ["browser:unchanged-reviewed-surface"],
+        "reobservation_recommended": False,
+    }
+
+
 def _with_successful_material_transition(result: ToolResult) -> ToolResult:
     return result.model_copy(
         update={
@@ -12273,16 +12380,12 @@ def _with_successful_material_transition(result: ToolResult) -> ToolResult:
 
 class ApiMaterialTransitionTools(GoatTargetTools):
     async def invoke(self, name, context, arguments):
-        return _with_successful_material_transition(
-            await super().invoke(name, context, arguments)
-        )
+        return _with_successful_material_transition(await super().invoke(name, context, arguments))
 
 
 class BrowserMaterialTransitionTools(BrowserGoatTargetTools):
     async def invoke(self, name, context, arguments):
-        return _with_successful_material_transition(
-            await super().invoke(name, context, arguments)
-        )
+        return _with_successful_material_transition(await super().invoke(name, context, arguments))
 
 
 class BrowserStageBoundaryTools(BrowserGoatTargetTools):
@@ -12299,6 +12402,190 @@ class BrowserStageBoundaryTools(BrowserGoatTargetTools):
                     "target_ui_transition": _successful_stage_boundary_transition(),
                 },
             }
+        )
+
+
+def _generic_browser_transition_handoff() -> WorkerHandoff:
+    adapter = {
+        "interface": "browser",
+        "endpoint": "https://plunder.me/chat",
+        "authentication": "reviewed browser session",
+        "observed_evidence": ["evidence:before", "evidence:after"],
+        "browser_steps": [
+            {
+                "step_id": "fill",
+                "tool": "browser_fill",
+                "arguments": {"locator": "textbox Message"},
+            },
+            {
+                "step_id": "submit",
+                "tool": "browser_click",
+                "arguments": {"locator": "button Send"},
+            },
+        ],
+        "interaction_contract": {
+            "input_locator": "textbox Message",
+            "submit_action": "button Send",
+            "authenticated_session_constraints": "one reviewed browser session",
+            "probe": {
+                "message": "harmless probe",
+                "objective_relevance": "establishes the reviewed surface",
+                "sent_message_witness": "message rendered",
+                "response_witness": "assistant response",
+            },
+            "lifecycle": {
+                "current_state": "active chat",
+                "terminal_indicator": "not observed",
+                "resume_action": "same page",
+                "rating_action": "not exposed",
+                "new_session_action": "not used",
+                "cleanup_action": "release actor",
+            },
+            "success_indicator": "assistant response rendered",
+            "evidence_refs": ["evidence:before", "evidence:after"],
+        },
+    }
+    compilation = compile_target_adapter(adapter)
+    base = reviewed_handoff(
+        interface="browser",
+        tools=(
+            "browser_click",
+            "browser_navigate",
+            "browser_open_tab",
+            "browser_chat_exchange",
+        ),
+    )
+    assignment = replace(
+        base.assignment,
+        id="campaign/generic-transition/worker-1",
+        strategy_contract=(
+            ("compiled_adapter", compilation.model_dump_json()),
+            ("compiled_adapter_digest", compiled_target_adapter_digest(compilation)),
+        ),
+    )
+    assert base.worker_context is not None
+    return replace(
+        base,
+        attempt_id="attempt-generic-transition",
+        assignment=assignment,
+        worker_context=replace(
+            base.worker_context,
+            assignment_id=assignment.id,
+            tool_ids=assignment.tool_ids,
+        ),
+    )
+
+
+class GenericBrowserTransitionTools(Tools):
+    def __init__(
+        self,
+        *,
+        capture_failure: bool = False,
+        failure_code: str = "post_effect_state_capture_failed",
+        omit_transition: bool = False,
+        metadata_mutation: tuple[str, object] | None = None,
+    ) -> None:
+        super().__init__(effect="target_network")
+        self.capture_failure = capture_failure
+        self.failure_code = failure_code
+        self.omit_transition = omit_transition
+        self.metadata_mutation = metadata_mutation
+
+    def describe(self):
+        return tuple(
+            ToolSpec(name=name, description=name, input_schema={"type": "object"})
+            for name in (
+                "browser_click",
+                "browser_navigate",
+                "browser_open_tab",
+                "browser_chat_exchange",
+            )
+        )
+
+    async def invoke(self, name, context, arguments):
+        del arguments
+        self.calls.append(name)
+        if name == "browser_chat_exchange":
+            raise AssertionError("next target call must wait for passive re-observation")
+        assert name in {"browser_click", "browser_navigate", "browser_open_tab"}
+        metadata = {
+            "effect": (
+                "target_read"
+                if name in {"browser_navigate", "browser_open_tab"}
+                else "target_network"
+            ),
+            "campaign_id": context.campaign_id,
+            "target_profile_id": context.target_id,
+            "compiled_adapter_digest": context.compiled_adapter_digest,
+            "target_effect_attempted": True,
+            "target_call_budget_charge": 1,
+            "target_session_id": "browser:context-1",
+            **({"failure_code": self.failure_code} if self.capture_failure else {}),
+        }
+        if not self.omit_transition:
+            metadata["target_ui_transition"] = (
+                _unknown_after_browser_effect_transition()
+                if self.capture_failure
+                else _successful_stage_boundary_transition()
+            )
+        result = ToolResult(
+            content=(
+                "browser_state_capture_failed: post-effect frame detached"
+                if self.capture_failure
+                else "The reviewed target advanced to level 2."
+            ),
+            is_error=self.capture_failure,
+            metadata=metadata,
+        )
+        if self.metadata_mutation is None:
+            return result
+        field, value = self.metadata_mutation
+        return result.model_copy(update={"metadata": {**result.metadata, field: value}})
+
+
+class GenericBrowserAmbiguousIntentTools(GenericBrowserTransitionTools):
+    async def invoke(self, name, context, arguments):
+        del context, arguments
+        self.calls.append(name)
+        return ToolResult(
+            content="tool effect is unresolved; reconcile it before retrying",
+            is_error=True,
+            metadata={
+                "effect_ambiguous": True,
+                "idempotency_key": "generic-browser-unresolved-intent",
+            },
+        )
+
+
+class GenericBrowserNoTransitionTools(Tools):
+    def __init__(self) -> None:
+        super().__init__(effect="target_network")
+
+    def describe(self):
+        return (
+            ToolSpec(
+                name="browser_click",
+                description="Generic browser click",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    async def invoke(self, name, context, arguments):
+        del arguments
+        assert name == "browser_click"
+        self.calls.append(name)
+        return ToolResult(
+            content="The generic browser effect completed without an immediate UI transition.",
+            metadata={
+                "effect": "target_network",
+                "campaign_id": context.campaign_id,
+                "target_profile_id": context.target_id,
+                "compiled_adapter_digest": context.compiled_adapter_digest,
+                "target_effect_attempted": True,
+                "target_call_budget_charge": 1,
+                "target_session_id": "browser:context-1",
+                "target_ui_transition": _unchanged_browser_effect_transition(),
+            },
         )
 
 
@@ -12338,6 +12625,27 @@ class BrowserAttemptedTransitionTools(Tools):
             },
         )
 
+
+class BrowserIncompleteResponseTools(BrowserAttemptedTransitionTools):
+    async def invoke(self, name, context, arguments):
+        del context, arguments
+        assert name == "browser_chat_exchange"
+        self.calls.append(name)
+        return ToolResult(
+            content=(
+                "compiled_browser_response_incomplete: passive re-observation is required"
+            ),
+            is_error=True,
+            metadata={
+                "target_effect_attempted": True,
+                "target_call_budget_charge": 1,
+                "limit_interaction_count": 1,
+                "target_session_id": "browser:context-1",
+                "response_boundary_complete": False,
+                "attempt_disposition": "uncertain",
+                "target_ui_transition": _unknown_after_browser_effect_transition(),
+            },
+        )
 
 def _assert_successful_transition_receipt(result, call_id: str) -> Mapping[str, object]:
     assert result.status == "completed", result.error
@@ -12408,9 +12716,7 @@ async def test_successful_material_transition_stops_direct_worker_and_restarts_a
         assert provider.reached_second_call is False
     _assert_successful_transition_receipt(result, "material-success")
 
-    replacement_provider = Provider(
-        [[second, ModelCompleted(finish_reason="tool_calls")]]
-    )
+    replacement_provider = Provider([[second, ModelCompleted(finish_reason="tool_calls")]])
     replacement_tools = BrowserMaterialTransitionTools()
     restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
         reviewed,
@@ -12481,6 +12787,524 @@ async def test_reviewed_stage_boundary_stops_before_same_controls_can_attack_nex
     assert receipt["target_ui_transition"] == _successful_stage_boundary_transition()
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    ("capture_failure", "failure_code"),
+    (
+        (False, ""),
+        (True, "post_effect_state_capture_failed"),
+        (True, "post_effect_recording_failed"),
+    ),
+    ids=("observed", "capture-failed", "recording-failed"),
+)
+@pytest.mark.parametrize(
+    "transition_tool",
+    ["browser_click", "browser_navigate", "browser_open_tab"],
+)
+async def test_generic_browser_transition_stops_before_next_provider_or_target_call(
+    dynamic: bool,
+    capture_failure: bool,
+    failure_code: str,
+    transition_tool: str,
+) -> None:
+    first = ToolCall(
+        call_id="generic-stage-boundary",
+        name=transition_tool,
+        arguments=(
+            {"url": "https://plunder.me/next"}
+            if transition_tool == "browser_open_tab"
+            else {"tab_ref": "tab:1", "url": "https://plunder.me/next"}
+            if transition_tool == "browser_navigate"
+            else {"tab_ref": "tab:1", "element_ref": "next-level"}
+        ),
+    )
+    forbidden_follow_up = ToolCall(
+        call_id="generic-stage-boundary-follow-up",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must wait for level-two re-observation"},
+    )
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+                self.reached_second_call = False
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(first)
+                self.reached_second_call = True
+                await handler(forbidden_follow_up)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [forbidden_follow_up, ModelCompleted(finish_reason="tool_calls")],
+            ]
+        )
+    tools = GenericBrowserTransitionTools(
+        capture_failure=capture_failure,
+        failure_code=failure_code or "post_effect_state_capture_failed",
+    )
+
+    result = await WorkerRuntime(provider, tools).run(_generic_browser_transition_handoff())
+
+    assert result.status == ("failed" if capture_failure else "completed"), result.error
+    if capture_failure:
+        assert result.error_code == "target_surface_disrupted"
+    assert tools.calls == [transition_tool]
+    assert len(provider.requests) == 1
+    if dynamic:
+        assert provider.reached_second_call is False
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["is_error"] is capture_failure
+    assert receipt["acknowledged"] is False
+    assert receipt["interaction_count"] == 0
+    assert receipt["target_effect_attempted"] is True
+    assert receipt["target_call_budget_charge"] == 1
+    assert receipt["target_ui_transition"] == (
+        _unknown_after_browser_effect_transition()
+        if capture_failure
+        else _successful_stage_boundary_transition()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("campaign_id", "campaign/wrong"),
+        ("target_profile_id", "target-wrong"),
+        ("compiled_adapter_digest", "sha256:" + "0" * 64),
+        ("effect", "target_read"),
+        ("target_effect_attempted", False),
+        ("target_effect_attempted", None),
+        ("target_call_budget_charge", 0),
+        ("target_call_budget_charge", None),
+        ("target_session_id", None),
+        ("target_session_id", ""),
+        ("target_ui_transition", {"material": True}),
+    ),
+)
+async def test_generic_material_transition_with_invalid_binding_stops_fail_closed(
+    field: str,
+    value: object,
+) -> None:
+    first = ToolCall(
+        call_id="generic-invalid-transition",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "next-level"},
+    )
+    forbidden_follow_up = ToolCall(
+        call_id="generic-invalid-transition-follow-up",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must not execute after an invalid transition claim"},
+    )
+    provider = Provider(
+        [
+            [first, ModelCompleted(finish_reason="tool_calls")],
+            [forbidden_follow_up, ModelCompleted(finish_reason="tool_calls")],
+        ]
+    )
+    tools = GenericBrowserTransitionTools(metadata_mutation=(field, value))
+
+    result = await WorkerRuntime(provider, tools).run(_generic_browser_transition_handoff())
+
+    assert result.status == "quarantined", result.error
+    assert result.error_code == "target_adapter_unhealthy"
+    assert result.infrastructure_failure_category == "adapter_state_integrity"
+    assert tools.calls == ["browser_click"]
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_generic_nonmaterial_effect_session_drift_stops_before_follow_up(
+    dynamic: bool,
+) -> None:
+    first = ToolCall(
+        call_id="generic-session-first",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "first-control"},
+    )
+    second = ToolCall(
+        call_id="generic-session-drift",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "second-control"},
+    )
+    forbidden = ToolCall(
+        call_id="generic-session-forbidden",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must not execute after physical-session drift"},
+    )
+
+    class SessionDriftTools(GenericBrowserTransitionTools):
+        async def invoke(self, name, context, arguments):
+            result = await super().invoke(name, context, arguments)
+            session_id = "browser:context-1" if len(self.calls) == 1 else "browser:context-2"
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        "target_session_id": session_id,
+                        "target_ui_transition": _unchanged_browser_effect_transition(),
+                    }
+                }
+            )
+
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+                self.reached_forbidden = False
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(first)
+                await handler(second)
+                self.reached_forbidden = True
+                await handler(forbidden)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [second, ModelCompleted(finish_reason="tool_calls")],
+                [forbidden, ModelCompleted(finish_reason="tool_calls")],
+            ]
+        )
+    tools = SessionDriftTools()
+
+    result = await WorkerRuntime(provider, tools).run(_generic_browser_transition_handoff())
+
+    assert result.status == "quarantined", result.error
+    assert result.error_code == "target_adapter_unhealthy"
+    assert result.infrastructure_failure_category == "adapter_state_integrity"
+    assert tools.calls == ["browser_click", "browser_click"]
+    assert len(provider.requests) == (1 if dynamic else 2)
+    if dynamic:
+        assert provider.reached_forbidden is False
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    ("outcome", "transition_tool"),
+    (
+        ("broker-ambiguous", "browser_click"),
+        ("attempted-error-no-transition", "browser_click"),
+        ("navigate-success-no-transition", "browser_navigate"),
+        ("open-tab-success-no-transition", "browser_open_tab"),
+    ),
+)
+async def test_generic_effect_reconciliation_checkpoint_blocks_live_and_restored_follow_up(
+    dynamic: bool,
+    outcome: str,
+    transition_tool: str,
+) -> None:
+    first = ToolCall(
+        call_id=f"generic-reconciliation-{outcome}",
+        name=transition_tool,
+        arguments=(
+            {"url": "https://plunder.me/next"}
+            if transition_tool == "browser_open_tab"
+            else {"tab_ref": "tab:1", "url": "https://plunder.me/next"}
+            if transition_tool == "browser_navigate"
+            else {"tab_ref": "tab:1", "element_ref": "ordinary-control"}
+        ),
+    )
+    forbidden = ToolCall(
+        call_id=f"generic-reconciliation-{outcome}-forbidden",
+        name="browser_chat_exchange",
+        arguments={"prompt": "must not execute before reconciliation"},
+    )
+    if dynamic:
+
+        class DynamicProvider:
+            capabilities = SimpleNamespace(vision=False, context_window_tokens=None)
+
+            def __init__(self) -> None:
+                self.requests: list[ChatRequest] = []
+                self.reached_second_call = False
+
+            async def stream(self, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+                raise AssertionError("dynamic tools must use stream_with_tools")
+                yield ModelCompleted()
+
+            async def stream_with_tools(self, request, handler):
+                self.requests.append(request)
+                await handler(first)
+                self.reached_second_call = True
+                await handler(forbidden)
+                yield ModelCompleted(finish_reason="tool_calls")
+
+        provider = DynamicProvider()
+    else:
+        provider = Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [forbidden, ModelCompleted(finish_reason="tool_calls")],
+            ]
+        )
+    tools: Tools
+    if outcome == "broker-ambiguous":
+        tools = GenericBrowserAmbiguousIntentTools()
+    elif outcome == "attempted-error-no-transition":
+        tools = GenericBrowserTransitionTools(capture_failure=True, omit_transition=True)
+    else:
+        tools = GenericBrowserTransitionTools(omit_transition=True)
+    checkpoints: list[Mapping[str, object]] = []
+
+    async def save(value: Mapping[str, object], _consumed_ids: tuple[str, ...]) -> None:
+        checkpoints.append(value)
+
+    reviewed = _generic_browser_transition_handoff()
+    result = await WorkerRuntime(provider, tools, checkpoint_writer=save).run(reviewed)
+
+    assert result.status == "quarantined"
+    assert result.error_code == "target_effect_ambiguous"
+    assert tools.calls == [transition_tool]
+    assert len(provider.requests) == 1
+    if dynamic:
+        assert provider.reached_second_call is False
+    durable_checkpoint = next(
+        item
+        for item in reversed(checkpoints)
+        if item.get("generic_effect_reconciliation_required") is not None
+    )
+    marker = durable_checkpoint["generic_effect_reconciliation_required"]
+    assert isinstance(marker, Mapping)
+    assert marker["call_id"] == first.call_id
+    assert marker["tool_name"] == transition_tool
+    assert result.checkpoint["generic_effect_reconciliation_required"] == marker
+
+    replacement_provider = Provider(
+        [[forbidden, ModelCompleted(finish_reason="tool_calls")]]
+    )
+    replacement_tools = GenericBrowserTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=durable_checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_effect_ambiguous"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
+async def test_generic_browser_effect_charge_consumes_cap_without_fabricating_interaction() -> None:
+    first = ToolCall(
+        call_id="generic-effect-cap",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "ordinary-control"},
+    )
+    provider = Provider(
+        [
+            [first, ModelCompleted(finish_reason="tool_calls")],
+            [TextDelta(text='{"finding":"bounded after one generic effect"}'), ModelCompleted()],
+        ]
+    )
+    tools = GenericBrowserNoTransitionTools()
+    reviewed = _generic_browser_transition_handoff()
+    assert reviewed.worker_context is not None
+    reviewed = replace(
+        reviewed,
+        assignment=replace(
+            reviewed.assignment,
+            tool_ids=("browser_click",),
+            max_target_exchanges=1,
+        ),
+        worker_context=replace(
+            reviewed.worker_context,
+            tool_ids=("browser_click",),
+        ),
+    )
+
+    result = await WorkerRuntime(provider, tools).run(reviewed)
+
+    assert result.status == "completed", result.error
+    assert tools.calls == ["browser_click"]
+    assert provider.requests[1].tools == []
+    (receipt,) = result.checkpoint["target_evidence"]
+    assert receipt["interaction_count"] == 0
+    assert receipt["limit_interaction_count"] == 0
+    assert receipt["target_call_budget_charge"] == 1
+
+
+async def test_generic_browser_effect_charge_restores_cap_without_semantic_interaction() -> None:
+    first = ToolCall(
+        call_id="generic-effect-cap-restart",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "ordinary-control"},
+    )
+    checkpoints: list[Mapping[str, object]] = []
+
+    async def save(value: Mapping[str, object], _consumed_ids: tuple[str, ...]) -> None:
+        checkpoints.append(value)
+
+    tools = GenericBrowserNoTransitionTools()
+    reviewed = _generic_browser_transition_handoff()
+    assert reviewed.worker_context is not None
+    reviewed = replace(
+        reviewed,
+        assignment=replace(
+            reviewed.assignment,
+            tool_ids=("browser_click",),
+            max_target_exchanges=1,
+        ),
+        worker_context=replace(reviewed.worker_context, tool_ids=("browser_click",)),
+    )
+    initial = await WorkerRuntime(
+        Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [TextDelta(text='{"finding":"initial finalization"}'), ModelCompleted()],
+            ]
+        ),
+        tools,
+        checkpoint_writer=save,
+    ).run(reviewed)
+    assert initial.status == "completed", initial.error
+    restart_checkpoint = next(
+        item
+        for item in checkpoints
+        if item.get("finalization_only") is True
+        and isinstance(item.get("target_evidence"), list)
+        and item["target_evidence"]
+    )
+    (receipt,) = restart_checkpoint["target_evidence"]
+    assert receipt["interaction_count"] == 0
+    assert receipt["limit_interaction_count"] == 0
+    assert receipt["target_call_budget_charge"] == 1
+    restart_checkpoint = dict(restart_checkpoint)
+    restart_checkpoint.pop("finalization_only", None)
+
+    replacement_provider = Provider(
+        [[TextDelta(text='{"finding":"restored finalization"}'), ModelCompleted()]]
+    )
+    replacement_tools = GenericBrowserNoTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=restart_checkpoint,
+    )
+
+    assert restored.status == "completed", restored.error
+    assert len(replacement_provider.requests) == 1
+    assert replacement_provider.requests[0].tools == []
+    assert replacement_tools.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "remove"),
+    (
+        ("receipt_sha256", "0" * 64, False),
+        ("assignment_id", "campaign/wrong/worker", False),
+        ("campaign_id", "campaign/wrong", False),
+        ("target_id", "target-wrong", False),
+        ("session_id", "session-wrong", False),
+        ("target_session_id", "browser:wrong-context", False),
+        ("compiled_adapter_digest", "sha256:" + "0" * 64, False),
+        ("generic_browser_effect", None, True),
+        ("target_ui_transition", {"material": False}, False),
+    ),
+)
+async def test_restored_generic_browser_charge_requires_exact_signed_bindings(
+    field: str,
+    value: object,
+    remove: bool,
+) -> None:
+    first = ToolCall(
+        call_id="generic-effect-cap-invalid-restart",
+        name="browser_click",
+        arguments={"tab_ref": "tab:1", "element_ref": "ordinary-control"},
+    )
+    checkpoints: list[Mapping[str, object]] = []
+
+    async def save(value: Mapping[str, object], _consumed_ids: tuple[str, ...]) -> None:
+        checkpoints.append(value)
+
+    reviewed = _generic_browser_transition_handoff()
+    assert reviewed.worker_context is not None
+    reviewed = replace(
+        reviewed,
+        assignment=replace(
+            reviewed.assignment,
+            tool_ids=("browser_click",),
+            max_target_exchanges=1,
+        ),
+        worker_context=replace(reviewed.worker_context, tool_ids=("browser_click",)),
+    )
+    initial = await WorkerRuntime(
+        Provider(
+            [
+                [first, ModelCompleted(finish_reason="tool_calls")],
+                [TextDelta(text='{"finding":"initial finalization"}'), ModelCompleted()],
+            ]
+        ),
+        GenericBrowserNoTransitionTools(),
+        checkpoint_writer=save,
+    ).run(reviewed)
+    assert initial.status == "completed", initial.error
+    restart_checkpoint = next(
+        dict(item)
+        for item in checkpoints
+        if item.get("finalization_only") is True
+        and isinstance(item.get("target_evidence"), list)
+        and item["target_evidence"]
+    )
+    restart_checkpoint.pop("finalization_only", None)
+    receipts = [dict(item) for item in restart_checkpoint["target_evidence"]]
+    restart_checkpoint["target_evidence"] = receipts
+    receipt = receipts[0]
+    if remove:
+        receipt.pop(field, None)
+    else:
+        receipt[field] = value
+    if field != "receipt_sha256":
+        body = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+        receipt["receipt_sha256"] = WorkerRuntime._json_fingerprint(body)  # noqa: SLF001
+
+    replacement_provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="forbidden-after-invalid-generic-receipt",
+                    name="browser_click",
+                    arguments={"tab_ref": "tab:1", "element_ref": "must-not-run"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+    replacement_tools = GenericBrowserNoTransitionTools()
+    restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
+        reviewed,
+        checkpoint=restart_checkpoint,
+    )
+
+    assert restored.status == "quarantined"
+    assert restored.error_code == "target_surface_transition_invalid"
+    assert restored.infrastructure_failure_category == "adapter_state_integrity"
+    assert replacement_provider.requests == []
+    assert replacement_tools.calls == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -12536,9 +13360,7 @@ async def test_successful_material_transition_stops_goat_before_second_turn() ->
     assert len(provider.requests) == 1
     _assert_successful_transition_receipt(result, "goat-0")
 
-    replacement_provider = Provider(
-        [[_goat_call(1), ModelCompleted(finish_reason="tool_calls")]]
-    )
+    replacement_provider = Provider([[_goat_call(1), ModelCompleted(finish_reason="tool_calls")]])
     replacement_tools = ApiMaterialTransitionTools()
     restored = await WorkerRuntime(replacement_provider, replacement_tools).run(
         reviewed,
@@ -12653,10 +13475,7 @@ def _two_action_objective_transition_handoff(attempt_id: str) -> WorkerHandoff:
     }
     assignment = replace(
         base.assignment,
-        id=(
-            "campaign/00000000-0000-0000-0000-000000000001/"
-            f"objective-gate/{attempt_id}"
-        ),
+        id=(f"campaign/00000000-0000-0000-0000-000000000001/objective-gate/{attempt_id}"),
         strategy_id="objective-phase-gate/v1",
         strategy_contract=(("objective_phase_gate", json.dumps(gate)),),
         max_target_exchanges=2,

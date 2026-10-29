@@ -34,6 +34,7 @@ from merlin_contracts import (
     TextDelta,
     ToolCall,
     ToolContext,
+    ToolInteractionRole,
     ToolResult,
     ToolSpec,
     parse_model_json,
@@ -212,6 +213,20 @@ _CONTEXT_RECENT_PROTOCOL_TAIL_BYTES = 32_768
 _BROWSER_OBSERVATION_TOOLS = frozenset(
     {"browser_snapshot", "browser_wait_for_text", "browser_network_events"}
 )
+_GENERIC_BROWSER_MUTATION_TOOLS = frozenset(
+    {
+        "browser_click",
+        "browser_fill",
+        "browser_press",
+        "browser_select",
+        "browser_check",
+        "browser_uncheck",
+        "browser_hover",
+        "browser_upload",
+    }
+)
+_GENERIC_BROWSER_NAVIGATION_TOOLS = frozenset({"browser_navigate", "browser_open_tab"})
+_GENERIC_BROWSER_EFFECT_TOOLS = _GENERIC_BROWSER_MUTATION_TOOLS | _GENERIC_BROWSER_NAVIGATION_TOOLS
 _SUPERSEDABLE_OBSERVATION_TOOLS = _BROWSER_OBSERVATION_TOOLS | {
     "knowledge_search",
     "list_directory",
@@ -497,6 +512,31 @@ def _target_limit_interaction_count(result: ToolResult) -> int:
     return _target_interaction_count(result)
 
 
+def _target_limit_receipt_count(receipt: Mapping[str, object]) -> int:
+    """Restore semantic exchanges plus authenticated generic browser effect charges."""
+
+    explicit = receipt.get("limit_interaction_count")
+    interaction_count = receipt.get("interaction_count")
+    semantic_count = (
+        int(explicit)
+        if type(explicit) is int and explicit >= 0
+        else int(interaction_count)
+        if type(interaction_count) is int and interaction_count >= 0
+        else 1
+        if receipt.get("acknowledged") is True
+        else 0
+    )
+    charge = receipt.get("target_call_budget_charge")
+    if (
+        receipt.get("tool_name") in _GENERIC_BROWSER_EFFECT_TOOLS
+        and receipt.get("target_effect_attempted") is True
+        and type(charge) is int
+        and charge >= 0
+    ):
+        return max(semantic_count, int(charge))
+    return semantic_count
+
+
 def _strict_target_surface_transition(result: ToolResult) -> dict[str, object] | None:
     return strict_pre_effect_transition(
         result.metadata,
@@ -512,10 +552,7 @@ def _target_evidence_effect_observed(
     return any(
         receipt.get("acknowledged") is True
         or receipt.get("target_effect_attempted") is True
-        or (
-            type(receipt.get("interaction_count")) is int
-            and int(receipt["interaction_count"]) > 0
-        )
+        or (type(receipt.get("interaction_count")) is int and int(receipt["interaction_count"]) > 0)
         or (
             type(receipt.get("target_call_budget_charge")) is int
             and int(receipt["target_call_budget_charge"]) > 0
@@ -573,6 +610,7 @@ def _target_surface_transition_decision(
     result: ToolResult,
     *,
     target_session_id: str | None,
+    authenticated_generic_effect: bool = False,
 ) -> WorkerResult | None:
     if not _target_surface_transition_claimed(result.metadata):
         return None
@@ -598,7 +636,12 @@ def _target_surface_transition_decision(
         and result_session_id == target_session_id
         and (
             not result.is_error
-            and _target_interaction_count(result) == 1
+            and (
+                _target_interaction_count(result) == 1
+                or authenticated_generic_effect
+                and result.metadata.get("target_effect_attempted") is True
+                and result.metadata.get("target_call_budget_charge") == 1
+            )
             or result.is_error
             and (
                 result.metadata.get("target_effect_attempted") is True
@@ -622,6 +665,93 @@ def _target_surface_transition_decision(
         result.content,
         is_error=result.is_error,
         target_session_id=target_session_id,
+    )
+
+
+def _authenticated_generic_browser_effect(
+    handoff: WorkerHandoff,
+    result: ToolResult,
+    *,
+    tool_name: str,
+    sealed_compiled_adapter_digest: str | None,
+) -> bool:
+    metadata = result.metadata
+    effect_valid = (
+        tool_name in _GENERIC_BROWSER_MUTATION_TOOLS
+        and metadata.get("effect") == "target_network"
+        or tool_name in _GENERIC_BROWSER_NAVIGATION_TOOLS
+        and metadata.get("effect") == "target_read"
+    )
+    expected_campaign_id = (
+        "/".join(handoff.assignment.id.split("/")[:2])
+        if handoff.assignment.id.startswith("campaign/")
+        else None
+    )
+    expected_target_id = (
+        handoff.worker_context.target.id
+        if handoff.worker_context is not None
+        else handoff.assignment.target_profile_id
+    )
+    return bool(
+        effect_valid
+        and tool_name in handoff.assignment.tool_ids
+        and metadata.get("target_effect_attempted") is True
+        and metadata.get("target_call_budget_charge") == 1
+        and isinstance(metadata.get("target_session_id"), str)
+        and bool(str(metadata["target_session_id"]).strip())
+        and isinstance(expected_campaign_id, str)
+        and metadata.get("campaign_id") == expected_campaign_id
+        and metadata.get("target_profile_id") == expected_target_id
+        and isinstance(sealed_compiled_adapter_digest, str)
+        and metadata.get("compiled_adapter_digest") == sealed_compiled_adapter_digest
+    )
+
+
+def _generic_target_surface_transition(
+    handoff: WorkerHandoff,
+    result: ToolResult,
+    *,
+    tool_name: str,
+    sealed_compiled_adapter_digest: str | None,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Admit a transition-capable browser result only with exact sealed bindings."""
+
+    metadata = result.metadata
+    if tool_name not in _GENERIC_BROWSER_EFFECT_TOOLS or "target_ui_transition" not in metadata:
+        return None, None
+    transition = normalize_target_ui_transition(metadata)
+    if transition is None:
+        return None, "generic browser transition metadata is malformed"
+    if not _authenticated_generic_browser_effect(
+        handoff,
+        result,
+        tool_name=tool_name,
+        sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+    ):
+        return None, "generic browser transition lacks exact sealed target bindings"
+    return transition, None
+
+
+def _generic_effect_reconciliation_result(
+    handoff: WorkerHandoff,
+    result: ToolResult,
+    *,
+    reason: str,
+    target_session_id: str | None,
+    checkpoint: Mapping[str, object] | None = None,
+) -> WorkerResult:
+    """Stop after a generic browser effect whose outcome cannot be authenticated."""
+
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="quarantined",
+        content=result.content,
+        error=reason,
+        error_code="target_effect_ambiguous",
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
+        infrastructure_failure_category="effect_reconciliation_required",
     )
 
 
@@ -706,9 +836,7 @@ def _restored_target_call(messages: Sequence[ChatMessage], call_id: str) -> Tool
     return ToolCall(call_id=call_id, name=name, arguments=dict(arguments))
 
 
-def _restored_target_result(
-    messages: Sequence[ChatMessage], call_id: str
-) -> ChatMessage | None:
+def _restored_target_result(messages: Sequence[ChatMessage], call_id: str) -> ChatMessage | None:
     matches = [
         message
         for message in messages
@@ -739,9 +867,10 @@ def _checkpoint_tool_content_identity(
         compact_receipt = json.loads(content)
     except json.JSONDecodeError:
         compact_receipt = None
-    if isinstance(compact_receipt, Mapping) and compact_receipt.get(
-        "type"
-    ) == "tool_result_receipt":
+    if (
+        isinstance(compact_receipt, Mapping)
+        and compact_receipt.get("type") == "tool_result_receipt"
+    ):
         receipt_call_id = compact_receipt.get("call_id")
         receipt_name = compact_receipt.get("name")
         receipt_hash = compact_receipt.get("content_sha256")
@@ -818,20 +947,110 @@ def _strict_restored_transition_evidence(
             continue
         call_id = item.get("call_id")
         reference = item.get("reference")
-        if (
-            not isinstance(call_id, str)
-            or not call_id
-            or reference != f"target-call:{call_id}"
-        ):
+        if not isinstance(call_id, str) or not call_id or reference != f"target-call:{call_id}":
             raise ValueError("restored target evidence contains a malformed identity")
         if call_id in restored:
             raise ValueError("restored target evidence contains a duplicate call identity")
         body = {key: value for key, value in item.items() if key != "receipt_sha256"}
         if item.get("receipt_sha256") != WorkerRuntime._json_fingerprint(body):
             raise ValueError("restored target evidence receipt hash is invalid")
-        transition_claimed = transition_claimed or transition_key_present
+        if item.get("generic_browser_effect") is True and not transition_key_present:
+            raise ValueError("restored generic browser receipt omitted its transition evidence")
+        if transition_key_present:
+            transition = normalize_target_ui_transition(item)
+            if transition is None:
+                raise ValueError("restored target evidence contains a malformed transition")
+            transition_claimed = transition_claimed or _target_surface_transition_claimed(item)
         restored[call_id] = dict(item)
     return restored if transition_claimed else {}
+
+
+def _restored_generic_browser_receipt_integrity_result(
+    handoff: WorkerHandoff,
+    checkpoint: Mapping[str, object] | None,
+) -> WorkerResult | None:
+    """Fail closed when a restored generic-effect budget receipt is not attributable."""
+
+    raw = (checkpoint or {}).get("target_evidence")
+    if not isinstance(raw, list):
+        return None
+    expected_campaign_id = (
+        "/".join(handoff.assignment.id.split("/")[:2])
+        if handoff.assignment.id.startswith("campaign/")
+        else handoff.assignment.id.rsplit("/", 1)[0]
+    )
+    expected_target_id = (
+        handoff.worker_context.target.id
+        if handoff.worker_context is not None
+        else handoff.assignment.target_profile_id
+    )
+    sealed_compiled_adapter_digest = dict(handoff.assignment.strategy_contract).get(
+        "compiled_adapter_digest"
+    )
+    expected_target_session_id = (checkpoint or {}).get("target_session_id")
+    invalid_reason: str | None = None
+    seen: set[str] = set()
+    for item in raw:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("tool_name") not in _GENERIC_BROWSER_EFFECT_TOOLS
+        ):
+            continue
+        tool_name = str(item["tool_name"])
+        call_id = item.get("call_id")
+        body = {key: value for key, value in item.items() if key != "receipt_sha256"}
+        expected_effect = (
+            "target_network"
+            if tool_name in _GENERIC_BROWSER_MUTATION_TOOLS
+            else "target_read"
+        )
+        transition = normalize_target_ui_transition(item)
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id in seen
+            or item.get("reference") != f"target-call:{call_id}"
+            or item.get("receipt_sha256") != WorkerRuntime._json_fingerprint(body)
+            or item.get("generic_browser_effect") is not True
+            or item.get("generic_browser_effect_class") != expected_effect
+            or tool_name not in handoff.assignment.tool_ids
+            or item.get("assignment_id") != handoff.assignment.id
+            or item.get("campaign_id") != expected_campaign_id
+            or item.get("session_id") != handoff.session_id
+            or item.get("target_id") != expected_target_id
+            or not isinstance(sealed_compiled_adapter_digest, str)
+            or item.get("compiled_adapter_digest") != sealed_compiled_adapter_digest
+            or item.get("target_effect_attempted") is not True
+            or item.get("interaction_count") != 0
+            or item.get("limit_interaction_count") != 0
+            or item.get("target_call_budget_charge") != 1
+            or type(item.get("is_error")) is not bool
+            or not isinstance(item.get("target_session_id"), str)
+            or not str(item["target_session_id"]).strip()
+            or item.get("target_session_id") != expected_target_session_id
+            or transition is None
+            or item.get("target_ui_transition") != transition
+        ):
+            invalid_reason = "restored generic browser effect receipt lacks exact sealed bindings"
+            break
+        seen.add(call_id)
+    if invalid_reason is None:
+        return None
+    target_session_id = (
+        str(expected_target_session_id)
+        if isinstance(expected_target_session_id, str) and expected_target_session_id.strip()
+        else None
+    )
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="quarantined",
+        error=invalid_reason,
+        error_code="target_surface_transition_invalid",
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        target_session_id=target_session_id,
+        infrastructure_failure_category="adapter_state_integrity",
+    )
 
 
 def _restored_surface_transition_result(
@@ -870,6 +1089,121 @@ def _restored_surface_transition_result(
         checkpoint=checkpoint,
         target_session_id=target_session_id,
         infrastructure_failure_category="adapter_state_integrity",
+    )
+
+
+_GENERIC_EFFECT_RECONCILIATION_REASONS = frozenset(
+    {
+        "broker_effect_ambiguous",
+        "post_effect_receipt_missing",
+        "transition_auth_invalid",
+    }
+)
+
+
+def _generic_effect_reconciliation_marker(
+    handoff: WorkerHandoff,
+    call: ToolCall,
+    result: ToolResult,
+    *,
+    reason: str,
+) -> dict[str, object]:
+    """Create a bounded checkpoint fence for an unresolved generic browser effect."""
+
+    expected_campaign_id = (
+        "/".join(handoff.assignment.id.split("/")[:2])
+        if handoff.assignment.id.startswith("campaign/")
+        else None
+    )
+    raw_effect_identity = result.metadata.get("idempotency_key")
+    effect_identity = (
+        str(raw_effect_identity)
+        if isinstance(raw_effect_identity, str) and raw_effect_identity
+        else "\0".join(
+            (
+                handoff.session_id,
+                str(handoff.attempt_id or ""),
+                call.call_id,
+                call.name,
+            )
+        )
+    )
+    body: dict[str, object] = {
+        "schema": "merlin.generic-browser-effect-reconciliation.v1",
+        "assignment_id": handoff.assignment.id,
+        "campaign_id": expected_campaign_id,
+        "target_id": handoff.assignment.target_profile_id,
+        "call_id": call.call_id,
+        "tool_name": call.name,
+        "reason": reason,
+        "effect_identity_digest": "sha256:"
+        + hashlib.sha256(effect_identity.encode("utf-8")).hexdigest(),
+    }
+    return {**body, "marker_sha256": WorkerRuntime._json_fingerprint(body)}
+
+
+def _restored_generic_effect_reconciliation_result(
+    handoff: WorkerHandoff,
+    checkpoint: Mapping[str, object] | None,
+) -> WorkerResult | None:
+    raw = (
+        checkpoint.get("generic_effect_reconciliation_required")
+        if isinstance(checkpoint, Mapping)
+        else None
+    )
+    if raw is None:
+        return None
+    marker_valid = False
+    if isinstance(raw, Mapping):
+        body = {key: value for key, value in raw.items() if key != "marker_sha256"}
+        expected_campaign_id = (
+            "/".join(handoff.assignment.id.split("/")[:2])
+            if handoff.assignment.id.startswith("campaign/")
+            else None
+        )
+        marker_valid = bool(
+            set(raw)
+            == {
+                "schema",
+                "assignment_id",
+                "campaign_id",
+                "target_id",
+                "call_id",
+                "tool_name",
+                "reason",
+                "effect_identity_digest",
+                "marker_sha256",
+            }
+            and raw.get("schema") == "merlin.generic-browser-effect-reconciliation.v1"
+            and raw.get("assignment_id") == handoff.assignment.id
+            and raw.get("campaign_id") == expected_campaign_id
+            and raw.get("target_id") == handoff.assignment.target_profile_id
+            and isinstance(raw.get("call_id"), str)
+            and bool(str(raw["call_id"]))
+            and raw.get("tool_name") in _GENERIC_BROWSER_EFFECT_TOOLS
+            and raw.get("tool_name") in handoff.assignment.tool_ids
+            and raw.get("reason") in _GENERIC_EFFECT_RECONCILIATION_REASONS
+            and isinstance(raw.get("effect_identity_digest"), str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(raw["effect_identity_digest"]))
+            and raw.get("marker_sha256") == WorkerRuntime._json_fingerprint(body)
+        )
+    return WorkerResult(
+        task_id=handoff.assignment.id,
+        status="quarantined",
+        error=(
+            "restored generic browser effect requires authoritative durable reconciliation "
+            "before provider or tool execution"
+            if marker_valid
+            else "restored generic browser effect reconciliation marker is invalid"
+        ),
+        error_code=(
+            "target_effect_ambiguous" if marker_valid else "target_effect_reconciliation_invalid"
+        ),
+        retry_class="terminal",
+        checkpoint=checkpoint,
+        infrastructure_failure_category=(
+            "effect_reconciliation_required" if marker_valid else "adapter_state_integrity"
+        ),
     )
 
 
@@ -2296,6 +2630,18 @@ class WorkerRuntime:
                 "checkpoint technique-attempt identity differs from the active ledger",
                 retry_class="terminal",
             )
+        restored_generic_effect_result = _restored_generic_effect_reconciliation_result(
+            handoff,
+            checkpoint,
+        )
+        if restored_generic_effect_result is not None:
+            return restored_generic_effect_result
+        restored_generic_receipt_result = _restored_generic_browser_receipt_integrity_result(
+            handoff,
+            checkpoint,
+        )
+        if restored_generic_receipt_result is not None:
+            return restored_generic_receipt_result
         restored_surface_result = _restored_surface_transition_result(
             handoff,
             checkpoint,
@@ -2567,6 +2913,7 @@ class WorkerRuntime:
 
         messages = self._restore_messages(handoff, checkpoint, grant=grant)
         target_evidence = self._restore_target_evidence(checkpoint)
+        generic_effect_reconciliation_required: dict[str, object] | None = None
         started = time.monotonic()
         elapsed_before = float((checkpoint or {}).get("elapsed_seconds", 0.0))
         usage_totals = self._restore_usage(checkpoint)
@@ -2597,13 +2944,7 @@ class WorkerRuntime:
             1 for item in target_evidence.values() if "limit_interaction_count" not in item
         )
         target_exchange_count = sum(
-            int(
-                item.get(
-                    "limit_interaction_count",
-                    item.get("interaction_count", 1 if item.get("acknowledged") is True else 0),
-                )
-            )
-            for item in target_evidence.values()
+            _target_limit_receipt_count(item) for item in target_evidence.values()
         )
         if probe_transport_retry_pending and legacy_probe_receipts:
             # Legacy retry checkpoints predate the typed limit counter. Their one
@@ -2641,9 +2982,7 @@ class WorkerRuntime:
         provider_failures = int((checkpoint or {}).get("provider_failures", 0))
         goat_planner_strikes = int((checkpoint or {}).get("goat_planner_strikes", 0))
         goat_planner_strike_turn = -1
-        crescendo_planner_strikes = int(
-            (checkpoint or {}).get("crescendo_planner_strikes", 0)
-        )
+        crescendo_planner_strikes = int((checkpoint or {}).get("crescendo_planner_strikes", 0))
         crescendo_planner_strike_turn = -1
         max_model_turns = self._max_model_turns
         malformed_call_strikes = 0
@@ -2736,9 +3075,7 @@ class WorkerRuntime:
                 return
             history_index, _ = review
             if 0 <= history_index < len(messages):
-                messages[history_index] = _mark_visual_delivery_attempted(
-                    messages[history_index]
-                )
+                messages[history_index] = _mark_visual_delivery_attempted(messages[history_index])
 
         def process_visual_review(
             call_name: str,
@@ -3388,6 +3725,9 @@ class WorkerRuntime:
             kwargs["technique_attempt_id"] = handoff.technique_attempt_id
             kwargs["target_evidence"] = tuple(target_evidence.values())
             kwargs["evaluation_uncertainties"] = tuple(evaluation_uncertainties)
+            kwargs["generic_effect_reconciliation_required"] = (
+                generic_effect_reconciliation_required
+            )
             kwargs["hydra_action_reservation_active"] = hydra_action_reservation_active
             kwargs["finalization_only"] = finalization_only
             kwargs["truncation_finalizer_only"] = truncation_finalizer_only
@@ -3547,6 +3887,7 @@ class WorkerRuntime:
                     technique_attempt_id=handoff.technique_attempt_id,
                     target_evidence=tuple(target_evidence.values()),
                     evaluation_uncertainties=tuple(evaluation_uncertainties),
+                    generic_effect_reconciliation_required=(generic_effect_reconciliation_required),
                     finalization_only=finalization_only,
                     truncation_finalizer_only=truncation_finalizer_only,
                     truncation_signatures=tuple(truncation_signatures),
@@ -4318,8 +4659,8 @@ class WorkerRuntime:
                             result.content,
                             "adapter_state_integrity",
                         )
-                    effect_observed = (
-                        effect_observed or _target_evidence_effect_observed(target_evidence)
+                    effect_observed = effect_observed or _target_evidence_effect_observed(
+                        target_evidence
                     )
                     transition_decision = _target_surface_transition_decision(
                         handoff,
@@ -4510,8 +4851,8 @@ class WorkerRuntime:
                         pending_result.content,
                         "adapter_state_integrity",
                     )
-                effect_observed = (
-                    effect_observed or _target_evidence_effect_observed(target_evidence)
+                effect_observed = effect_observed or _target_evidence_effect_observed(
+                    target_evidence
                 )
                 transition_decision = _target_surface_transition_decision(
                     handoff,
@@ -4792,17 +5133,13 @@ class WorkerRuntime:
                             request_message = request_message.model_copy(
                                 update={
                                     "content": messages[history_index].content,
-                                    "image_attachments": (
-                                        request_message.image_attachments[:-1]
-                                    ),
+                                    "image_attachments": (request_message.image_attachments[:-1]),
                                 }
                             )
                         else:
                             request_message = request_message.model_copy(
                                 update={
-                                    "image_attachments": (
-                                        request_message.image_attachments[:-1]
-                                    )
+                                    "image_attachments": (request_message.image_attachments[:-1])
                                 }
                             )
                         active_visual_review = (history_index, request_message)
@@ -5032,6 +5369,7 @@ class WorkerRuntime:
                 nonlocal target_exchange_count
                 nonlocal target_session_id
                 nonlocal target_session_generation
+                nonlocal generic_effect_reconciliation_required
 
                 call = bind_probe_transport_retry_nonce(call)
                 content_so_far = "".join(turn_text)
@@ -5438,13 +5776,88 @@ class WorkerRuntime:
                                 "adapter_state_integrity",
                             )
                         )
+                generic_surface_transition, generic_surface_transition_error = (
+                    (None, None)
+                    if is_target_exchange_call
+                    else _generic_target_surface_transition(
+                        handoff,
+                        result,
+                        tool_name=call.name,
+                        sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+                    )
+                )
+                generic_effect_claimed = bool(
+                    not is_target_exchange_call
+                    and call.name in _GENERIC_BROWSER_EFFECT_TOOLS
+                    and result.metadata.get("target_effect_attempted") is True
+                )
+                generic_effect_authenticated = bool(
+                    not is_target_exchange_call
+                    and _authenticated_generic_browser_effect(
+                        handoff,
+                        result,
+                        tool_name=call.name,
+                        sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+                    )
+                )
+                generic_effect_reconciliation_error: str | None = None
+                generic_effect_reconciliation_reason: str | None = None
+                generic_session_failure: WorkerResult | None = None
+                if (
+                    not is_target_exchange_call
+                    and call.name in _GENERIC_BROWSER_EFFECT_TOOLS
+                    and result.is_error
+                    and result.metadata.get("effect_ambiguous") is True
+                ):
+                    generic_effect_reconciliation_error = (
+                        "generic browser effect intent is unresolved and requires durable "
+                        "reconciliation before another provider or target call"
+                    )
+                    generic_effect_reconciliation_reason = "broker_effect_ambiguous"
+                elif (
+                    generic_effect_authenticated
+                    and generic_surface_transition is None
+                    and generic_surface_transition_error is None
+                ):
+                    generic_effect_reconciliation_error = (
+                        "generic browser effect completed without the required target surface "
+                        "transition receipt"
+                    )
+                    generic_effect_reconciliation_reason = "post_effect_receipt_missing"
+                if (
+                    generic_effect_claimed
+                    and not generic_effect_authenticated
+                    and generic_surface_transition_error is None
+                ):
+                    generic_surface_transition_error = (
+                        "generic browser effect lacks exact sealed target bindings"
+                    )
+                if generic_effect_authenticated:
+                    try:
+                        target_session_id, target_session_generation = self._merge_target_session(
+                            target_session_id,
+                            target_session_generation,
+                            result,
+                        )
+                    except ValueError as error:
+                        generic_session_failure = target_adapter_quarantined(
+                            call.name,
+                            str(error),
+                            content_so_far,
+                            "adapter_state_integrity",
+                        )
                 surface_transition = (
                     normalize_target_ui_transition(result.metadata)
                     if is_target_exchange_call
-                    else None
+                    else generic_surface_transition
                 )
-                surface_transition_claimed = (
+                surface_transition_admitted = bool(
+                    is_target_exchange_call or generic_surface_transition is not None
+                )
+                surface_transition_claimed = bool(
                     is_target_exchange_call
+                    and _target_surface_transition_claimed(result.metadata)
+                    or generic_surface_transition is not None
                     and _target_surface_transition_claimed(result.metadata)
                 )
                 probe_server_failure = (
@@ -5464,7 +5877,11 @@ class WorkerRuntime:
                     "call_semantic": call_semantic,
                     "result_semantic": self._semantic_text_signature(result.content),
                 }
-                if is_target_exchange_call or _target_interaction_count(result):
+                if (
+                    is_target_exchange_call
+                    or _target_interaction_count(result)
+                    or generic_effect_authenticated
+                ):
                     repeat_audit = repeat_plan_audit(
                         handoff.worker_context.guidance if handoff.worker_context else (),
                         _controller_logical_arguments(target_tool, call.arguments),
@@ -5481,14 +5898,18 @@ class WorkerRuntime:
                 )
                 target_interactions = _target_interaction_count(result)
                 evidence_result = result
-                if is_target_exchange_call or target_interactions:
+                if is_target_exchange_call or target_interactions or generic_effect_authenticated:
                     evidence_result = (
                         result.model_copy(update={"is_error": True})
                         if probe_server_failure is not None and not probe_worker
                         else result
                     )
                     self._record_target_evidence(target_evidence, handoff, call, evidence_result)
-                    target_exchange_count += _target_limit_interaction_count(result)
+                    target_exchange_count += (
+                        int(result.metadata["target_call_budget_charge"])
+                        if generic_effect_authenticated
+                        else _target_limit_interaction_count(result)
+                    )
                     history_entry.update(
                         self._target_history_fields(
                             handoff, target_session_id, result, call_fingerprint
@@ -5496,9 +5917,38 @@ class WorkerRuntime:
                     )
                 action_history.append(history_entry)
                 action_count += 1
-                target_decision: WorkerResult | None = session_isolation_failure
+                target_decision: WorkerResult | None = (
+                    session_isolation_failure or generic_session_failure
+                )
+                if generic_effect_reconciliation_error is not None and target_decision is None:
+                    assert generic_effect_reconciliation_reason is not None
+                    generic_effect_reconciliation_required = _generic_effect_reconciliation_marker(
+                        handoff,
+                        call,
+                        result,
+                        reason=generic_effect_reconciliation_reason,
+                    )
+                    target_decision = _generic_effect_reconciliation_result(
+                        handoff,
+                        result,
+                        reason=generic_effect_reconciliation_error,
+                        target_session_id=target_session_id,
+                    )
+                if generic_surface_transition_error is not None and target_decision is None:
+                    generic_effect_reconciliation_required = _generic_effect_reconciliation_marker(
+                        handoff,
+                        call,
+                        result,
+                        reason="transition_auth_invalid",
+                    )
+                    target_decision = target_adapter_quarantined(
+                        call.name,
+                        generic_surface_transition_error,
+                        content_so_far,
+                        "adapter_state_integrity",
+                    )
                 if (
-                    is_target_exchange_call
+                    surface_transition_admitted
                     and target_decision is None
                     and surface_transition_claimed
                 ):
@@ -5518,6 +5968,7 @@ class WorkerRuntime:
                             handoff,
                             evidence_result,
                             target_session_id=target_session_id,
+                            authenticated_generic_effect=(generic_surface_transition is not None),
                         )
                 if is_target_exchange_call and target_decision is None:
                     target_decision = target_delivery_rejection_failure_result(result)
@@ -5594,9 +6045,8 @@ class WorkerRuntime:
                         )
                 if target_decision is not None:
                     if surface_transition_claimed:
-                        effect_observed = (
-                            effect_observed
-                            or _target_evidence_effect_observed(target_evidence)
+                        effect_observed = effect_observed or _target_evidence_effect_observed(
+                            target_evidence
                         )
                     if (
                         effect in {"target_network", "target_read"}
@@ -5642,7 +6092,10 @@ class WorkerRuntime:
                         turns_completed=turn_model_turns,
                         active_phase="target",
                     )
-                    if surface_transition_claimed:
+                    if (
+                        surface_transition_claimed
+                        or generic_effect_reconciliation_required is not None
+                    ):
                         target_decision = terminal_runtime_result(target_decision)
                     raise _DynamicToolTerminated(target_decision)
                 if crescendo_state is not None:
@@ -6578,13 +7031,90 @@ class WorkerRuntime:
                                 content,
                                 "adapter_state_integrity",
                             )
+                    generic_surface_transition, generic_surface_transition_error = (
+                        (None, None)
+                        if is_target_exchange_call
+                        else _generic_target_surface_transition(
+                            handoff,
+                            result,
+                            tool_name=call.name,
+                            sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+                        )
+                    )
+                    generic_effect_claimed = bool(
+                        not is_target_exchange_call
+                        and call.name in _GENERIC_BROWSER_EFFECT_TOOLS
+                        and result.metadata.get("target_effect_attempted") is True
+                    )
+                    generic_effect_authenticated = bool(
+                        not is_target_exchange_call
+                        and _authenticated_generic_browser_effect(
+                            handoff,
+                            result,
+                            tool_name=call.name,
+                            sealed_compiled_adapter_digest=sealed_compiled_adapter_digest,
+                        )
+                    )
+                    generic_effect_reconciliation_error: str | None = None
+                    generic_effect_reconciliation_reason: str | None = None
+                    generic_session_failure: WorkerResult | None = None
+                    if (
+                        not is_target_exchange_call
+                        and call.name in _GENERIC_BROWSER_EFFECT_TOOLS
+                        and result.is_error
+                        and result.metadata.get("effect_ambiguous") is True
+                    ):
+                        generic_effect_reconciliation_error = (
+                            "generic browser effect intent is unresolved and requires durable "
+                            "reconciliation before another provider or target call"
+                        )
+                        generic_effect_reconciliation_reason = "broker_effect_ambiguous"
+                    elif (
+                        generic_effect_authenticated
+                        and generic_surface_transition is None
+                        and generic_surface_transition_error is None
+                    ):
+                        generic_effect_reconciliation_error = (
+                            "generic browser effect completed without the required target "
+                            "surface transition receipt"
+                        )
+                        generic_effect_reconciliation_reason = "post_effect_receipt_missing"
+                    if (
+                        generic_effect_claimed
+                        and not generic_effect_authenticated
+                        and generic_surface_transition_error is None
+                    ):
+                        generic_surface_transition_error = (
+                            "generic browser effect lacks exact sealed target bindings"
+                        )
+                    if generic_effect_authenticated:
+                        try:
+                            target_session_id, target_session_generation = (
+                                self._merge_target_session(
+                                    target_session_id,
+                                    target_session_generation,
+                                    result,
+                                )
+                            )
+                        except ValueError as error:
+                            generic_session_failure = target_adapter_quarantined(
+                                call.name,
+                                str(error),
+                                content,
+                                "adapter_state_integrity",
+                            )
                     surface_transition = (
                         normalize_target_ui_transition(result.metadata)
                         if is_target_exchange_call
-                        else None
+                        else generic_surface_transition
                     )
-                    surface_transition_claimed = (
+                    surface_transition_admitted = bool(
+                        is_target_exchange_call or generic_surface_transition is not None
+                    )
+                    surface_transition_claimed = bool(
                         is_target_exchange_call
+                        and _target_surface_transition_claimed(result.metadata)
+                        or generic_surface_transition is not None
                         and _target_surface_transition_claimed(result.metadata)
                     )
                     probe_server_failure = (
@@ -6606,7 +7136,11 @@ class WorkerRuntime:
                         "call_semantic": call_semantic,
                         "result_semantic": self._semantic_text_signature(result.content),
                     }
-                    if is_target_exchange_call or _target_interaction_count(result):
+                    if (
+                        is_target_exchange_call
+                        or _target_interaction_count(result)
+                        or generic_effect_authenticated
+                    ):
                         repeat_audit = repeat_plan_audit(
                             handoff.worker_context.guidance if handoff.worker_context else (),
                             _controller_logical_arguments(target_tool, call.arguments),
@@ -6623,7 +7157,11 @@ class WorkerRuntime:
                     )
                     target_interactions = _target_interaction_count(result)
                     evidence_result = result
-                    if is_target_exchange_call or target_interactions:
+                    if (
+                        is_target_exchange_call
+                        or target_interactions
+                        or generic_effect_authenticated
+                    ):
                         evidence_result = (
                             result.model_copy(update={"is_error": True})
                             if probe_server_failure is not None and not probe_worker
@@ -6632,7 +7170,11 @@ class WorkerRuntime:
                         self._record_target_evidence(
                             target_evidence, handoff, call, evidence_result
                         )
-                        target_exchange_count += _target_limit_interaction_count(result)
+                        target_exchange_count += (
+                            int(result.metadata["target_call_budget_charge"])
+                            if generic_effect_authenticated
+                            else _target_limit_interaction_count(result)
+                        )
                         history_entry.update(
                             self._target_history_fields(
                                 handoff, target_session_id, result, call_fingerprint
@@ -6640,9 +7182,42 @@ class WorkerRuntime:
                         )
                     action_history.append(history_entry)
                     action_count += 1
-                    target_decision: WorkerResult | None = session_isolation_failure
+                    target_decision: WorkerResult | None = (
+                        session_isolation_failure or generic_session_failure
+                    )
+                    if generic_effect_reconciliation_error is not None and target_decision is None:
+                        assert generic_effect_reconciliation_reason is not None
+                        generic_effect_reconciliation_required = (
+                            _generic_effect_reconciliation_marker(
+                                handoff,
+                                call,
+                                result,
+                                reason=generic_effect_reconciliation_reason,
+                            )
+                        )
+                        target_decision = _generic_effect_reconciliation_result(
+                            handoff,
+                            result,
+                            reason=generic_effect_reconciliation_error,
+                            target_session_id=target_session_id,
+                        )
+                    if generic_surface_transition_error is not None and target_decision is None:
+                        generic_effect_reconciliation_required = (
+                            _generic_effect_reconciliation_marker(
+                                handoff,
+                                call,
+                                result,
+                                reason="transition_auth_invalid",
+                            )
+                        )
+                        target_decision = target_adapter_quarantined(
+                            call.name,
+                            generic_surface_transition_error,
+                            content,
+                            "adapter_state_integrity",
+                        )
                     if (
-                        is_target_exchange_call
+                        surface_transition_admitted
                         and target_decision is None
                         and surface_transition_claimed
                     ):
@@ -6664,6 +7239,9 @@ class WorkerRuntime:
                                 handoff,
                                 evidence_result,
                                 target_session_id=target_session_id,
+                                authenticated_generic_effect=(
+                                    generic_surface_transition is not None
+                                ),
                             )
                     if is_target_exchange_call and target_decision is None:
                         target_decision = target_delivery_rejection_failure_result(result)
@@ -6742,9 +7320,8 @@ class WorkerRuntime:
                             )
                     if target_decision is not None:
                         if surface_transition_claimed:
-                            effect_observed = (
-                                effect_observed
-                                or _target_evidence_effect_observed(target_evidence)
+                            effect_observed = effect_observed or _target_evidence_effect_observed(
+                                target_evidence
                             )
                         if (
                             effect in {"target_network", "target_read"}
@@ -6785,7 +7362,10 @@ class WorkerRuntime:
                             turns_completed=model_turns,
                             active_phase="target",
                         )
-                        if surface_transition_claimed:
+                        if (
+                            surface_transition_claimed
+                            or generic_effect_reconciliation_required is not None
+                        ):
                             target_decision = terminal_runtime_result(target_decision)
                         return target_decision
                     if crescendo_state is not None:
@@ -7172,10 +7752,7 @@ class WorkerRuntime:
                     crescendo_planner_strike_turn = crescendo_step_count
                     crescendo_planner_strikes = 0
                 crescendo_planner_strikes += 1
-                if (
-                    crescendo_planner_strikes
-                    >= CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT
-                ):
+                if crescendo_planner_strikes >= CRESCENDO_PLANNER_NO_CALL_STRIKE_LIMIT:
                     finalized = self._validate_result(handoff, content)
                     schema_failure = finalized.status == "failed" and (
                         finalized.error or ""
@@ -7782,6 +8359,7 @@ class WorkerRuntime:
         technique_attempt_id: str | None = None,
         target_evidence: Sequence[Mapping[str, object]] = (),
         evaluation_uncertainties: Sequence[Mapping[str, object]] = (),
+        generic_effect_reconciliation_required: Mapping[str, object] | None = None,
         hydra_action_reservation_active: bool = False,
         finalization_only: bool = False,
         truncation_finalizer_only: bool = False,
@@ -7815,6 +8393,7 @@ class WorkerRuntime:
                     technique_attempt_id=technique_attempt_id,
                     target_evidence=target_evidence,
                     evaluation_uncertainties=evaluation_uncertainties,
+                    generic_effect_reconciliation_required=(generic_effect_reconciliation_required),
                     hydra_action_reservation_active=hydra_action_reservation_active,
                     finalization_only=finalization_only,
                     truncation_finalizer_only=truncation_finalizer_only,
@@ -7854,6 +8433,7 @@ class WorkerRuntime:
         technique_attempt_id: str | None = None,
         target_evidence: Sequence[Mapping[str, object]] = (),
         evaluation_uncertainties: Sequence[Mapping[str, object]] = (),
+        generic_effect_reconciliation_required: Mapping[str, object] | None = None,
         hydra_action_reservation_active: bool = False,
         finalization_only: bool = False,
         truncation_finalizer_only: bool = False,
@@ -7917,6 +8497,15 @@ class WorkerRuntime:
                 for item in sorted(target_evidence, key=lambda item: str(item.get("call_id", "")))
             ],
             "evaluation_uncertainties": [dict(item) for item in evaluation_uncertainties],
+            **(
+                {
+                    "generic_effect_reconciliation_required": dict(
+                        generic_effect_reconciliation_required
+                    )
+                }
+                if generic_effect_reconciliation_required is not None
+                else {}
+            ),
             "hydra_action_reservation_active": hydra_action_reservation_active,
             "terminal_prompt_state": (
                 "captured" if terminal_prompt_digest is not None else "incomplete"
@@ -9204,6 +9793,7 @@ class WorkerRuntime:
             "call_id": call.call_id,
             "tool_name": call.name,
             "reference": f"target-call:{call.call_id}",
+            "session_id": handoff.session_id,
             "campaign_id": campaign_id,
             "assignment_id": handoff.assignment.id,
             "attempt_id": handoff.attempt_id,
@@ -9224,6 +9814,37 @@ class WorkerRuntime:
             "limit_interaction_count": limit_interaction_count,
             "target_call_budget_charge": target_call_budget_charge,
         }
+        if result.metadata.get("interaction_role") == ToolInteractionRole.TARGET_EXCHANGE.value:
+            receipt_body["interaction_role"] = ToolInteractionRole.TARGET_EXCHANGE.value
+        compiled_adapter_digest = result.metadata.get("compiled_adapter_digest")
+        expected_generic_effect = (
+            "target_network"
+            if call.name in _GENERIC_BROWSER_MUTATION_TOOLS
+            else "target_read"
+            if call.name in _GENERIC_BROWSER_NAVIGATION_TOOLS
+            else None
+        )
+        if (
+            expected_generic_effect is not None
+            and result.metadata.get("effect") == expected_generic_effect
+            and result.metadata.get("target_effect_attempted") is True
+            and target_call_budget_charge == 1
+            and result.metadata.get("campaign_id") == campaign_id
+            and result.metadata.get("target_profile_id") == receipt_body["target_id"]
+            and isinstance(compiled_adapter_digest, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", compiled_adapter_digest)
+        ):
+            # This marker creates a durable, non-credit transition projection.
+            # It does not turn an AUXILIARY browser effect into a semantic target
+            # exchange; the exact effect record and transition receipt are
+            # re-authenticated by DurableAgentService before Lead sees it.
+            receipt_body.update(
+                {
+                    "generic_browser_effect": True,
+                    "generic_browser_effect_class": expected_generic_effect,
+                    "compiled_adapter_digest": compiled_adapter_digest,
+                }
+            )
         if idempotent_replay:
             receipt_body["target_effect_attempted"] = False
         elif type(result.metadata.get("target_effect_attempted")) is bool:
@@ -9517,9 +10138,7 @@ class WorkerRuntime:
             raw_observations, (str, bytes)
         ):
             observations.extend(raw_observations)
-        raw_exchanges = metadata.get(
-            "current_target_exchanges", metadata.get("target_exchanges")
-        )
+        raw_exchanges = metadata.get("current_target_exchanges", metadata.get("target_exchanges"))
         exchanges = (
             raw_exchanges
             if isinstance(raw_exchanges, Sequence) and not isinstance(raw_exchanges, (str, bytes))

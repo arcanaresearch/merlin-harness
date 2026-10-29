@@ -18988,19 +18988,28 @@ class CampaignService:
                         )
                         is not None
                     )
-                    trusted_refs = frozenset(
-                        {
-                            *(
-                                str(value)
-                                for value in committed.get("target_call_ids", ())
-                                if isinstance(value, str)
-                            ),
-                            *(
-                                (str(committed["reference"]),)
-                                if isinstance(committed.get("reference"), str)
-                                else ()
-                            ),
-                        }
+                    projection_uncertainties = _durable_effect_projection_uncertainties(
+                        task.technique_ids,
+                        committed,
+                    )
+                    transport_uncertainties += projection_uncertainties
+                    trusted_refs = (
+                        frozenset()
+                        if projection_uncertainties
+                        else frozenset(
+                            {
+                                *(
+                                    str(value)
+                                    for value in committed.get("target_call_ids", ())
+                                    if isinstance(value, str)
+                                ),
+                                *(
+                                    (str(committed["reference"]),)
+                                    if isinstance(committed.get("reference"), str)
+                                    else ()
+                                ),
+                            }
+                        )
                     )
                     completion_receipts.append(
                         {
@@ -27870,6 +27879,33 @@ def _transport_attribution_uncertainty(
         "retryable": True,
         "withhold_surface_credit": True,
     }
+
+
+def _durable_effect_projection_uncertainties(
+    technique_ids: Sequence[str],
+    committed: Mapping[str, object],
+) -> tuple[Mapping[str, object], ...]:
+    """Withhold terminal credit when bounded durable effect history is incomplete."""
+    marker = committed.get("durable_effect_projection_error")
+    if not isinstance(marker, Mapping):
+        return ()
+    code = str(marker.get("code") or "durable_effect_projection_error")
+    return tuple(
+        {
+            "kind": "evaluation_uncertain",
+            "source": "campaign.durable_effect_projection",
+            "reason": (
+                "Durable target-effect history exceeded Merlin's bounded recovery projection "
+                f"({code}); the attempt remains recorded, but terminal attack credit is withheld "
+                "until the effect lineage is reconciled."
+            ),
+            "confidence": 1.0,
+            "technique_id": technique_id,
+            "retryable": True,
+            "withhold_surface_credit": True,
+        }
+        for technique_id in technique_ids
+    )
 
 
 def _sealed_hypothesis_contract(objective: str) -> Mapping[str, object]:

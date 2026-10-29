@@ -247,12 +247,24 @@ class ToolEffectRepository:
             ).fetchall()
         return [self._record(row) for row in rows]
 
-    def list_for_attempt(self, attempt_id: str) -> list[ToolEffectRecord]:
-        rows = self.connection.execute(
-            """SELECT * FROM merlin_storage.tool_effects
-               WHERE attempt_id = %s ORDER BY created_at, idempotency_key""",
-            (attempt_id,),
-        ).fetchall()
+    def list_for_attempt(
+        self, attempt_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]:
+        if limit is None:
+            rows = self.connection.execute(
+                """SELECT * FROM merlin_storage.tool_effects
+                   WHERE attempt_id = %s ORDER BY created_at, idempotency_key""",
+                (attempt_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """SELECT * FROM (
+                       SELECT * FROM merlin_storage.tool_effects
+                       WHERE attempt_id = %s
+                       ORDER BY created_at DESC, idempotency_key DESC LIMIT %s
+                   ) AS recent ORDER BY created_at, idempotency_key""",
+                (attempt_id, max(1, limit)),
+            ).fetchall()
         return [self._record(row) for row in rows]
 
     def list_for_campaign(
@@ -305,8 +317,14 @@ class PostgresToolEffectStore:
             self._repository.list_for_session, session_id, tool_name=tool_name
         )
 
-    async def list_for_attempt(self, attempt_id: str) -> list[ToolEffectRecord]:
-        return await asyncio.to_thread(self._repository.list_for_attempt, attempt_id)
+    async def list_for_attempt(
+        self, attempt_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]:
+        return await asyncio.to_thread(
+            self._repository.list_for_attempt,
+            attempt_id,
+            limit=limit,
+        )
 
     async def list_for_campaign(
         self, campaign_id: str, *, limit: int | None = None

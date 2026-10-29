@@ -64,7 +64,7 @@ def _normalized_accessible_name(value: str) -> str:
 
 _REVIEWED_LOCATOR_ROLES = ("button", "textbox", "link", "checkbox", "radio", "combobox")
 _REVIEWED_LOCATOR_ROLE_PATTERN = "|".join(_REVIEWED_LOCATOR_ROLES)
-_QUOTED_LOCATOR_NAME_PATTERN = r'''(?P<quoted>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+_QUOTED_LOCATOR_NAME_PATTERN = r"""(?P<quoted>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
 _REVIEWED_LOCATOR_EXAMPLES = (
     {"role": "textbox", "name": "Message"},
     'textbox[name="Message"]',
@@ -174,9 +174,7 @@ def _reviewed_locator_identities(
             flags=re.IGNORECASE,
         )
         if legacy is not None:
-            identities.append(
-                (legacy.group("role").casefold(), legacy.group("name").strip(" '\""))
-            )
+            identities.append((legacy.group("role").casefold(), legacy.group("name").strip(" '\"")))
     return tuple(dict.fromkeys(identities))
 
 
@@ -336,6 +334,33 @@ def _json_contains_exact(value: object, expected: str) -> bool:
 
 class BrowserSessionResolver(Protocol):
     def __call__(self, session_id: str) -> BrowserSession | Awaitable[BrowserSession]: ...
+
+
+async def _resolve_existing_browser_session(
+    resolver: BrowserSessionResolver,
+    session_id: str,
+) -> BrowserSession:
+    """Resolve a live browser context without creating or transferring one."""
+
+    owner = getattr(resolver, "__self__", None)
+    lookup = getattr(owner, "existing_for_tool", None)
+    if not callable(lookup):
+        lookup = getattr(resolver, "existing_for_tool", None)
+    if not callable(lookup):
+        raise BrowserBoundaryError(
+            "browser session resolver does not expose a side-effect-free existing-context lookup"
+        )
+    resolved = lookup(session_id)
+    session = await resolved if isawaitable(resolved) else resolved
+    context_id = getattr(session, "context_id", None)
+    if (
+        not isinstance(context_id, str)
+        or not context_id
+        or len(context_id) > 500
+        or "\x00" in context_id
+    ):
+        raise BrowserBoundaryError("browser session resolver returned an invalid live context")
+    return session  # type: ignore[return-value]
 
 
 class ReviewedBrowserAdapterResolver(Protocol):
@@ -601,6 +626,21 @@ _SPECS = {
     "browser_release": ("release", {}),
 }
 
+_GENERIC_TARGET_EFFECT_KINDS = frozenset(
+    {
+        "open_tab",
+        "navigate",
+        "click",
+        "fill",
+        "press",
+        "select",
+        "check",
+        "uncheck",
+        "hover",
+        "upload",
+    }
+)
+
 
 def _bounded_json_pointer_schema(value: object) -> dict[str, object]:
     """Expose bounded JSON shape without returning captured scalar values."""
@@ -669,9 +709,31 @@ class BrowserTool:
             },
         )
 
+    async def resolve_target_session_id(self, context: ToolContext) -> str:
+        """Resolve the physical browser context before durable effect admission."""
+
+        session = await _resolve_existing_browser_session(self._resolver, context.session_id)
+        return f"browser:{session.context_id}"
+
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
+        expected_target_session_id = getattr(context, "expected_target_session_id", None)
+        if (
+            expected_target_session_id is not None
+            and expected_target_session_id != f"browser:{session.context_id}"
+        ):
+            return ToolResult(
+                content="browser context changed after durable effect admission",
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "target_session_mismatch",
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "target_session_id": f"browser:{session.context_id}",
+                },
+            )
         kind, properties = _SPECS[self.name][:2]
         allowed = {*properties, "step", "timeout_ms"}
         required = {
@@ -688,9 +750,7 @@ class BrowserTool:
             )
         recall_key = (context.session_id, session.bounds.target_id)
         handoff_loader = (
-            getattr(self._recorder, "list_handoffs", None)
-            if self._recorder is not None
-            else None
+            getattr(self._recorder, "list_handoffs", None) if self._recorder is not None else None
         )
         reusable_handoff_count = 0
         if (
@@ -703,9 +763,7 @@ class BrowserTool:
             if reusable_handoffs:
                 reusable_handoff_count = len(reusable_handoffs)
         recalled_surface = (
-            self._recalled_recon.get(recall_key)
-            if self._recalled_recon is not None
-            else None
+            self._recalled_recon.get(recall_key) if self._recalled_recon is not None else None
         )
         requested_url = _string(arguments.get("url"))
         recalled_surface_mismatch = (
@@ -789,7 +847,15 @@ class BrowserTool:
             )
         state_scope: _BrowserStateScope | None = None
         session_recon_scope = False
+        before: BrowserObservation | None = None
+        before_url = ""
         before_refs: tuple[str, ...] = ()
+        transition_tab_ref = action.tab_ref
+        if kind == "open_tab" and context.campaign_id is not None and session.mode == "persistent":
+            transition_tab_ref = next(
+                (tab.tab_ref for tab in reversed(session.metadata().tabs) if tab.state == "open"),
+                "",
+            )
         if self._state_scope_store is not None:
             if context.campaign_id is None:
                 action_kind = _browser_action_kind(context, kind)
@@ -867,10 +933,32 @@ class BrowserTool:
                             "target_call_budget_charge": 0,
                         },
                     )
-            if action.tab_ref and kind != "open_tab":
+            if kind == "open_tab" and context.campaign_id is not None and not transition_tab_ref:
+                assert state_scope is not None
+                await state_scope.pause(
+                    MissingEvidenceReason.NOT_APPLICABLE,
+                    action_refs=action.evidence_refs,
+                    retryable=False,
+                )
+                return ToolResult(
+                    content=(
+                        "campaign browser_open_tab requires an existing reviewed persistent "
+                        "surface; create the initial tab during pre-campaign reconnaissance"
+                    ),
+                    is_error=True,
+                    metadata={
+                        "effect": self.effect,
+                        "failure_code": "campaign_open_tab_requires_existing_surface",
+                        "retryable": False,
+                        "reobserve_required": True,
+                        "target_effect_attempted": False,
+                        "target_call_budget_charge": 0,
+                    },
+                )
+            if transition_tab_ref:
                 try:
                     before = await session.snapshot(
-                        action.tab_ref, action.frame_ref, step=action.step
+                        transition_tab_ref, action.frame_ref, step=action.step
                     )
                 except Exception:
                     if state_scope is not None:
@@ -886,6 +974,7 @@ class BrowserTool:
                             "target_call_budget_charge": 0,
                         },
                     )
+                before_url = _browser_tab_url(session, transition_tab_ref)
                 before_refs = (_browser_evidence_ref("before", before),)
                 if self._recorder is not None:
                     try:
@@ -913,6 +1002,37 @@ class BrowserTool:
         recorded = action
         if action.redaction_status == "redacted":
             recorded = action.model_copy(update={"value": "[redacted]"})
+        transition_adapter, transition_adapter_digest = _browser_context_chat_adapter(
+            context,
+            target_id=str(session.bounds.target_id),
+        )
+        if (
+            state_scope is not None
+            and kind in _GENERIC_TARGET_EFFECT_KINDS
+            and transition_adapter is None
+        ):
+            await state_scope.pause(
+                MissingEvidenceReason.NOT_APPLICABLE,
+                before_refs=before_refs,
+                action_refs=action.evidence_refs,
+                retryable=False,
+            )
+            return ToolResult(
+                content=(
+                    "campaign browser mutation requires the exact sealed browser adapter; "
+                    "the target was not called and passive re-observation is required"
+                ),
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "compiled_browser_adapter_required",
+                    "retryable": False,
+                    "reobserve_required": True,
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "target_session_id": f"browser:{session.context_id}",
+                },
+            )
         if state_scope is not None:
             try:
                 await state_scope.lifecycle.ensure_authoritative_before(before_refs)
@@ -966,6 +1086,10 @@ class BrowserTool:
             )
         visual_evidence: tuple[dict[str, object], ...] = ()
         visual_capture_errors: tuple[str, ...] = ()
+        target_effect_completed = False
+        post_action_observation: BrowserObservation | None = None
+        post_action_ref: str | None = None
+        target_ui_transition: dict[str, object] | None = None
         try:
             if state_scope is not None:
                 await state_scope.lifecycle.acknowledge(
@@ -974,6 +1098,70 @@ class BrowserTool:
                 )
             async with asyncio.timeout(action.timeout_ms / 1_000):
                 observation = await session.act(action, actor_id=actor_id)
+            target_effect_completed = True
+            if (
+                state_scope is not None
+                and before is not None
+                and kind in _GENERIC_TARGET_EFFECT_KINDS
+            ):
+                transition_action = (
+                    action
+                    if action.tab_ref == transition_tab_ref
+                    else action.model_copy(update={"tab_ref": transition_tab_ref})
+                )
+                post_action_observation, after_url = await _browser_stabilized_after_snapshot(
+                    session,
+                    transition_action,
+                    before=before,
+                    before_url=before_url,
+                )
+                state_observations: list[dict[str, object]] = []
+                if transition_adapter is not None:
+                    state_observations, _ = _browser_rendered_state_observations(
+                        transition_adapter,
+                        before.text,
+                        post_action_observation.text,
+                        submitted_prompt=(
+                            action.value
+                            if kind in {"fill", "press", "select", "upload"}
+                            and action.value is not None
+                            else ""
+                        ),
+                    )
+                target_ui_transition = _browser_target_ui_transition(
+                    before,
+                    post_action_observation,
+                    before_url=before_url,
+                    after_url=after_url,
+                    adapter=transition_adapter,
+                    state_observations=state_observations,
+                )
+                if (
+                    target_ui_transition["material"] is not True
+                    and transition_adapter is not None
+                    and (
+                        kind in {"navigate", "open_tab"}
+                        or _browser_action_is_reviewed_submit(
+                            before,
+                            action=transition_action,
+                            adapter=transition_adapter,
+                            session=session,
+                        )
+                    )
+                ):
+                    # A same-URL navigation can still replace the browser's
+                    # client/session state while preserving the exact control
+                    # shape. Without an authenticated continuity proof every
+                    # admitted campaign navigation therefore invalidates the
+                    # reviewed surface, just like a reviewed submit whose
+                    # response can arrive after the bounded observation window.
+                    target_ui_transition = _browser_unknown_after_transition(
+                        before,
+                        before_url=before_url,
+                        adapter=transition_adapter,
+                        action=action,
+                    )
+                post_action_ref = _browser_evidence_ref("after", post_action_observation)
             if (
                 kind == "snapshot"
                 and observation.kind == "snapshot"
@@ -998,12 +1186,34 @@ class BrowserTool:
                     )
         except BaseException as error:
             self._failures[fingerprint] = self._failures.get(fingerprint, 0) + 1
+            target_effect_dispatched = target_effect_completed or (
+                kind in _GENERIC_TARGET_EFFECT_KINDS
+                and _browser_effect_was_dispatched(session, action)
+            )
+            uncertain_after_transition = (
+                _browser_unknown_after_transition(
+                    before,
+                    before_url=before_url,
+                    adapter=transition_adapter,
+                    action=action,
+                )
+                if target_effect_dispatched
+                and before is not None
+                and kind in _GENERIC_TARGET_EFFECT_KINDS
+                and transition_adapter is not None
+                and transition_adapter_digest is not None
+                else None
+            )
             if state_scope is not None:
                 # The action was acknowledged before dispatch. Settle that fact
                 # first so cancellation or best-effort diagnostic failures cannot
                 # leave a permanently acknowledged campaign scope behind.
                 await state_scope.pause(
-                    MissingEvidenceReason.TRANSPORT_FAILED,
+                    (
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE
+                        if target_effect_dispatched
+                        else MissingEvidenceReason.TRANSPORT_FAILED
+                    ),
                     before_refs=before_refs,
                     action_refs=action.evidence_refs,
                 )
@@ -1047,9 +1257,23 @@ class BrowserTool:
                         )
                     }
             if self._recorder is not None:
-                await self._recorder.save_metadata(session.metadata(restart=True))
+                try:
+                    await self._recorder.save_metadata(session.metadata(restart=True))
+                except Exception as recorder_error:
+                    # Diagnostics are best effort after the acknowledged scope
+                    # has already been paused. A recorder failure must not
+                    # suppress the authoritative unknown-after receipt.
+                    if diagnostics is None:
+                        diagnostics = {}
+                    diagnostics["recording_error_type"] = (
+                        f"{type(recorder_error).__module__}.{type(recorder_error).__qualname__}"
+                    )
             category = (
-                "browser_boundary"
+                "browser_state_capture_failed"
+                if target_effect_completed
+                else "browser_effect_outcome_unknown"
+                if target_effect_dispatched
+                else "browser_boundary"
                 if isinstance(error, BrowserBoundaryError)
                 else "browser_action_failed"
             )
@@ -1093,6 +1317,32 @@ class BrowserTool:
                     "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
                     "retryable": True,
                     **(
+                        {
+                            "target_ui_transition": uncertain_after_transition,
+                            "preferred_next_tool": "browser_snapshot",
+                            "preferred_next_tool_mode": "strict",
+                            "campaign_id": context.campaign_id,
+                            "target_profile_id": str(session.bounds.target_id),
+                            "compiled_adapter_digest": transition_adapter_digest,
+                            "evidence_refs": uncertain_after_transition["evidence_refs"],
+                        }
+                        if uncertain_after_transition is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "failure_code": (
+                                "post_effect_state_capture_failed"
+                                if target_effect_completed
+                                else "target_effect_outcome_unknown"
+                            ),
+                            "target_effect_attempted": True,
+                            "target_call_budget_charge": 1,
+                        }
+                        if target_effect_dispatched
+                        else {}
+                    ),
+                    **(
                         {"diagnostic_screenshot": diagnostics["screenshot"]}
                         if diagnostics is not None and "screenshot" in diagnostics
                         else {}
@@ -1105,31 +1355,102 @@ class BrowserTool:
         if kind == "close_tab":
             await session.release_actor(actor_id)
         if self._recorder is not None:
-            visual_refs = {
-                str(item["evidence_ref"])
-                for item in visual_evidence
-                if isinstance(item.get("evidence_ref"), str)
-            }
-            for item in visual_evidence:
-                reference = str(item["evidence_ref"])
-                await self._recorder.record_evidence(
-                    action.context_id,
-                    reference,
-                    "browser_visual_evidence",
-                    item,
+            try:
+                visual_refs = {
+                    str(item["evidence_ref"])
+                    for item in visual_evidence
+                    if isinstance(item.get("evidence_ref"), str)
+                }
+                for item in visual_evidence:
+                    reference = str(item["evidence_ref"])
+                    await self._recorder.record_evidence(
+                        action.context_id,
+                        reference,
+                        "browser_visual_evidence",
+                        item,
+                    )
+                for reference in observation.evidence_refs:
+                    if reference in visual_refs:
+                        continue
+                    await self._recorder.record_evidence(
+                        action.context_id,
+                        reference,
+                        "browser_action",
+                        recorded.model_dump(mode="json"),
+                    )
+                await self._recorder.append_observation(observation)
+                if post_action_observation is not None and post_action_ref is not None:
+                    await self._recorder.record_evidence(
+                        action.context_id,
+                        post_action_ref,
+                        "browser_after_snapshot",
+                        post_action_observation.model_dump(mode="json"),
+                    )
+                    await self._recorder.append_observation(post_action_observation)
+                await self._recorder.save_metadata(session.metadata(restart=True))
+            except BaseException as recorder_error:
+                guarded_effect = bool(
+                    state_scope is not None
+                    and target_effect_completed
+                    and before is not None
+                    and kind in _GENERIC_TARGET_EFFECT_KINDS
+                    and transition_adapter is not None
+                    and transition_adapter_digest is not None
                 )
-            for reference in observation.evidence_refs:
-                if reference in visual_refs:
-                    continue
-                await self._recorder.record_evidence(
-                    action.context_id,
-                    reference,
-                    "browser_action",
-                    recorded.model_dump(mode="json"),
+                uncertain_after_transition = (
+                    _browser_unknown_after_transition(
+                        before,
+                        before_url=before_url,
+                        adapter=transition_adapter,
+                        action=action,
+                    )
+                    if guarded_effect and before is not None and transition_adapter is not None
+                    else None
                 )
-            await self._recorder.append_observation(observation)
-            await self._recorder.save_metadata(session.metadata(restart=True))
-        content = observation.model_dump_json()
+                if state_scope is not None:
+                    # Recording is secondary to releasing the acknowledged
+                    # physical-state lease. The returned transition receipt is
+                    # the runtime barrier; the durable Lead obligation is
+                    # derived from that receipt rather than a partial evidence
+                    # write from this recorder.
+                    await state_scope.pause(
+                        MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                        before_refs=before_refs,
+                        action_refs=action.evidence_refs,
+                    )
+                    state_scope = None
+                if not isinstance(recorder_error, Exception):
+                    raise
+                if uncertain_after_transition is None:
+                    raise
+                return ToolResult(
+                    content=(
+                        "post_effect_recording_failed: the browser effect completed but "
+                        "durable evidence recording failed; passive re-observation is required"
+                    ),
+                    is_error=True,
+                    metadata={
+                        "effect": self.effect,
+                        "target": session.bounds.target_id,
+                        "target_session_id": f"browser:{session.context_id}",
+                        "error_type": (
+                            f"{type(recorder_error).__module__}.{type(recorder_error).__qualname__}"
+                        ),
+                        "failure_code": "post_effect_recording_failed",
+                        "retryable": True,
+                        "target_effect_attempted": True,
+                        "target_call_budget_charge": 1,
+                        "target_ui_transition": uncertain_after_transition,
+                        "preferred_next_tool": "browser_snapshot",
+                        "preferred_next_tool_mode": "strict",
+                        "campaign_id": context.campaign_id,
+                        "target_profile_id": str(session.bounds.target_id),
+                        "compiled_adapter_digest": transition_adapter_digest,
+                        "evidence_refs": uncertain_after_transition["evidence_refs"],
+                    },
+                )
+        result_observation = post_action_observation or observation
+        content = result_observation.model_dump_json()
         network_delta_metadata: dict[str, object] | None = None
         if kind == "network_events":
             try:
@@ -1205,8 +1526,42 @@ class BrowserTool:
             "target": session.bounds.target_id,
             "target_session_id": f"browser:{session.context_id}",
             "browser_action": recorded.model_dump(mode="json"),
-            "evidence_refs": list(observation.evidence_refs),
+            "evidence_refs": list(
+                dict.fromkeys(
+                    (
+                        *observation.evidence_refs,
+                        *((post_action_ref,) if post_action_ref is not None else ()),
+                    )
+                )
+            ),
         }
+        if (
+            state_scope is not None
+            and kind in _GENERIC_TARGET_EFFECT_KINDS
+            and transition_adapter_digest is not None
+        ):
+            metadata.update(
+                {
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "campaign_id": context.campaign_id,
+                    "compiled_adapter_digest": transition_adapter_digest,
+                    "target_profile_id": str(session.bounds.target_id),
+                }
+            )
+        if target_ui_transition is not None:
+            # Retain a bounded authenticated unchanged receipt as positive
+            # evidence for crash recovery. Runtime admission deliberately
+            # ignores material=false, reobservation=false transitions, while
+            # durable recovery can distinguish them from a missing receipt.
+            metadata["target_ui_transition"] = target_ui_transition
+            if target_ui_transition["material"] is True:
+                metadata.update(
+                    {
+                        "preferred_next_tool": "browser_snapshot",
+                        "preferred_next_tool_mode": "strict",
+                    }
+                )
         if visual_evidence:
             metadata["visual_evidence"] = list(visual_evidence)
             metadata["visual_review_pending"] = True
@@ -1243,9 +1598,7 @@ class BrowserTool:
             )
         exchange_loader = getattr(session, "api_exchange_events", None)
         api_exchanges = exchange_loader() if callable(exchange_loader) else ()
-        probe_exchange_ready = any(
-            _probe_linked_api_exchange(event) for event in api_exchanges
-        )
+        probe_exchange_ready = any(_probe_linked_api_exchange(event) for event in api_exchanges)
         recalled_recon_active = (
             self._recalled_recon is not None and recall_key in self._recalled_recon
         )
@@ -1265,12 +1618,19 @@ class BrowserTool:
                 "session ownership."
             )
         if state_scope is not None:
+            transition_disposition = (
+                _browser_transition_disposition(target_ui_transition)
+                if target_ui_transition is not None
+                else "unchanged"
+            )
             await state_scope.settle(
                 before_refs=before_refs,
                 action_refs=action.evidence_refs,
                 response_refs=observation.evidence_refs,
-                after_refs=observation.evidence_refs,
-                transition_disposition="unchanged",
+                after_refs=(
+                    (post_action_ref,) if post_action_ref is not None else observation.evidence_refs
+                ),
+                transition_disposition=transition_disposition,
                 cleanup_disposition=("completed" if kind == "close_tab" else "retained"),
             )
             metadata["state_scope_id"] = state_scope.lifecycle.scope_id
@@ -1896,9 +2256,7 @@ class ApiReconHandoffTool:
                             },
                             {
                                 "if": {
-                                    "properties": {
-                                        "value_type": {"enum": ["string", "boolean"]}
-                                    },
+                                    "properties": {"value_type": {"enum": ["string", "boolean"]}},
                                     "required": ["value_type"],
                                 },
                                 "then": {
@@ -1976,9 +2334,7 @@ class ApiReconHandoffTool:
                         "type": "object",
                         "properties": {
                             "step_id": {"type": "string", "minLength": 1},
-                            "tool": {
-                                "enum": ["browser_fill", "browser_click", "browser_press"]
-                            },
+                            "tool": {"enum": ["browser_fill", "browser_click", "browser_press"]},
                             "arguments": {
                                 "type": "object",
                                 "properties": {"locator": reviewed_locator_schema},
@@ -2328,9 +2684,7 @@ class ApiReconHandoffTool:
                     default_role=default_role,
                 )
                 source_index = step.source_index if step.source_index is not None else index
-                field = (
-                    f"reusable_adapter.browser_steps[{source_index}].arguments.locator"
-                )
+                field = f"reusable_adapter.browser_steps[{source_index}].arguments.locator"
                 if step_irreducibly_ambiguous:
                     if not locator_repeats_contract_failure:
                         ambiguous_fields.append(field)
@@ -2529,9 +2883,7 @@ class ApiReconHandoffTool:
                 },
             )
         if surface_generation_receipt is not None:
-            identity = "|".join(
-                (identity, str(surface_generation_receipt["evidence_ref"]))
-            )
+            identity = "|".join((identity, str(surface_generation_receipt["evidence_ref"])))
         try:
             handoff = ApiReconHandoff(
                 id=f"handoff:{uuid5(NAMESPACE_URL, identity)}",
@@ -2550,9 +2902,7 @@ class ApiReconHandoffTool:
                 reusable_site_facts=reusable_site_facts,
                 recon_scope=recon_scope,
                 recon_observations=(
-                    (surface_generation_receipt,)
-                    if surface_generation_receipt is not None
-                    else ()
+                    (surface_generation_receipt,) if surface_generation_receipt is not None else ()
                 ),
             )
             await self._recorder.record_handoff(handoff)
@@ -2560,9 +2910,9 @@ class ApiReconHandoffTool:
             return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
         metadata: dict[str, object] = {"effect": self.effect, "target": handoff.target_id}
         if surface_generation_receipt is not None:
-            metadata["target_surface_generation_evidence_ref"] = (
-                surface_generation_receipt["evidence_ref"]
-            )
+            metadata["target_surface_generation_evidence_ref"] = surface_generation_receipt[
+                "evidence_ref"
+            ]
         if handoff_uncertainties:
             metadata["evaluation_uncertainties"] = handoff_uncertainties
         if derived_handoff is not None:
@@ -2622,6 +2972,30 @@ class BrowserCheckpointStore(Protocol):
     def mark_objective_gate_checkpoint_restored(
         self, *args: Any, **kwargs: Any
     ) -> Mapping[str, object]: ...
+
+
+async def _browser_finish_scope_despite_cancellation(operation: Awaitable[None]) -> None:
+    """Finish one acknowledged scope transition before propagating cancellation.
+
+    Browser effects can already be visible when the caller is cancelled.  A
+    shield alone is insufficient because repeated ``Task.cancel()`` calls can
+    interrupt each successive await.  Run settlement and lease release in one
+    child task, remember every outer cancellation, and propagate cancellation
+    only after that child reaches a terminal state.
+    """
+
+    completion = asyncio.create_task(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not completion.done():
+        try:
+            await asyncio.shield(completion)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    # Settlement/release failures take precedence: callers must not mistake a
+    # failed durable transition for a clean cancellation.
+    completion.result()
+    if cancellation is not None:
+        raise cancellation
 
 
 @dataclass(slots=True)
@@ -2699,16 +3073,19 @@ class _BrowserStateScope:
         action_refs: tuple[str, ...] = (),
         retryable: bool = True,
     ) -> None:
-        try:
-            await self.lifecycle.pause(
-                before_refs=before_refs,
-                action_refs=action_refs,
-                reason=reason.value,
-                retryable=retryable,
-                isolation_disposition=self.isolation_disposition,
-            )
-        finally:
-            await self.close()
+        async def finish() -> None:
+            try:
+                await self.lifecycle.pause(
+                    before_refs=before_refs,
+                    action_refs=action_refs,
+                    reason=reason.value,
+                    retryable=retryable,
+                    isolation_disposition=self.isolation_disposition,
+                )
+            finally:
+                await self.close()
+
+        await _browser_finish_scope_despite_cancellation(finish())
 
     async def settle(
         self,
@@ -2720,18 +3097,21 @@ class _BrowserStateScope:
         transition_disposition: str,
         cleanup_disposition: str = "retained",
     ) -> None:
-        try:
-            await self.lifecycle.settle(
-                before_refs=before_refs,
-                action_refs=action_refs,
-                response_refs=response_refs,
-                after_refs=after_refs,
-                transition_disposition=transition_disposition,
-                isolation_disposition=self.isolation_disposition,
-                cleanup_disposition=cleanup_disposition,
-            )
-        finally:
-            await self.close()
+        async def finish() -> None:
+            try:
+                await self.lifecycle.settle(
+                    before_refs=before_refs,
+                    action_refs=action_refs,
+                    response_refs=response_refs,
+                    after_refs=after_refs,
+                    transition_disposition=transition_disposition,
+                    isolation_disposition=self.isolation_disposition,
+                    cleanup_disposition=cleanup_disposition,
+                )
+            finally:
+                await self.close()
+
+        await _browser_finish_scope_despite_cancellation(finish())
 
     async def close(self) -> None:
         release = self.store.release_state_scope_lease  # type: ignore[attr-defined]
@@ -2946,12 +3326,7 @@ def _browser_action_kind(context: ToolContext, kind: str) -> StateScopeActionKin
 def _browser_experiment_id(context: ToolContext, fallback: str) -> str:
     """Keep every surface action for one scheduler experiment on one lane."""
 
-    return str(
-        context.technique_attempt_id
-        or context.attempt_id
-        or context.agent_id
-        or fallback
-    )
+    return str(context.technique_attempt_id or context.attempt_id or context.agent_id or fallback)
 
 
 def _checkpoint_context(context: ToolContext) -> tuple[str, str, str, str] | None:
@@ -3434,9 +3809,7 @@ def _browser_rendered_state_observations(
                 phase_evidence_refs.get(phase) if phase_evidence_refs is not None else None
             )
             emitted_evidence_ref = (
-                rendered_text_evidence_ref
-                if phase_evidence_refs is None
-                else phase_evidence_ref
+                rendered_text_evidence_ref if phase_evidence_refs is None else phase_evidence_ref
             )
             phase_text_digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
             value, error = _browser_rendered_value(
@@ -3499,8 +3872,10 @@ def _browser_redact_rendered_text(text: str, secret: str | None) -> str:
 
 def _browser_reviewed_control_states(
     observation: BrowserObservation,
-    adapter: BrowserChat,
+    adapter: BrowserChat | None,
 ) -> list[dict[str, object]]:
+    if adapter is None:
+        return []
     states: list[dict[str, object]] = []
     for name, locator, role in (
         ("input", adapter.interaction.input_locator, "textbox"),
@@ -3528,7 +3903,7 @@ def _browser_surface_snapshot(
     observation: BrowserObservation,
     *,
     url: str,
-    adapter: BrowserChat,
+    adapter: BrowserChat | None,
     text_limit: int = 2_000,
     control_limit: int = 40,
 ) -> dict[str, object]:
@@ -3549,7 +3924,7 @@ def _browser_surface_snapshot(
         for element in observation.elements[:control_limit]
     ]
     current_state: list[dict[str, object]] = []
-    for definition in adapter.interaction.state_observations:
+    for definition in adapter.interaction.state_observations if adapter is not None else ():
         value, error = _browser_rendered_value(
             observation.text,
             definition.capture,
@@ -3564,12 +3939,17 @@ def _browser_surface_snapshot(
                     "value_type": definition.value_type,
                 }
             )
-    reviewed_refs = {
-        item.ref
-        for locator, role in (
+    reviewed_locators = (
+        (
             (adapter.interaction.input_locator, "textbox"),
             (adapter.interaction.submit_action, "button"),
         )
+        if adapter is not None
+        else ()
+    )
+    reviewed_refs = {
+        item.ref
+        for locator, role in reviewed_locators
         for item in _matching_reviewed_elements(observation, locator, default_role=role)
     }
     stable_controls: list[dict[str, object]] = []
@@ -3677,13 +4057,244 @@ def _browser_response_snapshot_signature(
     return (url, observation.kind, observation.frame_ref, tuple(controls))
 
 
+def _browser_context_chat_adapter(
+    context: ToolContext,
+    *,
+    target_id: str,
+) -> tuple[BrowserChat | None, str | None]:
+    """Return only a sealed browser adapter whose semantic identity still verifies."""
+
+    if (
+        context.compiled_adapter is None
+        or context.compiled_adapter_digest is None
+        or context.target_id != target_id
+    ):
+        return None, None
+    try:
+        compilation = read_target_adapter(context.compiled_adapter)
+    except AdapterCompileError:
+        return None, None
+    observed_digest = compiled_target_adapter_digest(compilation)
+    executable = compilation.executable
+    if observed_digest != context.compiled_adapter_digest or not isinstance(
+        executable, BrowserChat
+    ):
+        return None, None
+    return executable, observed_digest
+
+
+def _browser_tab_url(session: BrowserSession, tab_ref: str, fallback: str = "") -> str:
+    return next(
+        (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
+        fallback,
+    )
+
+
+def _browser_effect_was_dispatched(session: BrowserSession, action: BrowserAction) -> bool:
+    probe = getattr(session, "effect_was_dispatched", None)
+    if not callable(probe):
+        return False
+    try:
+        return probe(action) is True
+    except Exception:
+        return False
+
+
+async def _browser_stabilized_after_snapshot(
+    session: BrowserSession,
+    action: BrowserAction,
+    *,
+    before: BrowserObservation,
+    before_url: str,
+) -> tuple[BrowserObservation, str]:
+    """Capture a bounded, structurally settled post-effect DOM observation."""
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    observation_horizon = min(2.0, max(1.5, action.timeout_ms / 10_000))
+    deadline = started + observation_horizon
+
+    async def snapshot_before_deadline() -> BrowserObservation:
+        if loop.time() >= deadline:
+            raise TimeoutError("post-effect browser state did not settle before the deadline")
+        # Bound every individual DOM read as well as the overall stabilization
+        # horizon. A wedged frame must not turn a generic effect into an
+        # unbounded wait after the target has already acknowledged it.
+        per_snapshot_timeout = min(0.75, max(0.25, action.timeout_ms / 1_000))
+        async with asyncio.timeout(per_snapshot_timeout):
+            return await session.snapshot(action.tab_ref, action.frame_ref, step=action.step)
+
+    after = await snapshot_before_deadline()
+    after_url = _browser_tab_url(session, action.tab_ref, before_url)
+    signature = _browser_response_snapshot_signature(after, after_url)
+    baseline_signature = _browser_response_snapshot_signature(before, before_url)
+    change_observed = after.text != before.text or signature != baseline_signature
+    stable_since = loop.time()
+    while loop.time() < deadline:
+        await asyncio.sleep(min(0.2, max(0.0, deadline - loop.time())))
+        if loop.time() >= deadline:
+            break
+        candidate = await snapshot_before_deadline()
+        candidate_url = _browser_tab_url(session, action.tab_ref, after_url)
+        candidate_signature = _browser_response_snapshot_signature(candidate, candidate_url)
+        if candidate.text != after.text or candidate_signature != signature:
+            after = candidate
+            after_url = candidate_url
+            signature = candidate_signature
+            change_observed = True
+            stable_since = loop.time()
+            continue
+        if change_observed and loop.time() - stable_since >= 0.2:
+            break
+    return after, after_url
+
+
+def _browser_transition_disposition(transition: Mapping[str, object]) -> str:
+    if transition.get("material") is not True:
+        return "unchanged"
+    boundaries = {
+        item.get("boundary")
+        for item in transition.get("reviewed_state_changes", ())
+        if isinstance(item, Mapping) and item.get("boundary") in {"stage", "success", "failure"}
+    }
+    if boundaries == {"success"}:
+        return "terminal_success"
+    if boundaries == {"failure"}:
+        return "terminal_failure"
+    if boundaries == {"stage"}:
+        return "progress"
+    return "ambiguous"
+
+
+def _browser_action_is_reviewed_submit(
+    before: BrowserObservation,
+    *,
+    action: BrowserAction,
+    adapter: BrowserChat,
+    session: BrowserSession,
+) -> bool:
+    """Match only the sealed submit control or Enter on the sealed input control."""
+
+    if action.kind == "click":
+        reviewed = _matching_reviewed_elements(
+            before,
+            adapter.interaction.submit_action,
+            default_role="button",
+        )
+    elif action.kind == "press" and action.value in {"Enter", "NumpadEnter"}:
+        reviewed = _matching_reviewed_elements(
+            before,
+            adapter.interaction.input_locator,
+            default_role="textbox",
+        )
+    else:
+        return False
+    if any(
+        item.ref == action.element_ref
+        and (action.frame_ref is None or item.frame_ref == action.frame_ref)
+        for item in reviewed
+    ):
+        return True
+    identity_probe = getattr(session, "element_identity", None)
+    if not callable(identity_probe):
+        return False
+    identity = identity_probe(action.element_ref)
+    if not isinstance(identity, tuple) or len(identity) != 3:
+        return False
+    role, name, frame_ref = identity
+    return any(
+        item.role.casefold() == str(role).casefold()
+        and _normalized_accessible_name(item.name) == _normalized_accessible_name(str(name))
+        and item.frame_ref == frame_ref
+        for item in reviewed
+    )
+
+
+def _browser_unknown_after_transition(
+    before: BrowserObservation,
+    *,
+    before_url: str,
+    adapter: BrowserChat,
+    action: BrowserAction,
+) -> dict[str, object]:
+    """Describe an acknowledged mutation whose post-effect state could not be captured."""
+
+    before_surface = _browser_surface_snapshot(before, url=before_url, adapter=adapter)
+    before_digest = str(before_surface["surface_fingerprint"])
+    action_refs = sorted(str(item) for item in action.evidence_refs if str(item))
+    after_digest = _digest_json(
+        {
+            "state": "unknown_after_acknowledged_browser_effect",
+            "before_digest": before_digest,
+            "action_kind": action.kind,
+            "action_refs": action_refs,
+        }
+    )
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": before_digest,
+        "after_digest": after_digest,
+        "transition_digest": _digest_json([before_digest, after_digest]),
+        "changed_dimensions": ["after_state_unavailable"],
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "evidence_refs": list(
+            dict.fromkeys((_browser_evidence_ref("before", before), *action_refs))
+        )[:8],
+        "reobservation_recommended": True,
+    }
+
+
+def _browser_unknown_after_exchange_transition(
+    before: BrowserObservation,
+    *,
+    before_url: str,
+    adapter: BrowserChat,
+    action_ref: str,
+) -> dict[str, object]:
+    """Describe a compiled submit whose delayed response is not yet observable."""
+
+    before_surface = _browser_surface_snapshot(before, url=before_url, adapter=adapter)
+    before_digest = str(before_surface["surface_fingerprint"])
+    after_digest = _digest_json(
+        {
+            "state": "unknown_after_acknowledged_compiled_exchange",
+            "before_digest": before_digest,
+            "action_ref": action_ref,
+        }
+    )
+    return {
+        "schema": "merlin.target-ui-transition.v1",
+        "material": True,
+        "adapter_stale": True,
+        "before_digest": before_digest,
+        "after_digest": after_digest,
+        "transition_digest": _digest_json([before_digest, after_digest]),
+        "changed_dimensions": ["after_state_unavailable"],
+        "added_controls": [],
+        "removed_controls": [],
+        "controls_truncated": False,
+        "reviewed_state_changes": [],
+        "state_changes_truncated": False,
+        "evidence_refs": list(
+            dict.fromkeys((_browser_evidence_ref("before", before), action_ref))
+        ),
+        "reobservation_recommended": True,
+    }
+
+
 def _browser_target_ui_transition(
     before: BrowserObservation,
     after: BrowserObservation,
     *,
     before_url: str,
     after_url: str,
-    adapter: BrowserChat,
+    adapter: BrowserChat | None,
     state_observations: Sequence[Mapping[str, object]],
     control_limit: int = 20,
     text_line_limit: int = 20,
@@ -3723,13 +4334,18 @@ def _browser_target_ui_transition(
     after_counts = Counter(control_key(item) for item in after.elements)
     before_controls = {control_key(item): control_value(item) for item in before.elements}
     after_controls = {control_key(item): control_value(item) for item in after.elements}
-    reviewed_control_keys = {
-        control_key(item)
-        for observation in (before, after)
-        for locator, role in (
+    reviewed_locators = (
+        (
             (adapter.interaction.input_locator, "textbox"),
             (adapter.interaction.submit_action, "button"),
         )
+        if adapter is not None
+        else ()
+    )
+    reviewed_control_keys = {
+        control_key(item)
+        for observation in (before, after)
+        for locator, role in reviewed_locators
         for item in _matching_reviewed_elements(observation, locator, default_role=role)
     }
     structural_control_keys = {
@@ -3825,9 +4441,7 @@ def _browser_target_ui_transition(
     ]
     url_change = {"before": before_url, "after": after_url} if before_url != after_url else None
     title_change = (
-        {"before": before.title, "after": after.title}
-        if before.title != after.title
-        else None
+        {"before": before.title, "after": after.title} if before.title != after.title else None
     )
     frame_change = (
         {
@@ -4022,6 +4636,23 @@ def _browser_endpoint_identity(value: str) -> tuple[str, str, str, str, str]:
     )
 
 
+class _BrowserChatEffectGuard:
+    """Track the outer compiled exchange across its submit boundary."""
+
+    def __init__(self) -> None:
+        self.state_scope: _BrowserStateScope | None = None
+        self.resource_reservations: list[tuple[str, object]] = []
+        self.resources_acknowledged = False
+        self.dispatched = False
+        self.before: BrowserObservation | None = None
+        self.before_url = ""
+        self.before_ref = ""
+        self.action_ref = ""
+        self.adapter: BrowserChat | None = None
+        self.adapter_metadata: dict[str, object] = {}
+        self.session: BrowserSession | None = None
+
+
 class BrowserChatExchangeTool:
     """Execute the reviewed fill/submit browser flow without another model turn."""
 
@@ -4083,7 +4714,84 @@ class BrowserChatExchangeTool:
             target_delivery=TargetDeliveryClass.DIRECT_USER_CHANNEL,
         )
 
+    async def resolve_target_session_id(self, context: ToolContext) -> str:
+        """Resolve the physical browser context before durable effect admission."""
+
+        session = await _resolve_existing_browser_session(self._resolver, context.session_id)
+        return f"browser:{session.context_id}"
+
     async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+        guard = _BrowserChatEffectGuard()
+        try:
+            return await self._invoke(context, arguments, guard)
+        except BaseException as error:
+            scope = guard.state_scope
+            if scope is not None and not scope.lifecycle.finished:
+
+                async def finish_scope() -> None:
+                    try:
+                        if guard.resources_acknowledged:
+                            await scope.settle_resources(guard.resource_reservations)
+                        else:
+                            await scope.release_resources(guard.resource_reservations)
+                    finally:
+                        if not scope.lifecycle.finished:
+                            await scope.pause(
+                                (
+                                    MissingEvidenceReason.CAPTURE_INCOMPLETE
+                                    if guard.dispatched
+                                    else MissingEvidenceReason.TRANSPORT_FAILED
+                                ),
+                                before_refs=((guard.before_ref,) if guard.before_ref else ()),
+                                action_refs=((guard.action_ref,) if guard.action_ref else ()),
+                            )
+
+                await _browser_finish_scope_despite_cancellation(finish_scope())
+            if not isinstance(error, Exception) or not guard.dispatched:
+                raise
+            if (
+                guard.before is None
+                or guard.adapter is None
+                or guard.session is None
+                or not guard.action_ref
+            ):
+                raise
+            transition = _browser_unknown_after_exchange_transition(
+                guard.before,
+                before_url=guard.before_url,
+                adapter=guard.adapter,
+                action_ref=guard.action_ref,
+            )
+            return ToolResult(
+                content=(
+                    "compiled_browser_exchange_outcome_unknown: the reviewed submit was "
+                    "dispatched but its post-effect evidence could not be completed; passive "
+                    "re-observation is required"
+                ),
+                is_error=True,
+                metadata={
+                    **guard.adapter_metadata,
+                    "failure_code": "compiled_exchange_outcome_unknown",
+                    "retryable": True,
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "limit_interaction_count": 1,
+                    "target_session_id": f"browser:{guard.session.context_id}",
+                    "target_ui_transition": transition,
+                    "preferred_next_tool": "browser_snapshot",
+                    "preferred_next_tool_mode": "strict",
+                    "error_type": (
+                        f"{type(error).__module__}.{type(error).__qualname__}"
+                    ),
+                },
+            )
+
+    async def _invoke(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        guard: _BrowserChatEffectGuard,
+    ) -> ToolResult:
         if context.campaign_id is None:
             return ToolResult(
                 content="compiled browser flow requires an active reviewed campaign",
@@ -4100,6 +4808,20 @@ class BrowserChatExchangeTool:
             )
         session_value = self._resolver(context.session_id)
         session = await session_value if isawaitable(session_value) else session_value
+        expected_target_session_id = getattr(context, "expected_target_session_id", None)
+        if (
+            expected_target_session_id is not None
+            and expected_target_session_id != f"browser:{session.context_id}"
+        ):
+            return _adapter_state_integrity_result(
+                "browser context changed after durable effect admission",
+                effect=self.effect,
+                expected=str(expected_target_session_id),
+                observed=f"browser:{session.context_id}",
+                identity_field="target_session_id",
+                failure_code="target_session_mismatch",
+            )
+        guard.session = session
         session_target_id = str(session.bounds.target_id)
         if context.target_id is not None and context.target_id != session_target_id:
             return _adapter_state_integrity_result(
@@ -4197,6 +4919,8 @@ class BrowserChatExchangeTool:
             "compiled_adapter_digest": compiled_adapter_digest,
             "target_profile_id": session_target_id,
         }
+        guard.adapter = executable_adapter
+        guard.adapter_metadata = adapter_identity_metadata
         compilation_uncertainties = _compilation_uncertainties(canonical_compilation)
         prompt = str(arguments["prompt"])
         if self._state_scope_store is None:
@@ -4244,6 +4968,7 @@ class BrowserChatExchangeTool:
                     "target_call_budget_charge": 0,
                 },
             )
+        guard.state_scope = state_scope
         resource_block = await state_scope.preflight_resource_block(executable_adapter)
         if resource_block is not None:
             await state_scope.pause(MissingEvidenceReason.NOT_YET_OBSERVED)
@@ -4319,9 +5044,7 @@ class BrowserChatExchangeTool:
                 _resolve_reviewed_element(
                     observation,
                     compiled_step.arguments.get("locator"),
-                    default_role=(
-                        "button" if compiled_step.tool == "browser_click" else "textbox"
-                    ),
+                    default_role=("button" if compiled_step.tool == "browser_click" else "textbox"),
                 )
                 is not None
                 for compiled_step in executable_adapter.steps
@@ -4368,8 +5091,7 @@ class BrowserChatExchangeTool:
                         item
                         for item in compatible_tabs
                         if item[0] == affinity["tab_ref"]
-                        and _browser_endpoint_identity(open_tab_urls[item[0]])
-                        == endpoint_identity
+                        and _browser_endpoint_identity(open_tab_urls[item[0]]) == endpoint_identity
                     ]
                     reviewed_affinity_status = "stale"
                     if len(reviewed_tabs) == 1:
@@ -4388,9 +5110,7 @@ class BrowserChatExchangeTool:
         if len(compatible_tabs) != 1:
             compatible_tab_count = len(compatible_tabs)
             failure_code = (
-                "target_tab_unavailable"
-                if compatible_tab_count == 0
-                else "ambiguous_target_tabs"
+                "target_tab_unavailable" if compatible_tab_count == 0 else "ambiguous_target_tabs"
             )
             await state_scope.pause(MissingEvidenceReason.SELECTOR_UNAVAILABLE)
             surface_snapshots = [
@@ -4537,6 +5257,9 @@ class BrowserChatExchangeTool:
         adapter_identity_metadata["tab_resolution"] = tab_resolution
         before_url = next(tab.url for tab in open_tabs if tab.tab_ref == tab_ref)
         before_ref = _browser_evidence_ref("before", current)
+        guard.before = current
+        guard.before_url = before_url
+        guard.before_ref = before_ref
         try:
             await state_scope.lifecycle.ensure_authoritative_before((before_ref,))
         except BaseException:
@@ -4548,6 +5271,7 @@ class BrowserChatExchangeTool:
         action_ref = _browser_evidence_ref(
             "action", {"adapter_digest": compiled_adapter_digest, "prompt": prompt}
         )
+        guard.action_ref = action_ref
         checkpoint_contract = (
             executable_adapter.state_capabilities.checkpoint
             if executable_adapter.state_capabilities is not None
@@ -4659,6 +5383,7 @@ class BrowserChatExchangeTool:
                         }
                     )
                 return None
+
         checkpoint_receipt: dict[str, object] | None = None
         restore_claimed = False
         restore_secret: str | None = None
@@ -4812,6 +5537,7 @@ class BrowserChatExchangeTool:
                     "wake_at": error.status.get("wake_at"),
                 },
             )
+        guard.resource_reservations = resource_reservations
         results: list[ToolResult] = []
         fill_step: tuple[str, str | None, str] | None = None
         resources_acknowledged = False
@@ -4828,9 +5554,7 @@ class BrowserChatExchangeTool:
         submit_started: float | None = None
         submit_completed: float | None = None
         last_input_fill_index = max(
-            index
-            for index, (name, _, _, _) in enumerate(executable)
-            if name == "browser_fill"
+            index for index, (name, _, _, _) in enumerate(executable) if name == "browser_fill"
         )
         submit_step_indices = [
             index
@@ -4843,8 +5567,7 @@ class BrowserChatExchangeTool:
             submit_step_indices = [
                 index
                 for index, (name, _, _, _) in enumerate(executable)
-                if index > last_input_fill_index
-                and name in {"browser_click", "browser_press"}
+                if index > last_input_fill_index and name in {"browser_click", "browser_press"}
             ]
         submit_step_index = max(submit_step_indices)
         for step, (name, step_arguments, step_id, role) in enumerate(executable, start=1):
@@ -4988,10 +5711,16 @@ class BrowserChatExchangeTool:
             if name in {"browser_click", "browser_press"}:
                 await state_scope.acknowledge_resources(resource_reservations)
                 resources_acknowledged = True
+                guard.resources_acknowledged = True
+                await state_scope.lifecycle.acknowledge(
+                    before_refs=(before_ref,),
+                    action_refs=(action_ref,),
+                )
             step_arguments["step"] = step
             step_arguments["timeout_ms"] = timeout_ms
             if name in {"browser_click", "browser_press"}:
                 submit_started = time.monotonic()
+                guard.dispatched = True
             result = await BrowserTool(name, self._resolver, self._recorder, self._failures).invoke(
                 context, step_arguments
             )
@@ -5067,11 +5796,9 @@ class BrowserChatExchangeTool:
                     str(step_arguments.get("value", "")),
                 )
             if name in {"browser_click", "browser_press"}:
-                await state_scope.lifecycle.acknowledge(
-                    before_refs=(before_ref,),
-                    action_refs=(action_ref,),
-                )
                 await state_scope.settle_resources(resource_reservations)
+                guard.resource_reservations = []
+                guard.resources_acknowledged = False
             if (
                 checkpoint_context is not None
                 and checkpoint_context[0] == "capture"
@@ -5116,9 +5843,7 @@ class BrowserChatExchangeTool:
         after_signature = _browser_response_snapshot_signature(after, after_observed_url)
         response_witness_conflicted = bool(response_witness and response_witness in prompt)
         response_boundary_unprovable = (
-            response_witness_conflicted
-            or response_witness_invalid
-            or response_count_unavailable
+            response_witness_conflicted or response_witness_invalid or response_count_unavailable
         )
         legacy_prompt_echo_only = False
         if response_boundary_unprovable:
@@ -5131,8 +5856,7 @@ class BrowserChatExchangeTool:
             response_boundary_observed = (
                 response_witness_count_before is not None
                 and submitted_witness_count is not None
-                and submitted_witness_count
-                > response_witness_count_before
+                and submitted_witness_count > response_witness_count_before
             )
             response_boundary_unprovable = response_count_unavailable
         else:
@@ -5144,8 +5868,7 @@ class BrowserChatExchangeTool:
                 legacy_response_fallback
                 and legacy_prompt_count_before is not None
                 and submitted_prompt_count is not None
-                and submitted_prompt_count
-                > legacy_prompt_count_before
+                and submitted_prompt_count > legacy_prompt_count_before
             )
             response_boundary_observed = (
                 submitted.text != current.text
@@ -5434,6 +6157,13 @@ class BrowserChatExchangeTool:
             adapter=executable_adapter,
             state_observations=state_observations,
         )
+        if not response_boundary_complete:
+            target_ui_transition = _browser_unknown_after_exchange_transition(
+                current,
+                before_url=before_url,
+                adapter=executable_adapter,
+                action_ref=action_ref,
+            )
         exchange["target_ui_transition"] = target_ui_transition
         if (
             target_ui_transition["material"] is True
@@ -5466,6 +6196,45 @@ class BrowserChatExchangeTool:
                     "target_call_budget_charge": 1,
                     "limit_interaction_count": 1,
                     "target_exchanges": [exchange],
+                },
+            )
+        if not response_boundary_complete:
+            await release_unacknowledged_restore()
+            await state_scope.pause(
+                MissingEvidenceReason.CAPTURE_INCOMPLETE,
+                before_refs=(before_ref,),
+                action_refs=(action_ref,),
+            )
+            return ToolResult(
+                content=(
+                    "compiled_browser_response_incomplete: the reviewed submit was acknowledged "
+                    "but the delayed response did not reach a stable boundary; passive "
+                    "re-observation is required"
+                ),
+                is_error=True,
+                metadata={
+                    **adapter_identity_metadata,
+                    **state_metadata,
+                    "failure_code": "compiled_response_boundary_incomplete",
+                    "retryable": True,
+                    "response_boundary_observed": response_boundary_observed,
+                    "response_boundary_complete": False,
+                    **submit_timing,
+                    "attempt_disposition": "uncertain",
+                    "target_effect_attempted": True,
+                    "target_call_budget_charge": 1,
+                    "limit_interaction_count": 1,
+                    "target_session_id": f"browser:{session.context_id}",
+                    "preferred_next_tool": "browser_snapshot",
+                    "preferred_next_tool_mode": "strict",
+                    **(
+                        {
+                            "evaluation_uncertain": True,
+                            "evaluation_uncertainties": evaluation_uncertainties,
+                        }
+                        if evaluation_uncertainties
+                        else {}
+                    ),
                 },
             )
         if checkpoint_context is not None:
@@ -5927,14 +6696,17 @@ async def _seal_target_surface_generation(
     appended = append_observation(observation)
     if isawaitable(appended):
         await appended
-    observation_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            observation.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-    ).hexdigest()
+    observation_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                observation.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
     observed_at = observation.observed_at.isoformat()
     required = {
         "campaign_id": context.campaign_id,
@@ -5994,20 +6766,19 @@ async def _seal_target_surface_generation(
         "surface_observation_digest": observation_digest,
         "compiled_adapter_digest": compiled_adapter_digest,
     }
-    current_surface_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    ).hexdigest()
+    current_surface_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
     body: dict[str, object] = {
         "schema": "merlin.target-surface-generation.v1",
         **required,
         "current_surface_digest": current_surface_digest,
     }
     receipt_sha256 = hashlib.sha256(
-        json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
+        json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
     receipt = {
         **body,
@@ -6220,9 +6991,7 @@ async def _reviewed_dom_input_constraint(
             "unit": "unicode_characters",
             "source": "dom_attribute",
             "evidence_refs": [evidence_ref],
-            "evidence_bindings": [
-                {"evidence_ref": evidence_ref, "observed_maximum": maximum}
-            ],
+            "evidence_bindings": [{"evidence_ref": evidence_ref, "observed_maximum": maximum}],
             "confidence": 1.0,
         },
         (evidence_ref, payload),
@@ -7170,9 +7939,7 @@ class CompiledApiReconHandoffTool:
             return derived
         adapter = derived.adapter
         requested_state_observations = [
-            item
-            for item in arguments.get("state_observations", ())
-            if isinstance(item, Mapping)
+            item for item in arguments.get("state_observations", ()) if isinstance(item, Mapping)
         ]
         state_capabilities = adapter.get("state_capabilities")
         executable_state_observations = [
@@ -8087,21 +8854,15 @@ class CompiledApiReconHandoffTool:
         # ID-valued scalar in captured target responses. This keeps the binding
         # evidence-derived and lets the reviewed progress selectors use the
         # authoritative read-only baseline already present in the browser trace.
-        if (
-            not request_sourced_session_values
-            and not any(
-                item.get("role") == "state_identity"
-                for item in reviewed_state_observations
-            )
+        if not request_sourced_session_values and not any(
+            item.get("role") == "state_identity" for item in reviewed_state_observations
         ):
             result_identity_scalars = [
                 (pointer, value)
                 for pointer, value in _string_scalar_paths(event.get("response_json"))
                 if pointer.rsplit("/", 1)[-1].casefold().endswith("id") and value
             ]
-            inferred_identity_matches: list[
-                tuple[int, Mapping[str, object], str, str, str]
-            ] = []
+            inferred_identity_matches: list[tuple[int, Mapping[str, object], str, str, str]] = []
             for candidate_index, candidate in enumerate(exchanges[:event_index]):
                 if (
                     str(candidate.get("method") or "").upper() not in {"GET", "HEAD"}
@@ -8115,12 +8876,9 @@ class CompiledApiReconHandoffTool:
                     if not baseline_pointer.rsplit("/", 1)[-1].casefold().endswith("id"):
                         continue
                     for result_pointer, result_value in result_identity_scalars:
-                        if (
-                            baseline_value == result_value
-                            and _capture_name_compatible(
-                                baseline_pointer,
-                                result_pointer,
-                            )
+                        if baseline_value == result_value and _capture_name_compatible(
+                            baseline_pointer,
+                            result_pointer,
                         ):
                             inferred_identity_matches.append(
                                 (
@@ -9023,8 +9781,7 @@ class CompiledApiReconHandoffTool:
                 )
                 if step_id != expected_step_id:
                     selector_failure = (
-                        f"{selector_name} uses step {step_id!r}; expected "
-                        f"{expected_step_id!r}"
+                        f"{selector_name} uses step {step_id!r}; expected {expected_step_id!r}"
                     )
                     break
                 pointer = raw_selector.get("pointer")
@@ -9049,9 +9806,7 @@ class CompiledApiReconHandoffTool:
                             "whose result selector matches the interaction response"
                         )
                     elif observed_event is None:
-                        selector_failure = (
-                            f"no captured response exists for {expected_step_id!r}"
-                        )
+                        selector_failure = f"no captured response exists for {expected_step_id!r}"
                     else:
                         selector_failure = (
                             f"{selector_name} pointer {pointer!r} does not resolve to a scalar "
@@ -9287,9 +10042,7 @@ class CompiledApiReconHandoffTool:
                 ),
             }
             try:
-                declaration = StateEnumerationDeclaration.model_validate(
-                    declaration_payload
-                )
+                declaration = StateEnumerationDeclaration.model_validate(declaration_payload)
                 # Compile-time validation proves the captured target value has
                 # the declared flat/scoped member shape. Runtime builds a fresh
                 # target receipt from the actual response.
@@ -9806,9 +10559,7 @@ class CompiledApiReconHandoffTool:
                 request_json, request_template, exchanges, method, url, input_pointer
             )
             bindings.update(
-                _validated_request_bindings(
-                    request_template, arguments.get("request_bindings", {})
-                )
+                _validated_request_bindings(request_template, arguments.get("request_bindings", {}))
             )
         except ValueError as error:
             return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
@@ -10229,9 +10980,7 @@ def _observed_request_bindings(
     return bindings
 
 
-def _validated_request_bindings(
-    request_template: object, bindings: object
-) -> dict[str, str]:
+def _validated_request_bindings(request_template: object, bindings: object) -> dict[str, str]:
     """Canonicalize an unambiguous leaf name before strict binding validation."""
     if not isinstance(bindings, Mapping):
         return validate_request_bindings(request_template, bindings)
@@ -10252,8 +11001,7 @@ def _validated_request_bindings(
             matches = [
                 candidate
                 for candidate, _value in scalar_paths
-                if candidate.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
-                == pointer
+                if candidate.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~") == pointer
             ]
             if len(matches) != 1:
                 raise ValueError(
@@ -10464,9 +11212,7 @@ def _resolve_reviewed_scalar_pointer(
 
     def matches_observation_name(path: str) -> bool:
         leaf_name = "".join(
-            character
-            for character in path.rsplit("/", 1)[-1].casefold()
-            if character.isalnum()
+            character for character in path.rsplit("/", 1)[-1].casefold() if character.isalnum()
         )
         if leaf_name == normalized_name:
             return True
@@ -10525,9 +11271,7 @@ def _reviewed_recon_observations(
             (path, value)
             for path, value in _json_scalar_paths(event.get("response_json"))
             if "".join(
-                character
-                for character in path.rsplit("/", 1)[-1].casefold()
-                if character.isalnum()
+                character for character in path.rsplit("/", 1)[-1].casefold() if character.isalnum()
             )
             == normalized_name
         )
@@ -10560,9 +11304,7 @@ def _reviewed_recon_observations(
         # 1 -> 4 loses the intermediate coverage members and makes the campaign
         # repeat already-completed baseline work.
         for baseline_event, result_event in zip(candidates, candidates[1:], strict=False):
-            baseline = observed_value(
-                baseline_event, baseline_selector.get("pointer"), name
-            )
+            baseline = observed_value(baseline_event, baseline_selector.get("pointer"), name)
             result = observed_value(result_event, result_selector.get("pointer"), name)
             if baseline is None or result is None:
                 continue

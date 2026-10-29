@@ -63,7 +63,9 @@ class ToolEffectStore(Protocol):
         self, session_id: str, *, tool_name: str | None = None
     ) -> list[ToolEffectRecord]: ...
 
-    async def list_for_attempt(self, attempt_id: str) -> list[ToolEffectRecord]: ...
+    async def list_for_attempt(
+        self, attempt_id: str, *, limit: int | None = None
+    ) -> list[ToolEffectRecord]: ...
 
     async def list_for_campaign(
         self, campaign_id: str, *, limit: int | None = None
@@ -241,14 +243,18 @@ class ToolBroker:
         # Compatibility for callers registering pre-role target tools.
         return tuple(name for name in candidates if name in LEGACY_TARGET_EXCHANGE_TOOL_IDS)
 
-    async def list_effects_for_attempt(self, attempt_id: str) -> tuple[ToolEffectRecord, ...]:
+    async def list_effects_for_attempt(
+        self, attempt_id: str, *, limit: int | None = None
+    ) -> tuple[ToolEffectRecord, ...]:
         """Expose immutable durable effects for evidence resolution, when configured."""
         if self._effect_store is None:
             return ()
         loader = getattr(self._effect_store, "list_for_attempt", None)
         if not callable(loader):
             return ()
-        return tuple(await loader(attempt_id))
+        if limit is None:
+            return tuple(await loader(attempt_id))
+        return tuple(await loader(attempt_id, limit=limit))
 
     async def list_effects_for_campaign(
         self, campaign_id: str, *, limit: int | None = None

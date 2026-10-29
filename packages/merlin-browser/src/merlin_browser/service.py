@@ -65,6 +65,21 @@ class BrowserService:
         restarted_at = self._restarted_context_at.get(context_id)
         return restarted_at is None or sealed_at >= restarted_at
 
+    def existing_for_tool(self, session_id: str) -> BrowserSession:
+        """Return an already-owned live context without launch, resume, or transfer."""
+
+        if self._closed:
+            raise BrowserBoundaryError("browser service is shutting down")
+        context_id = self._session_context.get(session_id)
+        session = self._live.get(context_id) if context_id is not None else None
+        if session is None:
+            raise BrowserBoundaryError(
+                "reviewed browser context is not live; passive reconnaissance must establish it"
+            )
+        if session.owner.worker_id == "operator":
+            raise BrowserBoundaryError("browser context is under operator control")
+        return session
+
     async def for_tool(self, session_id: str) -> BrowserSession:
         if self._closed:
             raise BrowserBoundaryError("browser service is shutting down")

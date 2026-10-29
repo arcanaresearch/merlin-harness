@@ -210,6 +210,30 @@ def test_attempted_effect_error_accepts_fresh_adapter_without_attack_credit() ->
     }.isdisjoint(observed)
 
 
+def test_generic_post_effect_capture_error_creates_reobservation_obligation() -> None:
+    receipt = _receipt(
+        call_id="call-generic-capture-failed",
+        adapter_stale=True,
+        attempted_effect=True,
+    )
+    receipt.update(
+        {
+            "tool_name": "browser_click",
+            "interaction_count": 0,
+            "limit_interaction_count": 0,
+        }
+    )
+    receipt = _resign(receipt)
+
+    obligations = _extract(receipt, projection="target_ui_transition_receipts")
+
+    assert len(obligations) == 1
+    obligation = obligations[0]
+    assert obligation.target_call_id == "call-generic-capture-failed"
+    assert obligation.transition["adapter_stale"] is True
+    assert obligation.receipt_projection == "target_ui_transition_receipts"
+
+
 def test_attempted_effect_projection_rejects_malformed_unsigned_and_non_error_receipts() -> None:
     malformed = _receipt(
         call_id="call-malformed",

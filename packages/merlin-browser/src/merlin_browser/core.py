@@ -858,6 +858,10 @@ class BrowserSession:
         self._actor_id: str | None = None
         self._actor_wait_seconds = actor_wait_seconds
         self._network_events: deque[dict[str, object]] = deque(maxlen=256)
+        # A bounded, content-addressed dispatch ledger distinguishes selector or
+        # validation failures from exceptions that can occur after Playwright may
+        # already have changed the target. It contains no raw input values.
+        self._effect_dispatch_refs: deque[str] = deque(maxlen=256)
         # Raw filled text is held only long enough to causally associate a browser submit
         # with the request it initiates. It is never serialized, hashed, or recorded.
         self._recent_fills: deque[tuple[str, str, str, str | None, int, datetime]] = deque(
@@ -952,6 +956,7 @@ class BrowserSession:
             if action.kind == "open_tab":
                 if action.value is None:
                     raise BrowserBoundaryError("open_tab requires a URL")
+                self._mark_effect_dispatch(action)
                 tab_ref = await self.new_tab(action.value)
                 return self._observation(
                     tab_ref,
@@ -965,6 +970,7 @@ class BrowserSession:
                 if action.value is None:
                     raise BrowserBoundaryError("navigate requires a URL")
                 self._require_url(action.value)
+                self._mark_effect_dispatch(action)
                 await page.goto(action.value)
             elif action.kind in {
                 "click",
@@ -986,6 +992,7 @@ class BrowserSession:
                         action.step,
                         action.created_at,
                     )
+                    self._mark_effect_dispatch(action)
                     try:
                         await locator.click()
                     finally:
@@ -1003,6 +1010,7 @@ class BrowserSession:
                     input_type = await locator.get_attribute("type")
                     if input_type in {"password", "file"}:
                         raise BrowserBoundaryError("credential and upload fields are unavailable")
+                    self._mark_effect_dispatch(action)
                     await locator.fill(action.value)
                     probe_refs = tuple(
                         reference
@@ -1028,6 +1036,7 @@ class BrowserSession:
                         action.step,
                         action.created_at,
                     )
+                    self._mark_effect_dispatch(action)
                     try:
                         await locator.press(action.value)
                     finally:
@@ -1035,12 +1044,16 @@ class BrowserSession:
                 elif action.kind == "select":
                     if action.value is None:
                         raise BrowserBoundaryError("select requires an option value")
+                    self._mark_effect_dispatch(action)
                     await locator.select_option(action.value)
                 elif action.kind == "check":
+                    self._mark_effect_dispatch(action)
                     await locator.check()
                 elif action.kind == "uncheck":
+                    self._mark_effect_dispatch(action)
                     await locator.uncheck()
                 elif action.kind == "hover":
+                    self._mark_effect_dispatch(action)
                     await locator.hover()
                 else:
                     if not self.bounds.allow_uploads:
@@ -1058,6 +1071,7 @@ class BrowserSession:
                     )
                     if upload not in allowed:
                         raise BrowserBoundaryError("upload path is outside browser bounds")
+                    self._mark_effect_dispatch(action)
                     await locator.set_input_files(upload)
             elif action.kind == "wait_for_text":
                 if action.value is None:
@@ -1103,6 +1117,22 @@ class BrowserSession:
                 evidence=(self._evidence(action),),
                 step=action.step,
             )
+
+    def effect_was_dispatched(self, action: BrowserAction) -> bool:
+        """Return whether Playwright crossed the possible-effect call boundary."""
+
+        return self._evidence(action) in self._effect_dispatch_refs
+
+    def element_identity(self, element_ref: str | None) -> tuple[str, str, str] | None:
+        """Return one bounded accessible identity for internal reviewed-step matching."""
+
+        element = self._elements.get(element_ref or "")
+        if element is None:
+            return None
+        return element.role, element.name, element.frame_ref
+
+    def _mark_effect_dispatch(self, action: BrowserAction) -> None:
+        self._effect_dispatch_refs.append(self._evidence(action))
 
     async def release_actor(self, actor_id: str) -> None:
         async with self._actor_condition:
@@ -1223,9 +1253,7 @@ class BrowserSession:
             "[role=alert], [popover]"
         )
         structural_count = min(await structural_surfaces.count(), 20)
-        structural_metadata = await _element_surface_metadata(
-            structural_surfaces, structural_count
-        )
+        structural_metadata = await _element_surface_metadata(structural_surfaces, structural_count)
         for index in range(structural_count):
             surface_scope, occluded = structural_metadata[index]
             if surface_scope not in {"status", "dialog", "modal", "top_layer"}:
@@ -1596,8 +1624,8 @@ class BrowserSession:
                         timeout=_VISUAL_CAPTURE_TIMEOUT_MS,
                     )
                     try:
-                        sensitive_after_capture = (
-                            await _page_contains_sensitive_rendered_control(page)
+                        sensitive_after_capture = await _page_contains_sensitive_rendered_control(
+                            page
                         )
                     except PlaywrightError as error:
                         errors.append(f"viewport_post_inspection:{type(error).__name__}")
@@ -1769,13 +1797,11 @@ class BrowserSession:
                     continue
                 viewport_x = max(
                     0.0,
-                    float(bounding_box["x"])
-                    + float(candidate.get("visible_offset_x") or 0),
+                    float(bounding_box["x"]) + float(candidate.get("visible_offset_x") or 0),
                 )
                 viewport_y = max(
                     0.0,
-                    float(bounding_box["y"])
-                    + float(candidate.get("visible_offset_y") or 0),
+                    float(bounding_box["y"]) + float(candidate.get("visible_offset_y") or 0),
                 )
                 clip_width = min(
                     float(candidate.get("visible_width") or 0),

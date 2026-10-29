@@ -88,6 +88,7 @@ from merlin_agents.campaign_service import (
     _conservative_semantic_outcome,
     _coverage_extension_stop_reason,
     _crescendo_lesson_evidence,
+    _durable_effect_projection_uncertainties,
     _dynamic_specialist_policy,
     _evidence_derived_arm_proposals,
     _explicit_target_session_interaction_limit,
@@ -1217,6 +1218,27 @@ def test_adapted_agent_message_transport_withholds_surface_credit() -> None:
         )
         is not None
     )
+
+
+def test_durable_effect_projection_overflow_withholds_terminal_surface_credit() -> None:
+    uncertainties = _durable_effect_projection_uncertainties(
+        ("technique-1", "technique-2"),
+        {
+            "durable_effect_projection_error": {
+                "schema": "merlin.durable-effect-projection-error.v1",
+                "code": "effect_history_overflow",
+                "retryable": False,
+            }
+        },
+    )
+
+    assert tuple(item["technique_id"] for item in uncertainties) == (
+        "technique-1",
+        "technique-2",
+    )
+    assert all(item["withhold_surface_credit"] is True for item in uncertainties)
+    assert all(item["retryable"] is True for item in uncertainties)
+    assert all("effect_history_overflow" in str(item["reason"]) for item in uncertainties)
 
 
 def test_validation_equivalence_uses_typed_target_exchange_identity() -> None:

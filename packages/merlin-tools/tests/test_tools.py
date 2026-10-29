@@ -624,8 +624,9 @@ class EffectStore:
             if item.session_id == session_id and (tool_name is None or item.tool_name == tool_name)
         ]
 
-    async def list_for_attempt(self, attempt_id: str):
-        return [item for item in self.records.values() if item.attempt_id == attempt_id]
+    async def list_for_attempt(self, attempt_id: str, *, limit: int | None = None):
+        values = [item for item in self.records.values() if item.attempt_id == attempt_id]
+        return values if limit is None else values[-limit:]
 
     async def list_for_campaign(self, campaign_id: str, *, limit: int | None = None):
         records = [item for item in self.records.values() if item.campaign_id == campaign_id]

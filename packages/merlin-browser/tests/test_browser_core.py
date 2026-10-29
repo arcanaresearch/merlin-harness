@@ -92,12 +92,18 @@ def test_api_exchange_events_include_read_only_json_state_baselines() -> None:
 
 
 def test_visual_source_url_drops_credentials_query_and_fragment() -> None:
-    assert _sanitized_visual_source_url(
-        "https://user:secret@[2001:db8::1]:8443/phone.png?token=secret#panel"
-    ) == "https://[2001:db8::1]:8443/phone.png"
-    assert _sanitized_visual_source_url(
-        "blob:https://user:secret@target.test/render-id?token=secret#panel"
-    ) == "blob:https://target.test/render-id"
+    assert (
+        _sanitized_visual_source_url(
+            "https://user:secret@[2001:db8::1]:8443/phone.png?token=secret#panel"
+        )
+        == "https://[2001:db8::1]:8443/phone.png"
+    )
+    assert (
+        _sanitized_visual_source_url(
+            "blob:https://user:secret@target.test/render-id?token=secret#panel"
+        )
+        == "blob:https://target.test/render-id"
+    )
 
 
 def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
@@ -120,9 +126,7 @@ def test_reviewed_recon_observation_attributes_prior_browser_progress() -> None:
             "status": 200,
             "observed_at": "2026-10-13T18:32:24+00:00",
             "request_json": {"message": "winning turn"},
-            "response_json": {
-                "result": {"turn": {"score": 100, "outcome": {"kind": "win"}}}
-            },
+            "response_json": {"result": {"turn": {"score": 100, "outcome": {"kind": "win"}}}},
         },
         {
             "method": "POST",
@@ -1755,11 +1759,34 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
             allowed_origins={"https://target.example"},
         )
         owner = browser_owner
-        mode = "isolated"
+        mode = "persistent"
 
         def metadata(self, restart=False):
             del restart
-            return SimpleNamespace(tabs=())
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref="tab-reviewed",
+                        state="open",
+                        url="https://target.example",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del frame_ref
+            if tab_ref != "tab-reviewed":
+                raise BrowserBoundaryError("unknown fixture tab")
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                step=step,
+                evidence_refs=("browser-before:fixture",),
+            )
 
         async def act(self, action, *, actor_id):
             del actor_id
@@ -1779,6 +1806,41 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
             return ()
 
     recorder = Recorder()
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    adapter = reviewed_browser_adapter("https://target.example")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button SEND"},
+        },
+    ]
+    compiled_adapter = compile_target_adapter(adapter)
+
+    def campaign_context(call_id: str, **updates: object) -> ToolContext:
+        return ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            campaign_id="campaign:raw-browser",
+            call_id=call_id,
+            agent_id="campaign:raw-browser/worker-1",
+            technique_attempt_id="attempt:raw-browser",
+            permission_grant_digest="grant:raw-browser",
+            target_id="target",
+            compiled_adapter=compiled_adapter.model_dump_json(),
+            compiled_adapter_digest=compiled_target_adapter_digest(compiled_adapter),
+            **updates,
+        )
+
     tools = {
         tool.name: tool
         for tool in _production_browser_tools(
@@ -1846,12 +1908,7 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
     assert events == []
 
     result = await tools["browser_open_tab"].invoke(
-        ToolContext(
-            session_id="s1",
-            workspace_root="/tmp",
-            campaign_id="campaign:raw-browser",
-            call_id="call:raw-browser",
-        ),
+        campaign_context("call:raw-browser"),
         {"url": "https://target.example", "step": 0},
     )
 
@@ -1865,16 +1922,13 @@ async def test_raw_browser_action_persists_and_claims_scope_before_target_delive
         "settled",
         "released",
     ]
-    assert scope_store.envelopes[0]["action_kind"] == "reconnaissance"
+    assert scope_store.envelopes[0]["action_kind"] == "candidate"
     assert scope_store.envelopes[0]["before"]["availability"] == "missing"
     assert result.metadata["state_scope_id"].startswith("state-scope:")
 
     baseline = await tools["browser_open_tab"].invoke(
-        ToolContext(
-            session_id="s1",
-            workspace_root="/tmp",
-            campaign_id="campaign:raw-browser",
-            call_id="call:raw-browser-baseline",
+        campaign_context(
+            "call:raw-browser-baseline",
             objective_phase_checkpoint_intent="capture",
         ),
         {"url": "https://target.example", "step": 0},
@@ -1931,65 +1985,220 @@ async def test_raw_browser_action_does_not_deliver_when_global_scope_lease_fails
 
 
 @pytest.mark.asyncio
-async def test_cancelled_browser_action_settles_acknowledged_scope_before_reraising() -> None:
+async def test_cancelled_browser_action_finishes_blocked_scope_settlement_before_reraising(
+    monkeypatch,
+) -> None:
     events: list[str] = []
-    scope_store = _StateScopeFixtureStore(events)
+
+    settle_entered = threading.Event()
+    settle_release = threading.Event()
+
+    class BlockingScopeStore(_StateScopeFixtureStore):
+        def settle_state_scope(self, *args, **kwargs):
+            settle_entered.set()
+            assert settle_release.wait(timeout=5)
+            return super().settle_state_scope(*args, **kwargs)
+
+    scope_store = BlockingScopeStore(events)
 
     class Recorder:
         async def append_action(self, _value):
             return None
 
+        async def append_observation(self, _value):
+            return None
+
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    <button aria-label="No change">No change</button>
+    """
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            button = next(item for item in snapshot.elements if item.name == "No change")
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            from merlin_contracts.target_adapter_compiler import (
+                compile_target_adapter,
+                compiled_target_adapter_digest,
+            )
+
+            compilation = compile_target_adapter(adapter)
+            target_entered = asyncio.Event()
+
+            async def stalled_action(*_args, **_kwargs):
+                events.append("target")
+                target_entered.set()
+                await asyncio.Event().wait()
+
+            async def unavailable_diagnostics(*_args, **_kwargs):
+                raise BrowserBoundaryError("diagnostics unavailable after cancellation")
+
+            monkeypatch.setattr(session, "act", stalled_action)
+            monkeypatch.setattr(session, "capture_failure_diagnostics", unavailable_diagnostics)
+            tool = BrowserTool(
+                "browser_click",
+                lambda _: session,
+                Recorder(),  # type: ignore[arg-type]
+                state_scope_store=scope_store,
+            )
+            invocation = asyncio.create_task(
+                tool.invoke(
+                    ToolContext(
+                        session_id="s1",
+                        workspace_root="/tmp",
+                        campaign_id="campaign:cancelled-browser",
+                        call_id="call:cancelled-browser",
+                        agent_id="campaign:cancelled-browser/worker-1",
+                        technique_attempt_id="attempt:cancelled-browser",
+                        permission_grant_digest="grant:cancelled-browser",
+                        target_id="target",
+                        compiled_adapter=compilation.model_dump_json(),
+                        compiled_adapter_digest=compiled_target_adapter_digest(compilation),
+                    ),
+                    {
+                        "tab_ref": tab,
+                        "frame_ref": button.frame_ref,
+                        "element_ref": button.ref,
+                    },
+                )
+            )
+            await asyncio.wait_for(target_entered.wait(), timeout=2)
+            invocation.cancel()
+            assert await asyncio.to_thread(settle_entered.wait, 5)
+            await asyncio.sleep(0)
+            invocation.cancel()
+            await asyncio.sleep(0)
+            assert invocation.done() is False
+            settle_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(invocation, timeout=2)
+
+    assert events[-4:] == ["acknowledged", "target", "settled", "released"]
+    assert scope_store.settle_calls[-1]["transition_disposition"] == ("infrastructure_failure")
+    assert scope_store.claims == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_compiled_exchange_finishes_outer_scope_before_reraising(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    settle_entered = threading.Event()
+    settle_release = threading.Event()
+
+    class BlockingScopeStore(_StateScopeFixtureStore):
+        def settle_state_scope(self, *args, **kwargs):
+            settle_entered.set()
+            assert settle_release.wait(timeout=5)
+            return super().settle_state_scope(*args, **kwargs)
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
         async def save_metadata(self, _value):
             return None
 
-    class Session:
-        context_id = "cancelled-browser-context"
-        bounds = BrowserBounds(
-            target_id="target",
-            allowed_origins={"https://target.example"},
-        )
-        owner = owner()
-        mode = "isolated"
+    scope_store = BlockingScopeStore(events)
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            target_entered = asyncio.Event()
+            original_act = session.act
 
-        def metadata(self, restart=False):
-            del restart
-            return SimpleNamespace(tabs=())
+            async def stalled_action(action, *, actor_id):
+                if action.kind not in {"click", "press"}:
+                    return await original_act(action, actor_id=actor_id)
+                events.append("target")
+                target_entered.set()
+                await asyncio.Event().wait()
 
-        async def act(self, action, *, actor_id):
-            del action, actor_id
-            events.append("target")
-            raise asyncio.CancelledError
+            monkeypatch.setattr(session, "act", stalled_action)
+            async def unavailable_diagnostics(*_args, **_kwargs):
+                raise BrowserBoundaryError("diagnostics unavailable after cancellation")
 
-    tool = BrowserTool(
-        "browser_open_tab",
-        lambda _: Session(),
-        Recorder(),  # type: ignore[arg-type]
-        state_scope_store=scope_store,
-    )
+            monkeypatch.setattr(session, "capture_failure_diagnostics", unavailable_diagnostics)
+            tool = next(
+                item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                )
+                if item.name == "browser_chat_exchange"
+            )
+            invocation = asyncio.create_task(
+                tool.invoke(
+                    ToolContext(
+                        session_id="s1",
+                        workspace_root="/tmp",
+                        campaign_id="campaign:compiled-cancel",
+                        call_id="compiled-cancel",
+                        agent_id="campaign:compiled-cancel/worker-1",
+                        target_id="target",
+                    ),
+                    {"prompt": "hello", "timeout_ms": 4_000},
+                )
+            )
+            await asyncio.wait_for(target_entered.wait(), timeout=2)
+            invocation.cancel()
+            assert await asyncio.to_thread(settle_entered.wait, 5)
+            await asyncio.sleep(0)
+            invocation.cancel()
+            await asyncio.sleep(0)
+            assert invocation.done() is False
+            settle_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(invocation, timeout=2)
 
-    with pytest.raises(asyncio.CancelledError):
-        await tool.invoke(
-            ToolContext(
-                session_id="s1",
-                workspace_root="/tmp",
-                campaign_id="campaign:cancelled-browser",
-                call_id="call:cancelled-browser",
-            ),
-            {"url": "https://target.example", "step": 0},
-        )
-
-    assert events == [
-        "created",
-        "claimed",
-        "revised",
-        "acknowledged",
-        "target",
-        "settled",
-        "released",
-    ]
-    assert scope_store.settle_calls[-1]["transition_disposition"] == (
-        "infrastructure_failure"
-    )
+    assert events[-4:] == ["acknowledged", "target", "settled", "released"]
+    assert scope_store.claims == {}
 
 
 @pytest.mark.asyncio
@@ -2005,14 +2214,37 @@ async def test_raw_browser_actions_serialize_aliases_across_contexts_and_campaig
             allowed_origins={"https://target.example"},
         )
         owner = owner()
-        mode = "isolated"
+        mode = "persistent"
 
         def __init__(self, context_id: str) -> None:
             self.context_id = context_id
 
         def metadata(self, restart=False):
             del restart
-            return SimpleNamespace(tabs=())
+            return SimpleNamespace(
+                tabs=(
+                    SimpleNamespace(
+                        tab_ref=f"tab:{self.context_id}",
+                        state="open",
+                        url="https://target.example",
+                    ),
+                )
+            )
+
+        async def snapshot(self, tab_ref, frame_ref=None, *, step=0):
+            del frame_ref
+            if tab_ref != f"tab:{self.context_id}":
+                raise BrowserBoundaryError("unknown fixture tab")
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.example",
+                owner=self.owner,
+                tab_ref=tab_ref,
+                kind="snapshot",
+                step=step,
+                evidence_refs=(f"browser-before:{self.context_id}",),
+            )
 
         async def act(self, action, *, actor_id):
             del actor_id
@@ -2035,6 +2267,40 @@ async def test_raw_browser_actions_serialize_aliases_across_contexts_and_campaig
             return ()
 
     sessions = {"s1": Session("context-a"), "s2": Session("context-b")}
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    adapter = reviewed_browser_adapter("https://target.example")
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button SEND"},
+        },
+    ]
+    compiled_adapter = compile_target_adapter(adapter)
+
+    def campaign_context(session_id: str, campaign_id: str, call_id: str) -> ToolContext:
+        return ToolContext(
+            session_id=session_id,
+            workspace_root="/tmp",
+            campaign_id=campaign_id,
+            call_id=call_id,
+            agent_id=f"{campaign_id}/worker-1",
+            technique_attempt_id=f"attempt:{campaign_id}",
+            permission_grant_digest=f"grant:{campaign_id}",
+            target_id="target",
+            compiled_adapter=compiled_adapter.model_dump_json(),
+            compiled_adapter_digest=compiled_target_adapter_digest(compiled_adapter),
+        )
+
     tools = {
         tool.name: tool
         for tool in _production_browser_tools(
@@ -2044,23 +2310,13 @@ async def test_raw_browser_actions_serialize_aliases_across_contexts_and_campaig
     }
     first = asyncio.create_task(
         tools["browser_open_tab"].invoke(
-            ToolContext(
-                session_id="s1",
-                workspace_root="/tmp",
-                campaign_id="campaign:first",
-                call_id="call:first",
-            ),
+            campaign_context("s1", "campaign:first", "call:first"),
             {"url": "https://target.example", "step": 0},
         )
     )
     await first_started.wait()
     second = await tools["browser_open_tab"].invoke(
-        ToolContext(
-            session_id="s2",
-            workspace_root="/tmp",
-            campaign_id="campaign:second",
-            call_id="call:second",
-        ),
+        campaign_context("s2", "campaign:second", "call:second"),
         {"url": "https://target.example", "step": 0},
     )
     finish_first.set()
@@ -2466,9 +2722,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
     assert capabilities["identity"]["baseline_selector"]["pointer"] == (
         "/result/data/json/run/runId"
     )
-    assert capabilities["identity"]["result_selector"]["pointer"] == (
-        "/result/data/json/run/runId"
-    )
+    assert capabilities["identity"]["result_selector"]["pointer"] == ("/result/data/json/run/runId")
     assert {item["name"] for item in capabilities["observations"]} == {
         "run_id",
         "tier",
@@ -2819,9 +3073,7 @@ async def test_compiled_api_handoff_seals_evidence_bound_generic_target_capabili
     assert enumeration["completeness"] == "complete"
     assert enumeration["selector"]["pointer"] == "/availableLanguages"
     assert enumeration["selector"]["step_id"] == "observed-session-setup"
-    assert enumeration["selector"]["evidence_refs"][0].startswith(
-        "browser-api-response:sha256:"
-    )
+    assert enumeration["selector"]["evidence_refs"][0].startswith("browser-api-response:sha256:")
     assert capabilities.get("affordances", []) == []
     assert capabilities.get("freshness_rules", []) == []
     assert capabilities["identity_equivalence_rules"][0]["relation"] == "equal"
@@ -4124,9 +4376,7 @@ async def test_api_handoff_requires_baseline_when_all_state_selectors_are_invali
     assert recorder.handoff is None
     assert result.metadata["state_observation_repair_available"] is True
     assert result.metadata["preferred_next_tool"] == "browser_network_events"
-    assert "no pre-interaction baseline was selected" in result.metadata[
-        "state_observation_repair"
-    ]
+    assert "no pre-interaction baseline was selected" in result.metadata["state_observation_repair"]
     assert "role='state_identity'" in result.metadata["state_observation_repair"]
     assert result.metadata["state_observation_failures"] == [
         result.metadata["state_observation_repair"]
@@ -4203,7 +4453,7 @@ async def test_api_handoff_retains_state_when_monotonic_hint_is_contradicted() -
             "value_type": "integer",
             "minimum_value": 0,
             "maximum_value": 100,
-        }
+        },
     ]
     recorder = Recorder()
     tool = next(
@@ -4218,9 +4468,7 @@ async def test_api_handoff_retains_state_when_monotonic_hint_is_contradicted() -
     assert recorder.handoff is not None
     adapter = json.loads(recorder.handoff.adapter)
     score = next(
-        item
-        for item in adapter["state_capabilities"]["observations"]
-        if item["name"] == "score"
+        item for item in adapter["state_capabilities"]["observations"] if item["name"] == "score"
     )
     assert score["name"] == "score"
     assert "monotonicity" not in score
@@ -4339,9 +4587,7 @@ async def test_api_handoff_infers_omitted_identity_from_shared_read_only_state()
         "session_score",
         "turns_left",
     }
-    score = next(
-        item for item in capabilities["observations"] if item["name"] == "session_score"
-    )
+    score = next(item for item in capabilities["observations"] if item["name"] == "session_score")
     assert score["baseline_selector"]["pointer"] == "/session/score"
     assert score["result_selector"]["pointer"] == "/turn/score"
 
@@ -7934,9 +8180,10 @@ async def test_recon_recall_separates_exact_reuse_from_different_bot_recon() -> 
                 },
             )
             assert different_bot.metadata["default_action"] == "semantic_scope_review"
-            assert "Campaign Lead must compare requested_scope" in different_bot.metadata[
-                "next_action"
-            ]
+            assert (
+                "Campaign Lead must compare requested_scope"
+                in different_bot.metadata["next_action"]
+            )
             assert "at most one harmless UI exchange" in different_bot.metadata["next_action"]
             assert "Do not probe robots.txt" in different_bot.metadata["next_action"]
             assert different_bot.metadata["exact_matches"] == []
@@ -8035,13 +8282,9 @@ async def test_recon_recall_allows_requested_path_on_recalled_origin() -> None:
         ) as session:
             actions = browser_tools(lambda _: session, Recorder())
             recall = next(
-                item
-                for item in actions
-                if item.describe().name == "browser_recall_reconnaissance"
+                item for item in actions if item.describe().name == "browser_recall_reconnaissance"
             )
-            opened = next(
-                item for item in actions if item.describe().name == "browser_open_tab"
-            )
+            opened = next(item for item in actions if item.describe().name == "browser_open_tab")
             context = ToolContext(session_id="s1", workspace_root="/tmp")
 
             result = await recall.invoke(
@@ -8082,13 +8325,9 @@ async def test_recon_recall_surface_mismatch_is_advisory_within_target_bounds() 
         ) as session:
             actions = browser_tools(lambda _: session, Recorder())
             recall = next(
-                item
-                for item in actions
-                if item.describe().name == "browser_recall_reconnaissance"
+                item for item in actions if item.describe().name == "browser_recall_reconnaissance"
             )
-            opened = next(
-                item for item in actions if item.describe().name == "browser_open_tab"
-            )
+            opened = next(item for item in actions if item.describe().name == "browser_open_tab")
             context = ToolContext(session_id="s1", workspace_root="/tmp")
 
             await recall.invoke(
@@ -8383,9 +8622,7 @@ async def test_recon_recall_tolerates_scope_drift_and_reuses_exact_adapter() -> 
             assert candidate["candidate_reuse_status"] == "semantic_review_required"
             assert candidate["candidate_adapter_blueprint"] == {"interface": "http_api"}
             assert "shared_site_facts" not in candidate
-            assert ambiguous_result.metadata["match_projection"]["partial"][
-                "eligible_count"
-            ] == 2
+            assert ambiguous_result.metadata["match_projection"]["partial"]["eligible_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -8604,9 +8841,7 @@ async def test_browser_open_tab_advises_recall_without_blocking_when_durable_rec
             tools = browser_tools(lambda _: session, Recorder(handoff))
             open_tab = next(item for item in tools if item.describe().name == "browser_open_tab")
             recall = next(
-                item
-                for item in tools
-                if item.describe().name == "browser_recall_reconnaissance"
+                item for item in tools if item.describe().name == "browser_recall_reconnaissance"
             )
             context = ToolContext(session_id="s1", workspace_root="/tmp")
 
@@ -9088,9 +9323,7 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
     assert receipt["tab_ref"] == "tab-1"
     assert receipt["observed_at"] == "2026-10-28T12:00:00+00:00"
     assert receipt["compiled_adapter_digest"] == handoff.compiled_adapter_digest
-    assert result.metadata["target_surface_generation_evidence_ref"] == receipt[
-        "evidence_ref"
-    ]
+    assert result.metadata["target_surface_generation_evidence_ref"] == receipt["evidence_ref"]
     assert len(recorder.observations) == 1
     assert {
         (evidence_ref, kind) for _context_id, evidence_ref, kind, _payload in recorder.evidence
@@ -9253,9 +9486,7 @@ async def test_dom_fallback_preserves_bare_names_that_begin_with_legacy_verbs(
 async def test_dom_fallback_ignores_locator_on_compiler_omitted_step() -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
-        lambda _: _dom_fallback_session(
-            {}, input_name="Textbox 1", submit_name="Button 8"
-        )(),
+        lambda _: _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -9304,9 +9535,7 @@ async def test_dom_fallback_ignores_locator_on_compiler_omitted_step() -> None:
 async def test_dom_fallback_empty_step_locator_uses_compiler_fallback() -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
-        lambda _: _dom_fallback_session(
-            {}, input_name="Textbox 1", submit_name="Button 8"
-        )(),
+        lambda _: _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -9341,9 +9570,7 @@ async def test_dom_fallback_empty_step_locator_uses_compiler_fallback() -> None:
     assert result.is_error is False
     assert recorder.handoff is not None
     persisted = json.loads(recorder.handoff.reusable_adapter)
-    assert persisted["browser_steps"][0]["arguments"]["locator"] == (
-        'textbox[name="Textbox 1"]'
-    )
+    assert persisted["browser_steps"][0]["arguments"]["locator"] == ('textbox[name="Textbox 1"]')
 
 
 @pytest.mark.asyncio
@@ -9481,9 +9708,7 @@ async def test_dom_fallback_parser_ambiguity_is_repairable_with_structured_locat
 async def test_dom_fallback_rejects_invalid_explicit_browser_step_locator() -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
-        lambda _: _dom_fallback_session(
-            {}, input_name="Textbox 1", submit_name="Button 8"
-        )(),
+        lambda _: _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -9528,9 +9753,7 @@ async def test_dom_fallback_rejects_invalid_explicit_browser_step_locator() -> N
 async def test_dom_fallback_locator_error_preserves_raw_step_index_after_omission() -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
-        lambda _: _dom_fallback_session(
-            {}, input_name="Textbox 1", submit_name="Button 8"
-        )(),
+        lambda _: _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -9580,9 +9803,7 @@ async def test_dom_fallback_locator_error_preserves_raw_step_index_after_omissio
 async def test_dom_fallback_locator_error_preserves_caller_index_after_hydration() -> None:
     recorder = _NativeReceiptRecorder()
     tool = ApiReconHandoffTool(
-        lambda _: _dom_fallback_session(
-            {}, input_name="Textbox 1", submit_name="Button 8"
-        )(),
+        lambda _: _dom_fallback_session({}, input_name="Textbox 1", submit_name="Button 8")(),
         recorder,
     )
     adapter = reviewed_browser_adapter("https://target.test/chat")
@@ -9715,9 +9936,9 @@ def test_api_handoff_schema_documents_structured_and_legacy_locator_forms() -> N
     schema = ApiReconHandoffTool(object(), object()).describe().input_schema
     browser = schema["properties"]["reusable_adapter"]["properties"]
     interaction = browser["interaction_contract"]["properties"]
-    step_locator = browser["browser_steps"]["items"]["properties"]["arguments"][
-        "properties"
-    ]["locator"]
+    step_locator = browser["browser_steps"]["items"]["properties"]["arguments"]["properties"][
+        "locator"
+    ]
 
     for field in ("input_locator", "submit_action"):
         locator = interaction[field]
@@ -9905,9 +10126,7 @@ def test_target_ui_transition_separates_stage_boundaries_from_score_churn() -> N
         "boundary": "stage",
     }
     score_change = next(
-        item
-        for item in transition["reviewed_state_changes"]
-        if item["name"] == "current_score"
+        item for item in transition["reviewed_state_changes"] if item["name"] == "current_score"
     )
     assert score_change == {
         "name": "current_score",
@@ -10075,9 +10294,7 @@ def test_target_ui_transition_separates_stage_boundaries_from_score_churn() -> N
     read_only_input = after.model_copy(
         update={
             "elements": tuple(
-                item.model_copy(update={"read_only": True})
-                if item.name == "Message"
-                else item
+                item.model_copy(update={"read_only": True}) if item.name == "Message" else item
                 for item in after.elements
             )
         }
@@ -10243,24 +10460,30 @@ def test_rendered_state_literal_scan_bounds_repeated_prefix_work() -> None:
     )
 
     shared_suffix = CountingText(repeated_prefix + "z")
-    assert len(
-        _browser_literal_capture_candidates(
-            shared_suffix,
-            prefix="a",
-            suffix="z",
-            value_type="string",
-            occurrence="unique",
+    assert (
+        len(
+            _browser_literal_capture_candidates(
+                shared_suffix,
+                prefix="a",
+                suffix="z",
+                value_type="string",
+                occurrence="unique",
+            )
         )
-    ) == 2
-    assert len(
-        _browser_literal_capture_candidates(
-            shared_suffix,
-            prefix="a",
-            suffix="z",
-            value_type="string",
-            occurrence="first",
+        == 2
+    )
+    assert (
+        len(
+            _browser_literal_capture_candidates(
+                shared_suffix,
+                prefix="a",
+                suffix="z",
+                value_type="string",
+                occurrence="first",
+            )
         )
-    ) == 1
+        == 1
+    )
     shared_suffix.find_calls = 0
     shared_suffix.rfind_calls = 0
     assert _browser_literal_capture_candidates(
@@ -10818,9 +11041,7 @@ async def test_snapshot_surface_scope_uses_nearest_semantic_boundary() -> None:
             tab = await session.new_tab(origin)
             before = await session.snapshot(tab)
             controls = {item.name: item for item in before.elements}
-            plain_surfaces = [
-                item for item in before.elements if item.role == "surface"
-            ]
+            plain_surfaces = [item for item in before.elements if item.role == "surface"]
             assert plain_surfaces
             assert {item.surface_scope for item in plain_surfaces} == {"dialog", "status"}
 
@@ -11438,6 +11659,11 @@ async def test_compiled_chat_exchange_rejects_stale_cross_endpoint_affinity() ->
             exact_tab = await session.new_tab(origin)
             stale_tab = await session.new_tab(f"{origin}/lookalike")
             adapter = reviewed_browser_adapter(origin)
+            interaction_contract = adapter["interaction_contract"]
+            assert isinstance(interaction_contract, dict)
+            probe_contract = interaction_contract["probe"]
+            assert isinstance(probe_contract, dict)
+            probe_contract["response_witness"] = "assistant:"
             adapter["recon_handoff_id"] = "handoff:stale-cross-endpoint"
             adapter["browser_steps"] = [
                 {
@@ -11473,9 +11699,7 @@ async def test_compiled_chat_exchange_rejects_stale_cross_endpoint_affinity() ->
 
 
 @pytest.mark.asyncio
-async def test_compiled_chat_exchange_classifies_zero_compatible_tabs_for_reobservation() -> (
-    None
-):
+async def test_compiled_chat_exchange_classifies_zero_compatible_tabs_for_reobservation() -> None:
     class Recorder:
         def __init__(self) -> None:
             self.actions = []
@@ -11637,6 +11861,11 @@ async def test_reviewed_clone_isolation_rekeys_cross_campaign_browser_scopes() -
 
     async with web_fixture(chat) as origin:
         adapter = reviewed_browser_adapter(origin)
+        interaction_contract = adapter["interaction_contract"]
+        assert isinstance(interaction_contract, dict)
+        probe_contract = interaction_contract["probe"]
+        assert isinstance(probe_contract, dict)
+        probe_contract["response_witness"] = "assistant:"
         adapter["browser_steps"] = [
             {
                 "step_id": "clone",
@@ -12959,9 +13188,7 @@ async def test_failed_browser_diagnostic_error_does_not_persist_local_path(
             monkeypatch.setattr(session, "act", stalled_action)
             monkeypatch.setattr(session, "capture_failure_diagnostics", failed_diagnostics)
             click = next(
-                tool
-                for tool in browser_tools(lambda _: session)
-                if tool.name == "browser_click"
+                tool for tool in browser_tools(lambda _: session) if tool.name == "browser_click"
             )
 
             result = await click.invoke(
@@ -13221,7 +13448,7 @@ async def test_visual_recon_is_scoped_to_explicit_recon_and_caps_candidates(
         + "".join(
             f'<figure role="img" aria-label="Diagram {index}" '
             f'style="position:fixed;left:{400 + (index % 2) * 260}px;'
-                f"top:{20 + (index // 2) * 170}px;width:240px;height:140px;"
+            f"top:{20 + (index // 2) * 170}px;width:240px;height:140px;"
             f"background:url('{image(index)}') center/cover no-repeat\">"
             f"<figcaption>Diagram {index}</figcaption></figure>"
             for index in range(1, 5)
@@ -13543,9 +13770,7 @@ async def test_viewport_recon_skips_sensitive_autofill_and_identifiers(
 
 
 @pytest.mark.asyncio
-async def test_sensitive_control_inspection_fails_closed_at_bound(
-    tmp_path, monkeypatch
-) -> None:
+async def test_sensitive_control_inspection_fails_closed_at_bound(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     body = b"".join(
         f'<input name="ordinary-{index}">'.encode()
@@ -13563,9 +13788,7 @@ async def test_sensitive_control_inspection_fails_closed_at_bound(
 
 
 @pytest.mark.asyncio
-async def test_viewport_recon_skips_sensitive_control_in_child_frame(
-    tmp_path, monkeypatch
-) -> None:
+async def test_viewport_recon_skips_sensitive_control_in_child_frame(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     async with web_fixture() as origin:
         async with await launch_isolated(
@@ -14358,9 +14581,7 @@ async def test_visual_budget_exhaustion_keeps_browser_recon_successful(
                 visual_evidence_enabled=True,
             )
             first = await snapshot_tool.invoke(context, {"tab_ref": tab})
-            await page.evaluate(
-                "() => document.querySelector('#state').textContent = 'Score: 100'"
-            )
+            await page.evaluate("() => document.querySelector('#state').textContent = 'Score: 100'")
             saturated = await snapshot_tool.invoke(context, {"tab_ref": tab})
 
     assert first.is_error is False
@@ -14403,9 +14624,11 @@ async def test_visual_and_diagnostic_screenshots_share_context_budget(
                 tab,
                 capture_screenshot=True,
             )
-            later_snapshot, later_network, later_diagnostic = (
-                await session.capture_failure_diagnostics(tab, capture_screenshot=True)
-            )
+            (
+                later_snapshot,
+                later_network,
+                later_diagnostic,
+            ) = await session.capture_failure_diagnostics(tab, capture_screenshot=True)
             later_visual, later_errors = await session.capture_visual_evidence(tab)
 
     assert len(visual) == 1
@@ -14429,9 +14652,7 @@ async def test_visual_and_diagnostic_screenshots_share_context_budget(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_visual_paths_cannot_exceed_context_budget(
-    tmp_path, monkeypatch
-) -> None:
+async def test_concurrent_visual_paths_cannot_exceed_context_budget(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
     async with web_fixture(b"<main>Concurrent capture</main>") as origin:
@@ -14532,9 +14753,7 @@ async def test_cancelled_visual_write_is_accounted_before_lock_release(
 
 
 @pytest.mark.asyncio
-async def test_visual_retention_budget_survives_same_context_restart(
-    tmp_path, monkeypatch
-) -> None:
+async def test_visual_retention_budget_survives_same_context_restart(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(browser_core_module, "_VISUAL_CONTEXT_MAX_FILES", 1)
     async with web_fixture(b"<main>Restart budget</main>") as origin:
@@ -15694,8 +15913,26 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
                     "minimum_value": 0,
                 },
             ]
+            from merlin_contracts.target_adapter_compiler import (
+                compile_target_adapter,
+                compiled_target_adapter_digest,
+            )
+
+            compilation = compile_target_adapter(adapter)
+            compiled_adapter = json.dumps(
+                compilation.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            compiled_adapter_digest = compiled_target_adapter_digest(compilation)
+            scope_store = _StateScopeFixtureStore()
             broker = ToolBroker(
-                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                ),
                 confirmer=allow,
             )
 
@@ -15761,7 +15998,17 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
             )
             advanced = await broker.invoke(
                 "browser_click",
-                ToolContext(session_id="s1", workspace_root="/tmp"),
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:test",
+                    call_id="advance-level",
+                    agent_id="campaign:test/worker-1",
+                    permission_grant_digest="grant:test",
+                    target_id="target",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest=compiled_adapter_digest,
+                ),
                 {
                     "tab_ref": tab,
                     "frame_ref": next_level["frame_ref"],
@@ -15769,20 +16016,866 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
                 },
             )
             assert advanced.is_error is False
+            assert "Level 2" in json.loads(advanced.content)["text"]
+            transition = advanced.metadata["target_ui_transition"]
+            assert transition["material"] is True
+            assert transition["adapter_stale"] is False
+            assert transition["changed_dimensions"] == ["controls", "reviewed_state"]
+            level_change = next(
+                item for item in transition["reviewed_state_changes"] if item["name"] == "level"
+            )
+            assert level_change == {
+                "name": "level",
+                "role": "progress_ordinal",
+                "before": 1,
+                "after": 2,
+                "boundary": "stage",
+            }
+            assert advanced.metadata["preferred_next_tool"] == "browser_snapshot"
+            assert advanced.metadata["compiled_adapter_digest"] == compiled_adapter_digest
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "progress"
 
-            second = await broker.invoke(
-                "browser_chat_exchange",
-                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
-                {"prompt": "level two", "timeout_ms": 3_000},
+
+@pytest.mark.asyncio
+async def test_generic_browser_effects_settle_structural_transitions_and_noops(
+    monkeypatch,
+) -> None:
+    page = b"""
+    <div id="level">Level 1</div>
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    <button aria-label="No change">No change</button>
+    <button aria-label="Open surface" onclick="document.querySelector('dialog').showModal()">
+      Open surface
+    </button>
+    <button aria-label="Open delayed surface" onclick="
+      setTimeout(() => document.querySelector('dialog').showModal(), 1000)
+    ">Open delayed surface</button>
+    <button aria-label="Advance" onclick="
+      document.getElementById('level').textContent='Level 2'
+    ">Advance</button>
+    <button aria-label="Replace surface" onclick="
+      history.pushState({}, '', '/next');
+      document.querySelector('textarea').setAttribute('aria-label', 'Replacement input');
+      document.querySelector('[aria-label=Send]').setAttribute('aria-label', 'Replacement submit');
+    ">Replace surface</button>
+        <button aria-label="Ambiguous navigation" onclick="
+          history.pushState({}, '', '/ambiguous');
+          document.getElementById('level').textContent='Level 3';
+        ">Ambiguous navigation</button>
+    <dialog>
+      <button aria-label="Dismiss surface" onclick="document.querySelector('dialog').close()">
+        Dismiss surface
+      </button>
+    </dialog>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            contract["state_observations"] = [
+                {
+                    "name": "level",
+                    "role": "progress_ordinal",
+                    "value_type": "integer",
+                    "capture": {"template": "Level {value}"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 1,
+                }
+            ]
+            compilation = compile_target_adapter(adapter)
+            compiled_adapter = json.dumps(
+                compilation.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            compiled_adapter_digest = compiled_target_adapter_digest(compilation)
+            scope_store = _StateScopeFixtureStore()
+            tools = {
+                tool.name: tool
+                for tool in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                )
+            }
+            call_number = 0
+
+            def context() -> ToolContext:
+                nonlocal call_number
+                call_number += 1
+                return ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:generic-effects",
+                    call_id=f"generic-effect-{call_number}",
+                    agent_id="campaign:generic-effects/worker-1",
+                    permission_grant_digest="grant:generic-effects",
+                    technique_attempt_id="attempt:generic-effects",
+                    target_id="target",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest=compiled_adapter_digest,
+                )
+
+            async def click(name: str):
+                snapshot = await session.snapshot(tab)
+                element = next(item for item in snapshot.elements if item.name == name)
+                return await tools["browser_click"].invoke(
+                    context(),
+                    {
+                        "tab_ref": tab,
+                        "frame_ref": element.frame_ref,
+                        "element_ref": element.ref,
+                    },
+                )
+
+            unchanged = await click("No change")
+            assert unchanged.is_error is False
+            assert unchanged.metadata["target_ui_transition"]["material"] is False
+            assert unchanged.metadata["target_ui_transition"]["reobservation_recommended"] is False
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "unchanged"
+
+            snapshot = await session.snapshot(tab)
+            message = next(item for item in snapshot.elements if item.name == "Message")
+            filled = await tools["browser_fill"].invoke(
+                context(),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": message.frame_ref,
+                    "element_ref": message.ref,
+                    "value": "ordinary input",
+                },
+            )
+            assert filled.is_error is False
+            assert filled.metadata["target_ui_transition"]["material"] is False
+            assert filled.metadata["target_ui_transition"]["reobservation_recommended"] is False
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "unchanged"
+
+            passive = await tools["browser_snapshot"].invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:generic-effects",
+                    call_id="campaign-passive-reobservation",
+                    agent_id="campaign:generic-effects/worker-1",
+                    state_action_kind="reconnaissance",
+                    target_id="target",
+                ),
+                {"tab_ref": tab},
+            )
+            assert passive.is_error is False
+            assert passive.metadata["effect"] == "target_read"
+
+            snapshot = await session.snapshot(tab)
+            no_change = next(item for item in snapshot.elements if item.name == "No change")
+            rejected = await tools["browser_click"].invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:generic-effects",
+                    call_id="missing-compiled-adapter",
+                    agent_id="campaign:generic-effects/worker-1",
+                    state_action_kind="reconnaissance",
+                    target_id="target",
+                ),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": no_change.frame_ref,
+                    "element_ref": no_change.ref,
+                },
+            )
+            assert rejected.is_error is True
+            assert rejected.metadata["failure_code"] == "compiled_browser_adapter_required"
+            assert rejected.metadata["target_effect_attempted"] is False
+            assert rejected.metadata["target_call_budget_charge"] == 0
+
+            stale = await tools["browser_click"].invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:generic-effects",
+                    call_id="stale-compiled-adapter",
+                    agent_id="campaign:generic-effects/worker-1",
+                    technique_attempt_id="attempt:generic-effects:stale",
+                    target_id="target",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest="sha256:" + "0" * 64,
+                ),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": no_change.frame_ref,
+                    "element_ref": no_change.ref,
+                },
+            )
+            assert stale.is_error is True
+            assert stale.metadata["failure_code"] == "compiled_browser_adapter_required"
+            assert stale.metadata["target_effect_attempted"] is False
+            assert stale.metadata["target_call_budget_charge"] == 0
+
+            opened = await click("Open surface")
+            assert opened.is_error is False
+            assert opened.metadata["target_ui_transition"]["material"] is True
+            assert any(
+                item.get("surface_scope") == "modal"
+                for item in opened.metadata["target_ui_transition"]["added_controls"]
+            )
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "ambiguous"
+
+            dismissed = await click("Dismiss surface")
+            assert dismissed.is_error is False
+            assert dismissed.metadata["target_ui_transition"]["material"] is True
+            assert any(
+                item.get("surface_scope") == "modal"
+                for item in dismissed.metadata["target_ui_transition"]["removed_controls"]
+            )
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "ambiguous"
+
+            delayed = await click("Open delayed surface")
+            assert delayed.is_error is False
+            assert delayed.metadata["target_ui_transition"]["material"] is True
+            assert any(
+                item.get("surface_scope") == "modal"
+                for item in delayed.metadata["target_ui_transition"]["added_controls"]
+            )
+            delayed_dismissed = await click("Dismiss surface")
+            assert delayed_dismissed.is_error is False
+
+            advanced = await click("Advance")
+            assert advanced.is_error is False
+            assert advanced.metadata["target_ui_transition"]["changed_dimensions"] == [
+                "reviewed_state"
+            ]
+            assert advanced.metadata["target_ui_transition"]["reviewed_state_changes"] == [
+                {
+                    "name": "level",
+                    "role": "progress_ordinal",
+                    "before": 1,
+                    "after": 2,
+                    "boundary": "stage",
+                }
+            ]
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "progress"
+
+            settled_count = len(scope_store.settle_calls)
+            failed = await tools["browser_click"].invoke(
+                context(),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": "main",
+                    "element_ref": f"{tab}:missing:0",
+                },
+            )
+            assert failed.is_error is True
+            assert "target_ui_transition" not in failed.metadata
+            assert len(scope_store.settle_calls) == settled_count + 1
+            assert (
+                scope_store.settle_calls[-1]["transition_disposition"] == "infrastructure_failure"
+            )
+            assert scope_store.events[-2:] == ["settled", "released"]
+
+            import merlin_browser.tools as browser_tools_module
+
+            async def fail_after_capture(*_args, **_kwargs):
+                raise BrowserBoundaryError("post-effect frame detached")
+
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr(
+                    browser_tools_module,
+                    "_browser_stabilized_after_snapshot",
+                    fail_after_capture,
+                )
+                capture_failed = await click("No change")
+            assert capture_failed.is_error is True
+            assert capture_failed.metadata["failure_code"] == ("post_effect_state_capture_failed")
+            assert capture_failed.metadata["target_effect_attempted"] is True
+            assert capture_failed.metadata["target_call_budget_charge"] == 1
+            uncertain_transition = capture_failed.metadata["target_ui_transition"]
+            assert uncertain_transition["material"] is True
+            assert uncertain_transition["adapter_stale"] is True
+            assert uncertain_transition["changed_dimensions"] == ["after_state_unavailable"]
+            assert uncertain_transition["before_digest"] != uncertain_transition["after_digest"]
+            assert capture_failed.metadata["campaign_id"] == "campaign:generic-effects"
+            assert capture_failed.metadata["target_profile_id"] == "target"
+            assert capture_failed.metadata["compiled_adapter_digest"] == compiled_adapter_digest
+            assert scope_store.events[-2:] == ["settled", "released"]
+
+            replaced = await click("Replace surface")
+            assert replaced.is_error is False
+            replacement = replaced.metadata["target_ui_transition"]
+            assert replacement["material"] is True
+            assert replacement["adapter_stale"] is True
+            assert {"url", "controls", "reviewed_controls"} <= set(
+                replacement["changed_dimensions"]
+            )
+            assert replacement["url_change"] == {
+                "before": f"{origin}/",
+                "after": f"{origin}/next",
+            }
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "ambiguous"
+
+            async def fail_after_dispatched_navigation():
+                raise TimeoutError("post-dispatch page enforcement timed out")
+
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr(
+                    session,
+                    "_enforce_all_pages",
+                    fail_after_dispatched_navigation,
+                )
+                ambiguous = await click("Ambiguous navigation")
+            assert ambiguous.is_error is True
+            assert ambiguous.metadata["target_effect_attempted"] is True
+            assert ambiguous.metadata["target_call_budget_charge"] == 1
+            assert ambiguous.metadata["target_ui_transition"]["adapter_stale"] is True
+            assert ambiguous.metadata["target_ui_transition"]["changed_dimensions"] == [
+                "after_state_unavailable"
+            ]
+            assert next(item.url for item in session.metadata().tabs if item.tab_ref == tab) == (
+                f"{origin}/ambiguous"
             )
 
-            assert second.is_error is False
-            level_results = [
-                item["selected_value"]
-                for item in second.metadata["state_observations"]
-                if item["name"] == "level" and item["phase"] == "result"
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr(
+                    session,
+                    "_enforce_all_pages",
+                    fail_after_dispatched_navigation,
+                )
+                navigation_ambiguous = await tools["browser_navigate"].invoke(
+                    context(),
+                    {"tab_ref": tab, "url": f"{origin}/navigation-timeout"},
+                )
+            assert navigation_ambiguous.is_error is True
+            assert navigation_ambiguous.metadata["effect"] == "target_read"
+            assert navigation_ambiguous.metadata["target_effect_attempted"] is True
+            assert navigation_ambiguous.metadata["target_call_budget_charge"] == 1
+            assert navigation_ambiguous.metadata["target_ui_transition"]["adapter_stale"] is True
+
+            navigated = await tools["browser_navigate"].invoke(
+                context(),
+                {"tab_ref": tab, "url": f"{origin}/navigated"},
+            )
+            assert navigated.is_error is False
+            assert navigated.metadata["effect"] == "target_read"
+            assert navigated.metadata["target_ui_transition"]["url_change"] == {
+                "before": f"{origin}/navigation-timeout",
+                "after": f"{origin}/navigated",
+            }
+
+            same_url_reload = await tools["browser_navigate"].invoke(
+                context(),
+                {"tab_ref": tab, "url": f"{origin}/navigated"},
+            )
+            assert same_url_reload.is_error is False
+            assert same_url_reload.metadata["target_effect_attempted"] is True
+            assert same_url_reload.metadata["target_call_budget_charge"] == 1
+            assert same_url_reload.metadata["target_ui_transition"]["material"] is True
+            assert same_url_reload.metadata["target_ui_transition"]["adapter_stale"] is True
+            assert same_url_reload.metadata["target_ui_transition"]["changed_dimensions"] == [
+                "after_state_unavailable"
             ]
-            assert level_results == [2]
+            assert scope_store.settle_calls[-1]["transition_disposition"] == "ambiguous"
+
+            await session._tabs[tab].eval_on_selector(
+                '[aria-label="Send"]',
+                """element => {
+                  element.onclick = () => setTimeout(() => {
+                    document.getElementById('level').textContent = 'Level 9';
+                  }, 10000);
+                }""",
+            )
+            snapshot = await session.snapshot(tab)
+            send = next(item for item in snapshot.elements if item.name == "Send")
+            started = asyncio.get_running_loop().time()
+            delayed_submit = await tools["browser_click"].invoke(
+                context(),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": send.frame_ref,
+                    "element_ref": send.ref,
+                },
+            )
+            assert asyncio.get_running_loop().time() - started < 4
+            assert delayed_submit.is_error is False
+            assert delayed_submit.metadata["target_effect_attempted"] is True
+            assert delayed_submit.metadata["target_ui_transition"]["adapter_stale"] is True
+            assert delayed_submit.metadata["target_ui_transition"]["changed_dimensions"] == [
+                "after_state_unavailable"
+            ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_point", ("record_evidence", "append_observation", "save_metadata")
+)
+async def test_generic_post_effect_recording_failure_returns_bound_unknown_after_transition(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    <button aria-label="No change">No change</button>
+    """
+    private_path = tmp_path / "private-browser-recorder" / "secret.bin"
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.observations = 0
+
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            self.observations += 1
+            if failure_point == "append_observation" and self.observations >= 2:
+                raise OSError(f"cannot persist {private_path}")
+
+        async def record_evidence(self, *_value):
+            if failure_point == "record_evidence":
+                raise OSError(f"cannot persist {private_path}")
+
+        async def save_metadata(self, _value):
+            if failure_point == "save_metadata":
+                raise OSError(f"cannot persist {private_path}")
+
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            compilation = compile_target_adapter(adapter)
+            compiled_digest = compiled_target_adapter_digest(compilation)
+            scope_store = _StateScopeFixtureStore(enforce_conflicts=True)
+            click = next(
+                item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                )
+                if item.name == "browser_click"
+            )
+            snapshot = await session.snapshot(tab)
+            button = next(item for item in snapshot.elements if item.name == "No change")
+            result = await click.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:recorder-failure",
+                    call_id=f"recorder-failure:{failure_point}",
+                    agent_id="campaign:recorder-failure/worker-1",
+                    technique_attempt_id="attempt:recorder-failure",
+                    permission_grant_digest="grant:recorder-failure",
+                    target_id="target",
+                    compiled_adapter=compilation.model_dump_json(),
+                    compiled_adapter_digest=compiled_digest,
+                ),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": button.frame_ref,
+                    "element_ref": button.ref,
+                },
+            )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "post_effect_recording_failed"
+    assert result.metadata["target_effect_attempted"] is True
+    assert result.metadata["target_call_budget_charge"] == 1
+    assert result.metadata["campaign_id"] == "campaign:recorder-failure"
+    assert result.metadata["target_profile_id"] == "target"
+    assert result.metadata["compiled_adapter_digest"] == compiled_digest
+    assert result.metadata["target_ui_transition"]["material"] is True
+    assert result.metadata["target_ui_transition"]["adapter_stale"] is True
+    assert result.metadata["target_ui_transition"]["changed_dimensions"] == [
+        "after_state_unavailable"
+    ]
+    assert str(private_path) not in result.content
+    assert str(private_path) not in json.dumps(result.metadata, sort_keys=True)
+    assert scope_store.events[-2:] == ["settled", "released"]
+    assert scope_store.claims == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_point", ("record_evidence", "append_observation", "save_metadata")
+)
+async def test_compiled_exchange_post_submit_recording_failure_returns_unknown_after(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='assistant response';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+    private_path = tmp_path / "private-compiled-recorder" / "secret.bin"
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.submitted = False
+
+        async def append_action(self, value):
+            if value.kind in {"click", "press"}:
+                self.submitted = True
+
+        async def append_observation(self, _value):
+            if self.submitted and failure_point == "append_observation":
+                raise OSError(f"cannot persist {private_path}")
+
+        async def record_evidence(self, *_value):
+            if self.submitted and failure_point == "record_evidence":
+                raise OSError(f"cannot persist {private_path}")
+
+        async def save_metadata(self, _value):
+            if self.submitted and failure_point == "save_metadata":
+                raise OSError(f"cannot persist {private_path}")
+
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            scope_store = _StateScopeFixtureStore(enforce_conflicts=True)
+            tool = next(
+                item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                )
+                if item.name == "browser_chat_exchange"
+            )
+
+            result = await tool.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:compiled-recorder-failure",
+                    call_id=f"compiled-recorder-failure:{failure_point}",
+                    agent_id="campaign:compiled-recorder-failure/worker-1",
+                    target_id="target",
+                ),
+                {"prompt": "hello", "timeout_ms": 4_000},
+            )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "compiled_exchange_outcome_unknown"
+    assert result.metadata["target_effect_attempted"] is True
+    assert result.metadata["target_call_budget_charge"] == 1
+    assert result.metadata["limit_interaction_count"] == 1
+    assert result.metadata["target_ui_transition"]["material"] is True
+    assert result.metadata["target_ui_transition"]["adapter_stale"] is True
+    assert "target_exchanges" not in result.metadata
+    assert str(private_path) not in result.content
+    assert str(private_path) not in json.dumps(result.metadata, sort_keys=True)
+    assert scope_store.events[-3:] == ["acknowledged", "settled", "released"]
+    assert scope_store.claims == {}
+
+
+@pytest.mark.asyncio
+async def test_post_effect_capture_result_survives_error_path_metadata_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    <button aria-label="No change">No change</button>
+    """
+    private_path = tmp_path / "private-browser-recorder" / "secret.bin"
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            raise OSError(f"cannot persist {private_path}")
+
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            compilation = compile_target_adapter(adapter)
+            compiled_digest = compiled_target_adapter_digest(compilation)
+            scope_store = _StateScopeFixtureStore()
+            click = next(
+                item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    scope_store,
+                )
+                if item.name == "browser_click"
+            )
+            snapshot = await session.snapshot(tab)
+            button = next(item for item in snapshot.elements if item.name == "No change")
+
+            async def fail_after_capture(*_args, **_kwargs):
+                raise BrowserBoundaryError("post-effect frame detached")
+
+            import merlin_browser.tools as browser_tools_module
+
+            monkeypatch.setattr(
+                browser_tools_module,
+                "_browser_stabilized_after_snapshot",
+                fail_after_capture,
+            )
+            result = await click.invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:error-recorder",
+                    call_id="error-recorder",
+                    agent_id="campaign:error-recorder/worker-1",
+                    technique_attempt_id="attempt:error-recorder",
+                    permission_grant_digest="grant:error-recorder",
+                    target_id="target",
+                    compiled_adapter=compilation.model_dump_json(),
+                    compiled_adapter_digest=compiled_digest,
+                ),
+                {
+                    "tab_ref": tab,
+                    "frame_ref": button.frame_ref,
+                    "element_ref": button.ref,
+                },
+            )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "post_effect_state_capture_failed"
+    assert result.metadata["target_ui_transition"]["adapter_stale"] is True
+    assert "recording_error_type" in result.content
+    assert str(private_path) not in result.content
+    assert scope_store.events[-2:] == ["settled", "released"]
+
+
+@pytest.mark.asyncio
+async def test_campaign_open_tab_reuse_is_transition_fenced(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    async with web_fixture(page) as origin:
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={origin},
+            max_tabs=1,
+            requires_persistent_profile=True,
+        )
+        async with await launch_persistent(
+            tmp_path / "generic-transition-profile",
+            bounds,
+            owner(),
+            headless=True,
+        ) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            compilation = compile_target_adapter(adapter)
+            compiled_adapter = compilation.model_dump_json()
+            compiled_digest = compiled_target_adapter_digest(compilation)
+            tools = {
+                item.name: item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    _StateScopeFixtureStore(),
+                )
+            }
+            call_number = 0
+
+            def context() -> ToolContext:
+                nonlocal call_number
+                call_number += 1
+                return ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:open-tab-transition",
+                    call_id=f"open-tab-transition-{call_number}",
+                    agent_id="campaign:open-tab-transition/worker-1",
+                    technique_attempt_id="attempt:open-tab-transition",
+                    target_id="target",
+                    compiled_adapter=compiled_adapter,
+                    compiled_adapter_digest=compiled_digest,
+                )
+
+            transitioned = await tools["browser_open_tab"].invoke(
+                context(),
+                {"url": f"{origin}/level-2"},
+            )
+            assert transitioned.is_error is False
+            assert tuple(item.tab_ref for item in session.metadata().tabs) == (tab,)
+            assert transitioned.metadata["effect"] == "target_read"
+            assert transitioned.metadata["target_ui_transition"]["url_change"] == {
+                "before": f"{origin}/",
+                "after": f"{origin}/level-2",
+            }
+
+            original_new_tab = session.new_tab
+
+            async def navigate_then_timeout(url: str = "about:blank") -> str:
+                await original_new_tab(url)
+                raise TimeoutError("persistent reused-tab navigation timed out")
+
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr(session, "new_tab", navigate_then_timeout)
+                ambiguous = await tools["browser_open_tab"].invoke(
+                    context(),
+                    {"url": f"{origin}/level-3"},
+                )
+            assert ambiguous.is_error is True
+            assert ambiguous.metadata["failure_code"] == "target_effect_outcome_unknown"
+            assert ambiguous.metadata["target_effect_attempted"] is True
+            assert ambiguous.metadata["target_call_budget_charge"] == 1
+            assert ambiguous.metadata["target_ui_transition"]["adapter_stale"] is True
+            assert tuple(item.tab_ref for item in session.metadata().tabs) == (tab,)
+            assert next(item.url for item in session.metadata().tabs if item.tab_ref == tab) == (
+                f"{origin}/level-3"
+            )
 
 
 @pytest.mark.asyncio
@@ -15849,11 +16942,14 @@ async def test_compiled_chat_exchange_keeps_prompt_witness_collision_uncertain()
                 {"prompt": "Please explain Score:", "timeout_ms": 4_000},
             )
 
-            assert result.is_error is False
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "compiled_response_boundary_incomplete"
             assert result.metadata["response_boundary_observed"] is False
             assert result.metadata["response_boundary_complete"] is False
             assert result.metadata["attempt_disposition"] == "uncertain"
-            assert result.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+            assert result.metadata["response_wait_ms"] < 3_000
+            assert result.metadata["target_ui_transition"]["material"] is True
+            assert "target_exchanges" not in result.metadata
             assert any(
                 item["source"] == "browser.response_witness"
                 for item in result.metadata["evaluation_uncertainties"]
@@ -16040,8 +17136,7 @@ async def test_response_settling_includes_delayed_control_only_transition() -> N
             assert result.is_error is False
             assert result.metadata["response_boundary_complete"] is True
             controls = {
-                (item["role"], item["name"])
-                for item in json.loads(result.content)["elements"]
+                (item["role"], item["name"]) for item in json.loads(result.content)["elements"]
             }
             assert ("button", "Continue") in controls
             transition = result.metadata["target_ui_transition"]
@@ -16113,9 +17208,7 @@ async def test_rendered_state_respects_password_snapshot_redaction_boundary() ->
             assert snapshot.redaction_status == "redacted"
             assert "topsecret" not in snapshot.model_dump_json()
             assert observations == []
-            assert {
-                item["source"] for item in uncertainties
-            } == {
+            assert {item["source"] for item in uncertainties} == {
                 "browser.rendered_state.secret_text.baseline",
                 "browser.rendered_state.secret_text.result",
             }
@@ -16269,7 +17362,8 @@ async def test_response_witness_baseline_is_captured_after_setup_steps() -> None
                 {"prompt": "hello", "timeout_ms": 1_000},
             )
 
-            assert result.is_error is False
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "compiled_response_boundary_incomplete"
             assert result.metadata["response_boundary_observed"] is False
             assert result.metadata["response_boundary_complete"] is False
             assert result.metadata["attempt_disposition"] == "uncertain"
@@ -16342,11 +17436,14 @@ async def test_invalid_declared_witness_stays_uncertain_but_legacy_fallback_rema
                 )
 
     invalid = await run("w" * 513)
-    assert invalid.is_error is False
+    assert invalid.is_error is True
+    assert invalid.metadata["failure_code"] == "compiled_response_boundary_incomplete"
     assert invalid.metadata["response_boundary_observed"] is False
     assert invalid.metadata["response_boundary_complete"] is False
     assert invalid.metadata["attempt_disposition"] == "uncertain"
-    assert invalid.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+    assert invalid.metadata["response_wait_ms"] < 3_000
+    assert invalid.metadata["target_ui_transition"]["material"] is True
+    assert "target_exchanges" not in invalid.metadata
     assert any(
         item["source"] == "browser.response_witness"
         for item in invalid.metadata["evaluation_uncertainties"]
@@ -16424,11 +17521,14 @@ async def test_legacy_response_fallback_does_not_accept_prompt_echo_alone() -> N
                 {"prompt": "echo me", "timeout_ms": 4_000},
             )
 
-            assert result.is_error is False
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "compiled_response_boundary_incomplete"
             assert result.metadata["response_boundary_observed"] is False
             assert result.metadata["response_boundary_complete"] is False
             assert result.metadata["attempt_disposition"] == "uncertain"
-            assert result.metadata["target_exchanges"][0]["latency_ms"] < 3_000
+            assert result.metadata["response_wait_ms"] < 3_000
+            assert result.metadata["target_ui_transition"]["material"] is True
+            assert "target_exchanges" not in result.metadata
             assert any(
                 item["source"] == "browser.legacy_prompt_echo.count"
                 for item in result.metadata["evaluation_uncertainties"]
