@@ -166,12 +166,20 @@ def _payload(message: ChatMessage) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _settings(messages: Sequence[ChatMessage]) -> dict[str, Any]:
+def _configured_campaign_receipt(messages: Sequence[ChatMessage]) -> dict[str, Any]:
     for message in reversed(messages):
         if message.role == "tool" and message.name == "campaign_configure":
             payload = _payload(message)
             if payload.get("status") == "configured":
-                return dict(payload["settings"])
+                return payload
+    return {}
+
+
+def _settings(messages: Sequence[ChatMessage]) -> dict[str, Any]:
+    payload = _configured_campaign_receipt(messages)
+    settings = payload.get("settings")
+    if isinstance(settings, Mapping):
+        return dict(settings)
     return {}
 
 
@@ -364,6 +372,9 @@ class CampaignConfigureTool:
                 "revision": context.call_id,
                 "requires_review": True,
             }
+            campaign_request_scope = _latest_campaign_request_scope(messages)
+            if campaign_request_scope is not None:
+                result["campaign_request_id"] = campaign_request_scope[0]
             metadata = dict(result)
             if arguments.get("new_campaign") is True:
                 metadata["preferred_next_tool"] = "browser_recall_reconnaissance"
@@ -395,7 +406,9 @@ class ConfiguredCampaignTool:
         prepare_scope_request_id: str | None = None
         values = dict(arguments)
         if self.describe().name == "assessment_prepare":
-            settings = _settings(messages)
+            configured_receipt = _configured_campaign_receipt(messages)
+            configured_settings = configured_receipt.get("settings")
+            settings = dict(configured_settings) if isinstance(configured_settings, Mapping) else {}
             if not settings.get("objective") or not settings.get("campaign_profile"):
                 return ToolResult(
                     content="Record the operator's target, objective and selected profile with "
@@ -407,14 +420,15 @@ class ConfiguredCampaignTool:
                 "sha256:" + hashlib.sha256(str(settings["objective"]).strip().encode()).hexdigest()
             )
             campaign_request_scope = _latest_campaign_request_scope(messages)
-            if (
-                campaign_request_scope is not None
-                and campaign_request_scope[1] != prepare_scope_digest
+            configured_request_id = configured_receipt.get("campaign_request_id")
+            if campaign_request_scope is not None and (
+                configured_request_id != campaign_request_scope[0]
+                or campaign_request_scope[1] != prepare_scope_digest
             ):
                 return ToolResult(
                     content=(
                         "The latest campaign request does not match the configured operator "
-                        "objective. Call campaign_configure for that request before preparing."
+                        "request. Call campaign_configure for that request before preparing."
                     ),
                     is_error=True,
                 )

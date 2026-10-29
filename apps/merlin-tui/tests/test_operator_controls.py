@@ -62,6 +62,36 @@ def test_campaign_submit_envelope_parser_requires_exact_v2_shape() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_campaign_configure_receipt_binds_latest_v2_request_id() -> None:
+    campaign_request_id = "00000000-0000-4000-8000-000000000010"
+    objective = "Assess https://target.test"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                objective,
+                campaign_request_id=campaign_request_id,
+            ),
+        )
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": objective,
+            "campaign_profile": "recommended",
+        },
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == campaign_request_id
+    assert "campaign_request_id" not in receipt["settings"]
+    assert result.metadata["campaign_request_id"] == campaign_request_id
+
+
 class Delegate:
     effect = "workspace_write"
 
@@ -147,6 +177,7 @@ async def test_configured_prepare_preserves_handoff_repair_metadata() -> None:
         saved(
             "campaign_configure",
             {
+                "campaign_request_id": campaign_request_id,
                 "status": "configured",
                 "settings": {
                     "objective": "Assess https://target.test",
@@ -205,6 +236,7 @@ async def test_configured_prepare_routes_missing_durable_handoff_with_v2_scope(
         saved(
             "campaign_configure",
             {
+                "campaign_request_id": campaign_request_id,
                 "status": "configured",
                 "settings": {
                     "objective": objective,
@@ -270,9 +302,91 @@ async def test_configured_prepare_rejects_request_id_bound_to_stale_settings() -
     )
 
     assert result.is_error is True
-    assert "does not match the configured operator objective" in result.content
+    assert "does not match the configured operator request" in result.content
     assert result.metadata == {}
     assert delegate.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configured_prepare_rejects_new_v2_id_with_same_objective() -> None:
+    objective = "Assess https://target.test"
+    request_a = "00000000-0000-4000-8000-000000000011"
+    request_b = "00000000-0000-4000-8000-000000000012"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective, campaign_request_id=request_a),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                    "budget": {"max_turns": 17},
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective, campaign_request_id=request_b),
+        ),
+    ]
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"objective": objective, "adapter": {}}
+    )
+
+    assert result.is_error is True
+    assert "does not match the configured operator request" in result.content
+    assert result.metadata == {}
+    assert delegate.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configured_prepare_same_v2_id_retry_retains_configuration() -> None:
+    objective = "Assess https://target.test"
+    campaign_request_id = "00000000-0000-4000-8000-000000000013"
+    boundary = ChatMessage(
+        role="user",
+        content=campaign_submit_envelope(objective, campaign_request_id=campaign_request_id),
+    )
+    history = [
+        boundary,
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": campaign_request_id,
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                    "budget": {"max_turns": 17},
+                },
+            },
+        ),
+        boundary,
+    ]
+    delegate = Delegate("assessment_prepare")
+
+    result = await ConfiguredCampaignTool(delegate, AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"objective": "model retry", "adapter": {}}
+    )
+
+    assert not result.is_error
+    assert delegate.calls == [
+        {
+            "objective": objective,
+            "campaign_profile": "exhaustive",
+            "budget": {"max_turns": 17},
+            "adapter": {"execution_mode": "hybrid"},
+        }
+    ]
 
 
 @pytest.mark.asyncio
