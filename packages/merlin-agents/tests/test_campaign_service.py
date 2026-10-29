@@ -7474,7 +7474,7 @@ async def test_coverage_repair_compiles_receipt_bound_agendas() -> None:
     assert len(goat_assignments) == 1
     assert goat_assignments[0].strategy_id == "goat"
     assert goat_assignments[0].comparison_block_reason is None
-    assert "GOAT UNAVAILABLE" in goat_assignments[0].objective
+    assert "GOAT DEGRADED; DIRECT OBSERVATION ONLY" in goat_assignments[0].objective
     # No freeform repair lane remains: every repair cell gets an attributable
     # execution assignment even when optional comparison/strategy metadata is absent.
     assert not any(item.id.endswith("/adversarial-explorer-0") for item in compilation.assignments)
