@@ -22863,7 +22863,7 @@ class AssessmentPrepareTool:
                         )
                         adapter["evaluation_uncertainties"] = uncertainties
                 else:
-                    cache_key = (context.session_id, _campaign_request_id)
+                    cache_key = (context.session_id, _adapter_cache_scope)
                     cached_candidate = self._adapter_candidates.get(cache_key)
                     if cached_candidate is not None:
                         self._adapter_candidates[cache_key] = {

@@ -14343,7 +14343,7 @@ async def test_prepare_tool_drops_rejected_handoff_identity_claim_before_retry(
         "campaign_profile": "recommended",
     }
 
-    rejected = await tool.invoke_for_campaign_request(
+    rejected = await tool.invoke_for_configured_scope(
         context,
         {
             **base_arguments,
@@ -14352,15 +14352,15 @@ async def test_prepare_tool_drops_rejected_handoff_identity_claim_before_retry(
                 identity_field: wrong_identity,
             },
         },
-        campaign_request_id="00000000-0000-4000-8000-000000000040",
+        cache_scope="00000000-0000-4000-8000-000000000040",
     )
-    retried = await tool.invoke_for_campaign_request(
+    retried = await tool.invoke_for_configured_scope(
         context,
         {
             **base_arguments,
             "adapter": {"recon_handoff_id": handoff_id},
         },
-        campaign_request_id="00000000-0000-4000-8000-000000000040",
+        cache_scope="00000000-0000-4000-8000-000000000040",
     )
 
     assert rejected.is_error is True
