@@ -462,6 +462,12 @@ async def test_browser_handback_coordination_preserves_configured_prepare_scope(
         "Signed in at ftp://a.test. Hand the browser back and continue reconnaissance.",
         "Assess https://a.test while logged in and continue testing for authorization bypass.",
         "Explain current runtime status",
+        "I am not logged in; continue with a public-only explanation.",
+        "I couldn't get logged in; continue by explaining the error.",
+        "Authentication is complete, but do not continue; cancel this campaign.",
+        "Authentication is complete; stop this campaign and continue with an explanation.",
+        "Authentication is not completed; continue with an explanation.",
+        "Do not start a new campaign against https://a.test; continue the current assessment.",
     ],
 )
 async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
@@ -496,6 +502,12 @@ async def test_non_handback_or_target_changed_coordination_clears_prepare_scope(
         "Assess https://a.test while logged in and continue testing for authorization bypass.",
         "Run Merlin against https://a.test while logged in and continue testing.",
         "Continue with a new security assessment of https://a.test",
+        "Continue with a new campaign against https://a.test",
+        "Retry a fresh scan against https://a.test",
+        "Please resume with another assessment of https://a.test",
+        "Please continue with a fresh security evaluation of https://a.test",
+        "Start a new campaign against https://b.test",
+        "Launch a fresh scan of https://b.test",
     ],
 )
 async def test_explicit_campaign_intent_outranks_same_target_handback_cues(

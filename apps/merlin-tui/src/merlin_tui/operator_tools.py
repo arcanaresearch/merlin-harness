@@ -14,12 +14,16 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from merlin_contracts import ChatMessage, ToolContext, ToolResult, ToolSpec
+from merlin_contracts.campaign_coordination import (
+    has_url_candidate,
+    is_explicit_campaign_launch,
+    is_recon_handback_coordination,
+)
 
 MessageLoader = Callable[[str], Awaitable[Sequence[ChatMessage]]]
 PROFILES = ("quickscan", "recommended", "exhaustive", "exploration")
 MODES = ("api", "browser", "hybrid")
 _URL_RE = re.compile(r"https?://(?:\[[0-9a-f:.]+\]|[^\s<>\]\[(){}\"']+)+", re.IGNORECASE)
-_URL_CANDIDATE_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s]+", re.IGNORECASE)
 _CLI_CAMPAIGN_SUBMIT_MARKER = "MERLIN_CAMPAIGN_SUBMIT_REQUEST\n"
 _CLI_CAMPAIGN_SUBMIT_LEGACY_SCHEMA = "merlin.cli-campaign-submit.v1"
 _CLI_CAMPAIGN_SUBMIT_SCHEMA = "merlin.cli-campaign-submit.v2"
@@ -97,24 +101,7 @@ def _is_internal_campaign_continuation(content: str) -> bool:
 
 
 def _is_recon_handback_continuation(content: str) -> bool:
-    normalized = " ".join(content.casefold().split())
-    completion = (
-        "signed in" in normalized
-        or "logged in" in normalized
-        or re.search(
-            r"\b(?:login|auth|authentication|mfa|captcha)\b.{0,24}"
-            r"\b(?:complete|completed|done)\b",
-            normalized,
-        )
-        is not None
-        or re.search(
-            r"\b(?:hand|give|return|take)\b.{0,32}\bbrowser\b.{0,16}\bback\b",
-            normalized,
-        )
-        is not None
-    )
-    continuation = re.search(r"\b(?:continue|resume|proceed)\b", normalized) is not None
-    return completion and continuation
+    return is_recon_handback_coordination(content)
 
 
 def _primary_target(content: str) -> str | None:
@@ -142,7 +129,7 @@ def _primary_target(content: str) -> str | None:
 
 
 def _has_url_candidate(content: str) -> bool:
-    return _URL_CANDIDATE_RE.search(content) is not None
+    return has_url_candidate(content)
 
 
 def _configured_objective(messages: Sequence[ChatMessage]) -> str | None:
@@ -165,39 +152,8 @@ class _CampaignBoundary:
 
 def _looks_like_campaign_request(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
-    continuation_prefix = (
-        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
-    )
-    explicit_fresh_launch = (
-        re.search(
-            r"\b(?:new|fresh|another)\b.*\b(?:campaign|scan|assessment)\b",
-            normalized,
-        )
-        is not None
-    )
-    requests_assessment = any(
-        marker in normalized
-        for marker in (
-            "assess ",
-            "assessment against ",
-            "run merlin",
-            "use merlin",
-            "merlin scan",
-            "campaign profile",
-            "red pen scan",
-            "redpen scan",
-            "red-team scan",
-            "red team scan",
-            "red-team assessment",
-            "red team assessment",
-            "security assessment",
-            "security evaluation",
-        )
-    )
-    return (
-        requests_assessment
-        and (not continuation_prefix or explicit_fresh_launch)
-        and (_primary_target(content) is not None or "target" in normalized)
+    return is_explicit_campaign_launch(content) and (
+        _primary_target(content) is not None or "target" in normalized
     )
 
 

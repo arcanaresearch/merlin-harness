@@ -39,6 +39,11 @@ from merlin_contracts import (
     ToolContext,
     ToolResult,
 )
+from merlin_contracts.campaign_coordination import (
+    has_url_candidate,
+    is_explicit_campaign_launch,
+    is_recon_handback_coordination,
+)
 from merlin_contracts.storage_failures import storage_failure_category
 
 from .commands import CommandError, help_text, parse_command
@@ -95,7 +100,6 @@ _CAMPAIGN_REQUEST_ID_RE = re.compile(
 _CAMPAIGN_TARGET_URL_RE = re.compile(
     r"https?://(?:\[[0-9a-f:.]+\]|[^\s<>\]\[(){}\"'])+", re.IGNORECASE
 )
-_CAMPAIGN_URL_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>()]+", re.IGNORECASE)
 _RECON_RECALL_TOOL = "browser_recall_reconnaissance"
 _OWNED_SESSION_CLEANUP_TOOL = "browser_end_owned_session"
 _HANDOFF_REPAIR_OBSERVATION_TOOL = "browser_network_events"
@@ -488,37 +492,8 @@ def _typed_campaign_objective_digest(content: str) -> str | None:
 
 def _is_explicit_campaign_launch(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
-    requests_assessment = any(
-        marker in normalized
-        for marker in (
-            "assess ",
-            "assessment against ",
-            "run merlin",
-            "use merlin",
-            "merlin scan",
-            "campaign profile",
-            "red pen scan",
-            "redpen scan",
-            "red-team scan",
-            "red team scan",
-            "red-team assessment",
-            "red team assessment",
-            "security assessment",
-            "security evaluation",
-        )
-    )
-    explicit_fresh_launch = (
-        re.search(
-            r"\b(?:new|fresh|another)\b.*\b(?:campaign|scan|assessment)\b",
-            normalized,
-        )
-        is not None
-    )
-    continuation_prefix = (
-        re.match(r"^(?:please\s+)?(?:resume|retry|continue)\b", normalized) is not None
-    )
     has_target = _campaign_primary_target(content) is not None or "target" in normalized
-    return requests_assessment and has_target and (not continuation_prefix or explicit_fresh_launch)
+    return is_explicit_campaign_launch(content) and has_target
 
 
 def _is_campaign_boundary_continuation(content: str) -> bool:
@@ -539,23 +514,7 @@ def _is_campaign_boundary_continuation(content: str) -> bool:
 def _is_recon_handback_coordination(content: str) -> bool:
     """Recognize only completed-auth browser handback coordination."""
 
-    normalized = " ".join(content.casefold().split())
-    continues = re.search(r"\b(?:continue|resume|proceed)\b", normalized) is not None
-    auth_completed = (
-        re.search(r"\b(?:signed|logged)\s+in\b", normalized) is not None
-        or re.search(
-            r"\b(?:login|auth|authentication|mfa|captcha)\b.{0,40}"
-            r"\b(?:complete|completed|done)\b",
-            normalized,
-        )
-        is not None
-        or re.search(
-            r"\b(?:hand|give|return|take)\b.{0,40}\bbrowser\b.{0,20}\bback\b",
-            normalized,
-        )
-        is not None
-    )
-    return continues and auth_completed
+    return is_recon_handback_coordination(content)
 
 
 def _campaign_primary_target(content: str) -> str | None:
@@ -640,9 +599,9 @@ def _advance_campaign_boundary(
     explicit_campaign_launch = _is_explicit_campaign_launch(content)
     continuation = _is_campaign_boundary_continuation(content)
     handback = not explicit_campaign_launch and _is_recon_handback_coordination(content)
-    target_token = _CAMPAIGN_URL_TOKEN_RE.search(content)
+    target_token = has_url_candidate(content)
     if continuation or handback:
-        if target_token is None:
+        if not target_token:
             return state, False
         continuation_target = _campaign_primary_target(content)
         if continuation_target is not None and continuation_target == state.primary_target:
@@ -650,7 +609,7 @@ def _advance_campaign_boundary(
         return _CampaignBoundaryState("unbound", primary_target=continuation_target), True
     return _CampaignBoundaryState(
         "unbound",
-        primary_target=_campaign_primary_target(content) if target_token is not None else None,
+        primary_target=_campaign_primary_target(content) if target_token else None,
     ), True
 
 

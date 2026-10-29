@@ -5045,6 +5045,24 @@ def test_latest_campaign_scope_ignores_targetless_browser_handback_coordination(
     )
 
 
+def test_latest_campaign_scope_does_not_treat_new_login_as_fresh_campaign() -> None:
+    objective = "Assess https://a.test/chat"
+    handback = (
+        "Continue after a new login; I'm logged in for the current security "
+        "assessment of https://a.test/chat."
+    )
+
+    assert _latest_typed_campaign_scope(
+        [
+            ChatMessage(role="user", content=_campaign_scope_content(objective)),
+            ChatMessage(role="user", content=handback),
+        ]
+    ) == (
+        _CAMPAIGN_REQUEST_ID_A,
+        "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+    )
+
+
 @pytest.mark.parametrize("prefix", ["Resume", "Retry", "Continue"])
 @pytest.mark.parametrize("target", ["", " https://c.test/chat"])
 def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
@@ -5067,6 +5085,12 @@ def test_latest_campaign_scope_retains_matching_or_targetless_continuation(
         "Assess https://a.test while logged in and continue testing for authorization bypass.",
         "Run Merlin against https://a.test while logged in and continue testing.",
         "Continue with a new security assessment of https://a.test",
+        "Continue with a new campaign against https://a.test",
+        "Retry a fresh scan against https://a.test",
+        "Please resume with another assessment of https://a.test",
+        "Please continue with a fresh security evaluation of https://a.test",
+        "Start a new campaign against https://b.test",
+        "Launch a fresh scan of https://b.test",
     ],
 )
 def test_latest_campaign_scope_treats_explicit_same_target_launch_as_fresh(
@@ -5090,6 +5114,29 @@ def test_latest_campaign_scope_retains_same_target_prefixed_assessment() -> None
 
 
 @pytest.mark.parametrize(
+    "failed_handback",
+    [
+        "I am not logged in; continue with a public-only explanation.",
+        "I couldn't get logged in; continue by explaining the error.",
+        "Authentication is complete, but do not continue; cancel this campaign.",
+        "Authentication is complete; stop this campaign and continue with an explanation.",
+        "Authentication is not completed; continue with an explanation.",
+        "Do not start a new campaign against https://a.test; continue the current assessment.",
+        "MFA failed; proceed by reporting the failure.",
+    ],
+)
+def test_latest_campaign_scope_rejects_failed_or_cancelled_auth_handback(
+    failed_handback: str,
+) -> None:
+    scope = ChatMessage(role="user", content=_campaign_scope_content("Assess https://a.test"))
+
+    assert (
+        _latest_typed_campaign_scope([scope, ChatMessage(role="user", content=failed_handback)])
+        is None
+    )
+
+
+@pytest.mark.parametrize(
     "continuation",
     [
         "Resume https://b.test/chat",
@@ -5097,6 +5144,10 @@ def test_latest_campaign_scope_retains_same_target_prefixed_assessment() -> None
         "Continue https://c.test/chat/",
         "Resume https://user:secret@c.test/chat",
         "Resume ftp://c.test/chat",
+        "Continue with ftp://(broken)",
+        "Continue with https://(a.test)",
+        "Continue _ftp://b.test",
+        "Continue éftp://b.test",
     ],
 )
 def test_latest_campaign_scope_unbinds_different_or_unknown_primary_target(
@@ -5461,6 +5512,19 @@ def test_repair_restore_survives_targetless_browser_handback_coordination(
     restored = _restored_preferred_tool_repair(transcript)
     assert restored is not None
     assert restored[3] == _CAMPAIGN_REQUEST_ID_A
+    for failed_handback in (
+        "I am not logged in; continue with a public-only explanation.",
+        "I couldn't get logged in; continue by explaining the error.",
+        "Authentication is complete, but do not continue; cancel this campaign.",
+        "Authentication is complete; stop this campaign and continue with an explanation.",
+        "Authentication is not completed; continue with an explanation.",
+    ):
+        assert (
+            _restored_preferred_tool_repair(
+                [*transcript[:-1], ChatMessage(role="user", content=failed_handback)]
+            )
+            is None
+        )
     assert (
         _restored_preferred_tool_repair(
             [
@@ -5771,6 +5835,23 @@ def test_automatic_recon_survives_targetless_browser_handback_coordination(
         ]
     )
     assert restored is not None
+
+    for failed_handback in (
+        "I am not logged in; continue with a public-only explanation.",
+        "I couldn't get logged in; continue by explaining the error.",
+        "Authentication is complete, but do not continue; cancel this campaign.",
+        "Authentication is complete; stop this campaign and continue with an explanation.",
+        "Authentication is not completed; continue with an explanation.",
+    ):
+        failed, _ = _restored_automatic_recon(
+            [
+                ChatMessage(role="user", content=_campaign_scope_content(objective)),
+                call,
+                tool,
+                ChatMessage(role="user", content=failed_handback),
+            ]
+        )
+        assert failed is None
 
     same_target_campaign, _ = _restored_automatic_recon(
         [

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from merlin_contracts import (
     NodeProjection,
     ScheduleProjection,
 )
+from merlin_kernel.kernel import _latest_typed_campaign_scope
 from merlin_tui.configuration import ProviderConfiguration
 from merlin_tui.kernel_backend import KernelBackend, KernelSettings, event_to_stream
 from merlin_tui.operator_tools import campaign_submit_envelope
@@ -621,6 +623,7 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
             "Signed in at https://a.test:bad. Hand the browser back and continue reconnaissance.",
             True,
         ),
+        ("Continue with https://(a.test)", True),
         (
             "Assess https://a.test while logged in and continue testing for authorization bypass.",
             True,
@@ -629,7 +632,18 @@ async def test_backend_valid_typed_resume_prefix_is_never_double_wrapped() -> No
             "Run Merlin against https://a.test while logged in and continue testing.",
             True,
         ),
+        ("Continue with a new campaign against https://a.test", True),
+        ("Retry a fresh scan against https://a.test", True),
+        ("Please resume with another assessment of https://a.test", True),
+        ("Please continue with a fresh security evaluation of https://a.test", True),
+        ("Start a new campaign against https://b.test", True),
+        ("Launch a fresh scan of https://b.test", True),
         ("I'm logged in; continue the security assessment.", False),
+        (
+            "Continue after a new login; I'm logged in for the current security "
+            "assessment of https://a.test.",
+            False,
+        ),
     ],
 )
 async def test_backend_handback_continuation_is_target_aware(
@@ -663,6 +677,84 @@ async def test_backend_handback_continuation_is_target_aware(
         assert envelope["operator_objective"] == prompt
     else:
         assert submitted == prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Authentication for the selected operator account is complete; continue.",
+        "Hand " + ("x" * 35) + " browser back and continue.",
+    ],
+)
+async def test_backend_and_kernel_share_long_authenticated_handback_grammar(
+    prompt: str,
+) -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000091"
+    typed_request = campaign_submit_envelope(objective, campaign_request_id=request_id)
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (ChatMessage(role="user", content=typed_request),)
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+    assert kernel.submissions == [prompt]
+    assert _latest_typed_campaign_scope(
+        [
+            ChatMessage(role="user", content=typed_request),
+            ChatMessage(role="user", content=kernel.submissions[0]),
+        ]
+    ) == (
+        request_id,
+        "sha256:" + hashlib.sha256(objective.encode()).hexdigest(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "I am not logged in; continue with a public-only explanation.",
+        "I couldn't get logged in; continue by explaining the error.",
+        "Authentication is complete, but do not continue; cancel this campaign.",
+        "Authentication is complete; stop this campaign and continue with an explanation.",
+        "Authentication is not completed; continue with an explanation.",
+        "Do not start a new campaign against https://a.test; continue the current assessment.",
+        "I am unsigned in; continue.",
+        "The task was assigned in chat; continue.",
+    ],
+)
+async def test_backend_and_kernel_reject_failed_or_cancelled_auth_handback(
+    prompt: str,
+) -> None:
+    objective = "Assess https://a.test"
+    request_id = "00000000-0000-4000-8000-000000000092"
+    typed_request = campaign_submit_envelope(objective, campaign_request_id=request_id)
+
+    class Store:
+        async def load_messages(self, _session_id: str):
+            return (ChatMessage(role="user", content=typed_request),)
+
+    kernel = FakeKernel([])
+    kernel._store = Store()
+    backend = KernelBackend(kernel, operator_controls=True)  # type: ignore[arg-type]
+
+    assert [event async for event in backend.stream(prompt)] == []
+    assert kernel.submissions == [prompt]
+    assert (
+        _latest_typed_campaign_scope(
+            [
+                ChatMessage(role="user", content=typed_request),
+                ChatMessage(role="user", content=kernel.submissions[0]),
+            ]
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
