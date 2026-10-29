@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import ctypes
 import errno
 import fcntl
 import importlib.metadata
@@ -162,7 +163,7 @@ class RuntimeIdentity:
 @dataclass(frozen=True, slots=True)
 class _DaemonProcessIdentity:
     pid: int
-    started_at: str
+    start_token: tuple[str, int, int]
     argv: tuple[str, ...]
 
 
@@ -1423,6 +1424,63 @@ def _resume_stopped_foreground(socket_path: Path) -> None:
         return
 
 
+class _DarwinProcessBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _process_start_token(pid: int) -> tuple[str, int, int] | None:
+    if sys.platform == "darwin":
+        try:
+            libproc = ctypes.CDLL("libproc.dylib", use_errno=True)
+            proc_pidinfo = libproc.proc_pidinfo
+            proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            proc_pidinfo.restype = ctypes.c_int
+            info = _DarwinProcessBsdInfo()
+            size = ctypes.sizeof(info)
+            if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size or info.pbi_pid != pid:
+                return None
+            return ("darwin", int(info.pbi_start_tvsec), int(info.pbi_start_tvusec))
+        except (AttributeError, OSError):
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rindex(")") + 2 :].split()
+            return ("linux", int(fields[19]), 0)
+        except (IndexError, OSError, ValueError):
+            return None
+    return None
+
+
 def _daemon_process_identity(socket_path: Path) -> _DaemonProcessIdentity | None:
     """Return a stable same-user Merlin identity while it still owns the lock."""
     pid = _daemon_lock_owner(socket_path)
@@ -1430,29 +1488,31 @@ def _daemon_process_identity(socket_path: Path) -> _DaemonProcessIdentity | None
         return None
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "uid=,lstart=,args="],
+            ["ps", "-p", str(pid), "-o", "uid=,args="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-        identity = result.stdout.strip().split(maxsplit=6)
-        if len(identity) != 7 or identity[0] != str(os.getuid()):
+        process = result.stdout.strip().split(maxsplit=1)
+        if len(process) != 2 or process[0] != str(os.getuid()):
             return None
-        argv = shlex.split(identity[6])
+        argv = shlex.split(process[1])
         source = len(argv) == 4 and argv[1:] == ["-m", "merlin_tui.local_control", "daemon"]
         frozen = (
             len(argv) == 2
             and Path(argv[0]).name in {"merlin", "merlin-runtime"}
             and argv[1] == "daemon"
         )
+        start_token = _process_start_token(pid)
         if (
             not (source or frozen)
+            or start_token is None
             or _daemon_lock_owner(socket_path) != pid
             or _daemon_lock_released(socket_path)
         ):
             return None
-        return _DaemonProcessIdentity(pid, " ".join(identity[1:6]), tuple(argv))
+        return _DaemonProcessIdentity(pid, start_token, tuple(argv))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
 
@@ -2082,34 +2142,49 @@ async def _terminate_locked_daemon(socket_path: Path, shutdown_seconds: float) -
     identity = await asyncio.to_thread(_daemon_process_identity, socket_path)
     if identity is None:
         raise RuntimeError("Merlin daemon process identity could not be verified")
-    if await asyncio.to_thread(_daemon_process_identity, socket_path) != identity:
-        raise RuntimeError("Merlin daemon ownership changed; refusing to signal any process")
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    pidfd: int | None = None
+    if callable(pidfd_open) and callable(pidfd_send_signal):
+        try:
+            pidfd = pidfd_open(identity.pid)
+        except OSError as error:
+            raise RuntimeError(
+                "Could not bind force-stop to the verified daemon process"
+            ) from error
+
+    async def send_verified(signum: signal.Signals) -> None:
+        if await asyncio.to_thread(_daemon_process_identity, socket_path) != identity:
+            raise RuntimeError("Merlin daemon ownership changed; refusing to signal any process")
+        try:
+            if pidfd is not None:
+                pidfd_send_signal(pidfd, signum)
+            else:
+                os.kill(identity.pid, signum)
+        except ProcessLookupError:
+            pass
 
     try:
-        os.kill(identity.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    deadline = asyncio.get_running_loop().time() + shutdown_seconds
-    term_grace_seconds = min(1.0, shutdown_seconds / 2)
-    term_deadline = min(deadline, asyncio.get_running_loop().time() + term_grace_seconds)
-    while asyncio.get_running_loop().time() < term_deadline:
-        if await asyncio.to_thread(_daemon_lock_released, socket_path):
-            return True
-        await asyncio.sleep(0.05)
+        await send_verified(signal.SIGTERM)
+        deadline = asyncio.get_running_loop().time() + shutdown_seconds
+        term_grace_seconds = min(1.0, shutdown_seconds / 2)
+        term_deadline = min(deadline, asyncio.get_running_loop().time() + term_grace_seconds)
+        while asyncio.get_running_loop().time() < term_deadline:
+            if await asyncio.to_thread(_daemon_lock_released, socket_path):
+                return True
+            await asyncio.sleep(0.05)
 
-    if await asyncio.to_thread(_daemon_process_identity, socket_path) != identity:
-        raise RuntimeError(
-            "Merlin daemon ownership changed after SIGTERM; refusing to kill an unverified process"
+        await send_verified(signal.SIGKILL)
+        while asyncio.get_running_loop().time() < deadline:
+            if await asyncio.to_thread(_daemon_lock_released, socket_path):
+                return True
+            await asyncio.sleep(0.05)
+        raise TimeoutError(
+            f"Merlin daemon owner (pid {identity.pid}) retained its lock after SIGKILL"
         )
-    try:
-        os.kill(identity.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    while asyncio.get_running_loop().time() < deadline:
-        if await asyncio.to_thread(_daemon_lock_released, socket_path):
-            return True
-        await asyncio.sleep(0.05)
-    raise TimeoutError(f"Merlin daemon owner (pid {identity.pid}) retained its lock after SIGKILL")
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
 
 
 async def stop_daemon(

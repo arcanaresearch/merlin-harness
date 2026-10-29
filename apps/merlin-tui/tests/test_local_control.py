@@ -1115,7 +1115,7 @@ async def test_daemon_lock_records_owner_pid_and_force_stop_terminates_orphan(
         assert await asyncio.to_thread(_daemon_lock_owner, socket_path) == orphan.pid
         identity = _DaemonProcessIdentity(
             orphan.pid,
-            "fixture-start",
+            ("darwin", 100, 1),
             (sys.executable, "-m", "merlin_tui.local_control", "daemon"),
         )
         monkeypatch.setattr(
@@ -1185,7 +1185,7 @@ async def test_force_stop_escalates_acknowledged_shutdown_timeout_to_sigkill(
         assert _daemon_lock_owner(socket_path) == owner.pid
         identity = _DaemonProcessIdentity(
             owner.pid,
-            "fixture-start",
+            ("darwin", 100, 1),
             (sys.executable, "-m", "merlin_tui.local_control", "daemon"),
         )
         monkeypatch.setattr(
@@ -1231,7 +1231,7 @@ async def test_force_stop_escalates_unreachable_locked_owner_to_sigkill(
         assert _daemon_lock_owner(socket_path) == owner.pid
         identity = _DaemonProcessIdentity(
             owner.pid,
-            "fixture-start",
+            ("darwin", 100, 1),
             (sys.executable, "-m", "merlin_tui.local_control", "daemon"),
         )
         monkeypatch.setattr(
@@ -1259,10 +1259,10 @@ async def test_force_stop_sends_no_signal_when_process_identity_changes(
     socket_path = tmp_path / "daemon.sock"
     identities = iter(
         (
-            _DaemonProcessIdentity(111, "first-start", ("merlin-runtime", "daemon")),
+            _DaemonProcessIdentity(111, ("darwin", 100, 1), ("merlin-runtime", "daemon")),
             _DaemonProcessIdentity(
                 111 if reuse_pid else 222,
-                "second-start",
+                ("darwin", 100, 2),
                 ("merlin-runtime", "daemon"),
             ),
         )
@@ -1287,7 +1287,7 @@ async def test_force_stop_foreground_owner_verifies_identity_before_signal(
     socket_path = tmp_path / "daemon.sock"
     identity = local_control._DaemonProcessIdentity(
         424242,
-        "fixture-start",
+        ("darwin", 100, 1),
         ("merlin-runtime", "daemon"),
     )
     identity_checks: list[Path] = []
@@ -1331,6 +1331,44 @@ async def test_force_stop_foreground_owner_verifies_identity_before_signal(
     assert await stop_daemon(socket_path, force=True, shutdown_seconds=0.1)
     assert identity_checks == [socket_path, socket_path]
     assert kills == [(identity.pid, signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
+async def test_force_stop_uses_pidfd_for_the_signal_boundary(monkeypatch, tmp_path) -> None:
+    from merlin_tui import local_control
+
+    socket_path = tmp_path / "daemon.sock"
+    identity = local_control._DaemonProcessIdentity(
+        424242,
+        ("linux", 123456, 0),
+        ("merlin-runtime", "daemon"),
+    )
+    signals: list[tuple[int, signal.Signals]] = []
+    closed: list[int] = []
+    released = False
+
+    def send_signal(pidfd: int, signum: signal.Signals) -> None:
+        nonlocal released
+        signals.append((pidfd, signum))
+        if signum == signal.SIGKILL:
+            released = True
+
+    monkeypatch.setattr(local_control, "_daemon_process_identity", lambda _path: identity)
+    monkeypatch.setattr(local_control, "_daemon_lock_released", lambda _path: released)
+    monkeypatch.setattr(local_control.os, "pidfd_open", lambda pid: 73, raising=False)
+    monkeypatch.setattr(local_control.signal, "pidfd_send_signal", send_signal, raising=False)
+    monkeypatch.setattr(
+        local_control.os,
+        "kill",
+        lambda *_args: pytest.fail(
+            "numeric PID signaling must not be used when pidfd is available"
+        ),
+    )
+    monkeypatch.setattr(local_control.os, "close", closed.append)
+
+    assert await stop_daemon(socket_path, force=True, shutdown_seconds=0.1)
+    assert signals == [(73, signal.SIGTERM), (73, signal.SIGKILL)]
+    assert closed == [73]
 
 
 @pytest.mark.asyncio
@@ -1821,7 +1859,7 @@ async def test_force_stop_terminates_daemon_despite_foreground_lease(
     kills: list[tuple[int, int]] = []
     identity = local_control._DaemonProcessIdentity(
         424242,
-        "fixture-start",
+        ("darwin", 100, 1),
         ("merlin-runtime", "daemon"),
     )
     monkeypatch.setattr(local_control.os, "kill", lambda pid, sig: kills.append((pid, sig)))
@@ -3385,7 +3423,11 @@ def test_restart_resume_skips_unidentified_foreground(monkeypatch) -> None:
 async def test_restart_recovers_verified_real_orphan_before_start(monkeypatch) -> None:
     from uuid import uuid4
 
-    from merlin_tui.local_control import _daemon_lock_owner, restart_daemon
+    from merlin_tui.local_control import (
+        _daemon_lock_owner,
+        _DaemonProcessIdentity,
+        restart_daemon,
+    )
 
     path = Path(f"/tmp/merlin-restart-orphan-{uuid4().hex[:12]}.sock")
     orphan = await asyncio.create_subprocess_exec(
@@ -3400,8 +3442,20 @@ async def test_restart_recovers_verified_real_orphan_before_start(monkeypatch) -
     )
     starts = []
 
-    def verify_fixture_owner(socket_path):
-        return socket_path == path and _daemon_lock_owner(path) == orphan.pid
+    identity = _DaemonProcessIdentity(
+        orphan.pid,
+        ("darwin", 100, 1),
+        (sys.executable, "-m", "merlin_tui.local_control", "daemon"),
+    )
+
+    def fixture_identity(socket_path):
+        if (
+            socket_path != path
+            or orphan.returncode is not None
+            or _daemon_lock_owner(path) != orphan.pid
+        ):
+            return None
+        return identity
 
     async def start(socket_path):
         assert socket_path == path
@@ -3410,7 +3464,7 @@ async def test_restart_recovers_verified_real_orphan_before_start(monkeypatch) -
         starts.append(socket_path)
         return True
 
-    monkeypatch.setattr("merlin_tui.local_control._verified_daemon_owner", verify_fixture_owner)
+    monkeypatch.setattr("merlin_tui.local_control._daemon_process_identity", fixture_identity)
     monkeypatch.setattr("merlin_tui.local_control.ensure_daemon", start)
     try:
         async with asyncio.timeout(5):
@@ -3444,11 +3498,14 @@ def test_restart_orphan_verifies_daemon_identity(
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_owner", lambda _: pid)
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", lambda _: False)
     monkeypatch.setattr(
+        "merlin_tui.local_control._process_start_token", lambda _: ("darwin", 100, 1)
+    )
+    monkeypatch.setattr(
         "merlin_tui.local_control.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args,
             0,
-            stdout=f"{os.getuid() + uid_offset} Wed Oct 30 12:34:56 2026 {command}\n",
+            stdout=f"{os.getuid() + uid_offset} {command}\n",
         ),
     )
 
@@ -3462,14 +3519,14 @@ def test_restart_orphan_rechecks_lock_owner_after_process_identity(monkeypatch) 
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_owner", lambda _: next(owners))
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", lambda _: False)
     monkeypatch.setattr(
+        "merlin_tui.local_control._process_start_token", lambda _: ("darwin", 100, 1)
+    )
+    monkeypatch.setattr(
         "merlin_tui.local_control.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args,
             0,
-            stdout=(
-                f"{os.getuid()} Wed Oct 30 12:34:56 2026 "
-                "/usr/bin/python -m merlin_tui.local_control daemon\n"
-            ),
+            stdout=f"{os.getuid()} /usr/bin/python -m merlin_tui.local_control daemon\n",
         ),
     )
 
@@ -3483,18 +3540,30 @@ def test_daemon_identity_requires_process_to_still_hold_lock(monkeypatch) -> Non
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_owner", lambda _: pid)
     monkeypatch.setattr("merlin_tui.local_control._daemon_lock_released", lambda _: True)
     monkeypatch.setattr(
+        "merlin_tui.local_control._process_start_token", lambda _: ("darwin", 100, 1)
+    )
+    monkeypatch.setattr(
         "merlin_tui.local_control.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args,
             0,
-            stdout=(
-                f"{os.getuid()} Wed Oct 30 12:34:56 2026 "
-                "/usr/bin/python -m merlin_tui.local_control daemon\n"
-            ),
+            stdout=f"{os.getuid()} /usr/bin/python -m merlin_tui.local_control daemon\n",
         ),
     )
 
     assert not _verified_daemon_owner(Path("/tmp/merlin-released-owner.sock"))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin libproc contract")
+def test_darwin_process_start_token_uses_kernel_microseconds() -> None:
+    from merlin_tui.local_control import _process_start_token
+
+    token = _process_start_token(os.getpid())
+
+    assert token is not None
+    assert token[0] == "darwin"
+    assert token[1] > 0
+    assert 0 <= token[2] < 1_000_000
 
 
 @pytest.mark.asyncio
