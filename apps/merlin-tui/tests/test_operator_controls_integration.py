@@ -77,7 +77,9 @@ async def test_chat_intent_survives_real_kernel_storage_and_rejects_old_approval
                     metadata=prepared,
                 )
             )
+            recall = AsyncMock(return_value=ToolResult(content=json.dumps({"status": "recalled"})))
             execute = AsyncMock()
+            tools["browser_recall_reconnaissance"].invoke = recall
             tools["assessment_prepare"]._tool.invoke = prepare
             tools["assessment_execute"]._tool.invoke = execute
 
@@ -100,7 +102,7 @@ async def test_chat_intent_survives_real_kernel_storage_and_rejects_old_approval
                         )
                     elif self.count == 2:
                         yield ToolCall(
-                            call_id="new-review",
+                            call_id="held-review",
                             name="assessment_prepare",
                             arguments={
                                 "objective": "Old L4",
@@ -117,8 +119,26 @@ async def test_chat_intent_survives_real_kernel_storage_and_rejects_old_approval
                                 "manifest_digest": "sha256:old",
                             },
                         )
+                    elif self.count == 4:
+                        assert "browser_recall_reconnaissance" in {
+                            tool["function"]["name"] for tool in request.tools
+                        }
+                        yield ToolCall(
+                            call_id="recall-recon",
+                            name="browser_recall_reconnaissance",
+                            arguments={"surface": "L3", "agent_or_bot": "discovery scan"},
+                        )
+                    elif self.count == 5:
+                        yield ToolCall(
+                            call_id="new-review",
+                            name="assessment_prepare",
+                            arguments={
+                                "objective": "Old L4",
+                                "campaign_profile": "quickscan",
+                                "adapter": {"recon_handoff_id": "new-sealed-handoff"},
+                            },
+                        )
                     else:
-                        assert "superseded" in request.messages[-1].content
                         yield TextDelta(text="The L3 exploration campaign is ready for review.")
                         yield ModelCompleted()
                         return
@@ -128,7 +148,8 @@ async def test_chat_intent_survives_real_kernel_storage_and_rejects_old_approval
             kernel._provider = provider
             events = [event async for event in backend.stream("Run a new discovery scan on L3")]
             assert not [event.text for event in events if event.kind == "error"]
-            assert provider.count == 4
+            assert provider.count == 6
+            recall.assert_awaited_once()
             arguments = prepare.call_args.args[1]
             assert arguments["objective"] == "Discovery scan on L3"
             assert arguments["campaign_profile"] == "exploration"
@@ -138,11 +159,15 @@ async def test_chat_intent_survives_real_kernel_storage_and_rejects_old_approval
             review = next(event for event in events if event.kind == "campaign_review")
             assert json.loads(review.text)["campaign_id"] == "campaign/new-L3"
             messages = await kernel._store.load_messages(session_id)
+            held_receipt = next(m for m in messages if m.tool_call_id == "held-review")
+            assert "not admitted" in held_receipt.content
             receipt = next(m for m in messages if m.tool_call_id == "new-review")
             assert (
                 json.JSONDecoder().raw_decode(receipt.content)[0]["manifest_digest"] == "sha256:new"
             )
             assert len(receipt.content) < 1000
+            stale_receipt = next(m for m in messages if m.tool_call_id == "stale-approve")
+            assert "not admitted" in stale_receipt.content
             names = {spec.name for spec in kernel._tools.describe()}
             assert {
                 "campaign_configure",
