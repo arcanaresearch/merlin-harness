@@ -3793,6 +3793,72 @@ async def test_recovery_excludes_campaign_with_live_supervisor_from_lifecycle_re
     assert exclusions == [("campaign/live",)]
 
 
+async def test_targeted_campaign_recovery_does_not_sweep_unrelated_campaigns() -> None:
+    calls = []
+
+    class LifecycleRecovery:
+        async def reconcile(self, *, exclude_campaign_ids=(), include_campaign_ids=()):
+            calls.append(
+                {
+                    "exclude": tuple(exclude_campaign_ids),
+                    "include": tuple(include_campaign_ids),
+                }
+            )
+            return lifecycle_recovery_report(
+                {
+                    "schema": LIFECYCLE_RECOVERY_SCHEMA,
+                    "reconciled_at": datetime.now(UTC),
+                    "expired_global_leases": 0,
+                    "due_quota_wakes": 0,
+                    "campaigns": [],
+                }
+            )
+
+    class Store:
+        def list_terminal_active_schedules(self):
+            raise AssertionError("targeted recovery must not run global schedule cleanup")
+
+    service = CampaignService(
+        Store(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        preparation,
+        lifecycle_recovery=LifecycleRecovery(),  # type: ignore[arg-type]
+        recovery_repository=object(),  # type: ignore[arg-type]
+    )
+
+    assert await service._recover_campaign("campaign/target") == 0  # noqa: SLF001
+    assert calls == [{"exclude": (), "include": ("campaign/target",)}]
+
+
+async def test_targeted_campaign_recovery_tasks_are_retained_and_coalesced() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    class Service(CampaignService):
+        async def _recover_campaign(
+            self, campaign_id: str, *, resume_execution: bool = True
+        ) -> int:
+            calls.append((campaign_id, resume_execution))
+            started.set()
+            await release.wait()
+            return 0
+
+    service = Service(object(), object(), preparation)  # type: ignore[arg-type]
+    service._schedule_campaign_recovery("campaign/target")  # noqa: SLF001
+    service._schedule_campaign_recovery("campaign/target")  # noqa: SLF001
+    await started.wait()
+
+    assert calls == [("campaign/target", True)]
+    assert tuple(service._campaign_recovery_tasks) == ("campaign/target",)  # noqa: SLF001
+
+    task = service._campaign_recovery_tasks["campaign/target"]  # noqa: SLF001
+    release.set()
+    await task
+    await asyncio.sleep(0)
+    assert service._campaign_recovery_tasks == {}  # noqa: SLF001
+
+
 async def test_recovery_claim_covers_long_terminal_report_generation() -> None:
     claim_leases = []
     applied = []

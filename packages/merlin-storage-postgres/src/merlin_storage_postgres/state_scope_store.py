@@ -18,7 +18,7 @@ from merlin_contracts.state_scope import (
 )
 from psycopg.types.json import Jsonb
 
-_RECOVERY_POLICY_VERSION = "merlin.campaign-recovery-policy.v3"
+_RECOVERY_POLICY_VERSION = "merlin.campaign-recovery-policy.v4"
 
 
 class _StateScopeLeaseUnavailable(RuntimeError):
@@ -145,6 +145,7 @@ def _target_reobservation_recovery_action(
         "persist_successor_schedule",
         "persist_wave_binding",
         "resume_active",
+        "settle_terminal_batch",
     }:
         return scheduler_action
     if projection.get("recovery_state") is not None:
@@ -1299,6 +1300,7 @@ class StateScopeRepository:
         writable_format: str,
         lease_seconds: int,
         exclude_campaign_ids: Sequence[str] = (),
+        include_campaign_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Atomically reconcile global registries and classify campaign recovery."""
 
@@ -1310,6 +1312,14 @@ class StateScopeRepository:
         excluded = frozenset(
             _required(campaign_id, "excluded campaign id") for campaign_id in exclude_campaign_ids
         )
+        included = tuple(
+            dict.fromkeys(
+                _required(campaign_id, "included campaign id")
+                for campaign_id in include_campaign_ids
+            )
+        )
+        if excluded.intersection(included):
+            raise ValueError("lifecycle reconciliation campaign filters overlap")
         if lease_seconds < 1 or not readable:
             raise ValueError("lifecycle reconciliation requires formats and a positive lease")
         with self._lock, self.connection.transaction():
@@ -1368,17 +1378,26 @@ class StateScopeRepository:
                         str(item["window_key"]),
                     )
                 )
+            campaign_filters = ["status IN ('prepared', 'executing', 'paused')"]
+            campaign_filter_values: list[object] = []
+            if included:
+                campaign_filters.append("id = ANY(%s)")
+                campaign_filter_values.append(list(included))
+            if excluded:
+                campaign_filters.append("NOT (id = ANY(%s))")
+                campaign_filter_values.append(list(excluded))
             campaigns = self.connection.execute(
                 """SELECT id, session_id, manifest, status, execution_format,
                           lifecycle_pause_reason
                    FROM merlin_storage.assessment_campaigns
-                   WHERE status IN ('prepared', 'executing', 'paused') ORDER BY id FOR UPDATE"""
+                   WHERE """
+                + " AND ".join(campaign_filters)
+                + " ORDER BY id FOR UPDATE",
+                tuple(campaign_filter_values),
             ).fetchall()
             results: list[dict[str, Any]] = []
             for campaign in campaigns:
                 campaign_id = str(campaign["id"])
-                if campaign_id in excluded:
-                    continue
                 recovered_acknowledged = self._settle_orphaned_acknowledged_scopes_locked(
                     campaign_id
                 )
@@ -1545,7 +1564,7 @@ class StateScopeRepository:
                     {str(item["state"]): int(item["count"]) for item in frontier_rows}
                 )
                 reobservation_rows = self.connection.execute(
-                    """SELECT sequence, decision_id, payload
+                    """SELECT sequence, wave, decision_id, payload
                        FROM merlin_storage.campaign_lead_journal
                        WHERE campaign_id = %s
                          AND (

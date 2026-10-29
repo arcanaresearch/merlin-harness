@@ -2504,6 +2504,7 @@ class CampaignService:
         self._execution_startups = 0
         self._recovery_active = False
         self._supervisors: dict[str, asyncio.Task[None]] = {}
+        self._campaign_recovery_tasks: dict[str, asyncio.Task[int]] = {}
 
     def _target_exchange_tool_ids(self, assignments: Sequence[WorkerAssignment]) -> tuple[str, ...]:
         """Resolve target exchanges from the daemon's canonical tool contracts."""
@@ -7408,7 +7409,9 @@ class CampaignService:
             if registered_owner:
                 current = asyncio.current_task()
                 if current is not None:
-                    current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+                    current.add_done_callback(
+                        lambda _task: self._schedule_campaign_recovery(campaign_id)
+                    )
             return
         except _TargetReobservationBlocked:
             return
@@ -7495,7 +7498,9 @@ class CampaignService:
                 if registered_owner:
                     current = asyncio.current_task()
                     if current is not None:
-                        current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+                        current.add_done_callback(
+                            lambda _task: self._schedule_campaign_recovery(campaign_id)
+                        )
                 return
 
             if getattr(error, "cleanup_unresolved", False) is True:
@@ -10926,7 +10931,9 @@ class CampaignService:
             if projection.review_pending:
                 current = asyncio.current_task()
                 if current is not None and self._supervisors.get(campaign_id) is current:
-                    current.add_done_callback(lambda _task: asyncio.create_task(self.recover()))
+                    current.add_done_callback(
+                        lambda _task: self._schedule_campaign_recovery(campaign_id)
+                    )
                 return False
             settlement = projection.latest_refreshed
             if isinstance(settlement, Mapping):
@@ -18524,12 +18531,74 @@ class CampaignService:
             await task
 
     async def detach(self) -> None:
+        recovery_tasks = tuple(self._campaign_recovery_tasks.values())
+        for task in recovery_tasks:
+            task.cancel()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        self._campaign_recovery_tasks.clear()
         tasks = tuple(self._supervisors.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._supervisors.clear()
+        recovery_tasks = tuple(self._campaign_recovery_tasks.values())
+        for task in recovery_tasks:
+            task.cancel()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        self._campaign_recovery_tasks.clear()
+
+    def _schedule_campaign_recovery(self, campaign_id: str) -> None:
+        current = self._campaign_recovery_tasks.get(campaign_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._recover_campaign(campaign_id),
+            name=f"campaign-targeted-recovery:{campaign_id}",
+        )
+        self._campaign_recovery_tasks[campaign_id] = task
+
+        def observe(completed: asyncio.Task[int]) -> None:
+            if self._campaign_recovery_tasks.get(campaign_id) is completed:
+                self._campaign_recovery_tasks.pop(campaign_id, None)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                _LOGGER.exception("campaign-targeted recovery failed for %s", campaign_id)
+
+        task.add_done_callback(observe)
+
+    async def _recover_campaign(self, campaign_id: str, *, resume_execution: bool = True) -> int:
+        """Recover one completed local handoff without sweeping other campaigns."""
+
+        if self._recovery_repository is None:
+            return await self.recover(resume_execution=resume_execution)
+        if self._lifecycle_recovery is None:
+            raise RuntimeError("production recovery requires a fenced lifecycle report")
+        async with self._ownership_condition:
+            await self._ownership_condition.wait_for(
+                lambda: self._execution_startups == 0 and not self._recovery_active
+            )
+            self._recovery_active = True
+        try:
+            live_campaign_ids = tuple(
+                live_campaign_id
+                for live_campaign_id, supervisor in self._supervisors.items()
+                if not supervisor.done()
+            )
+            lifecycle_report = await self._lifecycle_recovery.reconcile(
+                exclude_campaign_ids=live_campaign_ids,
+                include_campaign_ids=(campaign_id,),
+            )
+            return await self._apply_lifecycle_report(lifecycle_report, resume_execution)
+        finally:
+            async with self._ownership_condition:
+                self._recovery_active = False
+                self._ownership_condition.notify_all()
 
     async def _recover_active_frontier_fenced(
         self,
