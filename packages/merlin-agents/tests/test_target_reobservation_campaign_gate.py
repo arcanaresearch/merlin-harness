@@ -1925,6 +1925,117 @@ async def test_special_continuations_review_refresh_before_resuming_caller(
     }.isdisjoint(refresh_assignment.tool_ids)
 
 
+async def test_failed_wave_zero_reviews_refresh_once_before_terminal_reconciliation() -> None:
+    manifest, context = _campaign()
+    obligation = replace(_obligation(), source_wave=0, source_schedule_id="wave-0")
+    order: list[tuple[str, str]] = []
+
+    class RecoveryStore(_JournalStore):
+        def __init__(self) -> None:
+            super().__init__(manifest, context, obligation, order)
+            self.row["status"] = "executing"
+
+        def list_waves(self, _campaign_id: str):
+            return (
+                {
+                    "wave": 0,
+                    "kind": "initial",
+                    "schedule_id": "wave-0",
+                    "status": "failed",
+                },
+            )
+
+        def load_active_frontier_batch(self, _campaign_id: str):
+            return None
+
+    class RecoveryService(_GateService):
+        def __init__(self, store: RecoveryStore, agents: _Agents) -> None:
+            super().__init__(store, agents)
+            self._lead_runner = object()  # type: ignore[assignment]
+            self.review_count = 0
+            self.terminalize = True
+
+        async def _run_lead_with_policy(self, active_manifest, tasks):
+            assert tuple(task.id for task in tasks) == ("wave-0-task",)
+            projection = await self._target_reobservation_projection(active_manifest.id)
+            generation = next(iter(projection.generations.values()))
+            _append_reviewed(self._store, generation)
+            self.review_count += 1
+            order.append(("lead", generation.generation_id))
+
+        async def _supervise(self, campaign_id, _manifest, _context, _live, **_kwargs) -> None:
+            order.append(("supervise", campaign_id))
+            if not self.terminalize:
+                return
+            terminalized = await self._finish_campaign(
+                campaign_id,
+                "failed",
+                "infrastructure_blocked_after_retry_policy",
+            )
+            assert terminalized is True
+
+    store = RecoveryStore()
+    agents = _Agents(order)
+    agents.schedules["wave-0"] = SimpleNamespace(
+        id="wave-0",
+        assignments=(SimpleNamespace(strategy_id="direct/v1", profile_id="attack"),),
+        worker_contexts={},
+        execution=None,
+    )
+    agents.tasks["wave-0"] = (
+        AgentTask(id="wave-0-task", objective="probe target", status="failed"),
+    )
+    service = RecoveryService(store, agents)
+    service.settlement_outcomes.append("refreshed")
+    generation = _generation(obligation)
+    refresh_schedule_id = service._target_reobservation_schedule_id(  # noqa: SLF001
+        manifest.id, generation.generation_id, 1
+    )
+    _append_started(store, obligation, refresh_schedule_id)
+    claimed = SimpleNamespace(
+        phase="reobserve",
+        generation_id=generation.generation_id,
+        target_session_id=generation.target_session_id,
+        event_set_digest=_digest({"event_digests": generation.event_digests}),
+        source_wave=0,
+        schedule_id=refresh_schedule_id,
+        settlement_id=None,
+        lead_decision_id=None,
+    )
+    decision = SimpleNamespace(
+        campaign_id=manifest.id,
+        recovery_action="recover_target_reobservation",
+        target_reobservation_recovery_state=claimed,
+    )
+
+    assert await service._recover_recorded_action(decision, True) == 1  # noqa: SLF001
+    await service._supervisors[manifest.id]  # noqa: SLF001
+
+    assert service.review_count == 1
+    assert store.finishes == [
+        (
+            manifest.id,
+            "failed",
+            "infrastructure_blocked_after_retry_policy",
+        )
+    ]
+    assert order.index(("settle", "refreshed")) < order.index(("lead", generation.generation_id))
+    assert order.index(("lead", generation.generation_id)) < order.index(("supervise", manifest.id))
+
+    reviewed = await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
+    recovery_state = reviewed.recovery_state(latest_wave=0)
+    assert recovery_state is not None
+    service.terminalize = False
+    replay = SimpleNamespace(
+        campaign_id=manifest.id,
+        recovery_action="recover_target_reobservation",
+        target_reobservation_recovery_state=SimpleNamespace(**recovery_state),
+    )
+    assert await service._recover_recorded_action(replay, True) == 1  # noqa: SLF001
+    await service._supervisors[manifest.id]  # noqa: SLF001
+    assert service.review_count == 1
+
+
 async def test_blocked_completion_does_not_seal_or_finish_campaign() -> None:
     manifest, context = _campaign()
     obligation = _obligation()

@@ -18880,19 +18880,15 @@ class CampaignService:
                     f"target re-observation source wave is incompatible: {error}"
                 ) from error
             assignments = tuple(getattr(live, "assignments", ()))
-            requires_continuation_review = bool(assignments) and (
-                all(item.strategy_id == "objective-phase-gate/v1" for item in assignments)
-                or all(item.profile_id == "recon" for item in assignments)
-            )
-            if requires_continuation_review:
+            generation_id = str(current["generation_id"])
+            if generation_id not in projection.reviewed:
                 if self._lead_runner is None:
                     raise _CampaignRecoveryIncompatible(
-                        "target re-observation continuation requires a Campaign Lead"
+                        "target re-observation review requires a Campaign Lead"
                     )
                 tasks = tuple(await self._agents.list_schedule_tasks(str(latest["schedule_id"])))
                 await self._run_lead_with_policy(manifest, tasks)
                 reviewed = await self._target_reobservation_projection(campaign_id)
-                generation_id = str(current["generation_id"])
                 if generation_id not in reviewed.reviewed:
                     raise _CampaignRecoveryIncompatible(
                         "Campaign Lead did not consume the refreshed target surface"
