@@ -231,6 +231,7 @@ from .target_reobservation import (
     TargetReobservationGeneration,
     TargetReobservationProjection,
     extract_target_reobservation_obligations,
+    normalize_current_state_snapshot_receipt,
     normalize_target_surface_generation_receipt,
     project_target_reobservations,
     target_reobservation_schedule_id,
@@ -13379,17 +13380,31 @@ class CampaignService:
                     value: frozenset(candidate_ids) for value, candidate_ids in supplied.items()
                 }
 
-    async def _record_browser_recon_observations(self, manifest: CampaignManifest) -> None:
+    async def _record_browser_recon_observations(
+        self,
+        manifest: CampaignManifest,
+        *,
+        handoff_id: str | None = None,
+        wave: int = 0,
+        source_kind: str = "reconnaissance",
+    ) -> None:
         """Attribute reviewed browser progress without fabricating candidate credit."""
         reader = self._recon_observation_reader
         writer = getattr(self._store, "record_observation", None)
         append_lead = getattr(self._store, "append_lead", None)
+        commit_lead = getattr(self._store, "commit_lead_decision", None)
         adapter = _reviewed_adapter_value(manifest)
-        handoff_id = adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None
+        reviewed_handoff_id = (
+            handoff_id
+            if handoff_id is not None
+            else adapter.get("recon_handoff_id")
+            if isinstance(adapter, Mapping)
+            else None
+        )
         if (
             reader is None
-            or (not callable(writer) and not callable(append_lead))
-            or not isinstance(handoff_id, str)
+            or (not callable(writer) and not callable(append_lead) and not callable(commit_lead))
+            or not isinstance(reviewed_handoff_id, str)
         ):
             return
         campaign = await asyncio.to_thread(self._store.get, manifest.id)
@@ -13415,9 +13430,71 @@ class CampaignService:
             if isinstance((payload := row.get("payload")), Mapping)
             if payload.get("kind") == "target_state_attribution"
         }
-        receipts = await reader(manifest.session_id, handoff_id, manifest.target.id)
+        receipts = await reader(manifest.session_id, reviewed_handoff_id, manifest.target.id)
         for receipt in receipts:
             if not isinstance(receipt, Mapping):
+                continue
+            if receipt.get("schema") == "merlin.browser.current-state.v1":
+                snapshot = normalize_current_state_snapshot_receipt(receipt)
+                if (
+                    snapshot is None
+                    or snapshot.get("session_id") != manifest.session_id
+                    or snapshot.get("target_id") != manifest.target.id
+                ):
+                    continue
+                receipt_digest = str(snapshot["digest"])
+                attribution_id = "target-state-attribution:" + receipt_digest.removeprefix(
+                    "sha256:"
+                )
+                if attribution_id in recorded or (
+                    not callable(append_lead) and not callable(commit_lead)
+                ):
+                    continue
+                observed_at = str(snapshot["observed_at"])
+                try:
+                    observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=UTC)
+                payload = {
+                    "kind": "target_state_attribution",
+                    "schema": "merlin.target-state-attribution.v1",
+                    "attribution_id": attribution_id,
+                    "campaign_id": manifest.id,
+                    "target_id": manifest.target.id,
+                    "task_id": source_kind + ":" + receipt_digest.removeprefix("sha256:"),
+                    "source_kind": source_kind,
+                    "provenance": "campaign" if observed >= created_at else "preexisting",
+                    "counts_as_campaign_progress": False,
+                    "target_call_id": None,
+                    "transition_digest": receipt_digest,
+                    "transition_outcome": "observed",
+                    "observed_at": observed.isoformat(),
+                    "changes": tuple(
+                        {
+                            "name": str(item["name"]),
+                            "role": str(item.get("role") or "custom"),
+                            "status": "observed",
+                            "before_value": None,
+                            "after_value": item["value"],
+                        }
+                        for item in snapshot["observations"]
+                        if isinstance(item, Mapping)
+                    ),
+                }
+                if callable(commit_lead):
+                    await asyncio.to_thread(
+                        commit_lead,
+                        manifest.id,
+                        wave,
+                        attribution_id,
+                        payload,
+                        (),
+                    )
+                else:
+                    await asyncio.to_thread(append_lead, manifest.id, wave, payload)
+                recorded.add(attribution_id)
                 continue
             observed_at = receipt.get("result_observed_at")
             try:
@@ -13454,7 +13531,7 @@ class CampaignService:
                 await asyncio.to_thread(
                     append_lead,
                     manifest.id,
-                    0,
+                    wave,
                     {
                         "kind": "target_state_attribution",
                         "schema": "merlin.target-state-attribution.v1",
@@ -13462,7 +13539,7 @@ class CampaignService:
                         "campaign_id": manifest.id,
                         "target_id": manifest.target.id,
                         "task_id": "browser-recon:" + receipt_digest.removeprefix("sha256:"),
-                        "source_kind": "reconnaissance",
+                        "source_kind": source_kind,
                         "provenance": "campaign" if current_campaign else "preexisting",
                         "counts_as_campaign_progress": current_campaign,
                         "target_call_id": None,
@@ -14886,6 +14963,12 @@ class CampaignService:
                 "result_reference": result_reference,
                 "result_digest": result_digest,
             },
+        )
+        await self._record_browser_recon_observations(
+            manifest,
+            handoff_id=handoff_id,
+            wave=generation.source_wave,
+            source_kind="target_reobservation",
         )
 
     async def _ensure_target_reobserved(

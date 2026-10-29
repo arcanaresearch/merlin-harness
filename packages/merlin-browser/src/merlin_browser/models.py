@@ -179,6 +179,119 @@ def _validate_target_surface_generation_receipt(
         raise ValueError("target surface generation receipt does not match handoff")
 
 
+def _validate_current_state_snapshot_receipt(
+    receipt: Mapping[str, object],
+    *,
+    session_id: str,
+    context_id: str,
+    target_id: str,
+    compiled_adapter_digest: str | None,
+) -> None:
+    fields = {
+        "schema",
+        "session_id",
+        "context_id",
+        "target_id",
+        "tab_ref",
+        "observed_at",
+        "compiled_adapter_digest",
+        "surface_observation_digest",
+        "observations",
+        "evidence_refs",
+        "digest",
+    }
+    if set(receipt) != fields or receipt.get("schema") != "merlin.browser.current-state.v1":
+        raise ValueError("current-state snapshot receipt fields are unsupported")
+    text_limits = {
+        "session_id": 256,
+        "context_id": 256,
+        "target_id": 256,
+        "tab_ref": 256,
+        "observed_at": 64,
+        "compiled_adapter_digest": 71,
+        "surface_observation_digest": 71,
+        "digest": 71,
+    }
+    if any(
+        not isinstance(receipt.get(name), str)
+        or not receipt[name]
+        or len(str(receipt[name])) > limit
+        for name, limit in text_limits.items()
+    ):
+        raise ValueError("current-state snapshot receipt fields are invalid")
+    for name in ("compiled_adapter_digest", "surface_observation_digest", "digest"):
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt[name])) is None:
+            raise ValueError("current-state snapshot receipt digest is invalid")
+    try:
+        observed_at = datetime.fromisoformat(str(receipt["observed_at"]).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("current-state snapshot receipt timestamp is invalid") from error
+    if observed_at.tzinfo is None:
+        raise ValueError("current-state snapshot receipt timestamp must include a timezone")
+    evidence_refs = receipt.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs, list)
+        or not evidence_refs
+        or len(evidence_refs) > 32
+        or any(
+            not isinstance(reference, str)
+            or len(reference) > 512
+            or re.search(r":sha256:[0-9a-f]{64}$", reference) is None
+            for reference in evidence_refs
+        )
+        or len(set(evidence_refs)) != len(evidence_refs)
+    ):
+        raise ValueError("current-state snapshot evidence references are invalid")
+    observations = receipt.get("observations")
+    if not isinstance(observations, list) or not observations or len(observations) > 32:
+        raise ValueError("current-state snapshot observations are invalid")
+    scalar_types = {
+        "boolean": lambda value: type(value) is bool,
+        "integer": lambda value: type(value) is int,
+        "number": lambda value: type(value) in {int, float},
+        "string": lambda value: isinstance(value, str) and len(value) <= 512,
+    }
+    names: set[str] = set()
+    for observation in observations:
+        if not isinstance(observation, Mapping) or set(observation) != {
+            "name",
+            "role",
+            "value",
+            "value_type",
+        }:
+            raise ValueError("current-state snapshot observation fields are unsupported")
+        name = observation.get("name")
+        role = observation.get("role")
+        value_type = observation.get("value_type")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            or name in names
+            or not isinstance(role, str)
+            or not role
+            or len(role) > 64
+            or value_type not in scalar_types
+            or not scalar_types[str(value_type)](observation.get("value"))
+        ):
+            raise ValueError("current-state snapshot observation is invalid")
+        names.add(name)
+    body = {key: value for key, value in receipt.items() if key != "digest"}
+    expected_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
+    if (
+        receipt["session_id"] != session_id
+        or receipt["context_id"] != context_id
+        or receipt["target_id"] != target_id
+        or receipt["compiled_adapter_digest"] != compiled_adapter_digest
+        or receipt["digest"] != expected_digest
+    ):
+        raise ValueError("current-state snapshot receipt does not match handoff")
+
+
 API_FIRST_RECONNAISSANCE_GUIDANCE = (
     "Inspect attributable network evidence first. Prefer a bounded, reproducible API adapter "
     "when it preserves the same target behavior; retain DOM interaction only when no equivalent "
@@ -430,6 +543,15 @@ class ApiReconHandoff(BrowserModel):
             "digest",
         }
         for observation in self.recon_observations:
+            if observation.get("schema") == "merlin.browser.current-state.v1":
+                _validate_current_state_snapshot_receipt(
+                    observation,
+                    session_id=self.owner.session_id,
+                    context_id=self.context_id,
+                    target_id=self.target_id,
+                    compiled_adapter_digest=self.compiled_adapter_digest,
+                )
+                continue
             if observation.get("schema") == "merlin.target-surface-generation.v1":
                 _validate_target_surface_generation_receipt(
                     observation,

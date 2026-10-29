@@ -87,6 +87,112 @@ def normalize_target_ui_transition(value: object) -> tuple[dict[str, object], st
     return projected, transition_digest
 
 
+def normalize_current_state_snapshot_receipt(value: object) -> Mapping[str, object] | None:
+    """Validate one daemon-sealed current-state snapshot without inferring progress."""
+
+    if not isinstance(value, Mapping):
+        return None
+    fields = {
+        "schema",
+        "session_id",
+        "context_id",
+        "target_id",
+        "tab_ref",
+        "observed_at",
+        "compiled_adapter_digest",
+        "surface_observation_digest",
+        "observations",
+        "evidence_refs",
+        "digest",
+    }
+    if set(value) != fields or value.get("schema") != "merlin.browser.current-state.v1":
+        return None
+    text_limits = {
+        "session_id": 256,
+        "context_id": 256,
+        "target_id": 256,
+        "tab_ref": 256,
+        "observed_at": 64,
+        "compiled_adapter_digest": 71,
+        "surface_observation_digest": 71,
+        "digest": 71,
+    }
+    if any(
+        _text(value.get(name), limit=limit, required=True) is None
+        for name, limit in text_limits.items()
+    ):
+        return None
+    if any(
+        _DIGEST.fullmatch(str(value[field])) is None
+        for field in ("compiled_adapter_digest", "surface_observation_digest", "digest")
+    ):
+        return None
+    try:
+        observed_at = datetime.fromisoformat(str(value["observed_at"]).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed_at.tzinfo is None:
+        return None
+    evidence_refs = value.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs, (list, tuple))
+        or not evidence_refs
+        or len(evidence_refs) > 32
+        or len(set(evidence_refs)) != len(evidence_refs)
+        or any(
+            not isinstance(reference, str)
+            or len(reference) > 512
+            or re.search(r":sha256:[0-9a-f]{64}$", reference) is None
+            for reference in evidence_refs
+        )
+    ):
+        return None
+    observations = value.get("observations")
+    if not isinstance(observations, (list, tuple)) or not observations or len(observations) > 32:
+        return None
+    scalar_types = {
+        "boolean": lambda item: type(item) is bool,
+        "integer": lambda item: type(item) is int,
+        "number": lambda item: type(item) in {int, float},
+        "string": lambda item: isinstance(item, str) and len(item) <= 512,
+    }
+    names: set[str] = set()
+    projected_observations: list[dict[str, object]] = []
+    for observation in observations:
+        if not isinstance(observation, Mapping) or set(observation) != {
+            "name",
+            "role",
+            "value",
+            "value_type",
+        }:
+            return None
+        name = observation.get("name")
+        role = observation.get("role")
+        value_type = observation.get("value_type")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            or name in names
+            or not isinstance(role, str)
+            or not role
+            or len(role) > 64
+            or value_type not in scalar_types
+            or not scalar_types[str(value_type)](observation.get("value"))
+        ):
+            return None
+        names.add(name)
+        projected_observations.append(dict(observation))
+    body = {key: value[key] for key in fields if key != "digest"}
+    if value["digest"] != _digest(body):
+        return None
+    return {
+        **body,
+        "observations": tuple(projected_observations),
+        "evidence_refs": tuple(str(reference) for reference in evidence_refs),
+        "digest": value["digest"],
+    }
+
+
 def normalize_target_surface_generation_receipt(
     value: object,
 ) -> Mapping[str, object] | None:

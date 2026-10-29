@@ -157,6 +157,7 @@ from merlin_agents.lifecycle_recovery import (
     lifecycle_recovery_report,
 )
 from merlin_agents.specialists import DynamicSpecialistPolicy, LanguageFrontierSpec
+from merlin_agents.target_progress_attribution import merge_target_progress_attributions
 from merlin_agents.technique_history import entries_for_completion, technique_cell_parts
 from merlin_agents.transforms import materialize_transform_envelope
 from merlin_contracts import (
@@ -27648,6 +27649,109 @@ async def test_browser_recon_progress_is_attributed_once_without_arm_credit() ->
     }
     assert {item["changes"][0]["role"] for item in attributions} == {"custom"}
     assert not hasattr(store, "arm_observations")
+
+
+@pytest.mark.asyncio
+async def test_browser_current_state_snapshot_projects_without_campaign_progress_credit() -> None:
+    body = {
+        "schema": "merlin.browser.current-state.v1",
+        "session_id": "session-1",
+        "context_id": "browser-context",
+        "target_id": "target-1",
+        "tab_ref": "tab-1",
+        "observed_at": "2026-10-13T18:32:24+00:00",
+        "compiled_adapter_digest": "sha256:" + "a" * 64,
+        "surface_observation_digest": "sha256:" + "b" * 64,
+        "observations": [
+            {"name": "level", "role": "progress_ordinal", "value": 2, "value_type": "integer"},
+            {"name": "score", "role": "score", "value": 75, "value_type": "integer"},
+            {"name": "turn", "role": "budget_remaining", "value": 4, "value_type": "integer"},
+            {
+                "name": "interaction_state",
+                "role": "custom",
+                "value": "ready",
+                "value_type": "string",
+            },
+        ],
+        "evidence_refs": ["browser-snapshot:sha256:" + "c" * 64],
+    }
+    receipt = {
+        **body,
+        "digest": "sha256:"
+        + hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest(),
+    }
+    tampered = copy.deepcopy(receipt)
+    tampered["observations"][1]["value"] = 100
+
+    class ReconStore:
+        def __init__(self) -> None:
+            self.lead = []
+
+        def get(self, _campaign_id):
+            return {"created_at": datetime(2026, 10, 13, 18, 29, tzinfo=UTC)}
+
+        def list_lead(self, _campaign_id):
+            return tuple(self.lead)
+
+        def append_lead(self, campaign_id, wave, payload):
+            self.lead.append({"campaign_id": campaign_id, "wave": wave, "payload": payload})
+
+    async def read_recon(_session_id, _handoff_id, _target_id):
+        return (receipt, tampered)
+
+    contract = ContextDocument.create(
+        "target:reviewed-interaction-contract",
+        "Reviewed interaction contract\n" + json.dumps({"recon_handoff_id": "handoff:browser"}),
+    )
+    manifest = SimpleNamespace(
+        id="campaign-1",
+        session_id="session-1",
+        target=SimpleNamespace(id="target-1"),
+        catalogue=(contract,),
+    )
+    store = ReconStore()
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        SimpleNamespace(),
+        None,
+        recon_observation_reader=read_recon,
+    )
+
+    await service._record_browser_recon_observations(manifest)  # type: ignore[arg-type]  # noqa: SLF001
+    await service._record_browser_recon_observations(manifest)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert len(store.lead) == 1
+    attribution = store.lead[0]["payload"]
+    assert attribution["counts_as_campaign_progress"] is False
+    assert attribution["source_kind"] == "reconnaissance"
+    assert {item["name"]: item["after_value"] for item in attribution["changes"]} == {
+        "level": 2,
+        "score": 75,
+        "turn": 4,
+        "interaction_state": "ready",
+    }
+    progress = merge_target_progress_attributions(
+        {
+            "status": "unknown",
+            "current_state": (),
+            "target_exchange_count": 0,
+            "limitations": (
+                "Target state has not been discovered from reviewed observations yet.",
+            ),
+        },
+        store.lead,
+        campaign_id="campaign-1",
+        target_id="target-1",
+    )
+    assert progress["status"] == "observed"
+    assert {item["name"]: item["value"] for item in progress["current_state"]} == {
+        "level": 2,
+        "score": 75,
+        "turn": 4,
+        "interaction_state": "ready",
+    }
 
 
 @pytest.mark.asyncio

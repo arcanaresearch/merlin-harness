@@ -3029,6 +3029,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
             "method": "GET",
             "url": "https://target.test/api/state",
             "status": 200,
+            "observed_at": "2026-10-28T11:59:59+00:00",
             "request_json": None,
             "response_json": {
                 "result": {
@@ -3045,6 +3046,7 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
             "method": "POST",
             "url": "https://target.test/api/turn",
             "status": 200,
+            "observed_at": "2026-10-28T12:00:00+00:00",
             "request_json": {"clientTurnId": "turn-1", "text": "harmless probe"},
             "response_json": {
                 "result": {
@@ -3176,6 +3178,17 @@ async def test_compiled_api_handoff_uses_read_only_cookie_state_as_baseline() ->
     score = next(item for item in capabilities["observations"] if item["name"] == "score")
     assert score["baseline_selector"]["pointer"] == "/result/data/json/session/score"
     assert score["result_selector"]["pointer"] == "/result/data/json/turn/score"
+    snapshot = next(
+        item
+        for item in recorder.handoff.recon_observations
+        if item.get("schema") == "merlin.browser.current-state.v1"
+    )
+    assert {item["name"]: item["value"] for item in snapshot["observations"]} == {
+        "run_id": "run-1",
+        "tier": 1,
+        "score": 49,
+    }
+    assert snapshot["compiled_adapter_digest"] == recorder.handoff.compiled_adapter_digest
 
 
 @pytest.mark.asyncio
@@ -11237,6 +11250,109 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
         ),
         (receipt["evidence_ref"], "target_surface_generation"),
     }
+
+
+@pytest.mark.asyncio
+async def test_dom_handoff_seals_typed_current_state_and_rejects_tampering() -> None:
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(
+            target_id="target",
+            allowed_origins={"https://target.test"},
+        )
+        owner = owner()
+
+        def api_exchange_events(self):
+            return ()
+
+        def metadata(self):
+            return SimpleNamespace(tabs=[SimpleNamespace(tab_ref="tab-1", state="open")])
+
+        async def snapshot(self, _tab):
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.test",
+                owner=self.owner,
+                tab_ref="tab-1",
+                kind="snapshot",
+                text="Level 2 Score 75 Turn 4 State ready",
+                observed_at=datetime(2026, 10, 28, 12, tzinfo=UTC),
+                elements=(
+                    ElementRef(
+                        role="textbox",
+                        name="Message",
+                        ref="tab-1:message",
+                        tab_ref="tab-1",
+                        frame_ref="main",
+                    ),
+                    ElementRef(
+                        role="button",
+                        name="Send",
+                        ref="tab-1:send",
+                        tab_ref="tab-1",
+                        frame_ref="main",
+                    ),
+                ),
+            )
+
+    adapter = reviewed_browser_adapter("https://target.test/chat")
+    adapter["interaction_contract"]["state_observations"] = [
+        {
+            "name": "level",
+            "role": "progress_ordinal",
+            "value_type": "integer",
+            "capture": {"template": "Level {value}"},
+        },
+        {
+            "name": "score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score {value}"},
+        },
+        {
+            "name": "turn",
+            "role": "budget_remaining",
+            "value_type": "integer",
+            "capture": {"template": "Turn {value}"},
+        },
+        {
+            "name": "interaction_state",
+            "role": "custom",
+            "value_type": "string",
+            "capture": {"template": "State {value}"},
+        },
+    ]
+    recorder = _NativeReceiptRecorder()
+    result = await ApiReconHandoffTool(lambda _: Session(), recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "browser-snapshot:sha256:" + "a" * 64,
+            "response_evidence_ref": "browser-snapshot:sha256:" + "b" * 64,
+            "dom_fallback_reason": "the observed message transport is not a JSON API",
+            "reusable_adapter": adapter,
+        },
+    )
+
+    assert result.is_error is False, result.content
+    assert recorder.handoff is not None
+    snapshot = next(
+        item
+        for item in recorder.handoff.recon_observations
+        if item.get("schema") == "merlin.browser.current-state.v1"
+    )
+    assert {item["name"]: item["value"] for item in snapshot["observations"]} == {
+        "level": 2,
+        "score": 75,
+        "turn": 4,
+        "interaction_state": "ready",
+    }
+    tampered = recorder.handoff.model_dump(mode="json")
+    tampered["recon_observations"][0]["observations"][0]["value"] = 3
+    with pytest.raises(ValueError, match="does not match handoff"):
+        ApiReconHandoff.model_validate(tampered)
 
 
 @pytest.mark.parametrize(

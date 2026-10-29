@@ -276,6 +276,32 @@ def _surface_generation_receipt(
     }
 
 
+def _current_state_receipt(*, score: int = 75) -> dict[str, object]:
+    body: dict[str, object] = {
+        "schema": "merlin.browser.current-state.v1",
+        "session_id": "session-1",
+        "context_id": "browser-context-1",
+        "target_id": "target-1",
+        "tab_ref": "target-tab-1",
+        "observed_at": "2026-10-28T12:00:00Z",
+        "compiled_adapter_digest": "sha256:" + "5" * 64,
+        "surface_observation_digest": "sha256:" + "f" * 64,
+        "observations": [
+            {"name": "level", "role": "progress_ordinal", "value": 2, "value_type": "integer"},
+            {"name": "score", "role": "score", "value": score, "value_type": "integer"},
+            {"name": "turn", "role": "budget_remaining", "value": 4, "value_type": "integer"},
+            {
+                "name": "interaction_state",
+                "role": "custom",
+                "value": "ready",
+                "value_type": "string",
+            },
+        ],
+        "evidence_refs": ["browser-request:sha256:" + "a" * 64],
+    }
+    return {**body, "digest": _digest(body)}
+
+
 class _JournalStore:
     def __init__(
         self,
@@ -1508,6 +1534,7 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
     obligation = _obligation()
     order: list[tuple[str, str]] = []
     store = _JournalStore(manifest, context, obligation, order)
+    store.row["created_at"] = "2026-10-28T11:59:00+00:00"
     agents = _Agents(order)
     service = _RealSettlementService(store, agents)
     generation = _generation(obligation)
@@ -1524,6 +1551,7 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
     result_digest = "sha256:" + "7" * 64
     result_reference = "merlin-result://target-reobservation-task"
     surface_receipt = _surface_generation_receipt(generation)
+    current_state_receipt = _current_state_receipt()
     required_refs = [
         str(surface_receipt["request_evidence_ref"]),
         str(surface_receipt["response_evidence_ref"]),
@@ -1545,7 +1573,7 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
     async def read_receipts(
         _session_id: str, _handoff_id: str, _target_id: str
     ) -> tuple[dict[str, object], ...]:
-        return (surface_receipt,)
+        return (surface_receipt, current_state_receipt)
 
     service._recon_observation_reader = read_receipts  # noqa: SLF001
 
@@ -1573,6 +1601,19 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
         "target-surface-snapshot:" + str(surface_receipt["current_surface_digest"])
         in projection.latest_refreshed["surface_evidence_refs"]
     )
+    attribution = next(
+        row["payload"]
+        for row in store.lead
+        if row["payload"].get("kind") == "target_state_attribution"
+    )
+    assert attribution["source_kind"] == "target_reobservation"
+    assert attribution["counts_as_campaign_progress"] is False
+    assert {item["name"]: item["after_value"] for item in attribution["changes"]} == {
+        "level": 2,
+        "score": 75,
+        "turn": 4,
+        "interaction_state": "ready",
+    }
 
 
 async def test_real_settlement_rejects_same_session_receipt_for_another_target() -> None:

@@ -4031,6 +4031,42 @@ class ApiReconHandoffTool:
             )
         if surface_generation_receipt is not None:
             identity = "|".join((identity, str(surface_generation_receipt["evidence_ref"])))
+        current_state_receipt: dict[str, object] | None = None
+        final_compilation = read_target_adapter(compiled_adapter)
+        if (
+            isinstance(final_compilation.executable, BrowserChat)
+            and surface_observation is not None
+        ):
+            surface_snapshot = _browser_surface_snapshot(
+                surface_observation,
+                url=str(arguments["url"]),
+                adapter=final_compilation.executable,
+            )
+            reviewed_state = surface_snapshot.get("reviewed_state")
+            current_state_receipt = _current_state_snapshot_receipt(
+                session_id=context.session_id,
+                context_id=session.context_id,
+                target_id=session.bounds.target_id,
+                tab_ref=surface_observation.tab_ref,
+                observed_at=surface_observation.observed_at.isoformat(),
+                compiled_adapter_digest=compiled_adapter_digest,
+                surface_observation_digest="sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        surface_observation.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest(),
+                observations=(reviewed_state if isinstance(reviewed_state, list) else ()),
+                evidence_refs=(
+                    str(arguments["request_evidence_ref"]),
+                    str(arguments["response_evidence_ref"]),
+                ),
+            )
+        if current_state_receipt is not None:
+            identity = "|".join((identity, str(current_state_receipt["digest"])))
         try:
             handoff = ApiReconHandoff(
                 id=f"handoff:{uuid5(NAMESPACE_URL, identity)}",
@@ -4049,7 +4085,12 @@ class ApiReconHandoffTool:
                 reusable_site_facts=reusable_site_facts,
                 recon_scope=recon_scope,
                 recon_observations=(
-                    (surface_generation_receipt,) if surface_generation_receipt is not None else ()
+                    *((current_state_receipt,) if current_state_receipt is not None else ()),
+                    *(
+                        (surface_generation_receipt,)
+                        if surface_generation_receipt is not None
+                        else ()
+                    ),
                 ),
             )
             await self._recorder.record_handoff(handoff)
@@ -5215,6 +5256,90 @@ def _browser_surface_snapshot(
         "visible_text_digest": "sha256:" + hashlib.sha256(encoded_text).hexdigest(),
         "control_count": len(observation.elements),
         "controls_truncated": len(observation.elements) > control_limit,
+    }
+
+
+def _current_state_snapshot_receipt(
+    *,
+    session_id: str,
+    context_id: str,
+    target_id: str,
+    tab_ref: str,
+    observed_at: str,
+    compiled_adapter_digest: str,
+    surface_observation_digest: str,
+    observations: Sequence[Mapping[str, object]],
+    evidence_refs: Sequence[str],
+) -> dict[str, object] | None:
+    """Seal current reviewed state without claiming a target transition."""
+
+    try:
+        parsed_observed_at = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if (
+        parsed_observed_at.tzinfo is None
+        or not tab_ref
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", compiled_adapter_digest)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", surface_observation_digest)
+    ):
+        return None
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for observation in observations:
+        name = observation.get("name")
+        value = observation.get("value")
+        value_type = observation.get("value_type")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            or name in seen
+            or not isinstance(value_type, str)
+            or value_type not in {"boolean", "integer", "number", "string"}
+            or (value_type == "boolean" and type(value) is not bool)
+            or (value_type == "integer" and type(value) is not int)
+            or (value_type == "number" and type(value) not in {int, float})
+            or (value_type == "string" and (not isinstance(value, str) or len(value) > 512))
+        ):
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "role": str(observation.get("role") or "custom"),
+                "value": value,
+                "value_type": value_type,
+            }
+        )
+        seen.add(name)
+    refs = list(
+        dict.fromkeys(
+            reference
+            for reference in evidence_refs
+            if reference
+            and len(reference) <= 512
+            and re.search(r":sha256:[0-9a-f]{64}$", reference)
+        )
+    )
+    if not normalized or not refs:
+        return None
+    body: dict[str, object] = {
+        "schema": "merlin.browser.current-state.v1",
+        "session_id": session_id,
+        "context_id": context_id,
+        "target_id": target_id,
+        "tab_ref": tab_ref,
+        "observed_at": observed_at,
+        "compiled_adapter_digest": compiled_adapter_digest,
+        "surface_observation_digest": surface_observation_digest,
+        "observations": normalized[:BROWSER_STATE_OBSERVATION_LIMIT],
+        "evidence_refs": refs[:32],
+    }
+    return {
+        **body,
+        "digest": "sha256:"
+        + hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest(),
     }
 
 
@@ -12608,6 +12733,59 @@ class CompiledApiReconHandoffTool:
         if compiler_uncertainties:
             evaluation_uncertainties.extend(compiler_uncertainties)
             adapter["evaluation_uncertainties"] = _dedupe_uncertainties(evaluation_uncertainties)
+        current_observations: list[dict[str, object]] = []
+        current_evidence_refs: list[str] = []
+        for observation in state_observations:
+            name = str(observation["name"])
+            values = observation_values_by_name.get(name)
+            if values is None or "result_selector" not in values:
+                continue
+            value = values["result_selector"]
+            value_type = observation.get("value_type")
+            if value_type is None:
+                value_type = (
+                    "boolean"
+                    if type(value) is bool
+                    else "integer"
+                    if type(value) is int
+                    else "number"
+                    if type(value) is float
+                    else "string"
+                    if isinstance(value, str)
+                    else None
+                )
+            if not isinstance(value_type, str):
+                continue
+            current_observations.append(
+                {
+                    "name": name,
+                    "role": str(observation.get("role") or "custom"),
+                    "value": value,
+                    "value_type": value_type,
+                }
+            )
+            selector = observation.get("result_selector")
+            if isinstance(selector, Mapping):
+                current_evidence_refs.extend(
+                    str(reference)
+                    for reference in selector.get("evidence_refs", ())
+                    if isinstance(reference, str)
+                )
+        current_state_receipt = _current_state_snapshot_receipt(
+            session_id=session.owner.session_id,
+            context_id=session.context_id,
+            target_id=session.bounds.target_id,
+            tab_ref=str(event.get("tab_ref") or event.get("_observation_tab_ref") or "unknown"),
+            observed_at=str(
+                event.get("observed_at") or event.get("_observation_observed_at") or ""
+            ),
+            compiled_adapter_digest=compiled_adapter_digest,
+            surface_observation_digest=_digest_json(response_evidence),
+            observations=current_observations,
+            evidence_refs=current_evidence_refs,
+        )
+        if current_state_receipt is not None:
+            recon_observations = (*recon_observations, current_state_receipt)
         setup_response = setup_event.get("response_json") if setup_event is not None else None
         return _DerivedApiHandoff(
             adapter=adapter,
