@@ -118,7 +118,14 @@ _SENSITIVE_SHELL_OPTION = re.compile(
 def _tool_admitted_after_recon_recall(name: str) -> bool:
     """Keep post-recall reconnaissance on attributable target evidence surfaces."""
     return name == "assessment_prepare" or (
-        name.startswith("browser_") and name != _RECON_RECALL_TOOL
+        name.startswith("browser_")
+        and name
+        not in {
+            _RECON_RECALL_TOOL,
+            "browser_chat_exchange",
+            "browser_fill",
+            "browser_upload",
+        }
     )
 
 

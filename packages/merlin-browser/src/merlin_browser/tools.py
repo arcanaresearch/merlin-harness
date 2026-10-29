@@ -695,8 +695,9 @@ _SPECS = {
             "connection_probe": {
                 "type": "boolean",
                 "description": (
-                    "Set true only during API adapter discovery. Merlin appends a "
-                    "one-time harmless marker to prove the exact request input field."
+                    "Internal API-adapter discovery flag. Merlin ignores the supplied value and "
+                    "replaces it with a daemon-authored one-time benign marker. Provider-driven "
+                    "reconnaissance must use browser_recon_exchange instead."
                 ),
             },
         },
@@ -786,6 +787,233 @@ _GENERIC_TARGET_EFFECT_KINDS = frozenset(
     }
 )
 _VISUAL_BOOTSTRAP_SCOPE_LIMIT = 256
+_FOREGROUND_RECON_SAFE_PRESS_KEYS = frozenset(
+    {
+        "arrowdown",
+        "arrowleft",
+        "arrowright",
+        "arrowup",
+        "escape",
+        "shift+tab",
+        "tab",
+    }
+)
+
+
+@dataclass
+class _ForegroundReconProbePermit:
+    """Bind one daemon-authored reconnaissance probe to one physical browser surface."""
+
+    stage: str
+    tab_ref: str
+    input_ref: str
+    input_frame_ref: str | None
+    submit_kind: str
+    submit_element_ref: str
+    submit_frame_ref: str | None
+    exchange_owner: str | None
+    payload_digest: str = ""
+    fill_action_ref: str = ""
+    probe_ref: str = ""
+    submit_action_ref: str | None = None
+
+
+def _session_foreground_recon_probe_permits(
+    session: BrowserSession,
+    fallback: dict[tuple[str, str, str], _ForegroundReconProbePermit],
+) -> dict[tuple[str, str, str], _ForegroundReconProbePermit]:
+    """Share the atomic permit across tool factories attached to one browser context."""
+
+    existing = getattr(session, "_merlin_foreground_recon_probe_permits", None)
+    if isinstance(existing, dict):
+        return existing
+    session._merlin_foreground_recon_probe_permits = fallback  # type: ignore[attr-defined]  # noqa: SLF001
+    return fallback
+
+
+def _foreground_recon_probe_rejection(
+    message: str,
+    *,
+    failure_code: str,
+    target_session_id: str,
+    preferred_next_tool: str | None = None,
+) -> ToolResult:
+    metadata: dict[str, object] = {
+        "effect": "target_network",
+        "failure_code": failure_code,
+        "retryable": False,
+        "effect_applied": False,
+        "target_effect_attempted": False,
+        "target_call_budget_charge": 0,
+        "limit_interaction_count": 0,
+        "target_session_id": target_session_id,
+    }
+    if preferred_next_tool is not None:
+        metadata.update(
+            {
+                "preferred_next_tool": preferred_next_tool,
+                "preferred_next_tool_mode": "strict",
+            }
+        )
+    return ToolResult(content=message, is_error=True, metadata=metadata)
+
+
+def _foreground_recon_dispatch_receipt(
+    *,
+    session: BrowserSession,
+    action: BrowserAction,
+    permit: _ForegroundReconProbePermit,
+    origin: str,
+    disposition: str,
+) -> BrowserObservation:
+    if disposition not in {"confirmed_undispatched", "dispatched_unknown"}:
+        raise ValueError(f"unsupported foreground recon disposition: {disposition}")
+    core = {
+        "schema": "merlin.browser.recon-probe-submit.v1",
+        "disposition": disposition,
+        "context_id": action.context_id,
+        "target_id": str(action.target_id),
+        "tab_ref": action.tab_ref,
+        "fill_action_ref": permit.fill_action_ref,
+        "probe_ref": permit.probe_ref,
+        "submit_action_ref": action.evidence_refs[0],
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt_ref = f"browser-recon-probe-submit:sha256:{receipt_sha256}"
+    receipt = {
+        **core,
+        "receipt_sha256": receipt_sha256,
+        "evidence_ref": receipt_ref,
+    }
+    return BrowserObservation(
+        context_id=action.context_id,
+        target_id=str(action.target_id),
+        origin=origin,
+        owner=session.owner,
+        tab_ref=action.tab_ref,
+        frame_ref=action.frame_ref,
+        kind="blocker",
+        step=action.step,
+        title="Foreground reconnaissance probe submit receipt",
+        text=json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        evidence_refs=(
+            permit.fill_action_ref,
+            permit.probe_ref,
+            action.evidence_refs[0],
+            receipt_ref,
+        ),
+    )
+
+
+def _valid_foreground_recon_dispatch_receipt(
+    observation: BrowserObservation,
+    actions: Sequence[BrowserAction],
+) -> tuple[str, str] | None:
+    if observation.kind != "blocker":
+        return None
+    try:
+        receipt = json.loads(observation.text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(receipt, Mapping):
+        return None
+    fields = {
+        "schema",
+        "disposition",
+        "context_id",
+        "target_id",
+        "tab_ref",
+        "fill_action_ref",
+        "probe_ref",
+        "submit_action_ref",
+        "receipt_sha256",
+        "evidence_ref",
+    }
+    if set(receipt) != fields:
+        return None
+    core = {key: receipt[key] for key in fields - {"receipt_sha256", "evidence_ref"}}
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt_ref = f"browser-recon-probe-submit:sha256:{receipt_sha256}"
+    disposition = receipt.get("disposition")
+    if (
+        receipt.get("schema") != "merlin.browser.recon-probe-submit.v1"
+        or disposition not in {"confirmed_undispatched", "dispatched_unknown"}
+        or receipt.get("context_id") != observation.context_id
+        or receipt.get("target_id") != str(observation.target_id)
+        or receipt.get("tab_ref") != observation.tab_ref
+        or receipt.get("receipt_sha256") != receipt_sha256
+        or receipt.get("evidence_ref") != receipt_ref
+        or receipt_ref not in observation.evidence_refs
+    ):
+        return None
+    fill_action_ref = receipt.get("fill_action_ref")
+    probe_ref = receipt.get("probe_ref")
+    submit_action_ref = receipt.get("submit_action_ref")
+    valid_actions = any(
+        action.kind == "fill"
+        and fill_action_ref in action.evidence_refs
+        and probe_ref in action.evidence_refs
+        for action in actions
+    ) and any(
+        action.kind in {"click", "press"} and submit_action_ref in action.evidence_refs
+        for action in actions
+    )
+    if not valid_actions or not isinstance(submit_action_ref, str):
+        return None
+    return submit_action_ref, str(disposition)
+
+
+def _durable_foreground_recon_probe_completed(
+    actions: Sequence[BrowserAction],
+    observations: Sequence[BrowserObservation],
+    api_exchanges: Sequence[Mapping[str, object]],
+) -> bool:
+    """Consume completed or crash-ambiguous probes; retry only confirmed non-dispatch."""
+
+    if any(_probe_linked_api_exchange(event) for event in api_exchanges):
+        return True
+    terminal_receipts = dict(
+        receipt
+        for observation in observations
+        if (receipt := _valid_foreground_recon_dispatch_receipt(observation, actions)) is not None
+    )
+    observed_refs = {
+        reference
+        for observation in observations
+        if _valid_foreground_recon_dispatch_receipt(observation, actions) is None
+        for reference in observation.evidence_refs
+    }
+    for fill in actions:
+        if fill.kind != "fill" or not fill.evidence_refs:
+            continue
+        if not any(
+            str(reference).startswith("browser-input-probe:") for reference in fill.evidence_refs
+        ):
+            continue
+        if fill.evidence_refs[0] not in observed_refs:
+            continue
+        for submit in actions:
+            if not (
+                submit.kind in {"click", "press"}
+                and submit.tab_ref == fill.tab_ref
+                and submit.created_at >= fill.created_at
+                and bool(submit.evidence_refs)
+            ):
+                continue
+            submit_ref = submit.evidence_refs[0]
+            disposition = terminal_receipts.get(submit_ref)
+            if disposition == "confirmed_undispatched":
+                continue
+            # A normal reviewed response or explicit possible-dispatch receipt
+            # consumes the probe. Submit intent without a terminal receipt also
+            # fails closed across restart: a crash between intent and dispatch
+            # cannot safely authorize replay.
+            return True
+    return False
 
 
 def _bounded_json_pointer_schema(value: object) -> dict[str, object]:
@@ -825,6 +1053,10 @@ class BrowserTool:
         state_scope_store: object | None = None,
         recalled_recon: dict[tuple[str, str], str] | None = None,
         visual_bootstrap_seen: dict[tuple[str, ...], None] | None = None,
+        foreground_recon_probe_permits: (
+            dict[tuple[str, str, str], _ForegroundReconProbePermit] | None
+        ) = None,
+        foreground_recon_probe_owner: str | None = None,
     ) -> None:
         if name not in _SPECS:
             raise ValueError(f"unknown browser tool: {name}")
@@ -838,6 +1070,10 @@ class BrowserTool:
         self._visual_bootstrap_seen = (
             visual_bootstrap_seen if visual_bootstrap_seen is not None else {}
         )
+        self._foreground_recon_probe_permits = (
+            foreground_recon_probe_permits if foreground_recon_probe_permits is not None else {}
+        )
+        self._foreground_recon_probe_owner = foreground_recon_probe_owner
 
     def describe(self) -> ToolSpec:
         kind, properties = _SPECS[self.name][:2]
@@ -929,11 +1165,129 @@ class BrowserTool:
         )
         action_value = _string(arguments.get("url", arguments.get("value")))
         evidence_refs = ["browser-action:sha256:" + uuid4().hex + uuid4().hex]
+        foreground_recon_scope = context.campaign_id is None
+        probe_permit_key = (
+            context.session_id,
+            session.context_id,
+            str(session.bounds.target_id),
+        )
+        foreground_recon_probe_permits = _session_foreground_recon_probe_permits(
+            session, self._foreground_recon_probe_permits
+        )
+        probe_permit = foreground_recon_probe_permits.get(probe_permit_key)
+        reserve_probe_fill = False
+        consume_probe_submit = False
         if kind == "fill" and arguments.get("connection_probe") is True:
             nonce = secrets.token_urlsafe(24)
-            base = (action_value or "Harmless API adapter discovery").strip()
-            action_value = f"{base} [Merlin connection probe {nonce}]"
+            action_value = (
+                "Merlin authorized reconnaissance marker "
+                f"{nonce}. Reply with this marker only; do not take any external action."
+            )
             evidence_refs.append(f"browser-input-probe:{nonce}")
+        if foreground_recon_scope:
+            if kind == "upload":
+                return _foreground_recon_probe_rejection(
+                    "foreground reconnaissance cannot upload target content before campaign "
+                    "preparation and approval; the target was not called",
+                    failure_code="foreground_recon_upload_blocked",
+                    target_session_id=target_session_id,
+                )
+            if kind == "fill":
+                if recalled_surface is None:
+                    return _foreground_recon_probe_rejection(
+                        "foreground reconnaissance text entry requires durable reconnaissance "
+                        "recall first; the target was not called",
+                        failure_code="foreground_recon_recall_required",
+                        target_session_id=target_session_id,
+                        preferred_next_tool="browser_recall_reconnaissance",
+                    )
+                if arguments.get("connection_probe") is not True:
+                    return _foreground_recon_probe_rejection(
+                        "arbitrary foreground reconnaissance text entry is not admitted. Use "
+                        "connection_probe=true once so the daemon supplies the bounded benign "
+                        "payload, or prepare and approve a campaign; the target was not called",
+                        failure_code="foreground_recon_probe_required",
+                        target_session_id=target_session_id,
+                    )
+                requested_tab_ref = str(arguments.get("tab_ref", ""))
+                requested_input_ref = str(arguments.get("element_ref", ""))
+                requested_input_frame_ref = _string(arguments.get("frame_ref"))
+                if probe_permit is None:
+                    # Low-level callers may exercise the harmless fill for adapter
+                    # discovery, but only the atomic wrapper can bind and discharge
+                    # a submit action.
+                    probe_permit = _ForegroundReconProbePermit(
+                        stage="planned",
+                        tab_ref=requested_tab_ref,
+                        input_ref=requested_input_ref,
+                        input_frame_ref=requested_input_frame_ref,
+                        submit_kind="",
+                        submit_element_ref="",
+                        submit_frame_ref=None,
+                        exchange_owner=None,
+                    )
+                elif not (
+                    probe_permit.stage == "planned"
+                    and probe_permit.exchange_owner is not None
+                    and probe_permit.exchange_owner == self._foreground_recon_probe_owner
+                    and probe_permit.tab_ref == requested_tab_ref
+                    and probe_permit.input_ref == requested_input_ref
+                    and probe_permit.input_frame_ref == requested_input_frame_ref
+                ):
+                    return _foreground_recon_probe_rejection(
+                        "the one-use foreground reconnaissance probe is already reserved or "
+                        "consumed for this browser session; the target was not called",
+                        failure_code="foreground_recon_probe_exhausted",
+                        target_session_id=target_session_id,
+                        preferred_next_tool=(
+                            "browser_network_events" if probe_permit.stage == "submitted" else None
+                        ),
+                    )
+                reserve_probe_fill = True
+            elif kind in {"click", "press"} and probe_permit is not None:
+                if probe_permit.stage != "filled":
+                    return _foreground_recon_probe_rejection(
+                        "the one-use foreground reconnaissance probe has already been submitted "
+                        "or did not complete its safe fill; the target was not called",
+                        failure_code="foreground_recon_probe_exhausted",
+                        target_session_id=target_session_id,
+                        preferred_next_tool=(
+                            "browser_network_events" if probe_permit.stage == "submitted" else None
+                        ),
+                    )
+                requested_submit_kind = "press_enter" if kind == "press" else "click"
+                submit_matches = (
+                    probe_permit.exchange_owner is not None
+                    and probe_permit.exchange_owner == self._foreground_recon_probe_owner
+                    and requested_submit_kind == probe_permit.submit_kind
+                    and str(arguments.get("tab_ref", "")) == probe_permit.tab_ref
+                    and str(arguments.get("element_ref", "")) == probe_permit.submit_element_ref
+                    and _string(arguments.get("frame_ref")) == probe_permit.submit_frame_ref
+                    and (
+                        kind != "press"
+                        or str(arguments.get("value", "")).casefold() in {"enter", "numpadenter"}
+                    )
+                )
+                if not submit_matches:
+                    return _foreground_recon_probe_rejection(
+                        "the foreground reconnaissance probe submit must be the exact action "
+                        "reserved by browser_recon_exchange; the target was not called",
+                        failure_code="foreground_recon_probe_submit_mismatch",
+                        target_session_id=target_session_id,
+                    )
+                consume_probe_submit = True
+            elif (
+                kind == "press"
+                and str(arguments.get("value", "")).casefold()
+                not in _FOREGROUND_RECON_SAFE_PRESS_KEYS
+            ):
+                return _foreground_recon_probe_rejection(
+                    "foreground reconnaissance key submission requires the daemon-authored "
+                    "one-use probe. Only non-submitting navigation keys are available before "
+                    "that fill; the target was not called",
+                    failure_code="foreground_recon_press_blocked",
+                    target_session_id=target_session_id,
+                )
         action = BrowserAction(
             context_id=session.context_id,
             target_id=session.bounds.target_id,
@@ -1200,10 +1554,53 @@ class BrowserTool:
             action.element_ref or "",
             recorded.value or "",
         )
+        if reserve_probe_fill:
+            assert probe_permit is not None
+            reserved = foreground_recon_probe_permits.setdefault(probe_permit_key, probe_permit)
+            if reserved is not probe_permit or probe_permit.stage != "planned":
+                return _foreground_recon_probe_rejection(
+                    "another foreground reconnaissance probe already owns this physical browser "
+                    "session; the target was not called",
+                    failure_code="foreground_recon_probe_exhausted",
+                    target_session_id=target_session_id,
+                )
+            probe_permit.stage = "fill_reserved"
+            probe_permit.payload_digest = hashlib.sha256((action_value or "").encode()).hexdigest()
+            probe_permit.fill_action_ref = evidence_refs[0]
+            probe_permit.probe_ref = evidence_refs[1]
+        if consume_probe_submit:
+            assert probe_permit is not None
+            current_probe_permit = foreground_recon_probe_permits.get(probe_permit_key)
+            if current_probe_permit is not probe_permit or probe_permit.stage != "filled":
+                return _foreground_recon_probe_rejection(
+                    "the foreground reconnaissance probe submit permit is no longer current; "
+                    "the target was not called",
+                    failure_code="foreground_recon_probe_exhausted",
+                    target_session_id=target_session_id,
+                )
+            probe_permit.stage = "submitted"
+            probe_permit.submit_action_ref = evidence_refs[0]
+
+        def release_undispatched_probe_permit() -> None:
+            if reserve_probe_fill and probe_permit is not None:
+                current = foreground_recon_probe_permits.get(probe_permit_key)
+                if current is probe_permit and probe_permit.stage == "fill_reserved":
+                    foreground_recon_probe_permits.pop(probe_permit_key, None)
+            if consume_probe_submit and probe_permit is not None:
+                current = foreground_recon_probe_permits.get(probe_permit_key)
+                if current is probe_permit and probe_permit.stage == "submitted":
+                    probe_permit.stage = "filled"
+                    probe_permit.submit_action_ref = None
+                    # A corrected atomic exchange must explicitly reclaim and
+                    # rebind the exact submit locator after a confirmed
+                    # pre-dispatch failure.
+                    probe_permit.exchange_owner = None
+
         if self._recorder is not None:
             try:
                 await self._recorder.append_action(recorded)
             except BaseException:
+                release_undispatched_probe_permit()
                 if state_scope is not None:
                     await state_scope.pause(
                         MissingEvidenceReason.CAPTURE_INCOMPLETE,
@@ -1212,6 +1609,26 @@ class BrowserTool:
                     )
                 raise
         if self._failures.get(fingerprint, 0) >= 2:
+            release_undispatched_probe_permit()
+            if consume_probe_submit and probe_permit is not None and self._recorder is not None:
+                undispatched_receipt = _foreground_recon_dispatch_receipt(
+                    session=session,
+                    action=action,
+                    permit=probe_permit,
+                    origin=(
+                        before.origin
+                        if before is not None
+                        else _browser_tab_url(session, action.tab_ref)
+                    ),
+                    disposition="confirmed_undispatched",
+                )
+                await self._recorder.append_observation(undispatched_receipt)
+                await self._recorder.record_evidence(
+                    action.context_id,
+                    undispatched_receipt.evidence_refs[-1],
+                    "browser_recon_probe_submit",
+                    json.loads(undispatched_receipt.text),
+                )
             if state_scope is not None:
                 await state_scope.pause(
                     MissingEvidenceReason.NOT_APPLICABLE,
@@ -1246,6 +1663,13 @@ class BrowserTool:
             async with asyncio.timeout(action.timeout_ms / 1_000):
                 observation = await session.act(action, actor_id=actor_id)
             target_effect_completed = True
+            if (
+                foreground_recon_scope
+                and kind == "fill"
+                and probe_permit is not None
+                and probe_permit.stage == "fill_reserved"
+            ):
+                probe_permit.stage = "filled"
             if (
                 state_scope is not None
                 and before is not None
@@ -1355,6 +1779,40 @@ class BrowserTool:
                 kind in _GENERIC_TARGET_EFFECT_KINDS
                 and _browser_effect_was_dispatched(session, action)
             )
+            if (reserve_probe_fill or consume_probe_submit) and not target_effect_dispatched:
+                release_undispatched_probe_permit()
+            dispatch_receipt: BrowserObservation | None = None
+            dispatch_receipt_persisted = False
+            dispatch_receipt_error_type: str | None = None
+            if consume_probe_submit and probe_permit is not None and self._recorder is not None:
+                dispatch_receipt = _foreground_recon_dispatch_receipt(
+                    session=session,
+                    action=action,
+                    permit=probe_permit,
+                    origin=(
+                        before.origin
+                        if before is not None
+                        else _browser_tab_url(session, action.tab_ref)
+                    ),
+                    disposition=(
+                        "dispatched_unknown"
+                        if target_effect_dispatched
+                        else "confirmed_undispatched"
+                    ),
+                )
+                try:
+                    await self._recorder.append_observation(dispatch_receipt)
+                    dispatch_receipt_persisted = True
+                    await self._recorder.record_evidence(
+                        action.context_id,
+                        dispatch_receipt.evidence_refs[-1],
+                        "browser_recon_probe_submit",
+                        json.loads(dispatch_receipt.text),
+                    )
+                except Exception as receipt_error:
+                    dispatch_receipt_error_type = (
+                        f"{type(receipt_error).__module__}.{type(receipt_error).__qualname__}"
+                    )
             uncertain_after_transition = (
                 _browser_unknown_after_transition(
                     before,
@@ -1386,6 +1844,10 @@ class BrowserTool:
             if not isinstance(error, Exception):
                 raise
             diagnostics: dict[str, object] | None = None
+            if dispatch_receipt_error_type is not None:
+                diagnostics = {
+                    "recon_probe_dispatch_receipt_error_type": dispatch_receipt_error_type
+                }
             diagnostic_tab = action.tab_ref
             if not diagnostic_tab:
                 open_tabs = [tab.tab_ref for tab in session.metadata().tabs if tab.state == "open"]
@@ -1508,6 +1970,11 @@ class BrowserTool:
                         else {}
                     ),
                     **(
+                        {"foreground_recon_probe_dispatch": json.loads(dispatch_receipt.text)}
+                        if dispatch_receipt is not None and dispatch_receipt_persisted
+                        else {}
+                    ),
+                    **(
                         {"diagnostic_screenshot": diagnostics["screenshot"]}
                         if diagnostics is not None and "screenshot" in diagnostics
                         else {}
@@ -1554,6 +2021,35 @@ class BrowserTool:
                     await self._recorder.append_observation(post_action_observation)
                 await self._recorder.save_metadata(session.metadata(restart=True))
             except BaseException as recorder_error:
+                post_recording_dispatch_receipt: BrowserObservation | None = None
+                post_recording_dispatch_receipt_persisted = False
+                if target_effect_completed and consume_probe_submit and probe_permit is not None:
+                    post_recording_dispatch_receipt = _foreground_recon_dispatch_receipt(
+                        session=session,
+                        action=action,
+                        permit=probe_permit,
+                        origin=(
+                            observation.origin
+                            if observation.origin
+                            else _browser_tab_url(session, action.tab_ref)
+                        ),
+                        disposition="dispatched_unknown",
+                    )
+                    try:
+                        # This is deliberately a separate write after the failed
+                        # normal observation path. A transient recorder failure
+                        # must still leave a durable no-retry receipt for a
+                        # completed submit.
+                        await self._recorder.append_observation(post_recording_dispatch_receipt)
+                        post_recording_dispatch_receipt_persisted = True
+                        await self._recorder.record_evidence(
+                            action.context_id,
+                            post_recording_dispatch_receipt.evidence_refs[-1],
+                            "browser_recon_probe_submit",
+                            json.loads(post_recording_dispatch_receipt.text),
+                        )
+                    except Exception:
+                        pass
                 guarded_effect = bool(
                     state_scope is not None
                     and target_effect_completed
@@ -1612,6 +2108,16 @@ class BrowserTool:
                         "target_profile_id": str(session.bounds.target_id),
                         "compiled_adapter_digest": transition_adapter_digest,
                         "evidence_refs": uncertain_after_transition["evidence_refs"],
+                        **(
+                            {
+                                "foreground_recon_probe_dispatch": json.loads(
+                                    post_recording_dispatch_receipt.text
+                                )
+                            }
+                            if post_recording_dispatch_receipt is not None
+                            and post_recording_dispatch_receipt_persisted
+                            else {}
+                        ),
                     },
                 )
         result_observation = post_action_observation or observation
@@ -1808,6 +2314,285 @@ class BrowserTool:
                 }
             )
         return ToolResult(content=content, metadata=metadata)
+
+
+class BrowserReconExchangeTool:
+    """Run one daemon-authored benign probe through reviewed live controls."""
+
+    name = "browser_recon_exchange"
+    effect = "target_network"
+
+    def __init__(
+        self,
+        resolver: BrowserSessionResolver,
+        recorder: BrowserRecorder,
+        failure_tracker: dict[tuple[str, ...], int],
+        network_seen: dict[tuple[str, ...], deque[str]],
+        state_scope_store: object | None,
+        recalled_recon: dict[tuple[str, str], str],
+        visual_bootstrap_seen: dict[tuple[str, ...], None],
+        foreground_recon_probe_permits: dict[tuple[str, str, str], _ForegroundReconProbePermit],
+    ) -> None:
+        self._resolver = resolver
+        self._recorder = recorder
+        self._failure_tracker = failure_tracker
+        self._network_seen = network_seen
+        self._state_scope_store = state_scope_store
+        self._recalled_recon = recalled_recon
+        self._visual_bootstrap_seen = visual_bootstrap_seen
+        self._foreground_recon_probe_permits = foreground_recon_probe_permits
+
+    def describe(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.name,
+            description=(
+                "Send exactly one bounded benign reconnaissance message through the current "
+                "browser controls. Supply locators only: Merlin creates the message, binds it "
+                "to this physical browser session, fills and submits it atomically, and records "
+                "durable action evidence. The operator objective or model cannot supply probe "
+                "content. Inspect the resulting DOM or network response with the strict next "
+                "tool returned by this exchange. "
+                "Use this only after browser_recall_reconnaissance and before compiling the "
+                "durable browser/API handoff."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tab_ref": {"type": "string", "minLength": 1},
+                    "input_element_ref": {"type": "string", "minLength": 1},
+                    "submit_element_ref": {"type": "string", "minLength": 1},
+                    "input_frame_ref": {"type": "string", "minLength": 1},
+                    "submit_frame_ref": {"type": "string", "minLength": 1},
+                    "submit_kind": {"type": "string", "enum": ["click", "press_enter"]},
+                    "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 30000},
+                },
+                "required": [
+                    "tab_ref",
+                    "input_element_ref",
+                    "submit_element_ref",
+                    "submit_kind",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    async def resolve_target_session_id(self, context: ToolContext) -> str:
+        session = await _resolve_existing_browser_session(self._resolver, context.session_id)
+        return f"browser:{session.context_id}"
+
+    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+        resolved = self._resolver(context.session_id)
+        session = await resolved if isawaitable(resolved) else resolved
+        target_session_id = f"browser:{session.context_id}"
+        if context.campaign_id is not None:
+            return _foreground_recon_probe_rejection(
+                "browser_recon_exchange is pre-campaign reconnaissance only; use the approved "
+                "campaign browser exchange for attack execution",
+                failure_code="foreground_recon_campaign_context_rejected",
+                target_session_id=target_session_id,
+            )
+        recall_key = (context.session_id, session.bounds.target_id)
+        if recall_key not in self._recalled_recon:
+            return _foreground_recon_probe_rejection(
+                "browser_recon_exchange requires durable reconnaissance recall first; the "
+                "target was not called",
+                failure_code="foreground_recon_recall_required",
+                target_session_id=target_session_id,
+                preferred_next_tool="browser_recall_reconnaissance",
+            )
+        list_actions = getattr(self._recorder, "list_actions", None)
+        list_observations = getattr(self._recorder, "list_observations", None)
+        if not callable(list_actions) or not callable(list_observations):
+            return _foreground_recon_probe_rejection(
+                "browser_recon_exchange requires durable action and observation history before "
+                "dispatch; the target was not called",
+                failure_code="foreground_recon_action_history_required",
+                target_session_id=target_session_id,
+            )
+        prior_actions, prior_observations = await _reviewed_browser_history(session, self._recorder)
+        exchange_loader = getattr(session, "api_exchange_events", None)
+        api_exchanges = exchange_loader() if callable(exchange_loader) else ()
+        durable_probe_exists = _durable_foreground_recon_probe_completed(
+            prior_actions,
+            prior_observations,
+            api_exchanges,
+        )
+        if durable_probe_exists:
+            return _foreground_recon_probe_rejection(
+                "the durable browser history already contains a reconnaissance probe for this "
+                "physical session; the target was not called again",
+                failure_code="foreground_recon_probe_exhausted",
+                target_session_id=target_session_id,
+                preferred_next_tool="browser_network_events",
+            )
+        permit_key = (
+            context.session_id,
+            session.context_id,
+            str(session.bounds.target_id),
+        )
+        foreground_recon_probe_permits = _session_foreground_recon_probe_permits(
+            session, self._foreground_recon_probe_permits
+        )
+        exchange_owner = uuid4().hex
+        tab_ref = str(arguments["tab_ref"])
+        input_element_ref = str(arguments["input_element_ref"])
+        input_frame_ref = _string(arguments.get("input_frame_ref"))
+        submit_kind = str(arguments["submit_kind"])
+        submit_element_ref = str(arguments["submit_element_ref"])
+        submit_frame_ref = _string(arguments.get("submit_frame_ref"))
+        pending_permit = foreground_recon_probe_permits.get(permit_key)
+        reuse_pending_fill = False
+        if pending_permit is None:
+            pending_permit = _ForegroundReconProbePermit(
+                stage="planned",
+                tab_ref=tab_ref,
+                input_ref=input_element_ref,
+                input_frame_ref=input_frame_ref,
+                submit_kind=submit_kind,
+                submit_element_ref=submit_element_ref,
+                submit_frame_ref=submit_frame_ref,
+                exchange_owner=exchange_owner,
+            )
+            reserved = foreground_recon_probe_permits.setdefault(permit_key, pending_permit)
+            if reserved is not pending_permit:
+                pending_permit = reserved
+        if pending_permit.exchange_owner != exchange_owner:
+            if (
+                pending_permit.stage == "filled"
+                and pending_permit.exchange_owner is None
+                and pending_permit.tab_ref == tab_ref
+                and pending_permit.input_ref == input_element_ref
+                and pending_permit.input_frame_ref == input_frame_ref
+            ):
+                pending_permit.submit_kind = submit_kind
+                pending_permit.submit_element_ref = submit_element_ref
+                pending_permit.submit_frame_ref = submit_frame_ref
+                pending_permit.exchange_owner = exchange_owner
+                reuse_pending_fill = True
+            else:
+                return _foreground_recon_probe_rejection(
+                    "a foreground reconnaissance probe is already in flight for this physical "
+                    "browser session; observe its outcome before another exchange",
+                    failure_code="foreground_recon_probe_exhausted",
+                    target_session_id=target_session_id,
+                    preferred_next_tool=(
+                        "browser_network_events" if pending_permit.stage == "submitted" else None
+                    ),
+                )
+
+        def raw_tool(name: str) -> BrowserTool:
+            return BrowserTool(
+                name,
+                self._resolver,
+                self._recorder,
+                self._failure_tracker,
+                self._network_seen,
+                self._state_scope_store,
+                self._recalled_recon,
+                self._visual_bootstrap_seen,
+                foreground_recon_probe_permits,
+                exchange_owner,
+            )
+
+        timeout_ms = int(arguments.get("timeout_ms", 10_000))
+        fill_arguments: dict[str, object] = {
+            "tab_ref": tab_ref,
+            "element_ref": input_element_ref,
+            "value": "",
+            "connection_probe": True,
+            "timeout_ms": timeout_ms,
+            "step": 0,
+        }
+        if input_frame_ref is not None:
+            fill_arguments["frame_ref"] = input_frame_ref
+        if not reuse_pending_fill:
+            try:
+                fill = await raw_tool("browser_fill").invoke(context, fill_arguments)
+            except BaseException:
+                current_permit = foreground_recon_probe_permits.get(permit_key)
+                if (
+                    current_permit is pending_permit
+                    and pending_permit.exchange_owner == exchange_owner
+                    and pending_permit.stage == "planned"
+                ):
+                    foreground_recon_probe_permits.pop(permit_key, None)
+                raise
+            if fill.is_error:
+                current_permit = foreground_recon_probe_permits.get(permit_key)
+                if (
+                    current_permit is pending_permit
+                    and pending_permit.exchange_owner == exchange_owner
+                    and fill.metadata.get("target_effect_attempted") is not True
+                ):
+                    foreground_recon_probe_permits.pop(permit_key, None)
+                return fill
+
+        submit_arguments: dict[str, object] = {
+            "tab_ref": tab_ref,
+            "element_ref": submit_element_ref,
+            "timeout_ms": timeout_ms,
+            "step": 1,
+        }
+        if submit_frame_ref is not None:
+            submit_arguments["frame_ref"] = submit_frame_ref
+        if submit_kind == "press_enter":
+            submit_arguments["value"] = "Enter"
+            raw_submit_name = "browser_press"
+        else:
+            raw_submit_name = "browser_click"
+        try:
+            submitted = await raw_tool(raw_submit_name).invoke(context, submit_arguments)
+        except BaseException:
+            current_permit = foreground_recon_probe_permits.get(permit_key)
+            if (
+                current_permit is pending_permit
+                and pending_permit.exchange_owner == exchange_owner
+                and pending_permit.stage == "filled"
+                and pending_permit.submit_action_ref is None
+            ):
+                pending_permit.exchange_owner = None
+            raise
+        if submitted.is_error:
+            current_permit = foreground_recon_probe_permits.get(permit_key)
+            if (
+                current_permit is pending_permit
+                and pending_permit.exchange_owner == exchange_owner
+                and submitted.metadata.get("target_effect_attempted") is not True
+            ):
+                pending_permit.stage = "filled"
+                pending_permit.submit_action_ref = None
+                pending_permit.exchange_owner = None
+            return submitted
+
+        permit = foreground_recon_probe_permits.get(permit_key)
+        probe_metadata = (
+            {
+                "schema": "merlin.browser.recon-probe.v1",
+                "payload_digest": permit.payload_digest,
+                "fill_action_ref": permit.fill_action_ref,
+                "probe_ref": permit.probe_ref,
+                "submit_action_ref": permit.submit_action_ref,
+                "tab_ref": permit.tab_ref,
+                "durable_one_use": True,
+            }
+            if permit is not None
+            else {}
+        )
+        metadata = {
+            **submitted.metadata,
+            "foreground_recon_probe": probe_metadata,
+            "target_effect_attempted": True,
+            "target_call_budget_charge": 0,
+            "limit_interaction_count": 1,
+        }
+        if "preferred_next_tool" not in metadata:
+            metadata.update(
+                {
+                    "preferred_next_tool": "browser_network_events",
+                    "preferred_next_tool_mode": "strict",
+                }
+            )
+        return ToolResult(content=submitted.content, metadata=metadata)
 
 
 _OWNED_SESSION_END_LABEL = re.compile(
@@ -7921,9 +8706,9 @@ class CompiledApiReconHandoffTool:
             description=(
                 "Compile and seal an HTTP API lifecycle from exact captured JSON evidence. "
                 "First complete the bounded same-origin frontend/network inventory, then capture "
-                "setup and one harmless message/response. The message must be entered with "
-                "browser_fill connection_probe=true before it is submitted, so the captured "
-                "request can be linked to the reviewed input field. Compile that interaction "
+                "setup and one harmless message/response. Send that message with the atomic "
+                "browser_recon_exchange tool, which supplies the benign payload and binds its "
+                "fill and submit evidence to the reviewed input field. Compile that interaction "
                 "before ending its session. Include cleanup only when an exact "
                 "post-message cleanup exchange was observed; when the target exposes a visible "
                 "session-ending action (forfeit, end, reset), capture that exchange by ending "
@@ -8991,9 +9776,9 @@ class CompiledApiReconHandoffTool:
                 )
             return ToolResult(
                 content=(
-                    "input_pointer is not linked to the latest successful browser fill action. "
-                    "Use browser_fill with connection_probe=true, submit once in the same live "
-                    "session, wait for its response, then compile before cleanup."
+                    "input_pointer is not linked to the latest successful atomic reconnaissance "
+                    "exchange. Use browser_recon_exchange once in the same live session, wait "
+                    "for its response, then compile before cleanup."
                 ),
                 is_error=True,
                 metadata={
@@ -12931,6 +13716,7 @@ def browser_tools(
     assignment_adapter_resolver: ReviewedBrowserAssignmentAdapterResolver | None = None,
 ) -> tuple[
     BrowserTool
+    | BrowserReconExchangeTool
     | BrowserOwnedSessionCleanupTool
     | ReconRecallTool
     | ApiReconHandoffTool
@@ -12942,8 +13728,10 @@ def browser_tools(
     network_seen: dict[tuple[str, ...], deque[str]] = {}
     recalled_recon: dict[tuple[str, str], str] | None = {} if recorder is not None else None
     visual_bootstrap_seen: dict[tuple[str, ...], None] = {}
+    foreground_recon_probe_permits: dict[tuple[str, str, str], _ForegroundReconProbePermit] = {}
     actions: tuple[
         BrowserTool
+        | BrowserReconExchangeTool
         | BrowserOwnedSessionCleanupTool
         | ReconRecallTool
         | ApiReconHandoffTool
@@ -12960,6 +13748,7 @@ def browser_tools(
             state_scope_store,
             recalled_recon,
             visual_bootstrap_seen,
+            foreground_recon_probe_permits,
         )
         for name in _SPECS
     )
@@ -12973,9 +13762,20 @@ def browser_tools(
         ),
     )
     if recorder is not None:
+        assert recalled_recon is not None
         actions = (
             *actions,
             ReconRecallTool(resolver, recorder, recalled_recon),
+            BrowserReconExchangeTool(
+                resolver,
+                recorder,
+                failures,
+                network_seen,
+                state_scope_store,
+                recalled_recon,
+                visual_bootstrap_seen,
+                foreground_recon_probe_permits,
+            ),
             ApiReconHandoffTool(resolver, recorder),
             CompiledApiReconHandoffTool(resolver, recorder),
         )

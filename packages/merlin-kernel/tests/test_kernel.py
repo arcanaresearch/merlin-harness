@@ -286,6 +286,10 @@ async def test_recon_recall_withholds_workspace_and_shell_tools_from_later_reque
                 for name in (
                     "browser_recall_reconnaissance",
                     "browser_open_tab",
+                    "browser_chat_exchange",
+                    "browser_fill",
+                    "browser_upload",
+                    "browser_recon_exchange",
                     "browser_network_events",
                     "browser_compile_api_handoff",
                     "assessment_prepare",
@@ -316,6 +320,7 @@ async def test_recon_recall_withholds_workspace_and_shell_tools_from_later_reque
                 return
             assert names == {
                 "browser_open_tab",
+                "browser_recon_exchange",
                 "browser_network_events",
                 "browser_compile_api_handoff",
                 "assessment_prepare",
@@ -323,6 +328,10 @@ async def test_recon_recall_withholds_workspace_and_shell_tools_from_later_reque
             if len(self.requests) == 2:
                 # A provider may retain an earlier schema. Admission still rejects it.
                 yield ToolCall(call_id="source-crawl", name="shell_command", arguments={})
+                yield ToolCall(call_id="raw-fill", name="browser_fill", arguments={})
+                yield ToolCall(call_id="raw-upload", name="browser_upload", arguments={})
+                yield ToolCall(call_id="raw-chat", name="browser_chat_exchange", arguments={})
+                yield ToolCall(call_id="safe-probe", name="browser_recon_exchange", arguments={})
                 yield ToolCall(call_id="open", name="browser_open_tab", arguments={})
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
@@ -336,7 +345,11 @@ async def test_recon_recall_withholds_workspace_and_shell_tools_from_later_reque
     await kernel.submit("reuse prior reconnaissance")
     await kernel.wait_for_turn()
 
-    assert tools.calls == ["browser_recall_reconnaissance", "browser_open_tab"]
+    assert tools.calls == [
+        "browser_recall_reconnaissance",
+        "browser_recon_exchange",
+        "browser_open_tab",
+    ]
     assert len(provider.requests) == 3
 
 
