@@ -1937,6 +1937,7 @@ async def test_campaign_objective_repair_reuses_campaign_request_id(monkeypatch)
     assert client.execute_calls == [("campaign/exact", "sha256:exact")]
     assert len(prompts) == 2
     assert all(prompt.count(f'"campaign_request_id": "{request_id}"') == 1 for prompt in prompts)
+    assert all("specialist_composition='opinionated'" in prompt for prompt in prompts)
 
 
 def test_campaign_approve_accepts_verbatim_objective_with_target_anchor(monkeypatch) -> None:
@@ -2239,6 +2240,7 @@ def test_campaign_approve_retries_once_when_prepare_turn_ends_without_tool(monke
     assert prompts[0] == "/new"
     assert prompts[1].startswith("Assess target")
     assert "ended without calling assessment_prepare" in prompts[2]
+    assert all("specialist_composition='opinionated'" in prompt for prompt in prompts[1:])
     assert all(
         prompt.count(f'"campaign_request_id": "{campaign_request_id}"') == 1
         for prompt in prompts[1:]
@@ -2678,7 +2680,7 @@ def test_campaign_submit_threads_autonomous_composition_into_prompt(monkeypatch)
     assert "assessment_prepare" in prompt
 
 
-def test_campaign_submit_default_composition_leaves_prompt_unchanged(monkeypatch) -> None:
+def test_campaign_submit_threads_opinionated_composition_into_prompt(monkeypatch) -> None:
     calls = []
 
     async def print_stream(prompt, *, approve_once=False, **_kwargs):
@@ -2701,7 +2703,9 @@ def test_campaign_submit_default_composition_leaves_prompt_unchanged(monkeypatch
 
     main()
 
-    assert "specialist composition" not in calls[1][0]
+    prompt = calls[1][0]
+    assert "operator explicitly selected specialist composition: opinionated" in prompt
+    assert "specialist_composition='opinionated'" in prompt
 
 
 def test_campaign_submit_rejects_unknown_composition(monkeypatch) -> None:

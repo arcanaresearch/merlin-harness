@@ -937,13 +937,11 @@ async def _submit_campaign(arguments: list[str]) -> None:
             "\nThe operator requested no provider/model campaign limits. Keep max_turns, "
             "max_tokens, max_seconds, and max_cost_usd unset; do not invent safety caps."
         )
-    composition_instruction = ""
-    if composition != "opinionated":
-        composition_instruction = (
-            f"\nThe operator explicitly selected specialist composition: {composition} "
-            "(orthogonal to the coverage profile); pass "
-            f"specialist_composition={composition!r} to assessment_prepare; do not ask again."
-        )
+    composition_instruction = (
+        f"\nThe operator explicitly selected specialist composition: {composition} "
+        "(orthogonal to the coverage profile); pass "
+        f"specialist_composition={composition!r} to assessment_prepare; do not ask again."
+    )
     preparation_prompt = (
         f"{objective}\n{campaign_envelope}\n"
         f"The operator explicitly selected campaign profile: {profile}; "
@@ -994,11 +992,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     "Target line or changing verbs, punctuation, or quotes:\n"
                     f"operator_objective_json={json.dumps(objective, ensure_ascii=False)}\n"
                     f"Use campaign_profile={profile!r}"
-                    + (
-                        f" and specialist_composition={composition!r}"
-                        if composition != "opinionated"
-                        else ""
-                    )
+                    + f" and specialist_composition={composition!r}"
                     + (
                         ". Keep the exact previously selected budget: "
                         + ", ".join(f"max_{name}={value}" for name, value in sorted(limits.items()))
@@ -1014,11 +1008,7 @@ async def _submit_campaign(arguments: list[str]) -> None:
                     "now with the already-sealed recon handoff for this session, the "
                     "operator objective verbatim, "
                     f"campaign_profile={profile!r}"
-                    + (
-                        f", specialist_composition={composition!r}"
-                        if composition != "opinionated"
-                        else ""
-                    )
+                    + f", specialist_composition={composition!r}"
                     + (
                         ", and "
                         + (
