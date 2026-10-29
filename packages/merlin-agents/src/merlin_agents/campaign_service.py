@@ -22879,6 +22879,9 @@ class AssessmentPrepareTool:
                         adapter["evaluation_uncertainties"] = uncertainties
                 else:
                     return failed_after_merge(str(error))
+            except Exception:
+                self._discard_adapter_identity_claims(candidate_cache_key)
+                raise
             if isinstance(handoff_id, str) and handoff_id.strip():
                 resolved_handoff_id = (
                     adapter.get("recon_handoff_id") if isinstance(adapter, Mapping) else None

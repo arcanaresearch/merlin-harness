@@ -14308,6 +14308,7 @@ async def test_prepare_tool_replaces_cached_candidate_when_handoff_id_changes() 
     "failure_mode",
     [
         "value_error",
+        "resolver_exception",
         "resolver_unavailable",
         "different_handoff",
         "reviewed_adapter_validation",
@@ -14331,6 +14332,7 @@ async def test_prepare_tool_discards_identity_claims_after_every_post_merge_fail
     prepared: list[Mapping[str, object]] = []
     handoff_id = "handoff:reviewed"
     fail_prepare = failure_mode == "service_exception"
+    resolver_error = RuntimeError("resolver crashed")
     hydrated = {
         **_reviewed_browser_adapter(),
         "recon_handoff_id": handoff_id,
@@ -14352,6 +14354,8 @@ async def test_prepare_tool_discards_identity_claims_after_every_post_merge_fail
         if adapter.get(identity_field) == wrong_identity:
             if failure_mode == "value_error":
                 raise ValueError("identity claim rejected")
+            if failure_mode == "resolver_exception":
+                raise resolver_error
             if failure_mode == "different_handoff":
                 return {"recon_handoff_id": "handoff:different"}
             if failure_mode == "reviewed_adapter_validation":
@@ -14395,7 +14399,12 @@ async def test_prepare_tool_discards_identity_claims_after_every_post_merge_fail
     elif failure_mode == "bounded_regeneration":
         rejected_arguments["bounded_regeneration"] = "invalid"
 
-    if failure_mode == "service_exception":
+    if failure_mode == "resolver_exception":
+        with pytest.raises(RuntimeError, match="resolver crashed") as raised:
+            await invoke(rejected_arguments)
+        assert raised.value is resolver_error
+        rejected = None
+    elif failure_mode == "service_exception":
         with pytest.raises(RuntimeError, match="prepare failed"):
             await invoke(rejected_arguments)
         rejected = None
