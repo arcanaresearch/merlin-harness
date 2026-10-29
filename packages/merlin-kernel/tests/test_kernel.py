@@ -6219,6 +6219,187 @@ async def test_handoff_repair_does_not_hijack_later_operator_turn() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("steer_during_tool", [False, True])
+@pytest.mark.parametrize(
+    ("steering", "retained"),
+    [
+        (_campaign_scope_content("Assess https://a.test"), True),
+        ("Continue", True),
+        ("Continue the assessment against https://a.test", True),
+        ("Signed in. Hand the browser back and continue.", True),
+        ("Logged in. Continue at https://a.test", True),
+        (
+            _campaign_scope_content("Assess https://a.test", _CAMPAIGN_REQUEST_ID_B),
+            False,
+        ),
+        (_campaign_scope_content("Assess https://a.test for a different objective"), False),
+        (
+            (
+                "Explain current runtime status",
+                _campaign_scope_content("Assess https://a.test"),
+            ),
+            False,
+        ),
+        ("Continue the assessment against https://b.test", False),
+        ("Logged in. Continue at https://b.test", False),
+        (
+            "Assess https://a.test while logged in and continue testing for authorization bypass",
+            False,
+        ),
+        ("Explain current runtime status", False),
+    ],
+)
+async def test_steering_revalidates_durable_campaign_tool_authority(
+    dynamic: bool,
+    steer_during_tool: bool,
+    steering: str | tuple[str, ...],
+    retained: bool,
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    objective = "Assess https://a.test"
+    store = Store()
+    session_id = await store.create_session()
+    prepare_result = ToolResult(
+        content="handoff and cleanup discovery required",
+        is_error=True,
+        metadata={
+            "retryable": True,
+            "repair_reason": "recon_handoff_required",
+            "preferred_next_tool": "browser_compile_api_handoff",
+            "preferred_next_tool_mode": "strict",
+            "automatic_recon_continuation": _cleanup_continuation("handoff:steered-a"),
+        },
+    )
+    store.messages[session_id] = [
+        ChatMessage(role="user", content=_campaign_scope_content(objective)),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "prepare-steered-a",
+                    "type": "function",
+                    "function": {
+                        "name": "assessment_prepare",
+                        "arguments": json.dumps({"objective": objective}),
+                    },
+                }
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            name="assessment_prepare",
+            tool_call_id="prepare-steered-a",
+            content=_tool_content_with_automatic_marker(
+                "assessment_prepare",
+                "prepare-steered-a",
+                {"objective": objective},
+                prepare_result,
+                campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+            ),
+        ),
+    ]
+
+    class CampaignTools(Tools):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={}) for name in _DISCOVERY_TOOLS
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if steer_during_tool:
+                started.set()
+                await release.wait()
+            return ToolResult(content="compiled")
+
+    class DelayedProvider:
+        def __init__(self) -> None:
+            self.requests = []
+            self.dynamic_outputs: list[DynamicToolOutput] = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                if not steer_during_tool:
+                    started.set()
+                    await release.wait()
+                yield ToolCall(
+                    call_id="delayed-compile-a",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="new durable boundary acknowledged")
+            yield ModelCompleted()
+
+        async def dynamic_stream(self, request, handler):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                if not steer_during_tool:
+                    started.set()
+                    await release.wait()
+                self.dynamic_outputs.append(
+                    await handler(
+                        ToolCall(
+                            call_id="delayed-compile-a",
+                            name="browser_compile_api_handoff",
+                            arguments={},
+                        )
+                    )
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="new durable boundary acknowledged")
+            yield ModelCompleted()
+
+    provider = DelayedProvider()
+    if dynamic:
+        provider.stream_with_tools = provider.dynamic_stream
+    tools = CampaignTools()
+    kernel = Kernel(provider, store, tools, Settings())
+    await kernel.start(session_id)
+    await kernel.submit("Continue")
+    await started.wait()
+    steering_messages = (steering,) if isinstance(steering, str) else steering
+    for steering_message in steering_messages:
+        assert await kernel.steer(steering_message)
+    release.set()
+    await kernel.wait_for_turn()
+
+    tool_was_admitted = retained or steer_during_tool
+    assert tools.calls == (["browser_compile_api_handoff"] if tool_was_admitted else [])
+    delayed_results = [
+        message
+        for message in store.messages[session_id]
+        if message.role == "tool" and message.tool_call_id == "delayed-compile-a"
+    ]
+    assert delayed_results, [event.payload for event in store.events if event.type == "error"]
+    delayed_result = delayed_results[0]
+    if retained:
+        assert _CAMPAIGN_REQUEST_ID_A in delayed_result.content
+    else:
+        assert _CAMPAIGN_REQUEST_ID_A not in delayed_result.content
+        assert len(provider.requests) >= 2
+        assert provider.requests[1].required_tool_name is None
+        assert {tool["function"]["name"] for tool in provider.requests[1].tools} == set(
+            _DISCOVERY_TOOLS
+        )
+        assert not any(
+            "Continue the internal reconnaissance automatically" in message.content
+            for message in provider.requests[1].messages
+            if message.role == "system"
+        )
+    if dynamic:
+        assert provider.dynamic_outputs[0].success is retained
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operator_prompt", "expected_required_tool"),
     [

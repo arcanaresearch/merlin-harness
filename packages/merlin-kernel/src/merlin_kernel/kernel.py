@@ -1615,7 +1615,8 @@ class Kernel:
         automatic_progress_key: str | None = None
         automatic_recon_stalled = False
         recon_recall_completed = False
-        automatic_state_restored = False
+        restored_steering_version = -1
+        restored_user_boundaries = -1
         owned_cleanup_failed = False
         owned_cleanup_evidence_failed = False
         owned_cleanup_completed = False
@@ -1708,28 +1709,148 @@ class Kernel:
                     )
                 )
 
+            async def refresh_request_authority(
+                *,
+                request_version: int,
+                request_user_boundaries: int,
+                request_campaign_epoch: int,
+                request_campaign_scope: tuple[str, str] | None,
+                request_preferred_tool: str | None,
+                request_preferred_mode: str,
+                request_automatic_recon: Mapping[str, object] | None,
+            ) -> tuple[bool, str | None]:
+                """Refresh durable authority before admitting a delayed provider tool."""
+
+                nonlocal automatic_no_progress_key
+                nonlocal automatic_progress_key
+                nonlocal automatic_recon_continuation
+                nonlocal automatic_recon_stalled
+                nonlocal preferred_tool_follow_through_failures
+                nonlocal preferred_transition_observation_used
+                nonlocal preferred_next_tool_name
+                nonlocal preferred_next_tool_mode
+                nonlocal recovery_reasoning
+                nonlocal recovery_tool_name
+                nonlocal repair_messages
+                nonlocal repair_scope_campaign_request_id
+                nonlocal restored_steering_version
+                nonlocal restored_user_boundaries
+                durable_messages = list(await self._store.load_messages(session_id))
+                current_user_boundaries = sum(
+                    message.role == "user" for message in durable_messages
+                )
+                if (
+                    self._steering_version == request_version
+                    and current_user_boundaries == request_user_boundaries
+                ):
+                    return True, repair_scope_campaign_request_id
+
+                current_campaign_epoch, current_campaign_scope = campaign_epoch(durable_messages)
+                restored_continuation, restored_progress = _restored_automatic_recon(
+                    durable_messages
+                )
+                restored_repair = _restored_preferred_tool_repair(durable_messages)
+                current_preferred_tool: str | None = None
+                current_preferred_mode = "strict"
+                repair_scope_campaign_request_id = (
+                    current_campaign_scope[0] if current_campaign_scope is not None else None
+                )
+                if restored_repair is not None:
+                    (
+                        current_preferred_tool,
+                        current_preferred_mode,
+                        _scope,
+                        repair_scope_campaign_request_id,
+                    ) = restored_repair
+                preferred_next_tool_name = current_preferred_tool
+                preferred_next_tool_mode = current_preferred_mode
+                automatic_recon_continuation = restored_continuation
+                automatic_progress_seen.clear()
+                automatic_progress_seen.update(restored_progress)
+                automatic_progress_key = (
+                    str(restored_continuation.get("progress_key"))
+                    if restored_continuation is not None
+                    else None
+                )
+                automatic_no_progress_key = None
+                repair_messages = []
+                restored_steering_version = self._steering_version
+                restored_user_boundaries = current_user_boundaries
+                authority_valid = (
+                    current_campaign_epoch == request_campaign_epoch
+                    and current_campaign_scope == request_campaign_scope
+                    and current_preferred_tool == request_preferred_tool
+                    and current_preferred_mode == request_preferred_mode
+                    and restored_continuation == request_automatic_recon
+                )
+                if not authority_valid:
+                    recovery_tool_name = None
+                    recovery_reasoning = None
+                    blocked_recovery_tools.clear()
+                    preferred_tool_retry_state.clear()
+                    preferred_tool_follow_through_failures = 0
+                    preferred_transition_observation_used = False
+                    automatic_recon_stalled = False
+                return authority_valid, repair_scope_campaign_request_id
+
+            def campaign_epoch(
+                messages: list[ChatMessage],
+            ) -> tuple[int, tuple[str, str] | None]:
+                """Return the chronological campaign epoch and its bound scope."""
+
+                state = _CampaignBoundaryState()
+                request_objectives: dict[str, str] = {}
+                invalid_request_ids: set[str] = set()
+                epoch = 0
+                for message in messages:
+                    if message.role != "user":
+                        continue
+                    state, new_boundary = _advance_campaign_boundary(
+                        message.content,
+                        state,
+                        request_objectives,
+                        invalid_request_ids,
+                    )
+                    if new_boundary:
+                        epoch += 1
+                return epoch, state.scope if state.kind == "bound" else None
+
             while True:
-                if not automatic_state_restored:
-                    durable_messages = list(await self._store.load_messages(session_id))
-                    typed_campaign_scope = _latest_typed_campaign_scope(durable_messages)
-                    if typed_campaign_scope is not None:
-                        repair_scope_campaign_request_id = typed_campaign_scope[0]
+                durable_messages = list(await self._store.load_messages(session_id))
+                current_user_boundaries = sum(
+                    message.role == "user" for message in durable_messages
+                )
+                if (
+                    restored_steering_version != self._steering_version
+                    or restored_user_boundaries != current_user_boundaries
+                ):
+                    _current_campaign_epoch, typed_campaign_scope = campaign_epoch(durable_messages)
+                    repair_scope_campaign_request_id = (
+                        typed_campaign_scope[0] if typed_campaign_scope is not None else None
+                    )
                     restored_continuation, restored_progress = _restored_automatic_recon(
                         durable_messages
                     )
                     restored_repair = _restored_preferred_tool_repair(durable_messages)
-                    if restored_continuation is not None:
-                        automatic_recon_continuation = restored_continuation
-                        automatic_progress_key = str(restored_continuation.get("progress_key"))
+                    automatic_recon_continuation = restored_continuation
+                    automatic_progress_seen.clear()
                     automatic_progress_seen.update(restored_progress)
-                    if restored_repair is not None and preferred_next_tool_name is None:
+                    automatic_progress_key = (
+                        str(restored_continuation.get("progress_key"))
+                        if restored_continuation is not None
+                        else None
+                    )
+                    preferred_next_tool_name = None
+                    preferred_next_tool_mode = "strict"
+                    if restored_repair is not None:
                         (
                             preferred_next_tool_name,
                             preferred_next_tool_mode,
                             _scope,
                             repair_scope_campaign_request_id,
                         ) = restored_repair
-                    automatic_state_restored = True
+                    restored_steering_version = self._steering_version
+                    restored_user_boundaries = current_user_boundaries
                 request_steering_version = self._steering_version
                 request_has_followup = request_steering_version != consumed_steering_version
                 consumed_steering_version = request_steering_version
@@ -1748,6 +1869,18 @@ class Kernel:
                 )
                 request_repair_messages = repair_messages
                 repair_messages = []
+                request_durable_messages = list(await self._store.load_messages(session_id))
+                request_user_boundaries = sum(
+                    message.role == "user" for message in request_durable_messages
+                )
+                request_campaign_epoch, request_campaign_scope = campaign_epoch(
+                    request_durable_messages
+                )
+                request_automatic_recon = (
+                    dict(automatic_recon_continuation)
+                    if automatic_recon_continuation is not None
+                    else None
+                )
                 if self._permissions is not None and not await self._permissions.authorize_provider(
                     session_id, self._workspace_root
                 ):
@@ -1915,6 +2048,32 @@ class Kernel:
                 reasoning = ""
                 retry_provider = False
                 preferred_tool_invoked_dynamically = False
+                request_authority_revoked = False
+
+                async def revalidate_request_authority(
+                    _request_version: int = request_steering_version,
+                    _request_user_boundaries: int = request_user_boundaries,
+                    _request_campaign_epoch: int = request_campaign_epoch,
+                    _request_campaign_scope: tuple[str, str] | None = request_campaign_scope,
+                    _request_preferred_tool: str | None = request_preferred_tool_name,
+                    _request_preferred_mode: str = request_preferred_tool_mode,
+                    _request_automatic_recon: Mapping[str, object] | None = (
+                        request_automatic_recon
+                    ),
+                ) -> tuple[bool, str | None]:
+                    nonlocal request_authority_revoked
+                    valid, current_scope = await refresh_request_authority(
+                        request_version=_request_version,
+                        request_user_boundaries=_request_user_boundaries,
+                        request_campaign_epoch=_request_campaign_epoch,
+                        request_campaign_scope=_request_campaign_scope,
+                        request_preferred_tool=_request_preferred_tool,
+                        request_preferred_mode=_request_preferred_mode,
+                        request_automatic_recon=_request_automatic_recon,
+                    )
+                    if not valid:
+                        request_authority_revoked = True
+                    return valid, current_scope
 
                 async def handle_dynamic_tool(
                     call: ToolCall,
@@ -1923,9 +2082,6 @@ class Kernel:
                         spec.name for spec in described_tools
                     ),
                     _request_preferred_tool_name: str | None = request_preferred_tool_name,
-                    _repair_scope_campaign_request_id: str | None = (
-                        repair_scope_campaign_request_id
-                    ),
                 ) -> DynamicToolOutput:
                     nonlocal automatic_no_progress_key
                     nonlocal automatic_progress_fingerprint
@@ -1941,6 +2097,10 @@ class Kernel:
                     nonlocal preferred_transition_observation_used
                     nonlocal preferred_tool_invoked_dynamically
                     nonlocal recon_recall_completed
+                    (
+                        request_authority_valid,
+                        current_repair_scope,
+                    ) = await revalidate_request_authority()
                     await self._store.append_message(
                         session_id,
                         ChatMessage(
@@ -2012,7 +2172,8 @@ class Kernel:
                         call_id=call.call_id,
                     )
                     tool_admitted = (
-                        (
+                        request_authority_valid
+                        and (
                             call.name in _advertised_tool_names
                             or dynamically_admitted_transition
                             or bounded_preferred_observation
@@ -2089,21 +2250,30 @@ class Kernel:
                                 )
                             },
                         )
+                    (
+                        post_invoke_authority_valid,
+                        current_repair_scope,
+                    ) = await revalidate_request_authority()
+                    stale_result = not request_authority_valid or not post_invoke_authority_valid
                     await self._append_tool_terminal(
                         session_id,
                         name=call.name,
                         call_id=call.call_id,
-                        content=_tool_content_with_automatic_marker(
-                            call.name,
-                            call.call_id,
-                            call.arguments,
-                            result,
-                            campaign_request_id=_repair_scope_campaign_request_id,
-                            progress_key=(
-                                str(automatic_recon_continuation.get("progress_key"))
-                                if automatic_recon_continuation is not None
-                                else None
-                            ),
+                        content=(
+                            result.content
+                            if stale_result
+                            else _tool_content_with_automatic_marker(
+                                call.name,
+                                call.call_id,
+                                call.arguments,
+                                result,
+                                campaign_request_id=current_repair_scope,
+                                progress_key=(
+                                    str(automatic_recon_continuation.get("progress_key"))
+                                    if automatic_recon_continuation is not None
+                                    else None
+                                ),
+                            )
                         ),
                     )
                     failure_category = tool_failure_category(result)
@@ -2118,6 +2288,8 @@ class Kernel:
                             **failure_event_payload(failure_category),
                         )
                     )
+                    if stale_result:
+                        return DynamicToolOutput(content=result.content, success=False)
                     if call.name == "request_user_input" and not result.is_error:
                         raise _AwaitingUserInput
                     if preferred_retry_exhausted:
@@ -2396,6 +2568,10 @@ class Kernel:
                     assistant = ""
                     reasoning = ""
                     continue
+                if request_authority_revoked:
+                    assistant = ""
+                    reasoning = ""
+                    continue
                 if preferred_tool_retry_state.get("exhausted") is True:
                     await emit_preferred_tool_retry_exhausted()
                     return
@@ -2444,6 +2620,10 @@ class Kernel:
                     return
                 if used_tool:
                     (
+                        request_authority_valid,
+                        _current_repair_scope,
+                    ) = await revalidate_request_authority()
+                    (
                         next_preferred_tool_name,
                         tool_continuation,
                         tool_progress_fingerprint,
@@ -2473,7 +2653,13 @@ class Kernel:
                         owned_cleanup_attempted_in_turn=owned_cleanup_attempted_in_turn,
                         repair_scope_campaign_request_id=(repair_scope_campaign_request_id),
                         recon_recall_completed=recon_recall_completed,
+                        request_authority_valid=request_authority_valid,
+                        authority_check=revalidate_request_authority,
                     )
+                    if not request_authority_valid or request_authority_revoked:
+                        assistant = ""
+                        reasoning = ""
+                        continue
                     preferred_tool_invoked = request_preferred_tool_name is not None and any(
                         call.name == request_preferred_tool_name for call in tool_calls
                     )
@@ -2807,6 +2993,8 @@ class Kernel:
         owned_cleanup_attempted_in_turn: set[str] | None = None,
         repair_scope_campaign_request_id: str | None = None,
         recon_recall_completed: bool = False,
+        request_authority_valid: bool = True,
+        authority_check: Callable[[], Awaitable[tuple[bool, str | None]]] | None = None,
     ) -> tuple[str | None, dict[str, object] | None, str | None, bool | None, bool, str]:
         if not events:
             return (
@@ -2858,6 +3046,9 @@ class Kernel:
             ),
         )
         for position, event in enumerate(events):
+            current_repair_scope = repair_scope_campaign_request_id
+            if authority_check is not None:
+                request_authority_valid, current_repair_scope = await authority_check()
             current_preferred_tool = preferred_next_tool
             bounded_preferred_action = (
                 current_preferred_tool == "browser_compile_api_handoff"
@@ -2892,7 +3083,8 @@ class Kernel:
                 or (bounded_preferred_action and not preferred_nonpreferred_action_used)
             )
             tool_admitted = (
-                cleanup_admitted
+                request_authority_valid
+                and cleanup_admitted
                 and (admitted_tool_name is None or event.name == admitted_tool_name)
                 and preferred_action_admitted
                 and (not recon_recall_completed or _tool_admitted_after_recon_recall(event.name))
@@ -2955,18 +3147,28 @@ class Kernel:
                         )
                     },
                 )
-            continuation = _tool_automatic_recon_continuation(event.name, result)
+            post_invoke_authority_valid = request_authority_valid
+            if authority_check is not None:
+                post_invoke_authority_valid, current_repair_scope = await authority_check()
+            stale_result = not request_authority_valid or not post_invoke_authority_valid
+            continuation = (
+                None if stale_result else _tool_automatic_recon_continuation(event.name, result)
+            )
             await self._append_tool_terminal(
                 session_id,
                 name=event.name,
                 call_id=event.call_id,
-                content=_tool_content_with_automatic_marker(
-                    event.name,
-                    event.call_id,
-                    event.arguments,
-                    result,
-                    campaign_request_id=repair_scope_campaign_request_id,
-                    progress_key=automatic_progress_key,
+                content=(
+                    result.content
+                    if stale_result
+                    else _tool_content_with_automatic_marker(
+                        event.name,
+                        event.call_id,
+                        event.arguments,
+                        result,
+                        campaign_request_id=current_repair_scope,
+                        progress_key=automatic_progress_key,
+                    )
                 ),
             )
             failure_category = tool_failure_category(result)
@@ -2981,6 +3183,8 @@ class Kernel:
                     **failure_event_payload(failure_category),
                 )
             )
+            if stale_result:
+                continue
             if event.name == "request_user_input" and not result.is_error:
                 # Every call in the assistant batch must have a terminal receipt.
                 # Calls after a question are deferred, never executed on guessed input.
