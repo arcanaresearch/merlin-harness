@@ -778,58 +778,26 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
             ]
             assert len(worker_attempts) == 2
             assert worker_attempts[0]["state"] == "expired"
-            assert worker_attempts[1]["state"] == "cancelled"
-            assert worker_attempts[1]["failure_kind"] == "unknown"
-            assert worker_attempts[1]["error"] == (
-                "target admission held after an authenticated surface transition"
-            )
-            held_partial = max(
-                (
-                    row
-                    for row in scheduler.list_results(schedule_id)
-                    if row["node_id"] == f"worker:{assignment.id}"
-                    and row["schema_id"] == "schema/partial-result"
-                ),
-                key=lambda row: int(row["generation"]),
-            )
-            held_payload = held_partial["payload"]
-            assert held_payload["error_code"] == "target_admission_latched"
-            assert held_payload["infrastructure_failure_category"] is None
-            hold_marker = held_payload["worker_checkpoint"]["target_control_hold"]
-            assert hold_marker["schema"] == "merlin.target-control-hold.v1"
-            assert hold_marker["assignment_id"] == assignment.id
-            assert hold_marker["attempt_id"] == str(worker_attempts[1]["id"])
-            assert hold_marker["call_id"] == "seeded-call-1"
-            assert hold_marker["tool_name"] == "target_request"
-            assert hold_marker["failure_code"] == "target_session_identity_mismatch"
-            assert hold_marker["target_session_id"] == worker_attempts[1]["target_session_id"]
-            assert len(str(hold_marker["receipt_sha256"])) == 64
-            int(str(hold_marker["receipt_sha256"]), 16)
-            hold_projection = held_payload["structured"]["control_plane_hold"]
-            assert all(hold_projection[key] == value for key, value in hold_marker.items())
-            assert hold_projection["effect_applied"] is False
-            assert hold_projection["target_effect_attempted"] is False
-            assert hold_projection["interaction_count"] == 0
-            assert hold_projection["limit_interaction_count"] == 0
-            assert hold_projection["target_call_budget_charge"] == 0
-            assert hold_projection["target_call_ids"] == []
-            assert hold_projection["target_evidence"] == []
-            assert hold_projection["target_ui_transitions"] == []
+            assert worker_attempts[1]["state"] == "completed"
+            assert worker_attempts[1]["failure_kind"] is None
+            assert worker_attempts[1]["error"] is None
             assert provider.calls == baseline_calls, "restart must not regenerate provider turns"
             assert len(target.invocations("start")) - baseline_starts == 1
+            assert len(target.invocations("message")) - baseline_messages == 2
             assert len(target.invocations("cleanup")) - baseline_cleanups == 1
             gate = scheduler.goat_gate(schedule_id)
             assert gate["ambiguous"] == (assignment.id,)
             receipt = gate["strategies"][assignment.id]
-            assert receipt["execution_terminal"] == "cancelled"
-            assert receipt["execution_complete"] is False
+            assert receipt["execution_complete"] is True
             assert receipt["evidence_verdict"] == "ambiguous"
             assert receipt["evaluation_uncertain"] is True
-            assert len(receipt["steps"]) == 1
+            assert len(receipt["steps"]) == 2
             assert receipt["steps"][-1]["objective_matched"] is True
             assert {str(step["scheduler_attempt_id"]) for step in receipt["steps"]} == {
                 first_attempt_id,
+                str(worker_attempts[1]["id"]),
             }
+            assert len({str(step["target_session_id"]) for step in receipt["steps"]}) == 1
     return {
         "lane": "api-restart",
         "execution_mode": "api",
@@ -839,11 +807,7 @@ async def run_api_restart_lane(workdir: Path, target: FixtureTargetServer) -> di
         "message_count": len(target.invocations("message")) - baseline_messages,
         "gate_verdict": receipt["evidence_verdict"],
         "attempts": [row["state"] for row in worker_attempts],
-        "session_conflict_fenced": (
-            hold_marker["failure_code"] == "target_session_identity_mismatch"
-            and hold_projection["target_effect_attempted"] is False
-            and hold_projection["target_call_budget_charge"] == 0
-        ),
+        "session_reused": len({str(step["target_session_id"]) for step in receipt["steps"]}) == 1,
         "receipt_attempt_ids": sorted(
             {str(step["scheduler_attempt_id"]) for step in receipt["steps"]}
         ),
