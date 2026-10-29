@@ -611,7 +611,15 @@ class ConfiguredCampaignTool:
                 ),
                 is_error=True,
             )
-        result = await self._tool.invoke(context, values)
+        scoped_prepare = getattr(self._tool, "invoke_for_campaign_request", None)
+        if prepare_scope_request_id is not None and callable(scoped_prepare):
+            result = await scoped_prepare(
+                context,
+                values,
+                campaign_request_id=prepare_scope_request_id,
+            )
+        else:
+            result = await self._tool.invoke(context, values)
         if self.describe().name == "assessment_prepare":
             result = result.model_copy(
                 update={

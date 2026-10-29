@@ -489,6 +489,152 @@ async def test_configured_prepare_same_v2_id_retry_retains_configuration() -> No
 
 
 @pytest.mark.asyncio
+async def test_configured_prepare_adapter_candidates_are_scoped_to_v2_request_id() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000030"
+    request_b = "00000000-0000-4000-8000-000000000031"
+    requests = []
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            raise ValueError("candidate rejected for regression coverage")
+
+        async def prepare(self, *_args, **_kwargs):
+            raise AssertionError("rejected candidates must not reach preparation")
+
+    def configured_history(objective: str, request_id: str):
+        return (
+            ChatMessage(
+                role="user",
+                content=campaign_submit_envelope(objective, campaign_request_id=request_id),
+            ),
+            saved(
+                "campaign_configure",
+                {
+                    "campaign_request_id": request_id,
+                    "status": "configured",
+                    "settings": {
+                        "objective": objective,
+                        "campaign_profile": "recommended",
+                    },
+                },
+            ),
+        )
+
+    history = configured_history(objective_a, request_a)
+    loader = AsyncMock(side_effect=lambda _: history)
+    tool = ConfiguredCampaignTool(AssessmentPrepareTool(Service()), loader)  # type: ignore[arg-type]
+    candidate_a = {
+        "interface": "http_api",
+        "execution_mode": "api",
+        "endpoint": "https://a.test/v1/chat",
+        "api_steps": [
+            {
+                "step_id": "message",
+                "endpoint": "/v1/chat",
+                "method": "POST",
+                "request_template": {"message": "{{input}}"},
+                "interaction": True,
+                "cleanup": False,
+            }
+        ],
+    }
+
+    first = await tool.invoke(context(), {"adapter": candidate_a})
+    same_request_retry = await tool.invoke(
+        context(),
+        {
+            "adapter": {
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://a.test/v1/chat",
+            }
+        },
+    )
+    history = configured_history(objective_b, request_b)
+    fresh_request = await tool.invoke(
+        context(),
+        {
+            "adapter": {
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://b.test/v2/chat",
+            }
+        },
+    )
+    history = configured_history(objective_a, request_a)
+    invalidated_old_request = await tool.invoke(
+        context(),
+        {
+            "adapter": {
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://a.test/v1/chat",
+            }
+        },
+    )
+
+    assert (
+        first.is_error
+        and same_request_retry.is_error
+        and fresh_request.is_error
+        and invalidated_old_request.is_error
+    )
+    assert requests[1]["api_steps"] == candidate_a["api_steps"]
+    assert requests[2] == {
+        "interface": "http_api",
+        "execution_mode": "api",
+        "endpoint": "https://b.test/v2/chat",
+    }
+    assert "api_steps" not in requests[3]
+
+
+@pytest.mark.asyncio
+async def test_prepare_adapter_candidate_without_v2_scope_retains_legacy_session_retry() -> None:
+    requests = []
+
+    class Service:
+        async def resolve_reviewed_adapter(self, _session_id, adapter):
+            requests.append(dict(adapter))
+            raise ValueError("candidate rejected for regression coverage")
+
+    tool = AssessmentPrepareTool(Service())  # type: ignore[arg-type]
+    base = {
+        "objective": "Assess legacy target",
+        "campaign_profile": "recommended",
+    }
+    await tool.invoke(
+        context(),
+        {
+            **base,
+            "adapter": {
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://legacy.test/chat",
+                "api_steps": [{"step_id": "message", "request_template": {"q": "{{input}}"}}],
+            },
+        },
+    )
+    await tool.invoke(
+        context(),
+        {
+            **base,
+            "adapter": {
+                "interface": "http_api",
+                "execution_mode": "api",
+                "endpoint": "https://legacy.test/chat",
+            },
+        },
+    )
+
+    assert requests[1]["api_steps"] == [
+        {"step_id": "message", "request_template": {"q": "{{input}}"}}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_settings_revision_preserves_unspecified_fields_and_new_scan_resets_them():
     initial = {
         "status": "configured",

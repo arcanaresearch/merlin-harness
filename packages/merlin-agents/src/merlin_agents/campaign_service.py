@@ -22353,16 +22353,28 @@ class AssessmentPrepareTool:
         # sending only the fields named by the validation error.  Keep the richest
         # browser-adapter candidate for the current session so a subsequent repair
         # augments it instead of discarding already reviewed reconnaissance facts.
-        # Candidates never cross sessions or incompatible handoff/fallback identities.
-        self._adapter_candidates: dict[str, dict[str, Any]] = {}
+        # Candidates never cross sessions, configured campaign requests, or
+        # incompatible handoff/fallback identities. Legacy callers without a
+        # durable request identity retain the historical session scope.
+        self._adapter_candidates: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     def _merge_adapter_candidate(
-        self, session_id: str, adapter: Mapping[str, Any]
+        self,
+        session_id: str,
+        campaign_request_id: str | None,
+        adapter: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        cache_key = (session_id, campaign_request_id)
+        if campaign_request_id is not None:
+            self._adapter_candidates = {
+                key: candidate
+                for key, candidate in self._adapter_candidates.items()
+                if key[0] != session_id or key == cache_key
+            }
         current = dict(adapter)
-        previous = self._adapter_candidates.get(session_id)
+        previous = self._adapter_candidates.get(cache_key)
         if previous is None:
-            self._adapter_candidates[session_id] = current
+            self._adapter_candidates[cache_key] = current
             return current
         previous_handoff = previous.get("recon_handoff_id")
         current_handoff = current.get("recon_handoff_id")
@@ -22378,11 +22390,26 @@ class AssessmentPrepareTool:
             )
         )
         if not same_identity:
-            self._adapter_candidates[session_id] = current
+            self._adapter_candidates[cache_key] = current
             return current
         merged = {**previous, **current}
-        self._adapter_candidates[session_id] = merged
+        self._adapter_candidates[cache_key] = merged
         return merged
+
+    async def invoke_for_campaign_request(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        *,
+        campaign_request_id: str,
+    ) -> ToolResult:
+        """Prepare within one validated, durable operator request boundary."""
+
+        return await self.invoke(
+            context,
+            arguments,
+            _campaign_request_id=campaign_request_id,
+        )
 
     def describe(self) -> ToolSpec:
         return ToolSpec(
@@ -22733,7 +22760,13 @@ class AssessmentPrepareTool:
             },
         )
 
-    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+    async def invoke(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, Any],
+        *,
+        _campaign_request_id: str | None = None,
+    ) -> ToolResult:
         objective = arguments.get("objective")
         try:
             profile = CampaignProfile(str(arguments.get("campaign_profile")))
@@ -22788,7 +22821,9 @@ class AssessmentPrepareTool:
                 # Every durable handoff is authoritative for executable fields.  A
                 # mixed API/browser repair must not replace its endpoint or actions.
                 adapter = _durable_recon_handoff_request(adapter)
-            adapter = self._merge_adapter_candidate(context.session_id, adapter)
+            adapter = self._merge_adapter_candidate(
+                context.session_id, _campaign_request_id, adapter
+            )
             try:
                 resolver = getattr(self._service, "resolve_reviewed_adapter", None)
                 if resolver is not None:
@@ -22919,7 +22954,7 @@ class AssessmentPrepareTool:
             result = await self._service.prepare(
                 context.session_id, objective, profile, adapter, budget, **prepare_kwargs
             )
-        self._adapter_candidates.pop(context.session_id, None)
+        self._adapter_candidates.pop((context.session_id, _campaign_request_id), None)
         return ToolResult(content=json.dumps(result, sort_keys=True), metadata=result)
 
 
