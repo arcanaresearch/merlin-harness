@@ -940,6 +940,31 @@ def _restored_automatic_recon(
         if not isinstance(payload, Mapping):
             continue
         state = payload.get("state")
+        if set(payload) == {"continuation", "state"}:
+            if (
+                active_request_id is not None
+                or message.name != "assessment_prepare"
+                or state != "held"
+                or not isinstance(payload.get("continuation"), Mapping)
+            ):
+                continue
+            candidate = _validated_automatic_recon_continuation(payload["continuation"])
+            if candidate is None:
+                continue
+            handoff_id = str(candidate["handoff_id"])
+            candidate = {
+                **candidate,
+                "progress_key": f"{handoff_id}:session_not_owned",
+                "session_ownership": "unknown",
+                "ownership_evidence_refs": [],
+                "allowed_tools": list(_READ_ONLY_LIFECYCLE_DISCOVERY_TOOLS),
+            }
+            prior_key = str(continuation.get("progress_key")) if continuation is not None else None
+            if prior_key != str(candidate["progress_key"]):
+                progress.clear()
+            continuation = candidate
+            continuation_request_id = None
+            continue
         expected_fields = {
             "call_id",
             "campaign_request_id",
@@ -1811,17 +1836,18 @@ class Kernel:
                     await self._emit(
                         self._event("tool", name=call.name, state="started", **invocation)
                     )
-                    owned_cleanup_key = (
+                    active_owned_cleanup_key = (
                         str(automatic_recon_continuation.get("progress_key"))
                         if automatic_recon_continuation is not None
+                        and automatic_recon_continuation.get("session_ownership") == "owned"
                         else ""
                     )
-                    is_required_owned_cleanup = (
-                        call.name == _request_preferred_tool_name == _OWNED_SESSION_CLEANUP_TOOL
+                    is_active_owned_cleanup = call.name == _OWNED_SESSION_CLEANUP_TOOL and bool(
+                        active_owned_cleanup_key
                     )
                     duplicate_owned_cleanup = (
-                        is_required_owned_cleanup
-                        and owned_cleanup_key in owned_cleanup_attempted_keys
+                        is_active_owned_cleanup
+                        and active_owned_cleanup_key in owned_cleanup_attempted_keys
                     )
                     current_preferred_tool_name = preferred_next_tool_name
                     is_preferred_tool_call = call.name == current_preferred_tool_name
@@ -1883,8 +1909,9 @@ class Kernel:
                         and not duplicate_owned_cleanup
                         and not preferred_retry_exhausted
                     )
-                    if is_required_owned_cleanup and not duplicate_owned_cleanup:
-                        owned_cleanup_attempted_keys.add(owned_cleanup_key)
+                    admitted_owned_cleanup = tool_admitted and is_active_owned_cleanup
+                    if admitted_owned_cleanup:
+                        owned_cleanup_attempted_keys.add(active_owned_cleanup_key)
                     if bounded_preferred_observation:
                         preferred_transition_observation_used = True
                     try:
@@ -2043,7 +2070,7 @@ class Kernel:
                         preferred_tool_follow_through_failures = 0
                     if call.name == _RECON_RECALL_TOOL and not result.is_error:
                         recon_recall_completed = True
-                    if is_required_owned_cleanup and not duplicate_owned_cleanup:
+                    if admitted_owned_cleanup:
                         owned_cleanup_failed = (
                             result.is_error or next_tool != "browser_compile_api_handoff"
                         )

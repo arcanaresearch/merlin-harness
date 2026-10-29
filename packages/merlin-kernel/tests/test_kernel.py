@@ -3920,6 +3920,78 @@ async def test_owned_cleanup_runs_at_most_once_for_dynamic_provider() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dynamic_owned_cleanup_created_mid_request_runs_once() -> None:
+    class MidRequestTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in ("assessment_prepare", "browser_end_owned_session")
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare":
+                return ToolResult(
+                    content="owned cleanup required",
+                    is_error=True,
+                    metadata={
+                        "automatic_recon_continuation": _cleanup_continuation(
+                            "handoff:mid-request",
+                            ownership="owned",
+                            ownership_evidence_refs=["creation:before", "creation:after"],
+                        )
+                    },
+                )
+            return ToolResult(
+                content="cleanup must retry",
+                is_error=True,
+                metadata={
+                    "retryable": True,
+                    "preferred_next_tool": "browser_end_owned_session",
+                    "preferred_next_tool_mode": "strict",
+                },
+            )
+
+    class MidRequestProvider:
+        def __init__(self) -> None:
+            self.second_cleanup = None
+
+        async def stream(self, request):
+            raise AssertionError("dynamic provider must use stream_with_tools")
+            yield  # pragma: no cover
+
+        async def stream_with_tools(self, request, handler):
+            prepared = await handler(
+                ToolCall(call_id="prepare", name="assessment_prepare", arguments={})
+            )
+            assert prepared.success is False
+            first_cleanup = await handler(
+                ToolCall(call_id="cleanup-1", name="browser_end_owned_session", arguments={})
+            )
+            assert first_cleanup.success is False
+            self.second_cleanup = await handler(
+                ToolCall(call_id="cleanup-2", name="browser_end_owned_session", arguments={})
+            )
+            yield ModelCompleted(finish_reason="tool_calls")
+
+    tools = MidRequestTools()
+    provider = MidRequestProvider()
+    kernel = Kernel(provider, Store(), tools, Settings())
+    await kernel.start()
+    await kernel.submit("prepare and clean up")
+    await kernel.wait_for_turn()
+
+    assert tools.calls == ["assessment_prepare", "browser_end_owned_session"]
+    assert provider.second_cleanup == DynamicToolOutput(
+        content="browser_end_owned_session failed: tool is not admitted for this provider request",
+        success=False,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("second_handoff", ["handoff:repeated-hold", "handoff:superseding"])
 async def test_repeated_owned_cleanup_hold_fails_evidence_without_repeating_cleanup(
     second_handoff: str,
@@ -4717,6 +4789,89 @@ def test_automatic_recon_restore_is_authenticated_and_campaign_scoped() -> None:
     )
     tampered, _ = _restored_automatic_recon([scope_a, assistant, tampered_tool])
     assert tampered is None
+
+
+def _legacy_automatic_recon_messages(
+    handoff_id: str, call_id: str
+) -> tuple[ChatMessage, ChatMessage]:
+    continuation = _cleanup_continuation(
+        handoff_id,
+        ownership="owned",
+        ownership_evidence_refs=["creation:before", "creation:after"],
+    )
+    call = ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "assessment_prepare", "arguments": "{}"},
+            }
+        ],
+    )
+    result = ChatMessage(
+        role="tool",
+        name="assessment_prepare",
+        tool_call_id=call_id,
+        content=(
+            "cleanup discovery required\n[merlin-automatic-recon]"
+            + json.dumps(
+                {"state": "held", "continuation": continuation},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+    )
+    return call, result
+
+
+def test_legacy_automatic_recon_marker_resumes_read_only() -> None:
+    call, result = _legacy_automatic_recon_messages("handoff:legacy-resume", "legacy-prepare")
+
+    restored, progress = _restored_automatic_recon([call, result])
+
+    assert restored is not None
+    assert restored["progress_key"] == "handoff:legacy-resume:session_not_owned"
+    assert restored["session_ownership"] == "unknown"
+    assert restored["ownership_evidence_refs"] == []
+    assert restored["allowed_tools"] == [
+        "browser_snapshot",
+        "browser_network_events",
+        "browser_compile_api_handoff",
+        "assessment_prepare",
+    ]
+    assert progress == set()
+
+
+def test_legacy_automatic_recon_marker_is_cleared_by_later_v2_boundary() -> None:
+    call, result = _legacy_automatic_recon_messages("handoff:legacy-cleared", "legacy-cleared")
+
+    restored, _ = _restored_automatic_recon(
+        [
+            call,
+            result,
+            ChatMessage(role="user", content=_campaign_scope_content("Assess target B")),
+        ]
+    )
+
+    assert restored is None
+
+
+def test_legacy_automatic_recon_marker_rejects_future_call() -> None:
+    call, result = _legacy_automatic_recon_messages("handoff:legacy-future", "legacy-future")
+
+    restored, _ = _restored_automatic_recon([result, call])
+
+    assert restored is None
+
+
+def test_legacy_automatic_recon_marker_rejects_duplicate_call_id() -> None:
+    call, result = _legacy_automatic_recon_messages("handoff:legacy-duplicate", "legacy-duplicate")
+
+    restored, _ = _restored_automatic_recon([call, call, result])
+
+    assert restored is None
 
 
 def test_handoff_repair_restore_retains_obligation_without_typed_completion() -> None:

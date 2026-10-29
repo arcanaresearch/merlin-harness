@@ -319,7 +319,15 @@ class CampaignConfigureTool:
         try:
             _foreground(context)
             messages = await self._load(context.session_id)
-            settings = {} if arguments.get("new_campaign") is True else _settings(messages)
+            configured_receipt = _configured_campaign_receipt(messages)
+            campaign_request_scope = _latest_campaign_request_scope(messages)
+            configured_request_id = configured_receipt.get("campaign_request_id")
+            fresh_v2_campaign = (
+                campaign_request_scope is not None
+                and configured_request_id != campaign_request_scope[0]
+            )
+            starts_new_campaign = arguments.get("new_campaign") is True or fresh_v2_campaign
+            settings = {} if starts_new_campaign else _settings(messages)
             allowed = set(self.describe().input_schema["properties"])
             if set(arguments) - allowed:
                 raise ValueError("unknown campaign setting")
@@ -345,9 +353,7 @@ class CampaignConfigureTool:
                 if key == "budget" and not isinstance(value, Mapping):
                     raise ValueError("budget must be an object or null")
                 settings[key] = value
-            if arguments.get("new_campaign") is True and not settings.get("objective"):
-                raise ValueError("a new campaign requires its exact objective and target")
-            if arguments.get("new_campaign") is True:
+            if starts_new_campaign:
                 operator_objective = _operator_campaign_request(messages, settings.get("objective"))
                 if operator_objective is not None:
                     settings["objective"] = operator_objective
@@ -356,6 +362,8 @@ class CampaignConfigureTool:
                     )
                 else:
                     settings.setdefault("campaign_profile", "recommended")
+            if starts_new_campaign and not settings.get("objective"):
+                raise ValueError("a new campaign requires its exact objective and target")
             profile = settings.get("campaign_profile")
             if profile and self._preflight is not None:
                 ready, report = await self._preflight(profile)
@@ -372,11 +380,10 @@ class CampaignConfigureTool:
                 "revision": context.call_id,
                 "requires_review": True,
             }
-            campaign_request_scope = _latest_campaign_request_scope(messages)
             if campaign_request_scope is not None:
                 result["campaign_request_id"] = campaign_request_scope[0]
             metadata = dict(result)
-            if arguments.get("new_campaign") is True:
+            if starts_new_campaign:
                 metadata["preferred_next_tool"] = "browser_recall_reconnaissance"
                 metadata["preferred_next_tool_mode"] = "after_one_admitted_action"
             return ToolResult(content=json.dumps(result, sort_keys=True), metadata=metadata)

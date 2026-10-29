@@ -425,6 +425,95 @@ async def test_settings_revision_preserves_unspecified_fields_and_new_scan_reset
 
 
 @pytest.mark.asyncio
+async def test_different_v2_request_omission_starts_fresh_settings() -> None:
+    objective_a = "Assess https://a.test"
+    objective_b = "Assess https://b.test"
+    request_a = "00000000-0000-4000-8000-000000000020"
+    request_b = "00000000-0000-4000-8000-000000000021"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_a, campaign_request_id=request_a),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": request_a,
+                "status": "configured",
+                "settings": {
+                    "objective": objective_a,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                    "specialist_composition": "autonomous",
+                    "budget": {"max_turns": 17},
+                },
+            },
+        ),
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(objective_b, campaign_request_id=request_b),
+        ),
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"campaign_profile": "recommended"}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == request_b
+    assert receipt["settings"] == {
+        "objective": objective_b,
+        "campaign_profile": "recommended",
+    }
+    assert result.metadata["preferred_next_tool"] == "browser_recall_reconnaissance"
+
+
+@pytest.mark.asyncio
+async def test_same_v2_request_partial_update_retains_settings() -> None:
+    objective = "Assess https://target.test"
+    campaign_request_id = "00000000-0000-4000-8000-000000000022"
+    history = [
+        ChatMessage(
+            role="user",
+            content=campaign_submit_envelope(
+                objective,
+                campaign_request_id=campaign_request_id,
+            ),
+        ),
+        saved(
+            "campaign_configure",
+            {
+                "campaign_request_id": campaign_request_id,
+                "status": "configured",
+                "settings": {
+                    "objective": objective,
+                    "campaign_profile": "exhaustive",
+                    "execution_mode": "hybrid",
+                    "specialist_composition": "autonomous",
+                    "budget": {"max_turns": 17},
+                },
+            },
+        ),
+    ]
+
+    result = await CampaignConfigureTool(AsyncMock(return_value=tuple(history))).invoke(
+        context(), {"campaign_profile": "quickscan"}
+    )
+
+    assert not result.is_error
+    receipt = json.loads(result.content)
+    assert receipt["campaign_request_id"] == campaign_request_id
+    assert receipt["settings"] == {
+        "objective": objective,
+        "campaign_profile": "quickscan",
+        "execution_mode": "hybrid",
+        "specialist_composition": "autonomous",
+        "budget": {"max_turns": 17},
+    }
+
+
+@pytest.mark.asyncio
 async def test_new_campaign_defaults_to_recommended_when_profile_is_unspecified():
     tool = CampaignConfigureTool(AsyncMock(return_value=()))
 
