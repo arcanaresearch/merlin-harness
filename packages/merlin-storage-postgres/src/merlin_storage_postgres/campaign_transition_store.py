@@ -86,7 +86,7 @@ class CampaignTransitionRepository:
         self, campaign_id: str, campaign: Mapping[str, object]
     ) -> TargetReobservationProjection:
         rows = self.connection.execute(
-            """SELECT sequence, decision_id, payload
+            """SELECT wave, sequence, decision_id, payload
                FROM merlin_storage.campaign_lead_journal
                WHERE campaign_id = %s
                  AND (

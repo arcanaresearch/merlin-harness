@@ -7023,14 +7023,18 @@ class DurableSchedulerStore:
                         "compiled_adapter_digest",
                         "reviewed_adapter_digest",
                     )
-                ) or latch.get("authorized_assignment_tools") != {
-                    assignment_id: list(target_assignment_tools[assignment_id])
-                    for assignment_id in sorted(target_assignment_tools)
-                }:
+                ):
                     raise TargetAdmissionLatchedError(
                         "target admission activation conflicts with current authority"
                     )
                 if str(latch["authorized_schedule_id"]) == schedule_id:
+                    if latch.get("authorized_assignment_tools") != {
+                        assignment_id: list(target_assignment_tools[assignment_id])
+                        for assignment_id in sorted(target_assignment_tools)
+                    }:
+                        raise TargetAdmissionLatchedError(
+                            "target admission activation conflicts with current authority"
+                        )
                     return activation_id
                 prior_schedule = self.connection.execute(
                     """SELECT status FROM merlin_storage.scheduler_schedules

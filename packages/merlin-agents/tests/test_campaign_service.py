@@ -397,10 +397,13 @@ def test_supervision_retries_only_known_transient_provider_and_transaction_failu
     class StaleLeaseError(RuntimeError):
         pass
 
+    class TargetAdmissionLatchedError(StaleLeaseError):
+        pass
+
     assert _retryable_supervision_error(OSError("provider total deadline exceeded"))
     assert _retryable_supervision_error(OSError("provider read timeout"))
     assert _retryable_supervision_error(
-        StaleLeaseError("attempt does not own the current lease generation")
+        TargetAdmissionLatchedError("target admission activation conflicts with current authority")
     )
     assert not _retryable_supervision_error(OSError("provider authentication failed"))
 
@@ -24250,8 +24253,13 @@ async def test_supervision_reattaches_when_live_execution_dies_with_stale_lease(
     class StaleLeaseError(RuntimeError):
         pass
 
+    class TargetAdmissionLatchedError(StaleLeaseError):
+        pass
+
     async def dead_execution() -> None:
-        raise StaleLeaseError("attempt does not own the current lease generation")
+        raise TargetAdmissionLatchedError(
+            "target admission activation conflicts with current authority"
+        )
 
     class Store:
         def __init__(self) -> None:

@@ -1585,12 +1585,18 @@ def _objective_outcome(
     return project_campaign_outcome(progress, active_lifecycle=active_lifecycle)
 
 
+def _is_stale_lease_error(error: BaseException) -> bool:
+    """Recognize scheduler lease errors without importing its storage package."""
+
+    return any(candidate.__name__ == "StaleLeaseError" for candidate in type(error).__mro__)
+
+
 def _retryable_supervision_error(error: BaseException) -> bool:
     """Return whether supervision can safely reattach to durable live work."""
 
     if _retryable_transaction_order_error(error):
         return True
-    if type(error).__name__ == "StaleLeaseError":
+    if _is_stale_lease_error(error):
         # A committed cancellation or lease handoff wins over any late supervision
         # read; the durable scheduler remains authoritative and still makes progress.
         return True
@@ -7440,7 +7446,7 @@ class CampaignService:
                     "campaign is not executing",
                     "campaign is unknown or not executing",
                 }
-            ) or type(error).__name__ == "StaleLeaseError"
+            ) or _is_stale_lease_error(error)
 
             async def canonical_campaign_status() -> str | None:
                 try:

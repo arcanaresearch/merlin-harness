@@ -2743,14 +2743,53 @@ def test_pg0_activation_supersedes_all_reviewed_latched_target_sessions(
                 "claim_id": takeover_claim,
                 "claimant_id": takeover_claimant,
             }
-            store.reject_schedule(rebound_schedule, reason="reviewed follow-up completed")
-            rebound_graph = store.load_schedule(rebound_schedule)["graph"]
+            next_rebound_task = f"{campaign_id}/wave-2/rebound"
+            next_rebound_next_task = f"{campaign_id}/wave-2/rebound-next"
+            rebound_graph = {
+                "assignments": [
+                    {
+                        "id": next_rebound_task,
+                        "target_profile_id": target_id,
+                        "tool_ids": ["browser_chat_exchange"],
+                        "strategy_id": "direct",
+                        "strategy_contract": rebound_contract,
+                        "reviewed_adapter_digest": authority["reviewed_adapter_digest"],
+                    },
+                    {
+                        "id": next_rebound_next_task,
+                        "target_profile_id": target_id,
+                        "tool_ids": ["browser_chat_exchange"],
+                        "strategy_id": "direct",
+                        "strategy_contract": rebound_contract,
+                        "reviewed_adapter_digest": authority["reviewed_adapter_digest"],
+                    },
+                ],
+                "worker_contexts": {
+                    next_rebound_task: _persisted_worker_context(
+                        assignment_id=next_rebound_task,
+                        target_id=target_id,
+                        tool_ids=("browser_chat_exchange",),
+                        strategy_id="direct",
+                        strategy_contract=rebound_contract,
+                    ),
+                    next_rebound_next_task: _persisted_worker_context(
+                        assignment_id=next_rebound_next_task,
+                        target_id=target_id,
+                        tool_ids=("browser_chat_exchange",),
+                        strategy_id="direct",
+                        strategy_contract=rebound_contract,
+                    ),
+                },
+            }
             next_rebound_schedule = store.create_schedule(
                 str(session.id),
                 rebound_graph,
                 {"nodes": {}},
-                [f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
-                ready_nodes=[f"worker:{rebound_task}", f"worker:{rebound_next_task}"],
+                [f"worker:{next_rebound_task}", f"worker:{next_rebound_next_task}"],
+                ready_nodes=[
+                    f"worker:{next_rebound_task}",
+                    f"worker:{next_rebound_next_task}",
+                ],
                 initial_status="paused",
             )
             campaigns.add_wave(campaign_id, 2, "followup", next_rebound_schedule)
@@ -2760,11 +2799,22 @@ def test_pg0_activation_supersedes_all_reviewed_latched_target_sessions(
                 "wave": 2,
                 "latch_revision": current[0]["revision"],
                 "superseded_generations": (),
+                "target_assignment_tools": {
+                    next_rebound_task: ["browser_chat_exchange"],
+                    next_rebound_next_task: ["browser_chat_exchange"],
+                },
             }
+            with pytest.raises(
+                scheduler_store_module.TargetAdmissionLatchedError,
+                match="prior activated target schedule is not terminal",
+            ):
+                store.activate_target_admission(next_activation)
+            store.reject_schedule(rebound_schedule, reason="reviewed follow-up completed")
             next_activation_id = store.activate_target_admission(next_activation)
             assert next_activation_id == store.activate_target_admission(next_activation)
             assert next_activation_id != activation_id
             rebound_schedule = next_rebound_schedule
+            rebound_task = next_rebound_task
 
             rebound_admission = _target_admission(
                 campaign_id=campaign_id,
