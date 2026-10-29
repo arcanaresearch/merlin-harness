@@ -72,6 +72,7 @@ class AgentTask(AgentContract):
     status: TaskStatus
     agent_id: str | None = None
     result: str | None = None
+    failure_kind: str | None = None
     technique_ids: tuple[str, ...] = ()
 
 

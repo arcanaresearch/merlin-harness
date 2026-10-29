@@ -1760,6 +1760,10 @@ class DurableAgentService:
             row["node_id"]: row
             for row in await self._call(self._store.list_results, schedule["id"])
         }
+        attempts = {
+            row["node_id"]: row
+            for row in await self._call(self._store.list_attempts, schedule["id"])
+        }
         return [
             AgentTask(
                 id=assignment.id,
@@ -1769,6 +1773,9 @@ class DurableAgentService:
                 ),
                 agent_id=f"worker:{assignment.id}",
                 result=_result_text(results.get(f"worker:{assignment.id}")),
+                failure_kind=_optional_text(
+                    attempts.get(f"worker:{assignment.id}", {}).get("failure_kind")
+                ),
                 technique_ids=assignment.technique_ids,
             )
             for assignment in (
@@ -1786,6 +1793,9 @@ class DurableAgentService:
         results = {
             row["node_id"]: row for row in await self._call(self._store.list_results, schedule_id)
         }
+        attempts = {
+            row["node_id"]: row for row in await self._call(self._store.list_attempts, schedule_id)
+        }
         return [
             AgentTask(
                 id=assignment.id,
@@ -1795,6 +1805,9 @@ class DurableAgentService:
                 ),
                 agent_id=f"worker:{assignment.id}",
                 result=_result_text(results.get(f"worker:{assignment.id}")),
+                failure_kind=_optional_text(
+                    attempts.get(f"worker:{assignment.id}", {}).get("failure_kind")
+                ),
                 technique_ids=assignment.technique_ids,
             )
             for assignment in (

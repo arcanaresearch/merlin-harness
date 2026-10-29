@@ -4348,8 +4348,11 @@ async def test_terminal_surface_drift_commits_transition_without_replacement(
 
     node_id = f"worker:{assignment.id}"
     task = (await service.list_schedule_tasks(live.id))[0]
+    session_task = (await service.list_tasks("session-surface-drift"))[0]
     attempts = [attempt for attempt in store.attempts.values() if attempt.node_id == node_id]
     assert task.status == "failed"
+    assert task.failure_kind == expected_failure_kind
+    assert session_task.failure_kind == expected_failure_kind
     assert store.nodes[live.id][node_id]["state"] == "failed"
     assert live.scheduler.status(node_id).value == "failed"
     assert len(attempts) == 1
