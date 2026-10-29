@@ -15049,6 +15049,11 @@ class CampaignService:
             if not target_tools.intersection(assignment.tool_ids):
                 assignments.append(assignment)
                 continue
+            adapter_guidance_count = assignment.guidance_ids.count(guidance_document.id)
+            if adapter_guidance_count > 1:
+                raise RuntimeError(
+                    "target re-observation cannot rebind duplicate adapter guidance identity"
+                )
             contract = dict(assignment.strategy_contract)
             contract.pop("compiled_adapter_compatibility", None)
             contract.update(
@@ -15065,6 +15070,11 @@ class CampaignService:
             )
             updated = replace(
                 assignment,
+                guidance_ids=(
+                    (*assignment.guidance_ids, guidance_document.id)
+                    if adapter_guidance_count == 0
+                    else assignment.guidance_ids
+                ),
                 reviewed_adapter_digest=reviewed_digest,
                 strategy_contract=tuple(sorted(contract.items())),
             )
@@ -15076,13 +15086,18 @@ class CampaignService:
             if assignment is None:
                 contexts.append(worker_context)
                 continue
-            if sum(item.id == guidance_document.id for item in worker_context.guidance) != 1:
-                raise RuntimeError(
-                    "target re-observation cannot rebind missing or duplicate adapter guidance"
+            adapter_guidance_count = sum(
+                item.id == guidance_document.id for item in worker_context.guidance
+            )
+            if adapter_guidance_count > 1:
+                raise RuntimeError("target re-observation cannot rebind duplicate adapter guidance")
+            guidance = (
+                (*worker_context.guidance, guidance_document)
+                if adapter_guidance_count == 0
+                else tuple(
+                    guidance_document if item.id == guidance_document.id else item
+                    for item in worker_context.guidance
                 )
-            guidance = tuple(
-                guidance_document if item.id == guidance_document.id else item
-                for item in worker_context.guidance
             )
             values = {
                 "assignment_id": worker_context.assignment_id,

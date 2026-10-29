@@ -2180,6 +2180,69 @@ async def test_refreshed_adapter_is_overlaid_on_target_assignment_and_context() 
     )
     worker_context.validate()
 
+    missing_guidance_assignment = replace(
+        original.assignments[0],
+        guidance_ids=tuple(
+            item for item in original.assignments[0].guidance_ids if item != refreshed_document.id
+        ),
+    )
+    missing_guidance_context = replace(
+        original.worker_contexts[0],
+        guidance=tuple(
+            item
+            for item in original.worker_contexts[0].guidance
+            if item.id != refreshed_document.id
+        ),
+    )
+    rebound_missing_guidance = await service._rebind_compilation_to_target_reobservation(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        CampaignCompilation(
+            (missing_guidance_assignment,),
+            (missing_guidance_context,),
+        ),
+    )
+    assert rebound_missing_guidance.assignments[0].guidance_ids.count(refreshed_document.id) == 1
+    rebound_guidance = rebound_missing_guidance.worker_contexts[0].guidance
+    assert sum(item.id == refreshed_document.id for item in rebound_guidance) == 1
+    assert next(item for item in rebound_guidance if item.id == refreshed_document.id) == (
+        refreshed_document
+    )
+    rebound_missing_guidance.worker_contexts[0].validate()
+
+    rebound_twice = await service._rebind_compilation_to_target_reobservation(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        rebound_missing_guidance,
+    )
+    assert rebound_twice.assignments[0].guidance_ids.count(refreshed_document.id) == 1
+    assert (
+        sum(item.id == refreshed_document.id for item in rebound_twice.worker_contexts[0].guidance)
+        == 1
+    )
+
+    duplicate_assignment = replace(
+        rebound_twice.assignments[0],
+        guidance_ids=(*rebound_twice.assignments[0].guidance_ids, refreshed_document.id),
+    )
+    with pytest.raises(RuntimeError, match="duplicate adapter guidance identity"):
+        await service._rebind_compilation_to_target_reobservation(  # noqa: SLF001
+            manifest.id,
+            manifest,
+            replace(rebound_twice, assignments=(duplicate_assignment,)),
+        )
+
+    duplicate_context = replace(
+        rebound_twice.worker_contexts[0],
+        guidance=(*rebound_twice.worker_contexts[0].guidance, refreshed_document),
+    )
+    with pytest.raises(RuntimeError, match="duplicate adapter guidance$"):
+        await service._rebind_compilation_to_target_reobservation(  # noqa: SLF001
+            manifest.id,
+            manifest,
+            replace(rebound_twice, worker_contexts=(duplicate_context,)),
+        )
+
     _append_reviewed(store, generation)
     validation_live = await service._start_wave(  # noqa: SLF001
         manifest.id, manifest, 2, "validation", original
