@@ -11134,6 +11134,14 @@ def build_backend(
             # worker wiring).  Complements deterministic receipt grading.
             refusal_judge=refusal_judge,
         )
+        from .campaign_diagnostics import CampaignDiagnosticsExporter
+
+        campaign_diagnostics = CampaignDiagnosticsExporter(
+            campaign_store,
+            scheduler_store,
+            agents.schedule_usage,
+            effect_store.list_for_campaign,
+        )
         from .app import COMMAND_HINTS, COMMANDS
         from .operator_tools import (
             CampaignConfigureTool,
@@ -11310,6 +11318,7 @@ def build_backend(
             campaigns=campaigns,
             lifecycle_recovery=lifecycle_recovery,
             report_repository=report_repository,
+            campaign_diagnostics=campaign_diagnostics,
             route_preflight=preflight_campaign_routes,
             operator_controls=True,
         )

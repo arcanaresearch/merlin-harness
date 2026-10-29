@@ -148,6 +148,9 @@ def main() -> None:
     if sys.argv[1:] == ["campaign", "list"]:
         asyncio.run(_print_call("list_campaigns"))
         return
+    if len(sys.argv) == 5 and sys.argv[1:3] == ["campaign", "diagnostics"]:
+        asyncio.run(_print_call("export_campaign_diagnostics", sys.argv[3], sys.argv[4]))
+        return
     if len(sys.argv) in {3, 4} and sys.argv[1:3] == ["campaign", "cancel"]:
         requested = sys.argv[3] if len(sys.argv) == 4 else "*"
         campaign_id = "*" if requested.lower() == "all" else requested
@@ -235,6 +238,7 @@ def main() -> None:
         raise SystemExit(
             "usage: merlin [--version|start|stop [--force]|restart|status|"
             "daemon [start|status|stop [--force]]|campaign submit|list|status|cancel|"
+            "diagnostics CAMPAIGN_ID OUTPUT.zip|"
             "lessons|agents [kill all]|tasks|resume|"
             "interrupt|report export|support OUTPUT.zip|database [status|shell]|"
             "browser profile DIRECTORY ORIGIN...|"

@@ -165,6 +165,7 @@ class KernelBackend:
         campaigns: Any | None = None,
         lifecycle_recovery: Any | None = None,
         report_repository: Any | None = None,
+        campaign_diagnostics: Any | None = None,
         route_preflight: RoutePreflight | None = None,
         operator_controls: bool = False,
     ) -> None:
@@ -194,6 +195,7 @@ class KernelBackend:
         self._campaigns = campaigns
         self._lifecycle_recovery = lifecycle_recovery
         self._report_repository = report_repository
+        self._campaign_diagnostics = campaign_diagnostics
         self._route_preflight = route_preflight
         self._operator_controls = operator_controls
         self._pending_campaign_objective: str | None = None
@@ -1334,6 +1336,13 @@ class KernelBackend:
         )
         self._report_history.append(view)
         return view
+
+    async def export_campaign_diagnostics(
+        self, campaign_id: str, output: str
+    ) -> Mapping[str, object]:
+        if self._campaign_diagnostics is None:
+            raise RuntimeError("Campaign diagnostics are not configured")
+        return await self._campaign_diagnostics.export(campaign_id, output)
 
     async def get_permission_mode(self) -> str:
         return await self._permissions.get_mode() if self._permissions is not None else "auto"

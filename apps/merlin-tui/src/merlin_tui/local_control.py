@@ -207,6 +207,7 @@ _ALLOWED = {
     "list_findings",
     "list_reports",
     "export_campaign_report",
+    "export_campaign_diagnostics",
     "get_permission_mode",
     "set_permission_mode",
     "list_permission_rules",

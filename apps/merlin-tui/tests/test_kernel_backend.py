@@ -2385,6 +2385,31 @@ async def test_export_saved_campaign_uses_selected_revision_not_current_session(
 
 
 @pytest.mark.asyncio
+async def test_campaign_diagnostics_export_delegates_without_campaign_execution() -> None:
+    calls = []
+
+    class Diagnostics:
+        async def export(self, campaign_id, output):
+            calls.append((campaign_id, output))
+            return {"campaign_id": campaign_id, "output": output, "member_count": 5}
+
+    backend = KernelBackend(FakeKernel([]), campaign_diagnostics=Diagnostics())
+
+    assert await backend.export_campaign_diagnostics(
+        "campaign/historical", "/tmp/historical.zip"
+    ) == {
+        "campaign_id": "campaign/historical",
+        "output": "/tmp/historical.zip",
+        "member_count": 5,
+    }
+    assert calls == [("campaign/historical", "/tmp/historical.zip")]
+
+    unconfigured = KernelBackend(FakeKernel([]))
+    with pytest.raises(RuntimeError, match="not configured"):
+        await unconfigured.export_campaign_diagnostics("campaign/historical", "ignored.zip")
+
+
+@pytest.mark.asyncio
 async def test_resume_restores_exact_prepared_review_without_execution() -> None:
     import json
 
