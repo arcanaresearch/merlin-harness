@@ -19446,6 +19446,91 @@ async def test_campaign_open_tab_reuse_is_transition_fenced(
 
 
 @pytest.mark.asyncio
+async def test_campaign_open_tab_reuses_reviewed_isolated_surface() -> None:
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    from merlin_contracts.target_adapter_compiler import (
+        compile_target_adapter,
+        compiled_target_adapter_digest,
+    )
+
+    async with web_fixture(page) as origin:
+        bounds = BrowserBounds(
+            target_id="target",
+            allowed_origins={origin},
+            max_tabs=2,
+        )
+        async with await launch_isolated(bounds, owner()) as session:
+            tab = await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            contract["input_locator"] = "textbox Message"
+            contract["submit_action"] = "button Send"
+            compilation = compile_target_adapter(adapter)
+            tools = {
+                item.name: item
+                for item in browser_tools(
+                    lambda _: session,
+                    Recorder(),
+                    lambda _: adapter,
+                    _StateScopeFixtureStore(),
+                )
+            }
+
+            result = await tools["browser_open_tab"].invoke(
+                ToolContext(
+                    session_id="s1",
+                    workspace_root="/tmp",
+                    campaign_id="campaign:isolated-surface",
+                    call_id="open-isolated-surface",
+                    agent_id="campaign:isolated-surface/worker-1",
+                    technique_attempt_id="attempt:isolated-surface",
+                    target_id="target",
+                    expected_target_session_id=f"browser:{session.context_id}",
+                    compiled_adapter=compilation.model_dump_json(),
+                    compiled_adapter_digest=compiled_target_adapter_digest(compilation),
+                ),
+                {"url": origin},
+            )
+
+            assert result.is_error is False
+            assert result.metadata["browser_action"]["tab_ref"] == tab
+            assert tuple(item.tab_ref for item in session.metadata().tabs) == (tab,)
+            assert next(item.url for item in session.metadata().tabs if item.tab_ref == tab) == (
+                origin + "/"
+            )
+
+
+@pytest.mark.asyncio
 async def test_compiled_chat_exchange_keeps_prompt_witness_collision_uncertain() -> None:
     chat = b"""
     <textarea aria-label="Message" maxlength="500"></textarea>

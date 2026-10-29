@@ -996,7 +996,15 @@ class BrowserSession:
                 if action.value is None:
                     raise BrowserBoundaryError("open_tab requires a URL")
                 self._mark_effect_dispatch(action)
-                tab_ref = await self.new_tab(action.value)
+                tab_ref = action.tab_ref
+                if tab_ref:
+                    page = self._page(tab_ref)
+                    self._require_url(action.value)
+                    if page.url != action.value:
+                        await page.goto(action.value)
+                        await self._enforce_page(page)
+                else:
+                    tab_ref = await self.new_tab(action.value)
                 return self._observation(
                     tab_ref,
                     "navigation",

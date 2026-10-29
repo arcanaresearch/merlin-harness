@@ -1376,11 +1376,17 @@ class BrowserTool:
         before_url = ""
         before_refs: tuple[str, ...] = ()
         transition_tab_ref = action.tab_ref
-        if kind == "open_tab" and context.campaign_id is not None and session.mode == "persistent":
+        if kind == "open_tab" and context.campaign_id is not None:
             transition_tab_ref = next(
                 (tab.tab_ref for tab in reversed(session.metadata().tabs) if tab.state == "open"),
                 "",
             )
+            if transition_tab_ref and session.mode != "persistent":
+                # Campaign workers must continue from the surface reviewed during
+                # reconnaissance. Persistent sessions already reuse their sole live
+                # tab in BrowserSession.new_tab; isolated and attached sessions need
+                # the reviewed reference carried into BrowserSession.act explicitly.
+                action = action.model_copy(update={"tab_ref": transition_tab_ref})
         if self._state_scope_store is not None:
             if context.campaign_id is None:
                 action_kind = _browser_action_kind(context, kind)
@@ -1465,7 +1471,7 @@ class BrowserTool:
                 )
                 return ToolResult(
                     content=(
-                        "campaign browser_open_tab requires an existing reviewed persistent "
+                        "campaign browser_open_tab requires an existing reviewed "
                         "surface; create the initial tab during pre-campaign reconnaissance"
                     ),
                     is_error=True,
