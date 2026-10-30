@@ -2840,6 +2840,8 @@ async def test_model_routing_screen_keeps_exact_discovered_vision(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -> None:
+    from merlin_tui.provider_catalog import ModelCandidate, ModelDiscovery
+
     class RouteBackend(DemoBackend):
         configured = None
         applied = False
@@ -2890,6 +2892,10 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
 
     monkeypatch.setattr("httpx.get", _fail_http)
     monkeypatch.setattr("httpx.post", _fail_http)
+    monkeypatch.setattr(
+        "merlin_tui.provider_catalog.discover_claude_cli",
+        lambda: ModelDiscovery((ModelCandidate("lead-model"),)),
+    )
     monkeypatch.setattr(
         app_module,
         "_configured_model_screen",
@@ -2959,6 +2965,46 @@ async def test_model_screen_saves_worker_and_lead_routes_together(monkeypatch) -
         assert backend.applied is True
         transcript = "".join(line.text for line in app.query_one("#transcript").lines)
         assert "route saved daemon reconnected" in transcript
+
+
+@pytest.mark.asyncio
+async def test_model_routing_reports_claude_cli_preflight_failure(monkeypatch) -> None:
+    from merlin_tui.provider_catalog import ModelDiscovery
+
+    class RouteBackend(DemoBackend):
+        called = False
+
+        async def set_model_routing(self, *args, **kwargs):
+            self.called = True
+            raise AssertionError("routing must not be saved when Claude CLI is unavailable")
+
+    monkeypatch.setattr(
+        "merlin_tui.provider_catalog.discover_claude_cli",
+        lambda: ModelDiscovery(error="Claude CLI is not authenticated; retry /model."),
+    )
+    backend = RouteBackend()
+    app = build_app(backend)
+    setup = app_module.ModelSetup(
+        "worker-model",
+        "openai_compatible",
+        True,
+        "sonnet",
+        "claude_cli",
+        "worker-model",
+        "openai_compatible",
+        "worker-model",
+        "openai_compatible",
+        "worker-model",
+        "openai_compatible",
+        {},
+        {},
+        False,
+    )
+
+    async with app.run_test() as pilot:
+        await app._change_model(setup)  # noqa: SLF001
+        await pilot.pause()
+        assert backend.called is False
 
 
 @pytest.mark.asyncio

@@ -378,7 +378,7 @@ def _run_first_setup(
 ) -> None:
     """Run the first-use provider wizard before the daemon needs a provider."""
     from .configuration import ProviderConfiguration
-    from .provider_catalog import PROVIDER_ROUTES, discover_model_catalog
+    from .provider_catalog import PROVIDER_ROUTES, discover_claude_cli, discover_model_catalog
 
     print("Merlin needs an LLM provider before its first session.", file=output)
     print("Models are discovered live; Merlin does not use a baked model list.\n", file=output)
@@ -506,10 +506,25 @@ def _run_first_setup(
             "3": "claude_cli",
             "4": "kimi_acp",
         }.get(raw_transport)
-        if transport is not None:
-            break
-        print("Press Enter or 1 for the provider model; choose 2-4 for a native CLI.", file=output)
-    lead_model = read("Exact Campaign Lead model ID: ").strip()
+        if transport is None:
+            print(
+                "Press Enter or 1 for the provider model; choose 2-4 for a native CLI.", file=output
+            )
+            continue
+        if transport == "claude_cli":
+            claude = discover_claude_cli()
+            if claude.error:
+                print(f"\n{claude.error}", file=output)
+                continue
+        break
+    prompt = (
+        "Campaign Lead model ID (Enter for sonnet): "
+        if transport == "claude_cli"
+        else "Exact Campaign Lead model ID: "
+    )
+    lead_model = read(prompt).strip()
+    if transport == "claude_cli" and not lead_model:
+        lead_model = "sonnet"
     while not lead_model:
         lead_model = read("Campaign Lead model ID is required: ").strip()
     configuration.save_model_route(lead_model, transport, lead_only=True)

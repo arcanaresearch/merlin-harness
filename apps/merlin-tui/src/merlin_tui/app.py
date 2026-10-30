@@ -6558,6 +6558,19 @@ class MerlinApp(App[None]):
 
     async def _change_model(self, setup: ModelSetup) -> None:
         try:
+            selected_transports = {
+                setup.worker_transport,
+                setup.lead_transport,
+                setup.recon_transport,
+                setup.validator_transport,
+                setup.adversarial_explorer_transport,
+            }
+            if "claude_cli" in selected_transports:
+                from .provider_catalog import discover_claude_cli
+
+                discovery = await asyncio.to_thread(discover_claude_cli)
+                if discovery.error:
+                    raise ValueError(discovery.error)
             message = await self.backend.set_model_routing(
                 setup.worker_model,
                 setup.worker_transport,

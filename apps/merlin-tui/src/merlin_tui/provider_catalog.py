@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +35,34 @@ class ModelCandidate:
 class ModelDiscovery:
     models: tuple[ModelCandidate, ...] = ()
     error: str | None = None
+
+
+def discover_claude_cli(timeout: float = 10.0) -> ModelDiscovery:
+    """Check that Claude CLI is installed and authenticated without exposing account data."""
+    executable = shutil.which("claude")
+    if executable is None:
+        return ModelDiscovery(
+            error="Claude CLI was not found in Merlin's PATH; install it and reopen Merlin."
+        )
+    try:
+        status = subprocess.run(
+            (executable, "auth", "status"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ModelDiscovery(error="Claude CLI authentication check timed out; retry /model.")
+    except OSError:
+        return ModelDiscovery(error="Claude CLI could not be launched from Merlin's PATH.")
+    if status.returncode != 0:
+        return ModelDiscovery(
+            error="Claude CLI is not authenticated; run `claude auth login`, then retry /model."
+        )
+    # Claude CLI does not expose a model catalogue. These documented aliases
+    # make the common path selectable while retaining custom model entry.
+    return ModelDiscovery((ModelCandidate("sonnet"), ModelCandidate("opus")))
 
 
 # Routes are stable protocol configuration. Model IDs deliberately do not live
@@ -182,14 +212,18 @@ async def discover_routing_models(
         api_key,
         base_url=base_url,
     )
-    openai, codex = await asyncio.gather(openai_task, discover_codex_models())
+    openai, codex, claude = await asyncio.gather(
+        openai_task,
+        discover_codex_models(),
+        asyncio.to_thread(discover_claude_cli),
+    )
     unavailable = ModelDiscovery(
         error="This transport does not expose a reliable live model catalogue."
     )
     return {
         "openai_compatible": openai,
         "codex_app_server": codex,
-        "claude_cli": unavailable,
+        "claude_cli": claude,
         "kimi_acp": unavailable,
     }
 

@@ -531,6 +531,32 @@ def test_first_setup_can_assign_native_cli_to_campaign_lead(monkeypatch) -> None
     assert routes == [("lead-model", "codex_app_server", True)]
 
 
+def test_first_setup_checks_claude_cli_and_defaults_to_sonnet(monkeypatch) -> None:
+    routes = []
+
+    class Configuration:
+        def save(self, *args, **kwargs):
+            return None
+
+        def save_model_route(self, model, transport, *, lead_only):
+            routes.append((model, transport, lead_only))
+
+    answers = iter(("1", "worker-model", "", "", "n", "3", ""))
+    monkeypatch.setattr("merlin_tui.configuration.ProviderConfiguration", Configuration)
+    monkeypatch.setattr(
+        "merlin_tui.provider_catalog.discover_model_catalog",
+        lambda *args, **kwargs: ModelDiscovery(error="offline"),
+    )
+    monkeypatch.setattr(
+        "merlin_tui.provider_catalog.discover_claude_cli",
+        lambda: ModelDiscovery((ModelCandidate("sonnet"), ModelCandidate("opus"))),
+    )
+
+    _run_first_setup(read=lambda _prompt: next(answers), output=io.StringIO())
+
+    assert routes == [("sonnet", "claude_cli", True)]
+
+
 def test_first_setup_registers_additional_model_endpoints(monkeypatch) -> None:
     endpoints = []
     secrets = iter(("primary-secret", "endpoint-secret"))
