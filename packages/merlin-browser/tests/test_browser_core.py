@@ -8009,6 +8009,74 @@ async def test_browser_fill_records_non_sensitive_input_verbatim(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_foreground_recon_pending_response_returns_bounded_network_followup() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def list_actions(self, _context_id):
+            return tuple(self.actions)
+
+        async def list_observations(self, _context_id):
+            return tuple(self.observations)
+
+        async def list_handoffs(self, _target_id, limit=20):
+            return ()
+
+    page = b"""
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="Send">Send</button>
+    """
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            snapshot = await session.snapshot(tab)
+            message = next(item for item in snapshot.elements if item.name == "Message")
+            send = next(item for item in snapshot.elements if item.name == "Send")
+            recorder = Recorder()
+            context = ToolContext(session_id="s1", workspace_root="/tmp")
+            tools = {
+                tool.describe().name: tool
+                for tool in _production_browser_tools(lambda _: session, recorder)
+            }
+            recalled = await tools["browser_recall_reconnaissance"].invoke(
+                context,
+                {"surface": origin, "agent_or_bot": "fixture assistant"},
+            )
+            result = await tools["browser_recon_exchange"].invoke(
+                context,
+                {
+                    "tab_ref": tab,
+                    "input_element_ref": message.ref,
+                    "submit_element_ref": send.ref,
+                    "submit_kind": "click",
+                    "timeout_ms": 1_000,
+                },
+            )
+
+    assert recalled.is_error is False
+    assert result.is_error is False
+    assert result.metadata["preferred_next_tool"] == "browser_network_events"
+    assert result.metadata["preferred_next_tool_mode"] == "after_one_admitted_action"
+    assert result.metadata["network_delta"]["new_events"] >= 0
+
+
+@pytest.mark.asyncio
 async def test_foreground_recon_blocks_raw_content_before_recorder_and_browser_act(
     monkeypatch,
 ) -> None:
@@ -8609,7 +8677,7 @@ async def test_concurrent_foreground_recon_exchange_has_one_atomic_winner() -> N
     assert sum(not result.is_error for result in results) == 1
     rejected = next(result for result in results if result.is_error)
     assert rejected.metadata["failure_code"] == "foreground_recon_probe_exhausted"
-    assert [action.kind for action in recorder.actions] == ["fill", "click"]
+    assert [action.kind for action in recorder.actions] == ["fill", "click", "network_events"]
 
 
 @pytest.mark.asyncio

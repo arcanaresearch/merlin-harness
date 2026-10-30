@@ -2460,8 +2460,8 @@ class BrowserReconExchangeTool:
                 "browser controls. Supply locators only: Merlin creates the message, binds it "
                 "to this physical browser session, fills and submits it atomically, and records "
                 "durable action evidence. The operator objective or model cannot supply probe "
-                "content. Inspect the resulting DOM or network response with the strict next "
-                "tool returned by this exchange. "
+                "content. Merlin waits for and captures the resulting network response inside "
+                "this atomic exchange; any follow-up read is advisory and bounded. "
                 "Use this only after browser_recall_reconnaissance and before compiling the "
                 "durable browser/API handoff."
             ),
@@ -2681,7 +2681,7 @@ class BrowserReconExchangeTool:
         # after the submit action returns.
         exchange_loader = getattr(session, "api_exchange_events", None)
         if callable(exchange_loader):
-            settle_deadline = asyncio.get_running_loop().time() + min(timeout_ms / 1_000, 3.0)
+            settle_deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
             api_exchanges = exchange_loader()
             while not any(_probe_linked_api_exchange(event) for event in api_exchanges):
                 remaining = settle_deadline - asyncio.get_running_loop().time()
@@ -2689,13 +2689,12 @@ class BrowserReconExchangeTool:
                     break
                 await asyncio.sleep(min(0.05, remaining))
                 api_exchanges = exchange_loader()
-            if any(_probe_linked_api_exchange(event) for event in api_exchanges):
-                network = await raw_tool("browser_network_events").invoke(
-                    context,
-                    {"tab_ref": tab_ref, "timeout_ms": timeout_ms, "step": 2},
-                )
-                if not network.is_error:
-                    submitted = network
+            network = await raw_tool("browser_network_events").invoke(
+                context,
+                {"tab_ref": tab_ref, "timeout_ms": timeout_ms, "step": 2},
+            )
+            if not network.is_error:
+                submitted = network
 
         permit = foreground_recon_probe_permits.get(permit_key)
         probe_metadata = (
@@ -2722,7 +2721,7 @@ class BrowserReconExchangeTool:
             metadata.update(
                 {
                     "preferred_next_tool": "browser_network_events",
-                    "preferred_next_tool_mode": "strict",
+                    "preferred_next_tool_mode": "after_one_admitted_action",
                 }
             )
         return ToolResult(content=submitted.content, metadata=metadata)
