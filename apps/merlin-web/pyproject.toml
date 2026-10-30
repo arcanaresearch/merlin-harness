@@ -1,6 +1,6 @@
 [project]
 name = "merlin-web"
-version = "0.2.29"
+version = "0.2.30"
 description = "Local browser operator workspace for Merlin"
 requires-python = ">=3.13"
 license = "Apache-2.0"

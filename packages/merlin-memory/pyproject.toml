@@ -1,6 +1,6 @@
 [project]
 name = "merlin-memory"
-version = "0.2.29"
+version = "0.2.30"
 description = "Reviewed portable memory bundles for Merlin"
 requires-python = ">=3.13"
 dependencies = ["pydantic>=2.10,<3", "merlin-agents"]
