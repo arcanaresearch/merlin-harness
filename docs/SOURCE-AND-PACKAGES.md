@@ -141,7 +141,7 @@ Within `merlin-agents`:
 
 | Package | What it owns | Start here |
 |---|---|---|
-| `merlin-providers` | OpenAI-compatible streaming plus Codex App Server, Claude CLI, Kimi/Kiro/OpenCode ACP, request-scoped MCP admission, and exact-model routing | `routing.py`, `dynamic_mcp.py`, `openai_compatible.py`, transport-specific modules |
+| `merlin-providers` | OpenAI-compatible streaming plus Codex App Server, Claude CLI, Kimi/Kiro/OpenCode ACP, Pi RPC, request-scoped MCP admission, and exact-model routing | `routing.py`, `dynamic_mcp.py`, `openai_compatible.py`, transport-specific modules |
 | `merlin-tools` | Tool registry/broker, permission checks, effect recording, workspace read/list/shell tools, MCP wrappers | `broker.py`, `workspace.py`, `mcp.py` |
 | `merlin-permissions` | Permission rules, scope matching, decisions, audit records and authorization service | `engine.py`, `models.py`, `service.py` |
 | `merlin-browser` | Bounded Playwright sessions, exact-origin checks, element references, persistent/isolated contexts, recon handoffs and browser tools | `core.py`, `tools.py`, `service.py`, `models.py` |

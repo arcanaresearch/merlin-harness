@@ -309,7 +309,8 @@ def test_provider_model_transports_are_exact_and_validated(tmp_path: Path) -> No
         "'claude-opus'='claude_cli'\n"
         "'kimi-k2'='kimi_acp'\n"
         "'kiro-default'='kiro_acp'\n"
-        "'opencode-default'='opencode_acp'\n",
+        "'opencode-default'='opencode_acp'\n"
+        "'pi-default'='pi_rpc'\n",
         encoding="utf-8",
     )
     paths.config.chmod(0o600)
@@ -319,6 +320,7 @@ def test_provider_model_transports_are_exact_and_validated(tmp_path: Path) -> No
         "kimi-k2": "kimi_acp",
         "kiro-default": "kiro_acp",
         "opencode-default": "opencode_acp",
+        "pi-default": "pi_rpc",
     }
 
     paths.config.write_text(

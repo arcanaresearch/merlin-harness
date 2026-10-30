@@ -161,7 +161,8 @@ uv run --package merlin-tui python scripts/acceptance_provider_route.py \
 The command evaluates every positional fixture through one provider instance and reports both
 per-case and production-identical aggregate metrics. Native routes add
 `--transport codex_app_server`, `--transport claude_cli`, `--transport kimi_acp`,
-`--transport kiro_acp`, or `--transport opencode_acp`. The command reports the fixture SHA-256,
+`--transport kiro_acp`, `--transport opencode_acp`, or `--transport pi_rpc`. The command reports
+the fixture SHA-256,
 exact provider/model/route,
 bounded quality, attribution, authority, latency, usage-cost, and cancellation-recovery metrics;
 raw input/output/total tokens remain visible even when a native or subscription route has no
@@ -240,15 +241,24 @@ The first launch installs Merlin for the current user at `~/.local/bin/merlin` a
 opens the TUI. If no provider has been configured, Merlin starts the guided provider, model, and
 hidden API-key setup first. Later launches can use `merlin` directly and skip setup unless the user
 runs `/setup` again. First setup also offers an optional numbered Campaign Lead route through Codex
-App Server, Claude CLI, Kimi ACP, Kiro ACP, or OpenCode ACP; pressing Enter keeps the provider model
-for every role.
+App Server, Claude CLI, Kimi ACP, Kiro ACP, OpenCode ACP, or Pi Agent RPC; pressing Enter keeps
+the provider model for every role.
 
-Use `/model` to assign any role to Codex App Server, Claude CLI, Kimi ACP, Kiro ACP, or OpenCode ACP.
+Use `/model` to assign any role to Codex App Server, Claude CLI, Kimi ACP, Kiro ACP, OpenCode ACP,
+or Pi Agent RPC.
 For tool-bearing turns, Merlin gives the agent a private, request-scoped MCP server containing only
 the reviewed tools. The agent can propose calls, but Merlin remains the sole executor and applies
-the normal authorization, budget, and evidence boundaries. Kimi, Kiro, and OpenCode ACP routes
-cannot be used when a campaign seals an explicit token budget because these ACP transports do not
-report authoritative billable per-turn usage. Restart Merlin after changing a route.
+the normal authorization, budget, and evidence boundaries. Kimi, Kiro, and OpenCode ACP plus Pi
+RPC routes cannot be used when a campaign seals an explicit token budget because these transports
+do not report authoritative billable per-turn usage. Restart Merlin after changing a route.
+
+Pi RPC runs with an isolated agent directory and disables discovered tools, extensions, skills,
+prompt templates, themes, and context files. It loads only Pi's built-in MCP support when a Merlin
+request has reviewed tools, and that MCP server exposes only the current request's tool schema.
+Provider authentication and custom model definitions remain available through owner-controlled
+links to Pi's local `auth.json` and `models.json`; Merlin does not read or copy their contents.
+This isolates local agent authority. It does not stop the selected upstream model provider from
+receiving the prompts and reviewed tool results required to perform the requested work.
 
 Run `make install-release` to build, test, and install the same release as
 `~/.local/bin/merlin`. The wheelhouse remains an internal, offline-install artifact.
@@ -348,7 +358,7 @@ apply the customer-redaction policy; internal reports retain attributable eviden
   deferred until this boundary is clean.
 - Supported source-runtime transport: one configured OpenAI-compatible endpoint with exact
   per-role model selection plus opt-in bounded Codex App Server, Claude CLI, Kimi ACP, Kiro ACP,
-  or OpenCode ACP routing. Tool-bearing turns use Merlin's request-scoped MCP admission bridge;
+  OpenCode ACP, or Pi Agent RPC routing. Tool-bearing turns use Merlin's request-scoped MCP admission bridge;
   tool execution remains inside Merlin. Live agent-transport evaluation and a newly requested
   release still gate distribution.
 - Campaigns are single reviewed target sessions. Automatic fresh-session recycling is deliberately

@@ -910,6 +910,7 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
             ("Kimi ACP (Merlin tools; provider-default effort)", "kimi_acp"),
             ("Kiro ACP (Merlin tools supported)", "kiro_acp"),
             ("OpenCode ACP (Merlin tools; provider-default effort)", "opencode_acp"),
+            ("Pi Agent RPC (Merlin tools supported)", "pi_rpc"),
         )
 
     @staticmethod

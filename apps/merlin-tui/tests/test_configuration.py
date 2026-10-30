@@ -329,6 +329,15 @@ def test_model_routing_accepts_kiro_effort_and_rejects_unmapped_acp_effort(
     provider = load_config(paths, environ={}).values["provider"]
     assert provider["model_efforts"] == {"kiro-worker": "high"}
 
+    configuration.save_model_routing(
+        "pi-worker",
+        "pi_rpc",
+        heterogeneous=False,
+        role_efforts={"workers": "high"},
+    )
+    provider = load_config(paths, environ={}).values["provider"]
+    assert provider["model_efforts"] == {"pi-worker": "high"}
+
     with pytest.raises(ValueError, match="provider-default effort for: workers"):
         configuration.save_model_routing(
             "opencode-worker",

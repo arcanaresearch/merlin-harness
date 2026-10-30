@@ -614,6 +614,7 @@ def _preparation_factory(
                             "kimi_acp",
                             "kiro_acp",
                             "opencode_acp",
+                            "pi_rpc",
                         }
                         else f"reviewed API {strategy_id} contract is unavailable"
                     ),
@@ -775,7 +776,9 @@ async def test_hydra_preview_route_digest_matches_heterogeneous_compiled_assignm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ("claude_cli", "kimi_acp", "kiro_acp", "opencode_acp"))
+@pytest.mark.parametrize(
+    "transport", ("claude_cli", "kimi_acp", "kiro_acp", "opencode_acp", "pi_rpc")
+)
 async def test_assessment_prepare_accepts_tool_capable_agent_routes(transport: str) -> None:
     factory, captured = _preparation_factory(
         "goat", worker_model=f"{transport}-model", worker_transport=transport

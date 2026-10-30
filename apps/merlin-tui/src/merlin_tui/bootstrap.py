@@ -4452,6 +4452,8 @@ def build_backend(
         OpenAICompatibleProvider,
         OpenAIResponsesConfig,
         OpenAIResponsesProvider,
+        PiRpcConfig,
+        PiRpcProvider,
         ProviderConfig,
         TargetProviderFactory,
         load_last_good_snapshot,
@@ -4693,6 +4695,7 @@ def build_backend(
                     "kimi_acp",
                     "kiro_acp",
                     "opencode_acp",
+                    "pi_rpc",
                 }
                 else str(
                     endpoint_override.get("base_url", base_url)
@@ -4894,6 +4897,20 @@ def build_backend(
                         configure_model_in_session=transport != "kiro_acp",
                     )
                 )
+            elif transport == "pi_rpc":
+                transport_routes[routed_model] = PiRpcProvider(
+                    PiRpcConfig(
+                        model=routed_model,
+                        state_directory=transport_state,
+                        startup_timeout_seconds=provider_runtime.connect_timeout_seconds,
+                        idle_timeout_seconds=provider_runtime.idle_timeout_seconds,
+                        partial_idle_timeout_seconds=min(
+                            provider_runtime.idle_timeout_seconds, 60.0
+                        ),
+                        turn_timeout_seconds=provider_runtime.total_timeout_seconds,
+                        reasoning_effort=route_effort,
+                    )
+                )
             elif transport in {"openai_responses", "anthropic_messages", "gemini"}:
                 # HTTP native-API transports share the base ProviderConfig fields;
                 # per-model endpoint overrides ([provider.model_endpoints]) re-point
@@ -5023,6 +5040,7 @@ def build_backend(
                     "kimi_acp": "Kimi ACP",
                     "kiro_acp": "Kiro ACP",
                     "opencode_acp": "OpenCode ACP",
+                    "pi_rpc": "Pi Agent RPC",
                 }.get(transport, transport)
                 lines.append(f"- {role}: {selected_model} · {label} · {state}")
             return not errors, "\n".join(lines)
@@ -7753,6 +7771,7 @@ def build_backend(
                                         "kimi_acp",
                                         "kiro_acp",
                                         "opencode_acp",
+                                        "pi_rpc",
                                     }
                                     else "reviewed API GOAT strategy contract is unavailable"
                                 )

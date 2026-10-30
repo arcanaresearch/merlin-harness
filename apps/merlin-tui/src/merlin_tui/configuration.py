@@ -16,6 +16,7 @@ _CLI_TRANSPORTS = {
     "kimi_acp",
     "kiro_acp",
     "opencode_acp",
+    "pi_rpc",
 }
 _NATIVE_HTTP_TRANSPORTS = {"openai_responses", "anthropic_messages", "gemini"}
 _MODEL_TRANSPORTS = {"openai_compatible"} | _CLI_TRANSPORTS | _NATIVE_HTTP_TRANSPORTS

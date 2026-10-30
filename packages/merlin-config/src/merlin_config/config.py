@@ -93,6 +93,7 @@ _PROVIDER_TRANSPORTS = {
     "kiro_acp",
     "kimi_acp",
     "opencode_acp",
+    "pi_rpc",
     "openai_compatible",
     "openai_responses",
 }

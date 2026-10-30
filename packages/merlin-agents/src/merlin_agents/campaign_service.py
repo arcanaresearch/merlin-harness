@@ -5026,7 +5026,7 @@ class CampaignService:
         candidates.extend(("campaign-lead fallback", model, ()) for model in lead_escalation)
         for role, model, _tool_ids in candidates:
             transport = context.transport_for_model(model)
-            if transport in {"kimi_acp", "kiro_acp", "opencode_acp"} and budgeted:
+            if transport in {"kimi_acp", "kiro_acp", "opencode_acp", "pi_rpc"} and budgeted:
                 raise ValueError(
                     f"model route {role} uses {transport} without billable token usage for a "
                     "token-budgeted campaign"

@@ -30,6 +30,7 @@ from .openai_compatible import (
     ProviderQuotaSnapshot,
 )
 from .openai_responses import OpenAIResponsesConfig, OpenAIResponsesProvider
+from .pi_rpc import PiRpcConfig, PiRpcProvider
 from .routing import ModelRoutingProvider
 from .targets import TargetCredentialError, TargetProviderFactory, TargetSessionIdentity
 
@@ -55,6 +56,8 @@ __all__ = [
     "OpenAIResponsesConfig",
     "OpenAIResponsesProvider",
     "OperatorOverride",
+    "PiRpcConfig",
+    "PiRpcProvider",
     "ProviderCapabilities",
     "ProviderConfig",
     "ProviderError",

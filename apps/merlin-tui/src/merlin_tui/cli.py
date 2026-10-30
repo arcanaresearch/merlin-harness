@@ -499,8 +499,9 @@ def _run_first_setup(
     print("4. Kimi ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
     print("5. Kiro ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
     print("6. OpenCode ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
+    print("7. Pi Agent RPC (Merlin tools; unavailable to token-capped campaigns)", file=output)
     while True:
-        raw_transport = read("Lead transport (Enter or 1-6): ").strip()
+        raw_transport = read("Lead transport (Enter or 1-7): ").strip()
         if raw_transport in {"", "1"}:
             return
         transport = {
@@ -509,10 +510,11 @@ def _run_first_setup(
             "4": "kimi_acp",
             "5": "kiro_acp",
             "6": "opencode_acp",
+            "7": "pi_rpc",
         }.get(raw_transport)
         if transport is None:
             print(
-                "Press Enter or 1 for the provider model; choose 2-6 for an agent transport.",
+                "Press Enter or 1 for the provider model; choose 2-7 for an agent transport.",
                 file=output,
             )
             continue

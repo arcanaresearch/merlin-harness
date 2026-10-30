@@ -100,6 +100,7 @@ def test_route_vision_rejects_image_unsupported_transports() -> None:
         "kimi_acp",
         "kiro_acp",
         "opencode_acp",
+        "pi_rpc",
     ):
         assert not _route_vision_enabled(
             provider,
@@ -136,6 +137,10 @@ async def test_build_backend_constructs_generic_acp_routes(
             return None
 
     CapturingAcpProvider.configs = []
+
+    class CapturingPiProvider(CapturingAcpProvider):
+        configs = []
+
     with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
         monkeypatch.setattr(
             "merlin_config.load_config",
@@ -148,6 +153,7 @@ async def test_build_backend_constructs_generic_acp_routes(
                         "model_transports": {
                             "kiro-model": "kiro_acp",
                             "opencode-model": "opencode_acp",
+                            "pi-model": "pi_rpc",
                         },
                         "model_efforts": {"kiro-model": "high"},
                     }
@@ -156,6 +162,7 @@ async def test_build_backend_constructs_generic_acp_routes(
         )
         monkeypatch.setattr(CredentialStore, "load", lambda _self: {"api_key": "secret"})
         monkeypatch.setattr("merlin_providers.KimiAcpProvider", CapturingAcpProvider)
+        monkeypatch.setattr("merlin_providers.PiRpcProvider", CapturingPiProvider)
 
         backend = build_backend(tmp_path / "workspace")
         try:
@@ -172,6 +179,8 @@ async def test_build_backend_constructs_generic_acp_routes(
             assert configs["kiro_acp"].configure_model_in_session is False
             assert configs["opencode_acp"].command == ("opencode", "acp")
             assert configs["opencode_acp"].mode_id is None
+            assert CapturingPiProvider.configs[0].model == "pi-model"
+            assert CapturingPiProvider.configs[0].reasoning_effort == "default"
         finally:
             await backend.close()
 

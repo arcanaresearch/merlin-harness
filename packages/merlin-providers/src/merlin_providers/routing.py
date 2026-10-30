@@ -120,7 +120,7 @@ class ModelRoutingProvider:
             "gemini",
         }:
             return "native"
-        if transport in {"claude_cli", "kimi_acp", "kiro_acp", "opencode_acp"}:
+        if transport in {"claude_cli", "kimi_acp", "kiro_acp", "opencode_acp", "pi_rpc"}:
             return "truncation"
         return "unsupported"
 

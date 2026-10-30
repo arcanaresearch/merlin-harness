@@ -1940,6 +1940,9 @@ export function App() {
                                                             "codex_app_server",
                                                             "claude_cli",
                                                             "kimi_acp",
+                                                            "kiro_acp",
+                                                            "opencode_acp",
+                                                            "pi_rpc",
                                                         ].map((t) => (
                                                             <option key={t}>
                                                                 {t}

@@ -1803,7 +1803,7 @@ async def test_model_screen_offers_agent_transports_for_every_role() -> None:
             "#adversarial-explorer-transport",
         ):
             values = app.screen.query_one(selector, Select)._legal_values
-            assert {"claude_cli", "kimi_acp", "kiro_acp", "opencode_acp"} <= values
+            assert {"claude_cli", "kimi_acp", "kiro_acp", "opencode_acp", "pi_rpc"} <= values
 
 
 @pytest.mark.asyncio

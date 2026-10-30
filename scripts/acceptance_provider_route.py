@@ -27,6 +27,8 @@ from merlin_providers import (
     KimiAcpConfig,
     KimiAcpProvider,
     OpenAICompatibleProvider,
+    PiRpcConfig,
+    PiRpcProvider,
     ProviderConfig,
 )
 
@@ -44,6 +46,7 @@ def _arguments() -> argparse.Namespace:
             "kimi_acp",
             "kiro_acp",
             "opencode_acp",
+            "pi_rpc",
         ),
         default="default",
     )
@@ -126,6 +129,16 @@ def _provider(arguments: argparse.Namespace):
                 state_subdirectory=settings[2],
                 mode_id=settings[3],
                 configure_model_in_session=arguments.transport != "kiro_acp",
+            )
+        )
+    if arguments.transport == "pi_rpc":
+        return PiRpcProvider(
+            PiRpcConfig(
+                model=arguments.model,
+                state_directory=state,
+                startup_timeout_seconds=runtime.connect_timeout_seconds,
+                idle_timeout_seconds=runtime.idle_timeout_seconds,
+                turn_timeout_seconds=runtime.total_timeout_seconds,
             )
         )
     values = config.values.get("provider")

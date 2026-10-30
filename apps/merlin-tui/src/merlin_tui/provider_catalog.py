@@ -227,6 +227,7 @@ async def discover_routing_models(
         "kimi_acp": unavailable,
         "kiro_acp": unavailable,
         "opencode_acp": unavailable,
+        "pi_rpc": unavailable,
     }
 
 

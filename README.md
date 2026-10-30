@@ -106,7 +106,7 @@ Merlin for the current user and opens the same guided setup when needed.
 ### Lead providers and worker models
 
 Use `/model` to route any model role through **Codex App Server**, **Claude CLI**, **Kimi ACP**,
-**Kiro ACP**, or **OpenCode ACP**, or configure a hosted or local model through `/setup`. Agent
+**Kiro ACP**, **OpenCode ACP**, or **Pi Agent RPC**, or configure a hosted or local model through `/setup`. Agent
 transports require their respective local installation and authentication. Merlin exposes only the
 reviewed tools for the current request through a private MCP bridge; the external agent proposes a
 call, while Merlin retains permission checks, execution, budgets, and evidence recording.

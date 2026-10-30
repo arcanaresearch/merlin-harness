@@ -84,6 +84,7 @@ async def test_routing_catalogs_keep_models_separated_by_transport(monkeypatch) 
     assert discovered["kimi_acp"].error
     assert discovered["kiro_acp"].error
     assert discovered["opencode_acp"].error
+    assert discovered["pi_rpc"].error
 
 
 def test_claude_cli_discovery_reports_missing_binary(monkeypatch) -> None:

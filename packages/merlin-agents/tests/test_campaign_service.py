@@ -12964,15 +12964,18 @@ async def test_prepare_accepts_claude_dynamic_tools_for_tool_bearing_worker() ->
 
 
 @pytest.mark.asyncio
-async def test_prepare_rejects_kimi_for_explicit_token_budget() -> None:
+@pytest.mark.parametrize("transport", ("kimi_acp", "pi_rpc"))
+async def test_prepare_rejects_usage_blind_transport_for_explicit_token_budget(
+    transport: str,
+) -> None:
     async def routed_preparation(session_id, objective, profile):
         prepared = await preparation(session_id, objective, profile)
         return replace(
             prepared,
             assignment_context=replace(
                 prepared.assignment_context,
-                provider_role_models=(("lead", "kimi-lead"),),
-                provider_model_transports=(("kimi-lead", "kimi_acp"),),
+                provider_role_models=(("lead", "usage-blind-lead"),),
+                provider_model_transports=(("usage-blind-lead", transport),),
             ),
         )
 
