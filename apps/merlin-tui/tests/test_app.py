@@ -1789,15 +1789,21 @@ async def test_provider_setup_save_discovers_a_missing_model(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_model_screen_filters_no_tool_transports_to_campaign_lead() -> None:
+async def test_model_screen_offers_agent_transports_for_every_role() -> None:
     app = build_app(DemoBackend())
     async with app.run_test() as pilot:
         app.push_screen(ModelScreen())
         await pilot.pause()
 
-        assert "kimi_acp" not in app.screen.query_one("#worker-transport", Select)._legal_values
-        assert "claude_cli" not in app.screen.query_one("#recon-transport", Select)._legal_values
-        assert "kimi_acp" in app.screen.query_one("#lead-transport", Select)._legal_values
+        for selector in (
+            "#worker-transport",
+            "#lead-transport",
+            "#recon-transport",
+            "#validator-transport",
+            "#adversarial-explorer-transport",
+        ):
+            values = app.screen.query_one(selector, Select)._legal_values
+            assert {"claude_cli", "kimi_acp", "kiro_acp", "opencode_acp"} <= values
 
 
 @pytest.mark.asyncio

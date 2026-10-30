@@ -81,6 +81,9 @@ async def test_routing_catalogs_keep_models_separated_by_transport(monkeypatch) 
     assert discovered["openai_compatible"].models[0].id == "worker-current"
     assert discovered["codex_app_server"].models[0].id == "gpt-current"
     assert discovered["claude_cli"].models[0].id == "sonnet"
+    assert discovered["kimi_acp"].error
+    assert discovered["kiro_acp"].error
+    assert discovered["opencode_acp"].error
 
 
 def test_claude_cli_discovery_reports_missing_binary(monkeypatch) -> None:

@@ -209,7 +209,7 @@ def test_model_routing_preserves_explicit_capabilities_and_unknown_stays_unknown
     }
 
 
-def test_model_route_persists_safe_lead_transport_and_rejects_cli_default(tmp_path: Path) -> None:
+def test_model_route_persists_lead_and_tool_capable_cli_worker_routes(tmp_path: Path) -> None:
     paths = ConfigPaths(tmp_path / "merlin")
     configuration = ProviderConfiguration(paths)
     configuration.save("https://example.test/v1", "worker-model", "secret")
@@ -220,8 +220,14 @@ def test_model_route_persists_safe_lead_transport_and_rejects_cli_default(tmp_pa
     assert provider["model"] == "worker-model"
     assert provider["role_models"] == {"lead": "lead-model", "recon": "lead-model"}
     assert provider["model_transports"] == {"lead-model": "codex_app_server"}
-    with pytest.raises(ValueError, match="only be assigned to Campaign Lead"):
-        configuration.save_model_route("unsafe", "claude_cli", lead_only=False)
+    configuration.save_model_route("claude-worker", "claude_cli", lead_only=False)
+
+    provider = load_config(paths, environ={}).values["provider"]
+    assert provider["model"] == "claude-worker"
+    assert provider["model_transports"] == {
+        "lead-model": "codex_app_server",
+        "claude-worker": "claude_cli",
+    }
 
 
 def test_model_route_allows_codex_worker_transport(tmp_path: Path) -> None:
@@ -305,6 +311,31 @@ def test_model_routing_is_atomic_and_homogeneous_mode_removes_lead_override(
     assert provider["model"] == "one-model"
     assert "role_models" not in provider
     assert provider["model_transports"] == {"one-model": "openai_compatible"}
+
+
+def test_model_routing_accepts_kiro_effort_and_rejects_unmapped_acp_effort(
+    tmp_path: Path,
+) -> None:
+    paths = ConfigPaths(tmp_path / "merlin")
+    configuration = ProviderConfiguration(paths)
+    configuration.save("https://example.test/v1", "old-worker", "secret")
+
+    configuration.save_model_routing(
+        "kiro-worker",
+        "kiro_acp",
+        heterogeneous=False,
+        role_efforts={"workers": "high"},
+    )
+    provider = load_config(paths, environ={}).values["provider"]
+    assert provider["model_efforts"] == {"kiro-worker": "high"}
+
+    with pytest.raises(ValueError, match="provider-default effort for: workers"):
+        configuration.save_model_routing(
+            "opencode-worker",
+            "opencode_acp",
+            heterogeneous=False,
+            role_efforts={"workers": "high"},
+        )
 
 
 def test_model_endpoint_persists_per_model_override_and_removes_it(tmp_path: Path) -> None:

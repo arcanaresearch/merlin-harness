@@ -1,4 +1,4 @@
-"""Bounded no-tool transport for Claude Code's stream-json print mode."""
+"""Bounded Claude Code transport with Merlin-brokered MCP tools."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Any
 from merlin_contracts import (
     ChatMessage,
     ChatRequest,
+    DynamicToolHandler,
     ModelCompleted,
     ModelError,
     ModelEvent,
@@ -22,9 +23,11 @@ from merlin_contracts import (
     ProviderFailureKind,
     ReasoningDelta,
     TextDelta,
+    ToolCall,
 )
 
 from .capabilities import RouteIdentity
+from .dynamic_mcp import DynamicMcpBroker
 from .openai_compatible import ProviderCapabilities
 
 _SESSION_NAMESPACE = uuid.UUID("7f3a1a7b-e987-4c2a-a2ac-c30fd8b7df85")
@@ -67,7 +70,7 @@ class ClaudeCliConfig:
 
 
 class ClaudeCliProvider:
-    """Uses Claude authentication/session persistence without inheriting its tools."""
+    """Uses Claude authentication while admitting only Merlin-brokered MCP tools."""
 
     def __init__(self, config: ClaudeCliConfig) -> None:
         self.config = config
@@ -77,7 +80,7 @@ class ClaudeCliProvider:
 
     @property
     def capabilities(self) -> ProviderCapabilities:
-        return ProviderCapabilities(streaming=True, tools=False, usage_in_stream=True)
+        return ProviderCapabilities(streaming=True, tools=True, usage_in_stream=True)
 
     @property
     def route_identity(self) -> RouteIdentity:
@@ -98,10 +101,35 @@ class ClaudeCliProvider:
                 failure_kind=ProviderFailureKind.CONFIGURATION,
             )
             return
+        async for event in self._stream(request, None):
+            yield event
+
+    async def stream_with_tools(
+        self, request: ChatRequest, handler: DynamicToolHandler
+    ) -> AsyncIterator[ModelEvent]:
+        async for event in self._stream(request, handler):
+            yield event
+
+    async def _stream(
+        self, request: ChatRequest, handler: DynamicToolHandler | None
+    ) -> AsyncIterator[ModelEvent]:
+        if request.reasoning == "disabled" and request.reasoning_control == "required":
+            yield ModelError(
+                message="Claude CLI cannot authoritatively disable reasoning",
+                code="unsupported_request_control",
+            )
+            return
+        if request.tools and handler is None:
+            yield ModelError(
+                message="Claude CLI tools require Merlin's authority callback",
+                code="claude_cli_tools_unsupported",
+                failure_kind=ProviderFailureKind.CONFIGURATION,
+            )
+            return
         key = request.budget_id or f"ephemeral:{id(request)}"
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            async for event in self._stream_locked(key, request):
+            async for event in self._stream_locked(key, request, handler):
                 yield event
         if request.budget_id is None:
             self._history.pop(key, None)
@@ -112,11 +140,24 @@ class ClaudeCliProvider:
             self._temporary_directory.cleanup()
             self._temporary_directory = None
 
-    async def _stream_locked(self, key: str, request: ChatRequest) -> AsyncIterator[ModelEvent]:
+    async def _stream_locked(
+        self,
+        key: str,
+        request: ChatRequest,
+        handler: DynamicToolHandler | None,
+    ) -> AsyncIterator[ModelEvent]:
         previous = self._history.get(key, ())
         prompt, history = _request_prompt(request.messages, previous)
         session_id = str(uuid.uuid5(_SESSION_NAMESPACE, key))
         resume = bool(previous)
+        broker = (
+            DynamicMcpBroker(request.tools, max_line_bytes=self.config.max_line_bytes)
+            if request.tools and handler is not None
+            else None
+        )
+        if broker is not None:
+            await broker.start()
+        mcp_config = broker.claude_config() if broker is not None else '{"mcpServers":{}}'
         arguments = [
             *self.config.command,
             "--print",
@@ -130,17 +171,23 @@ class ClaudeCliProvider:
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--mcp-config",
-            '{"mcpServers":{}}',
+            mcp_config,
             "--tools",
             "",
             "--permission-mode",
             "dontAsk",
             "--system-prompt",
             (
-                "You are a language-model transport inside Merlin. Do not call any tools, "
-                "skills, agents, hooks, plugins, MCP servers, browsers, files, or shell commands."
+                "You are a language-model transport inside Merlin. Use only MCP tools from the "
+                "`merlin` server when tools are available. Never use built-in tools, skills, "
+                "agents, hooks, plugins, browsers, files, or shell commands. After an MCP tool "
+                "returns an acceptance receipt, end the turn immediately; Merlin supplies the "
+                "authority-checked result in the next step."
             ),
         ]
+        if broker is not None:
+            arguments.append("--allowedTools")
+            arguments.extend(f"mcp__merlin__{name}" for name in sorted(broker.tool_names))
         if request.model or self.config.model:
             arguments.extend(("--model", request.model or self.config.model or ""))
         arguments.extend(
@@ -156,6 +203,8 @@ class ClaudeCliProvider:
         )
         result_seen = False
         visible_progress = False
+        line_task: asyncio.Task[bytes] | None = None
+        broker_task: asyncio.Task[ToolCall] | None = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *arguments,
@@ -168,12 +217,32 @@ class ClaudeCliProvider:
             assert process.stdout is not None
             async with asyncio.timeout(self.config.turn_timeout_seconds):
                 while True:
-                    line = await asyncio.wait_for(
-                        process.stdout.readline(),
-                        self.config.partial_idle_timeout_seconds
-                        if visible_progress
-                        else self.config.idle_timeout_seconds,
+                    if line_task is None:
+                        line_task = asyncio.create_task(process.stdout.readline())
+                    if broker is not None and broker_task is None:
+                        broker_task = asyncio.create_task(broker.next_event())
+                    waiting = {line_task}
+                    if broker_task is not None:
+                        waiting.add(broker_task)
+                    done, _ = await asyncio.wait(
+                        waiting,
+                        timeout=(
+                            self.config.partial_idle_timeout_seconds
+                            if visible_progress
+                            else self.config.idle_timeout_seconds
+                        ),
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if not done:
+                        raise TimeoutError
+                    if broker_task is not None and broker_task in done:
+                        call = broker_task.result()
+                        broker_task = None
+                        visible_progress = True
+                        yield call
+                        continue
+                    line = line_task.result()
+                    line_task = None
                     if not line:
                         break
                     if len(line) > self.config.max_line_bytes:
@@ -181,13 +250,19 @@ class ClaudeCliProvider:
                     message = _json_object(line)
                     event = _mapping(message.get("event"))
                     if _is_tool_use(message, event):
-                        yield ModelError(
-                            message="Claude CLI attempted a forbidden tool call",
-                            code="claude_cli_forbidden_tool",
-                            partial=emitted_chars > 0,
-                            failure_kind=ProviderFailureKind.PERMISSION,
-                        )
-                        return
+                        tool_name = _tool_use_name(message, event)
+                        if not (
+                            broker is not None
+                            and isinstance(tool_name, str)
+                            and tool_name.startswith("mcp__merlin__")
+                        ):
+                            yield ModelError(
+                                message="Claude CLI attempted a forbidden tool call",
+                                code="claude_cli_forbidden_tool",
+                                partial=emitted_chars > 0,
+                                failure_kind=ProviderFailureKind.PERMISSION,
+                            )
+                            return
                     delta = _mapping(event.get("delta"))
                     delta_type = delta.get("type")
                     if message.get("type") == "stream_event" and delta_type == "thinking_delta":
@@ -263,6 +338,13 @@ class ClaudeCliProvider:
                 ),
             )
         finally:
+            for task in (line_task, broker_task):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (line_task, broker_task) if task is not None),
+                return_exceptions=True,
+            )
             if process is not None and process.returncode is None:
                 process.terminate()
                 try:
@@ -273,6 +355,8 @@ class ClaudeCliProvider:
             if stderr_task is not None:
                 stderr_task.cancel()
                 await asyncio.gather(stderr_task, return_exceptions=True)
+            if broker is not None:
+                await broker.close()
 
     def _sandbox_directory(self) -> Path:
         if self.config.state_directory is not None:
@@ -326,6 +410,12 @@ def _is_tool_use(message: Mapping[str, Any], event: Mapping[str, Any]) -> bool:
         return True
     block = _mapping(event.get("content_block"))
     return block.get("type") in {"tool_use", "server_tool_use"}
+
+
+def _tool_use_name(message: Mapping[str, Any], event: Mapping[str, Any]) -> object:
+    if message.get("type") == "tool_use":
+        return message.get("name")
+    return _mapping(event.get("content_block")).get("name")
 
 
 def _usage(message: Mapping[str, Any]) -> ModelUsage | None:

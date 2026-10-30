@@ -13,6 +13,7 @@ from merlin_contracts import (
     ProviderFailureKind,
     ReasoningDelta,
     TextDelta,
+    ToolCall,
 )
 
 from merlin_providers import ClaudeCliConfig, ClaudeCliProvider
@@ -137,6 +138,67 @@ def test_claude_cli_rejects_tools_before_launch(tmp_path: Path) -> None:
     assert isinstance(events[-1], ModelError)
     assert events[-1].code == "claude_cli_tools_unsupported"
     assert events[-1].failure_kind is ProviderFailureKind.CONFIGURATION
+
+
+def test_claude_cli_admits_reviewed_mcp_tool_call(tmp_path: Path) -> None:
+    command = _write_cli(
+        tmp_path / "claude.py",
+        """
+import json, subprocess, sys, time
+arguments = sys.argv[1:]
+config = json.loads(arguments[arguments.index("--mcp-config") + 1])
+server = config["mcpServers"]["merlin"]
+child = subprocess.Popen(
+    [server["command"], *server["args"]],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True,
+)
+assert child.stdin is not None and child.stdout is not None
+child.stdin.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"target_request","arguments":{"message":"hello"}}}) + "\\n")
+child.stdin.flush()
+json.loads(child.stdout.readline())
+child.stdin.close()
+child.wait()
+time.sleep(0.1)
+print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":""}), flush=True)
+""",
+    )
+
+    async def scenario() -> list[object]:
+        provider = ClaudeCliProvider(
+            ClaudeCliConfig(command=command, model="claude-test", state_directory=tmp_path)
+        )
+
+        async def unused_handler(_call: ToolCall) -> str:
+            raise AssertionError("the transport must not execute Merlin tools")
+
+        return [
+            event
+            async for event in provider.stream_with_tools(
+                ChatRequest(
+                    model="claude-test",
+                    messages=[ChatMessage(role="user", content="hello")],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "target_request",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                ),
+                unused_handler,
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    calls = [event for event in events if isinstance(event, ToolCall)]
+    assert len(calls) == 1
+    assert calls[0].name == "target_request"
+    assert calls[0].arguments == {"message": "hello"}
+    assert isinstance(events[-1], ModelCompleted)
 
 
 def test_claude_cli_fails_closed_on_tool_use_event(tmp_path: Path) -> None:

@@ -12943,7 +12943,7 @@ async def test_prepare_accepts_codex_dynamic_tools_for_tool_bearing_worker() -> 
 
 
 @pytest.mark.asyncio
-async def test_prepare_rejects_claude_no_tool_transport_for_tool_bearing_worker() -> None:
+async def test_prepare_accepts_claude_dynamic_tools_for_tool_bearing_worker() -> None:
     async def routed_preparation(session_id, objective, profile):
         prepared = await preparation(session_id, objective, profile)
         return replace(
@@ -12958,9 +12958,9 @@ async def test_prepare_rejects_claude_no_tool_transport_for_tool_bearing_worker(
     store = Store()
     service = CampaignService(store, Agents(store), routed_preparation)  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match="no-tool transport claude_cli"):
-        await service.prepare("session-1", "Assess", CampaignProfile.RECOMMENDED)
-    assert store.rows == {}
+    result = await service.prepare("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    assert result["campaign_id"] == "campaign-1"
+    assert store.rows["campaign-1"]["status"] == "prepared"
 
 
 @pytest.mark.asyncio

@@ -5024,15 +5024,11 @@ class CampaignService:
             )
         lead_escalation = dict(context.provider_escalation_models).get("lead", ())
         candidates.extend(("campaign-lead fallback", model, ()) for model in lead_escalation)
-        for role, model, tool_ids in candidates:
+        for role, model, _tool_ids in candidates:
             transport = context.transport_for_model(model)
-            if transport in {"claude_cli", "kimi_acp"} and tool_ids:
+            if transport in {"kimi_acp", "kiro_acp", "opencode_acp"} and budgeted:
                 raise ValueError(
-                    f"model route {role} uses no-tool transport {transport} with admitted tools"
-                )
-            if transport == "kimi_acp" and budgeted:
-                raise ValueError(
-                    f"model route {role} uses kimi_acp without billable token usage for a "
+                    f"model route {role} uses {transport} without billable token usage for a "
                     "token-budgeted campaign"
                 )
 

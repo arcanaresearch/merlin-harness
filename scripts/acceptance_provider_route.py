@@ -37,7 +37,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--transport",
-        choices=("default", "codex_app_server", "claude_cli", "kimi_acp"),
+        choices=(
+            "default",
+            "codex_app_server",
+            "claude_cli",
+            "kimi_acp",
+            "kiro_acp",
+            "opencode_acp",
+        ),
         default="default",
     )
     parser.add_argument("--provider-name", default="configured")
@@ -95,14 +102,30 @@ def _provider(arguments: argparse.Namespace):
                 turn_timeout_seconds=runtime.total_timeout_seconds,
             )
         )
-    if arguments.transport == "kimi_acp":
+    if arguments.transport in {"kimi_acp", "kiro_acp", "opencode_acp"}:
+        settings = {
+            "kimi_acp": (("kimi", "acp"), "Kimi ACP", "kimi-acp", "plan"),
+            "kiro_acp": (
+                ("kiro-cli", "acp", "--model", arguments.model),
+                "Kiro ACP",
+                "kiro-acp",
+                None,
+            ),
+            "opencode_acp": (("opencode", "acp"), "OpenCode ACP", "opencode-acp", None),
+        }[arguments.transport]
         return KimiAcpProvider(
             KimiAcpConfig(
+                command=settings[0],
                 model=arguments.model,
                 state_directory=state,
                 startup_timeout_seconds=runtime.connect_timeout_seconds,
                 idle_timeout_seconds=runtime.idle_timeout_seconds,
                 turn_timeout_seconds=runtime.total_timeout_seconds,
+                transport=arguments.transport,
+                label=settings[1],
+                state_subdirectory=settings[2],
+                mode_id=settings[3],
+                configure_model_in_session=arguments.transport != "kiro_acp",
             )
         )
     values = config.values.get("provider")

@@ -93,7 +93,14 @@ def test_text_default_and_vision_recon_construct_exact_provider_capabilities() -
 def test_route_vision_rejects_image_unsupported_transports() -> None:
     provider = {"model_capabilities": {"vision-model": ["vision", "tools"]}}
 
-    for transport in ("gemini", "codex_app_server", "claude_cli", "kimi_acp"):
+    for transport in (
+        "gemini",
+        "codex_app_server",
+        "claude_cli",
+        "kimi_acp",
+        "kiro_acp",
+        "opencode_acp",
+    ):
         assert not _route_vision_enabled(
             provider,
             "vision-model",
@@ -108,6 +115,65 @@ def test_route_vision_rejects_image_unsupported_transports() -> None:
         )
         assert route_values["vision"] is False
         assert route_values["model_capabilities"] == {"vision-model": ["tools"]}
+
+
+@pytest.mark.asyncio
+async def test_build_backend_constructs_generic_acp_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from merlin_config import Config, CredentialStore
+    from merlin_storage_postgres import Database, DatabaseConfig
+    from merlin_tui.bootstrap import build_backend
+
+    class CapturingAcpProvider:
+        configs = []
+
+        def __init__(self, config) -> None:
+            self.config = config
+            type(self).configs.append(config)
+
+        async def close(self) -> None:
+            return None
+
+    CapturingAcpProvider.configs = []
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres")) as database:
+        monkeypatch.setattr(
+            "merlin_config.load_config",
+            lambda: Config(
+                database_url=database.url,
+                values={
+                    "provider": {
+                        "base_url": "https://api.example/v1",
+                        "model": "default-model",
+                        "model_transports": {
+                            "kiro-model": "kiro_acp",
+                            "opencode-model": "opencode_acp",
+                        },
+                        "model_efforts": {"kiro-model": "high"},
+                    }
+                },
+            ),
+        )
+        monkeypatch.setattr(CredentialStore, "load", lambda _self: {"api_key": "secret"})
+        monkeypatch.setattr("merlin_providers.KimiAcpProvider", CapturingAcpProvider)
+
+        backend = build_backend(tmp_path / "workspace")
+        try:
+            configs = {config.transport: config for config in CapturingAcpProvider.configs}
+            assert configs["kiro_acp"].command == (
+                "kiro-cli",
+                "acp",
+                "--model",
+                "kiro-model",
+                "--effort",
+                "high",
+            )
+            assert configs["kiro_acp"].mode_id is None
+            assert configs["kiro_acp"].configure_model_in_session is False
+            assert configs["opencode_acp"].command == ("opencode", "acp")
+            assert configs["opencode_acp"].mode_id is None
+        finally:
+            await backend.close()
 
 
 def test_route_vision_accepts_exact_anthropic_messages_model() -> None:

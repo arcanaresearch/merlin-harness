@@ -105,11 +105,11 @@ Merlin for the current user and opens the same guided setup when needed.
 
 ### Lead providers and worker models
 
-Use `/model` to select a native **Codex App Server**, **Claude CLI**, or **Kimi ACP** Lead,
-or configure a hosted or local model through `/setup`. Native CLI integrations require their
-respective local installation and authentication. The API-provider picker lists model endpoints;
-CLI Lead choices live in the Lead/model selection flow. Specialist workers use Merlin's own tool
-execution and reviewed model routes.
+Use `/model` to route any model role through **Codex App Server**, **Claude CLI**, **Kimi ACP**,
+**Kiro ACP**, or **OpenCode ACP**, or configure a hosted or local model through `/setup`. Agent
+transports require their respective local installation and authentication. Merlin exposes only the
+reviewed tools for the current request through a private MCP bridge; the external agent proposes a
+call, while Merlin retains permission checks, execution, budgets, and evidence recording.
 
 ### Optional JEV judgments
 

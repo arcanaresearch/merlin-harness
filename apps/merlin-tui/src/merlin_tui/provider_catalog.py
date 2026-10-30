@@ -225,6 +225,8 @@ async def discover_routing_models(
         "codex_app_server": codex,
         "claude_cli": claude,
         "kimi_acp": unavailable,
+        "kiro_acp": unavailable,
+        "opencode_acp": unavailable,
     }
 
 

@@ -607,7 +607,14 @@ def _preparation_factory(
                         if supported
                         else "GOAT v1 requires a buffered Merlin-tool-capable worker route"
                         if strategy_id == "goat"
-                        and worker_transport in {"codex_app_server", "claude_cli", "kimi_acp"}
+                        and worker_transport
+                        in {
+                            "codex_app_server",
+                            "claude_cli",
+                            "kimi_acp",
+                            "kiro_acp",
+                            "opencode_acp",
+                        }
                         else f"reviewed API {strategy_id} contract is unavailable"
                     ),
                     strategy_contract=contract,
@@ -768,21 +775,21 @@ async def test_hydra_preview_route_digest_matches_heterogeneous_compiled_assignm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ("claude_cli", "kimi_acp"))
-async def test_assessment_prepare_blocks_goat_no_tool_cli_routes(transport: str) -> None:
+@pytest.mark.parametrize("transport", ("claude_cli", "kimi_acp", "kiro_acp", "opencode_acp"))
+async def test_assessment_prepare_accepts_tool_capable_agent_routes(transport: str) -> None:
     factory, captured = _preparation_factory(
         "goat", worker_model=f"{transport}-model", worker_transport=transport
     )
     service = CampaignService(_PreparationStore(), object(), factory)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match=f"no-tool transport {transport}"):
-        await AssessmentPrepareTool(service).invoke(
-            ToolContext(session_id="session-1", workspace_root="/workspace"),
-            {
-                "objective": "Run reviewed goat",
-                "campaign_profile": "recommended",
-                "adapter": _reviewed_adapter(singular_objective=True),
-            },
-        )
+    result = await AssessmentPrepareTool(service).invoke(
+        ToolContext(session_id="session-1", workspace_root="/workspace"),
+        {
+            "objective": "Run reviewed goat",
+            "campaign_profile": "recommended",
+            "adapter": _reviewed_adapter(singular_objective=True),
+        },
+    )
+    assert result.is_error is False
     assert captured[-1].assignment_context.techniques[0].comparison_supported is True
 
 

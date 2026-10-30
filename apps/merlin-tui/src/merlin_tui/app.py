@@ -906,6 +906,10 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
             ("Anthropic Messages (native)", "anthropic_messages"),
             ("Gemini (native)", "gemini"),
             ("Codex App Server (Merlin tools supported)", "codex_app_server"),
+            ("Claude CLI (Merlin tools supported)", "claude_cli"),
+            ("Kimi ACP (Merlin tools; provider-default effort)", "kimi_acp"),
+            ("Kiro ACP (Merlin tools supported)", "kiro_acp"),
+            ("OpenCode ACP (Merlin tools; provider-default effort)", "opencode_acp"),
         )
 
     @staticmethod
@@ -959,15 +963,7 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
                 )
                 yield Input(placeholder="Custom Campaign Lead model ID", id="lead-model-custom")
                 yield Select(
-                    (
-                        ("OpenAI-compatible endpoint", "openai_compatible"),
-                        ("OpenAI Responses (native)", "openai_responses"),
-                        ("Anthropic Messages (native)", "anthropic_messages"),
-                        ("Gemini (native)", "gemini"),
-                        ("Codex App Server (Merlin tools supported)", "codex_app_server"),
-                        ("Claude CLI (no Merlin tools)", "claude_cli"),
-                        ("Kimi ACP (no tools; provider-default effort)", "kimi_acp"),
-                    ),
+                    self._transport_options(),
                     value=self.lead_transport,
                     name="Campaign Lead transport",
                     id="lead-transport",
@@ -1166,9 +1162,23 @@ class ModelScreen(ModalScreen[ModelSetup | None]):
                 self.query_one("#adversarial-explorer-effort", Select).value
             ),
         }
-        if lead_transport == "kimi_acp" and role_efforts["lead"] != "default":
+        transports_by_role = {
+            "workers": str(worker_transport),
+            "lead": str(lead_transport),
+            "recon": str(recon_transport),
+            "validator": str(validator_transport),
+            "adversarial-explorer": str(explorer_transport),
+        }
+        provider_default_effort = {"kimi_acp", "opencode_acp"}
+        invalid_effort_roles = [
+            role
+            for role, transport in transports_by_role.items()
+            if transport in provider_default_effort and role_efforts[role] != "default"
+        ]
+        if invalid_effort_roles:
             self.notify(
-                "Kimi ACP does not expose a reasoning-effort option; choose Provider default",
+                "ACP transports require Provider default effort: "
+                + ", ".join(invalid_effort_roles),
                 severity="error",
             )
             return

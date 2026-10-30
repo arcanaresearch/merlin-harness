@@ -10,7 +10,13 @@ import tomli_w
 from merlin_config import ConfigPaths, CredentialStore, load_config
 
 _UNSET = object()
-_CLI_TRANSPORTS = {"codex_app_server", "claude_cli", "kimi_acp"}
+_CLI_TRANSPORTS = {
+    "codex_app_server",
+    "claude_cli",
+    "kimi_acp",
+    "kiro_acp",
+    "opencode_acp",
+}
 _NATIVE_HTTP_TRANSPORTS = {"openai_responses", "anthropic_messages", "gemini"}
 _MODEL_TRANSPORTS = {"openai_compatible"} | _CLI_TRANSPORTS | _NATIVE_HTTP_TRANSPORTS
 _NO_CREDENTIAL_ADVICE = (
@@ -207,8 +213,6 @@ class ProviderConfiguration:
             raise ValueError("model is required")
         if transport not in _MODEL_TRANSPORTS:
             raise ValueError("model transport is unsupported")
-        if transport in {"claude_cli", "kimi_acp"} and not lead_only:
-            raise ValueError("no-tool CLI transports can only be assigned to Campaign Lead")
         config = load_config(self.paths, environ={})
         provider = config.values.get("provider", {})
         if not isinstance(provider, Mapping) or not isinstance(provider.get("base_url"), str):
@@ -288,18 +292,28 @@ class ProviderConfiguration:
             <= _MODEL_TRANSPORTS
         ):
             raise ValueError("model transport is unsupported")
-        if worker_transport in {"claude_cli", "kimi_acp"}:
-            raise ValueError("no-tool CLI transports cannot be assigned to workers")
         if heterogeneous and not lead_model:
             raise ValueError("Campaign Lead model is required for heterogeneous routing")
-        for role, transport in (
-            ("workers", worker_transport),
-            ("recon", recon_transport),
-            ("validator", validator_transport),
-            ("adversarial explorer", adversarial_explorer_transport),
-        ):
-            if transport in {"claude_cli", "kimi_acp"}:
-                raise ValueError(f"no-tool CLI transports cannot be assigned to {role}")
+        provider_default_effort = {"kimi_acp", "opencode_acp"}
+        role_transports = {
+            "workers": worker_transport,
+            "lead": lead_transport,
+            "recon": recon_transport,
+            "validator": validator_transport,
+            "adversarial-explorer": adversarial_explorer_transport,
+        }
+        if role_efforts is not None:
+            invalid_effort_roles = [
+                role
+                for role, transport in role_transports.items()
+                if transport in provider_default_effort
+                and role_efforts.get(role, "default") != "default"
+            ]
+            if invalid_effort_roles:
+                raise ValueError(
+                    "ACP transports require provider-default effort for: "
+                    + ", ".join(invalid_effort_roles)
+                )
 
         config = load_config(self.paths, environ={})
         provider = config.values.get("provider", {})

@@ -495,20 +495,25 @@ def _run_first_setup(
     print("\nOptional Campaign Lead model transport:", file=output)
     print("1. Keep the configured provider model for every role [default]", file=output)
     print("2. Codex App Server (Merlin tools supported)", file=output)
-    print("3. Claude CLI (no Merlin tools)", file=output)
-    print("4. Kimi ACP (no tools; unavailable to token-capped campaigns)", file=output)
+    print("3. Claude CLI (Merlin tools supported)", file=output)
+    print("4. Kimi ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
+    print("5. Kiro ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
+    print("6. OpenCode ACP (Merlin tools; unavailable to token-capped campaigns)", file=output)
     while True:
-        raw_transport = read("Lead transport (Enter or 1-4): ").strip()
+        raw_transport = read("Lead transport (Enter or 1-6): ").strip()
         if raw_transport in {"", "1"}:
             return
         transport = {
             "2": "codex_app_server",
             "3": "claude_cli",
             "4": "kimi_acp",
+            "5": "kiro_acp",
+            "6": "opencode_acp",
         }.get(raw_transport)
         if transport is None:
             print(
-                "Press Enter or 1 for the provider model; choose 2-4 for a native CLI.", file=output
+                "Press Enter or 1 for the provider model; choose 2-6 for an agent transport.",
+                file=output,
             )
             continue
         if transport == "claude_cli":

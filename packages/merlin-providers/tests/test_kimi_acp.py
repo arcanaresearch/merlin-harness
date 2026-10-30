@@ -13,6 +13,7 @@ from merlin_contracts import (
     ProviderFailureKind,
     ReasoningDelta,
     TextDelta,
+    ToolCall,
 )
 
 from merlin_providers import KimiAcpConfig, KimiAcpProvider
@@ -155,6 +156,47 @@ for line in sys.stdin:
     assert events[-1].failure_kind is ProviderFailureKind.PERMISSION
 
 
+def test_acp_transport_fails_closed_on_unreviewed_tool_update(tmp_path: Path) -> None:
+    command = _write_server(
+        tmp_path / "acp.py",
+        """
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"protocolVersion":1,"agentCapabilities":{}}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"sessionId":"session-1"}}), flush=True)
+    elif method in {"session/set_mode", "session/set_config_option"}:
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{}}), flush=True)
+    elif method == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","title":"Bash"}}}), flush=True)
+""",
+    )
+
+    async def scenario() -> list[object]:
+        provider = KimiAcpProvider(
+            KimiAcpConfig(command=command, model="kimi-test", state_directory=tmp_path)
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ChatRequest(
+                    model="kimi-test",
+                    messages=[ChatMessage(role="user", content="hello")],
+                )
+            )
+        ]
+        await provider.close()
+        return events
+
+    events = asyncio.run(scenario())
+    assert isinstance(events[-1], ModelError)
+    assert events[-1].code == "kimi_acp_forbidden_tool"
+    assert events[-1].failure_kind is ProviderFailureKind.PERMISSION
+
+
 def test_kimi_acp_rejects_tools_before_launch(tmp_path: Path) -> None:
     provider = KimiAcpProvider(
         KimiAcpConfig(command=("does-not-exist",), model="kimi-test", state_directory=tmp_path)
@@ -176,6 +218,87 @@ def test_kimi_acp_rejects_tools_before_launch(tmp_path: Path) -> None:
     assert isinstance(events[-1], ModelError)
     assert events[-1].code == "kimi_acp_tools_unsupported"
     assert events[-1].failure_kind is ProviderFailureKind.CONFIGURATION
+
+
+def test_acp_transport_admits_reviewed_mcp_tool_call(tmp_path: Path) -> None:
+    command = _write_server(
+        tmp_path / "acp.py",
+        """
+import json, subprocess, sys, time
+servers = []
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"protocolVersion":1,"agentCapabilities":{}}}), flush=True)
+    elif method == "session/new":
+        servers = message["params"]["mcpServers"]
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"sessionId":"session-1"}}), flush=True)
+    elif method == "session/set_config_option":
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{}}), flush=True)
+    elif method == "session/prompt":
+        server = servers[0]
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","name":"target_request"}}}), flush=True)
+        child = subprocess.Popen(
+            [server["command"], *server["args"]],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        child.stdin.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"target_request","arguments":{"message":"hello"}}}) + "\\n")
+        child.stdin.flush()
+        json.loads(child.stdout.readline())
+        child.stdin.close()
+        child.wait()
+        time.sleep(0.1)
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"stopReason":"end_turn"}}), flush=True)
+""",
+    )
+
+    async def scenario() -> list[object]:
+        provider = KimiAcpProvider(
+            KimiAcpConfig(
+                command=command,
+                model="agent-test",
+                state_directory=tmp_path,
+                transport="kiro_acp",
+                label="Kiro ACP",
+                state_subdirectory="kiro-acp",
+                mode_id=None,
+            )
+        )
+
+        async def unused_handler(_call: ToolCall) -> str:
+            raise AssertionError("the transport must not execute Merlin tools")
+
+        events = [
+            event
+            async for event in provider.stream_with_tools(
+                ChatRequest(
+                    model="agent-test",
+                    messages=[ChatMessage(role="user", content="hello")],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "target_request",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                ),
+                unused_handler,
+            )
+        ]
+        await provider.close()
+        return events
+
+    events = asyncio.run(scenario())
+    calls = [event for event in events if isinstance(event, ToolCall)]
+    assert len(calls) == 1
+    assert calls[0].name == "target_request"
+    assert calls[0].arguments == {"message": "hello"}
+    assert isinstance(events[-1], ModelCompleted)
 
 
 def test_kimi_acp_preserves_structured_quota_error(tmp_path: Path) -> None:

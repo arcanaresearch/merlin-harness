@@ -307,7 +307,9 @@ def test_provider_model_transports_are_exact_and_validated(tmp_path: Path) -> No
         "[provider.model_transports]\n"
         "'gpt-5.4'='codex_app_server'\n"
         "'claude-opus'='claude_cli'\n"
-        "'kimi-k2'='kimi_acp'\n",
+        "'kimi-k2'='kimi_acp'\n"
+        "'kiro-default'='kiro_acp'\n"
+        "'opencode-default'='opencode_acp'\n",
         encoding="utf-8",
     )
     paths.config.chmod(0o600)
@@ -315,6 +317,8 @@ def test_provider_model_transports_are_exact_and_validated(tmp_path: Path) -> No
         "gpt-5.4": "codex_app_server",
         "claude-opus": "claude_cli",
         "kimi-k2": "kimi_acp",
+        "kiro-default": "kiro_acp",
+        "opencode-default": "opencode_acp",
     }
 
     paths.config.write_text(

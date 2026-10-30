@@ -4686,7 +4686,14 @@ def build_backend(
             endpoint_override = config.provider_model_endpoints.get(routed_model)
             route_endpoint = (
                 ""
-                if transport in {"codex_app_server", "claude_cli", "kimi_acp"}
+                if transport
+                in {
+                    "codex_app_server",
+                    "claude_cli",
+                    "kimi_acp",
+                    "kiro_acp",
+                    "opencode_acp",
+                }
                 else str(
                     endpoint_override.get("base_url", base_url)
                     if endpoint_override is not None
@@ -4849,6 +4856,44 @@ def build_backend(
                         reasoning_effort=route_effort,
                     )
                 )
+            elif transport in {"kiro_acp", "opencode_acp"}:
+                acp_settings = {
+                    "kiro_acp": {
+                        "command": (
+                            "kiro-cli",
+                            "acp",
+                            "--model",
+                            routed_model,
+                            *(("--effort", route_effort) if route_effort != "default" else ()),
+                        ),
+                        "label": "Kiro ACP",
+                        "state_subdirectory": "kiro-acp",
+                    },
+                    "opencode_acp": {
+                        "command": ("opencode", "acp"),
+                        "label": "OpenCode ACP",
+                        "state_subdirectory": "opencode-acp",
+                    },
+                }[transport]
+                transport_routes[routed_model] = KimiAcpProvider(
+                    KimiAcpConfig(
+                        command=acp_settings["command"],
+                        model=routed_model,
+                        state_directory=transport_state,
+                        startup_timeout_seconds=provider_runtime.connect_timeout_seconds,
+                        idle_timeout_seconds=provider_runtime.idle_timeout_seconds,
+                        partial_idle_timeout_seconds=min(
+                            provider_runtime.idle_timeout_seconds, 60.0
+                        ),
+                        turn_timeout_seconds=provider_runtime.total_timeout_seconds,
+                        reasoning_effort=("default" if transport == "kiro_acp" else route_effort),
+                        transport=transport,
+                        label=acp_settings["label"],
+                        state_subdirectory=acp_settings["state_subdirectory"],
+                        mode_id=None,
+                        configure_model_in_session=transport != "kiro_acp",
+                    )
+                )
             elif transport in {"openai_responses", "anthropic_messages", "gemini"}:
                 # HTTP native-API transports share the base ProviderConfig fields;
                 # per-model endpoint overrides ([provider.model_endpoints]) re-point
@@ -4976,6 +5021,8 @@ def build_backend(
                     "open_ai_compatible": "OpenAI-compatible endpoint",
                     "claude_cli": "Claude CLI",
                     "kimi_acp": "Kimi ACP",
+                    "kiro_acp": "Kiro ACP",
+                    "opencode_acp": "OpenCode ACP",
                 }.get(transport, transport)
                 lines.append(f"- {role}: {selected_model} · {label} · {state}")
             return not errors, "\n".join(lines)
@@ -7700,7 +7747,13 @@ def build_backend(
                                     else "GOAT v1 requires a buffered Merlin-tool-capable "
                                     "worker route"
                                     if config.provider_model_transports.get(routed_model_for(item))
-                                    in {"codex_app_server", "claude_cli", "kimi_acp"}
+                                    in {
+                                        "codex_app_server",
+                                        "claude_cli",
+                                        "kimi_acp",
+                                        "kiro_acp",
+                                        "opencode_acp",
+                                    }
                                     else "reviewed API GOAT strategy contract is unavailable"
                                 )
                                 if str(item.get("strategy_id", "direct")) == "goat"

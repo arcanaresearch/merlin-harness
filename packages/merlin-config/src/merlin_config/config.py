@@ -90,7 +90,9 @@ _PROVIDER_TRANSPORTS = {
     "claude_cli",
     "codex_app_server",
     "gemini",
+    "kiro_acp",
     "kimi_acp",
+    "opencode_acp",
     "openai_compatible",
     "openai_responses",
 }
