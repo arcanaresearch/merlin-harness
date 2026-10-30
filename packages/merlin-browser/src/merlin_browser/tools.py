@@ -2674,6 +2674,29 @@ class BrowserReconExchangeTool:
                 pending_permit.exchange_owner = None
             return submitted
 
+        # The exchange is an atomic harness operation, so finish collecting its
+        # directly-linked network evidence here instead of depending on the
+        # provider to honor an immediate forced follow-up tool call.  Response
+        # events are recorded asynchronously by Playwright and can settle just
+        # after the submit action returns.
+        exchange_loader = getattr(session, "api_exchange_events", None)
+        if callable(exchange_loader):
+            settle_deadline = asyncio.get_running_loop().time() + min(timeout_ms / 1_000, 3.0)
+            api_exchanges = exchange_loader()
+            while not any(_probe_linked_api_exchange(event) for event in api_exchanges):
+                remaining = settle_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.05, remaining))
+                api_exchanges = exchange_loader()
+            if any(_probe_linked_api_exchange(event) for event in api_exchanges):
+                network = await raw_tool("browser_network_events").invoke(
+                    context,
+                    {"tab_ref": tab_ref, "timeout_ms": timeout_ms, "step": 2},
+                )
+                if not network.is_error:
+                    submitted = network
+
         permit = foreground_recon_probe_permits.get(permit_key)
         probe_metadata = (
             {

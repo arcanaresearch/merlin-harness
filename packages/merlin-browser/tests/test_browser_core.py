@@ -7971,6 +7971,9 @@ async def test_browser_fill_records_non_sensitive_input_verbatim(monkeypatch) ->
 
     assert recalled.is_error is False
     assert result.is_error is False
+    assert result.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
+    assert result.metadata["preferred_next_tool_mode"] == "after_one_admitted_action"
+    assert result.metadata["network_delta"]["new_events"] >= 1
     assert bounded.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
     assert network.is_error is False
     assert network.metadata["preferred_next_tool"] == "browser_compile_api_handoff"
@@ -8266,7 +8269,7 @@ async def test_stale_recon_probe_locator_does_not_consume_durable_one_use_exchan
     assert failed.is_error is True
     assert failed_action_count == 1
     assert corrected.is_error is False
-    assert completed_action_count == 3
+    assert completed_action_count == 4
     assert completed_exchange_count == 1
     assert exhausted.is_error is True
     assert exhausted.metadata["failure_code"] == "foreground_recon_probe_exhausted"
@@ -8355,7 +8358,7 @@ async def test_same_daemon_stale_recon_tab_releases_pre_dispatch_reservation() -
     assert failed.metadata["failure_code"] == "state_scope_before_unavailable"
     assert failed.metadata["target_effect_attempted"] is False
     assert corrected.is_error is False
-    assert len(recorder.actions) == 2
+    assert [action.kind for action in recorder.actions] == ["fill", "click", "network_events"]
 
 
 @pytest.mark.asyncio
@@ -8450,7 +8453,12 @@ async def test_same_daemon_stale_recon_submit_reuses_safe_fill_for_corrected_ret
 
     assert failed.is_error is True
     assert corrected.is_error is False
-    assert [action.kind for action in recorder.actions] == ["fill", "click", "click"]
+    assert [action.kind for action in recorder.actions] == [
+        "fill",
+        "click",
+        "click",
+        "network_events",
+    ]
     assert exhausted.is_error is True
     assert exhausted.metadata["failure_code"] == "foreground_recon_probe_exhausted"
     assert len(recorder.actions) == completed_action_count
