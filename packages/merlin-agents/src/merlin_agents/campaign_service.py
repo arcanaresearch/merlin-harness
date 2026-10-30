@@ -5363,7 +5363,7 @@ class CampaignService:
         supervision_retry_attempt: int = 0,
     ) -> None:
         supervisor_task = asyncio.current_task()
-        registered_owner = self._supervisors.get(campaign_id) is supervisor_task
+        registered_owner_at_entry = self._supervisors.get(campaign_id) is supervisor_task
         # Track the latest wave so late exception-path journaling cites the wave
         # that actually faulted, not the (possibly stale) entry wave.
         wave = initial_wave
@@ -7416,12 +7416,7 @@ class CampaignService:
             if terminalized is not False:
                 await self._generate_report(campaign_id, manifest, wave, "operator_stopped")
         except _TargetReobservationReviewRequired:
-            if registered_owner:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.add_done_callback(
-                        lambda _task: self._schedule_campaign_recovery(campaign_id)
-                    )
+            self._schedule_owned_campaign_recovery(campaign_id, supervisor_task)
             return
         except _TargetReobservationBlocked:
             return
@@ -7431,7 +7426,10 @@ class CampaignService:
             # Journal against the wave that actually faulted: the validation and
             # follow-up loops advance ``wave`` beyond the entry wave.
             initial_wave = wave
-            if registered_owner and self._supervisors.get(campaign_id) is not supervisor_task:
+            if (
+                registered_owner_at_entry
+                and self._supervisors.get(campaign_id) is not supervisor_task
+            ):
                 # Recovery or shutdown replaced/released this supervisor's
                 # ownership.  Any state-transition failure from this point is
                 # a stale-writer conflict, not evidence that the campaign or
@@ -7505,12 +7503,7 @@ class CampaignService:
             if surface_reobservation is not None and (
                 surface_reobservation.pending or surface_reobservation.review_pending
             ):
-                if registered_owner:
-                    current = asyncio.current_task()
-                    if current is not None:
-                        current.add_done_callback(
-                            lambda _task: self._schedule_campaign_recovery(campaign_id)
-                        )
+                self._schedule_owned_campaign_recovery(campaign_id, supervisor_task)
                 return
 
             if getattr(error, "cleanup_unresolved", False) is True:
@@ -18645,6 +18638,19 @@ class CampaignService:
         if recovery_tasks:
             await asyncio.gather(*recovery_tasks, return_exceptions=True)
         self._campaign_recovery_tasks.clear()
+
+    def _schedule_owned_campaign_recovery(
+        self,
+        campaign_id: str,
+        supervisor_task: asyncio.Task[None] | None,
+    ) -> None:
+        """Hand off only when the completing task still owns the campaign."""
+
+        if supervisor_task is None or self._supervisors.get(campaign_id) is not supervisor_task:
+            return
+        supervisor_task.add_done_callback(
+            lambda _task: self._schedule_campaign_recovery(campaign_id)
+        )
 
     def _schedule_campaign_recovery(self, campaign_id: str) -> None:
         current = self._campaign_recovery_tasks.get(campaign_id)

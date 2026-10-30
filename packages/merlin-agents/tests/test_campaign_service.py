@@ -3863,6 +3863,40 @@ async def test_targeted_campaign_recovery_tasks_are_retained_and_coalesced() -> 
     assert service._campaign_recovery_tasks == {}  # noqa: SLF001
 
 
+async def test_campaign_recovery_handoff_uses_completion_time_owner() -> None:
+    recoveries = []
+
+    class Service(CampaignService):
+        def _schedule_campaign_recovery(self, campaign_id: str) -> None:
+            recoveries.append(campaign_id)
+
+    service = Service(object(), object(), preparation)  # type: ignore[arg-type]
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def settle_after_late_registration() -> None:
+        entered.set()
+        await release.wait()
+
+    owner = asyncio.create_task(settle_after_late_registration())
+    await entered.wait()
+    service._supervisors["campaign/owned"] = owner  # noqa: SLF001
+    service._schedule_owned_campaign_recovery("campaign/owned", owner)  # noqa: SLF001
+    release.set()
+    await owner
+    await asyncio.sleep(0)
+    assert recoveries == ["campaign/owned"]
+
+    stale = asyncio.create_task(asyncio.sleep(0))
+    replacement = asyncio.create_task(asyncio.sleep(0))
+    service._supervisors["campaign/replaced"] = replacement  # noqa: SLF001
+    service._schedule_owned_campaign_recovery("campaign/replaced", stale)  # noqa: SLF001
+    await asyncio.gather(stale, replacement)
+    await asyncio.sleep(0)
+    assert recoveries == ["campaign/owned"]
+
+
 async def test_recovery_claim_covers_long_terminal_report_generation() -> None:
     claim_leases = []
     applied = []
