@@ -103,6 +103,9 @@ _CAMPAIGN_TARGET_URL_RE = re.compile(
 _RECON_RECALL_TOOL = "browser_recall_reconnaissance"
 _OWNED_SESSION_CLEANUP_TOOL = "browser_end_owned_session"
 _HANDOFF_REPAIR_OBSERVATION_TOOL = "browser_network_events"
+_PREFERRED_TOOL_STRICT_MODE = "strict"
+_PREFERRED_TOOL_AFTER_ONE_MODE = "after_one_admitted_action"
+_PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE = "after_one_admitted_action_consumed"
 _BROWSER_HANDOFF_REPAIR_TOOLS = frozenset(
     {"browser_compile_api_handoff", "browser_record_api_handoff"}
 )
@@ -1697,7 +1700,10 @@ class Kernel:
                 )
                 if preferred_tool_follow_through_failures < self._max_provider_retries:
                     preferred_tool_follow_through_failures += 1
-                    bounded_preference = preferred_next_tool_mode == "after_one_admitted_action"
+                    bounded_preference = preferred_next_tool_mode in {
+                        _PREFERRED_TOOL_AFTER_ONE_MODE,
+                        _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE,
+                    }
                     repair_messages = [
                         ChatMessage(
                             role="system",
@@ -1717,7 +1723,10 @@ class Kernel:
                         )
                     ]
                     return "retry"
-                if preferred_next_tool_mode == "after_one_admitted_action":
+                if preferred_next_tool_mode in {
+                    _PREFERRED_TOOL_AFTER_ONE_MODE,
+                    _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE,
+                }:
                     preferred_next_tool_name = None
                     preferred_tool_follow_through_failures = 0
                     return "released"
@@ -1911,7 +1920,7 @@ class Kernel:
                 request_preferred_tool_mode = preferred_next_tool_mode
                 request_preferred_tool_is_strict = (
                     request_preferred_tool_name is not None
-                    and preferred_next_tool_mode != "after_one_admitted_action"
+                    and preferred_next_tool_mode == _PREFERRED_TOOL_STRICT_MODE
                 )
                 request_repair_messages = repair_messages
                 repair_messages = []
@@ -2272,6 +2281,7 @@ class Kernel:
                             owned_cleanup_attempted_in_turn.add(call.call_id)
                         if bounded_preferred_observation:
                             preferred_transition_observation_used = True
+                            preferred_next_tool_mode = _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE
                         async with asyncio.timeout(self._tool_timeout_seconds):
                             result = await self._tools.invoke(call.name, context, call.arguments)
                     except asyncio.CancelledError:
@@ -2439,8 +2449,11 @@ class Kernel:
                         if next_tool != current_preferred_tool_name:
                             preferred_transition_observation_used = False
                         preferred_next_tool_name = next_tool
-                        preferred_next_tool_mode = str(
-                            result.metadata.get("preferred_next_tool_mode") or "strict"
+                        preferred_next_tool_mode = (
+                            _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE
+                            if bounded_preferred_observation
+                            and next_tool == current_preferred_tool_name
+                            else str(result.metadata.get("preferred_next_tool_mode") or "strict")
                         )
                         preferred_tool_follow_through_failures = 0
                     elif retained_preferred_error:
@@ -3222,7 +3235,7 @@ class Kernel:
             current_preferred_tool = preferred_next_tool
             bounded_preferred_action = (
                 current_preferred_tool == "browser_compile_api_handoff"
-                and preferred_next_tool_mode == "after_one_admitted_action"
+                and preferred_next_tool_mode == _PREFERRED_TOOL_AFTER_ONE_MODE
                 and event.name
                 in {
                     "browser_snapshot",
@@ -3268,8 +3281,13 @@ class Kernel:
                     raise PermissionError("tool is not admitted for this provider request")
                 if bounded_preferred_action:
                     preferred_nonpreferred_action_used = True
-                    preferred_next_tool_mode = "strict"
-                    admitted_tool_name = current_preferred_tool
+                    # Keep every provider schema visible after the single admitted
+                    # observation.  The kernel still rejects any non-compile call,
+                    # but providers that ignore forced tool choice can now be
+                    # repaired through the ordinary preferred-tool miss path
+                    # instead of failing inside transport validation.
+                    preferred_next_tool_mode = _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE
+                    admitted_tool_name = None
                 if event.name == _OWNED_SESSION_CLEANUP_TOOL:
                     owned_cleanup_invoked = True
                     cleanup_attempts.add(event.call_id)
@@ -3439,10 +3457,16 @@ class Kernel:
                 retry_state.clear()
             if isinstance(next_tool, str):
                 preferred_next_tool = next_tool
-                preferred_next_tool_mode = str(
-                    result.metadata.get("preferred_next_tool_mode") or "strict"
-                )
-                admitted_tool_name = next_tool
+                if bounded_preferred_action and next_tool == current_preferred_tool:
+                    # The observation cannot re-arm the one-observation allowance
+                    # or promote the same preference back to transport-level strict.
+                    preferred_next_tool_mode = _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE
+                    admitted_tool_name = None
+                else:
+                    preferred_next_tool_mode = str(
+                        result.metadata.get("preferred_next_tool_mode") or "strict"
+                    )
+                    admitted_tool_name = next_tool
             elif retained_preferred_error:
                 # Invoking a required tool does not discharge the obligation when
                 # that tool reports a retryable failure without another repair step.

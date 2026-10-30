@@ -2350,6 +2350,7 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
                     description="Compile",
                     input_schema={},
                 ),
+                ToolSpec(name="browser_click", description="Effect", input_schema={}),
             )
 
         async def invoke(self, name, context, arguments):
@@ -2360,6 +2361,14 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
                     metadata={
                         "preferred_next_tool": "browser_compile_api_handoff",
                         "preferred_next_tool_mode": "after_one_admitted_action",
+                    },
+                )
+            if name == "browser_wait_for_text":
+                return ToolResult(
+                    content="final observation",
+                    metadata={
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "strict",
                     },
                 )
             return ToolResult(content="done")
@@ -2380,6 +2389,10 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
             if call_number == 3:
+                yield ToolCall(call_id="effect", name="browser_click", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 4:
                 yield ToolCall(call_id="compile", name="browser_compile_api_handoff", arguments={})
                 yield ModelCompleted(finish_reason="tool_calls")
                 return
@@ -2397,12 +2410,23 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
         "browser_snapshot",
         "browser_wait_for_text",
         "browser_compile_api_handoff",
+        "browser_click",
     ]
     assert provider.requests[1].required_tool_name is None
     assert [tool["function"]["name"] for tool in provider.requests[2].tools] == [
-        "browser_compile_api_handoff"
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_compile_api_handoff",
+        "browser_click",
     ]
-    assert provider.requests[2].required_tool_name == "browser_compile_api_handoff"
+    assert provider.requests[2].required_tool_name is None
+    assert [tool["function"]["name"] for tool in provider.requests[3].tools] == [
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_compile_api_handoff",
+        "browser_click",
+    ]
+    assert provider.requests[3].required_tool_name is None
     assert tools.calls == [
         "browser_snapshot",
         "browser_wait_for_text",
@@ -8316,7 +8340,7 @@ async def test_buffered_after_one_mode_admits_only_one_nonpreferred_batch_action
 
     assert tools.calls == ["browser_snapshot"]
     assert next_tool == "browser_compile_api_handoff"
-    assert next_mode == "strict"
+    assert next_mode == "after_one_admitted_action_consumed"
     rejected = [
         message.name
         for message in store.messages[session_id]
