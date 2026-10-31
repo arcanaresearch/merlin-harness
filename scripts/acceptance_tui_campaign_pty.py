@@ -449,8 +449,6 @@ def _settle(tui: Tui, boot_timeout: float, *, resume_existing: bool = False) -> 
             )
             continue
         if "daemon attached" in visible:
-            if gate_answered and "Resume last session" in visible:
-                continue
             if resume_existing and "campaign totals below" not in visible:
                 continue
             # The startup gate and composer focus settle on separate Textual

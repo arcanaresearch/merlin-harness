@@ -220,3 +220,36 @@ def test_resume_settle_waits_for_full_gate_and_restored_campaign() -> None:
 
     assert tui.sent == ["1"]
     assert "campaign totals below" in tui.visible_text
+
+
+def test_new_session_settle_ignores_gate_text_in_history() -> None:
+    module = _script_module()
+
+    class Tui:
+        def __init__(self) -> None:
+            self.sent = []
+            self.frames = (
+                "Resume last session\nNew session\nEnter starts a new session",
+                "Resume last session\ndaemon attached\nWelcome",
+            )
+            self.visible_text = "ready · /help"
+
+        def wait(self, _text, _timeout):
+            return None
+
+        def _pump(self, _timeout):
+            index = min(len(self.sent), len(self.frames) - 1)
+            self.visible_text = self.frames[index]
+            return True
+
+        def visible(self):
+            return self.visible_text
+
+        def send(self, text):
+            self.sent.append(text)
+
+    tui = Tui()
+
+    module._settle(tui, 0.5)
+
+    assert tui.sent == ["2"]
