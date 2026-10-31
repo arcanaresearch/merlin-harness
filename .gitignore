@@ -23,7 +23,6 @@ target/
 *.log
 api_cred.md
 credentials.json
-.gitnexus
 .claude/
 .playwright-mcp
 tmp

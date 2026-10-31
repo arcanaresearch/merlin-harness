@@ -2785,7 +2785,16 @@ async def restart_persistent(
         session._page_refs.clear()
         session._openers.clear()
         session._owned_pages.clear()
-        await _restore_tabs(session, metadata)
+        restorable_tabs = []
+        for tab in metadata.tabs:
+            if tab.state != "open":
+                continue
+            try:
+                session._require_url(tab.url, allow_blank=True)
+            except OriginDenied:
+                continue
+            restorable_tabs.append(tab)
+        await _restore_tabs(session, metadata.model_copy(update={"tabs": tuple(restorable_tabs)}))
     except BaseException:
         await session.close()
         raise

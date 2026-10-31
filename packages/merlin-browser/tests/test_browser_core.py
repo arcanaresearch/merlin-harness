@@ -18164,6 +18164,46 @@ async def test_persistent_browser_reopens_after_only_tab_was_closed(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_restart_persistent_skips_out_of_bounds_metadata_tabs(tmp_path: Path) -> None:
+    async with web_fixture() as target_origin, web_fixture() as foreign_origin:
+        profile = tmp_path / "shared-profile"
+        foreign = await launch_persistent(
+            profile,
+            BrowserBounds(target_id="foreign", allowed_origins={foreign_origin}),
+            owner(),
+            headless=True,
+        )
+        await foreign.new_tab(foreign_origin)
+        contaminated = foreign.metadata(restart=True)
+        await foreign.close()
+
+        bounds = BrowserBounds(target_id="target-with-auth", allowed_origins={target_origin})
+        contaminated = contaminated.model_copy(
+            update={
+                "target_id": bounds.target_id,
+                "allowed_origins": bounds.allowed_origins,
+            }
+        )
+        restarted = await restart_persistent(
+            contaminated,
+            bounds,
+            owner(),
+            profile,
+            headless=True,
+        )
+        try:
+            assert restarted.metadata().tabs == ()
+
+            tab_ref = await restarted.new_tab(target_origin)
+            observation = await restarted.snapshot(tab_ref)
+
+            assert observation.tab_ref == tab_ref
+            assert "Run" in observation.text
+        finally:
+            await restarted.close()
+
+
+@pytest.mark.asyncio
 async def test_restarted_persistent_browser_recovers_obsolete_ref_for_only_live_tab(
     tmp_path: Path,
 ) -> None:
