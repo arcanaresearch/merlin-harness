@@ -5043,7 +5043,7 @@ class DurableSchedulerStore:
                     and effect["state"] == "reconciled"
                     and isinstance(metadata, Mapping)
                     and metadata.get("target_effect_dispatch_status") == "revoked_before_dispatch"
-                    and target_session_matches
+                    and permit.get("target_session_id") == effect_session
                 )
                 continue
             if not target_session_matches:

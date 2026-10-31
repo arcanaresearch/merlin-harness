@@ -1621,6 +1621,102 @@ async def test_pg0_completed_retry_releases_aggregate_lane_with_prior_effect(
 
 
 @pytest.mark.asyncio
+async def test_pg0_completed_retry_accepts_revoked_predecessor_session(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-revoked-lineage")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("revoked predecessor session")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            node_id = f"worker:{tasks[0]}"
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first = store.claim(
+                schedule_id,
+                node_id,
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            revoked_session_id = "api:revoked-before-retry"
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=first.id,
+                    call_id="call-revoked-before-retry",
+                )
+            )
+            store.final_target_effect_admitted(
+                schedule_id,
+                node_id,
+                first.id,
+                first.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={**admission, "target_session_id": revoked_session_id},
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            store.settle_attempt(
+                first.id,
+                first.generation,
+                "failed",
+                reason="worker failed before dispatch",
+                checkpoint={"nodes": {}},
+            )
+            current = store.load_schedule(schedule_id)
+            assert current is not None
+            store.retry_failed(
+                schedule_id,
+                node_id,
+                checkpoint={"nodes": {}},
+                expected_event_count=current["event_count"],
+            )
+            replacement_session_id = "api:completed-replacement"
+            replacement_admission = {**admission, "target_session_id": replacement_session_id}
+            replacement = store.claim(
+                schedule_id,
+                node_id,
+                "worker:replacement",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=replacement_admission,
+            )
+            store.commit_reducer(
+                replacement.id,
+                replacement.generation,
+                schema_id="schema/result",
+                result={"content": "replacement completed without a new target call"},
+                checkpoint={"nodes": {}},
+                target_session_id=replacement_session_id,
+            )
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                    target_session_id=replacement_session_id,
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("recovery_mode", ("sibling", "replacement"))
 async def test_pg0_expired_nonmaterial_target_effect_allows_exact_recovery(
     tmp_path: Path, recovery_mode: str
