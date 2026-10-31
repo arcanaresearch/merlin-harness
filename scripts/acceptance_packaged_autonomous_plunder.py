@@ -108,9 +108,22 @@ async def _start_owned_release(binary: Path) -> LocalControlClient:
         "a Merlin daemon is already running; refusing to replace or stop an unrelated owner",
     )
     await _launcher(binary, "start")
-    owner = LocalControlClient(owns_daemon=True)
-    await owner.acquire_foreground_lease()
-    return owner
+    return LocalControlClient(owns_daemon=True)
+
+
+async def _claim_owned_lease(owner: LocalControlClient, timeout_seconds: float = 120) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        try:
+            await owner.acquire_foreground_lease()
+            return
+        except RuntimeError as error:
+            if (
+                "already has a foreground owner" not in str(error)
+                or asyncio.get_running_loop().time() >= deadline
+            ):
+                raise
+            await asyncio.sleep(0.05)
 
 
 async def _restart_owned_release(binary: Path, owner: LocalControlClient) -> LocalControlClient:
@@ -467,6 +480,7 @@ async def _run(args: argparse.Namespace) -> None:
             LIVE_OBJECTIVE,
             timeout_seconds=args.approval_timeout,
         )
+        await _claim_owned_lease(owner)
 
         rows = _plain(await client.list_campaigns())
         _require(isinstance(rows, list), "campaign list is not an array")

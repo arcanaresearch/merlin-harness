@@ -1565,9 +1565,10 @@ def test_unadmitted_native_tool_call_fails_before_reaching_kernel() -> None:
     events = asyncio.run(run())
     assert len(events) == 1
     assert isinstance(events[0], ModelError)
-    assert events[0].code == "malformed_tool_call"
-    assert events[0].tool_name == "assessment_prepare"
-    assert "browser_compile_api_handoff" not in events[0].message
+    assert events[0].code == "unadmitted_tool_call"
+    assert events[0].tool_name == "browser_compile_api_handoff"
+    assert "browser_compile_api_handoff" in events[0].message
+    assert "assessment_prepare" in events[0].message
     assert not any(isinstance(event, ToolCall) for event in events)
 
 

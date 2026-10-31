@@ -1011,12 +1011,13 @@ class OpenAICompatibleProvider:
                 events.append(
                     ModelError(
                         message=(
-                            f"provider returned an unadmitted native tool call; expected {expected}"
+                            f"provider returned an unadmitted native tool call `{name}`; "
+                            f"expected {expected}"
                         ),
-                        code="malformed_tool_call",
+                        code="unadmitted_tool_call",
                         retryable=True,
                         partial=partial,
-                        tool_name=required_tool_name,
+                        tool_name=name,
                         failure_kind=ProviderFailureKind.FORMATTING,
                     )
                 )

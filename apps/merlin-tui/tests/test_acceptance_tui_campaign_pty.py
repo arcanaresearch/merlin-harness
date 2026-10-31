@@ -148,3 +148,36 @@ def test_approval_uses_durable_execution_without_mock_execute_response() -> None
 
     assert result == ("campaign/hybrid", len(b"review"))
     assert tui.sent == ["approve"]
+
+
+def test_cleanup_escalates_failed_graceful_stop() -> None:
+    module = _script_module()
+    calls = []
+
+    def cli(_binary, _home, _workspace, *args):
+        calls.append(args)
+        if args == ("stop",):
+            raise AssertionError("graceful shutdown timed out")
+        return ""
+
+    module._cli = cli
+
+    module._stop_daemon(Path("binary"), Path("home"), Path("workspace"))
+
+    assert calls == [("stop",), ("stop", "--force")]
+
+
+def test_cleanup_does_not_hide_force_stop_failure() -> None:
+    module = _script_module()
+
+    def cli(_binary, _home, _workspace, *args):
+        raise RuntimeError(f"failed: {' '.join(args)}")
+
+    module._cli = cli
+
+    try:
+        module._stop_daemon(Path("binary"), Path("home"), Path("workspace"))
+    except RuntimeError as error:
+        assert str(error) == "failed: stop --force"
+    else:
+        raise AssertionError("force-stop failure was hidden")

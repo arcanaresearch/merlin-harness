@@ -70,6 +70,54 @@ def test_main_reports_keyboard_interrupt_without_traceback(
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.asyncio
+async def test_start_owned_release_leaves_lease_for_campaign_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _script_module()
+    commands = []
+
+    class Owner:
+        def __init__(self) -> None:
+            self.lease_calls = 0
+
+        async def acquire_foreground_lease(self):
+            self.lease_calls += 1
+
+    owner = Owner()
+
+    async def launcher(_binary, *args, timeout_seconds=120):
+        commands.append(args)
+        return "stopped" if args == ("status",) else ""
+
+    monkeypatch.setattr(module, "_launcher", launcher)
+    monkeypatch.setattr(module, "LocalControlClient", lambda owns_daemon: owner)
+
+    assert await module._start_owned_release(Path("merlin")) is owner  # noqa: SLF001
+    assert commands == [("status",), ("start",)]
+    assert owner.lease_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_owned_lease_allows_cli_eof_handoff() -> None:
+    module = _script_module()
+
+    class Owner:
+        def __init__(self) -> None:
+            self.lease_calls = 0
+
+        async def acquire_foreground_lease(self):
+            self.lease_calls += 1
+            if self.lease_calls < 3:
+                raise RuntimeError("Merlin already has a foreground owner")
+
+    owner = Owner()
+
+    await module._claim_owned_lease(owner, timeout_seconds=1)  # noqa: SLF001
+
+    assert owner.lease_calls == 3
+
+
 def test_composition_assertion_requires_autonomous() -> None:
     module = _script_module()
     module._assert_autonomous(  # noqa: SLF001

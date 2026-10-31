@@ -383,6 +383,13 @@ def _cli(binary: Path, home: Path, workspace: Path, *args: str) -> str:
     return result.stdout
 
 
+def _stop_daemon(binary: Path, home: Path, workspace: Path) -> None:
+    try:
+        _cli(binary, home, workspace, "stop")
+    except Exception:
+        _cli(binary, home, workspace, "stop", "--force")
+
+
 def _campaign_summary(
     binary: Path, home: Path, workspace: Path, campaign_id: str
 ) -> dict[str, object]:
@@ -1119,10 +1126,7 @@ def main() -> int:
                 pass
         if tui is not None:
             tui.stop()
-        try:
-            _cli(binary, home, workspace, "stop")
-        except Exception:
-            pass
+        _stop_daemon(binary, home, workspace)
         llm.shutdown()
         target.close()
 

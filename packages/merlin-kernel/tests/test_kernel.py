@@ -2435,6 +2435,87 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
 
 
 @pytest.mark.asyncio
+async def test_unadmitted_native_tool_error_preserves_bounded_handoff_fallback() -> None:
+    class HandoffTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="browser_network_events", description="Network", input_schema={}),
+                ToolSpec(
+                    name="browser_compile_api_handoff",
+                    description="Compile",
+                    input_schema={},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_network_events":
+                return ToolResult(
+                    content="captured exchange evidence",
+                    metadata={
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "after_one_admitted_action",
+                    },
+                )
+            return ToolResult(content="compiled")
+
+    class Provider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number <= 2:
+                yield ToolCall(
+                    call_id=f"observe-{call_number}",
+                    name="browser_network_events",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number <= 5:
+                yield ModelError(
+                    message="provider returned an unadmitted native tool call",
+                    code="unadmitted_tool_call",
+                    retryable=True,
+                    tool_name="browser_network_events",
+                )
+                return
+            if call_number == 6:
+                yield ToolCall(
+                    call_id="compile",
+                    name="browser_compile_api_handoff",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="compiled")
+            yield ModelCompleted()
+
+    provider = Provider()
+    tools = HandoffTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings(), max_provider_retries=2)
+    await kernel.start()
+    await kernel.submit("recon")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == 7
+    assert all(request.required_tool_name is None for request in provider.requests[1:])
+    assert all(len(request.tools) == 2 for request in provider.requests[2:6])
+    assert tools.calls == [
+        "browser_network_events",
+        "browser_network_events",
+        "browser_compile_api_handoff",
+    ]
+    assert not any(event.type == "error" for event in store.events)
+
+
+@pytest.mark.asyncio
 async def test_preferred_tool_refusal_is_uncertain_then_cooperates() -> None:
     class FollowThroughTools(Tools):
         def __init__(self):

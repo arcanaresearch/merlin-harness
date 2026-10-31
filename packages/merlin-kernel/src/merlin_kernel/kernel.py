@@ -2560,6 +2560,19 @@ class Kernel:
                             assistant = ""
                             reasoning = ""
                             break
+                        if (
+                            event.code == "unadmitted_tool_call"
+                            and request_preferred_tool_name is not None
+                            and not request_preferred_tool_is_strict
+                        ):
+                            disposition = await handle_preferred_tool_miss(
+                                request_preferred_tool_name
+                            )
+                            if disposition in {"retry", "released"}:
+                                assistant = ""
+                                reasoning = ""
+                                retry_provider = True
+                                break
                         failure_category = provider_failure_category(event.code)
                         provider_already_retried_transport = (
                             not event.partial and event.code in _PROVIDER_OWNED_TRANSPORT_RETRIES
