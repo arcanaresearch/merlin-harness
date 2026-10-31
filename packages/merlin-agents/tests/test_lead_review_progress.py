@@ -249,6 +249,54 @@ async def test_wave_progress_projects_blocking_incremental_merge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wave_progress_completed_merge_clears_stale_task_review() -> None:
+    class Store:
+        def list_waves(self, _campaign_id):
+            return [
+                {
+                    "wave": 3,
+                    "kind": "frontier",
+                    "status": "running",
+                    "schedule_id": "schedule-3",
+                    "target_id": "target-1",
+                }
+            ]
+
+        def list_lead(self, _campaign_id):
+            return [
+                {
+                    "payload": {
+                        "kind": "incremental_task_review_started",
+                        "schedule_id": "schedule-3",
+                        "task_id": "task-1",
+                    }
+                },
+                {
+                    "payload": {
+                        "kind": "incremental_review_merge_started",
+                        "schedule_id": "schedule-3",
+                        "review_count": 1,
+                    }
+                },
+                {
+                    "payload": {
+                        "kind": "incremental_review_merge_completed",
+                        "schedule_id": "schedule-3",
+                        "review_count": 1,
+                    }
+                },
+            ]
+
+    class Agents:
+        async def target_progress(self, _campaign_id, _target_id):
+            return {}
+
+    service = CampaignService(Store(), Agents(), None)  # type: ignore[arg-type]
+
+    assert (await service.wave_progress("campaign-1"))["review_progress"] == {}
+
+
+@pytest.mark.asyncio
 async def test_wave_progress_includes_reviewed_reconnaissance_state() -> None:
     observed_at = datetime.now(UTC).isoformat()
 

@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import merlin_storage_postgres.scheduler_store as scheduler_store_module
@@ -291,6 +291,54 @@ def test_scheduler_rejects_oversized_artifact_before_opening_transaction(
     assert connection.execute_called is False
 
 
+def test_schedule_event_count_does_not_read_graph() -> None:
+    class Connection:
+        def execute(self, query, *args, **kwargs):
+            normalized = " ".join(str(query).split())
+            assert normalized == (
+                "SELECT event_count FROM merlin_storage.scheduler_schedules WHERE id = %s"
+            )
+            assert args == (("schedule-1",),)
+            return SimpleNamespace(fetchone=lambda: {"event_count": 7})
+
+    assert DurableSchedulerStore(Connection()).schedule_event_count("schedule-1") == 7
+
+
+def test_list_result_contents_projects_text_without_decoding_payload() -> None:
+    class Connection:
+        def execute(self, query, *args, **kwargs):
+            normalized = " ".join(str(query).split())
+            assert "COALESCE(payload->>'content', payload::text) AS content" in normalized
+            assert "payload, payload_digest" not in normalized
+            return SimpleNamespace(
+                fetchall=lambda: [
+                    {
+                        "attempt_id": "attempt-1",
+                        "schedule_id": "schedule-1",
+                        "node_id": "worker:one",
+                        "content": "result",
+                    }
+                ]
+            )
+
+    rows = DurableSchedulerStore(Connection()).list_result_contents("schedule-1")
+
+    assert rows[0]["content"] == "result"
+
+
+def test_list_result_progress_uses_scalar_checkpoint_fields() -> None:
+    class Connection:
+        def execute(self, query, *args, **kwargs):
+            normalized = " ".join(str(query).split())
+            assert "active_phase" in normalized
+            assert "turns_completed" in normalized
+            assert "action_count" in normalized
+            assert "payload, payload_digest" not in normalized
+            return SimpleNamespace(fetchall=lambda: [])
+
+    assert DurableSchedulerStore(Connection()).list_result_progress("schedule-1") == []
+
+
 def test_pg0_scheduler_fences_stale_attempt_and_commits_reducer_atomically(
     tmp_path: Path,
 ) -> None:
@@ -385,6 +433,88 @@ def test_pg0_scheduler_fences_stale_attempt_and_commits_reducer_atomically(
                 for previous, current in zip(events, events[1:], strict=False)
             )
             store.verify(schedule_id)
+
+
+def test_heartbeat_and_effect_adoption_share_schedule_before_attempt_lock_order(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-attempt-lock-order")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("scheduler lock order")
+            store = DurableSchedulerStore(connection)
+            schedule_id = store.create_schedule(
+                session.id,
+                {"nodes": ["worker"]},
+                {"completed": []},
+                ["worker"],
+                ready_nodes=["worker"],
+            )
+            lease = store.claim(
+                schedule_id,
+                "worker",
+                "agent-1",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            )
+
+        schedule_locked = Event()
+        heartbeat_progress = Event()
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def execute(self, query, *args, **kwargs):
+                normalized = " ".join(str(query).split())
+                if (
+                    "FROM merlin_storage.scheduler_schedules" in normalized
+                    and "FOR UPDATE" in normalized
+                ):
+                    heartbeat_progress.set()
+                result = self._connection.execute(query, *args, **kwargs)
+                if (
+                    "FROM merlin_storage.scheduler_attempts AS attempt" in normalized
+                    and "FOR UPDATE" in normalized
+                ):
+                    heartbeat_progress.set()
+                return result
+
+        def adopt_effect() -> str:
+            with database.connect() as connection, connection.transaction():
+                connection.execute("SET LOCAL deadlock_timeout = '100ms'")
+                connection.execute(
+                    "SELECT id FROM merlin_storage.scheduler_schedules WHERE id = %s FOR UPDATE",
+                    (schedule_id,),
+                )
+                schedule_locked.set()
+                assert heartbeat_progress.wait(3)
+                connection.execute(
+                    "SELECT id FROM merlin_storage.scheduler_attempts WHERE id = %s FOR UPDATE",
+                    (lease.id,),
+                )
+            return "effect"
+
+        def heartbeat() -> str:
+            assert schedule_locked.wait(3)
+            with database.connect() as connection:
+                connection.execute("SET deadlock_timeout = '100ms'")
+                DurableSchedulerStore(ObservedConnection(connection)).heartbeat(
+                    lease.id,
+                    lease.generation,
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+                )
+            return "heartbeat"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            effect = executor.submit(adopt_effect)
+            settlement = executor.submit(heartbeat)
+            assert {effect.result(timeout=5), settlement.result(timeout=5)} == {
+                "effect",
+                "heartbeat",
+            }
 
 
 def _prepare_target_transition_campaign(connection, session_id: str):
@@ -1381,6 +1511,250 @@ async def test_pg0_target_effect_permit_adopts_finishes_and_releases_lane(
                     schedule_id=schedule_id,
                     target_id=target_id,
                     assignment_id=tasks[1],
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
+async def test_pg0_completed_retry_releases_aggregate_lane_with_prior_effect(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-target-retry-lineage")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("completed target retry lineage")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            node_id = f"worker:{tasks[0]}"
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first = store.claim(
+                schedule_id,
+                node_id,
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            physical_session_id = "api:retry-lineage"
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=first.id,
+                    call_id="call-before-retry",
+                )
+            )
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                node_id,
+                first.id,
+                first.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission={**admission, "target_session_id": physical_session_id},
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            adopted, _ = await effects.adopt_permitted(intent, permit_digest)
+            await effects.finish(
+                adopted.model_copy(
+                    update={
+                        "state": ToolEffectState.ACKNOWLEDGED,
+                        "result_content": "target replied",
+                        "result_is_error": False,
+                        "result_metadata": {"target_session_id": physical_session_id},
+                    }
+                )
+            )
+            store.settle_attempt(
+                first.id,
+                first.generation,
+                "failed",
+                reason="worker failed after an acknowledged target effect",
+                checkpoint={"nodes": {}},
+            )
+            current = store.load_schedule(schedule_id)
+            assert current is not None
+            store.retry_failed(
+                schedule_id,
+                node_id,
+                checkpoint={"nodes": {}},
+                expected_event_count=current["event_count"],
+            )
+            replacement = store.claim(
+                schedule_id,
+                node_id,
+                "worker:replacement",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            store.commit_reducer(
+                replacement.id,
+                replacement.generation,
+                schema_id="schema/result",
+                result={"content": "replacement completed"},
+                checkpoint={"nodes": {}},
+            )
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                ),
+            )
+            assert sibling.node_id == f"worker:{tasks[1]}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_mode", ("sibling", "replacement"))
+async def test_pg0_expired_nonmaterial_target_effect_allows_exact_recovery(
+    tmp_path: Path, recovery_mode: str
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-nonmaterial-recovery")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("nonmaterial target recovery")
+            store, _campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            node_id = f"worker:{tasks[0]}"
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first = store.claim(
+                schedule_id,
+                node_id,
+                "worker:first",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            physical_session_id = "api:expired-nonmaterial"
+            recovery_admission = {**admission, "target_session_id": physical_session_id}
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=first.id,
+                    call_id="call-before-expiry",
+                )
+            )
+            permit_digest = store.final_target_effect_admitted(
+                schedule_id,
+                node_id,
+                first.id,
+                first.generation,
+                tool_name=intent.tool_name,
+                call_id=intent.call_id,
+                target_admission=recovery_admission,
+                effect_intent=intent.model_dump(mode="json"),
+            )
+            effects = PostgresToolEffectStore(ToolEffectRepository(connection))
+            adopted, _ = await effects.adopt_permitted(intent, permit_digest)
+            await effects.finish(
+                adopted.model_copy(
+                    update={
+                        "state": ToolEffectState.ACKNOWLEDGED,
+                        "result_content": "target replied before expiry",
+                        "result_is_error": False,
+                        "result_metadata": {"target_session_id": physical_session_id},
+                    }
+                )
+            )
+            connection.execute(
+                """UPDATE merlin_storage.scheduler_attempts
+                   SET lease_expires_at = now() - interval '1 second' WHERE id = %s""",
+                (first.id,),
+            )
+            connection.commit()
+            store.expire(first.id, first.generation)
+            connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_schedule_id = %s, lane_node_id = %s,
+                       lane_assignment_id = %s, lane_attempt_id = %s,
+                       lane_generation = %s, lane_recovery_required = true,
+                       lane_recovery_root_attempt_id = %s
+                   WHERE campaign_id = %s AND target_id = %s AND target_session_id = %s""",
+                (
+                    schedule_id,
+                    node_id,
+                    tasks[0],
+                    first.id,
+                    first.generation,
+                    first.id,
+                    campaign_id,
+                    target_id,
+                    physical_session_id,
+                ),
+            )
+            connection.commit()
+            if recovery_mode == "replacement":
+                replacement = store.claim(
+                    schedule_id,
+                    node_id,
+                    "worker:replacement",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=recovery_admission,
+                )
+                assert replacement.replaced_attempt_id == first.id
+                assert replacement.lane_recovery_required is True
+                recovery_body = {
+                    "schema": "merlin.target-lane-recovery.v1",
+                    "prior_attempt_id": first.id,
+                    "effect_ids": [intent.idempotency_key],
+                    "outcome": "no_material_transition",
+                }
+                store.resolve_target_lane_recovery(
+                    schedule_id,
+                    node_id,
+                    replacement.id,
+                    replacement.generation,
+                    target_admission=recovery_admission,
+                    recovery={
+                        **recovery_body,
+                        "recovery_digest": _qualified(recovery_body),
+                    },
+                )
+                store.commit_reducer(
+                    replacement.id,
+                    replacement.generation,
+                    schema_id="schema/result",
+                    result={"content": "replacement completed"},
+                    checkpoint={"nodes": {}},
+                    target_session_id=physical_session_id,
+                )
+            sibling = store.claim(
+                schedule_id,
+                f"worker:{tasks[1]}",
+                "worker:sibling",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=_target_admission(
+                    campaign_id=campaign_id,
+                    session_id=str(session.id),
+                    schedule_id=schedule_id,
+                    target_id=target_id,
+                    assignment_id=tasks[1],
+                    target_session_id=physical_session_id,
                 ),
             )
             assert sibling.node_id == f"worker:{tasks[1]}"

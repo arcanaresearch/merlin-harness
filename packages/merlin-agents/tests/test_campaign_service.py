@@ -17849,6 +17849,57 @@ async def test_frontier_reviews_tasks_concurrently_then_merges_before_next_claim
     assert any(event.get("kind") == "incremental_review_merge_completed" for event in events)
 
 
+async def test_incremental_task_review_timeout_cannot_freeze_wave_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+    events: list[dict[str, object]] = []
+
+    class Store:
+        def append_lead(self, _campaign_id, _wave, payload):
+            events.append(dict(payload))
+
+    async def lead(*_args):
+        return LeadAssessment("unused", False)
+
+    async def review_forever(*_args):
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    service = CampaignService(  # type: ignore[arg-type]
+        Store(),
+        object(),
+        preparation,
+        lead,
+        task_review_runner=review_forever,
+        stalled_after_seconds=0.01,
+    )
+
+    async def compact_context(*_args):
+        return {"evidence_digest": "sha256:fixture"}
+
+    monkeypatch.setattr(service, "_incremental_review_context", compact_context)
+    task = AgentTask(id="task-timeout", objective="probe", status="completed")
+
+    with pytest.raises(TimeoutError):
+        await service._review_terminal_task(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            3,
+            "schedule-frontier",
+            task,
+            (task,),
+        )
+
+    assert [event.get("kind") for event in events] == [
+        "incremental_task_review_started",
+        "incremental_task_review_failed",
+    ]
+    assert events[-1]["error_type"] == "builtins.TimeoutError"
+
+
 @pytest.mark.parametrize(
     (
         "is_error",

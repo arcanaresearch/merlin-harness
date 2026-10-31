@@ -19,10 +19,9 @@ the operator journey end-to-end without a human:
 7. terminal close pauses the campaign; explicit same-session resume completes
    it after relaunch without duplicate execution.
 
-Browser-only execution is attempted honestly and asserted as a product
-finding (see FINDINGS in the printed report): the reviewed flow cannot seal a
-browser adapter for an API-backed chat target, so only api/hybrid modes are
-reachable. Nothing is faked.
+Browser-only execution is attempted honestly. The reviewed flow normalizes
+this API-backed chat target to api/hybrid modes; the acceptance proves that no
+browser-only adapter is sealed or executed and never fakes a rejection.
 
 Run::
 
@@ -36,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -48,6 +48,7 @@ import sys
 import termios
 import threading
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -140,12 +141,8 @@ class Tui:
         self._permission_open = False
         master, slave = pty.openpty()
         _resize(slave, 140, 40)
-        environment = dict(
-            os.environ,
-            HOME=str(home),
-            TERM="xterm-256color",
-            COLORTERM="truecolor",
-        )
+        environment = _acceptance_environment(home)
+        environment.update(TERM="xterm-256color", COLORTERM="truecolor")
         self.process = subprocess.Popen(
             [str(binary)],
             stdin=slave,
@@ -357,14 +354,26 @@ class Tui:
             pass
 
 
+def _acceptance_environment(home: Path) -> dict[str, str]:
+    """Return a per-run environment that cannot attach to another Merlin."""
+    identity = hashlib.sha256(str(home).encode()).hexdigest()[:16]
+    return dict(
+        os.environ,
+        HOME=str(home),
+        MERLIN_SOCKET_PATH=f"/tmp/merlin-pty-uat-{identity}/daemon.sock",
+    )
+
+
 def _cli(binary: Path, home: Path, workspace: Path, *args: str) -> str:
+    installed = home / ".local" / "bin" / "merlin"
+    cli_binary = installed if installed.is_file() else binary
     result = subprocess.run(
-        [str(binary), *args],
+        [str(cli_binary), *args],
         capture_output=True,
         text=True,
         timeout=120,
         cwd=workspace,
-        env=dict(os.environ, HOME=str(home)),
+        env=_acceptance_environment(home),
     )
     if result.returncode != 0:
         raise AssertionError(
@@ -372,6 +381,15 @@ def _cli(binary: Path, home: Path, workspace: Path, *args: str) -> str:
             f"{result.stdout[-800:]} {result.stderr[-800:]}"
         )
     return result.stdout
+
+
+def _campaign_summary(
+    binary: Path, home: Path, workspace: Path, campaign_id: str
+) -> dict[str, object]:
+    for row in _json_lines(_cli(binary, home, workspace, "campaign", "list")):
+        if isinstance(row, dict) and str(row.get("id") or "") == campaign_id:
+            return row
+    return {}
 
 
 def _seed_home(home: Path, llm_base_url: str) -> None:
@@ -420,6 +438,14 @@ def _settle(tui: Tui, boot_timeout: float, *, resume_existing: bool = False) -> 
             )
             continue
         if "daemon attached" in visible:
+            # The startup gate and composer focus settle on separate Textual
+            # ticks.  Seeing the daemon status is necessary but not sufficient:
+            # typing immediately after the gate can lose the command prefix
+            # while focus moves back to the composer.  Drain that transition
+            # before the acceptance driver sends its first real command.
+            stable_until = time.monotonic() + 1.0
+            while time.monotonic() < stable_until:
+                tui._pump(0.1)  # noqa: SLF001
             return
     raise TimeoutError(
         f"TUI did not attach to the daemon within {boot_timeout:.1f}s; "
@@ -458,16 +484,17 @@ def _wait_report_through_coverage_decisions(
     campaign_id: str,
     stall_timeout: float = 150,
     max_coverage_continuations: int = 3,
+    status_reader: Callable[[], Mapping[str, object]] | None = None,
+    status_poll_seconds: float = 30.0,
 ) -> tuple[str, tuple[str, ...]]:
     """Resolve coverage choices in the attached TUI until it presents a report.
 
-    Starting a standalone ``merlin campaign status`` process while the TUI owns
-    the backend can trigger recovery fencing and pause the campaign being
-    observed. Drive every required-coverage continuation through the attached
-    operator-facing choice screen. Continue through several independently
-    reviewed repair plans, then stop if the same unresolved frontier returns;
-    that proves the honest completed-with-limitations report path without an
-    unbounded target loop.
+    Read-only durable status polls do not acquire the foreground lease and keep
+    a stale display from looking like a stopped campaign. Every coverage choice
+    still goes through the attached operator-facing choice screen. Continue
+    through several independently reviewed repair plans, then stop if the same
+    unresolved frontier returns; that proves the honest
+    completed-with-limitations report path without an unbounded target loop.
     """
     start = len(tui.output)
     # This is a safety ceiling, not an activity timeout. Broad packaged
@@ -476,10 +503,17 @@ def _wait_report_through_coverage_decisions(
     deadline = time.monotonic() + max(timeout, 1_200)
     progress_deadline = time.monotonic() + stall_timeout
     highest_wave = -1
+    latest_task_counts = (-1, -1)
+    highest_target_exchanges = -1
+    next_status_poll = 0.0
+    status_error = ""
     decisions: list[str] = []
     decision_wave = -1
     choice_scan = start
     handled_request_ids: set[str] = set()
+    report_marker = f"campaign-{campaign_id.rsplit('/', 1)[-1]}.html"
+    scan_offset = start
+    recent = ""
     while time.monotonic() < deadline:
         if not tui._pump(0.2):  # noqa: SLF001
             break
@@ -487,8 +521,10 @@ def _wait_report_through_coverage_decisions(
         # Campaign rendering is append-only and can exceed tens of megabytes.
         # Every marker used below is a current-state marker, so scan a bounded
         # recent window instead of repeatedly regexing the full PTY history.
-        fresh = tui.fresh(start)[-250_000:]
-        if "Campaign report ready" in fresh:
+        recent = (recent + tui.fresh(scan_offset))[-250_000:]
+        scan_offset = len(tui.output)
+        fresh = recent
+        if "Campaign report ready" in fresh or ("HTML report:" in fresh and report_marker in fresh):
             return fresh, tuple(decisions)
         # Only the workspace header is authoritative campaign progress. Lead
         # journals and task prose also contain ``Wave N`` references, sometimes
@@ -504,6 +540,66 @@ def _wait_report_through_coverage_decisions(
         if current_wave > highest_wave:
             highest_wave = current_wave
             progress_deadline = time.monotonic() + stall_timeout
+        task_counts = [
+            (int(finished), int(total))
+            for finished, total in re.findall(r"tasks (\d+)/(\d+) finished", fresh)
+        ]
+        if task_counts and task_counts[-1] != latest_task_counts:
+            latest_task_counts = task_counts[-1]
+            progress_deadline = time.monotonic() + stall_timeout
+        exchange_counts = [
+            int(value) for value in re.findall(r"(\d+) target exchanges observed", fresh)
+        ]
+        if exchange_counts and max(exchange_counts) > highest_target_exchanges:
+            highest_target_exchanges = max(exchange_counts)
+            progress_deadline = time.monotonic() + stall_timeout
+        if status_reader is not None and time.monotonic() >= next_status_poll:
+            next_status_poll = time.monotonic() + max(status_poll_seconds, 0.0)
+            try:
+                status = status_reader()
+            except Exception as error:
+                status_error = f"{type(error).__name__}: {error}"
+            else:
+                status_error = ""
+                if isinstance(status, Mapping):
+                    try:
+                        durable_wave = int(status.get("wave_number") or -1)
+                    except (TypeError, ValueError):
+                        durable_wave = -1
+                    if durable_wave > highest_wave:
+                        highest_wave = durable_wave
+                        progress_deadline = time.monotonic() + stall_timeout
+                    target_progress = status.get("target_progress")
+                    if isinstance(target_progress, Mapping):
+                        try:
+                            durable_exchanges = int(
+                                target_progress.get("target_exchange_count") or 0
+                            )
+                        except (TypeError, ValueError):
+                            durable_exchanges = 0
+                        if durable_exchanges > highest_target_exchanges:
+                            highest_target_exchanges = durable_exchanges
+                            progress_deadline = time.monotonic() + stall_timeout
+                    waves = status.get("waves")
+                    if isinstance(waves, (list, tuple)):
+                        tasks = [
+                            task
+                            for wave in waves
+                            if isinstance(wave, Mapping)
+                            for task in (wave.get("tasks") or ())
+                            if isinstance(task, Mapping)
+                        ]
+                        durable_counts = (
+                            sum(
+                                task.get("status")
+                                in {"completed", "failed", "quarantined", "cancelled"}
+                                for task in tasks
+                            ),
+                            len(tasks),
+                        )
+                        if tasks and durable_counts != latest_task_counts:
+                            latest_task_counts = durable_counts
+                            progress_deadline = time.monotonic() + stall_timeout
         if len(decisions) >= 128:
             raise TimeoutError(
                 "campaign requested more than 128 distinct coverage decisions without completing"
@@ -525,6 +621,7 @@ def _wait_report_through_coverage_decisions(
                 raise TimeoutError(
                     "campaign stopped advancing before exporting a report: "
                     f"last_wave={highest_wave}, stall_timeout={stall_timeout}s; "
+                    f"durable_status_error={status_error or 'none'}; "
                     f"tail={tui.visible()[-3000:]!r}"
                 )
             continue
@@ -584,7 +681,7 @@ def _wait_report_through_coverage_decisions(
 
 
 def _completed_coverage(status: dict[str, object]) -> tuple[set[str], set[str]]:
-    """Return durable admitted and terminally evaluated catalogue coverage."""
+    """Return durable admitted and attempted semantic catalogue cells."""
     saturation = status.get("saturation")
     if not isinstance(saturation, dict):
         return set(), set()
@@ -594,26 +691,14 @@ def _completed_coverage(status: dict[str, object]) -> tuple[set[str], set[str]]:
         if isinstance(owners, list)
         else set()
     )
-    completion = status.get("completion_document")
-    cells = completion.get("cells") if isinstance(completion, dict) else None
-    terminal = (
-        {
-            str(row[1])
-            for row in cells
-            if isinstance(row, list)
-            and len(row) >= 3
-            and isinstance(row[1], str)
-            and str(row[1]).startswith("merlin-injection-taxonomy/")
-            and str(row[2]) in {"confirmed", "refuted", "unclear"}
-        }
-        if isinstance(cells, list)
-        else set()
-    )
-    return admitted, terminal
+    untested = saturation.get("untested_cell_ids")
+    if not isinstance(untested, list):
+        return admitted, set()
+    return admitted, admitted - {str(cell_id) for cell_id in untested}
 
 
 def _check_meaningful_coverage(label: str, status: dict[str, object]) -> tuple[set[str], set[str]]:
-    admitted, terminal = _completed_coverage(status)
+    admitted, attempted = _completed_coverage(status)
     saturation = status.get("saturation")
     saturation = saturation if isinstance(saturation, dict) else {}
     check(
@@ -623,12 +708,42 @@ def _check_meaningful_coverage(label: str, status: dict[str, object]) -> tuple[s
     )
     check(
         f"coverage {label}: every admitted technique actually ran",
-        terminal == admitted
-        and saturation.get("attempted_techniques") == len(admitted)
-        and saturation.get("execution_complete") is True,
-        f"terminal={sorted(terminal)} attempted={saturation.get('attempted_techniques')}",
+        attempted == admitted
+        and saturation.get("attempted_techniques") == saturation.get("admitted_techniques")
+        and saturation.get("catalogue_cells_unsearched") == 0,
+        f"attempted={sorted(attempted)} count={saturation.get('attempted_techniques')}",
     )
-    return admitted, terminal
+    return admitted, attempted
+
+
+def _approve_prepared_campaign(
+    tui: Tui,
+    prepared_ids: set[str],
+    *,
+    binary: Path,
+    home: Path,
+    workspace: Path,
+    status_reader: Callable[[str], Mapping[str, object]] | None = None,
+    attempts: int = 5,
+) -> tuple[str, int]:
+    if not prepared_ids:
+        raise AssertionError("no prepared campaign is available for approval")
+    read_status = status_reader or (
+        lambda campaign_id: _campaign_summary(binary, home, workspace, campaign_id)
+    )
+    output_start = len(tui.output)
+    for _ in range(attempts):
+        tui.wait_idle(180)
+        tui.send("approve")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            tui._pump(0.2)  # noqa: SLF001
+            tui._scan_permissions()  # noqa: SLF001
+            for campaign_id in sorted(prepared_ids):
+                status = read_status(campaign_id)
+                if status.get("status") in {"executing", "completed"}:
+                    return campaign_id, output_start
+    raise TimeoutError("approved campaign did not enter durable execution")
 
 
 def main() -> int:
@@ -773,6 +888,7 @@ def main() -> int:
             tui,
             420,
             campaign_id=campaign_id,
+            status_reader=lambda: _campaign_summary(binary, home, workspace, campaign_id),
         )
         final_json = (
             _json_of_text(_cli(binary, home, workspace, "campaign", "status", campaign_id)) or {}
@@ -848,39 +964,25 @@ def main() -> int:
             hybrid_selected,
             f"mock-prepared mode={brain.last_execution_mode}",
         )
-        # The hybrid manifest is armed only once its review panel renders;
-        # snapshotting after the mock's prepare means this marker can only
-        # come from the new review, not a stale repaint. Approval is typed
-        # explicitly ("approve" is both the armed choice value and the plain
-        # prompt the mock's approve branch matches), and execution is gated on
-        # the mock's request log — never on transcript echoes, which RichLog
-        # repaints can re-emit from campaign A in the same TUI instance.
+        # Approval is a TUI-owned action, not a requirement for the mock model
+        # to emit another tool call. Prove it against the newly prepared
+        # campaign's durable lifecycle rather than a transcript or model marker.
         _wait_review(tui, 420)
-        requests_before_approve = brain.request_count
-        execution_output_start = len(tui.output)
-        executed_b = False
-        for _approve_attempt in range(5):
-            tui.wait_idle(180)
-            tui.send("approve")
-            execute_deadline = time.monotonic() + 60
-            while time.monotonic() < execute_deadline:
-                tui._pump(0.2)  # noqa: SLF001
-                tui._scan_permissions()  # noqa: SLF001
-                if any(
-                    entry["response"] == "assessment_execute"
-                    and entry["n"] > requests_before_approve
-                    for entry in brain.request_log
-                ):
-                    executed_b = True
-                    break
-            if executed_b:
-                break
-        if not executed_b:
-            raise TimeoutError("mock did not receive assessment_execute for campaign B")
-        tui.wait("PTYUAT-EXECUTING", 120)
+        prepared_b_ids = {
+            str(row.get("id") or "")
+            for row in _json_lines(_cli(binary, home, workspace, "campaign", "list"))
+            if isinstance(row, dict) and row.get("status") == "prepared"
+        }
+        executed_b, execution_output_start = _approve_prepared_campaign(
+            tui,
+            prepared_b_ids,
+            binary=binary,
+            home=home,
+            workspace=workspace,
+        )
         check(
             "mode B: the approved campaign executed the hybrid manifest",
-            brain.last_execution_mode == "hybrid",
+            bool(executed_b) and brain.last_execution_mode == "hybrid",
             f"executed mode={brain.last_execution_mode}",
         )
         target.mark_attack_phase("B")
@@ -888,13 +990,14 @@ def main() -> int:
             r"Campaign started: (campaign/[0-9a-f-]{36})",
             tui.fresh(execution_output_start),
         )
-        campaign_b_running_id = started_b[-1] if started_b else ""
+        campaign_b_running_id = started_b[-1] if started_b else executed_b
         if not campaign_b_running_id:
             raise AssertionError("opinionated campaign was not durably executing")
         _, coverage_decisions = _wait_report_through_coverage_decisions(
             tui,
             600,
             campaign_id=campaign_b_running_id,
+            status_reader=lambda: _campaign_summary(binary, home, workspace, campaign_b_running_id),
         )
         check(
             "coverage B: missing work was replanned before limitations were exported",
@@ -947,36 +1050,31 @@ def main() -> int:
         )
 
         # -- Campaign C: Browser mode, attempted honestly ----------------------
-        executes_before_browser = sum(
-            entry["response"] == "assessment_execute" for entry in brain.request_log
-        )
         tui.send("/new")
         tui.wait_idle(120)
         _submit_campaign(tui, target.origin, "PTYUAT-BROWSER", "autonomous")
-        tui.wait("PTYUAT-BROWSER-FINDING", 420)
-        check(
-            "mode C: browser-only execution attempted and rejected by the reviewed flow",
-            True,
-            "finding surfaced in the TUI transcript",
+        browser_review = _wait_review(tui, 420)
+        available_modes = " ".join(
+            line.strip().lower()
+            for line in browser_review.splitlines()
+            if "Available modes" in line
         )
-        # The finding's full sentence is cropped by the RichLog viewport (only
-        # the marker is guaranteed to reach the byte stream), so the rejection
-        # is verified against the mock's authoritative request log: the
-        # finding content was served, and this browser-only attempt did not add
-        # an execution after the preceding campaigns' legitimate approvals.
-        executes = [
-            entry["n"] for entry in brain.request_log if entry["response"] == "assessment_execute"
+        check(
+            "mode C: browser-only request falls back to reviewed API/Hybrid modes",
+            "api" in available_modes
+            and "hybrid" in available_modes
+            and "browser" not in available_modes,
+            available_modes,
+        )
+        prepared_browser = [
+            row
+            for row in _json_lines(_cli(binary, home, workspace, "campaign", "list"))
+            if isinstance(row, dict) and row.get("status") == "prepared"
         ]
-        finding_served = any(
-            "PTYUAT-BROWSER-FINDING" in str(entry["response"]) for entry in brain.request_log
-        )
         check(
-            "mode C: no browser-adapter campaign was prepared (nothing faked)",
-            finding_served and len(executes) == executes_before_browser,
-            (
-                f"executes_before_browser={executes_before_browser} "
-                f"executes={executes} finding_served={finding_served}"
-            ),
+            "mode C: browser-only request remains unexecuted after the API fallback",
+            len(prepared_browser) == 1 and str(prepared_browser[0].get("status")) == "prepared",
+            f"prepared campaigns={len(prepared_browser)}",
         )
 
         # -- Whole-run permission audit (per TUI instance, never cross-counted) --

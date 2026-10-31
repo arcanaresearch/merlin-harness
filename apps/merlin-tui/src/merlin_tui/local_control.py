@@ -1919,10 +1919,14 @@ class LocalControlClient:
                         "kwargs": kwargs,
                     }
                 )
-                response = await channel.receive()
+                response = await channel.receive(
+                    deadline_seconds=configured_local_control_tuning().request_timeout_seconds
+                )
                 if response.get("type") == "error":
                     raise RuntimeError(str(response.get("error", "daemon request failed")))
                 return _decode(response.get("value"))
+            except TimeoutError:
+                raise
             except (ConnectionError, OSError):
                 if attempt:
                     raise

@@ -520,6 +520,14 @@ class DurableSchedulerStore:
         return _schedule_row(row)
 
     @_serialized
+    def schedule_event_count(self, schedule_id: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT event_count FROM merlin_storage.scheduler_schedules WHERE id = %s",
+            (schedule_id,),
+        ).fetchone()
+        return None if row is None else int(row["event_count"])
+
+    @_serialized
     def list_schedules(self, session_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """SELECT id, session_id, graph, graph_digest, checkpoint, checkpoint_digest,
@@ -565,7 +573,37 @@ class DurableSchedulerStore:
         """
         rows = self.connection.execute(
             """WITH scoped_schedules AS (
-                   SELECT schedule.id, schedule.session_id, schedule.graph,
+                   SELECT schedule.id, schedule.session_id,
+                          jsonb_set(
+                              schedule.graph,
+                              '{assignments}',
+                              COALESCE(
+                                  (
+                                      SELECT jsonb_agg(
+                                          jsonb_build_object(
+                                              'id', projected.value->>'id',
+                                              'objective', projected.value->>'objective',
+                                              'profile_id', projected.value->>'profile_id',
+                                              'provider_model', projected.value->>'provider_model',
+                                              'execution_stage',
+                                                  projected.value->>'execution_stage',
+                                              'technique_ids', projected.value->'technique_ids',
+                                              'strategy_id', projected.value->>'strategy_id',
+                                              'requested_transform_id',
+                                                  projected.value->>'requested_transform_id',
+                                              'requested_language',
+                                                  projected.value->>'requested_language',
+                                              'swarm_projection',
+                                                  projected.value->'swarm_projection'
+                                          )
+                                      )
+                                      FROM jsonb_array_elements(
+                                          schedule.graph -> 'assignments'
+                                      ) AS projected(value)
+                                  ),
+                                  '[]'::jsonb
+                              )
+                          ) AS graph,
                           schedule.status, schedule.updated_at
                    FROM merlin_storage.scheduler_schedules AS schedule
                    WHERE schedule.session_id = %s
@@ -601,7 +639,7 @@ class DurableSchedulerStore:
                       technique.terminal_reason AS evaluation_reason,
                       technique.strategy_state AS evaluation_detail,
                       successful_result.attempt_id AS successful_result_id,
-                      successful_result.payload AS successful_result_payload
+                      successful_result.payload ->> 'content' AS successful_result_content
                FROM scoped_schedules AS schedule
                CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(schedule.graph -> 'assignments', '[]'::jsonb)
@@ -820,6 +858,40 @@ class DurableSchedulerStore:
             }
             for row in rows
         ]
+
+    @_serialized
+    def list_result_contents(self, schedule_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT attempt_id, schedule_id, node_id,
+                      COALESCE(payload->>'content', payload::text) AS content
+               FROM merlin_storage.scheduler_results
+               WHERE schedule_id = %s ORDER BY created_at, attempt_id""",
+            (schedule_id,),
+        ).fetchall()
+        return [
+            {
+                **row,
+                "attempt_id": str(row["attempt_id"]),
+                "schedule_id": str(row["schedule_id"]),
+            }
+            for row in rows
+        ]
+
+    @_serialized
+    def list_result_progress(self, schedule_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT node_id, payload_digest,
+                      COALESCE(payload#>>'{worker_checkpoint,active_phase}', 'queued')
+                          AS active_phase,
+                      COALESCE((payload#>>'{worker_checkpoint,turns_completed}')::int, 0)
+                          AS turns_completed,
+                      COALESCE((payload#>>'{worker_checkpoint,action_count}')::int, 0)
+                          AS action_count
+               FROM merlin_storage.scheduler_results
+               WHERE schedule_id = %s ORDER BY created_at, attempt_id""",
+            (schedule_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     @_serialized
     def replacement_attempt_lineage(
@@ -4380,7 +4452,13 @@ class DurableSchedulerStore:
         }:
             disposition = self._target_lane_terminal_disposition_locked(
                 lane_attempt_id,
-                authority=("cancelled" if prior["state"] == "cancelled" else "recovery"),
+                authority=(
+                    "cancelled"
+                    if prior["state"] == "cancelled"
+                    else "settled"
+                    if prior["state"] == "completed"
+                    else "recovery"
+                ),
                 revoke_unadopted=prior["state"] == "cancelled",
             )
             if disposition in {"released", "latched"}:
@@ -4401,6 +4479,12 @@ class DurableSchedulerStore:
             and prior["state"] == "expired"
             and latch.get("lane_recovery_required") is True
         ):
+            disposition = self._target_lane_terminal_disposition_locked(
+                lane_attempt_id,
+                authority="recovery",
+            )
+            if disposition in {"released", "latched"}:
+                return None
             raise TargetLaneRecoveryRequiredError(
                 "expired target lane requires durable effect reconciliation"
             )
@@ -4820,7 +4904,7 @@ class DurableSchedulerStore:
         bounded_lineage = bool(
             lineage
             and len(lineage) <= 256
-            and lineage_ids[-1] == root_attempt_id
+            and root_attempt_id in lineage_ids
             and (len(lineage) < 256 or lineage[-1]["replaced_attempt_id"] is None)
             and all(
                 str(row["schedule_id"]) == str(latch["lane_schedule_id"])
@@ -4912,51 +4996,20 @@ class DurableSchedulerStore:
             """SELECT graph FROM merlin_storage.scheduler_schedules WHERE id = %s""",
             (latch["lane_schedule_id"],),
         ).fetchone()
-        assignment = None
-        if schedule is not None:
-            assignment = next(
-                (
-                    value
-                    for value in schedule["graph"].get("assignments", ())
-                    if isinstance(value, Mapping) and value.get("id") == latch["lane_assignment_id"]
-                ),
-                None,
-            )
-        assignment_tools = (
-            set(assignment.get("tool_ids", ())) if isinstance(assignment, Mapping) else set()
+        assignment = next(
+            (
+                value
+                for value in (schedule["graph"].get("assignments", ()) if schedule else ())
+                if isinstance(value, Mapping) and value.get("id") == latch["lane_assignment_id"]
+            ),
+            None,
         )
-        passive_assignment = bool(
-            isinstance(assignment, Mapping)
-            and assignment.get("strategy_id") == "target-reobservation/v1"
-            and not assignment.get("technique_ids")
-            and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= assignment_tools
-            and assignment_tools <= _TARGET_REOBSERVATION_TOOLS
+        adaptive_recovery = bool(
+            authority == "recovery"
+            and isinstance(assignment, Mapping)
+            and assignment.get("strategy_id") in {"goat", "crescendo", "hydra-select"}
         )
         permit_by_effect = {str(row["idempotency_key"]): row for row in permit_rows}
-
-        def strict_zero_effect(effect: Mapping[str, object]) -> bool:
-            metadata = effect.get("result_metadata")
-            target_session_id = str(latch["target_session_id"])
-            return bool(
-                effect.get("state") in {"acknowledged", "reconciled"}
-                and effect.get("result_is_error") is True
-                and isinstance(metadata, Mapping)
-                and metadata.get("target_effect_attempted") is False
-                and type(metadata.get("interaction_count")) is int
-                and metadata.get("interaction_count") == 0
-                and type(metadata.get("limit_interaction_count")) is int
-                and metadata.get("limit_interaction_count") == 0
-                and type(metadata.get("target_call_budget_charge")) is int
-                and metadata.get("target_call_budget_charge") == 0
-                and "target_ui_transition" not in metadata
-                and (
-                    target_session_id == ""
-                    and isinstance(metadata.get("target_session_id"), str)
-                    and bool(str(metadata["target_session_id"]).strip())
-                    or target_session_id != ""
-                    and metadata.get("target_session_id") == target_session_id
-                )
-            )
 
         # Expiry and pause are recovery authorities, not evidence that a target
         # effect did not leave the process.  Even an empty durable effect set
@@ -4967,11 +5020,18 @@ class DurableSchedulerStore:
         for effect in effect_rows:
             permit = permit_by_effect.get(str(effect["idempotency_key"]))
             metadata = effect.get("result_metadata")
+            effect_session = (
+                metadata.get("target_session_id") if isinstance(metadata, Mapping) else None
+            )
+            aggregate_lane = latch["target_session_id"] == ""
             target_session_matches = bool(
-                isinstance(metadata, Mapping)
-                and metadata.get("target_session_id") == latch["target_session_id"]
+                isinstance(effect_session, str)
+                and effect_session.strip()
                 and (
-                    permit is None or permit.get("target_session_id") == latch["target_session_id"]
+                    permit is not None and permit.get("target_session_id") == effect_session
+                    if aggregate_lane
+                    else effect_session == latch["target_session_id"]
+                    and (permit is None or permit.get("target_session_id") == effect_session)
                 )
             )
             transition_present = isinstance(metadata, Mapping) and (
@@ -5001,14 +5061,19 @@ class DurableSchedulerStore:
                     and committed_transition_call_id is not None
                     and effect["call_id"] == committed_transition_call_id
                 )
-                continue
-            if authority == "settled":
-                continue
-            if passive_assignment and effect["tool_name"] in _TARGET_REOBSERVATION_TOOLS:
-                continue
-            if strict_zero_effect(effect):
-                continue
-            safe = False
+            if adaptive_recovery:
+                safe = bool(
+                    safe
+                    and effect.get("result_is_error") is True
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("target_effect_attempted") is False
+                    and type(metadata.get("interaction_count")) is int
+                    and metadata.get("interaction_count") == 0
+                    and type(metadata.get("limit_interaction_count")) is int
+                    and metadata.get("limit_interaction_count") == 0
+                    and type(metadata.get("target_call_budget_charge")) is int
+                    and metadata.get("target_call_budget_charge") == 0
+                )
 
         if any(str(row["idempotency_key"]) not in effect_by_id for row in permit_rows):
             safe = False
@@ -5550,15 +5615,9 @@ class DurableSchedulerStore:
                 (list(lineage_ids),),
             ).fetchall()
             permit_by_effect = {str(row["idempotency_key"]): str(row["state"]) for row in permits}
-            assignment_tools = set(assignment.get("tool_ids", ()))
-            passive_assignment = bool(
-                assignment.get("strategy_id") == "target-reobservation/v1"
-                and not assignment.get("technique_ids")
-                and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= assignment_tools
-                and assignment_tools <= _TARGET_REOBSERVATION_TOOLS
-            )
 
             def safely_effect_free(row: Mapping[str, object]) -> bool:
+                """Return whether no further target dispatch is required for one effect."""
                 metadata = row.get("result_metadata")
                 permit_state = permit_by_effect.get(str(row["idempotency_key"]))
                 revoked_before_dispatch = bool(
@@ -5567,36 +5626,24 @@ class DurableSchedulerStore:
                     and isinstance(metadata, Mapping)
                     and metadata.get("target_effect_dispatch_status") == "revoked_before_dispatch"
                 )
-                exact_passive = bool(
-                    permit_state in {None, "terminal"}
-                    and passive_assignment
-                    and row.get("tool_name") in _TARGET_REOBSERVATION_TOOLS
-                    and row.get("state") in {"acknowledged", "reconciled"}
-                    and isinstance(metadata, Mapping)
-                    and "target_ui_transition" not in metadata
-                )
-                strict_zero_effect = bool(
+                terminal_nonmaterial_receipt = bool(
                     permit_state in {None, "terminal"}
                     and row.get("state") in {"acknowledged", "reconciled"}
-                    and row.get("result_is_error") is True
                     and isinstance(metadata, Mapping)
-                    and metadata.get("target_effect_attempted") is False
-                    and type(metadata.get("interaction_count")) is int
-                    and metadata.get("interaction_count") == 0
-                    and type(metadata.get("limit_interaction_count")) is int
-                    and metadata.get("limit_interaction_count") == 0
-                    and type(metadata.get("target_call_budget_charge")) is int
-                    and metadata.get("target_call_budget_charge") == 0
                     and "target_ui_transition" not in metadata
                     and (
-                        target_session_id == ""
-                        and isinstance(metadata.get("target_session_id"), str)
-                        and bool(str(metadata["target_session_id"]).strip())
-                        or target_session_id != ""
-                        and metadata.get("target_session_id") == target_session_id
+                        assignment.get("strategy_id") not in {"goat", "crescendo", "hydra-select"}
+                        or row.get("result_is_error") is True
+                        and metadata.get("target_effect_attempted") is False
+                        and type(metadata.get("interaction_count")) is int
+                        and metadata.get("interaction_count") == 0
+                        and type(metadata.get("limit_interaction_count")) is int
+                        and metadata.get("limit_interaction_count") == 0
+                        and type(metadata.get("target_call_budget_charge")) is int
+                        and metadata.get("target_call_budget_charge") == 0
                     )
                 )
-                return revoked_before_dispatch or exact_passive or strict_zero_effect
+                return revoked_before_dispatch or terminal_nonmaterial_receipt
 
             if (
                 latch is None
@@ -9160,6 +9207,18 @@ class DurableSchedulerStore:
     def _lock_attempt(
         self, attempt_id: str, generation: int, *, require_unexpired: bool = True
     ) -> dict[str, Any]:
+        identity = self.connection.execute(
+            "SELECT schedule_id FROM merlin_storage.scheduler_attempts WHERE id = %s",
+            (attempt_id,),
+        ).fetchone()
+        if identity is not None:
+            # Settlement appends schedule events in this transaction. Take the
+            # parent lock before the attempt so effect adoption cannot invert
+            # schedule -> attempt into attempt -> schedule and deadlock it.
+            self.connection.execute(
+                "SELECT id FROM merlin_storage.scheduler_schedules WHERE id = %s FOR UPDATE",
+                (identity["schedule_id"],),
+            ).fetchone()
         row = self.connection.execute(
             """SELECT attempt.id, attempt.schedule_id, attempt.node_id, attempt.generation,
                       attempt.owner, attempt.lease_expires_at

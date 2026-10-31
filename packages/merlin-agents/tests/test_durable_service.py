@@ -38,6 +38,7 @@ from merlin_agents.durable_service import (
     _capability_grant_narrows,
     _profile_for_handoff,
     _sealed_assignment_candidate_identity,
+    _snapshot_successful_result,
     _target_control_hold_marker,
     _target_control_hold_projection,
     _TargetAdmissionFencedTools,
@@ -13684,3 +13685,16 @@ async def test_restart_recovery_pauses_all_target_schedules_until_explicit_resum
     await asyncio.wait_for(resumed.execution, timeout=2)
     assert all(store.schedules[key]["status"] == "paused" for key in schedule_ids[1:])
     assert all(attempt.schedule_id == schedule_ids[0] for attempt in store.attempts.values())
+
+
+def test_snapshot_successful_result_uses_content_projection() -> None:
+    result = _snapshot_successful_result(
+        {
+            "successful_result_id": "attempt-1",
+            "successful_result_content": "  compact   result   summary  ",
+        }
+    )
+
+    assert result is not None
+    assert result.result_id == "attempt-1"
+    assert result.summary == "compact result summary"

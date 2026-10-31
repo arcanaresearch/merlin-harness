@@ -12,6 +12,92 @@ _SPEC.loader.exec_module(_MODULE)
 MockBrain = _MODULE.MockBrain
 
 
+def _tool_exchange(name: str, result: dict[str, object]) -> list[dict[str, object]]:
+    call_id = f"call-{name}"
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": json.dumps(result),
+        },
+    ]
+
+
+def test_packaged_recon_uses_bounded_exchange_after_recall() -> None:
+    brain = MockBrain(origin="http://127.0.0.1:8080")
+    messages: list[dict[str, object]] = [
+        {
+            "role": "user",
+            "content": (
+                "Execute the reviewed seeded UAT objective. PTYUAT-API composition: autonomous"
+            ),
+        },
+        *_tool_exchange("campaign_configure", {"configured": True}),
+        *_tool_exchange(
+            "browser_recall_reconnaissance",
+            {"default_action": "full_reconnaissance"},
+        ),
+        *_tool_exchange("browser_open_tab", {"tab_ref": "tab-1"}),
+        *_tool_exchange(
+            "browser_snapshot",
+            {
+                "elements": [
+                    {"role": "textbox", "ref": "input-1"},
+                    {"role": "button", "ref": "send-1"},
+                ]
+            },
+        ),
+    ]
+
+    response = brain._kernel(messages)
+
+    assert response == {
+        "tool": (
+            "browser_recon_exchange",
+            {
+                "tab_ref": "tab-1",
+                "input_element_ref": "input-1",
+                "submit_element_ref": "send-1",
+                "submit_kind": "click",
+            },
+        )
+    }
+
+
+def test_capability_worker_is_dispatched_before_operator_kernel_dialogue() -> None:
+    brain = MockBrain(origin="http://127.0.0.1:8080")
+    system = (
+        "You are Merlin. Perform exactly one harmless capability-discovery action. "
+        "Technique: capability/agent_messaging"
+    )
+
+    action = brain.decide(
+        {
+            "messages": [{"role": "system", "content": system}],
+            "tools": [{"function": {"name": "target_request"}}],
+        }
+    )
+    terminal = brain.decide({"messages": [{"role": "system", "content": system}]})
+
+    assert action["tool"][0] == "target_request"
+    assert json.loads(terminal["content"]) == {
+        "accepted": True,
+        "gracefully_rejected": False,
+        "probe_id": "capability/agent_messaging",
+        "summary": "Fixture capability probe completed with attributable evidence.",
+        "transport_available": True,
+    }
+
+
 def test_terminal_worker_dispatch_wins_over_retained_baseline_markers() -> None:
     brain = MockBrain(origin="http://127.0.0.1:8080")
     technique_id = "merlin-injection-taxonomy/cat/direct/override-baseline"

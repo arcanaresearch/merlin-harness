@@ -4324,7 +4324,7 @@ class MerlinApp(App[None]):
         self._set_status("ready")
         self.set_interval(2.0, self._poll_saturation_decisions)
         self.set_interval(2.0, self._poll_completed_reports)
-        self.set_interval(2.0, self._schedule_swarm_refresh)
+        self.set_interval(5.0, self._schedule_swarm_refresh)
         self._spawn(self._load_permission_mode())
         self._spawn(self._load_runtime_status())
         if self._startup_prompt:

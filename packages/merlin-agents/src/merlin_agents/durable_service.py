@@ -1783,16 +1783,27 @@ class DurableAgentService:
             )
         ]
 
-    async def list_schedule_tasks(self, schedule_id: str) -> Sequence[AgentTask]:
+    async def _schedule_assignments(self, schedule_id: str) -> tuple[WorkerAssignment, ...]:
+        live = self._live.get(schedule_id)
+        if live is not None:
+            return tuple(live.assignments)
         schedule = await self._call(self._store.load_schedule, schedule_id)
         if schedule is None:
             raise KeyError(f"unknown schedule {schedule_id!r}")
+        return tuple(_assignment(value) for value in schedule["graph"].get("assignments") or ())
+
+    async def _schedule_result_rows(self, schedule_id: str) -> Sequence[dict[str, Any]]:
+        reader = getattr(self._store, "list_result_contents", None)
+        if callable(reader):
+            return await self._call(reader, schedule_id)
+        return await self._call(self._store.list_results, schedule_id)
+
+    async def list_schedule_tasks(self, schedule_id: str) -> Sequence[AgentTask]:
+        assignments = await self._schedule_assignments(schedule_id)
         nodes = {
             row["node_id"]: row for row in await self._call(self._store.list_nodes, schedule_id)
         }
-        results = {
-            row["node_id"]: row for row in await self._call(self._store.list_results, schedule_id)
-        }
+        results = {row["node_id"]: row for row in await self._schedule_result_rows(schedule_id)}
         attempts = {
             row["node_id"]: row for row in await self._call(self._store.list_attempts, schedule_id)
         }
@@ -1810,9 +1821,7 @@ class DurableAgentService:
                 ),
                 technique_ids=assignment.technique_ids,
             )
-            for assignment in (
-                _assignment(value) for value in schedule["graph"].get("assignments") or ()
-            )
+            for assignment in assignments
         ]
 
     async def committed_task_result_evidence(
@@ -2608,35 +2617,43 @@ class DurableAgentService:
             and await self._call(verifier, source_schedule_id, validation_schedule_id)
         )
 
+    async def _schedule_progress_rows(self, schedule_id: str) -> Sequence[dict[str, Any]]:
+        reader = getattr(self._store, "list_result_progress", None)
+        if callable(reader):
+            return await self._call(reader, schedule_id)
+        return await self._call(self._store.list_results, schedule_id)
+
     async def schedule_progress(self, schedule_id: str) -> tuple[tuple[object, ...], ...]:
         """Return a durable, restart-safe projection of node progress and active phase."""
-        if await self._call(self._store.load_schedule, schedule_id) is None:
-            raise KeyError(f"unknown schedule {schedule_id!r}")
+        event_count = await self._schedule_event_count(self._live.get(schedule_id) or schedule_id)
+        del event_count
         nodes = await self._call(self._store.list_nodes, schedule_id)
         results = {
-            str(row["node_id"]): row
-            for row in await self._call(self._store.list_results, schedule_id)
+            str(row["node_id"]): row for row in await self._schedule_progress_rows(schedule_id)
         }
         projection: list[tuple[object, ...]] = []
         for node in sorted(nodes, key=lambda item: str(item["node_id"])):
             node_id = str(node["node_id"])
             row = results.get(node_id, {})
-            payload = row.get("payload") if isinstance(row, Mapping) else None
-            payload = payload if isinstance(payload, Mapping) else {}
-            checkpoint = payload.get("worker_checkpoint")
-            checkpoint = checkpoint if isinstance(checkpoint, Mapping) else {}
-            phase = (
-                "cleanup"
-                if node_id.startswith("cleanup:")
-                else str(checkpoint.get("active_phase", "queued"))
-            )
+            if "active_phase" in row:
+                phase = str(row.get("active_phase") or "queued")
+                turns_completed = int(row.get("turns_completed", 0) or 0)
+                action_count = int(row.get("action_count", 0) or 0)
+            else:
+                payload = row.get("payload") if isinstance(row, Mapping) else None
+                payload = payload if isinstance(payload, Mapping) else {}
+                checkpoint = payload.get("worker_checkpoint")
+                checkpoint = checkpoint if isinstance(checkpoint, Mapping) else {}
+                phase = str(checkpoint.get("active_phase", "queued"))
+                turns_completed = int(checkpoint.get("turns_completed", 0) or 0)
+                action_count = int(checkpoint.get("action_count", 0) or 0)
             projection.append(
                 (
                     node_id,
                     str(node.get("state", "pending")),
-                    phase,
-                    int(checkpoint.get("turns_completed", 0) or 0),
-                    int(checkpoint.get("action_count", 0) or 0),
+                    "cleanup" if node_id.startswith("cleanup:") else phase,
+                    turns_completed,
+                    action_count,
                     str(row.get("payload_digest", "")) if isinstance(row, Mapping) else "",
                 )
             )
@@ -7285,6 +7302,17 @@ class DurableAgentService:
                     raise
                 await asyncio.sleep(0)
 
+    async def _schedule_event_count(self, live: _LiveSchedule | str) -> int:
+        schedule_id = live if isinstance(live, str) else live.id
+        reader = getattr(self._store, "schedule_event_count", None)
+        if callable(reader):
+            count = await self._call(reader, schedule_id)
+            if count is not None:
+                return int(count)
+        schedule = await self._call(self._store.load_schedule, schedule_id)
+        assert schedule is not None
+        return int(schedule["event_count"])
+
     async def _ready_once(self, live: _LiveSchedule, nodes: Sequence[str]) -> None:
         requested = {node for node in nodes if node != "start"}
         persisted = await self._call(self._store.list_nodes, live.id)
@@ -7297,14 +7325,13 @@ class DurableAgentService:
             and state.disposition is not None
         }
         if failures:
-            schedule = await self._call(self._store.load_schedule, live.id)
-            assert schedule is not None
+            event_count = await self._schedule_event_count(live)
             await self._call(
                 self._store.transition_failed,
                 live.id,
                 failures,
                 checkpoint=live.scheduler.checkpoint(),
-                expected_event_count=schedule["event_count"],
+                expected_event_count=event_count,
             )
             persisted = await self._call(self._store.list_nodes, live.id)
         pending = [
@@ -7314,14 +7341,13 @@ class DurableAgentService:
         ]
         if not pending:
             return
-        schedule = await self._call(self._store.load_schedule, live.id)
-        assert schedule is not None
+        event_count = await self._schedule_event_count(live)
         await self._call(
             self._store.transition_ready,
             live.id,
             pending,
             checkpoint=live.scheduler.checkpoint(),
-            expected_event_count=schedule["event_count"],
+            expected_event_count=event_count,
         )
 
     async def _retry_failed_node(self, live: _LiveSchedule, node_id: str) -> None:
@@ -7331,15 +7357,14 @@ class DurableAgentService:
         # guarded transition is contention, not a lost fence. Re-read and
         # retry bounded times exactly like ``_ready`` does.
         for attempt in range(_READY_STALE_LEASE_RETRIES):
-            schedule = await self._call(self._store.load_schedule, live.id)
-            assert schedule is not None
+            event_count = await self._schedule_event_count(live)
             try:
                 await self._call(
                     self._store.retry_failed,
                     live.id,
                     node_id,
                     checkpoint=live.scheduler.checkpoint(),
-                    expected_event_count=schedule["event_count"],
+                    expected_event_count=event_count,
                 )
                 return
             except Exception as error:
@@ -8361,6 +8386,10 @@ def _snapshot_successful_result(
     result_id = _optional_text(row.get("successful_result_id"))
     if result_id is None:
         return None
+    content_value = row.get("successful_result_content")
+    if isinstance(content_value, str):
+        content = content_value
+        return SuccessfulResultSummary(result_id=result_id, summary=" ".join(content.split())[:240])
     payload = row.get("successful_result_payload")
     if isinstance(payload, Mapping) and isinstance(payload.get("content"), str):
         content = str(payload["content"])
@@ -8558,6 +8587,9 @@ def _bounded_worker_mail(
 def _result_text(row: dict[str, object] | None) -> str | None:
     if row is None:
         return None
+    content = row.get("content")
+    if isinstance(content, str):
+        return content
     payload = row.get("payload")
     if isinstance(payload, dict) and isinstance(payload.get("content"), str):
         return payload["content"]

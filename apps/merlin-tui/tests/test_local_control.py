@@ -766,6 +766,32 @@ def test_local_control_tuning_rejects_unsafe_bounds(kwargs, setting: str) -> Non
 
 
 @pytest.mark.asyncio
+async def test_client_rpc_response_uses_configured_deadline(
+    event_socket_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = event_socket_dir / "unresponsive.sock"
+
+    async def handle(reader, writer):
+        await reader.readline()
+        await reader.read()
+        writer.close()
+        await writer.wait_closed()
+
+    monkeypatch.setattr(
+        "merlin_tui.local_control.configured_local_control_tuning",
+        lambda: LocalControlTuning(request_timeout_seconds=1),
+    )
+    monkeypatch.setattr("merlin_tui.local_control._LOCAL_CONTROL_CLOSE_TIMEOUT_SECONDS", 0.01)
+    async with await asyncio.start_unix_server(handle, path):
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(LocalControlClient(socket_path=path).list_campaigns(), timeout=2)
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1.8
+
+
+@pytest.mark.asyncio
 async def test_reasoning_deltas_do_not_force_one_journal_rewrite_each(
     monkeypatch,
 ) -> None:

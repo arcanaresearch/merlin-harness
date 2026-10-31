@@ -11795,9 +11795,14 @@ class CampaignService:
         )
         started = time.monotonic()
         try:
-            review = await self._task_review_runner(
-                campaign_id, manifest.profile, wave, task, context
-            )
+            # Incremental reviews are advisory and must never become the
+            # campaign's liveness boundary.  Bound both microbatch admission
+            # and provider execution; a timed-out review is journaled below
+            # and durable worker evidence continues through wave reduction.
+            async with asyncio.timeout(min(self._stalled_after_seconds, 60.0)):
+                review = await self._task_review_runner(
+                    campaign_id, manifest.profile, wave, task, context
+                )
         except BaseException as error:
             await asyncio.to_thread(
                 self._store.append_lead,
@@ -21611,25 +21616,6 @@ class CampaignService:
             and (event.get("schedule_id") in {None, str(latest.get("schedule_id") or "")})
         ]
         if incremental_events:
-            started_tasks = {
-                str(event.get("task_id"))
-                for event in incremental_events
-                if event.get("kind") == "incremental_task_review_started"
-            }
-            finished_tasks = {
-                str(
-                    event.get("task_id")
-                    or (
-                        event.get("review", {}).get("task_id")
-                        if isinstance(event.get("review"), Mapping)
-                        else ""
-                    )
-                )
-                for event in incremental_events
-                if event.get("kind")
-                in {"incremental_task_review_completed", "incremental_task_review_failed"}
-            }
-            active_tasks = started_tasks.difference(finished_tasks)
             merge_started = max(
                 (
                     index
@@ -21647,6 +21633,31 @@ class CampaignService:
                 ),
                 default=-1,
             )
+            # A completed merge consumes every task review that preceded it.
+            # Restrict the active-review projection to the next merge epoch so
+            # an incomplete historical lifecycle pair cannot leave the TUI
+            # claiming that a reviewer is still running after Lead has already
+            # merged its conclusion and scheduled follow-up work.
+            current_review_events = incremental_events[merge_finished + 1 :]
+            started_tasks = {
+                str(event.get("task_id"))
+                for event in current_review_events
+                if event.get("kind") == "incremental_task_review_started"
+            }
+            finished_tasks = {
+                str(
+                    event.get("task_id")
+                    or (
+                        event.get("review", {}).get("task_id")
+                        if isinstance(event.get("review"), Mapping)
+                        else ""
+                    )
+                )
+                for event in current_review_events
+                if event.get("kind")
+                in {"incremental_task_review_completed", "incremental_task_review_failed"}
+            }
+            active_tasks = started_tasks.difference(finished_tasks)
             if merge_started > merge_finished:
                 event = incremental_events[merge_started]
                 review_progress = {

@@ -4749,7 +4749,17 @@ async def test_pair_receipt_joins_real_report_and_customer_exchange_after_pg_res
             await second._campaigns._finish_campaign(  # type: ignore[attr-defined]  # noqa: SLF001
                 campaign_id, "completed", "capped"
             )
+            inventory_calls = 0
+            list_schedules = second._agents.list_schedules
+
+            async def count_inventory_calls(session_id: str):
+                nonlocal inventory_calls
+                inventory_calls += 1
+                return await list_schedules(session_id)
+
+            second._agents.list_schedules = count_inventory_calls
             await second._campaigns._report_runner(campaign_id, manifest, "capped")  # type: ignore[attr-defined]
+            assert inventory_calls == 1
             revision = second._report_repository.list(campaign_id)[-1]  # type: ignore[attr-defined]
             internal = second._report_repository.get(revision.revision_id)  # type: ignore[attr-defined]
             assert internal.report_state == "incomplete"

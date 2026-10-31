@@ -8974,6 +8974,10 @@ def build_backend(
             learning_decisions = (
                 json.loads(learning_document.content) if learning_document is not None else []
             )
+            schedule_inventory = {
+                schedule.schedule_id: schedule
+                for schedule in await agents.list_schedules(manifest.session_id)
+            }
             for wave in waves:
                 schedule_id = str(wave["schedule_id"])
                 raw_schedule = await asyncio.to_thread(scheduler_store.load_schedule, schedule_id)
@@ -9122,14 +9126,7 @@ def build_backend(
                     usage["estimated_cost_usd"] = (
                         usage.get("estimated_cost_usd", 0.0) + schedule_cost
                     )
-                schedule = next(
-                    (
-                        item
-                        for item in await agents.list_schedules(manifest.session_id)
-                        if item.schedule_id == schedule_id
-                    ),
-                    None,
-                )
+                schedule = schedule_inventory.get(schedule_id)
                 if schedule is not None:
                     for node in schedule.nodes:
                         if not node.technique_ids:

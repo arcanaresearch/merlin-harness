@@ -278,6 +278,22 @@ class MockBrain:
             role, response = "goat", self._goat(system_text)
         elif "Daemon Crescendo stage:" in system_text:
             role, response = "crescendo", self._crescendo(system_text)
+        elif "You are Merlin" in system_text and re.search(r"capability/[a-z0-9_-]+", system_text):
+            # Capability probes share the operator agent identity, but their
+            # sealed technique id is present in the system assignment.  Route
+            # them before the generic kernel dialogue or they answer with the
+            # campaign-profile question and leave the wave non-terminal.
+            tool_names = {
+                str(tool.get("function", {}).get("name", ""))
+                for tool in (payload.get("tools") or [])
+                if isinstance(tool, dict)
+            }
+            role, response = (
+                "capability-worker",
+                self._capability_worker(
+                    system_text, can_call_target="target_request" in tool_names
+                ),
+            )
         elif "You are Merlin" in system_text and "PTYUAT-HYPOTHESIS" in _all_user_text(messages):
             # Follow-up wave executing the discovery lane's typed hypothesis.
             role, response = "hypothesis-worker", self._hypothesis_worker(messages)
@@ -745,6 +761,30 @@ class MockBrain:
             return {"tool": ("target_request", {"input": probe})}
         return self._worker_terminal(messages)
 
+    @staticmethod
+    def _capability_worker(system_text: str, *, can_call_target: bool) -> dict[str, Any]:
+        match = re.search(r"capability/[a-z0-9_-]+", system_text)
+        probe_id = match.group(0) if match else "capability/unknown"
+        if can_call_target:
+            return {
+                "tool": (
+                    "target_request",
+                    {"input": f"reviewed harmless fixture probe for {probe_id}"},
+                )
+            }
+        return {
+            "content": json.dumps(
+                {
+                    "probe_id": probe_id,
+                    "transport_available": True,
+                    "accepted": True,
+                    "gracefully_rejected": False,
+                    "summary": "Fixture capability probe completed with attributable evidence.",
+                },
+                sort_keys=True,
+            )
+        }
+
     # -- operator-facing kernel agent ----------------------------------------
 
     def _kernel(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -876,23 +916,16 @@ class MockBrain:
         if "browser_snapshot" not in by_name:
             return {"tool": ("browser_snapshot", {"tab_ref": tab_ref})}
         elements = self._elements(results.get("browser_snapshot", ""))
-        if "browser_fill" not in by_name:
+        if "browser_recon_exchange" not in by_name:
             return {
                 "tool": (
-                    "browser_fill",
+                    "browser_recon_exchange",
                     {
                         "tab_ref": tab_ref,
-                        "element_ref": elements.get("textbox", ""),
-                        "value": "State the seeded policy.",
-                        "connection_probe": True,
+                        "input_element_ref": elements.get("textbox", ""),
+                        "submit_element_ref": elements.get("button", ""),
+                        "submit_kind": "click",
                     },
-                )
-            }
-        if "browser_click" not in by_name:
-            return {
-                "tool": (
-                    "browser_click",
-                    {"tab_ref": tab_ref, "element_ref": elements.get("button", "")},
                 )
             }
         if "browser_network_events" not in by_name:

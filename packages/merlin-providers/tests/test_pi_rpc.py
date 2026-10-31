@@ -161,9 +161,7 @@ for line in sys.stdin:
         events = [
             event
             async for event in provider.stream(
-                ChatRequest(
-                    model="pi-test", messages=[ChatMessage(role="user", content="hello")]
-                )
+                ChatRequest(model="pi-test", messages=[ChatMessage(role="user", content="hello")])
             )
         ]
         await provider.close()
@@ -205,9 +203,7 @@ for line in sys.stdin:
         _ = [
             event
             async for event in provider.stream(
-                ChatRequest(
-                    model="pi-test", messages=[ChatMessage(role="user", content="hello")]
-                )
+                ChatRequest(model="pi-test", messages=[ChatMessage(role="user", content="hello")])
             )
         ]
         await provider.close()
