@@ -181,3 +181,42 @@ def test_cleanup_does_not_hide_force_stop_failure() -> None:
         assert str(error) == "failed: stop --force"
     else:
         raise AssertionError("force-stop failure was hidden")
+
+
+def test_resume_settle_waits_for_full_gate_and_restored_campaign() -> None:
+    module = _script_module()
+
+    class Tui:
+        def __init__(self) -> None:
+            self.sent = []
+            self.pumps = 0
+            self.frames = (
+                "Resume last session",
+                "Resume last session\nNew session\nEnter resumes the last session",
+                "Resume last session\ndaemon attached",
+                "daemon attached\nWelcome",
+                "daemon attached\nWave 13 · frontier · campaign totals below",
+            )
+            self.visible_text = "ready · /help"
+
+        def wait(self, _text, _timeout):
+            return None
+
+        def _pump(self, _timeout):
+            if self.pumps < len(self.frames):
+                self.visible_text = self.frames[self.pumps]
+            self.pumps += 1
+            return True
+
+        def visible(self):
+            return self.visible_text
+
+        def send(self, text):
+            self.sent.append(text)
+
+    tui = Tui()
+
+    module._settle(tui, 0.5, resume_existing=True)
+
+    assert tui.sent == ["1"]
+    assert "campaign totals below" in tui.visible_text

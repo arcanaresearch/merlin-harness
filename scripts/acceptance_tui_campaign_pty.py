@@ -436,6 +436,10 @@ def _settle(tui: Tui, boot_timeout: float, *, resume_existing: bool = False) -> 
         tui._pump(0.2)  # noqa: SLF001
         visible = tui.visible()
         if not gate_answered and "New session" in visible:
+            if resume_existing and "Enter resumes the last session" not in visible:
+                continue
+            if not resume_existing and "Enter starts a new session" not in visible:
+                continue
             tui.send("1" if resume_existing else "2")
             gate_answered = True
             print(
@@ -445,6 +449,10 @@ def _settle(tui: Tui, boot_timeout: float, *, resume_existing: bool = False) -> 
             )
             continue
         if "daemon attached" in visible:
+            if gate_answered and "Resume last session" in visible:
+                continue
+            if resume_existing and "campaign totals below" not in visible:
+                continue
             # The startup gate and composer focus settle on separate Textual
             # ticks.  Seeing the daemon status is necessary but not sufficient:
             # typing immediately after the gate can lose the command prefix
