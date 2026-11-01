@@ -1681,6 +1681,7 @@ class Kernel:
             async def handle_preferred_tool_miss(tool_name: str) -> str:
                 nonlocal preferred_tool_follow_through_failures
                 nonlocal preferred_next_tool_name
+                nonlocal preferred_next_tool_mode
                 nonlocal repair_messages
                 await self._emit(
                     self._event(
@@ -1727,6 +1728,24 @@ class Kernel:
                     _PREFERRED_TOOL_AFTER_ONE_MODE,
                     _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE,
                 }:
+                    if tool_name == "browser_compile_api_handoff" and any(
+                        spec.name == "browser_record_api_handoff" for spec in described_tools
+                    ):
+                        preferred_next_tool_name = "browser_record_api_handoff"
+                        preferred_next_tool_mode = "strict"
+                        preferred_tool_follow_through_failures = 0
+                        repair_messages = [
+                            ChatMessage(
+                                role="system",
+                                content=(
+                                    "The API handoff compiler did not complete after bounded "
+                                    "attempts. Call `browser_record_api_handoff` now with the "
+                                    "evidence-backed DOM interaction contract. Do not perform "
+                                    "more reconnaissance."
+                                ),
+                            )
+                        ]
+                        return "retry"
                     preferred_next_tool_name = None
                     preferred_tool_follow_through_failures = 0
                     return "released"

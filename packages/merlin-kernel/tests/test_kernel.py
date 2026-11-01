@@ -2435,6 +2435,86 @@ async def test_browser_compile_preference_allows_one_final_observation() -> None
 
 
 @pytest.mark.asyncio
+async def test_compile_misses_route_to_dom_fallback_without_releasing_recon() -> None:
+    class HandoffTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="browser_network_events", description="Network", input_schema={}),
+                ToolSpec(name="browser_snapshot", description="Observe", input_schema={}),
+                ToolSpec(
+                    name="browser_compile_api_handoff",
+                    description="Compile",
+                    input_schema={},
+                ),
+                ToolSpec(
+                    name="browser_record_api_handoff",
+                    description="Record DOM",
+                    input_schema={},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_network_events":
+                return ToolResult(
+                    content="captured evidence",
+                    metadata={
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                        "preferred_next_tool_mode": "after_one_admitted_action",
+                    },
+                )
+            if name == "browser_snapshot":
+                return ToolResult(
+                    content="final observation",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            return ToolResult(content="DOM handoff recorded")
+
+    class Provider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number == 1:
+                yield ToolCall(call_id="network", name="browser_network_events", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number in {2, 3}:
+                yield ToolCall(
+                    call_id=f"snapshot-{call_number}",
+                    name="browser_snapshot",
+                    arguments={},
+                )
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 4:
+                yield ToolCall(call_id="record", name="browser_record_api_handoff", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="prepared")
+            yield ModelCompleted()
+
+    provider = Provider()
+    tools = HandoffTools()
+    kernel = Kernel(provider, Store(), tools, Settings(), max_provider_retries=0)
+    await kernel.start()
+    await kernel.submit("recon")
+    await kernel.wait_for_turn()
+
+    assert provider.requests[3].required_tool_name == "browser_record_api_handoff"
+    assert tools.calls == [
+        "browser_network_events",
+        "browser_snapshot",
+        "browser_record_api_handoff",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unadmitted_native_tool_error_preserves_bounded_handoff_fallback() -> None:
     class HandoffTools(Tools):
         def __init__(self) -> None:
