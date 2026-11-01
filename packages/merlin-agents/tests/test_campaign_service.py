@@ -19003,6 +19003,91 @@ async def test_campaign_resume_rejects_a_stale_reviewed_browser_adapter() -> Non
     assert agents.resume_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("exchange_count", "expected_reset"),
+    ((0, True), (1, False), (None, False)),
+)
+async def test_browser_resume_permits_session_reset_only_before_target_exchanges(
+    exchange_count: int | None,
+    expected_reset: bool,
+) -> None:
+    source = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    adapter = _reviewed_browser_adapter(recon_handoff_id="handoff:browser")
+    manifest = replace(
+        source.manifest,
+        catalogue=(
+            *source.manifest.catalogue,
+            ContextDocument.create(
+                "target:reviewed-interaction-contract",
+                "Reviewed browser adapter.\n" + json.dumps(adapter, sort_keys=True),
+            ),
+        ),
+    )
+    prepared = CampaignPreparation(manifest, source.assignment_context)
+
+    class ResumeStore:
+        def __init__(self):
+            self.row = {
+                "id": manifest.id,
+                "session_id": manifest.session_id,
+                "manifest": _json_value(asdict(prepared)),
+                "manifest_digest": manifest.digest,
+                "status": "paused",
+            }
+            self.wave = {"wave": 0, "status": "paused", "schedule_id": "schedule-1"}
+
+        def get(self, _campaign_id):
+            return self.row
+
+        def list_waves(self, _campaign_id):
+            return [dict(self.wave)]
+
+        def list_lead(self, _campaign_id):
+            return []
+
+        def resume(self, _campaign_id):
+            self.row["status"] = "executing"
+            self.wave["status"] = "running"
+            return self.row
+
+        def append_lead(self, *_args):
+            return None
+
+    class ResumeAgents:
+        async def target_progress(self, _campaign_id, _target_id):
+            if exchange_count is None:
+                return {}
+            return {"target_exchange_count": exchange_count, "history_truncated": False}
+
+        async def resume_schedule(self, schedule_id):
+            return SimpleNamespace(id=schedule_id, execution=None)
+
+    class ResumeService(CampaignService):
+        async def _supervise(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    resolved = []
+
+    async def resolve(_session_id, adapter):
+        resolved.append(dict(adapter))
+        return adapter
+
+    store = ResumeStore()
+    service = ResumeService(  # type: ignore[arg-type]
+        store,
+        ResumeAgents(),
+        preparation,
+        reviewed_adapter_resolver=resolve,
+    )
+
+    assert await service.resume(manifest.id) == {
+        "campaign_id": manifest.id,
+        "status": "executing",
+    }
+    assert resolved[0].get("allow_browser_session_reset") is expected_reset
+    await service.detach()
+
+
 async def test_campaign_resume_at_lead_boundary_requires_no_paused_wave() -> None:
     class BoundaryStore:
         def __init__(self) -> None:

@@ -5219,3 +5219,138 @@ async def test_cross_session_handoff_reuse_rejects_failed_probe() -> None:
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_browser_only_handoff_reset_requires_zero_exchange_authorization() -> None:
+    from merlin_tui.bootstrap import _revalidate_handoff_cross_session
+
+    adapter = {
+        "interface": "browser",
+        "endpoint": "https://target.test/chat",
+        "browser_steps": [
+            {
+                "step_id": "send-message",
+                "tool": "browser_fill",
+                "interaction": True,
+                "arguments": {"locator": 'textbox[name="Textbox 1"]'},
+            }
+        ],
+        "interaction_contract": {"input_locator": 'textbox[name="Textbox 1"]'},
+    }
+
+    class BrowserOnlySession:
+        def __init__(self) -> None:
+            self.calls = []
+            self.tabs = []
+            self.ui_state = "chat"
+            self.snapshots_before_ui = 0
+            self.context_id = "context-1"
+            self.bounds = SimpleNamespace(target_id="target-1")
+            self.owner = BrowserOwner(
+                session_id="current-session",
+                worker_id="agent:browser",
+                technique_id="campaign-resume",
+            )
+
+        def metadata(self):
+            return SimpleNamespace(tabs=tuple(self.tabs))
+
+        @staticmethod
+        def _element(ref, role, name):
+            return SimpleNamespace(
+                ref=ref,
+                role=role,
+                name=name,
+                disabled=False,
+                read_only=False,
+                occluded=False,
+            )
+
+        def _observation(self):
+            if self.snapshots_before_ui:
+                self.snapshots_before_ui -= 1
+                return SimpleNamespace(
+                    kind="snapshot",
+                    elements=(
+                        self._element("button-generic", "button", ""),
+                        self._element("link-generic", "link", ""),
+                    ),
+                )
+            elements = (
+                (
+                    self._element("tab-info", "tab", "Info"),
+                    self._element("tab-game", "tab", "Game"),
+                )
+                if self.ui_state == "info"
+                else (self._element("button-chat", "button", "Chat"),)
+                if self.ui_state == "game"
+                else (self._element("element-1", "textbox", "Textbox 1"),)
+            )
+            return SimpleNamespace(kind="snapshot", elements=elements)
+
+        async def act(self, action, *, actor_id):
+            if action.kind == "navigate":
+                self.calls.append(("navigate-existing", action.tab_ref, action.value))
+                self.ui_state = "info"
+                return None
+            self.calls.append(("click", action.element_ref))
+            self.ui_state = {
+                "tab-info": "info",
+                "tab-game": "game",
+                "button-chat": "chat",
+            }[action.element_ref]
+            return self._observation()
+
+        async def new_tab(self, url):
+            self.calls.append(("navigate", url))
+            return "tab-1"
+
+        async def snapshot(self, tab_ref):
+            self.calls.append(("snapshot", tab_ref))
+            return self._observation()
+
+        async def request_json(self, *_args, **_kwargs):
+            raise AssertionError("browser-only recovery must not replay target exchanges")
+
+    session = BrowserOnlySession()
+    browser = _ProbeBrowser(session)  # type: ignore[arg-type]
+    handoff = _probe_handoff(adapter)
+
+    assert (
+        await _revalidate_handoff_cross_session(
+            browser,
+            "current-session",
+            handoff,
+            allow_browser_session_reset=True,
+        )
+        is True
+    )
+    assert session.calls == [
+        ("navigate", "https://target.test/chat"),
+        ("snapshot", "tab-1"),
+    ]
+
+    assert await _revalidate_handoff_cross_session(browser, "current-session", handoff) is False
+    assert len(session.calls) == 2
+
+    restored = BrowserOnlySession()
+    restored.tabs = [SimpleNamespace(tab_ref="tab-restored")]
+    restored.snapshots_before_ui = 1
+    assert (
+        await _revalidate_handoff_cross_session(
+            _ProbeBrowser(restored),  # type: ignore[arg-type]
+            "current-session",
+            handoff,
+            allow_browser_session_reset=True,
+        )
+        is True
+    )
+    assert restored.calls == [
+        ("navigate-existing", "tab-restored", "https://target.test/chat"),
+        ("snapshot", "tab-restored"),
+        ("snapshot", "tab-restored"),
+        ("click", "tab-info"),
+        ("click", "tab-game"),
+        ("click", "button-chat"),
+    ]

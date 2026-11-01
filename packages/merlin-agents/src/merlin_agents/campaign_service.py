@@ -2555,6 +2555,21 @@ class CampaignService:
             return adapter
         return await self._reviewed_adapter_resolver(session_id, adapter)
 
+    async def _reviewed_adapter_for_resume(
+        self, campaign_id: str, manifest: CampaignManifest
+    ) -> Mapping[str, Any] | None:
+        adapter = _reviewed_adapter_value(manifest)
+        if not isinstance(adapter, Mapping) or adapter.get("interface") != "browser":
+            return adapter
+        progress = await self.target_progress(campaign_id, manifest.target.id)
+        allow_reset = bool(
+            isinstance(progress, Mapping)
+            and type(progress.get("target_exchange_count")) is int
+            and progress.get("target_exchange_count") == 0
+            and progress.get("history_truncated") is False
+        )
+        return {**adapter, "allow_browser_session_reset": allow_reset}
+
     async def _apply_technique_skip(
         self,
         prepared: CampaignPreparation,
@@ -22119,7 +22134,7 @@ class CampaignService:
                 raise ValueError("failed campaign has no durable completed wave")
             envelope = row["manifest"]
             manifest = _manifest(envelope["manifest"])
-            reviewed_adapter = _reviewed_adapter_value(manifest)
+            reviewed_adapter = await self._reviewed_adapter_for_resume(campaign_id, manifest)
             if isinstance(reviewed_adapter, Mapping):
                 await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
             latest = completed[-1]
@@ -22156,7 +22171,7 @@ class CampaignService:
         if self._lifecycle_transitions is not None:
             envelope = row["manifest"]
             manifest = _manifest(envelope["manifest"])
-            reviewed_adapter = _reviewed_adapter_value(manifest)
+            reviewed_adapter = await self._reviewed_adapter_for_resume(campaign_id, manifest)
             if isinstance(reviewed_adapter, Mapping):
                 await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
             transition = await asyncio.to_thread(
@@ -22172,7 +22187,7 @@ class CampaignService:
             return {"campaign_id": campaign_id, "status": "executing"}
         envelope = row["manifest"]
         manifest = _manifest(envelope["manifest"])
-        reviewed_adapter = _reviewed_adapter_value(manifest)
+        reviewed_adapter = await self._reviewed_adapter_for_resume(campaign_id, manifest)
         if isinstance(reviewed_adapter, Mapping):
             await self.resolve_reviewed_adapter(manifest.session_id, reviewed_adapter)
         waves = await asyncio.to_thread(self._store.list_waves, campaign_id)

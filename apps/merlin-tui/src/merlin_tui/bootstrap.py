@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import UUID
 
 from merlin_browser import normalize_api_adapter_input_aliases
+from merlin_browser.models import BrowserAction
+from merlin_browser.tools import _matching_reviewed_elements
 from merlin_contracts import (
     CampaignTerminalReason,
     ChatMessage,
@@ -1024,14 +1026,17 @@ async def _revalidate_handoff_cross_session(
     browser: Any,
     session_id: str,
     handoff: Any,
+    *,
+    allow_browser_session_reset: bool = False,
 ) -> bool:
     """Prove a sealed handoff still works under the current Merlin session.
 
     Replays only the adapter's non-interaction, non-cleanup setup steps (for
     example a session-start exchange) through the live browser context and
     requires each expected status and every declared capture. Interaction
-    steps (real messages to the target) are never replayed — the probe is
-    read-only with respect to the target's conversation state.
+    steps (real messages to the target) are never replayed. A browser-only
+    handoff can instead establish a fresh session when resume authorized that
+    reset before any target exchange; its reviewed input control must be live.
     """
     sealed = handoff.adapter or handoff.reusable_adapter
     if sealed is None:
@@ -1041,17 +1046,121 @@ async def _revalidate_handoff_cross_session(
     except (TypeError, json.JSONDecodeError):
         return False
     steps = adapter.get("api_steps") if isinstance(adapter, Mapping) else None
-    if not isinstance(steps, list):
-        return False
-    setup = [
-        step
-        for step in steps
-        if isinstance(step, Mapping)
-        and step.get("interaction") is not True
-        and step.get("cleanup") is not True
-    ]
+    setup = (
+        [
+            step
+            for step in steps or []
+            if isinstance(step, Mapping)
+            and step.get("interaction") is not True
+            and step.get("cleanup") is not True
+        ]
+        if isinstance(steps, list)
+        else []
+    )
     if not setup:
-        return False
+        contract = adapter.get("interaction_contract") if isinstance(adapter, Mapping) else None
+        endpoint = adapter.get("endpoint") if isinstance(adapter, Mapping) else None
+        locator = contract.get("input_locator") if isinstance(contract, Mapping) else None
+        if (
+            not allow_browser_session_reset
+            or not isinstance(adapter, Mapping)
+            or adapter.get("interface") != "browser"
+            or not isinstance(endpoint, str)
+            or not endpoint
+            or locator is None
+        ):
+            return False
+        try:
+            session = await browser.for_tool(str(session_id))
+            tabs = session.metadata().tabs
+            if tabs:
+                tab_ref = tabs[-1].tab_ref
+                await session.act(
+                    BrowserAction(
+                        context_id=session.context_id,
+                        target_id=session.bounds.target_id,
+                        owner=session.owner,
+                        kind="navigate",
+                        tab_ref=tab_ref,
+                        value=endpoint,
+                        step=0,
+                    ),
+                    actor_id="campaign-resume",
+                )
+            else:
+                tab_ref = await session.new_tab(endpoint)
+            observation = await session.snapshot(tab_ref)
+        except Exception as error:
+            raise ValueError(
+                "browser-only handoff reset could not restore the reviewed page: "
+                + type(error).__name__
+            ) from error
+        attempted: set[tuple[str, str]] = set()
+        matches = ()
+        for step in range(1, 6):
+            matches = _matching_reviewed_elements(observation, locator, default_role="textbox")
+            if (
+                observation.kind != "blocker"
+                and len(matches) == 1
+                and not matches[0].disabled
+                and not matches[0].read_only
+                and not matches[0].occluded
+            ):
+                return True
+            control = None
+            for element in observation.elements:
+                role = element.role.casefold()
+                name = " ".join(element.name.casefold().split())
+                identity = (role, name)
+                if (
+                    identity not in attempted
+                    and not element.disabled
+                    and not element.occluded
+                    and (role == "tab" or (role == "button" and name in {"chat", "game"}))
+                ):
+                    control = (element, identity)
+                    break
+            if control is None:
+                if step == 5:
+                    break
+                try:
+                    await asyncio.sleep(0.5)
+                    observation = await session.snapshot(tab_ref)
+                except Exception as error:
+                    raise ValueError(
+                        "browser-only handoff reset could not restore the reviewed page: "
+                        + type(error).__name__
+                    ) from error
+                continue
+            element, identity = control
+            attempted.add(identity)
+            try:
+                observation = await session.act(
+                    BrowserAction(
+                        context_id=session.context_id,
+                        target_id=session.bounds.target_id,
+                        owner=session.owner,
+                        kind="click",
+                        tab_ref=tab_ref,
+                        element_ref=element.ref,
+                        step=step,
+                    ),
+                    actor_id="campaign-resume",
+                )
+            except Exception as error:
+                raise ValueError(
+                    "browser-only handoff reset could not restore the reviewed page: "
+                    + type(error).__name__
+                ) from error
+        role_counts: dict[str, int] = {}
+        for element in observation.elements:
+            role = element.role.casefold()
+            role_counts[role] = role_counts.get(role, 0) + 1
+        raise ValueError(
+            "browser-only handoff reset failed reviewed-input validation: "
+            f"kind={observation.kind} matches={len(matches)} "
+            f"attempts={len(attempted)} role_counts={role_counts}"
+        )
     try:
         session = await browser.for_tool(str(session_id))
         captures: dict[str, object] = {}
@@ -10585,10 +10694,16 @@ def build_backend(
                 or len(expected_target_session_id) > 256
             ):
                 raise ValueError("expected reviewed target session identity is invalid")
+            allow_browser_session_reset = adapter.get("allow_browser_session_reset") is True
             adapter = {
                 key: value
                 for key, value in adapter.items()
-                if key not in {"expected_target_id", "expected_target_session_id"}
+                if key
+                not in {
+                    "expected_target_id",
+                    "expected_target_session_id",
+                    "allow_browser_session_reset",
+                }
             }
             revalidated_after_restart = False
             if not _has_durable_handoff(adapter):
@@ -10615,12 +10730,15 @@ def build_backend(
                     )
                 if not _handoff_context_is_current(browser, handoff):
                     revalidated_after_restart = await _revalidate_handoff_cross_session(
-                        browser, session_id, handoff
+                        browser,
+                        session_id,
+                        handoff,
+                        allow_browser_session_reset=allow_browser_session_reset,
                     )
                     if not revalidated_after_restart:
                         raise ValueError(
                             "the reviewed browser context restarted after this reconnaissance "
-                            "handoff was sealed and its setup exchange could not be revalidated; "
+                            "handoff was sealed and its browser session could not be revalidated; "
                             "authenticate again and compile a new handoff"
                         )
                 if str(handoff.owner.session_id) != session_id:
@@ -10660,9 +10778,9 @@ def build_backend(
                     {
                         "kind": "handoff_revalidated_after_browser_restart",
                         "reason": (
-                            "The isolated browser context restarted; Merlin replayed only the "
-                            "sealed non-interaction setup exchange in the current context and "
-                            "verified its expected status and captures before resuming."
+                            "The isolated browser context restarted; Merlin revalidated the "
+                            "sealed setup exchange or reviewed browser controls in the current "
+                            "context without replaying target messages."
                         ),
                         "confidence": 0.9,
                     }
