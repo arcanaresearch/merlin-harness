@@ -2036,11 +2036,14 @@ class Kernel:
                             ),
                         )
                     )
+                request_preferred_tool_is_forced = (
+                    request_preferred_tool_is_strict and not model.lower().startswith("deepseek-v4")
+                )
                 if request_recovery_tool_name is not None:
                     available_tools = tuple(
                         spec for spec in available_tools if spec.name == request_recovery_tool_name
                     )
-                elif request_preferred_tool_is_strict:
+                elif request_preferred_tool_is_forced:
                     available_tools = tuple(
                         spec for spec in available_tools if spec.name == request_preferred_tool_name
                     )
@@ -2084,7 +2087,7 @@ class Kernel:
                         request_recovery_tool_name
                         or (
                             request_preferred_tool_name
-                            if request_preferred_tool_is_strict
+                            if request_preferred_tool_is_forced
                             else None
                         )
                     ),
@@ -3248,7 +3251,8 @@ class Kernel:
             current_preferred_tool = preferred_next_tool
             bounded_preferred_action = (
                 current_preferred_tool == "browser_compile_api_handoff"
-                and preferred_next_tool_mode == _PREFERRED_TOOL_AFTER_ONE_MODE
+                and preferred_next_tool_mode != _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE
+                and not preferred_nonpreferred_action_used
                 and event.name
                 in {
                     "browser_snapshot",
@@ -3278,6 +3282,8 @@ class Kernel:
                 or event.name == current_preferred_tool
                 or (bounded_preferred_action and not preferred_nonpreferred_action_used)
             )
+            if bounded_preferred_action:
+                admitted_tool_name = None
             tool_admitted = (
                 request_authority_valid
                 and cleanup_admitted

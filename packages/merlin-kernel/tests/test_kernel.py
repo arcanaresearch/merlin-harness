@@ -2516,6 +2516,102 @@ async def test_unadmitted_native_tool_error_preserves_bounded_handoff_fallback()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_final_observation", [False, True])
+async def test_deepseek_strict_handoff_compile_allows_one_bounded_native_observation(
+    repeat_final_observation: bool,
+) -> None:
+    class HandoffTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="browser_network_events", description="Network", input_schema={}),
+                ToolSpec(
+                    name="browser_compile_api_handoff",
+                    description="Compile",
+                    input_schema={},
+                ),
+                ToolSpec(name="browser_click", description="Click", input_schema={}),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_network_events":
+                return ToolResult(
+                    content="captured exchange evidence",
+                    metadata={"preferred_next_tool": "browser_compile_api_handoff"},
+                )
+            return ToolResult(content="compiled")
+
+    class Provider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number == 1:
+                yield ToolCall(call_id="observe", name="browser_network_events", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 2:
+                if request.required_tool_name is not None or not any(
+                    tool["function"]["name"] == "browser_network_events" for tool in request.tools
+                ):
+                    yield ModelError(
+                        message=(
+                            "provider returned an unadmitted native tool call "
+                            "`browser_network_events`; expected browser_compile_api_handoff"
+                        ),
+                        code="unadmitted_tool_call",
+                        retryable=True,
+                        tool_name="browser_network_events",
+                    )
+                    return
+                yield ToolCall(call_id="observe-final", name="browser_network_events", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == 3 and repeat_final_observation:
+                yield ToolCall(call_id="observe-extra", name="browser_network_events", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            if call_number == (4 if repeat_final_observation else 3):
+                yield ToolCall(call_id="compile", name="browser_compile_api_handoff", arguments={})
+                yield ModelCompleted(finish_reason="tool_calls")
+                return
+            yield TextDelta(text="compiled")
+            yield ModelCompleted()
+
+    provider = Provider()
+    tools = HandoffTools()
+    store = Store()
+    settings = Settings()
+    settings.model = "deepseek-v4-pro"
+    kernel = Kernel(
+        provider,
+        store,
+        tools,
+        settings,
+        max_provider_retries=0 if repeat_final_observation else 1,
+    )
+    await kernel.start()
+    await kernel.submit("recon")
+    await kernel.wait_for_turn()
+
+    assert len(provider.requests) == (5 if repeat_final_observation else 4)
+    assert all(request.model == "deepseek-v4-pro" for request in provider.requests)
+    assert all(request.required_tool_name is None for request in provider.requests)
+    assert tools.calls == [
+        "browser_network_events",
+        "browser_network_events",
+        "browser_compile_api_handoff",
+    ]
+    assert "browser_click" not in tools.calls
+    assert not any(event.type == "error" for event in store.events)
+
+
+@pytest.mark.asyncio
 async def test_preferred_tool_refusal_is_uncertain_then_cooperates() -> None:
     class FollowThroughTools(Tools):
         def __init__(self):
