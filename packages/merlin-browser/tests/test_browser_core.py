@@ -11433,6 +11433,148 @@ async def test_dom_handoff_seals_typed_current_state_and_rejects_tampering() -> 
         ApiReconHandoff.model_validate(tampered)
 
 
+@pytest.mark.asyncio
+async def test_reobservation_preserves_stale_chat_contract_and_seals_completion_state() -> None:
+    class Session:
+        context_id = "browser-context"
+        bounds = SimpleNamespace(
+            target_id="target",
+            allowed_origins={"https://target.test"},
+        )
+        owner = owner()
+
+        def api_exchange_events(self):
+            return ()
+
+        def metadata(self):
+            return SimpleNamespace(tabs=[SimpleNamespace(tab_ref="tab-1", state="open")])
+
+        async def snapshot(self, _tab):
+            return BrowserObservation(
+                context_id=self.context_id,
+                target_id=self.bounds.target_id,
+                origin="https://target.test",
+                owner=self.owner,
+                tab_ref="tab-1",
+                kind="snapshot",
+                text=(
+                    "Cycling Coach (Level 1)\n"
+                    "Level 1\n"
+                    "Target score: 75\n"
+                    "Score: 100\n"
+                    "Congratulations! You pass the level.\n"
+                    "Next Level"
+                ),
+                observed_at=datetime(2026, 10, 28, 12, tzinfo=UTC),
+                elements=(
+                    ElementRef(
+                        role="button",
+                        name="Next Level",
+                        ref="tab-1:next",
+                        tab_ref="tab-1",
+                        frame_ref="main",
+                    ),
+                ),
+            )
+
+    from merlin_contracts.target_adapter_compiler import compiled_target_adapter_digest
+
+    previous = reviewed_browser_adapter("https://target.test/chat")
+    previous["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "click SEND"},
+        },
+    ]
+    previous["interaction_contract"]["state_observations"] = [
+        {
+            "name": "level",
+            "role": "progress_ordinal",
+            "value_type": "integer",
+            "capture": {"template": "Level {value}"},
+        },
+        {
+            "name": "score",
+            "role": "score",
+            "value_type": "integer",
+            "capture": {"template": "Score: {value}"},
+        },
+    ]
+    compiled = compile_target_adapter(previous)
+    attempted = reviewed_browser_adapter("https://target.test/chat")
+    attempted["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "Next Level"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "Next Level"},
+        },
+    ]
+    attempted["interaction_contract"]["input_locator"] = "Next Level"
+    attempted["interaction_contract"]["submit_action"] = "Next Level"
+    recorder = _NativeReceiptRecorder()
+
+    result = await ApiReconHandoffTool(lambda _: Session(), recorder).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="record-completion",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-completion",
+            campaign_id="campaign/c1",
+            target_id="target",
+            compiled_adapter=compiled.model_dump_json(),
+            compiled_adapter_digest=compiled_target_adapter_digest(compiled),
+            expected_target_session_id="browser:browser-context",
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "2" * 64,
+        ),
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "browser-snapshot:sha256:" + "a" * 64,
+            "response_evidence_ref": "browser-snapshot:sha256:" + "b" * 64,
+            "dom_fallback_reason": (
+                "the reviewed response is complete but delayed evidence was incomplete"
+            ),
+            "reusable_adapter": attempted,
+        },
+    )
+
+    assert result.is_error is False, result.content
+    assert result.metadata["stale_interaction_preserved"] is True
+    assert result.metadata["surface_transition_required"] is True
+    assert result.metadata["available_controls"] == [
+        {"role": "button", "name": "Next Level", "frame_ref": "main"}
+    ]
+    assert recorder.handoff is not None
+    persisted = json.loads(recorder.handoff.reusable_adapter or "{}")
+    contract = persisted["interaction_contract"]
+    assert contract["input_locator"] == previous["interaction_contract"]["input_locator"]
+    assert contract["submit_action"] == previous["interaction_contract"]["submit_action"]
+    assert {item["name"] for item in contract["state_observations"]} == {"level", "score"}
+    snapshot = next(
+        item
+        for item in recorder.handoff.recon_observations
+        if item.get("schema") == "merlin.browser.current-state.v1"
+    )
+    assert {item["name"]: item["value"] for item in snapshot["observations"]} == {
+        "level": 1,
+        "score": 100,
+        "target_score": 75,
+    }
+
+
 @pytest.mark.parametrize(
     ("input_locator", "submit_action"),
     [

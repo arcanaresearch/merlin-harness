@@ -3614,6 +3614,18 @@ class ApiReconHandoffTool:
                     "retryable": True,
                 },
             )
+        previous_adapter: BrowserChat | None = None
+        if (
+            fallback is not None
+            and context.expected_target_session_id == f"browser:{session.context_id}"
+            and context.target_reobservation_generation_id is not None
+            and context.target_reobservation_event_set_digest is not None
+        ):
+            previous_adapter, _ = _browser_context_chat_adapter(
+                context,
+                target_id=str(session.bounds.target_id),
+            )
+        preserved_stale_interaction = False
         compilation_source = adapter_value or reusable_adapter_value
         assert compilation_source is not None
         try:
@@ -3676,6 +3688,75 @@ class ApiReconHandoffTool:
                 )
             current = await session.snapshot(open_tabs[0])
             surface_observation = current
+            if previous_adapter is not None and (
+                len(
+                    _matching_reviewed_elements(
+                        current,
+                        reviewed_contract["input_locator"],
+                        default_role="textbox",
+                    )
+                )
+                != 1
+                or len(
+                    _matching_reviewed_elements(
+                        current,
+                        reviewed_contract["submit_action"],
+                        default_role="button",
+                    )
+                )
+                != 1
+            ):
+                preserved_stale_interaction = True
+                reviewed_contract["input_locator"] = previous_adapter.interaction.input_locator
+                reviewed_contract["submit_action"] = previous_adapter.interaction.submit_action
+                inherited_observations = [
+                    item.model_dump(mode="json")
+                    for item in previous_adapter.interaction.state_observations
+                ]
+                current_observations = reviewed_contract.get("state_observations")
+                if isinstance(current_observations, list) and current_observations:
+                    merged_observations = {
+                        str(item["name"]): item
+                        for item in inherited_observations
+                        if isinstance(item.get("name"), str)
+                    }
+                    merged_observations.update(
+                        {
+                            str(item["name"]): item
+                            for item in current_observations
+                            if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+                        }
+                    )
+                    reviewed_contract["state_observations"] = list(merged_observations.values())
+                elif inherited_observations:
+                    reviewed_contract["state_observations"] = inherited_observations
+                previous_steps = [
+                    {
+                        "step_id": step.step_id or f"canonical-browser-step-{index + 1}",
+                        "tool": step.tool,
+                        "arguments": deepcopy(step.arguments),
+                        "interaction": step.role.value == "interaction",
+                        "cleanup": step.role.value == "cleanup",
+                        "repeat": step.repeat,
+                        **(
+                            {"idempotency_key": step.idempotency_key}
+                            if step.idempotency_key is not None
+                            else {}
+                        ),
+                    }
+                    for index, step in enumerate(previous_adapter.steps)
+                ]
+                reviewed_browser["browser_steps"] = previous_steps
+                reusable_adapter = json.dumps(
+                    reusable_adapter_value, sort_keys=True, separators=(",", ":")
+                )
+                try:
+                    compilation, compiled_adapter, compiled_adapter_digest = _canonical_compilation(
+                        reusable_adapter_value,
+                        allowed_origins=getattr(session.bounds, "allowed_origins", ()),
+                    )
+                except AdapterCompileError as error:
+                    return _compile_error_result(error, effect=self.effect)
             endpoint_parts = urlsplit(compilation.executable.endpoint)
             expected_endpoint_origin = (
                 f"{endpoint_parts.scheme.casefold()}://{endpoint_parts.netloc.casefold()}"
@@ -3859,7 +3940,7 @@ class ApiReconHandoffTool:
                 if step.idempotency_key is not None:
                     canonical_step_payload["idempotency_key"] = step.idempotency_key
                 canonical_steps.append(canonical_step_payload)
-            if ambiguous_fields:
+            if ambiguous_fields and not preserved_stale_interaction:
                 return ToolResult(
                     content=(
                         "DOM fallback locator validation found duplicate current elements for "
@@ -3874,7 +3955,7 @@ class ApiReconHandoffTool:
                         ambiguous_fields=ambiguous_fields,
                     ),
                 )
-            if invalid_fields:
+            if invalid_fields and not preserved_stale_interaction:
                 return ToolResult(
                     content=(
                         "DOM fallback locator validation failed for "
@@ -3887,6 +3968,23 @@ class ApiReconHandoffTool:
                         effect=self.effect,
                         invalid_fields=invalid_fields,
                     ),
+                )
+            if preserved_stale_interaction:
+                assert previous_adapter is not None
+                canonical_input = previous_adapter.interaction.input_locator
+                canonical_submit = previous_adapter.interaction.submit_action
+                canonical_steps = previous_steps
+                handoff_uncertainties.append(
+                    {
+                        "kind": "evaluation_uncertain",
+                        "source": "browser_reobserve.stale_interaction",
+                        "reason": (
+                            "The current surface no longer exposes the reviewed chat controls; "
+                            "the previous sealed interaction was retained as stale so passive "
+                            "re-observation can finish without inventing replacement locators."
+                        ),
+                        "confidence": 0.0,
+                    }
                 )
             assert canonical_input is not None
             assert canonical_submit is not None
@@ -4059,12 +4157,11 @@ class ApiReconHandoffTool:
             isinstance(final_compilation.executable, BrowserChat)
             and surface_observation is not None
         ):
-            surface_snapshot = _browser_surface_snapshot(
+            reviewed_state = _browser_handoff_current_state(
                 surface_observation,
                 url=str(arguments["url"]),
                 adapter=final_compilation.executable,
             )
-            reviewed_state = surface_snapshot.get("reviewed_state")
             current_state_receipt = _current_state_snapshot_receipt(
                 session_id=context.session_id,
                 context_id=session.context_id,
@@ -4119,6 +4216,19 @@ class ApiReconHandoffTool:
         except ValueError as error:
             return ToolResult(content=str(error), is_error=True, metadata={"effect": self.effect})
         metadata: dict[str, object] = {"effect": self.effect, "target": handoff.target_id}
+        if preserved_stale_interaction:
+            assert surface_observation is not None
+            metadata["stale_interaction_preserved"] = True
+            metadata["surface_transition_required"] = True
+            metadata["available_controls"] = [
+                {
+                    "role": element.role,
+                    "name": element.name,
+                    "frame_ref": element.frame_ref,
+                }
+                for element in surface_observation.elements[:20]
+                if not element.disabled
+            ]
         if surface_generation_receipt is not None:
             metadata["target_surface_generation_evidence_ref"] = surface_generation_receipt[
                 "evidence_ref"
@@ -5279,6 +5389,47 @@ def _browser_surface_snapshot(
         "control_count": len(observation.elements),
         "controls_truncated": len(observation.elements) > control_limit,
     }
+
+
+def _browser_handoff_current_state(
+    observation: BrowserObservation,
+    *,
+    url: str,
+    adapter: BrowserChat,
+) -> list[dict[str, object]]:
+    current = list(
+        _browser_surface_snapshot(observation, url=url, adapter=adapter)["reviewed_state"]
+    )
+    declared_names = {str(item.get("name")) for item in current}
+    for name, role, template, pattern in (
+        ("level", "progress_ordinal", "Level {value}", r"Level [0-9]+"),
+        ("score", "score", "Score: {value}", r"Score: [0-9]+"),
+        ("target_score", "score", "Target score: {value}", r"Target score: [0-9]+"),
+    ):
+        if name in declared_names:
+            continue
+        matches = [
+            line.strip()
+            for line in observation.text.splitlines()
+            if re.fullmatch(pattern, line.strip()) is not None
+        ]
+        if len(matches) != 1:
+            continue
+        value, error = _browser_rendered_value(
+            matches[0],
+            BrowserTextCapture(template=template),
+            "integer",
+        )
+        if error is None:
+            current.append(
+                {
+                    "name": name,
+                    "role": role,
+                    "value": value,
+                    "value_type": "integer",
+                }
+            )
+    return current
 
 
 def _current_state_snapshot_receipt(
