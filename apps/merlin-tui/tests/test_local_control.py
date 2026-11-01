@@ -792,6 +792,47 @@ async def test_client_rpc_response_uses_configured_deadline(
 
 
 @pytest.mark.asyncio
+async def test_campaign_start_has_a_bounded_longer_rpc_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from merlin_tui import local_control
+
+    deadlines: list[float] = []
+
+    class Channel:
+        def __init__(self, reader, writer) -> None:
+            pass
+
+        async def send(self, value) -> None:
+            pass
+
+        async def receive(self, *, deadline_seconds: float):
+            deadlines.append(deadline_seconds)
+            return {"type": "result", "value": {}}
+
+    async def open_unix_connection(*args, **kwargs):
+        return object(), object()
+
+    async def close_writer(writer) -> None:
+        pass
+
+    monkeypatch.setattr(local_control, "_Channel", Channel)
+    monkeypatch.setattr(local_control.asyncio, "open_unix_connection", open_unix_connection)
+    monkeypatch.setattr(local_control, "_close_writer", close_writer)
+    monkeypatch.setattr(
+        local_control,
+        "configured_local_control_tuning",
+        lambda: LocalControlTuning(request_timeout_seconds=30),
+    )
+    client = LocalControlClient()
+
+    await client.execute_campaign("campaign/test", "sha256:test")
+    await client.list_campaigns()
+
+    assert deadlines == [300.0, 30]
+
+
+@pytest.mark.asyncio
 async def test_reasoning_deltas_do_not_force_one_journal_rewrite_each(
     monkeypatch,
 ) -> None:

@@ -1904,6 +1904,9 @@ class LocalControlClient:
 
     async def _call(self, method: str, args: object, kwargs: object) -> Any:
         request_id = str(uuid4())
+        timeout_seconds = configured_local_control_tuning().request_timeout_seconds
+        if method == "execute_campaign":
+            timeout_seconds = max(timeout_seconds, 300.0)
         for attempt in range(2):
             writer: asyncio.StreamWriter | None = None
             try:
@@ -1919,9 +1922,7 @@ class LocalControlClient:
                         "kwargs": kwargs,
                     }
                 )
-                response = await channel.receive(
-                    deadline_seconds=configured_local_control_tuning().request_timeout_seconds
-                )
+                response = await channel.receive(deadline_seconds=timeout_seconds)
                 if response.get("type") == "error":
                     raise RuntimeError(str(response.get("error", "daemon request failed")))
                 return _decode(response.get("value"))
