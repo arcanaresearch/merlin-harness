@@ -561,16 +561,51 @@ def _strict_target_surface_transition(result: ToolResult) -> dict[str, object] |
     )
 
 
+def _requires_semantic_target_exchange(handoff: WorkerHandoff) -> bool:
+    objective = handoff.assignment.objective.lstrip().upper()
+    return objective.startswith(
+        (
+            "DIRECT OBSERVATION",
+            "DIRECT BASELINE",
+            "CRESCENDO DEGRADED",
+            "BENIGN CONTROL",
+        )
+    )
+
+
+def _target_effect_counts_for_assignment(
+    handoff: WorkerHandoff,
+    tool_name: str,
+    target_exchange_tool_names: frozenset[str],
+) -> bool:
+    return (
+        not _requires_semantic_target_exchange(handoff) or tool_name in target_exchange_tool_names
+    )
+
+
 def _target_evidence_effect_observed(
     target_evidence: Mapping[str, Mapping[str, object]],
+    *,
+    target_exchange_tool_names: frozenset[str] | None = None,
+    require_semantic_exchange: bool = False,
 ) -> bool:
     return any(
-        receipt.get("acknowledged") is True
-        or receipt.get("target_effect_attempted") is True
-        or (type(receipt.get("interaction_count")) is int and int(receipt["interaction_count"]) > 0)
-        or (
-            type(receipt.get("target_call_budget_charge")) is int
-            and int(receipt["target_call_budget_charge"]) > 0
+        (
+            not require_semantic_exchange
+            or target_exchange_tool_names is not None
+            and receipt.get("tool_name") in target_exchange_tool_names
+        )
+        and (
+            receipt.get("acknowledged") is True
+            or receipt.get("target_effect_attempted") is True
+            or (
+                type(receipt.get("interaction_count")) is int
+                and int(receipt["interaction_count"]) > 0
+            )
+            or (
+                type(receipt.get("target_call_budget_charge")) is int
+                and int(receipt["target_call_budget_charge"]) > 0
+            )
         )
         for receipt in target_evidence.values()
     )
@@ -613,6 +648,20 @@ def _target_surface_transition_result(
             target_session_id=target_session_id,
             checkpoint=checkpoint,
             retry_failure_kind=retry_failure_kind,
+        )
+    if _requires_semantic_target_exchange(handoff) and not (
+        checkpoint and checkpoint.get("effect_observed") is True
+    ):
+        return WorkerResult(
+            task_id=handoff.assignment.id,
+            status="failed",
+            content=content,
+            error="browser navigation did not execute the reviewed target exchange",
+            error_code="required_target_effect_missing",
+            retry_class="fresh_worker",
+            infrastructure_failure_category="missing_target_effect",
+            checkpoint=checkpoint,
+            target_session_id=target_session_id,
         )
     return WorkerResult(
         task_id=handoff.assignment.id,
@@ -4065,6 +4114,20 @@ class WorkerRuntime:
             return structured
 
         def terminal_runtime_result(result: WorkerResult) -> WorkerResult:
+            if (
+                result.status == "completed"
+                and _requires_semantic_target_exchange(handoff)
+                and target_exchange_tool_names
+                and not effect_observed
+            ):
+                return self._failed(
+                    handoff,
+                    "worker completed without executing a required target effect",
+                    content=result.content,
+                    retry_class="fresh_worker",
+                    error_code="required_target_effect_missing",
+                    infrastructure_failure_category="missing_target_effect",
+                )
             return WorkerResult(
                 task_id=result.task_id,
                 status=result.status,
@@ -4876,7 +4939,9 @@ class WorkerRuntime:
                             "adapter_state_integrity",
                         )
                     effect_observed = effect_observed or _target_evidence_effect_observed(
-                        target_evidence
+                        target_evidence,
+                        target_exchange_tool_names=target_exchange_tool_names,
+                        require_semantic_exchange=_requires_semantic_target_exchange(handoff),
                     )
                     transition_decision = _target_surface_transition_decision(
                         handoff,
@@ -4935,7 +5000,11 @@ class WorkerRuntime:
                         f"Hydra-Select target observation is not attributable: {error}",
                         "ambiguous",
                     )
-                if not self._is_idempotent_result_replay(result):
+                if not self._is_idempotent_result_replay(result) and (
+                    _target_effect_counts_for_assignment(
+                        handoff, call.name, target_exchange_tool_names
+                    )
+                ):
                     effect_observed = True
                 await write_checkpoint(
                     messages,
@@ -5068,7 +5137,9 @@ class WorkerRuntime:
                         "adapter_state_integrity",
                     )
                 effect_observed = effect_observed or _target_evidence_effect_observed(
-                    target_evidence
+                    target_evidence,
+                    target_exchange_tool_names=target_exchange_tool_names,
+                    require_semantic_exchange=_requires_semantic_target_exchange(handoff),
                 )
                 transition_decision = _target_surface_transition_decision(
                     handoff,
@@ -5093,7 +5164,11 @@ class WorkerRuntime:
             target_session_id, target_session_generation = self._merge_target_session(
                 target_session_id, target_session_generation, pending_result
             )
-            if not self._is_idempotent_result_replay(pending_result):
+            if not self._is_idempotent_result_replay(pending_result) and (
+                _target_effect_counts_for_assignment(
+                    handoff, pending_call.name, target_exchange_tool_names
+                )
+            ):
                 effect_observed = True
             try:
                 goat_state = observe_goat_target(
@@ -6279,12 +6354,17 @@ class WorkerRuntime:
                 if target_decision is not None:
                     if surface_transition_claimed:
                         effect_observed = effect_observed or _target_evidence_effect_observed(
-                            target_evidence
+                            target_evidence,
+                            target_exchange_tool_names=target_exchange_tool_names,
+                            require_semantic_exchange=_requires_semantic_target_exchange(handoff),
                         )
                     if (
                         effect in {"target_network", "target_read"}
                         and not result.is_error
                         and not self._is_idempotent_result_replay(result)
+                        and _target_effect_counts_for_assignment(
+                            handoff, call.name, target_exchange_tool_names
+                        )
                         and (probe_server_failure is None or probe_worker)
                     ):
                         effect_observed = True
@@ -6411,6 +6491,9 @@ class WorkerRuntime:
                     effect in {"target_network", "target_read"}
                     and not result.is_error
                     and not self._is_idempotent_result_replay(result)
+                    and _target_effect_counts_for_assignment(
+                        handoff, call.name, target_exchange_tool_names
+                    )
                 ):
                     effect_observed = True
                 if (
@@ -7568,7 +7651,11 @@ class WorkerRuntime:
                     if target_decision is not None:
                         if surface_transition_claimed:
                             effect_observed = effect_observed or _target_evidence_effect_observed(
-                                target_evidence
+                                target_evidence,
+                                target_exchange_tool_names=target_exchange_tool_names,
+                                require_semantic_exchange=_requires_semantic_target_exchange(
+                                    handoff
+                                ),
                             )
                         if (
                             effect in {"target_network", "target_read"}
@@ -7692,6 +7779,9 @@ class WorkerRuntime:
                         effect in {"target_network", "target_read"}
                         and not result.is_error
                         and not self._is_idempotent_result_replay(result)
+                        and _target_effect_counts_for_assignment(
+                            handoff, call.name, target_exchange_tool_names
+                        )
                     ):
                         effect_observed = True
                     if (
@@ -8354,7 +8444,9 @@ class WorkerRuntime:
             return self._checkpoint_payload(
                 messages,
                 {},
-                _target_evidence_effect_observed(target_evidence),
+                _target_evidence_effect_observed(
+                    target_evidence,
+                ),
                 action_count=len(target_evidence),
                 elapsed_seconds=elapsed_before + time.monotonic() - started,
                 active_phase="target",
@@ -8483,7 +8575,9 @@ class WorkerRuntime:
             checkpoint_arguments = (
                 messages,
                 {},
-                _target_evidence_effect_observed(target_evidence),
+                _target_evidence_effect_observed(
+                    target_evidence,
+                ),
                 (),
             )
             checkpoint_keywords = {
@@ -10251,7 +10345,7 @@ class WorkerRuntime:
                 task_id=handoff.assignment.id,
                 target_id=str(receipt_body["target_id"]),
                 target_endpoint=target.endpoint if target is not None else None,
-                technique_ids=handoff.assignment.technique_ids,
+                require_semantic_exchange=_requires_semantic_target_exchange(handoff),
                 is_error=result.is_error,
                 status_code=latest_status if type(latest_status) is int else None,
                 latency_ms=latest_latency_ms,

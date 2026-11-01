@@ -597,6 +597,11 @@ def test_baseline_agenda_runs_ordinary_direct_cell_without_control_metadata() ->
     assert observation.predecessor_assignment_id is None
     assert observation.comparison_block_reason is None
     assert "DIRECT OBSERVATION" in observation.objective
+    assert "first tool-call group exactly one reviewed target delivery" in observation.objective
+    assert (
+        "Do not open or navigate tabs, reset sessions, or perform generic fill/click"
+        in observation.objective
+    )
 
 
 def test_baseline_agenda_admits_multi_turn_with_reviewed_stateful_api_lifecycle() -> None:

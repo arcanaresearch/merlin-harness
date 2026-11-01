@@ -530,6 +530,45 @@ def test_http_runtime_keeps_injection_alongside_primary_reviewed_actor() -> None
 
 
 @pytest.mark.asyncio
+async def test_browser_navigation_does_not_complete_technique_delivery() -> None:
+    reviewed = _generic_browser_transition_handoff()
+    reviewed = replace(
+        reviewed,
+        assignment=replace(
+            reviewed.assignment,
+            objective=(
+                "DIRECT OBSERVATION for merlin-injection-taxonomy/cat/direct/override-baseline"
+                "@lang=en@variant=native. Execute one attributable target request."
+            ),
+        ),
+    )
+    provider = Provider(
+        [
+            [
+                ToolCall(call_id="open", name="browser_open_tab", arguments={}),
+                ModelCompleted(finish_reason="tool_calls"),
+            ],
+            [TextDelta(text='{"finding":"done"}'), ModelCompleted(finish_reason="stop")],
+        ]
+    )
+
+    class NavigationTools(GenericBrowserTransitionTools):
+        pass
+
+    result = await WorkerRuntime(provider, NavigationTools()).run(reviewed)
+
+    assert result.status == "failed", (
+        result.status,
+        result.error_code,
+        result.infrastructure_failure_category,
+        result.retry_class,
+        result.error,
+    )
+    assert result.infrastructure_failure_category == "missing_target_effect"
+    assert result.retry_class == "fresh_worker"
+
+
+@pytest.mark.asyncio
 async def test_missing_reviewed_actor_is_retryable_infrastructure_failure() -> None:
     reviewed = reviewed_handoff(interface="http_api", tools=("target_chat",))
     provider = Provider([])
