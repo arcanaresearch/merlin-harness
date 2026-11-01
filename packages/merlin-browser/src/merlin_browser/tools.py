@@ -10054,7 +10054,13 @@ class CompiledApiReconHandoffTool:
                 return ToolResult(
                     content="no exact captured JSON exchange matches the requested API endpoint",
                     is_error=True,
-                    metadata={"effect": self.effect},
+                    metadata={
+                        "effect": self.effect,
+                        "failure_code": "captured_exchange_not_found",
+                        "retryable": False,
+                        "preferred_next_tool": "browser_record_api_handoff",
+                        "preferred_next_tool_mode": "strict",
+                    },
                 )
             matches.sort(
                 key=lambda item: (

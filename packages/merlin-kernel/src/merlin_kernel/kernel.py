@@ -718,20 +718,27 @@ def _durable_preferred_tool_repair_marker(
     elif tool_name in _BROWSER_HANDOFF_REPAIR_TOOLS:
         if result.is_error:
             next_tool = next_tool or tool_name
-            valid = result.metadata.get("retryable") is True and (
-                next_tool == tool_name
-                or (
-                    tool_name == "browser_record_api_handoff"
-                    and next_tool == "browser_compile_api_handoff"
+            valid = (
+                result.metadata.get("retryable") is True
+                and (
+                    next_tool == tool_name
+                    or (
+                        tool_name == "browser_record_api_handoff"
+                        and next_tool == "browser_compile_api_handoff"
+                    )
+                    or (
+                        next_tool == _HANDOFF_REPAIR_OBSERVATION_TOOL
+                        and result.metadata.get("failure_code")
+                        in {
+                            "interaction_response_pending",
+                            "state_observation_baseline_required",
+                        }
+                    )
                 )
-                or (
-                    next_tool == _HANDOFF_REPAIR_OBSERVATION_TOOL
-                    and result.metadata.get("failure_code")
-                    in {
-                        "interaction_response_pending",
-                        "state_observation_baseline_required",
-                    }
-                )
+            ) or (
+                tool_name == "browser_compile_api_handoff"
+                and next_tool == "browser_record_api_handoff"
+                and result.metadata.get("failure_code") == "captured_exchange_not_found"
             )
             if (
                 next_tool == _OWNED_SESSION_CLEANUP_TOOL
@@ -973,6 +980,10 @@ def _restored_preferred_tool_repair(
                     "browser_compile_api_handoff",
                     _HANDOFF_REPAIR_OBSERVATION_TOOL,
                 }
+            )
+            or (
+                source == "browser_compile_api_handoff"
+                and tool_name == "browser_record_api_handoff"
             )
             or (
                 source == _HANDOFF_REPAIR_OBSERVATION_TOOL

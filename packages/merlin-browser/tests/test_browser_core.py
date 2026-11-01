@@ -7164,6 +7164,8 @@ async def test_api_handoff_rejects_durable_restart_prefix_owned_by_another_sessi
 
     assert result.is_error is True
     assert result.content == "no exact captured JSON exchange matches the requested API endpoint"
+    assert result.metadata["failure_code"] == "captured_exchange_not_found"
+    assert result.metadata["preferred_next_tool"] == "browser_record_api_handoff"
 
 
 @pytest.mark.asyncio

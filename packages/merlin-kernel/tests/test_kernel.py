@@ -4970,6 +4970,121 @@ async def test_handoff_repair_obligation_restores_strictly_after_kernel_restart(
 
 
 @pytest.mark.asyncio
+async def test_missing_capture_compile_fallback_restores_after_restart() -> None:
+    class RepairTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return tuple(
+                ToolSpec(name=name, description=name, input_schema={})
+                for name in (
+                    "assessment_prepare",
+                    "browser_compile_api_handoff",
+                    "browser_record_api_handoff",
+                )
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "assessment_prepare" and self.calls.count(name) == 1:
+                return ToolResult(
+                    content="browser handoff required",
+                    is_error=True,
+                    metadata={
+                        "retryable": True,
+                        "repair_reason": "recon_handoff_required",
+                        "preferred_next_tool": "browser_compile_api_handoff",
+                    },
+                )
+            if name == "browser_compile_api_handoff":
+                return ToolResult(
+                    content="no exact captured JSON exchange matches the requested API endpoint",
+                    is_error=True,
+                    metadata={
+                        "failure_code": "captured_exchange_not_found",
+                        "retryable": False,
+                        "preferred_next_tool": "browser_record_api_handoff",
+                    },
+                )
+            if name == "browser_record_api_handoff":
+                return ToolResult(
+                    content="DOM handoff recorded",
+                    metadata={"preferred_next_tool": "assessment_prepare"},
+                )
+            return ToolResult(content="campaign prepared")
+
+    store = Store()
+    tools = RepairTools()
+    first_kernel = Kernel(Provider(), store, tools, Settings())
+    session_id = await first_kernel.start()
+    await store.append_message(
+        session_id,
+        ChatMessage(role="user", content=_campaign_scope_content("Assess target A")),
+    )
+    next_tool, *_ = await first_kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [
+            ToolCall(
+                call_id="prepare-old",
+                name="assessment_prepare",
+                arguments={"objective": "Assess target A"},
+            )
+        ],
+        repair_scope_campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    assert next_tool == "browser_compile_api_handoff"
+    next_tool, *_ = await first_kernel._invoke_tools(  # noqa: SLF001
+        session_id,
+        [ToolCall(call_id="compile-old", name="browser_compile_api_handoff", arguments={})],
+        repair_scope_campaign_request_id=_CAMPAIGN_REQUEST_ID_A,
+    )
+    assert next_tool == "browser_record_api_handoff"
+    assert _restored_preferred_tool_repair(store.messages[session_id]) == (
+        "browser_record_api_handoff",
+        "strict",
+        "sha256:" + hashlib.sha256(b"Assess target A").hexdigest(),
+        _CAMPAIGN_REQUEST_ID_A,
+    )
+
+    class RestartProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ToolCall(
+                    call_id="record-new", name="browser_record_api_handoff", arguments={}
+                )
+            elif len(self.requests) == 2:
+                yield ToolCall(
+                    call_id="prepare-new",
+                    name="assessment_prepare",
+                    arguments={"objective": "Assess target A"},
+                )
+            else:
+                yield TextDelta(text="prepared")
+            yield ModelCompleted()
+
+    provider = RestartProvider()
+    restarted = Kernel(provider, store, tools, Settings())
+    await restarted.start(session_id)
+    await restarted.submit("resume interrupted turn")
+    await restarted.wait_for_turn()
+
+    assert provider.requests[0].required_tool_name == "browser_record_api_handoff"
+    assert provider.requests[1].required_tool_name == "assessment_prepare"
+    assert tools.calls == [
+        "assessment_prepare",
+        "browser_compile_api_handoff",
+        "browser_record_api_handoff",
+        "assessment_prepare",
+    ]
+    assert _restored_preferred_tool_repair(store.messages[session_id]) is None
+
+
+@pytest.mark.asyncio
 async def test_dom_handoff_repair_routes_record_success_back_to_prepare() -> None:
     class DomRepairTools(Tools):
         def __init__(self) -> None:
