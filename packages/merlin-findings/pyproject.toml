@@ -1,6 +1,6 @@
 [project]
 name = "merlin-findings"
-version = "0.2.40"
+version = "0.2.41"
 description = "Finding lifecycle and report exports for Merlin"
 requires-python = ">=3.13"
 dependencies = ["merlin-contracts"]
