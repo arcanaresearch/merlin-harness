@@ -3211,6 +3211,21 @@ class CampaignService:
             return await self._cap_quickscan_attack_context(
                 campaign_id, manifest, context, wave
             ), None
+        load_active = getattr(self._store, "load_active_frontier_batch", None)
+        active = (
+            await asyncio.to_thread(load_active, campaign_id) if callable(load_active) else None
+        )
+        if (
+            isinstance(active, Mapping)
+            and str(active.get("state") or "") == "claimed"
+            and not active.get("schedule_id")
+            and int(active.get("wave", -1)) == wave
+        ):
+            materialized = self._materialize_frontier_batch(context, active)
+            prioritized = await self._prioritize_execution_candidates(
+                campaign_id, manifest, materialized, wave
+            )
+            return replace(context, techniques=prioritized), active
         batch_id = str(uuid5(NAMESPACE_URL, f"merlin.frontier-batch.v1\n{campaign_id}\n{wave}"))
         batch_limit = await self._frontier_batch_limit(manifest)
         shortlist_loader = getattr(self._store, "list_frontier_shortlist", None)

@@ -27045,6 +27045,89 @@ async def test_adaptive_frontier_claim_scores_before_selection_and_keeps_rest_qu
     assert store.priorities["cell/2"] == 0.9
 
 
+async def test_supervisor_replay_reuses_unbound_frontier_batch():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = tuple(replace(base, id=f"cell/{index}") for index in range(3))
+    context = replace(prepared.assignment_context, techniques=techniques)
+
+    class ReplayStore(Store):
+        def __init__(self):
+            super().__init__()
+            self.queued = [item.id for item in techniques]
+            self.active = None
+            self.claims = []
+
+        def frontier_counts(self, _campaign_id):
+            return {"queued": len(self.queued), "total": len(techniques)}
+
+        def load_active_frontier_batch(self, _campaign_id):
+            return self.active
+
+        def claim_frontier_batch(self, *_args):
+            raise AssertionError("supervisor replay must use the exact durable claim")
+
+        def list_frontier_shortlist(self, _campaign_id, limit, *, after_ordinal=None):
+            assert after_ordinal is None
+            return tuple(
+                {
+                    "id": candidate_id,
+                    "family_id": candidate_id,
+                    "ordinal": int(candidate_id.split("/")[1]),
+                    "requested_language": "und",
+                    "variant_id": "baseline",
+                    "variant": {},
+                    "priority": None,
+                    "claim_generation": 0,
+                }
+                for candidate_id in self.queued[:limit]
+            )
+
+        def claim_frontier_batch_exact(self, _campaign_id, wave, batch_id, candidate_ids):
+            if self.active is not None:
+                raise ValueError(
+                    f"campaign already has active frontier batch {self.active['id']!r}"
+                )
+            selected = tuple(candidate_ids)
+            self.claims.append(selected)
+            self.queued = [item for item in self.queued if item not in selected]
+            self.active = {
+                "id": batch_id,
+                "wave": wave,
+                "state": "claimed",
+                "schedule_id": None,
+                "candidates": tuple(
+                    {
+                        "id": candidate_id,
+                        "family_id": candidate_id,
+                        "ordinal": int(candidate_id.split("/")[1]),
+                        "requested_language": "und",
+                        "variant_id": "baseline",
+                        "claim_generation": 1,
+                    }
+                    for candidate_id in selected
+                ),
+            }
+            return self.active
+
+    store = ReplayStore()
+    service = CampaignService(store, object(), None, max_worker_concurrency=1)  # type: ignore[arg-type]
+
+    first_context, first_batch = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 1
+    )
+    replay_context, replay_batch = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 1
+    )
+
+    assert store.claims == [tuple(item.id for item in first_context.techniques)]
+    assert replay_batch is first_batch
+    assert replay_context.techniques == first_context.techniques
+    assert set(store.queued) | {item.id for item in replay_context.techniques} == {
+        item.id for item in techniques
+    }
+
+
 def test_execution_diversity_fills_batch_across_families_and_states():
     base = AssignmentTechnique(
         id="family/a/first",
