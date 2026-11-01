@@ -1458,6 +1458,34 @@ def test_only_non_executable_transport_contracts_hard_fail(
     assert caught.value.path == path
 
 
+def test_browser_chat_requires_submit_after_last_fill() -> None:
+    raw = _browser_adapter()
+    raw["browser_steps"] = [
+        {
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+            "interaction": False,
+        },
+        {
+            "tool": "browser_click",
+            "arguments": {"locator": "button Chat"},
+            "interaction": False,
+        },
+        {
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+            "interaction": True,
+        },
+    ]
+
+    with pytest.raises(AdapterCompileError) as caught:
+        compile_target_adapter(raw)
+
+    assert caught.value.kind is AdapterCompileFailureKind.NON_EXECUTABLE_STEPS
+    assert caught.value.path == "browser_steps"
+    assert "after the last browser_fill" in str(caught.value)
+
+
 def test_reader_accepts_raw_v1_json_compiled_variant_and_envelope() -> None:
     raw = _http_adapter()
     from_mapping = read_target_adapter(raw)

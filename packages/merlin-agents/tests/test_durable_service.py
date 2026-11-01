@@ -7295,6 +7295,73 @@ async def test_fresh_worker_retry_runs_after_untouched_ready_assignments() -> No
     assert all(task.status == "completed" for task in tasks)
 
 
+async def test_capability_probe_missing_effect_retries_ready_worker() -> None:
+    class FailingBrowserTools(Tools):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_chat_exchange",
+                    description="Browser exchange",
+                    input_schema={},
+                    interaction_role=ToolInteractionRole.TARGET_EXCHANGE,
+                    target_delivery="direct-user-channel",
+                    target_delivery_from_reviewed_adapter=True,
+                ),
+            )
+
+        def effect(self, name):
+            return "target_network"
+
+        async def invoke(self, name, context, arguments):
+            self.calls += 1
+            return ToolResult(content="max() iterable argument is empty", is_error=True)
+
+    class ProbeProvider(Provider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            self.calls += 1
+            if self.calls <= 2:
+                yield ToolCall(
+                    call_id=f"probe-{self.calls}",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "harmless capability probe"},
+                )
+            else:
+                yield TextDelta(text='{"accepted":null,"summary":"no target effect"}')
+            yield ModelCompleted()
+
+    tools = FailingBrowserTools()
+    provider = ProbeProvider()
+    service = DurableAgentService(provider, tools, Store(), model="test")
+    assignment = WorkerAssignment(
+        id="campaign/test/capability-probe/agent_messaging",
+        objective="Test target capability: agent messaging",
+        profile_id="recon",
+        target_profile_id="target",
+        technique_ids=("capability/agent_messaging",),
+        guidance_ids=(),
+        tool_ids=("browser_chat_exchange",),
+        skill_ids=(),
+        provider_id="provider",
+        authority_ids=("target:reviewed",),
+        budget=AssignmentBudget(),
+        input_schema='{"type":"object"}',
+        output_schema='{"type":"object"}',
+    )
+
+    live = await service.submit("session", (assignment,), max_workers=1, minimum_workers=1)
+    assert live.execution is not None
+    await asyncio.wait_for(live.execution, timeout=2)
+
+    tasks = await service.list_schedule_tasks(live.id)
+    assert tools.calls > 1, [(task.status, task.result) for task in tasks]
+
+
 async def test_provider_error_code_and_message_surface_in_attempt_reason() -> None:
     class RejectingProvider(Provider):
         async def stream(self, request):

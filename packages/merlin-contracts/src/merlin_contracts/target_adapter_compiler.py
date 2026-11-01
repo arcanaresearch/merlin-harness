@@ -1432,15 +1432,17 @@ def _compile_browser_steps(
             "browser_steps",
             "browser chat requires one browser_fill step that can carry the attack input",
         )
-    fill_index = next(index for index, step in enumerate(compiled) if step.tool == "browser_fill")
+    last_fill_index = max(
+        index for index, step in enumerate(compiled) if step.tool == "browser_fill"
+    )
     if not any(
-        index > fill_index and step.tool in {"browser_click", "browser_press"}
+        index > last_fill_index and step.tool in {"browser_click", "browser_press"}
         for index, step in enumerate(compiled)
     ):
         raise AdapterCompileError(
             AdapterCompileFailureKind.NON_EXECUTABLE_STEPS,
             "browser_steps",
-            "browser chat requires a submit action after browser_fill",
+            "browser chat requires a submit action after the last browser_fill",
         )
     advisories.extend(
         _advisory(
