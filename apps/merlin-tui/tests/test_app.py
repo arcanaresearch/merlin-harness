@@ -32,10 +32,12 @@ from merlin_tui.backend import (
     CampaignView,
     DemoBackend,
     MemoryRecordView,
+    NodeView,
     PackCaseView,
     PackView,
     ReportView,
     ResumeSessionView,
+    ScheduleView,
     StreamEvent,
 )
 from merlin_tui.bootstrap import build_app
@@ -7161,6 +7163,112 @@ async def test_live_target_progress_card_is_separate_from_agent_swarm() -> None:
         rendered = progress.render()
         assert "Target progress\nStage 3" in getattr(rendered, "plain", str(rendered))
         assert "Agent swarm" in "\n".join(line.text for line in swarm.lines)
+
+
+@pytest.mark.asyncio
+async def test_live_campaign_projects_target_reobservation_and_refreshed_evidence() -> None:
+    class ReobservationBackend(DemoBackend):
+        def __init__(self):
+            super().__init__()
+            self.reobserving = True
+            self.node_status = "running"
+            self.progress = {
+                "status": "observed",
+                "freshness": "stale",
+                "target_exchange_count": 2,
+                "current_state": ({"name": "stage", "label": "Stage", "value": 4},),
+                "conflicts": (),
+            }
+
+        async def list_campaigns(self):
+            return (
+                CampaignView(
+                    "campaign/reobserve",
+                    "session-demo",
+                    "Stateful assessment",
+                    "recommended",
+                    "executing",
+                    "digest",
+                    5,
+                    "attack",
+                    "completed",
+                    target_progress=self.progress,
+                ),
+            )
+
+        async def list_agents(self):
+            return ()
+
+        async def list_active_schedules(self):
+            if not self.reobserving:
+                return ()
+            return (
+                ScheduleView(
+                    "reobservation-schedule",
+                    "running",
+                    "graph-digest",
+                    (
+                        NodeView(
+                            id=(
+                                "worker:campaign/reobserve/target-reobservation/"
+                                + "a" * 64
+                                + "/recon"
+                            ),
+                            status=self.node_status,
+                            profile="reconnaissance",
+                            technique="target-refresh",
+                            target_adapter="target/http",
+                            authority="observe",
+                            budgets="turns 1/2",
+                        ),
+                    ),
+                ),
+            )
+
+    backend = ReobservationBackend()
+    app = build_app(backend)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        swarm = app.query_one("#swarm-live", app_module.LiveSwarmLog)
+        progress = app.query_one("#target-progress", Static)
+        swarm_text = "\n".join(line.text for line in swarm.lines)
+        progress_text = str(progress.render())
+        assert "Re-observing target state" in swarm_text
+        assert "refreshing target evidence before wave review" in swarm_text
+        assert "Reviewing wave results" not in swarm_text
+        assert "Target progress · re-observing" in progress_text
+        assert "Evidence: stale · 2 target exchanges observed" in progress_text
+
+        backend.node_status = "completed"
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        swarm_text = "\n".join(line.text for line in swarm.lines)
+        progress_text = str(progress.render())
+        assert "Reviewing wave results" in swarm_text
+        assert "Re-observing target state" not in swarm_text
+        assert "Target progress · re-observing" not in progress_text
+
+        backend.reobserving = False
+        backend.progress = {
+            "status": "observed",
+            "freshness": "current",
+            "target_exchange_count": 3,
+            "current_state": ({"name": "stage", "label": "Stage", "value": 5},),
+            "conflicts": (),
+        }
+        await app._poll_swarm_progress()  # noqa: SLF001
+        await pilot.pause()
+
+        swarm_text = "\n".join(line.text for line in swarm.lines)
+        progress_text = str(progress.render())
+        assert "Reviewing wave results" in swarm_text
+        assert "Re-observing target state" not in swarm_text
+        assert "Stage 5" in progress_text
+        assert "Target progress · re-observing" not in progress_text
+        assert "Evidence: current · 3 target exchanges observed" in progress_text
 
 
 @pytest.mark.asyncio

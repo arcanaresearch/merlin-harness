@@ -402,6 +402,22 @@ def _independent_session_completion_limitations(
     return tuple(limitations[key] for key in sorted(limitations))
 
 
+def _target_reobservation_progress(
+    projection: TargetReobservationProjection,
+    *,
+    latest_wave: int | None,
+) -> dict[str, object]:
+    result = dict(projection.lead_projection(latest_wave=latest_wave))
+    current = projection.current_generation
+    active_schedule = (
+        projection.active_schedule(current.generation_id) if current is not None else None
+    )
+    generation = result.get("generation")
+    if active_schedule is not None and isinstance(generation, Mapping):
+        result["generation"] = {**generation, "schedule_id": active_schedule}
+    return result
+
+
 def _target_reobservation_review_bindings(
     tasks: Sequence[AgentTask],
 ) -> tuple[Mapping[str, str], ...]:
@@ -21078,12 +21094,28 @@ class CampaignService:
                 ).encode()
             ).hexdigest()
         )
+        target_progress = await self.target_progress(
+            campaign_id,
+            manifest.target.id,
+            lead=lead,
+        )
+        target_reobservation = _target_reobservation_progress(
+            project_target_reobservations(
+                tuple(lead),
+                campaign_id=campaign_id,
+                session_id=manifest.session_id,
+                target_id=manifest.target.id,
+            ),
+            latest_wave=int(waves[-1]["wave"]) if waves else None,
+        )
         return {
             "campaign_id": campaign_id,
             "session_id": manifest.session_id,
             "status": str(row["status"]),
             "stop_reason": row.get("stop_reason"),
             "manifest_digest": str(row["manifest_digest"]),
+            "target_progress": target_progress,
+            "target_reobservation": target_reobservation,
             # Top-level operator-facing composition: the durable review guard in
             # the CLI refuses approval when this is absent, so it must not live
             # only inside the dynamic_specialist_policy projection.
@@ -21609,16 +21641,6 @@ class CampaignService:
             and saturation_decision.get("automatic") is not True
             else None
         )
-        if pending_saturation_decision is not None:
-            return {
-                "wave_number": len(waves),
-                "wave_kind": str(latest["kind"]),
-                "wave_status": str(latest["status"]),
-                "lead_activity": "waiting for operator coverage decision",
-                "target_progress": {},
-                "review_progress": {},
-                "saturation_decision": pending_saturation_decision,
-            }
         review_events = [
             item["payload"]
             for item in lead
@@ -21645,7 +21667,7 @@ class CampaignService:
             if str(event.get("kind") or "").startswith("incremental_")
             and (event.get("schedule_id") in {None, str(latest.get("schedule_id") or "")})
         ]
-        if incremental_events:
+        if pending_saturation_decision is None and incremental_events:
             merge_started = max(
                 (
                     index
@@ -21714,7 +21736,7 @@ class CampaignService:
                     "waiting_for": "active workers and independent reviewers continue",
                     "completed_chunks": len(finished_tasks),
                 }
-        if review_events and not review_progress:
+        if pending_saturation_decision is None and review_events and not review_progress:
             latest_review = review_events[-1]
             review_id = latest_review.get("review_id")
             if latest_review.get("state") == "reviewing" and isinstance(review_id, str):
@@ -21762,8 +21784,8 @@ class CampaignService:
         )
         pending = await self._pending_operator_guidance(campaign_id)
         target_progress: Mapping[str, object] = {}
+        target_id = str(latest.get("target_id") or "")
         try:
-            target_id = str(latest.get("target_id") or "")
             if not target_id:
                 row = await asyncio.to_thread(self._store.get, campaign_id)
                 if row is not None:
@@ -21777,18 +21799,33 @@ class CampaignService:
         except Exception:  # noqa: BLE001 - progress projection must not hide campaign state
             _LOGGER.exception("target progress projection failed for %s", campaign_id)
             target_progress = {}
+        target_reobservation = _target_reobservation_progress(
+            project_target_reobservations(
+                tuple(lead),
+                campaign_id=campaign_id,
+                target_id=target_id or None,
+            ),
+            latest_wave=int(latest.get("wave") or 0),
+        )
+        generation = target_reobservation.get("generation")
+        reobserving = isinstance(generation, Mapping) and generation.get("status") == "reobserving"
         return {
             "wave_number": len(waves),
             "wave_kind": str(latest["kind"]),
             "wave_status": str(latest["status"]),
             "lead_activity": (
-                "finishing current work"
+                "waiting for operator coverage decision"
+                if pending_saturation_decision is not None
+                else "finishing current work"
                 if draining
                 else "responding to operator guidance"
                 if pending
+                else "re-observing changed target surface"
+                if reobserving
                 else ""
             ),
             "target_progress": target_progress,
+            "target_reobservation": target_reobservation,
             "review_progress": review_progress,
             "saturation_decision": pending_saturation_decision,
         }

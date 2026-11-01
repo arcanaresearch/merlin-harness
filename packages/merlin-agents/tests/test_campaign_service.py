@@ -23079,6 +23079,52 @@ async def test_status_projects_the_reviewed_dynamic_specialist_policy() -> None:
     assert projected["saturation"]["frontier_exhausted"] is False
 
 
+async def test_status_includes_current_target_progress_and_reobservation_state() -> None:
+    prepared = await preparation(
+        "session-1", "Assess the reviewed target", CampaignProfile.RECOMMENDED
+    )
+
+    class StatusStore(Store):
+        def list_waves(self, campaign_id):
+            return []
+
+        def list_lead(self, campaign_id):
+            return []
+
+    snapshot = {
+        "schema": "merlin.target-progress.v1",
+        "campaign_id": "campaign-1",
+        "target_id": prepared.manifest.target.id,
+        "status": "observed",
+        "freshness": "current",
+        "observed_at": "2026-11-01T07:29:10+00:00",
+        "current_state": (),
+    }
+
+    class Agents:
+        async def target_progress(self, campaign_id, target_id):
+            assert campaign_id == "campaign-1"
+            assert target_id == prepared.manifest.target.id
+            return snapshot
+
+    store = StatusStore()
+    service = CampaignService(store, Agents(), preparation)  # type: ignore[arg-type]
+    envelope = {
+        "manifest": _json_value(asdict(prepared.manifest)),
+        "assignment_context": _json_value(asdict(prepared.assignment_context)),
+    }
+    store.prepare("campaign-1", "session-1", envelope, "sha256:reviewed")
+
+    projected = await service.status("campaign-1")
+
+    assert projected["target_progress"] == snapshot
+    assert projected["target_reobservation"] == {
+        "pending": (),
+        "generation": None,
+        "refreshed": (),
+    }
+
+
 async def test_status_tolerates_datetime_inside_cleanup_authority() -> None:
     # A cleanup-authority (or receipt, or completion-document) payload carrying a
     # raw datetime must not crash the status projection — the digest path

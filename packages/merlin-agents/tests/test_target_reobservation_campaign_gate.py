@@ -36,6 +36,7 @@ from merlin_agents.target_reobservation import (
     TargetReobservationProjection,
     normalize_target_ui_transition,
     target_reobservation_generation,
+    target_reobservation_schedule_id,
 )
 from merlin_contracts import AgentTask
 
@@ -3192,3 +3193,42 @@ async def test_primary_followup_retirement_honors_noncredit_transition(
         assert records[0].state == "retired"
         assert records[0].retirement_reason == "failed"
     execution.cancel()
+
+
+async def test_wave_progress_reports_active_target_reobservation() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation()
+    generation = _generation(obligation)
+    store = _JournalStore(manifest, context, obligation, [])
+    store.add_wave(manifest.id, 1, "frontier", "source-schedule")
+    schedule_id = target_reobservation_schedule_id(manifest.id, generation.generation_id, 1)
+    _append_started(store, obligation, schedule_id)
+    snapshot = {
+        "schema": "merlin.target-progress.v1",
+        "campaign_id": manifest.id,
+        "target_id": manifest.target.id,
+        "status": "observed",
+        "freshness": "current",
+        "observed_at": "2026-11-01T07:29:10+00:00",
+        "current_state": (),
+    }
+
+    class Agents:
+        async def target_progress(self, _campaign_id, _target_id):
+            return snapshot
+
+    service = CampaignService(store, Agents(), None)  # type: ignore[arg-type]
+
+    progress = await service.wave_progress(manifest.id)
+
+    assert progress["target_progress"] == snapshot
+    assert progress["target_reobservation"]["generation"] == {
+        "generation_id": generation.generation_id,
+        "target_session_id": generation.target_session_id,
+        "event_count": 1,
+        "event_set_digest": _digest({"event_digests": generation.event_digests}),
+        "status": "reobserving",
+        "schedule_id": schedule_id,
+    }
+    assert progress["lead_activity"] == "re-observing changed target surface"
+    assert progress["review_progress"] == {}

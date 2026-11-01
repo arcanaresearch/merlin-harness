@@ -5761,7 +5761,6 @@ class MerlinApp(App[None]):
                 return
             session_campaigns = _campaigns_for_session(campaigns, self._active_session_id)
             self._last_swarm_campaigns = (self._active_session_id, session_campaigns)
-            self._update_target_progress(session_campaigns)
             for campaign in session_campaigns:
                 decision = campaign.saturation_decision
                 if campaign.status == "executing" and (
@@ -5781,6 +5780,20 @@ class MerlinApp(App[None]):
                 campaign
                 for campaign in _current_campaigns(session_campaigns)
                 if campaign.status != "prepared"
+            )
+            target_reobservation_active = False
+            schedule_reader = getattr(self.backend, "list_active_schedules", None)
+            if active_campaigns and callable(schedule_reader):
+                try:
+                    active_schedules = await schedule_reader()
+                except Exception:
+                    active_schedules = ()
+                target_reobservation_active = _has_active_target_reobservation(
+                    active_campaigns[0].id, active_schedules
+                )
+            self._update_target_progress(
+                session_campaigns,
+                target_reobservation_active=target_reobservation_active,
             )
             if active_campaigns:
                 self._operator_preparing_session = ""
@@ -5836,6 +5849,7 @@ class MerlinApp(App[None]):
                         _agents_for_campaigns(agents, active_campaigns),
                         active_campaigns,
                         self._spinner_index,
+                        target_reobservation_active=target_reobservation_active,
                     )
                     if agents_unavailable:
                         rendered.append("\nWorker details unavailable · retrying", style="yellow")
@@ -5927,7 +5941,12 @@ class MerlinApp(App[None]):
             view.write(rendered, expand=True, shrink=True)
             view.add_class("visible")
 
-    def _update_target_progress(self, campaigns: tuple[CampaignView, ...]) -> None:
+    def _update_target_progress(
+        self,
+        campaigns: tuple[CampaignView, ...],
+        *,
+        target_reobservation_active: bool = False,
+    ) -> None:
         """Render target state beside the swarm without changing worker presentation."""
         rows = list(self.query("#target-progress"))
         if not rows:
@@ -5947,7 +5966,11 @@ class MerlinApp(App[None]):
             view.update("")
             view.remove_class("visible")
             return
-        rendered = _render_target_progress(progress, campaign_status=selected.status)
+        rendered = _render_target_progress(
+            progress,
+            campaign_status=selected.status,
+            target_reobservation_active=target_reobservation_active,
+        )
         if rendered.plain == self._target_progress_rendered and view.has_class("visible"):
             return
         self._target_progress_rendered = rendered.plain
@@ -7818,11 +7841,27 @@ def _campaign_wave_label(campaign: CampaignView) -> str:
     return f"Wave {number} · {kind or 'execution'}"
 
 
+def _has_active_target_reobservation(campaign_id: str, schedules: Iterable[ScheduleView]) -> bool:
+    assignment_prefix = f"worker:{campaign_id}/target-reobservation/"
+    return any(
+        node.id.startswith(assignment_prefix)
+        and node.status in {"pending", "ready", "leased", "running"}
+        for schedule in schedules
+        for node in schedule.nodes
+    )
+
+
 def _render_target_progress(
-    progress: Mapping[str, object], *, campaign_status: object = None
+    progress: Mapping[str, object],
+    *,
+    campaign_status: object = None,
+    target_reobservation_active: bool = False,
 ) -> Text:
     rendered = Text()
-    rendered.append("Target progress\n", style="bold cyan")
+    rendered.append("Target progress", style="bold cyan")
+    if target_reobservation_active:
+        rendered.append(" · re-observing", style="cyan")
+    rendered.append("\n")
     fields_value = progress.get("current_state")
     fields = (
         tuple(item for item in fields_value if isinstance(item, Mapping))
@@ -7958,7 +7997,11 @@ def _render_review_progress(progress: Mapping[str, object]) -> Text:
 
 
 def _render_live_swarm(
-    agents: tuple[AgentView, ...], campaigns: tuple[CampaignView, ...], spinner_index: int
+    agents: tuple[AgentView, ...],
+    campaigns: tuple[CampaignView, ...],
+    spinner_index: int,
+    *,
+    target_reobservation_active: bool = False,
 ) -> Text:
     ordered = _ordered_agents(agents)
     counts = {group: 0 for group in ("working", "queued", "uncertain", "done")}
@@ -7986,6 +8029,7 @@ def _render_live_swarm(
     rendered.append(f"Agent swarm — {title}\n", style="bold cyan")
     lead = campaigns[0] if campaigns else None
     wave_label = _campaign_wave_label(lead) if lead else ""
+    reobserving = target_reobservation_active and bool(lead and lead.status == "executing")
     reviewing = bool(lead and lead.status == "executing") and (
         getattr(lead, "wave_status", "") in {"completed", "failed", "cancelled"}
         or (total > 0 and finished == total)
@@ -7999,6 +8043,8 @@ def _render_live_swarm(
         rendered.append(f"{spinner} Pausing · finishing active work…  ", style="bold yellow")
     elif paused:
         rendered.append("◎ Paused  ", style="bold yellow")
+    elif reobserving:
+        rendered.append(f"{spinner} Re-observing target state…  ", style="bold yellow")
     elif reviewing:
         rendered.append(f"{spinner} Reviewing wave results…  ", style="bold yellow")
     elif lead and lead.lead_activity == "finishing current work":
@@ -8020,7 +8066,9 @@ def _render_live_swarm(
         }.get(lead.status, lead.status)
         if pausing:
             lead_state = "pause requested · waiting for active work to reach a checkpoint"
-        if reviewing:
+        elif reobserving:
+            lead_state = "refreshing target evidence before wave review"
+        elif reviewing:
             lead_state = "reviewing results · deciding next wave or completion"
         if lead.lead_activity:
             lead_state = lead.lead_activity
