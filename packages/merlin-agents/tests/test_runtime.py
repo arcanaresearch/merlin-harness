@@ -569,6 +569,37 @@ async def test_browser_navigation_does_not_complete_technique_delivery() -> None
 
 
 @pytest.mark.asyncio
+async def test_direct_observation_preserves_effect_before_material_transition() -> None:
+    reviewed = _browser_surface_handoff()
+    reviewed = replace(
+        reviewed,
+        assignment=replace(
+            reviewed.assignment,
+            objective=(
+                "DIRECT OBSERVATION for merlin-injection-taxonomy/cat/direct/override-baseline"
+                "@lang=en@variant=native. Execute one attributable target request."
+            ),
+        ),
+    )
+    provider = Provider(
+        [
+            [
+                ToolCall(
+                    call_id="observed-material-transition",
+                    name="browser_chat_exchange",
+                    arguments={"prompt": "authorized target observation"},
+                ),
+                ModelCompleted(finish_reason="tool_calls"),
+            ]
+        ]
+    )
+
+    result = await WorkerRuntime(provider, BrowserMaterialTransitionTools()).run(reviewed)
+
+    _assert_successful_transition_receipt(result, "observed-material-transition")
+
+
+@pytest.mark.asyncio
 async def test_missing_reviewed_actor_is_retryable_infrastructure_failure() -> None:
     reviewed = reviewed_handoff(interface="http_api", tools=("target_chat",))
     provider = Provider([])

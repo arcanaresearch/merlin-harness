@@ -640,6 +640,7 @@ def _target_surface_transition_result(
     target_session_id: str | None,
     checkpoint: Mapping[str, object] | None = None,
     retry_failure_kind: RetryFailureKind | None = None,
+    effect_observed: bool = False,
 ) -> WorkerResult:
     if is_error:
         return _target_surface_disrupted_result(
@@ -650,7 +651,7 @@ def _target_surface_transition_result(
             retry_failure_kind=retry_failure_kind,
         )
     if _requires_semantic_target_exchange(handoff) and not (
-        checkpoint and checkpoint.get("effect_observed") is True
+        effect_observed or checkpoint and checkpoint.get("effect_observed") is True
     ):
         return WorkerResult(
             task_id=handoff.assignment.id,
@@ -679,6 +680,7 @@ def _target_surface_transition_decision(
     *,
     target_session_id: str | None,
     authenticated_generic_effect: bool = False,
+    effect_observed: bool = False,
 ) -> WorkerResult | None:
     if not _target_surface_transition_claimed(result.metadata):
         return None
@@ -744,6 +746,7 @@ def _target_surface_transition_decision(
         is_error=result.is_error,
         target_session_id=target_session_id,
         retry_failure_kind=retry_failure_kind,
+        effect_observed=effect_observed,
     )
 
 
@@ -4947,6 +4950,7 @@ class WorkerRuntime:
                         handoff,
                         result,
                         target_session_id=target_session_id,
+                        effect_observed=effect_observed,
                     )
                     assert transition_decision is not None
                     await write_transition_checkpoint(
@@ -5145,6 +5149,7 @@ class WorkerRuntime:
                     handoff,
                     pending_result,
                     target_session_id=target_session_id,
+                    effect_observed=effect_observed,
                 )
                 assert transition_decision is not None
                 await write_transition_checkpoint(
@@ -6277,6 +6282,16 @@ class WorkerRuntime:
                             evidence_result,
                             target_session_id=target_session_id,
                             authenticated_generic_effect=(generic_surface_transition is not None),
+                            effect_observed=(
+                                effect_observed
+                                or _target_evidence_effect_observed(
+                                    target_evidence,
+                                    target_exchange_tool_names=target_exchange_tool_names,
+                                    require_semantic_exchange=_requires_semantic_target_exchange(
+                                        handoff
+                                    ),
+                                )
+                            ),
                         )
                 if is_target_exchange_call and target_decision is None:
                     target_decision = target_delivery_rejection_failure_result(result)
@@ -7571,6 +7586,16 @@ class WorkerRuntime:
                                 target_session_id=target_session_id,
                                 authenticated_generic_effect=(
                                     generic_surface_transition is not None
+                                ),
+                                effect_observed=(
+                                    effect_observed
+                                    or _target_evidence_effect_observed(
+                                        target_evidence,
+                                        target_exchange_tool_names=target_exchange_tool_names,
+                                        require_semantic_exchange=(
+                                            _requires_semantic_target_exchange(handoff)
+                                        ),
+                                    )
                                 ),
                             )
                     if is_target_exchange_call and target_decision is None:
