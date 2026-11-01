@@ -1724,11 +1724,14 @@ class Kernel:
                         )
                     ]
                     return "retry"
-                if preferred_next_tool_mode in {
+                if tool_name == _HANDOFF_REPAIR_OBSERVATION_TOOL or preferred_next_tool_mode in {
                     _PREFERRED_TOOL_AFTER_ONE_MODE,
                     _PREFERRED_TOOL_AFTER_ONE_CONSUMED_MODE,
                 }:
-                    if tool_name == "browser_compile_api_handoff" and any(
+                    if tool_name in {
+                        "browser_compile_api_handoff",
+                        _HANDOFF_REPAIR_OBSERVATION_TOOL,
+                    } and any(
                         spec.name == "browser_record_api_handoff" for spec in described_tools
                     ):
                         preferred_next_tool_name = "browser_record_api_handoff"
@@ -1738,10 +1741,10 @@ class Kernel:
                             ChatMessage(
                                 role="system",
                                 content=(
-                                    "The API handoff compiler did not complete after bounded "
-                                    "attempts. Call `browser_record_api_handoff` now with the "
-                                    "evidence-backed DOM interaction contract. Do not perform "
-                                    "more reconnaissance."
+                                    "The preferred network observation or API handoff compilation "
+                                    "did not complete after bounded attempts. Call "
+                                    "`browser_record_api_handoff` now with the evidence-backed DOM "
+                                    "interaction contract. Do not perform more reconnaissance."
                                 ),
                             )
                         ]

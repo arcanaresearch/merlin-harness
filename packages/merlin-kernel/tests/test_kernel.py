@@ -2515,6 +2515,68 @@ async def test_compile_misses_route_to_dom_fallback_without_releasing_recon() ->
 
 
 @pytest.mark.asyncio
+async def test_network_observation_misses_route_to_dom_fallback() -> None:
+    class HandoffTools(Tools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        def describe(self):
+            return (
+                ToolSpec(name="browser_recon_exchange", description="Exchange", input_schema={}),
+                ToolSpec(name="browser_network_events", description="Network", input_schema={}),
+                ToolSpec(
+                    name="browser_record_api_handoff",
+                    description="Record DOM",
+                    input_schema={},
+                ),
+            )
+
+        async def invoke(self, name, context, arguments):
+            self.calls.append(name)
+            if name == "browser_recon_exchange":
+                return ToolResult(
+                    content="exchange submitted",
+                    metadata={"preferred_next_tool": "browser_network_events"},
+                )
+            return ToolResult(content="DOM handoff recorded")
+
+    class Provider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def stream(self, request):
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number == 1:
+                yield ToolCall(call_id="exchange", name="browser_recon_exchange", arguments={})
+            elif call_number in {2, 3}:
+                yield ToolCall(
+                    call_id=f"early-record-{call_number}",
+                    name="browser_record_api_handoff",
+                    arguments={},
+                )
+            elif call_number == 4:
+                yield ToolCall(call_id="record", name="browser_record_api_handoff", arguments={})
+            else:
+                yield TextDelta(text="recorded")
+            yield ModelCompleted()
+
+    provider = Provider()
+    tools = HandoffTools()
+    store = Store()
+    kernel = Kernel(provider, store, tools, Settings(), max_provider_retries=1)
+    await kernel.start()
+    await kernel.submit("recon")
+    await kernel.wait_for_turn()
+
+    assert provider.requests[1].required_tool_name == "browser_network_events"
+    assert provider.requests[2].required_tool_name == "browser_network_events"
+    assert provider.requests[3].required_tool_name == "browser_record_api_handoff"
+    assert tools.calls == ["browser_recon_exchange", "browser_record_api_handoff"]
+    assert not any(event.type == "error" for event in store.events)
+
+
+@pytest.mark.asyncio
 async def test_unadmitted_native_tool_error_preserves_bounded_handoff_fallback() -> None:
     class HandoffTools(Tools):
         def __init__(self) -> None:
