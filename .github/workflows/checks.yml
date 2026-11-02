@@ -39,6 +39,8 @@ jobs:
           apps/merlin-tui/tests/test_release_contract.py
           apps/merlin-tui/tests/test_packaged_launcher.py
           apps/merlin-tui/tests/test_install_release_script.py
+      - name: Install Playwright browser
+        run: uv run playwright install chromium
       - name: Run critical runtime release gate
         run: make critical-runtime-test
       - name: Run benchmark tooling tests
