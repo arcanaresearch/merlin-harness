@@ -78,7 +78,7 @@ Merlin 把这套工作流应用到获授权的安全调查中。
 要从源码运行 Merlin，请安装 Python 3.13+ 和 `uv`，一次性准备好工作区，然后使用仓库中的启动器：
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin

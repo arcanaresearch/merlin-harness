@@ -98,7 +98,7 @@ Merlin
 </div>
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin

@@ -89,7 +89,7 @@ Para ejecutar Merlin desde el código fuente, instala Python 3.13+ y `uv`, prepa
 trabajo una sola vez y usa el lanzador del repositorio:
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin

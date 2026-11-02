@@ -90,7 +90,7 @@ Um Merlin aus dem Quellcode auszuführen, installieren Sie Python 3.13+ und `uv`
 Workspace einmalig vor und verwenden Sie dann den Launcher im Repository:
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin

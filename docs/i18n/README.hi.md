@@ -86,7 +86,7 @@ Merlin को source से चलाने के लिए Python 3.13+ और
 repository में दिए गए launcher का उपयोग करें:
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin

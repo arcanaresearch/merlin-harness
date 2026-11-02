@@ -83,7 +83,7 @@ To run Merlin from source, install Python 3.13+ and `uv`, prepare the workspace 
 launcher in the repository:
 
 ```bash
-git clone https://github.com/triwiz-ai/merlin-harness.git
+git clone https://github.com/arcanaresearch/merlin-harness.git
 cd merlin-harness
 uv sync --all-packages --locked
 ./merlin
