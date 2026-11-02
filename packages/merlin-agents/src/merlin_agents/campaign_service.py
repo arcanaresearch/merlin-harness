@@ -2254,8 +2254,8 @@ _TARGET_REOBSERVATION_INSTRUCTIONS = (
     "the exact target-surface-generation and request/response evidence references emitted by the "
     "handoff tool. The recon_handoff_id must be the handoff:* id returned by "
     "browser_record_api_handoff, never a provider or tool call id. Do not complete the assignment "
-    "until browser_record_api_handoff succeeds. Merlin derives the sealed snapshot reference from "
-    "the authenticated receipt."
+    "until browser_record_api_handoff succeeds. Merlin derives and validates all sealed surface "
+    "evidence references from the authenticated receipt."
 )
 
 
@@ -14897,31 +14897,6 @@ class CampaignService:
                         )
                     else:
                         surface_receipt = candidates[0]
-                        returned_refs = structured.get("evidence_refs")
-                        cited_refs = (
-                            {str(item) for item in returned_refs}
-                            if isinstance(returned_refs, (list, tuple))
-                            else set()
-                        )
-                        cited_refs.add(
-                            "target-surface-snapshot:"
-                            + str(surface_receipt["current_surface_digest"])
-                        )
-                        required_refs = {
-                            str(surface_receipt["evidence_ref"]),
-                            "target-surface-snapshot:"
-                            + str(surface_receipt["current_surface_digest"]),
-                            str(surface_receipt["request_evidence_ref"]),
-                            str(surface_receipt["response_evidence_ref"]),
-                        }
-                        if (
-                            not isinstance(returned_refs, (list, tuple))
-                            or not required_refs <= cited_refs
-                        ):
-                            blocker = (
-                                "target re-observation output does not cite its sealed "
-                                "surface evidence"
-                            )
         usage_reader = getattr(self._agents, "schedule_usage", None)
         usage = await usage_reader(schedule_id) if callable(usage_reader) else {}
         common: dict[str, object] = {

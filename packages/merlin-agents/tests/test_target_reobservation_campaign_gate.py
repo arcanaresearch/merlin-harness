@@ -1530,7 +1530,10 @@ async def test_target_reobservation_overflow_pauses_and_blocks_target_work() -> 
     assert ("completion", "seal") not in order
 
 
-async def test_real_settlement_commits_authenticated_handoff_and_result_identity() -> None:
+@pytest.mark.parametrize("cite_surface_generation", [True, False])
+async def test_real_settlement_commits_authenticated_handoff_and_result_identity(
+    cite_surface_generation: bool,
+) -> None:
     manifest, context = _campaign()
     obligation = _obligation()
     order: list[tuple[str, str]] = []
@@ -1556,8 +1559,9 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
     required_refs = [
         str(surface_receipt["request_evidence_ref"]),
         str(surface_receipt["response_evidence_ref"]),
-        str(surface_receipt["evidence_ref"]),
     ]
+    if cite_surface_generation:
+        required_refs.append(str(surface_receipt["evidence_ref"]))
     service.evidence = {
         task.id: {
             "reference": result_reference,
