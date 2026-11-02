@@ -4336,7 +4336,35 @@ class BrowserReobserveHandoffTool:
                 },
             )
         assert previous.reusable_adapter is not None
+        assert previous.compiled_adapter is not None
         assert previous.dom_fallback_reason is not None
+        reusable_adapter = json.loads(previous.reusable_adapter)
+        try:
+            previous_compilation = read_target_adapter(previous.compiled_adapter)
+        except AdapterCompileError as error:
+            return _compile_error_result(error, effect=self.effect)
+        assert isinstance(previous_compilation.executable, BrowserChat)
+        interaction = previous_compilation.executable.interaction
+        retained_steps: list[dict[str, object]] = []
+        for step in previous_compilation.executable.steps:
+            if step.arguments.get("locator") not in {
+                interaction.input_locator,
+                interaction.submit_action,
+            }:
+                continue
+            retained_step: dict[str, object] = {
+                "tool": step.tool,
+                "arguments": step.arguments,
+                "interaction": step.role.value == "interaction",
+                "cleanup": step.role.value == "cleanup",
+                "repeat": step.repeat,
+            }
+            if step.step_id is not None:
+                retained_step["step_id"] = step.step_id
+            if step.idempotency_key is not None:
+                retained_step["idempotency_key"] = step.idempotency_key
+            retained_steps.append(retained_step)
+        reusable_adapter["browser_steps"] = retained_steps
         result = await ApiReconHandoffTool(self._resolver, self._recorder).invoke(
             context,
             {
@@ -4345,7 +4373,9 @@ class BrowserReobserveHandoffTool:
                 "request_evidence_ref": previous.request_evidence_ref,
                 "response_evidence_ref": previous.response_evidence_ref,
                 "dom_fallback_reason": previous.dom_fallback_reason,
-                "reusable_adapter": previous.reusable_adapter,
+                "reusable_adapter": json.dumps(
+                    reusable_adapter, sort_keys=True, separators=(",", ":")
+                ),
                 "reusable_site_facts": previous.reusable_site_facts,
                 "recon_scope": previous.recon_scope,
             },

@@ -11340,6 +11340,8 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
 
 @pytest.mark.asyncio
 async def test_deterministic_reobservation_reuses_reviewed_handoff() -> None:
+    from merlin_contracts.target_adapter_compiler import read_target_adapter
+
     recorder = _NativeReceiptRecorder()
     session = _dom_fallback_session(
         {
@@ -11375,6 +11377,23 @@ async def test_deterministic_reobservation_reuses_reviewed_handoff() -> None:
     assert initial.is_error is False
     previous = recorder.handoff
     assert previous is not None
+    previous_steps = json.loads(previous.reusable_adapter)
+    previous_steps["browser_steps"].insert(
+        0,
+        {
+            "step_id": "stale-extra-click",
+            "tool": "browser_click",
+            "arguments": {"locator": {"role": "button", "name": "Button 6"}},
+            "interaction": True,
+            "repeat": 1,
+        },
+    )
+    previous = previous.model_copy(
+        update={
+            "reusable_adapter": json.dumps(previous_steps, sort_keys=True, separators=(",", ":"))
+        }
+    )
+    recorder.handoff = previous
 
     refreshed = await BrowserReobserveHandoffTool(lambda _: session, recorder).invoke(
         ToolContext(
@@ -11396,7 +11415,13 @@ async def test_deterministic_reobservation_reuses_reviewed_handoff() -> None:
     assert refreshed.is_error is False, refreshed.content
     current = recorder.handoff
     assert current is not None
-    assert current.reusable_adapter == previous.reusable_adapter
+    current_steps = json.loads(current.reusable_adapter)["browser_steps"]
+    expected_locators = {
+        step.arguments["locator"]
+        for step in read_target_adapter(previous.compiled_adapter).executable.steps
+    }
+    assert {step["arguments"]["locator"] for step in current_steps} == expected_locators
+    assert all(step["step_id"] != "stale-extra-click" for step in current_steps)
     assert current.recon_observations[0]["schema"] == "merlin.target-surface-generation.v1"
     assert refreshed.metadata["deterministic_reobservation"] is True
     assert refreshed.metadata["previous_handoff_id"] == previous.id
