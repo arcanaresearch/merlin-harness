@@ -1544,7 +1544,7 @@ def test_pg0_completed_lane_allows_passive_refresh_and_reconciles_ambiguity(
                         {
                             "id": passive_task,
                             "target_profile_id": target_id,
-                            "tool_ids": ["browser_snapshot", "browser_record_api_handoff"],
+                            "tool_ids": ["browser_reobserve_handoff"],
                             "technique_ids": [],
                             "strategy_id": "target-reobservation/v1",
                             "strategy_contract": passive_contract,
@@ -3173,7 +3173,7 @@ def test_pg0_activation_supersedes_all_reviewed_latched_target_sessions(
                         {
                             "id": passive_task,
                             "target_profile_id": target_id,
-                            "tool_ids": ["browser_snapshot", "browser_record_api_handoff"],
+                            "tool_ids": ["browser_reobserve_handoff"],
                             "technique_ids": [],
                             "strategy_id": "target-reobservation/v1",
                             "strategy_contract": passive_contract,

@@ -4413,7 +4413,10 @@ class DurableSchedulerStore:
             and target_admission.get("strategy_id") == "target-reobservation/v1"
             and contract.get("schema") == "merlin.target-reobservation.v1"
             and isinstance(tools, (list, tuple))
-            and _TARGET_REOBSERVATION_REQUIRED_TOOLS <= set(tools)
+            and (
+                "browser_reobserve_handoff" in tools
+                or _TARGET_REOBSERVATION_REQUIRED_TOOLS <= set(tools)
+            )
             and set(tools) <= _TARGET_REOBSERVATION_TOOLS
             and not assignment.get("technique_ids")
             and isinstance(start_decision_id, str)
