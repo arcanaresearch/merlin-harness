@@ -32,11 +32,9 @@ reports, setup and advanced controls. See [run the browser workspace](docs/web-i
 
 ## Watch the CLI walkthrough
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="assets/merlin-cli-walkthrough.jpg" alt="Watch the 106-second Merlin CLI walkthrough on YouTube" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Watch on YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 See Merlin connect models, define an authorized target, review a campaign, coordinate agents,
 accept operator guidance, and produce an evidence-linked report.
@@ -101,7 +99,7 @@ To produce the standalone macOS bundle, run:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

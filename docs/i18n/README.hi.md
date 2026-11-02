@@ -35,11 +35,9 @@ reports, setup और advanced controls शामिल हैं। देख�
 
 ## CLI walkthrough देखें
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="YouTube पर Merlin CLI का 106-सेकंड का walkthrough देखें" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[YouTube पर देखें](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 देखिए कि Merlin कैसे models को connect करता है, authorized target परिभाषित करता है, campaign को review के लिए पेश करता है,
 agents को coordinate करता है, operator का guidance स्वीकार करता है, और evidence से जुड़ी रिपोर्ट तैयार करता है।
@@ -103,7 +101,7 @@ Standalone macOS bundle बनाने के लिए यह चलाएँ:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

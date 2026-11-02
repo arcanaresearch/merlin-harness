@@ -34,11 +34,9 @@
 
 ## 观看 CLI 演示
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="在 YouTube 上观看时长 106 秒的 Merlin CLI 演示" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[在 YouTube 上观看](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 了解 Merlin 如何连接模型、定义获授权的目标、审核 campaign、协调智能体、接受操作员指引，并生成与证据关联的报告。
 
@@ -93,7 +91,7 @@ Merlin 将凭据存放在仅限所有者访问的凭据存储中，而不会保�
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

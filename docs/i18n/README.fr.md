@@ -36,11 +36,9 @@ Voir [exécuter l'espace de travail navigateur](../web-interface.md).
 
 ## Regarder la démonstration de la CLI
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="Regarder sur YouTube la démonstration de 106 secondes de la CLI Merlin" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Regarder sur YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Voyez Merlin connecter des modèles, définir une cible autorisée, relire une campagne, coordonner des
 agents, accepter les consignes de l'opérateur et produire un rapport relié aux preuves.
@@ -106,7 +104,7 @@ Pour produire le bundle macOS autonome, exécutez :
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

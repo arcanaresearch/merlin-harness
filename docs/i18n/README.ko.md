@@ -36,11 +36,9 @@
 
 ## CLI 시연 영상 보기
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="106초 분량의 Merlin CLI 시연 영상을 YouTube에서 보기" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[YouTube에서 보기](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Merlin이 모델을 연결하고, 승인된 대상을 정의하고, 캠페인을 검토하고, 에이전트를 조율하고, 운영자의
 지침을 반영하며, 증거가 연결된 보고서를 생성하는 과정을 확인해 보세요.
@@ -103,7 +101,7 @@ Merlin은 자격 증명을 PostgreSQL, 프롬프트, 로그, 보고서, 내보�
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

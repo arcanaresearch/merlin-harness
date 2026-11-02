@@ -36,11 +36,9 @@ campanhas, agentes, cobertura, relatórios, configuração e controles avançado
 
 ## Assista à demonstração da CLI
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="Assista no YouTube à demonstração de 106 segundos da CLI do Merlin" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Assistir no YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Veja o Merlin conectar modelos, definir um alvo autorizado, revisar uma campanha, coordenar
 agentes, aceitar orientações do operador e produzir um relatório vinculado às evidências.
@@ -107,7 +105,7 @@ Para gerar o bundle standalone para macOS, execute:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

@@ -35,11 +35,9 @@ pb2 スタイルの Web ワークスペースを、ソースから利用でき�
 
 ## CLI ウォークスルー動画
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="YouTube で 106 秒の Merlin CLI ウォークスルーを見る" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[YouTube で見る](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Merlin がモデルを接続し、認可された対象を定義し、キャンペーンをレビューし、エージェントを連携させ、
 オペレーターの指示を受け入れ、証拠にひもづいたレポートを作成する様子をご覧ください。
@@ -104,7 +102,7 @@ Merlin は認証情報を、所有者のみがアクセスできる専用の認�
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

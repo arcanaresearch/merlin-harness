@@ -37,11 +37,9 @@
 
 ## شاهد العرض التوضيحي لواجهة سطر الأوامر
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="شاهد على YouTube العرض التوضيحي لواجهة سطر الأوامر في Merlin (106 ثوانٍ)" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[شاهد على YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 شاهد Merlin وهو يربط النماذج، ويحدّد هدفًا مصرَّحًا باختباره، ويراجع حملة، وينسّق الوكلاء،
 ويقبل توجيهات المشغّل، وينتج تقريرًا مرتبطًا بالأدلة.
@@ -120,7 +118,7 @@ uv sync --all-packages --locked
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

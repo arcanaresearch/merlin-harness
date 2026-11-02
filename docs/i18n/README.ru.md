@@ -35,11 +35,9 @@
 
 ## Смотрите обзор CLI
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="Смотрите 106-секундный обзор CLI Merlin на YouTube" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Смотреть на YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Посмотрите, как Merlin подключает модели, определяет авторизованную цель, проходит проверку
 кампании, координирует агентов, принимает указания оператора и формирует отчёт со ссылками на доказательства.
@@ -106,7 +104,7 @@ Merlin хранит учётные данные в собственном хра
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

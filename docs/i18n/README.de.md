@@ -36,11 +36,9 @@ Abdeckung, Berichte, Einrichtung und erweiterte Steuerung zur Verfügung. Siehe
 
 ## CLI-Walkthrough ansehen
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="Den 106-sekündigen Merlin-CLI-Walkthrough auf YouTube ansehen" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Auf YouTube ansehen](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Sehen Sie, wie Merlin Modelle anbindet, ein autorisiertes Ziel definiert, eine Kampagne zur Prüfung
 vorlegt, Agenten koordiniert, Anweisungen des Operators entgegennimmt und einen mit Belegen
@@ -108,7 +106,7 @@ Um das eigenständige macOS-Bundle zu erzeugen, führen Sie aus:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 

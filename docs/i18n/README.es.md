@@ -36,11 +36,9 @@ avanzados. Consulta [cómo ejecutar el espacio de trabajo en el navegador](../we
 
 ## Mira el recorrido por la CLI
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
-    <img src="../../assets/merlin-cli-walkthrough.jpg" alt="Mira en YouTube el recorrido de 106 segundos por la CLI de Merlin" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/9864aa6e-9d1d-4fab-8e41-2adfe0c734a4
+
+[Ver en YouTube](https://www.youtube.com/watch?v=Kyz2PcphWvo)
 
 Verás cómo Merlin conecta modelos, define un objetivo autorizado, revisa una campaña, coordina
 agentes, acepta indicaciones del operador y genera un informe vinculado a la evidencia.
@@ -107,7 +105,7 @@ Para generar el paquete independiente para macOS, ejecuta:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.47-darwin-arm64
+cd target/releases/merlin-0.2.48-darwin-arm64
 ./merlin
 ```
 
