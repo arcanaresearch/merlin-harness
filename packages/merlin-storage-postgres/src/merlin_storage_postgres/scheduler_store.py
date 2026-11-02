@@ -76,10 +76,7 @@ _TARGET_REOBSERVATION_TOOLS = frozenset(
     {
         "browser_snapshot",
         "browser_wait_for_text",
-        "browser_network_events",
-        "browser_recall_reconnaissance",
         "browser_record_api_handoff",
-        "browser_compile_api_handoff",
     }
 )
 _TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_snapshot", "browser_record_api_handoff"})

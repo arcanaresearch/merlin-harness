@@ -1725,10 +1725,7 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
     allowed = {
         "browser_snapshot",
         "browser_wait_for_text",
-        "browser_network_events",
-        "browser_recall_reconnaissance",
         "browser_record_api_handoff",
-        "browser_compile_api_handoff",
     }
     forbidden = {
         "target_chat",
@@ -1736,6 +1733,9 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
         "browser_navigate",
         "browser_fill",
         "browser_press",
+        "browser_network_events",
+        "browser_recall_reconnaissance",
+        "browser_compile_api_handoff",
     }
 
     assert set(assignment.tool_ids) == allowed

@@ -2239,21 +2239,18 @@ _TARGET_REOBSERVATION_STRATEGY = "target-reobservation/v1"
 _TARGET_REOBSERVATION_TOOLS = (
     "browser_snapshot",
     "browser_wait_for_text",
-    "browser_network_events",
-    "browser_recall_reconnaissance",
     "browser_record_api_handoff",
-    "browser_compile_api_handoff",
 )
 _TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_snapshot", "browser_record_api_handoff"})
 _TARGET_REOBSERVATION_INSTRUCTIONS = (
     "Re-observe the already-open reviewed target after an authenticated material UI transition. "
-    "Use only passive snapshots, bounded waits, network inspection, durable reconnaissance "
-    "recall, and handoff tools. Record the durable DOM fallback on every target; compile an API "
-    "handoff only when attributable JSON traffic supports it. Do not navigate, open a tab, click, "
-    "fill, press, "
-    "select, check, hover, upload, submit, send a chat exchange, or execute an attack. Do not "
-    "choose behavior from labels. Inspect the current shared tab, refresh the interaction "
-    "contract and executable handoff from observed state, and return the durable handoff id plus "
+    "Use only passive snapshots, bounded waits, and the durable DOM handoff recorder. Record the "
+    "durable DOM fallback from current observed state. Do not run fresh reconnaissance, inspect "
+    "unrelated network traffic, or compile an API handoff. Do not navigate, open a tab, click, "
+    "fill, press, select, check, hover, upload, submit, send a chat exchange, "
+    "or execute an attack. Do not choose behavior from labels. Inspect the current shared tab, "
+    "refresh the interaction contract and executable handoff from observed state, and return the "
+    "durable handoff id plus "
     "the exact target-surface-generation and request/response evidence references emitted by the "
     "handoff tool. The recon_handoff_id must be the handoff:* id returned by "
     "browser_record_api_handoff, never a provider or tool call id. Do not complete the assignment "
