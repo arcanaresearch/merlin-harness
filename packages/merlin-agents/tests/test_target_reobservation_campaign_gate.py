@@ -45,6 +45,7 @@ def _campaign() -> tuple[CampaignManifest, AssignmentContext]:
     budget = AssignmentBudget(8, 10_000, 60)
     tool_ids = (
         "target_chat",
+        "browser_reobserve_handoff",
         "browser_snapshot",
         "browser_wait_for_text",
         "browser_network_events",
@@ -1734,11 +1735,7 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
         ("target-reobservation-started/" + generation.generation_id.removeprefix("sha256:") + "/1"),
     )
     assignment = compilation.assignments[0]
-    allowed = {
-        "browser_snapshot",
-        "browser_wait_for_text",
-        "browser_record_api_handoff",
-    }
+    allowed = {"browser_reobserve_handoff"}
     forbidden = {
         "target_chat",
         "browser_click",
@@ -1748,6 +1745,9 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
         "browser_network_events",
         "browser_recall_reconnaissance",
         "browser_compile_api_handoff",
+        "browser_snapshot",
+        "browser_wait_for_text",
+        "browser_record_api_handoff",
     }
 
     assert set(assignment.tool_ids) == allowed
@@ -1771,9 +1771,7 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
     assert "click" in instructions
     assert "execute an attack" in instructions
     assert "never a provider or tool call id" in instructions
-    assert (
-        "Do not complete the assignment until browser_record_api_handoff succeeds" in instructions
-    )
+    assert "Do not complete the assignment until browser_reobserve_handoff succeeds" in instructions
 
 
 async def test_pass_modal_refresh_requires_fresh_lead_review_before_completion() -> None:

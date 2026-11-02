@@ -4278,6 +4278,88 @@ class ApiReconHandoffTool:
         )
 
 
+class BrowserReobserveHandoffTool:
+    name = "browser_reobserve_handoff"
+    effect = "harness_state"
+
+    def __init__(self, resolver: BrowserSessionResolver, recorder: BrowserRecorder) -> None:
+        self._resolver = resolver
+        self._recorder = recorder
+
+    def describe(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.name,
+            description=(
+                "Refresh the reviewed browser DOM handoff deterministically from the latest "
+                "handoff for this exact physical context and compiled adapter. No model-authored "
+                "adapter or evidence labels are accepted."
+            ),
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        )
+
+    async def invoke(self, context: ToolContext, arguments: Mapping[str, Any]) -> ToolResult:
+        del arguments
+        resolved = self._resolver(context.session_id)
+        session = await resolved if isawaitable(resolved) else resolved
+        if (
+            context.expected_target_session_id != f"browser:{session.context_id}"
+            or context.target_reobservation_generation_id is None
+            or context.target_reobservation_event_set_digest is None
+        ):
+            return ToolResult(
+                content=(
+                    "deterministic re-observation requires its authenticated generation context"
+                ),
+                is_error=True,
+                metadata={"effect": self.effect, "failure_code": "reobservation_context_required"},
+            )
+        handoffs = await self._recorder.list_handoffs(str(session.bounds.target_id), limit=100)
+        previous = next(
+            (
+                handoff
+                for handoff in handoffs
+                if handoff.context_id == session.context_id
+                and handoff.compiled_adapter_digest == context.compiled_adapter_digest
+                and handoff.reusable_adapter is not None
+                and handoff.dom_fallback_reason is not None
+            ),
+            None,
+        )
+        if previous is None:
+            return ToolResult(
+                content="no reviewed DOM handoff matches the current browser adapter",
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "previous_handoff_unavailable",
+                    "retryable": True,
+                },
+            )
+        assert previous.reusable_adapter is not None
+        assert previous.dom_fallback_reason is not None
+        result = await ApiReconHandoffTool(self._resolver, self._recorder).invoke(
+            context,
+            {
+                "method": previous.method,
+                "url": previous.url,
+                "request_evidence_ref": previous.request_evidence_ref,
+                "response_evidence_ref": previous.response_evidence_ref,
+                "dom_fallback_reason": previous.dom_fallback_reason,
+                "reusable_adapter": previous.reusable_adapter,
+                "reusable_site_facts": previous.reusable_site_facts,
+                "recon_scope": previous.recon_scope,
+            },
+        )
+        if not result.is_error:
+            result.metadata.update(
+                {
+                    "deterministic_reobservation": True,
+                    "previous_handoff_id": previous.id,
+                }
+            )
+        return result
+
+
 class BrowserCheckpointVaultEntry(Protocol):
     reference_id: str
 
@@ -14432,6 +14514,7 @@ def browser_tools(
     | BrowserOwnedSessionCleanupTool
     | ReconRecallTool
     | ApiReconHandoffTool
+    | BrowserReobserveHandoffTool
     | BrowserChatExchangeTool
     | CompiledApiReconHandoffTool,
     ...,
@@ -14447,6 +14530,7 @@ def browser_tools(
         | BrowserOwnedSessionCleanupTool
         | ReconRecallTool
         | ApiReconHandoffTool
+        | BrowserReobserveHandoffTool
         | BrowserChatExchangeTool
         | CompiledApiReconHandoffTool,
         ...,
@@ -14489,6 +14573,7 @@ def browser_tools(
                 foreground_recon_probe_permits,
             ),
             ApiReconHandoffTool(resolver, recorder),
+            BrowserReobserveHandoffTool(resolver, recorder),
             CompiledApiReconHandoffTool(resolver, recorder),
         )
         if adapter_resolver is not None:

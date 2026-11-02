@@ -38,6 +38,7 @@ from merlin_browser import (
 from merlin_browser.core import BrowserSession, _sanitized_visual_source_url
 from merlin_browser.tools import (
     ApiReconHandoffTool,
+    BrowserReobserveHandoffTool,
     BrowserTool,
     _campaign_pre_dispatch_rejection_metadata,
     _effective_browser_step_id,
@@ -10629,6 +10630,9 @@ class _NativeReceiptRecorder:
     async def record_handoff(self, value):
         self.handoff = value
 
+    async def list_handoffs(self, _target_id, limit=20):
+        return (self.handoff,) if self.handoff is not None else ()
+
     async def record_evidence(self, context_id, evidence_ref, kind, payload):
         self.evidence.append((context_id, evidence_ref, kind, payload))
 
@@ -11332,6 +11336,70 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
         ),
         (receipt["evidence_ref"], "target_surface_generation"),
     }
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reobservation_reuses_reviewed_handoff() -> None:
+    recorder = _NativeReceiptRecorder()
+    session = _dom_fallback_session(
+        {
+            "method": "GET",
+            "url": "https://target.test/events",
+            "status": 200,
+            "resource_type": "eventsource",
+        }
+    )()
+    context = ToolContext(
+        session_id="s1",
+        workspace_root="/tmp",
+        call_id="record-current-surface",
+        agent_id="campaign/c1/target-reobservation/generation/recon",
+        attempt_id="attempt-current-surface",
+        campaign_id="campaign/c1",
+        target_id="target",
+        target_reobservation_generation_id="sha256:" + "1" * 64,
+        target_reobservation_event_set_digest="sha256:" + "2" * 64,
+        expected_target_session_id="browser:browser-context",
+    )
+    initial = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        context,
+        {
+            "method": "browser",
+            "url": "https://target.test/chat",
+            "request_evidence_ref": "invented-request-label",
+            "response_evidence_ref": "invented-response-label",
+            "dom_fallback_reason": "the observed message transport is SSE without JSON API",
+            "reusable_adapter": reviewed_browser_adapter("https://target.test/chat"),
+        },
+    )
+    assert initial.is_error is False
+    previous = recorder.handoff
+    assert previous is not None
+
+    refreshed = await BrowserReobserveHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="deterministic-current-surface",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-current-surface",
+            campaign_id="campaign/c1",
+            target_id="target",
+            compiled_adapter_digest=previous.compiled_adapter_digest,
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "3" * 64,
+            expected_target_session_id="browser:browser-context",
+        ),
+        {},
+    )
+
+    assert refreshed.is_error is False, refreshed.content
+    current = recorder.handoff
+    assert current is not None
+    assert current.reusable_adapter == previous.reusable_adapter
+    assert current.recon_observations[0]["schema"] == "merlin.target-surface-generation.v1"
+    assert refreshed.metadata["deterministic_reobservation"] is True
+    assert refreshed.metadata["previous_handoff_id"] == previous.id
 
 
 @pytest.mark.asyncio

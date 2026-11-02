@@ -272,6 +272,64 @@ def handoff(*, tools: tuple[str, ...] = ("read",)) -> WorkerHandoff:
     return WorkerHandoff("session-1", "/workspace", "model-1", profile, assignment)
 
 
+@pytest.mark.asyncio
+async def test_deterministic_reobservation_does_not_call_provider() -> None:
+    class Tools:
+        def describe(self):
+            return (
+                ToolSpec(
+                    name="browser_reobserve_handoff",
+                    description="deterministic handoff",
+                    input_schema={"type": "object"},
+                ),
+            )
+
+        async def invoke(self, name, context, _arguments):
+            assert name == "browser_reobserve_handoff"
+            assert context.target_reobservation_generation_id == "sha256:" + "1" * 64
+            assert context.target_reobservation_event_set_digest == "sha256:" + "2" * 64
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "id": "handoff:deterministic",
+                        "request_evidence_ref": "request:1",
+                        "response_evidence_ref": "response:1",
+                        "recon_observations": [
+                            {
+                                "schema": "merlin.target-surface-generation.v1",
+                                "evidence_ref": "target-surface-generation:1",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    base = handoff(tools=("browser_reobserve_handoff",))
+    assignment = replace(
+        base.assignment,
+        strategy_id="target-reobservation/v1",
+        strategy_contract=tuple(
+            sorted(
+                {
+                    "schema": "merlin.target-reobservation.v1",
+                    "generation_id": "sha256:" + "1" * 64,
+                    "event_set_digest": "sha256:" + "2" * 64,
+                }.items()
+            )
+        ),
+    )
+    provider = Provider([])
+
+    result = await WorkerRuntime(provider, Tools()).run(replace(base, assignment=assignment))
+
+    assert result.status == "completed", result.error
+    assert json.loads(result.content) == {
+        "recon_handoff_id": "handoff:deterministic",
+        "evidence_refs": ["target-surface-generation:1", "request:1", "response:1"],
+    }
+    assert provider.requests == []
+
+
 def reviewed_handoff(
     *,
     interface: str,

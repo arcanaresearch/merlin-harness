@@ -2236,26 +2236,16 @@ class _TargetReobservationReviewRequired(Exception):
 
 
 _TARGET_REOBSERVATION_STRATEGY = "target-reobservation/v1"
-_TARGET_REOBSERVATION_TOOLS = (
-    "browser_snapshot",
-    "browser_wait_for_text",
-    "browser_record_api_handoff",
-)
-_TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_snapshot", "browser_record_api_handoff"})
+_TARGET_REOBSERVATION_TOOLS = ("browser_reobserve_handoff",)
+_TARGET_REOBSERVATION_REQUIRED_TOOLS = frozenset({"browser_reobserve_handoff"})
 _TARGET_REOBSERVATION_INSTRUCTIONS = (
     "Re-observe the already-open reviewed target after an authenticated material UI transition. "
-    "Use only passive snapshots, bounded waits, and the durable DOM handoff recorder. Record the "
-    "durable DOM fallback from current observed state. Do not run fresh reconnaissance, inspect "
-    "unrelated network traffic, or compile an API handoff. Do not navigate, open a tab, click, "
-    "fill, press, select, check, hover, upload, submit, send a chat exchange, "
-    "or execute an attack. Do not choose behavior from labels. Inspect the current shared tab, "
-    "refresh the interaction contract and executable handoff from observed state, and return the "
-    "durable handoff id plus "
-    "the exact target-surface-generation and request/response evidence references emitted by the "
-    "handoff tool. The recon_handoff_id must be the handoff:* id returned by "
-    "browser_record_api_handoff, never a provider or tool call id. Do not complete the assignment "
-    "until browser_record_api_handoff succeeds. Merlin derives and validates all sealed surface "
-    "evidence references from the authenticated receipt."
+    "Invoke browser_reobserve_handoff exactly once and return the durable handoff id and evidence "
+    "references from its receipt. Do not navigate, click, fill, press, select, check, hover, "
+    "upload, submit, send a chat exchange, execute an attack, or call any other tool. The "
+    "recon_handoff_id must be the handoff:* id returned by the tool, never a provider or tool "
+    "call id. Do not complete the assignment until browser_reobserve_handoff succeeds. Merlin "
+    "derives and validates all sealed surface evidence references from the authenticated receipt."
 )
 
 

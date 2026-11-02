@@ -3951,6 +3951,7 @@ _DECLARED_TOOL_EFFECTS: dict[str, str] = {
     "browser_release": "target_network",
     "browser_chat_exchange": "target_network",
     "browser_record_api_handoff": "harness_state",
+    "browser_reobserve_handoff": "harness_state",
     "browser_compile_api_handoff": "harness_state",
     "browser_recall_reconnaissance": "workspace_read",
 }

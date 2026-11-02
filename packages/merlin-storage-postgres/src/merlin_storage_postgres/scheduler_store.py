@@ -74,6 +74,7 @@ _MAX_SCHEDULE_JSONB_BYTES = 64 * 1024 * 1024
 
 _TARGET_REOBSERVATION_TOOLS = frozenset(
     {
+        "browser_reobserve_handoff",
         "browser_snapshot",
         "browser_wait_for_text",
         "browser_record_api_handoff",

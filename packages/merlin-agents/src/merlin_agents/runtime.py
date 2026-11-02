@@ -3269,6 +3269,89 @@ class WorkerRuntime:
                 values["expected_target_session_id"] = target_session_id
             return values
 
+        if (
+            handoff.assignment.strategy_id == "target-reobservation/v1"
+            and "browser_reobserve_handoff" in handoff.assignment.tool_ids
+        ):
+            try:
+                result = await self._interruptible(
+                    self._tools.invoke(
+                        "browser_reobserve_handoff",
+                        ToolContext(
+                            session_id=handoff.session_id,
+                            workspace_root=handoff.workspace_root,
+                            call_id=(
+                                f"passive-reobserve-{handoff.attempt_id or handoff.assignment.id}"
+                            ),
+                            agent_id=handoff.assignment.id,
+                            attempt_id=handoff.attempt_id,
+                            technique_attempt_id=handoff.technique_attempt_id,
+                            campaign_id=(
+                                "/".join(handoff.assignment.id.split("/")[:2])
+                                if handoff.assignment.id.startswith("campaign/")
+                                else None
+                            ),
+                            permission_grant_digest=(
+                                handoff.worker_context.digest
+                                if handoff.worker_context is not None
+                                else None
+                            ),
+                            target_id=(
+                                handoff.worker_context.target.id
+                                if handoff.worker_context is not None
+                                else handoff.assignment.target_profile_id
+                            ),
+                            compiled_adapter=sealed_compiled_adapter,
+                            compiled_adapter_digest=sealed_compiled_adapter_digest,
+                            state_action_kind="reconnaissance",
+                            **target_tool_context(),
+                        ),
+                        {},
+                    ),
+                    control,
+                )
+            except _WorkerCancelled:
+                return self._cancelled(handoff)
+            if result.is_error:
+                return self._failed(handoff, result.content, retry_class="fresh_worker")
+            try:
+                document = json.loads(result.content)
+                generation_refs = [
+                    str(observation["evidence_ref"])
+                    for observation in document["recon_observations"]
+                    if observation.get("schema") == "merlin.target-surface-generation.v1"
+                ]
+                evidence_refs = list(
+                    dict.fromkeys(
+                        [
+                            *generation_refs,
+                            str(document["request_evidence_ref"]),
+                            str(document["response_evidence_ref"]),
+                        ]
+                    )
+                )
+                if not generation_refs:
+                    raise ValueError("deterministic handoff lacks its generation receipt")
+                content = json.dumps(
+                    {
+                        "recon_handoff_id": document["id"],
+                        "evidence_refs": evidence_refs,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError, KeyError) as error:
+                return self._failed(
+                    handoff,
+                    f"deterministic re-observation returned an invalid handoff: {error}",
+                    retry_class="fresh_worker",
+                )
+            return WorkerResult(
+                task_id=handoff.assignment.id,
+                status="completed",
+                content=content,
+            )
+
         evaluation_uncertainties: list[dict[str, object]] = []
         raw_uncertainties = (checkpoint or {}).get("evaluation_uncertainties", ())
         if isinstance(raw_uncertainties, (list, tuple)):
