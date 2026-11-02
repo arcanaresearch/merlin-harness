@@ -696,6 +696,37 @@ def test_browser_seals_response_witness_and_rendered_state_templates() -> None:
     )
 
 
+def test_browser_marks_one_time_probe_response_witness_without_identity_drift() -> None:
+    raw = _browser_adapter()
+    contract = raw["interaction_contract"]
+    assert isinstance(contract, dict)
+    contract["probe"] = {
+        "message": "Reconnaissance validation: repeat LOC-QA-4471 only",
+        "sent_message_witness": "LOC-QA-4471",
+        "response_witness": "LOC-QA-4471",
+    }
+
+    compiled = compile_target_adapter(raw)
+
+    assert isinstance(compiled.executable, BrowserChat)
+    assert compiled.executable.interaction.response_witness == "LOC-QA-4471"
+    assert any(
+        item.kind is AdapterAdvisoryKind.UNSUPPORTED_CAPABILITY
+        and item.path == "interaction_contract.probe.response_witness"
+        and "one-time probe witness" in item.message
+        and "identity is preserved" in item.message
+        for item in compiled.advisories
+    )
+
+    invariant = deepcopy(raw)
+    invariant_contract = invariant["interaction_contract"]
+    assert isinstance(invariant_contract, dict)
+    invariant_contract["probe"]["response_witness"] = "Target reply rendered"
+    invariant_compiled = compile_target_adapter(invariant)
+    assert isinstance(invariant_compiled.executable, BrowserChat)
+    assert invariant_compiled.executable.interaction.response_witness == "Target reply rendered"
+
+
 def test_browser_malformed_rendered_state_is_advisory_and_legacy_shape_is_unchanged() -> None:
     legacy = compile_target_adapter(_browser_adapter())
     assert isinstance(legacy.executable, BrowserChat)

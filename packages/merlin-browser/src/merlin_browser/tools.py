@@ -50,6 +50,7 @@ from merlin_contracts.target_adapter_compiler import (
     BrowserChat,
     BrowserStep,
     BrowserTextCapture,
+    browser_response_witness_is_probe_scoped,
     compile_target_adapter,
     compiled_target_adapter_digest,
     read_target_adapter,
@@ -7213,9 +7214,18 @@ class BrowserChatExchangeTool:
                 is_error=True,
                 metadata=adapter_identity_metadata,
             )
-        response_witness = executable_adapter.interaction.response_witness or ""
         probe = contract.get("probe") if isinstance(contract, Mapping) else None
-        response_witness_declared = isinstance(probe, Mapping) and "response_witness" in probe
+        probe_scoped_response_witness = browser_response_witness_is_probe_scoped(probe)
+        response_witness = (
+            ""
+            if probe_scoped_response_witness
+            else executable_adapter.interaction.response_witness or ""
+        )
+        response_witness_declared = bool(
+            isinstance(probe, Mapping)
+            and "response_witness" in probe
+            and not probe_scoped_response_witness
+        )
         response_witness_invalid = response_witness_declared and not response_witness
         legacy_response_fallback = not response_witness_declared
         response_frame = (

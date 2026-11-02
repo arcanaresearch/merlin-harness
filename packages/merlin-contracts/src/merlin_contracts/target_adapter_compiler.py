@@ -1477,6 +1477,22 @@ def _bounded_browser_advisory_value(value: object) -> object:
     }
 
 
+def browser_response_witness_is_probe_scoped(probe: object) -> bool:
+    if not isinstance(probe, Mapping):
+        return False
+    witness = probe.get("response_witness")
+    if not isinstance(witness, str) or not witness.strip():
+        return False
+    message = probe.get("message")
+    sent_message_witness = probe.get("sent_message_witness")
+    return bool(
+        isinstance(message, str)
+        and witness in message
+        or isinstance(sent_message_witness, str)
+        and witness == sent_message_witness
+    )
+
+
 def _compile_browser_response_witness(
     interaction: Mapping[str, object],
     *,
@@ -1491,6 +1507,17 @@ def _compile_browser_response_witness(
         and witness.strip()
         and len(witness) <= BROWSER_TEXT_CAPTURE_MAX_LENGTH
     ):
+        if browser_response_witness_is_probe_scoped(probe):
+            _unsupported_step(
+                advisories,
+                path="interaction_contract.probe.response_witness",
+                message=(
+                    "The one-time probe witness cannot establish later target responses; the "
+                    "normal response boundary is used during execution while the reviewed "
+                    "adapter identity is preserved."
+                ),
+                value=_bounded_browser_advisory_value(witness),
+            )
         return witness
     _unsupported_step(
         advisories,

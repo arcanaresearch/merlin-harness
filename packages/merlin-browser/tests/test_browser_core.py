@@ -20712,6 +20712,73 @@ async def test_response_witness_baseline_is_captured_after_setup_steps() -> None
 
 
 @pytest.mark.asyncio
+async def test_probe_scoped_response_witness_does_not_hide_target_reply() -> None:
+    chat = b"""
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      document.getElementById('reply').textContent='Target reply rendered without the recon marker';
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["message"] = "Reconnaissance validation: repeat LOC-QA-4471 only"
+            probe["sent_message_witness"] = "LOC-QA-4471"
+            probe["response_witness"] = "LOC-QA-4471"
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 1_000},
+            )
+
+            assert result.is_error is False, result.content
+            assert result.metadata["response_boundary_observed"] is True
+            assert result.metadata["response_boundary_complete"] is True
+            assert result.metadata["attempt_disposition"] == "valid"
+
+
+@pytest.mark.asyncio
 async def test_static_page_witness_accepts_stable_change_after_prompt_echo() -> None:
     chat = b"""
     <div>Score: 0</div>
