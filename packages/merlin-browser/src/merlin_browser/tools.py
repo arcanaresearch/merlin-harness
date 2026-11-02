@@ -3460,7 +3460,9 @@ class ApiReconHandoffTool:
                 "one branch: API uses adapter (including api_steps); DOM fallback uses "
                 "dom_fallback_reason plus reusable_adapter (including browser_steps and an "
                 "interaction_contract) and must omit adapter/api_steps. An API failure does "
-                "not prevent sealing independently observed DOM evidence."
+                "not prevent sealing independently observed DOM evidence. During authenticated "
+                "passive re-observation, Merlin seals the current observation and supplies its "
+                "DOM evidence references itself."
             ),
             input_schema={
                 "type": "object",
@@ -3615,13 +3617,14 @@ class ApiReconHandoffTool:
                     "retryable": True,
                 },
             )
-        previous_adapter: BrowserChat | None = None
-        if (
+        authenticated_target_reobservation = bool(
             fallback is not None
             and context.expected_target_session_id == f"browser:{session.context_id}"
             and context.target_reobservation_generation_id is not None
             and context.target_reobservation_event_set_digest is not None
-        ):
+        )
+        previous_adapter: BrowserChat | None = None
+        if authenticated_target_reobservation:
             previous_adapter, _ = _browser_context_chat_adapter(
                 context,
                 target_id=str(session.bounds.target_id),
@@ -3689,6 +3692,19 @@ class ApiReconHandoffTool:
                 )
             current = await session.snapshot(open_tabs[0])
             surface_observation = current
+            if authenticated_target_reobservation:
+                current_evidence_ref = _browser_evidence_ref("current-surface", current)
+                await self._recorder.record_evidence(
+                    session.context_id,
+                    current_evidence_ref,
+                    "browser_observation",
+                    current.model_dump(mode="json"),
+                )
+                arguments = {
+                    **arguments,
+                    "request_evidence_ref": current_evidence_ref,
+                    "response_evidence_ref": current_evidence_ref,
+                }
             if previous_adapter is not None and (
                 len(
                     _matching_reviewed_elements(

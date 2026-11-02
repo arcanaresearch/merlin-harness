@@ -11294,12 +11294,13 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
             target_id="target",
             target_reobservation_generation_id=generation_id,
             target_reobservation_event_set_digest=event_set_digest,
+            expected_target_session_id="browser:browser-context",
         ),
         {
             "method": "browser",
             "url": "https://target.test/chat",
-            "request_evidence_ref": "browser-snapshot:sha256:" + "a" * 64,
-            "response_evidence_ref": "browser-snapshot:sha256:" + "b" * 64,
+            "request_evidence_ref": "invented-request-label",
+            "response_evidence_ref": "invented-response-label",
             "dom_fallback_reason": "the observed message transport is SSE without JSON API",
             "reusable_adapter": reviewed_browser_adapter("https://target.test/chat"),
         },
@@ -11309,6 +11310,8 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
     handoff = recorder.handoff
     assert handoff is not None
     assert handoff.adapter is None
+    assert handoff.request_evidence_ref == handoff.response_evidence_ref
+    assert "invented" not in handoff.request_evidence_ref
     receipt = handoff.recon_observations[0]
     assert receipt["schema"] == "merlin.target-surface-generation.v1"
     assert receipt["generation_id"] == generation_id
@@ -11322,6 +11325,7 @@ async def test_dom_only_reobservation_seals_surface_generation_receipt() -> None
     assert {
         (evidence_ref, kind) for _context_id, evidence_ref, kind, _payload in recorder.evidence
     } == {
+        (handoff.request_evidence_ref, "browser_observation"),
         (
             "target-surface-snapshot:" + receipt["current_surface_digest"],
             "target_surface_snapshot",
