@@ -195,6 +195,16 @@ def _qualified_digest(value: object) -> str:
     return "sha256:" + sha256(encoded.encode()).hexdigest()
 
 
+def _lead_journal_payload_digests(value: object) -> frozenset[str]:
+    return frozenset(
+        "sha256:" + sha256(encoded.encode()).hexdigest()
+        for encoded in (
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=ensure_ascii)
+            for ensure_ascii in (False, True)
+        )
+    )
+
+
 def _goat_checkpoint_digest(value: object) -> str:
     """Match the canonical digest written and validated by ``GoatState``."""
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -4350,7 +4360,8 @@ class DurableSchedulerStore:
             ).fetchall()
         )
         if {str(row["decision_id"]) for row in rows} != set(expected) or any(
-            row["payload_digest"] != _qualified_digest(dict(row["payload"])) for row in rows
+            row["payload_digest"] not in _lead_journal_payload_digests(dict(row["payload"]))
+            for row in rows
         ):
             raise TargetAdmissionLatchedError("target admission journal authority is incomplete")
         return rows

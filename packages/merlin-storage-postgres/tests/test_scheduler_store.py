@@ -2873,6 +2873,28 @@ def test_pg0_reviewed_refresh_can_resolve_terminal_without_authorizing_schedule(
                 )
 
 
+def test_pg0_lead_authority_accepts_existing_digest_encodings(tmp_path: Path) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-lead-digests")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("lead journal digest compatibility")
+            store, campaigns, _schedule_id, campaign_id, _target_id, _tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            payload = {"summary": "Continue → Level 2"}
+            ascii_id = "lead-decision:" + "a" * 64
+            unicode_id = "lead-decision:" + "b" * 64
+            campaigns.commit_lead_decision(campaign_id, 0, ascii_id, payload, ())
+            with connection.transaction():
+                store._append_campaign_lead_event_locked(campaign_id, 0, unicode_id, payload)
+
+            rows = store._exact_lead_rows_locked(campaign_id, (ascii_id, unicode_id))
+
+            assert {row["decision_id"] for row in rows} == {ascii_id, unicode_id}
+            with pytest.raises(scheduler_store_module.TargetAdmissionLatchedError):
+                store._exact_lead_rows_locked(campaign_id, ("lead-decision:missing",))
+
+
 def test_pg0_activation_supersedes_all_reviewed_latched_target_sessions(
     tmp_path: Path,
 ) -> None:
