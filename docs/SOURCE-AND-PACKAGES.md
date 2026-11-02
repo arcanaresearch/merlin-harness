@@ -435,5 +435,5 @@ Several files are intentionally integration-heavy today:
 - `merlin_storage_postgres/scheduler_store.py` is the persistence-heavy scheduler implementation.
 - `merlin_kernel/kernel.py` contains the conversation state machine.
 
-Before changing these symbols, use GitNexus impact analysis and trace the affected execution flows.
+Before changing these symbols, use CodeGraph to review their blast radius and trace the affected execution flows.
 The repository may contain unrelated in-progress changes; preserve them and use focused tests.
