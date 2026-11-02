@@ -292,8 +292,8 @@ async def test_deterministic_reobservation_does_not_call_provider() -> None:
                 content=json.dumps(
                     {
                         "id": "handoff:deterministic",
-                        "request_evidence_ref": "request:1",
-                        "response_evidence_ref": "response:1",
+                        "request_evidence_ref": "snapshot:1",
+                        "response_evidence_ref": "snapshot:1",
                         "recon_observations": [
                             {
                                 "schema": "merlin.target-surface-generation.v1",
@@ -325,7 +325,7 @@ async def test_deterministic_reobservation_does_not_call_provider() -> None:
     assert result.status == "completed", result.error
     assert json.loads(result.content) == {
         "recon_handoff_id": "handoff:deterministic",
-        "evidence_refs": ["target-surface-generation:1", "request:1", "response:1"],
+        "evidence_refs": ["target-surface-generation:1", "snapshot:1"],
     }
     assert provider.requests == []
 

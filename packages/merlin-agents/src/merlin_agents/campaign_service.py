@@ -14713,7 +14713,7 @@ class CampaignService:
                         },
                         "evidence_refs": {
                             "type": "array",
-                            "minItems": 3,
+                            "minItems": 2,
                             "uniqueItems": True,
                             "items": {"type": "string", "minLength": 1},
                         },

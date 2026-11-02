@@ -1761,6 +1761,10 @@ def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools()
         "evidence_refs": ["target-surface-generation:1", "request:1", "response:1"],
     }
     validate(instance=valid_result, schema=output_schema)
+    validate(
+        instance={**valid_result, "evidence_refs": ["target-surface-generation:1", "snapshot:1"]},
+        schema=output_schema,
+    )
     with pytest.raises(ValidationError, match="does not match"):
         validate(
             instance={**valid_result, "recon_handoff_id": "call_00_IHxhg5LgUSg6nJIz0UHG4384"},
