@@ -2,6 +2,8 @@
 
 <img src="assets/merlin-mark.png" alt="Merlin logo" width="96">
 
+**English** · [简体中文](docs/i18n/README.zh-CN.md) · [日本語](docs/i18n/README.ja.md) · [한국어](docs/i18n/README.ko.md) · [Español](docs/i18n/README.es.md) · [Français](docs/i18n/README.fr.md) · [Deutsch](docs/i18n/README.de.md) · [Português (Brasil)](docs/i18n/README.pt-BR.md) · [Русский](docs/i18n/README.ru.md) · [العربية](docs/i18n/README.ar.md) · [हिन्दी](docs/i18n/README.hi.md)
+
 # Merlin
 
 ### Conversation-first AI security testing
@@ -17,6 +19,8 @@ with clear evidence status and coverage gaps.
 [Quick start](#quick-start) · [How it works](#how-merlin-works) ·
 [What makes it different](#what-makes-merlin-different) · [Current coverage](#current-offensive-coverage)
 
+[![Latest release](https://img.shields.io/github/v/release/arcanaresearch/merlin-harness?label=latest%20release)](https://github.com/arcanaresearch/merlin-harness/releases/latest)
+
 </div>
 
 ![Merlin coordinated security assessment](assets/merlin-hero.png)
@@ -28,7 +32,11 @@ reports, setup and advanced controls. See [run the browser workspace](docs/web-i
 
 ## Watch the CLI walkthrough
 
-[![Watch the 106-second Merlin CLI walkthrough](assets/merlin-cli-walkthrough.jpg)](https://github.com/triwiz-ai/merlin-harness/releases/download/v0.2.0/merlin-cli-walkthrough-v2.mp4)
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=Kyz2PcphWvo">
+    <img src="assets/merlin-cli-walkthrough.jpg" alt="Watch the 106-second Merlin CLI walkthrough on YouTube" width="720">
+  </a>
+</p>
 
 See Merlin connect models, define an authorized target, review a campaign, coordinate agents,
 accept operator guidance, and produce an evidence-linked report.
@@ -93,7 +101,7 @@ To produce the standalone macOS bundle, run:
 
 ```bash
 make release
-cd target/releases/merlin-0.2.1-darwin-arm64
+cd target/releases/merlin-0.2.47-darwin-arm64
 ./merlin
 ```
 
