@@ -3332,14 +3332,11 @@ class WorkerRuntime:
                 )
                 if not generation_refs:
                     raise ValueError("deterministic handoff lacks its generation receipt")
-                content = json.dumps(
-                    {
-                        "recon_handoff_id": document["id"],
-                        "evidence_refs": evidence_refs,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+                structured = {
+                    "recon_handoff_id": document["id"],
+                    "evidence_refs": evidence_refs,
+                }
+                content = json.dumps(structured, sort_keys=True, separators=(",", ":"))
             except (TypeError, ValueError, KeyError) as error:
                 return self._failed(
                     handoff,
@@ -3350,6 +3347,7 @@ class WorkerRuntime:
                 task_id=handoff.assignment.id,
                 status="completed",
                 content=content,
+                structured=structured,
             )
 
         evaluation_uncertainties: list[dict[str, object]] = []

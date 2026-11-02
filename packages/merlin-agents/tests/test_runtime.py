@@ -327,6 +327,10 @@ async def test_deterministic_reobservation_does_not_call_provider() -> None:
         "recon_handoff_id": "handoff:deterministic",
         "evidence_refs": ["target-surface-generation:1", "snapshot:1"],
     }
+    assert result.structured == {
+        "recon_handoff_id": "handoff:deterministic",
+        "evidence_refs": ["target-surface-generation:1", "snapshot:1"],
+    }
     assert provider.requests == []
 
 
