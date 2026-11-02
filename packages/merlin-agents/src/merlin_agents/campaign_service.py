@@ -14980,6 +14980,9 @@ class CampaignService:
                 "result_digest": result_digest,
             },
         )
+        reconciler = getattr(self._agents, "reconcile_completed_target_lanes", None)
+        if callable(reconciler):
+            await reconciler(campaign_id, settlement_id)
         await self._record_browser_recon_observations(
             manifest,
             handoff_id=handoff_id,

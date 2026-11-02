@@ -1422,6 +1422,193 @@ def test_pg0_expired_target_lane_requires_exact_effect_recovery(
             )
 
 
+def test_pg0_completed_lane_allows_passive_refresh_and_reconciles_ambiguity(
+    tmp_path: Path,
+) -> None:
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-completed-lane")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("completed target lane recovery")
+            store, campaigns, schedule_id, campaign_id, target_id, tasks, _offline = (
+                _prepare_target_transition_campaign(connection, str(session.id))
+            )
+            admission = _target_admission(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                schedule_id=schedule_id,
+                target_id=target_id,
+                assignment_id=tasks[0],
+            )
+            first = store.claim(
+                schedule_id,
+                f"worker:{tasks[0]}",
+                "worker:completed-lane",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                target_admission=admission,
+            )
+            effects = ToolEffectRepository(connection)
+            intent = ToolEffectRecord.model_validate(
+                _target_effect_intent(
+                    session_id=str(session.id),
+                    campaign_id=campaign_id,
+                    target_id=target_id,
+                    assignment_id=tasks[0],
+                    attempt_id=first.id,
+                    call_id="call-ambiguous-completed-lane",
+                )
+            )
+            effects.begin(intent)
+            connection.execute(
+                """UPDATE merlin_storage.tool_effects
+                   SET state = 'ambiguous', result_is_error = true, result_metadata = %s
+                   WHERE idempotency_key = %s""",
+                (
+                    Jsonb(
+                        {
+                            "failure_code": "target_session_identity_unavailable",
+                            "target_effect_attempted": True,
+                        }
+                    ),
+                    intent.idempotency_key,
+                ),
+            )
+            transition = _surface_transition_observation(
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-completed",
+                task_id=tasks[0],
+                call_id="call-completed-lane-transition",
+            )
+            with connection.transaction():
+                store._commit_target_surface_transition_locked(
+                    schedule_id,
+                    f"worker:{tasks[0]}",
+                    transition,
+                )
+            connection.execute(
+                "UPDATE merlin_storage.scheduler_attempts SET state = 'completed' WHERE id = %s",
+                (first.id,),
+            )
+            connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_schedule_id = NULL, lane_node_id = NULL,
+                       lane_assignment_id = NULL, lane_attempt_id = NULL,
+                       lane_generation = NULL, lane_recovery_required = false,
+                       lane_recovery_root_attempt_id = NULL
+                   WHERE campaign_id = %s""",
+                (campaign_id,),
+            )
+            connection.execute(
+                """UPDATE merlin_storage.target_admission_latches
+                   SET lane_schedule_id = %s, lane_node_id = %s, lane_assignment_id = %s,
+                       lane_attempt_id = %s, lane_generation = %s,
+                       lane_recovery_required = true, lane_recovery_root_attempt_id = %s
+                   WHERE campaign_id = %s AND target_session_id = %s""",
+                (
+                    schedule_id,
+                    f"worker:{tasks[0]}",
+                    tasks[0],
+                    first.id,
+                    first.generation,
+                    first.id,
+                    campaign_id,
+                    "browser:context-completed",
+                ),
+            )
+            authority = _journal_reviewed_refresh(
+                campaigns,
+                campaign_id=campaign_id,
+                session_id=str(session.id),
+                target_id=target_id,
+                target_session_id="browser:context-completed",
+            )
+            passive_task = (
+                f"{campaign_id}/target-reobservation/"
+                f"{authority['generation_id'].removeprefix('sha256:')}/recon"
+            )
+            passive_contract = [
+                ["schema", "merlin.target-reobservation.v1"],
+                ["generation_id", authority["generation_id"]],
+                ["event_set_digest", authority["event_set_digest"]],
+                ["target_session_id", "browser:context-completed"],
+                [
+                    "target_reobservation_start_decision_id",
+                    authority["start_decision_id"],
+                ],
+            ]
+            store.create_schedule(
+                str(session.id),
+                {
+                    "assignments": [
+                        {
+                            "id": passive_task,
+                            "target_profile_id": target_id,
+                            "tool_ids": ["browser_snapshot", "browser_record_api_handoff"],
+                            "technique_ids": [],
+                            "strategy_id": "target-reobservation/v1",
+                            "strategy_contract": passive_contract,
+                            "reviewed_adapter_digest": "sha256:" + "8" * 64,
+                        }
+                    ],
+                    "worker_contexts": {},
+                },
+                {"nodes": {}},
+                [f"worker:{passive_task}"],
+                ready_nodes=[f"worker:{passive_task}"],
+                schedule_id=authority["reobserve_schedule_id"],
+            )
+
+            def claim_passive():
+                return store.claim(
+                    authority["reobserve_schedule_id"],
+                    f"worker:{passive_task}",
+                    "worker:passive-refresh",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+                    target_admission=_target_admission(
+                        campaign_id=campaign_id,
+                        session_id=str(session.id),
+                        schedule_id=authority["reobserve_schedule_id"],
+                        target_id=target_id,
+                        assignment_id=passive_task,
+                        target_session_id="browser:context-completed",
+                        strategy_id="target-reobservation/v1",
+                        generation_id=authority["generation_id"],
+                        event_set_digest=authority["event_set_digest"],
+                        start_decision_id=authority["start_decision_id"],
+                        target_exchange_tool_ids=(),
+                    ),
+                )
+
+            passive = claim_passive()
+            assert passive.lane_recovery_required is False
+            held = connection.execute(
+                """SELECT lane_attempt_id, lane_recovery_required
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_session_id = %s""",
+                (campaign_id, "browser:context-completed"),
+            ).fetchone()
+            assert str(held["lane_attempt_id"]) == first.id
+            assert held["lane_recovery_required"] is True
+
+            assert (
+                store.reconcile_completed_target_lanes(campaign_id, authority["settlement_id"]) == 1
+            )
+            effect = effects.list_for_attempt(first.id)[0]
+            assert effect.state == ToolEffectState.RECONCILED
+            assert effect.result_metadata["target_effect_attempted"] is True
+            assert (
+                effect.result_metadata["reconciliation_evidence_ref"] == authority["settlement_id"]
+            )
+            released = connection.execute(
+                """SELECT lane_attempt_id, lane_recovery_required
+                   FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_session_id = %s""",
+                (campaign_id, "browser:context-completed"),
+            ).fetchone()
+            assert released == {"lane_attempt_id": None, "lane_recovery_required": False}
+
+
 @pytest.mark.asyncio
 async def test_pg0_target_effect_permit_adopts_finishes_and_releases_lane(
     tmp_path: Path,

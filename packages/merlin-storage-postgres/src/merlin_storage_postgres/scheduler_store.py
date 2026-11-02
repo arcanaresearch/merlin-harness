@@ -4506,7 +4506,7 @@ class DurableSchedulerStore:
         *,
         current_attempt_id: str | None = None,
         current_generation: int | None = None,
-    ) -> tuple[str, str, str, str | None]:
+    ) -> tuple[str, str, str, str | None, bool]:
         campaign, assignment, _schedule = self._target_admission_scope_locked(
             schedule_id, node_id, target_admission
         )
@@ -4622,34 +4622,190 @@ class DurableSchedulerStore:
         elif head is not None and int(head["transition_count"]) > 0:
             raise TargetAdmissionLatchedError("target session has no refreshed authority")
 
-        other_lanes = self.connection.execute(
-            """SELECT * FROM merlin_storage.target_admission_latches
-               WHERE campaign_id = %s AND target_id = %s
-                 AND lane_attempt_id IS NOT NULL
-                 AND target_session_id <> %s
-               ORDER BY target_session_id LIMIT 2 FOR UPDATE""",
-            (campaign_id, target_id, target_session_id),
-        ).fetchall()
-        if len(other_lanes) > 1:
-            raise TargetAdmissionLatchedError("multiple durable target lanes require recovery")
-        for other_lane in other_lanes:
-            self._target_lane_available_locked(
-                dict(other_lane),
+        passive_completed_recovery = False
+        if passive_reobservation and latch is not None and latch.get("lane_recovery_required"):
+            lane_attempt = self.connection.execute(
+                "SELECT state FROM merlin_storage.scheduler_attempts WHERE id = %s",
+                (latch["lane_attempt_id"],),
+            ).fetchone()
+            passive_completed_recovery = (
+                lane_attempt is not None and lane_attempt["state"] == "completed"
+            )
+        recovery_attempt_id = None
+        if not passive_completed_recovery:
+            other_lanes = self.connection.execute(
+                """SELECT * FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_id = %s
+                     AND lane_attempt_id IS NOT NULL
+                     AND target_session_id <> %s
+                   ORDER BY target_session_id LIMIT 2 FOR UPDATE""",
+                (campaign_id, target_id, target_session_id),
+            ).fetchall()
+            if len(other_lanes) > 1:
+                raise TargetAdmissionLatchedError("multiple durable target lanes require recovery")
+            for other_lane in other_lanes:
+                self._target_lane_available_locked(
+                    dict(other_lane),
+                    current_attempt_id=current_attempt_id,
+                    current_schedule_id=schedule_id,
+                    current_node_id=node_id,
+                    current_generation=current_generation,
+                    prospective_assignment_id=str(target_admission["assignment_id"]),
+                )
+            recovery_attempt_id = self._target_lane_available_locked(
+                latch,
                 current_attempt_id=current_attempt_id,
                 current_schedule_id=schedule_id,
                 current_node_id=node_id,
                 current_generation=current_generation,
                 prospective_assignment_id=str(target_admission["assignment_id"]),
             )
-        recovery_attempt_id = self._target_lane_available_locked(
-            latch,
-            current_attempt_id=current_attempt_id,
-            current_schedule_id=schedule_id,
-            current_node_id=node_id,
-            current_generation=current_generation,
-            prospective_assignment_id=str(target_admission["assignment_id"]),
+        return (
+            campaign_id,
+            target_id,
+            target_session_id,
+            recovery_attempt_id,
+            not passive_completed_recovery,
         )
-        return campaign_id, target_id, target_session_id, recovery_attempt_id
+
+    @_serialized
+    def reconcile_completed_target_lanes(self, campaign_id: str, settlement_id: str) -> int:
+        with self.connection.transaction():
+            settlement_row = self._exact_lead_rows_locked(campaign_id, (settlement_id,))[0]
+            settlement = settlement_row["payload"]
+            target_session_id = settlement.get("target_session_id")
+            if (
+                settlement.get("schema") != "merlin.target-reobservation-settlement.v1"
+                or settlement.get("status") != "refreshed"
+                or not isinstance(target_session_id, str)
+                or not target_session_id
+            ):
+                raise TargetLaneRecoveryRequiredError(
+                    "completed target lane requires an exact passive settlement"
+                )
+            lanes = self.connection.execute(
+                """SELECT * FROM merlin_storage.target_admission_latches
+                   WHERE campaign_id = %s AND target_session_id = %s
+                     AND lane_recovery_required = true
+                   ORDER BY lane_attempt_id LIMIT 2 FOR UPDATE""",
+                (campaign_id, target_session_id),
+            ).fetchall()
+            if not lanes:
+                return 0
+            if len(lanes) != 1:
+                raise TargetLaneRecoveryRequiredError(
+                    "multiple completed target lanes require passive reconciliation"
+                )
+            latch = dict(lanes[0])
+            attempt_id = str(latch["lane_attempt_id"])
+            attempt = self.connection.execute(
+                """SELECT state FROM merlin_storage.scheduler_attempts
+                   WHERE id = %s FOR UPDATE""",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt["state"] != "completed":
+                raise TargetLaneRecoveryRequiredError(
+                    "passive reconciliation requires a completed target lane"
+                )
+            attempt_number = settlement.get("attempt")
+            generation_id = settlement.get("generation_id")
+            if type(attempt_number) is not int or attempt_number < 1:
+                raise TargetLaneRecoveryRequiredError("passive settlement attempt is invalid")
+            start_decision_id = (
+                "target-reobservation-started/"
+                + str(generation_id).removeprefix("sha256:")
+                + f"/{attempt_number}"
+            )
+            projection = self._bounded_target_reobservation_projection_locked(
+                latch,
+                start_decision_id=start_decision_id,
+                settlement_id=settlement_id,
+            )
+            if (
+                settlement.get("campaign_id") != campaign_id
+                or settlement.get("session_id") != str(latch["session_id"])
+                or settlement.get("target_id") != latch["target_id"]
+            ):
+                raise TargetLaneRecoveryRequiredError(
+                    "passive settlement does not match the completed target lane"
+                )
+            if generation_id not in projection.refreshed:
+                raise TargetLaneRecoveryRequiredError(
+                    "passive settlement generation is not refreshed"
+                )
+            lineage = self.connection.execute(
+                """WITH RECURSIVE lineage AS (
+                       SELECT id, schedule_id, node_id, replaced_attempt_id, 1 AS depth
+                       FROM merlin_storage.scheduler_attempts WHERE id = %s
+                       UNION ALL
+                       SELECT prior.id, prior.schedule_id, prior.node_id,
+                              prior.replaced_attempt_id, lineage.depth + 1
+                       FROM merlin_storage.scheduler_attempts AS prior
+                       JOIN lineage ON prior.id = lineage.replaced_attempt_id
+                       WHERE lineage.depth < 257
+                   )
+                   SELECT * FROM lineage ORDER BY depth""",
+                (attempt_id,),
+            ).fetchall()
+            lineage_ids = tuple(str(row["id"]) for row in lineage)
+            root_attempt_id = str(latch.get("lane_recovery_root_attempt_id") or attempt_id)
+            if (
+                not lineage
+                or len(lineage) > 256
+                or root_attempt_id not in lineage_ids
+                or not all(
+                    str(row["schedule_id"]) == str(latch["lane_schedule_id"])
+                    and str(row["node_id"]) == str(latch["lane_node_id"])
+                    for row in lineage
+                )
+            ):
+                raise TargetLaneRecoveryRequiredError(
+                    "completed target lane has an unbounded recovery lineage"
+                )
+            effects = self.connection.execute(
+                """SELECT * FROM merlin_storage.tool_effects
+                   WHERE attempt_id = ANY(%s) ORDER BY idempotency_key FOR UPDATE""",
+                (list(lineage_ids),),
+            ).fetchall()
+            for effect in effects:
+                if effect["state"] != "ambiguous":
+                    continue
+                metadata = (
+                    dict(effect["result_metadata"])
+                    if isinstance(effect["result_metadata"], Mapping)
+                    else {}
+                )
+                effect_session = metadata.get("target_session_id")
+                if effect_session is not None and effect_session != target_session_id:
+                    continue
+                metadata["target_session_id"] = target_session_id
+                metadata["reconciliation_evidence_ref"] = settlement_id
+                self.connection.execute(
+                    """UPDATE merlin_storage.tool_effects
+                       SET state = 'reconciled', result_metadata = %s,
+                           reconciliation = 'authenticated passive re-observation',
+                           updated_at = now()
+                       WHERE idempotency_key = %s AND state = 'ambiguous'""",
+                    (Jsonb(metadata), effect["idempotency_key"]),
+                )
+            transition_call_ids = {
+                str(effect["call_id"])
+                for effect in effects
+                if isinstance(effect["result_metadata"], Mapping)
+                and "target_ui_transition" in effect["result_metadata"]
+            }
+            disposition = self._target_lane_terminal_disposition_locked(
+                attempt_id,
+                authority="settled",
+                committed_transition_call_id=(
+                    next(iter(transition_call_ids)) if len(transition_call_ids) == 1 else None
+                ),
+            )
+            if disposition not in {"released", "latched"}:
+                raise TargetLaneRecoveryRequiredError(
+                    "completed target lane remains unreconciled after passive refresh"
+                )
+            return 1
 
     def _append_campaign_lead_event_locked(
         self,
@@ -7445,7 +7601,7 @@ class DurableSchedulerStore:
                     replaced_attempt_id,
                 ),
             ).fetchone()
-            if target_scope is not None:
+            if target_scope is not None and target_scope[4]:
                 if target_scope[3] is not None and str(replaced_attempt_id) != target_scope[3]:
                     raise TargetAdmissionLatchedError(
                         "target lane recovery does not match replacement lineage"

@@ -1376,6 +1376,12 @@ class DurableAgentService:
             raise RuntimeError("scheduler store cannot resolve refreshed target admission")
         return str(await self._call(resolver, value))
 
+    async def reconcile_completed_target_lanes(self, campaign_id: str, settlement_id: str) -> int:
+        reconciler = getattr(self._store, "reconcile_completed_target_lanes", None)
+        if not callable(reconciler):
+            raise RuntimeError("scheduler store cannot reconcile completed target lanes")
+        return int(await self._call(reconciler, campaign_id, settlement_id))
+
     async def reopen(self, schedule_id: str, *, resume_execution: bool = True) -> _LiveSchedule:
         existing = self._live.get(schedule_id)
         if existing is not None:

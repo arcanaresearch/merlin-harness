@@ -1581,6 +1581,13 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
         return (surface_receipt, current_state_receipt)
 
     service._recon_observation_reader = read_receipts  # noqa: SLF001
+    reconciliations: list[tuple[str, str]] = []
+
+    async def reconcile(campaign_id: str, settlement_id: str) -> int:
+        reconciliations.append((campaign_id, settlement_id))
+        return 1
+
+    agents.reconcile_completed_target_lanes = reconcile
 
     await service._settle_target_reobservation_attempt(  # noqa: SLF001
         manifest.id,
@@ -1595,6 +1602,7 @@ async def test_real_settlement_commits_authenticated_handoff_and_result_identity
     assert projection.pending == ()
     assert projection.latest_refreshed is not None
     assert projection.latest_refreshed["schedule_id"] == schedule_id
+    assert reconciliations == [(manifest.id, projection.latest_refreshed["settlement_id"])]
     assert projection.latest_refreshed["recon_handoff_id"] == "handoff-refreshed"
     assert projection.latest_refreshed["result_reference"] == result_reference
     assert projection.latest_refreshed["result_digest"] == result_digest
