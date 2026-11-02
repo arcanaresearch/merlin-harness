@@ -1679,6 +1679,39 @@ async def test_real_settlement_rejects_same_session_receipt_for_another_target()
     assert store.pauses == 1
 
 
+def test_reobservation_compilation_preserves_parent_adapter_identity(monkeypatch) -> None:
+    manifest, context = _campaign()
+    generation = _generation(_obligation())
+    parent = compile_attack_campaign(manifest, context).assignments[0]
+    parent = replace(
+        parent,
+        profile_id="recon",
+        grant_id=None,
+        strategy_contract=(
+            *parent.strategy_contract,
+            ("compiled_adapter", "sealed-compiled-adapter"),
+            ("compiled_adapter_digest", "sha256:" + "a" * 64),
+        ),
+    )
+    monkeypatch.setattr(
+        "merlin_agents.campaign_service.compile_recon_campaign",
+        lambda *_: CampaignCompilation((parent,), ()),
+    )
+
+    compilation = CampaignService._target_reobservation_compilation(  # noqa: SLF001
+        manifest,
+        context,
+        generation,
+        "target-reobservation-started/" + generation.generation_id.removeprefix("sha256:") + "/1",
+    )
+
+    assignment = compilation.assignments[0]
+    contract = dict(assignment.strategy_contract)
+    assert contract["compiled_adapter"] == "sealed-compiled-adapter"
+    assert contract["compiled_adapter_digest"] == "sha256:" + "a" * 64
+    assert compilation.worker_contexts[0].strategy_contract == assignment.strategy_contract
+
+
 def test_reobservation_compilation_is_passive_and_has_no_target_exchange_tools() -> None:
     manifest, context = _campaign()
     generation = _generation(_obligation())

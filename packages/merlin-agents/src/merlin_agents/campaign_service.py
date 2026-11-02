@@ -14698,6 +14698,10 @@ class CampaignService:
             "observation_cutoff_sequence": str(generation.observation_cutoff_sequence),
             "target_reobservation_start_decision_id": start_decision_id,
         }
+        parent_contract = dict(parent.strategy_contract)
+        for key in ("compiled_adapter", "compiled_adapter_digest"):
+            if key in parent_contract:
+                contract[key] = parent_contract[key]
         assignment = replace(
             parent,
             id=(
