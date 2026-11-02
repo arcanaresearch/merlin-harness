@@ -18914,6 +18914,86 @@ async def test_compiled_chat_exchange_waits_for_complete_multi_message_boundary(
 
 
 @pytest.mark.asyncio
+async def test_compiled_chat_exchange_advances_completed_level_before_prompt() -> None:
+    chat = b"""
+    <div id="completion">
+      <div>Level 1</div>
+      <div>Target score: 75</div>
+      <div>Score: 93</div>
+      <div>Congratulations! You pass the level.</div>
+      <button aria-label="Next Level" onclick="
+        document.getElementById('completion').hidden=true;
+        document.getElementById('chat').hidden=false;
+      ">Next Level</button>
+    </div>
+    <div id="chat" hidden>
+      <textarea aria-label="Message" maxlength="500"></textarea>
+      <button aria-label="Send" onclick="
+        document.getElementById('reply').textContent='assistant:'+document.querySelector('textarea').value;
+      ">Send</button>
+      <div id="reply" aria-live="polite"></div>
+    </div>
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.actions = []
+            self.observations = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def append_observation(self, value):
+            self.observations.append(value)
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            recorder = Recorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, recorder, lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 3_000},
+            )
+
+            assert result.is_error is False, result.content
+            assert result.metadata["level_transition"] == "next_level"
+            assert result.metadata["tab_resolution"] == "completed_level_transition"
+            assert [item.kind for item in recorder.actions][:3] == ["click", "fill", "click"]
+            (exchange,) = result.metadata["target_exchanges"]
+            assert exchange["response_boundary_complete"] is True
+            assert "assistant:hello" in exchange["response"]
+
+
+@pytest.mark.asyncio
 async def test_compiled_chat_exchange_returns_bounded_surface_drift_before_target_call() -> None:
     changed = b"""
     <div>Level 2</div>

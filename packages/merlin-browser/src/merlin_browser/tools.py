@@ -5579,6 +5579,54 @@ def _browser_context_chat_adapter(
     return executable, observed_digest
 
 
+def _browser_completed_level_transition(
+    observed_tabs: Sequence[tuple[object, BrowserObservation]],
+    adapter: BrowserChat,
+) -> tuple[str, BrowserObservation, ElementRef] | None:
+    for tab, observation in observed_tabs:
+        tab_ref = str(getattr(tab, "tab_ref", tab))
+        completed = "congratulations! you pass the level" in observation.text.casefold()
+        if not completed:
+            state = _browser_handoff_current_state(
+                observation,
+                url=adapter.endpoint,
+                adapter=adapter,
+            )
+            target = next(
+                (
+                    item.get("value")
+                    for item in state
+                    if item.get("name") == "target_score"
+                    and type(item.get("value")) in {int, float}
+                ),
+                None,
+            )
+            score = next(
+                (
+                    item.get("value")
+                    for item in state
+                    if item.get("name") in {"score", "progress_score"}
+                    and type(item.get("value")) in {int, float}
+                ),
+                None,
+            )
+            completed = target is not None and score is not None and score >= target
+        if not completed:
+            continue
+        candidates = [
+            element
+            for element in observation.elements
+            if element.role.casefold() == "button"
+            and _normalized_accessible_name(element.name) == "next level"
+            and not element.disabled
+            and not element.read_only
+            and not element.occluded
+        ]
+        if len(candidates) == 1:
+            return tab_ref, observation, candidates[0]
+    return None
+
+
 def _browser_tab_url(session: BrowserSession, tab_ref: str, fallback: str = "") -> str:
     return next(
         (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
@@ -6761,6 +6809,65 @@ class BrowserChatExchangeTool:
             if len(exact_endpoint_tabs) == 1:
                 compatible_tabs = exact_endpoint_tabs
                 tab_resolution = "unique_exact_endpoint_tab"
+        if not compatible_tabs:
+            level_transition = _browser_completed_level_transition(
+                observed_tabs,
+                executable_adapter,
+            )
+            if level_transition is not None:
+                transition_tab_ref, transition_observation, transition_element = level_transition
+                transition_result = await BrowserTool(
+                    "browser_click",
+                    self._resolver,
+                    self._recorder,
+                    self._failures,
+                ).invoke(
+                    context,
+                    {
+                        "tab_ref": transition_tab_ref,
+                        "frame_ref": transition_element.frame_ref,
+                        "element_ref": transition_element.ref,
+                        "timeout_ms": int(arguments.get("timeout_ms", 30_000)),
+                    },
+                )
+                if transition_result.is_error:
+                    return transition_result
+                guard.dispatched = True
+                guard.before = transition_observation
+                guard.before_url = _browser_tab_url(session, transition_tab_ref)
+                guard.action_ref = next(
+                    (
+                        str(item)
+                        for item in transition_result.metadata.get("evidence_refs", ())
+                        if isinstance(item, str) and item
+                    ),
+                    _browser_evidence_ref("level-transition", transition_observation),
+                )
+                transitioned = await session.snapshot(transition_tab_ref)
+                if (
+                    len(
+                        _matching_reviewed_elements(
+                            transitioned,
+                            executable_adapter.interaction.input_locator,
+                            default_role="textbox",
+                        )
+                    )
+                    != 1
+                    or len(
+                        _matching_reviewed_elements(
+                            transitioned,
+                            executable_adapter.interaction.submit_action,
+                            default_role="button",
+                        )
+                    )
+                    != 1
+                ):
+                    raise TimeoutError(
+                        "completed level transition did not expose the reviewed chat controls"
+                    )
+                compatible_tabs = [(transition_tab_ref, transitioned)]
+                tab_resolution = "completed_level_transition"
+                adapter_identity_metadata["level_transition"] = "next_level"
         if len(compatible_tabs) != 1:
             compatible_tab_count = len(compatible_tabs)
             failure_code = (
