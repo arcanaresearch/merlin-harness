@@ -79,6 +79,18 @@ def _jsonb_canonicalize(value: object) -> object:
     return value
 
 
+def _arm_history_metadata(usage: object) -> dict[str, object]:
+    if not isinstance(usage, Mapping):
+        return {"completed_experiment": None, "native_score_progress": None}
+    completed = usage.get("completed_experiment")
+    native = usage.get("native_score_observation")
+    progress = native.get("meaningful_progress") if isinstance(native, Mapping) else None
+    return {
+        "completed_experiment": completed if type(completed) is bool else None,
+        "native_score_progress": progress if type(progress) is bool else None,
+    }
+
+
 class CampaignArmStore:
     """Read/write access to admitted bandit arms for one campaign target."""
 
@@ -250,16 +262,19 @@ class CampaignArmStore:
                 else None
             ),
         )
+        expected_outcome = {
+            ArmOutcomeKind.AUTHORITATIVE_SUCCESS: "confirmed",
+            ArmOutcomeKind.VALIDATED_FINDING: "confirmed",
+            ArmOutcomeKind.CLEAN_NEGATIVE: "refuted",
+            ArmOutcomeKind.PARTIAL_SIGNAL: "progress",
+        }.get(outcome, "unclear")
+        if outcome == ArmOutcomeKind.AMBIGUOUS and canonical_projection["outcome"] == "regression":
+            expected_outcome = "regression"
         expected_projection = project_candidate_outcome(
             candidate_id=canonical_projection["candidate_id"],
             attempt_disposition=observation.get("attempt_disposition") or "uncertain",
             outcome_authority=observation.get("outcome_authority") or "none",
-            outcome={
-                ArmOutcomeKind.AUTHORITATIVE_SUCCESS: "confirmed",
-                ArmOutcomeKind.VALIDATED_FINDING: "confirmed",
-                ArmOutcomeKind.CLEAN_NEGATIVE: "refuted",
-                ArmOutcomeKind.PARTIAL_SIGNAL: "progress",
-            }.get(outcome, "unclear"),
+            outcome=expected_outcome,
             evidence_digest=canonical_projection["evidence_digest"],
         )
         if canonical_projection != expected_projection:
@@ -569,6 +584,7 @@ class CampaignArmStore:
                     else 0.0
                 ),
                 "infrastructure_failure": row["infrastructure_failure_category"] is not None,
+                **_arm_history_metadata(row["usage"]),
                 "generalized_win": (
                     str(row["source"]) == "win-generalization"
                     and str(row["outcome"]) in {"authoritative_success", "validated_finding"}

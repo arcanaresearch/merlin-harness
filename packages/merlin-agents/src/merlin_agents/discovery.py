@@ -278,6 +278,8 @@ class ArmObservation:
     evaluation_uncertainties: tuple[Mapping[str, object], ...] = ()
     attempt_disposition: AttemptDisposition | None = None
     outcome_authority: OutcomeAuthority | None = None
+    completed_experiment: bool | None = None
+    native_score_progress: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.outcome.strip():
@@ -323,6 +325,12 @@ class ArmObservation:
             OutcomeAuthority.VALIDATOR,
         }
 
+    @property
+    def is_completed_experiment(self) -> bool:
+        if self.completed_experiment is not None:
+            return self.completed_experiment
+        return self.quality_eligible
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ArmObservation:
         identity = value.get("identity")
@@ -334,8 +342,10 @@ class ArmObservation:
             "generalized_win",
             "boundary_signal",
             "transform_credit_eligible",
+            "completed_experiment",
+            "native_score_progress",
         ):
-            if name in value and type(value[name]) is not bool:
+            if name in value and value[name] is not None and type(value[name]) is not bool:
                 raise ValueError(f"arm observation {name} must be a boolean")
         partial = value.get("partial_signal", 0.0)
         if isinstance(partial, bool) or not isinstance(partial, (int, float)):
@@ -373,6 +383,8 @@ class ArmObservation:
                 if value.get("outcome_authority") is None
                 else OutcomeAuthority(str(value["outcome_authority"]))
             ),
+            completed_experiment=value.get("completed_experiment"),  # type: ignore[arg-type]
+            native_score_progress=value.get("native_score_progress"),  # type: ignore[arg-type]
         )
 
 
@@ -542,6 +554,50 @@ def classify_lifecycle(
             "context can restore rank",
         )
     return RetirementDecision("keep", "active retirement budget remains")
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyStall:
+    technique_id: str
+    consecutive_non_improving: int
+    threshold: int = 3
+
+    @property
+    def stalled(self) -> bool:
+        return self.consecutive_non_improving >= self.threshold
+
+    def projection(self) -> dict[str, object]:
+        return {
+            "technique_id": self.technique_id,
+            "consecutive_non_improving_completed_experiments": self.consecutive_non_improving,
+            "threshold": self.threshold,
+            "stalled": self.stalled,
+        }
+
+
+def project_family_stalls(
+    observations: Sequence[ArmObservation | Mapping[str, object]],
+    *,
+    threshold: int = 3,
+) -> dict[str, FamilyStall]:
+    if threshold < 1:
+        raise ValueError("family stall threshold must be positive")
+    counts: dict[str, int] = {}
+    for raw in observations:
+        item = raw if isinstance(raw, ArmObservation) else ArmObservation.from_mapping(raw)
+        if item.is_infrastructure_failure or not item.is_completed_experiment:
+            continue
+        technique_id = item.identity.technique_id
+        improved = item.outcome in {"finding", "validated_finding", "win"} or (
+            item.native_score_progress
+            if item.native_score_progress is not None
+            else item.partial_signal > 0
+        )
+        counts[technique_id] = 0 if improved else counts.get(technique_id, 0) + 1
+    return {
+        technique_id: FamilyStall(technique_id, count, threshold)
+        for technique_id, count in counts.items()
+    }
 
 
 def aggregate_observations(

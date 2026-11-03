@@ -159,7 +159,19 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
                     "model_steps": 3,
                     "latency_ms": 217,
                     "model_cost_usd": 0.0042,
-                    "usage": {"input_tokens": 120, "output_tokens": 35},
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 35,
+                        "completed_experiment": True,
+                        "native_score_observation": {
+                            "schema": "merlin.native-score-observation.v1",
+                            "outcome": "progress",
+                            "delta": 6.0,
+                            "signal": 0.06,
+                            "meaningful_progress": True,
+                            "observations": [],
+                        },
+                    },
                     "evaluation_uncertainties": (
                         {
                             "source": "adapter_expected_status",
@@ -175,6 +187,8 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
             assert history[0]["outcome"] == "near_miss"
             assert history[0]["partial_signal"] == 0.6
             assert history[0]["identity"]["state_id"] == "fresh-session"
+            assert history[0]["completed_experiment"] is True
+            assert history[0]["native_score_progress"] is True
             assert history[0]["evaluation_uncertainties"] == (
                 {
                     "source": "adapter_expected_status",
@@ -196,6 +210,15 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
             } == {
                 "input_tokens": 120,
                 "output_tokens": 35,
+                "completed_experiment": True,
+                "native_score_observation": {
+                    "schema": "merlin.native-score-observation.v1",
+                    "outcome": "progress",
+                    "delta": 6.0,
+                    "signal": 0.06,
+                    "meaningful_progress": True,
+                    "observations": [],
+                },
                 "evaluation_uncertainties": [
                     {
                         "source": "adapter_expected_status",
@@ -576,6 +599,29 @@ def test_pg0_arm_observation_preserves_and_guards_canonical_settlement(
                 "SELECT usage FROM merlin_storage.campaign_arm_outcomes"
             ).fetchone()
             assert persisted["usage"]["candidate_outcome_projection"] == projection
+
+            regression = project_candidate_outcome(
+                candidate_id=projection["candidate_id"],
+                attempt_disposition="valid",
+                outcome_authority="target",
+                outcome="regression",
+                evidence_digest="a" * 64,
+            )
+            store.record_arm_observation(
+                {
+                    **observation,
+                    "outcome": "ambiguous",
+                    "distance_to_success": 1.0,
+                    "candidate_outcome_projection": regression,
+                }
+            )
+            history = store.list_arm_observations("target-1", "sha256:scenario-one")
+            assert history[0]["outcome"] == "ambiguous"
+            assert history[0]["partial_signal"] == 0.0
+            persisted = connection.execute(
+                "SELECT usage FROM merlin_storage.campaign_arm_outcomes"
+            ).fetchone()
+            assert persisted["usage"]["candidate_outcome_projection"] == regression
 
             with pytest.raises(ValueError, match="candidate id conflicts"):
                 store.record_arm_observation(

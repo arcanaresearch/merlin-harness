@@ -31,7 +31,12 @@ from merlin_agents import (
     ReviewedTargetAdapter,
 )
 from merlin_agents.campaign_service import _arm_task_observation, _hypothesis_task_observation
-from merlin_contracts import AgentTask, project_candidate_outcome
+from merlin_contracts import (
+    AgentTask,
+    build_state_observation,
+    evaluate_state_transition,
+    project_candidate_outcome,
+)
 
 _GENERATED_OBJECTIVE = (
     "Probe cross-tenant isolation between two provisioned identities on the reviewed target."
@@ -142,6 +147,7 @@ def test_arm_observation_requires_an_acknowledged_target_attempt() -> None:
     assert infrastructure is not None
     assert infrastructure["outcome"] == "infrastructure_failure"
     assert infrastructure["signal"] is None
+    assert infrastructure["usage"]["completed_experiment"] is False
 
 
 def test_arm_observation_retains_target_signal_when_transform_attribution_is_uncertain() -> None:
@@ -238,6 +244,139 @@ def test_worker_partial_outcome_without_valid_signal_is_ambiguous() -> None:
     assert supported["outcome"] == "partial_signal"
     assert supported["signal"] == pytest.approx(0.25)
     assert supported["distance_to_success"] == pytest.approx(0.75)
+
+
+def _native_score_committed(
+    hypothesis_id: str, before: int, after: int, *, call_id: str = "call:native"
+) -> dict[str, object]:
+    def observed(phase: str, name: str, role: str, value: object) -> dict[str, object]:
+        return build_state_observation(
+            name=name,
+            role=role,
+            phase=phase,
+            step_id=f"{phase}-step",
+            evaluation_root="response_body",
+            pointer=f"/state/{name}",
+            binding_context={"adapter": "reviewed"},
+            selected_value=value,
+            value_type="integer" if role == "score" else "string",
+            preferred_direction="increase" if role == "score" else None,
+            minimum_value=0 if role == "score" else None,
+            maximum_value=100 if role == "score" else None,
+            trust_class="host_observed" if role == "score" else None,
+        )
+
+    observations = [
+        observed("baseline", "physical_state_identity", "state_identity", "run-1"),
+        observed("result", "physical_state_identity", "state_identity", "run-1"),
+        observed("baseline", "native_score", "score", before),
+        observed("result", "native_score", "score", after),
+    ]
+    transition = evaluate_state_transition(observations)
+    digest = "a" * 64
+    projection = project_candidate_outcome(
+        candidate_id=hypothesis_id,
+        attempt_disposition="valid",
+        outcome_authority="none",
+        outcome=transition["outcome"],
+        evidence_digest=digest,
+    )
+    return {
+        "attempt_id": "attempt:native",
+        "reference": "receipt:native",
+        "digest": "sha256:" + digest,
+        "target_call_ids": (call_id,),
+        "target_evidence_receipts": {
+            call_id: {
+                "attempt_disposition": "valid",
+                "target_authoritative_state_outcome": transition["outcome"],
+                "target_state_transition": transition,
+                "candidate_outcome_projection": projection,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("after", "expected_signal", "meaningful"),
+    [(15, 0.05, True), (14, 0.04, False)],
+)
+def test_native_score_delta_replaces_worker_signal_and_binds_target_call(
+    after: int, expected_signal: float, meaningful: bool
+) -> None:
+    hypothesis_id = "hypothesis:native-progress"
+    task = AgentTask(
+        id="arm-worker",
+        objective="sealed hypothesis",
+        status="completed",
+        result=json.dumps({"outcome": "near_miss", "signal": 0.9}),
+        technique_ids=(hypothesis_id,),
+    )
+    committed = _native_score_committed(hypothesis_id, 10, after)
+    unrelated = _native_score_committed(hypothesis_id, 0, 100, call_id="call:unrelated")[
+        "target_evidence_receipts"
+    ]
+    committed["target_evidence_receipts"].update(unrelated)  # type: ignore[union-attr]
+
+    measured = _hypothesis_task_observation("campaign-1", task, {"id": hypothesis_id}, committed)
+
+    assert measured is not None
+    assert measured["outcome"] == "partial_signal"
+    assert measured["signal"] == pytest.approx(expected_signal)
+    assert measured["signal"] != pytest.approx(0.9)
+    assert measured["outcome_authority"] == "target"
+    assert measured["candidate_outcome_projection"]["outcome"] == "progress"
+    native = measured["native_score_observation"]
+    assert native["delta"] == after - 10
+    assert native["meaningful_progress"] is meaningful
+    assert [item["target_call_id"] for item in native["observations"]] == ["call:native"]
+
+    arm = {
+        "id": "arm:native-progress",
+        "target_id": "target-1",
+        "scenario_fingerprint": "scenario-1",
+        "surface_id": "chat",
+        "technique_id": "technique-1",
+        "controller_id": "direct",
+        "mutation_id": "baseline",
+        "actual_language": "en",
+        "state_id": "fresh",
+    }
+    arm_observation = _arm_task_observation(
+        "campaign-1", task, arm, committed, contract_override={"id": hypothesis_id}
+    )
+    assert arm_observation is not None
+    assert arm_observation["usage"]["completed_experiment"] is True
+    assert arm_observation["usage"]["native_score_observation"] == native
+
+
+def test_native_score_regression_never_accepts_worker_partial_credit() -> None:
+    hypothesis_id = "hypothesis:native-regression"
+    task = AgentTask(
+        id="arm-worker",
+        objective="sealed hypothesis",
+        status="completed",
+        result=json.dumps({"outcome": "partial", "signal": 0.8}),
+        technique_ids=(hypothesis_id,),
+    )
+
+    measured = _hypothesis_task_observation(
+        "campaign-1",
+        task,
+        {"id": hypothesis_id},
+        _native_score_committed(hypothesis_id, 20, 16),
+    )
+
+    assert measured is not None
+    assert measured["outcome"] == "ambiguous"
+    assert measured["signal"] is None
+    assert measured["distance_to_success"] == 1.0
+    assert measured["candidate_outcome_projection"]["outcome"] == "regression"
+    assert measured["candidate_outcome_projection"]["terminality"] == "retryable"
+    native = measured["native_score_observation"]
+    assert native["outcome"] == "regression"
+    assert native["delta"] == -4
+    assert native["meaningful_progress"] is False
 
 
 async def test_unsupported_worker_partial_claim_earns_no_lifecycle_signal() -> None:

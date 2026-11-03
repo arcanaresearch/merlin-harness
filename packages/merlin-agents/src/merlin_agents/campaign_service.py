@@ -157,7 +157,12 @@ from .completion_frontier import (
     VerifiedCandidateOutcome,
     project_completion_frontier,
 )
-from .discovery import ArmIdentity, aggregate_observations, classify_lifecycle
+from .discovery import (
+    ArmIdentity,
+    aggregate_observations,
+    classify_lifecycle,
+    project_family_stalls,
+)
 from .durable_service import (
     DurableAgentService,
     InitialCompositionAdmitter,
@@ -10279,6 +10284,20 @@ class CampaignService:
             target_id = str(arm["target_id"])
             scenario = str(arm["scenario_fingerprint"])
             history = tuple(await asyncio.to_thread(history_loader, target_id, scenario))
+            family_stall = project_family_stalls(history).get(str(arm["technique_id"]))
+            append_lead = getattr(self._store, "append_lead", None)
+            if family_stall is not None and family_stall.stalled and callable(append_lead):
+                await asyncio.to_thread(
+                    append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "arm_family_stalled",
+                        "arm_id": str(arm["id"]),
+                        **family_stall.projection(),
+                        "evidence_refs": observation["evidence_refs"],
+                    },
+                )
             stats = aggregate_observations(history).get(ArmIdentity.from_mapping(arm).key)
             if stats is None:
                 continue
@@ -26759,6 +26778,13 @@ def _arm_task_observation(
                 "applied_transform_id": execution.get("applied_transform_id"),
             }
         )
+    usage = dict(committed.get("usage") or {})
+    native_score = measured.get("native_score_observation")
+    if isinstance(native_score, Mapping):
+        usage["native_score_observation"] = dict(native_score)
+    usage["completed_experiment"] = (
+        task.status == "completed" and measured["outcome"] != "infrastructure_failure"
+    )
     return {
         "campaign_id": campaign_id,
         "arm_id": str(arm["id"]),
@@ -26780,7 +26806,8 @@ def _arm_task_observation(
         "model_steps": int(committed.get("model_steps") or 0),
         "latency_ms": int(committed.get("latency_ms") or 0),
         "model_cost_usd": float(committed.get("model_cost_usd") or 0.0),
-        "usage": dict(committed.get("usage") or {}),
+        "usage": usage,
+        "native_score_observation": native_score,
         "evidence_refs": refs,
         "evaluation_uncertainties": tuple(uncertainties),
         "candidate_outcome_projection": measured.get("candidate_outcome_projection"),
@@ -26846,10 +26873,26 @@ def _hypothesis_task_observation(
     )
     attempt_disposition = str(canonical["attempt_disposition"])
     outcome_authority = str(canonical["outcome_authority"])
+    native_score = _native_score_observation(committed)
+    if (
+        native_score is not None
+        and typed_infrastructure is None
+        and task.status == "completed"
+        and attempt_disposition == "valid"
+        and outcome_authority == "none"
+    ):
+        outcome_authority = "target"
     attempted_outcomes = _attempted_technique_outcomes(task.result or "", task.technique_ids)
+    verdicts = set(attempted_outcomes.values())
     model_verdict = attempted_outcomes.get(hypothesis_id)
     if model_verdict is None and len(attempted_outcomes) == 1:
         model_verdict = next(iter(attempted_outcomes.values()))
+    confirmed = canonical["outcome"] == "confirmed" or (
+        outcome_authority == "validator" and "confirmed" in verdicts
+    )
+    refuted = canonical["outcome"] == "refuted" or (
+        outcome_authority == "validator" and "refuted" in verdicts
+    )
     if typed_infrastructure is not None:
         outcome, signal, distance, reason = (
             "infrastructure_failure",
@@ -26873,23 +26916,50 @@ def _hypothesis_task_observation(
             f"(disposition={attempt_disposition}, authority={outcome_authority})",
         )
     else:
-        authoritative_outcome = canonical["outcome"]
-        verdicts = set(attempted_outcomes.values())
         try:
             document = parse_model_json(task.result or "")
         except ValueError:
             document = {}
         declared = document.get("outcome") if isinstance(document, Mapping) else None
         declared_signal = document.get("signal") if isinstance(document, Mapping) else None
-        if authoritative_outcome == "confirmed" or (
-            outcome_authority == "validator" and "confirmed" in verdicts
-        ):
+        if native_score is not None and native_score["outcome"] == "regression" and confirmed:
+            raise ValueError("native score regression conflicts with terminal target success")
+        if confirmed:
             outcome, signal, distance, reason = (
                 "authoritative_success",
                 None,
                 0.0,
                 "sealed hypothesis oracle confirmed",
             )
+        elif native_score is not None:
+            if refuted:
+                outcome, signal, distance, reason = (
+                    "clean_negative",
+                    None,
+                    1.0,
+                    "sealed hypothesis oracle refuted",
+                )
+            elif native_score["outcome"] == "regression":
+                outcome, signal, distance, reason = (
+                    "ambiguous",
+                    None,
+                    1.0,
+                    "committed native target score regressed; worker signal ignored",
+                )
+            elif native_score["outcome"] == "progress":
+                signal = float(native_score["signal"])
+                outcome, distance, reason = (
+                    "partial_signal",
+                    1.0 - signal,
+                    "committed native target score delta replaced worker signal",
+                )
+            else:
+                outcome, signal, distance, reason = (
+                    "ambiguous",
+                    None,
+                    None,
+                    "committed native target score did not improve; worker signal ignored",
+                )
         elif declared in {"near_miss", "partial"}:
             if (
                 isinstance(declared_signal, (int, float))
@@ -26909,9 +26979,7 @@ def _hypothesis_task_observation(
                     None,
                     "worker declared a partial outcome without a valid numeric signal",
                 )
-        elif authoritative_outcome == "refuted" or (
-            outcome_authority == "validator" and "refuted" in verdicts
-        ):
+        elif refuted:
             outcome, signal, distance, reason = (
                 "clean_negative",
                 None,
@@ -26938,19 +27006,27 @@ def _hypothesis_task_observation(
     )
     if not refs:
         return None
-    if canonical.get("schema") == "merlin.candidate-outcome.v1":
+    native_projection = (
+        native_score is not None
+        and typed_infrastructure is None
+        and task.status == "completed"
+        and attempt_disposition == "valid"
+        and not confirmed
+        and not refuted
+    )
+    evidence_digest = str(committed.get("digest") or "")
+    if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", evidence_digest):
+        evidence_digest = candidate_evidence_digest(refs)
+    if canonical.get("schema") == "merlin.candidate-outcome.v1" and not native_projection:
         candidate_projection = validate_candidate_outcome_projection(
             canonical, expected_candidate_id=expected_candidate_id
         )
     else:
-        evidence_digest = str(committed.get("digest") or "")
-        if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", evidence_digest):
-            evidence_digest = candidate_evidence_digest(refs)
         candidate_projection = project_candidate_outcome(
             candidate_id=expected_candidate_id,
             attempt_disposition=attempt_disposition,
             outcome_authority=outcome_authority,
-            outcome=canonical["outcome"],
+            outcome=native_score["outcome"] if native_projection else canonical["outcome"],
             evidence_digest=evidence_digest,
         )
     disagreement = (
@@ -26972,12 +27048,103 @@ def _hypothesis_task_observation(
         "infrastructure_failure_category": typed_infrastructure,
         "candidate_outcome_projection": candidate_projection,
     }
+    if native_score is not None:
+        observation["native_score_observation"] = native_score
     if model_verdict is not None:
         observation["model_verdict"] = model_verdict
     if disagreement is not None:
         observation["model_authority_disagreement"] = disagreement
         observation["requires_independent_reproduction"] = True
     return observation
+
+
+def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, object] | None:
+    receipts = committed.get("target_evidence_receipts")
+    if not isinstance(receipts, Mapping):
+        return None
+
+    def number(value: object) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) else None
+
+    observations: list[dict[str, object]] = []
+    for call_id in committed.get("target_call_ids", ()):
+        if not isinstance(call_id, str):
+            continue
+        receipt = receipts.get(call_id)
+        if not isinstance(receipt, Mapping) or receipt.get("attempt_disposition") != "valid":
+            continue
+        transition = receipt.get("target_state_transition")
+        if not isinstance(transition, Mapping) or (
+            transition.get("schema") != "merlin.target-state-transition.v2"
+            or transition.get("authority") != "target"
+            or transition.get("identity_match") is not True
+            or transition.get("conflict") is True
+            or transition.get("validation_errors")
+        ):
+            continue
+        quarantined = {
+            str(item)
+            for item in transition.get("quarantined_observations", ())
+            if isinstance(item, str)
+        }
+        compared = transition.get("observations")
+        if not isinstance(compared, Sequence) or isinstance(compared, (str, bytes)):
+            continue
+        for item in compared:
+            if not isinstance(item, Mapping) or item.get("role") != "score":
+                continue
+            direction = item.get("preferred_direction")
+            before = number(item.get("before_value"))
+            after = number(item.get("after_value"))
+            if (
+                item.get("name") in quarantined
+                or item.get("validation_errors")
+                or direction not in {"increase", "decrease"}
+                or before is None
+                or after is None
+            ):
+                continue
+            delta = after - before if direction == "increase" else before - after
+            minimum = number(item.get("minimum_value"))
+            maximum = number(item.get("maximum_value"))
+            scale = maximum - minimum if minimum is not None and maximum is not None else 5.0
+            if scale <= 0:
+                scale = 5.0
+            observations.append(
+                {
+                    "name": str(item.get("name") or "score"),
+                    "target_call_id": call_id,
+                    "status": item.get("status"),
+                    "before_value": item["before_value"],
+                    "after_value": item["after_value"],
+                    "preferred_direction": direction,
+                    "delta": delta,
+                    "signal": min(1.0, max(0.0, delta / scale)),
+                }
+            )
+    if not observations:
+        return None
+    deltas = tuple(float(item["delta"]) for item in observations)
+    regressed = any(delta < 0 for delta in deltas)
+    outcome = (
+        "regression"
+        if regressed
+        else "progress"
+        if any(delta > 0 for delta in deltas)
+        else "unclear"
+    )
+    delta = min(deltas) if regressed else max(deltas)
+    signal = max(float(item["signal"]) for item in observations) if outcome == "progress" else None
+    return {
+        "schema": "merlin.native-score-observation.v1",
+        "outcome": outcome,
+        "delta": delta,
+        "signal": signal,
+        "meaningful_progress": outcome == "progress" and delta >= 5.0,
+        "observations": tuple(observations),
+    }
 
 
 def _committed_attempt_authority(committed: Mapping[str, object]) -> tuple[str, str]:
