@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from merlin_agents.arm_pool import load_ranked_pool, novel_arms, rank_frontier, rank_pool
-from merlin_agents.discovery import ArmIdentity, ArmObservation
+from merlin_agents.discovery import ArmIdentity, ArmObservation, project_family_stalls
 from merlin_contracts import AttemptDisposition, OutcomeAuthority
 
 
@@ -133,6 +133,73 @@ def test_ambiguous_and_cancelled_rows_never_advance_retirement_attempts() -> Non
         item for item in pristine.ranking.components if item.name == "portfolio_exploration_bonus"
     )
     assert uncertainty.measured_value == pristine_uncertainty.measured_value
+
+
+def test_family_stall_counts_only_completed_non_improving_experiments() -> None:
+    identity = ArmIdentity.from_mapping(_arm("stalled", "Probe one mechanism"))
+    other_identity = ArmIdentity.from_mapping(_arm("other", "Probe another mechanism"))
+    history = [
+        _valid(identity, "ambiguous", completed_experiment=True),
+        _valid(identity, "clean_negative", completed_experiment=True),
+    ]
+
+    assert project_family_stalls(history)["stalled"].projection() == {
+        "technique_id": "stalled",
+        "consecutive_non_improving_completed_experiments": 2,
+        "threshold": 3,
+        "stalled": False,
+    }
+
+    history.extend(
+        (
+            ArmObservation(
+                identity,
+                "provider_failure",
+                infrastructure_failure=True,
+                completed_experiment=True,
+            ),
+            _valid(identity, "clean_negative", completed_experiment=False),
+        )
+    )
+    assert project_family_stalls(history)["stalled"].consecutive_non_improving == 2
+
+    history.append(_valid(identity, "ambiguous", completed_experiment=True))
+    assert project_family_stalls(history)["stalled"].stalled is True
+
+    history.append(
+        _valid(
+            identity,
+            "near_miss",
+            partial_signal=0.04,
+            completed_experiment=True,
+            native_score_progress=False,
+        )
+    )
+    assert project_family_stalls(history)["stalled"].consecutive_non_improving == 4
+
+    history.append(
+        _valid(
+            identity,
+            "near_miss",
+            partial_signal=0.05,
+            completed_experiment=True,
+            native_score_progress=True,
+        )
+    )
+    assert project_family_stalls(history)["stalled"].stalled is False
+    assert project_family_stalls(history)["stalled"].consecutive_non_improving == 0
+
+    history.extend(
+        [
+            _valid(identity, "ambiguous", completed_experiment=True),
+            _valid(other_identity, "ambiguous", completed_experiment=True),
+            _valid(identity, "ambiguous", completed_experiment=True),
+            _valid(identity, "ambiguous", completed_experiment=True),
+        ]
+    )
+    stalls = project_family_stalls(history)
+    assert stalls["stalled"].stalled is True
+    assert stalls["other"].consecutive_non_improving == 1
 
 
 def test_rank_frontier_includes_existing_and_new_candidates_before_slicing() -> None:

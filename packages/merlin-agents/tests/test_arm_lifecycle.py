@@ -332,6 +332,23 @@ async def test_arm_trial_unchanged_below_min_attempts() -> None:
     assert not [p for _, p in store.lead if p.get("kind") == "arm_lifecycle_transition"]
 
 
+async def test_arm_family_stall_is_journaled_without_retiring_unrelated_coverage() -> None:
+    arm = _execution_arm()
+    arm_store = _LifecycleArmStore(_identity_observations(arm, "clean_negative", 3))
+    store = _JournalStore()
+
+    await _record_one_arm_task(arm_store, store, arm)
+
+    stalled = next(
+        payload for _, payload in store.lead if payload.get("kind") == "arm_family_stalled"
+    )
+    assert stalled["technique_id"] == "technique-1"
+    assert stalled["consecutive_non_improving_completed_experiments"] == 3
+    assert stalled["threshold"] == 3
+    assert stalled["stalled"] is True
+    assert arm_store.lifecycle == []
+
+
 # --- Discovery exclusion and prepare review ---------------------------------
 
 
