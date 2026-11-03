@@ -180,3 +180,54 @@ def test_release_build_writes_portable_checksum_and_removes_only_legacy_postgres
     assert 'find "$release_root/payload/postgresql' not in build
     assert 'shasum -a 256 "$(basename "$archive")"' in build
     assert 'shasum -a 256 "$archive"' not in build
+
+
+def test_launcher_install_preserves_real_postgres_directory_and_links_missing_source(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "merlin-1.2.3-darwin-arm64"
+    release.mkdir()
+    launcher_source = Path(__file__).resolve().parents[3] / "packaging" / "merlin-launcher"
+    launcher = release / "merlin"
+    launcher.write_bytes(launcher_source.read_bytes())
+    launcher.chmod(0o755)
+    runtime = release / "payload" / "merlin-runtime" / "merlin-runtime"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("#!/bin/sh\nprintf 'merlin 1.2.3\\n'\n", encoding="utf-8")
+    runtime.chmod(0o755)
+    bundled_postgres = release / "payload" / "postgresql" / "18.1.0"
+    bundled_postgres.mkdir(parents=True)
+    (release / "release-channel").write_text("stable\n", encoding="utf-8")
+
+    for source_exists in (True, False):
+        home = tmp_path / ("home-existing" if source_exists else "home-missing")
+        postgres_source = home / ".pg0" / "installation" / "18.1.0"
+        marker = postgres_source / "postgresql.conf"
+        if source_exists:
+            postgres_source.mkdir(parents=True)
+            marker.write_text("synthetic configuration\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [str(launcher)],
+            env={
+                "HOME": str(home),
+                "MERLIN_INSTALL_NO_LAUNCH": "1",
+                "PATH": "/usr/bin:/bin",
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        installed = home / ".local" / "share" / "merlin" / release.name
+        assert (home / ".local" / "bin" / "merlin").is_symlink()
+        if source_exists:
+            assert not postgres_source.is_symlink()
+            assert marker.read_text(encoding="utf-8") == "synthetic configuration\n"
+            assert not (postgres_source / "18.1.0").exists()
+        else:
+            assert postgres_source.is_symlink()
+            assert (
+                postgres_source.resolve()
+                == (installed / "payload" / "postgresql" / "18.1.0").resolve()
+            )
