@@ -14166,6 +14166,173 @@ async def test_compiled_chat_exchange_classifies_zero_compatible_tabs_for_reobse
             assert recorder.actions == []
 
 
+class _ComposerRecoveryRecorder:
+    def __init__(self) -> None:
+        self.actions = []
+        self.observations = []
+
+    async def append_action(self, value):
+        self.actions.append(value)
+
+    async def append_observation(self, value):
+        self.observations.append(value)
+
+    async def record_evidence(self, *_value):
+        return None
+
+    async def save_metadata(self, _value):
+        return None
+
+
+def _composer_recovery_adapter(endpoint: str) -> dict[str, object]:
+    adapter = reviewed_browser_adapter(endpoint)
+    adapter["browser_steps"] = [
+        {
+            "step_id": "fill",
+            "tool": "browser_fill",
+            "arguments": {"locator": "textbox Message"},
+        },
+        {
+            "step_id": "submit",
+            "tool": "browser_click",
+            "arguments": {"locator": "button SEND"},
+        },
+    ]
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_discloses_closed_composer_from_icon_semantics() -> None:
+    chat = b"""
+    <button aria-label="Settings">Settings</button>
+    <button id="composer-toggle" onclick="
+      this.hidden=true;
+      document.getElementById('composer').hidden=false;
+    "><svg class="lucide lucide-message-square" viewBox="0 0 24 24"></svg></button>
+    <div id="composer" hidden>
+      <textarea aria-label="Message"></textarea>
+      <button aria-label="SEND" onclick="
+        document.getElementById('reply').textContent=
+          'assistant:'+document.querySelector('textarea').value;
+      ">SEND</button>
+    </div>
+    <div id="reply" aria-live="polite"></div>
+    """
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            recorder = _ComposerRecoveryRecorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: _composer_recovery_adapter(origin),
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == ["click", "fill", "click"]
+            assert result.metadata["composer_disclosure"] == "accessible_semantics"
+            assert result.metadata["setup_activation_completed"] is True
+            assert result.metadata["activation_steps_completed"] == 1
+            assert result.metadata["target_call_budget_charge"] == 1
+            assert result.metadata["limit_interaction_count"] == 1
+            assert "assistant:hello" in result.content
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_does_not_disclose_when_composer_is_ready() -> None:
+    chat = b"""
+    <button id="composer-toggle" onclick="
+      document.getElementById('launcher-clicked').textContent='clicked';
+    "><svg data-lucide="message-square" viewBox="0 0 24 24"></svg></button>
+    <textarea aria-label="Message"></textarea>
+    <button aria-label="SEND" onclick="
+      document.getElementById('reply').textContent=
+        'assistant:'+document.querySelector('textarea').value;
+    ">SEND</button>
+    <div id="reply" aria-live="polite"></div>
+    <div id="launcher-clicked"></div>
+    """
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            recorder = _ComposerRecoveryRecorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: _composer_recovery_adapter(origin),
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2000},
+            )
+            snapshot = await session.snapshot(tab)
+
+            assert result.is_error is False, result.content
+            assert [action.kind for action in recorder.actions] == ["fill", "click"]
+            assert "composer_disclosure" not in result.metadata
+            assert "clicked" not in snapshot.text
+
+
+@pytest.mark.asyncio
+async def test_compiled_chat_exchange_refuses_without_safe_composer_control() -> None:
+    chat = b"""
+    <button aria-label="Settings">Settings</button>
+    <button aria-label="Send message">Send message</button>
+    <button><svg class="lucide lucide-message-square-more"></svg></button>
+    """
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            recorder = _ComposerRecoveryRecorder()
+
+            async def allow(*_):
+                return True
+
+            result = await ToolBroker(
+                browser_tools(
+                    lambda _: session,
+                    recorder,
+                    lambda _: _composer_recovery_adapter(origin),
+                ),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "must not be sent", "timeout_ms": 1000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "target_tab_unavailable"
+            assert result.metadata["target_effect_attempted"] is False
+            assert result.metadata["target_call_budget_charge"] == 0
+            assert "composer_disclosure" not in result.metadata
+            assert recorder.actions == []
+
+
 @pytest.mark.asyncio
 async def test_compiled_chat_exchange_skips_visible_launcher_when_composer_is_ready() -> None:
     chat = b"""
