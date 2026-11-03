@@ -9449,7 +9449,7 @@ class CampaignService:
                         "terminally blocked by a reviewed capability gap; "
                         "not remaining work — do not re-attack"
                     )
-                payload["coverage_gaps"] = coverage_gaps
+                payload["coverage_gaps"] = _json_value(coverage_gaps)
             commit = getattr(self._store, "commit_lead_decision", None)
             if commit is None:
                 await asyncio.to_thread(self._store.append_lead, campaign_id, wave, payload)
@@ -28314,7 +28314,7 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
         unresolved_count = sum(
             int(snapshot_states.get(state, 0)) for state in ("queued", "claimed", "scheduled")
         )
-        snapshot_marker = f"frontier-snapshot:{snapshot['row_digest']}"
+        snapshot_marker = "frontier-snapshot"
         if unresolved_count:
             unresolved = frozenset({*unresolved, snapshot_marker})
         else:
