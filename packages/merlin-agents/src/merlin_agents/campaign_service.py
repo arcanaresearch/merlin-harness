@@ -27072,6 +27072,8 @@ def _hypothesis_task_observation(
         and outcome_authority == "none"
     ):
         outcome_authority = "target"
+    if attempt_disposition == "valid" and outcome_authority not in {"target", "validator"}:
+        attempt_disposition = "uncertain"
     attempted_outcomes = _attempted_technique_outcomes(task.result or "", task.technique_ids)
     verdicts = set(attempted_outcomes.values())
     model_verdict = attempted_outcomes.get(hypothesis_id)
