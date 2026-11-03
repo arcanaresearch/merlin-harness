@@ -27348,7 +27348,12 @@ def _hypothesis_task_observation(
     evidence_digest = str(committed.get("digest") or "")
     if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", evidence_digest):
         evidence_digest = candidate_evidence_digest(refs)
-    if canonical.get("schema") == "merlin.candidate-outcome.v1" and not native_projection:
+    if (
+        canonical.get("schema") == "merlin.candidate-outcome.v1"
+        and canonical.get("attempt_disposition") == attempt_disposition
+        and canonical.get("outcome_authority") == outcome_authority
+        and not native_projection
+    ):
         candidate_projection = validate_candidate_outcome_projection(
             canonical, expected_candidate_id=expected_candidate_id
         )
