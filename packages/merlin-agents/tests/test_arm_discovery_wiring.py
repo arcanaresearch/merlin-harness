@@ -30,7 +30,11 @@ from merlin_agents import (
     LeadFollowUp,
     ReviewedTargetAdapter,
 )
-from merlin_agents.campaign_service import _arm_task_observation, _hypothesis_task_observation
+from merlin_agents.campaign_service import (
+    _arm_task_observation,
+    _hypothesis_task_observation,
+    _materialize_execution_arm,
+)
 from merlin_contracts import (
     AgentTask,
     build_state_observation,
@@ -95,6 +99,48 @@ def test_hypothesis_failure_requires_typed_infrastructure_category() -> None:
     assert completed_typed["outcome"] == "infrastructure_failure"
     assert completed_typed["signal"] is None
     assert disrupted is None
+
+
+@pytest.mark.parametrize(
+    ("target_session_id", "expected_state"),
+    (("browser:session", "browser:session"), (None, "stateless:call:one")),
+)
+def test_materialize_execution_arm_derives_receipt_coordinates(
+    target_session_id, expected_state
+) -> None:
+    arm = {
+        "surface_id": "reviewed target interaction",
+        "technique_id": "cell/one",
+        "controller_id": "direct",
+        "mutation_id": "mutation:one",
+        "objective": "exercise one reviewed candidate",
+        "execution_reachability": {
+            "requested_language": "en",
+            "requested_transform_id": "native",
+        },
+    }
+    committed = {
+        "target_call_ids": ("call:one",),
+        "target_evidence_receipts": {
+            "call:one": {"target_session_id": target_session_id},
+        },
+        "target_delivery_receipts": {
+            "call:one": {
+                "requested_transform_id": "native",
+                "applied_transform_id": "native",
+                "actual_language": "en",
+                "payload_digest": "sha256:" + "e" * 64,
+                "receipt_digest": "sha256:" + "d" * 64,
+            }
+        },
+    }
+
+    materialized = _materialize_execution_arm(arm, committed)
+
+    assert materialized is not None
+    assert materialized["surface_id"] == "reviewed target interaction"
+    assert materialized["state_id"] == expected_state
+    assert materialized["actual_language"] == "en"
 
 
 def test_arm_observation_requires_an_acknowledged_target_attempt() -> None:

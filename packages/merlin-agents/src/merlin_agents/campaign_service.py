@@ -10239,6 +10239,7 @@ class CampaignService:
                         "id": "proposal:" + candidate_id_for_identity(identity.projection()),
                         "target_id": identity.target_id,
                         "scenario_fingerprint": identity.scenario_fingerprint,
+                        "surface_id": "reviewed target interaction",
                         "semantic_id": identity.technique_id,
                         "strategy_id": identity.controller_id,
                         "technique_id": identity.technique_id,
@@ -26688,11 +26689,11 @@ def _materialize_execution_arm(
     arm: Mapping[str, object],
     committed: Mapping[str, object],
 ) -> Mapping[str, object] | None:
-    """Bind a proposal only after an authenticated target-delivery receipt exists."""
+    """Bind reviewed coordinates to an authenticated target-delivery receipt."""
     context = committed.get("arm_execution_context")
     deliveries = committed.get("target_delivery_receipts")
     reachability = arm.get("execution_reachability")
-    if not isinstance(context, Mapping) or not isinstance(deliveries, Mapping):
+    if not isinstance(deliveries, Mapping):
         return None
     reachability = reachability if isinstance(reachability, Mapping) else {}
     requested_transform = str(reachability.get("requested_transform_id") or "").strip()
@@ -26713,10 +26714,20 @@ def _materialize_execution_arm(
     requested_transform = (
         requested_transform or str(delivery.get("requested_transform_id") or "baseline").strip()
     )
-    execution = context
-    surface_id = str(execution.get("surface_id") or "").strip()
+    execution = context if isinstance(context, Mapping) else {}
+    surface_id = str(execution.get("surface_id") or arm.get("surface_id") or "").strip()
     actual_language = str(delivery.get("actual_language") or "").strip().casefold()
-    state_id = str(execution.get("state_id") or "").strip()
+    state_id = str(execution.get("state_id") or arm.get("state_id") or "").strip()
+    if not state_id:
+        receipts = committed.get("target_evidence_receipts")
+        receipts = receipts if isinstance(receipts, Mapping) else {}
+        for call_id in committed.get("target_call_ids", ()):
+            receipt = receipts.get(call_id)
+            if not isinstance(call_id, str) or not isinstance(receipt, Mapping):
+                continue
+            state_id = str(receipt.get("target_session_id") or f"stateless:{call_id}").strip()
+            if state_id:
+                break
     if actual_language in {"", "unknown", "requested"}:
         return None
     applied_transform = delivery.get("applied_transform_id")
