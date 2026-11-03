@@ -27345,6 +27345,122 @@ def test_execution_diversity_single_slot_preserves_top_ranked_candidate():
     assert ordered == candidates
 
 
+def test_execution_diversity_single_slot_escalates_adaptive_candidate():
+    base = AssignmentTechnique(
+        id="family/direct",
+        objective="exercise direct candidate",
+        tags=frozenset(),
+        guidance_ids=(),
+        semantic_id="family/direct",
+        domain_id="chat",
+    )
+    adaptive = replace(
+        base,
+        id="family/adaptive",
+        semantic_id="family/adaptive",
+        strategy_id="crescendo",
+    )
+    candidates = (base, adaptive)
+
+    ordered = CampaignService._diversify_execution_candidates(  # noqa: SLF001
+        "campaign/diversity",
+        candidates,
+        4,
+        1,
+        {},
+        frozenset(item.id for item in candidates),
+        {item.id: index for index, item in enumerate(candidates)},
+        frozenset({adaptive.id}),
+    )
+
+    assert ordered[0] is adaptive
+    assert set(ordered) == set(candidates)
+
+
+def test_non_improving_experiment_streak_skips_infrastructure_and_stops_at_progress():
+    identity = ArmIdentity("surface", "family/a", "direct", "baseline", "en", "state")
+    progress = ArmObservation(
+        identity,
+        "win",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        completed_experiment=True,
+        native_score_progress=True,
+    )
+    negative = ArmObservation(
+        identity,
+        "clean_negative",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        completed_experiment=True,
+        native_score_progress=False,
+    )
+    infrastructure = ArmObservation(
+        identity,
+        "infrastructure_failure",
+        infrastructure_failure=True,
+        completed_experiment=False,
+    )
+
+    streak = CampaignService._non_improving_experiment_streak(  # noqa: SLF001
+        (progress, negative, infrastructure, negative, negative)
+    )
+
+    assert streak == 3
+
+
+async def test_single_slot_prioritization_escalates_to_non_stalled_adaptive_family():
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    direct = replace(base, id="cell/direct", strategy_id="direct")
+    stalled_adaptive = replace(base, id="cell/stalled", strategy_id="crescendo")
+    alternative_adaptive = replace(base, id="cell/alternative", strategy_id="hydra-select")
+    identity = ArmIdentity("surface", stalled_adaptive.id, "crescendo", "baseline", "und", "state")
+    negative = ArmObservation(
+        identity,
+        "clean_negative",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        completed_experiment=True,
+        native_score_progress=False,
+    )
+
+    class Store:
+        def __init__(self):
+            self.events = []
+
+        def list_arms(self, _target_id, _scenario):
+            return []
+
+        def list_arm_observations(self, _target_id, _scenario):
+            return [negative, negative, negative]
+
+        def append_lead(self, _campaign_id, _wave, payload):
+            self.events.append(dict(payload))
+
+    store = Store()
+    service = CampaignService(  # type: ignore[arg-type]
+        store,
+        object(),
+        None,
+        arm_store=store,
+        max_worker_concurrency=1,
+    )
+
+    ordered = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        (direct, stalled_adaptive, alternative_adaptive),
+        3,
+        selection_width=1,
+    )
+
+    assert ordered[0] is alternative_adaptive
+    escalation = next(event for event in store.events if event["kind"] == "adaptive_escalation")
+    assert escalation["candidate_ids"] == (alternative_adaptive.id,)
+    assert escalation["non_improving_completed_experiments"] == 3
+
+
 async def test_frontier_records_measured_arm_outcomes_before_successor_claim_and_replays_once():
     prepared = await preparation("session-1", "Assess target", CampaignProfile.EXPLORATION)
     scenario = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
