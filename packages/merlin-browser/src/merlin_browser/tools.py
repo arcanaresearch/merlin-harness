@@ -839,6 +839,33 @@ _FOREGROUND_RECON_SAFE_PRESS_KEYS = frozenset(
         "tab",
     }
 )
+_COMPOSER_DISCLOSURE_NAMES = frozenset(
+    {
+        "chat",
+        "composer",
+        "message circle",
+        "message square",
+        "messages square",
+        "new chat",
+        "open chat",
+        "open composer",
+        "pen line",
+        "show chat",
+        "show composer",
+        "square pen",
+        "write message",
+    }
+)
+
+
+def _is_safe_composer_disclosure(element: ElementRef) -> bool:
+    return bool(
+        element.role.casefold() == "button"
+        and not element.disabled
+        and not element.read_only
+        and not element.occluded
+        and _normalized_accessible_name(element.name) in _COMPOSER_DISCLOSURE_NAMES
+    )
 
 
 @dataclass
@@ -1266,6 +1293,7 @@ class BrowserTool:
         probe_permit = foreground_recon_probe_permits.get(probe_permit_key)
         reserve_probe_fill = False
         consume_probe_submit = False
+        foreground_composer_disclosure = False
         if kind == "fill" and arguments.get("connection_probe") is True:
             nonce = secrets.token_urlsafe(24)
             action_value = (
@@ -1334,7 +1362,29 @@ class BrowserTool:
                     )
                 reserve_probe_fill = True
             elif kind in {"click", "press"} and probe_permit is not None:
-                if probe_permit.stage != "filled":
+                if kind == "click" and probe_permit.stage == "submitted":
+                    disclosure_observation = await session.snapshot(
+                        str(arguments.get("tab_ref", ""))
+                    )
+                    disclosure_identity = session.element_identity(
+                        _string(arguments.get("element_ref"))
+                    )
+                    disclosure_candidates = [
+                        element
+                        for element in disclosure_observation.elements
+                        if (element.role, element.name, element.frame_ref) == disclosure_identity
+                        and _is_safe_composer_disclosure(element)
+                    ]
+                    input_identity = session.element_identity(probe_permit.input_ref)
+                    foreground_composer_disclosure = bool(
+                        len(disclosure_candidates) == 1
+                        and input_identity is not None
+                        and all(
+                            (element.role, element.name, element.frame_ref) != input_identity
+                            for element in disclosure_observation.elements
+                        )
+                    )
+                if probe_permit.stage != "filled" and not foreground_composer_disclosure:
                     return _foreground_recon_probe_rejection(
                         "the one-use foreground reconnaissance probe has already been submitted "
                         "or did not complete its safe fill; the target was not called",
@@ -1344,27 +1394,29 @@ class BrowserTool:
                             "browser_network_events" if probe_permit.stage == "submitted" else None
                         ),
                     )
-                requested_submit_kind = "press_enter" if kind == "press" else "click"
-                submit_matches = (
-                    probe_permit.exchange_owner is not None
-                    and probe_permit.exchange_owner == self._foreground_recon_probe_owner
-                    and requested_submit_kind == probe_permit.submit_kind
-                    and str(arguments.get("tab_ref", "")) == probe_permit.tab_ref
-                    and str(arguments.get("element_ref", "")) == probe_permit.submit_element_ref
-                    and _string(arguments.get("frame_ref")) == probe_permit.submit_frame_ref
-                    and (
-                        kind != "press"
-                        or str(arguments.get("value", "")).casefold() in {"enter", "numpadenter"}
+                if not foreground_composer_disclosure:
+                    requested_submit_kind = "press_enter" if kind == "press" else "click"
+                    submit_matches = (
+                        probe_permit.exchange_owner is not None
+                        and probe_permit.exchange_owner == self._foreground_recon_probe_owner
+                        and requested_submit_kind == probe_permit.submit_kind
+                        and str(arguments.get("tab_ref", "")) == probe_permit.tab_ref
+                        and str(arguments.get("element_ref", "")) == probe_permit.submit_element_ref
+                        and _string(arguments.get("frame_ref")) == probe_permit.submit_frame_ref
+                        and (
+                            kind != "press"
+                            or str(arguments.get("value", "")).casefold()
+                            in {"enter", "numpadenter"}
+                        )
                     )
-                )
-                if not submit_matches:
-                    return _foreground_recon_probe_rejection(
-                        "the foreground reconnaissance probe submit must be the exact action "
-                        "reserved by browser_recon_exchange; the target was not called",
-                        failure_code="foreground_recon_probe_submit_mismatch",
-                        target_session_id=target_session_id,
-                    )
-                consume_probe_submit = True
+                    if not submit_matches:
+                        return _foreground_recon_probe_rejection(
+                            "the foreground reconnaissance probe submit must be the exact action "
+                            "reserved by browser_recon_exchange; the target was not called",
+                            failure_code="foreground_recon_probe_submit_mismatch",
+                            target_session_id=target_session_id,
+                        )
+                    consume_probe_submit = True
             elif (
                 kind == "press"
                 and str(arguments.get("value", "")).casefold()
@@ -2073,6 +2125,16 @@ class BrowserTool:
                         else {}
                     ),
                     **(
+                        {
+                            "target_effect_attempted": False,
+                            "target_call_budget_charge": 0,
+                            "interaction_count": 0,
+                            "limit_interaction_count": 0,
+                        }
+                        if foreground_composer_disclosure
+                        else {}
+                    ),
+                    **(
                         {"foreground_recon_probe_dispatch": json.loads(dispatch_receipt.text)}
                         if dispatch_receipt is not None and dispatch_receipt_persisted
                         else {}
@@ -2309,6 +2371,16 @@ class BrowserTool:
                 )
             ),
         }
+        if foreground_composer_disclosure:
+            metadata.update(
+                {
+                    "composer_disclosure": "accessible_semantics",
+                    "target_effect_attempted": False,
+                    "target_call_budget_charge": 0,
+                    "interaction_count": 0,
+                    "limit_interaction_count": 0,
+                }
+            )
         if requested_reobservation_tab_ref is not None:
             metadata.update(
                 {
@@ -3601,6 +3673,22 @@ class ApiReconHandoffTool:
             )
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
+        target_session_id = f"browser:{session.context_id}"
+        if (
+            context.expected_target_session_id is not None
+            and context.expected_target_session_id != target_session_id
+        ):
+            return ToolResult(
+                content="browser context does not match the refreshed target session",
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "target_session_identity_mismatch",
+                    "retryable": False,
+                    "expected_target_session_id": context.expected_target_session_id,
+                    "observed_target_session_id": target_session_id,
+                },
+            )
         if (
             getattr(session.bounds, "requires_persistent_profile", False)
             and getattr(session, "mode", None) != "persistent"
@@ -3619,10 +3707,21 @@ class ApiReconHandoffTool:
             )
         authenticated_target_reobservation = bool(
             fallback is not None
-            and context.expected_target_session_id == f"browser:{session.context_id}"
+            and context.expected_target_session_id == target_session_id
             and context.target_reobservation_generation_id is not None
             and context.target_reobservation_event_set_digest is not None
         )
+        if (
+            context.target_reobservation_generation_id is not None
+            or context.target_reobservation_event_set_digest is not None
+        ) and not authenticated_target_reobservation:
+            return ToolResult(
+                content=(
+                    "deterministic re-observation requires its authenticated generation context"
+                ),
+                is_error=True,
+                metadata={"effect": self.effect, "failure_code": "reobservation_context_required"},
+            )
         previous_adapter: BrowserChat | None = None
         if authenticated_target_reobservation:
             previous_adapter, _ = _browser_context_chat_adapter(
@@ -4290,9 +4389,10 @@ class BrowserReobserveHandoffTool:
         return ToolSpec(
             name=self.name,
             description=(
-                "Refresh the reviewed browser DOM handoff deterministically from the latest "
-                "handoff for this exact physical context and compiled adapter. No model-authored "
-                "adapter or evidence labels are accepted."
+                "Refresh the latest reviewed browser DOM handoff from this exact physical "
+                "context without model-authored adapters or evidence labels. Campaign "
+                "re-observation additionally requires its authenticated generation and compiled "
+                "adapter; foreground recovery reseals only the current context and target."
             ),
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         )
@@ -4301,11 +4401,32 @@ class BrowserReobserveHandoffTool:
         del arguments
         resolved = self._resolver(context.session_id)
         session = await resolved if isawaitable(resolved) else resolved
+        target_session_id = f"browser:{session.context_id}"
         if (
-            context.expected_target_session_id != f"browser:{session.context_id}"
-            or context.target_reobservation_generation_id is None
-            or context.target_reobservation_event_set_digest is None
+            context.expected_target_session_id is not None
+            and context.expected_target_session_id != target_session_id
         ):
+            return ToolResult(
+                content="browser context does not match the refreshed target session",
+                is_error=True,
+                metadata={
+                    "effect": self.effect,
+                    "failure_code": "target_session_identity_mismatch",
+                    "retryable": False,
+                    "expected_target_session_id": context.expected_target_session_id,
+                    "observed_target_session_id": target_session_id,
+                },
+            )
+        authenticated_target_reobservation = bool(
+            context.expected_target_session_id == target_session_id
+            and context.target_reobservation_generation_id is not None
+            and context.target_reobservation_event_set_digest is not None
+        )
+        if (
+            context.campaign_id is not None
+            or context.target_reobservation_generation_id is not None
+            or context.target_reobservation_event_set_digest is not None
+        ) and not authenticated_target_reobservation:
             return ToolResult(
                 content=(
                     "deterministic re-observation requires its authenticated generation context"
@@ -4319,7 +4440,11 @@ class BrowserReobserveHandoffTool:
                 handoff
                 for handoff in handoffs
                 if handoff.context_id == session.context_id
-                and handoff.compiled_adapter_digest == context.compiled_adapter_digest
+                and handoff.owner.session_id == context.session_id
+                and (
+                    not authenticated_target_reobservation
+                    or handoff.compiled_adapter_digest == context.compiled_adapter_digest
+                )
                 and handoff.reusable_adapter is not None
                 and handoff.dom_fallback_reason is not None
             ),
@@ -6891,26 +7016,7 @@ class BrowserChatExchangeTool:
                     default_role="textbox",
                 )
                 for element in observation.elements
-                if element.role.casefold() == "button"
-                and not element.disabled
-                and not element.read_only
-                and not element.occluded
-                and _normalized_accessible_name(element.name)
-                in {
-                    "chat",
-                    "composer",
-                    "message circle",
-                    "message square",
-                    "messages square",
-                    "new chat",
-                    "open chat",
-                    "open composer",
-                    "pen line",
-                    "show chat",
-                    "show composer",
-                    "square pen",
-                    "write message",
-                }
+                if _is_safe_composer_disclosure(element)
             ]
             if len(disclosure_candidates) == 1:
                 disclosure_tab_ref, disclosure_observation, disclosure_element = (

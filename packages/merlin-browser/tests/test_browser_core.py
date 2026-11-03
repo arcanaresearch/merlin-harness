@@ -11428,6 +11428,203 @@ async def test_deterministic_reobservation_reuses_reviewed_handoff() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dom_record_rejects_foreign_target_reobservation_generation() -> None:
+    recorder = _NativeReceiptRecorder()
+    session = _dom_fallback_session({})()
+
+    result = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="record-foreign-generation",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-foreign-generation",
+            campaign_id="campaign/c1",
+            target_id="target",
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "2" * 64,
+            expected_target_session_id="browser:foreign-context",
+        ),
+        _dom_fallback_arguments(reviewed_browser_adapter("https://target.test/chat")),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert result.metadata["expected_target_session_id"] == "browser:foreign-context"
+    assert result.metadata["observed_target_session_id"] == "browser:browser-context"
+    assert recorder.handoff is None
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reobservation_rejects_foreign_target_session() -> None:
+    recorder = _NativeReceiptRecorder()
+    session = _dom_fallback_session({})()
+    initial = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(session_id="s1", workspace_root="/tmp"),
+        _dom_fallback_arguments(reviewed_browser_adapter("https://target.test/chat")),
+    )
+    assert initial.is_error is False, initial.content
+    previous = recorder.handoff
+    assert previous is not None
+
+    result = await BrowserReobserveHandoffTool(lambda _: session, recorder).invoke(
+        ToolContext(
+            session_id="s1",
+            workspace_root="/tmp",
+            call_id="reobserve-foreign-generation",
+            agent_id="campaign/c1/target-reobservation/generation/recon",
+            attempt_id="attempt-foreign-generation",
+            campaign_id="campaign/c1",
+            target_id="target",
+            compiled_adapter=previous.compiled_adapter,
+            compiled_adapter_digest=previous.compiled_adapter_digest,
+            target_reobservation_generation_id="sha256:" + "1" * 64,
+            target_reobservation_event_set_digest="sha256:" + "2" * 64,
+            expected_target_session_id="browser:foreign-context",
+        ),
+        {},
+    )
+
+    assert result.is_error is True
+    assert result.metadata["failure_code"] == "target_session_identity_mismatch"
+    assert result.metadata["expected_target_session_id"] == "browser:foreign-context"
+    assert result.metadata["observed_target_session_id"] == "browser:browser-context"
+    assert recorder.handoff is previous
+
+
+@pytest.mark.asyncio
+async def test_foreground_reobservation_reseals_current_physical_session() -> None:
+    recorder = _NativeReceiptRecorder()
+    session = _dom_fallback_session({})()
+    context = ToolContext(session_id="s1", workspace_root="/tmp")
+    initial = await ApiReconHandoffTool(lambda _: session, recorder).invoke(
+        context,
+        _dom_fallback_arguments(reviewed_browser_adapter("https://target.test/chat")),
+    )
+    assert initial.is_error is False, initial.content
+    previous = recorder.handoff
+    assert previous is not None
+
+    refreshed = await BrowserReobserveHandoffTool(lambda _: session, recorder).invoke(context, {})
+
+    assert refreshed.is_error is False, refreshed.content
+    current = recorder.handoff
+    assert current is not None
+    assert current.context_id == previous.context_id == session.context_id
+    assert current.target_id == previous.target_id == session.bounds.target_id
+    assert current.owner.session_id == context.session_id
+    assert refreshed.metadata["deterministic_reobservation"] is True
+    assert refreshed.metadata["previous_handoff_id"] == previous.id
+
+
+@pytest.mark.asyncio
+async def test_completed_recon_probe_allows_safe_composer_disclosure_and_dom_reseal() -> None:
+    class Recorder(_NativeReceiptRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.actions = []
+
+        async def append_action(self, value):
+            self.actions.append(value)
+
+        async def save_metadata(self, _value):
+            return None
+
+        async def list_actions(self, _context_id):
+            return tuple(self.actions)
+
+        async def list_observations(self, _context_id):
+            return tuple(self.observations)
+
+    page = b"""
+    <button id="launcher" aria-label="Message square" hidden onclick="
+      this.hidden=true;
+      document.getElementById('composer').hidden=false;
+    ">Message square</button>
+    <div id="composer">
+      <textarea aria-label="Message" maxlength="500"></textarea>
+      <button aria-label="SEND" onclick="
+        document.getElementById('reply').textContent=
+          'assistant:'+document.querySelector('textarea').value;
+        document.getElementById('message-count').textContent='1';
+        document.getElementById('composer').hidden=true;
+        document.getElementById('launcher').hidden=false;
+      ">SEND</button>
+    </div>
+    <div id="reply" aria-live="polite"></div>
+    <div id="message-count">0</div>
+    """
+    async with web_fixture(page) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            tab = await session.new_tab(origin)
+            initial = await session.snapshot(tab)
+            message = next(item for item in initial.elements if item.name == "Message")
+            send = next(item for item in initial.elements if item.name == "SEND")
+            recorder = Recorder()
+            context = ToolContext(session_id="s1", workspace_root="/tmp")
+            tools = {
+                tool.describe().name: tool
+                for tool in _production_browser_tools(lambda _: session, recorder)
+            }
+            await tools["browser_recall_reconnaissance"].invoke(
+                context,
+                {"surface": origin, "agent_or_bot": "fixture assistant"},
+            )
+            exchange = await tools["browser_recon_exchange"].invoke(
+                context,
+                {
+                    "tab_ref": tab,
+                    "input_element_ref": message.ref,
+                    "submit_element_ref": send.ref,
+                    "submit_kind": "click",
+                    "timeout_ms": 200,
+                },
+            )
+            assert exchange.is_error is False, exchange.content
+            closed = await session.snapshot(tab)
+            launcher = next(item for item in closed.elements if item.name == "Message square")
+
+            disclosed = await tools["browser_click"].invoke(
+                context,
+                {"tab_ref": tab, "element_ref": launcher.ref},
+            )
+
+            assert disclosed.is_error is False, disclosed.content
+            assert disclosed.metadata["composer_disclosure"] == "accessible_semantics"
+            assert disclosed.metadata["target_effect_attempted"] is False
+            assert disclosed.metadata["target_call_budget_charge"] == 0
+            assert disclosed.metadata["limit_interaction_count"] == 0
+            handoff = await tools["browser_record_api_handoff"].invoke(
+                context,
+                {
+                    "method": "browser",
+                    "url": origin,
+                    "request_evidence_ref": "req",
+                    "response_evidence_ref": "res",
+                    "dom_fallback_reason": "no message POST was captured",
+                    "reusable_adapter": reviewed_browser_adapter(origin),
+                },
+            )
+            assert handoff.is_error is False, handoff.content
+            current = await session.snapshot(tab)
+            assert (
+                "1"
+                == next(
+                    line for line in current.text.splitlines() if line.strip() in {"0", "1"}
+                ).strip()
+            )
+            assert [action.kind for action in recorder.actions] == [
+                "fill",
+                "click",
+                "network_events",
+                "click",
+            ]
+            assert sum(action.kind == "fill" for action in recorder.actions) == 1
+
+
+@pytest.mark.asyncio
 async def test_dom_handoff_seals_typed_current_state_and_rejects_tampering() -> None:
     class Session:
         context_id = "browser-context"
