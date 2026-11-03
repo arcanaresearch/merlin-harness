@@ -7492,6 +7492,220 @@ async def test_autonomous_followup_plans_reach_bounded_coverage_stop(
     )
 
 
+@pytest.mark.parametrize(("infrastructure_at", "expected_started"), ((None, 3), (2, 4)))
+async def test_frontier_churn_reaches_coverage_decision_after_three_non_improving_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    infrastructure_at: int | None,
+    expected_started: int,
+) -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    monkeypatch.setattr(
+        "merlin_agents.campaign_service._specialist_composition",
+        lambda _manifest: "autonomous",
+    )
+    started = 0
+    decisions: list[str | None] = []
+
+    class Store:
+        def __init__(self) -> None:
+            self.lead: list[Mapping[str, object]] = []
+            self.terminal = None
+
+        def get(self, campaign_id):
+            return {"id": campaign_id, "session_id": "session-1", "status": "executing"}
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def list_waves(self, _campaign_id):
+            return []
+
+        def load_frontier_batch_for_schedule(self, _campaign_id, schedule_id):
+            return {
+                "id": f"batch-{schedule_id}",
+                "wave": started,
+                "state": "scheduled",
+                "schedule_id": schedule_id,
+                "candidates": ({"id": "hypothesis:churn", "claim_generation": 1},),
+            }
+
+        def claim_frontier_transition(self, *_args):
+            return "claim-1"
+
+        def renew_frontier_transition(self, *_args):
+            return True
+
+        def release_frontier_transition(self, *_args):
+            return True
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.lead.append({"wave": wave, "payload": dict(payload)})
+
+        def finish_wave(self, *_args):
+            return None
+
+        def finish(self, _campaign_id, status, *, stop_reason=None):
+            self.terminal = (status, stop_reason)
+
+    class Agents:
+        async def list_schedule_tasks(self, schedule_id):
+            return (
+                AgentTask(
+                    id=f"task-{schedule_id}",
+                    objective="attempt the next adaptive hypothesis",
+                    status="completed",
+                    result="{}",
+                    technique_ids=("hypothesis:churn",),
+                ),
+            )
+
+    class Service(CampaignService):
+        async def status(self, campaign_id):
+            receipts = tuple(
+                {
+                    "digest": f"sha256:receipt-{index}",
+                    "reference": f"receipt:{index}",
+                    "target_call_ids": (f"target-call-{index}",),
+                }
+                for index in range(started)
+            )
+            frontier = tuple(
+                {
+                    "kind": "hypothesis",
+                    "state": "unresolved",
+                    "key": ("hypothesis", f"churn-{index}"),
+                    "identity": {"hypothesis_id": f"hypothesis:churn-{index}"},
+                    "sources": (("typed_failure",) if started == infrastructure_at else ()),
+                    "reasons": (("adapter unavailable",) if started == infrastructure_at else ()),
+                    "outcome": "unclear",
+                }
+                for index in range(started + 1)
+            )
+            return {
+                "campaign_id": campaign_id,
+                "completion_digest": f"sha256:churn-{started}",
+                "completion_document": {
+                    "receipts": receipts,
+                    "findings": (),
+                    "capability_probes": (),
+                },
+                "target_progress": {
+                    "status": "unknown",
+                    "current_state": (),
+                    "latest_transition": None,
+                    "conflicts": (),
+                },
+                "saturation": {
+                    "ready": False,
+                    "execution_complete": False,
+                    "attempted_techniques": 1,
+                    "completion_frontier": frontier,
+                    "catalogue_cell_owners": (("catalogue/already-attempted", "task-initial"),),
+                    "untested_cell_ids": (),
+                    "catalogue_unresolved_cell_ids": (),
+                    "adaptive_unresolved": tuple(
+                        f"hypothesis:churn-{index}" for index in range(started + 1)
+                    ),
+                    "frontier_runnable": 1,
+                    "frontier_exhausted": False,
+                    "total_tasks": started + 1,
+                    "terminal_tasks": started + 1,
+                },
+                "budget": {"exhausted": ()},
+            }
+
+        async def _record_lessons(self, *_args, **_kwargs):
+            return None
+
+        async def _record_target_state_attributions(self, *_args, **_kwargs):
+            return None
+
+        async def _record_arm_outcomes(self, *_args, **_kwargs):
+            return None
+
+        async def _retire_terminal_dynamic_specialists(self, *_args):
+            return None
+
+        async def _campaign_budget_capped(self, *_args):
+            return False
+
+        async def _campaign_service_objective_state(self, *_args):
+            return {"violations": (), "metrics": {}}
+
+        async def _settle_execution_frontier_batch(self, *_args, **_kwargs):
+            return {"queued": 1, "terminal": 0, "total": 2, "retryable_below_cap": 1}
+
+        async def _claim_execution_frontier_context(
+            self, _campaign_id, _manifest, context, wave, **_kwargs
+        ):
+            return context, {"id": f"batch-{wave}"}
+
+        async def _start_wave(self, _campaign_id, _manifest, wave, kind, _compiled, **_kwargs):
+            nonlocal started
+            started += 1
+            if started > 6:
+                raise AssertionError("non-improving frontier churn was not bounded")
+            return SimpleNamespace(
+                id=f"schedule-{wave}",
+                assignments=(),
+                execution=None,
+            )
+
+        async def _assess_and_journal(self, *_args):
+            return LeadAssessment("all scheduled tasks are terminal", True)
+
+        async def _await_saturation_decision(self, *args, auto_decision=None, **kwargs):
+            decisions.append(auto_decision)
+            return {
+                "decision": "stop",
+                "automatic": False,
+                "request_id": "coverage/stop",
+                "coverage_gaps": {},
+            }
+
+        async def _run_saturation_continuation(self, *_args, **_kwargs):
+            raise AssertionError("the bounded stop must not execute another repair wave")
+
+    store = Store()
+    service = Service(store, Agents(), preparation)  # type: ignore[arg-type]
+    initial_wave = 0
+    await service._supervise(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        prepared.assignment_context,
+        SimpleNamespace(id="schedule-0", assignments=(), execution=None),
+        initial_wave=initial_wave,
+        wave_running=False,
+    )
+    for _ in range(8):
+        supervisor = service._supervisors.get(prepared.manifest.id)  # noqa: SLF001
+        if supervisor is None:
+            break
+        await supervisor
+        if started >= 6 or store.terminal is not None:
+            break
+
+    from merlin_agents.campaign_service import _coverage_frontier_signature
+    from merlin_agents.progress_policy import assess_campaign_progress
+
+    before_status = await service.status(prepared.manifest.id)
+    before = _progress_snapshot_from_status(before_status)
+    started += 1
+    after_status = await service.status(prepared.manifest.id)
+    after = _progress_snapshot_from_status(after_status)
+    started -= 1
+    assert assess_campaign_progress(before, after).action.value == "continue"
+    assert _coverage_frontier_signature(
+        before_status["saturation"]
+    ) != _coverage_frontier_signature(after_status["saturation"])
+    assert started == expected_started
+    assert decisions == [None]
+    assert store.terminal == ("completed", "operator_stopped")
+    assert any(
+        item["payload"].get("kind") == "frontier_saturation_cap_reached" for item in store.lead
+    )
+
+
 async def test_fully_executed_inconclusive_graph_completes_with_limitations() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
 

@@ -206,6 +206,7 @@ from .progress_policy import (
     ProgressSnapshot,
     ProviderHealth,
     assess_campaign_progress,
+    has_meaningful_campaign_progress,
 )
 from .repeat_planning import partial_repeat_documents, reseal_repeat_manifest
 from .runtime import _REFUSAL_MARKER
@@ -5485,6 +5486,8 @@ class CampaignService:
         initial_wave: int = 0,
         wave_running: bool = True,
         supervision_retry_attempt: int = 0,
+        frontier_progress_snapshot: ProgressSnapshot | None = None,
+        non_improving_frontier_batches: int = 0,
     ) -> None:
         supervisor_task = asyncio.current_task()
         registered_owner_at_entry = self._supervisors.get(campaign_id) is supervisor_task
@@ -5839,6 +5842,7 @@ class CampaignService:
             candidate_scenario = scenario_fingerprint_for(manifest.target, manifest.catalogue)
             hypothesis_cap_capped = False
             frontier_retry_cap_reached = False
+            frontier_saturation_cap_reached = False
             if (
                 not wave_running
                 and manifest.profile is not CampaignProfile.EXPLORATION
@@ -6086,6 +6090,85 @@ class CampaignService:
                     )
                 ):
                     return
+                if (
+                    transition_batch is not None
+                    and not surface_barrier_active
+                    and not budget_capped
+                    and manifest.profile is not CampaignProfile.QUICKSCAN
+                    and callable(getattr(self._store, "get", None))
+                ):
+                    try:
+                        current_frontier_status = await self.status(campaign_id)
+                    except KeyError:
+                        frontier_progress_snapshot = None
+                        non_improving_frontier_batches = 0
+                    else:
+                        current_frontier_progress = _progress_snapshot_from_status(
+                            current_frontier_status
+                        )
+                        try:
+                            frontier_progress_decision = assess_campaign_progress(
+                                frontier_progress_snapshot,
+                                current_frontier_progress,
+                            )
+                            meaningful_frontier_progress = has_meaningful_campaign_progress(
+                                frontier_progress_snapshot,
+                                current_frontier_progress,
+                            )
+                        except ValueError as error:
+                            await asyncio.to_thread(
+                                self._store.append_lead,
+                                campaign_id,
+                                initial_wave,
+                                {
+                                    "kind": "campaign_progress_projection_uncertain",
+                                    "reason": str(error),
+                                    "intervention": "rebuild the durable frontier and continue",
+                                },
+                            )
+                            non_improving_frontier_batches = 0
+                        else:
+                            if (
+                                frontier_progress_decision.action
+                                is ProgressAction.WAIT_FOR_INFRASTRUCTURE
+                            ):
+                                pass
+                            elif (
+                                frontier_progress_snapshot is not None
+                                and not meaningful_frontier_progress
+                            ):
+                                non_improving_frontier_batches += 1
+                            else:
+                                non_improving_frontier_batches = 0
+                            if non_improving_frontier_batches >= 3:
+                                frontier_saturation_cap_reached = True
+                                await asyncio.to_thread(
+                                    self._store.append_lead,
+                                    campaign_id,
+                                    initial_wave,
+                                    {
+                                        "kind": "frontier_saturation_cap_reached",
+                                        "state": "awaiting_coverage_decision",
+                                        "non_improving_frontier_batches": (
+                                            non_improving_frontier_batches
+                                        ),
+                                        "progress_action": frontier_progress_decision.action.value,
+                                        "attempted_coverage": len(
+                                            current_frontier_progress.attempted_coverage
+                                        ),
+                                        "durably_resolved": len(
+                                            current_frontier_progress.durably_resolved
+                                        ),
+                                        "reason": (
+                                            "three consecutive frontier batches added no attempted "
+                                            "catalogue coverage, durable resolution, or "
+                                            "target-state "
+                                            "change; remaining work requires a bounded coverage "
+                                            "decision"
+                                        ),
+                                    },
+                                )
+                        frontier_progress_snapshot = current_frontier_progress
                 frontier_retry_available = bool(
                     frontier_counts is not None
                     and int(
@@ -6108,6 +6191,7 @@ class CampaignService:
                     and not service_objective_state.get("violations")
                     and not quickscan_frontier_limit_reached
                     and not surface_barrier_active
+                    and not frontier_saturation_cap_reached
                 )
                 if (
                     quickscan_frontier_limit_reached
@@ -6160,6 +6244,7 @@ class CampaignService:
                     and not budget_capped
                     and not quickscan_frontier_limit_reached
                     and not surface_barrier_active
+                    and not frontier_saturation_cap_reached
                 ):
                     await asyncio.to_thread(
                         self._store.append_lead,
@@ -6262,6 +6347,8 @@ class CampaignService:
                                 context,
                                 next_live,
                                 initial_wave=candidate_wave,
+                                frontier_progress_snapshot=frontier_progress_snapshot,
+                                non_improving_frontier_batches=non_improving_frontier_batches,
                             )
                         )
                         return
@@ -6645,6 +6732,7 @@ class CampaignService:
             while (
                 not budget_capped
                 and not frontier_retry_cap_reached
+                and not frontier_saturation_cap_reached
                 and (
                     autonomous_adaptive
                     or assessment.followups
@@ -28298,6 +28386,30 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
             json.dumps(semantic_body, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
     )
+    owners = saturation.get("catalogue_cell_owners", ())
+    attempted_coverage = frozenset(
+        str(row[0])
+        for row in owners
+        if isinstance(row, (tuple, list)) and row and isinstance(row[0], str) and row[0].strip()
+    )
+    target_progress = status.get("target_progress")
+    target_progress = target_progress if isinstance(target_progress, Mapping) else {}
+    observation_body = {
+        "findings": semantic_body["findings"],
+        "capability_probes": semantic_body["capability_probes"],
+        "target": tuple(
+            target_progress.get(key)
+            for key in ("status", "current_state", "latest_transition", "conflicts")
+        ),
+    }
+    observation_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                observation_body, sort_keys=True, separators=(",", ":"), default=str
+            ).encode()
+        ).hexdigest()
+    )
     return ProgressSnapshot(
         durable_target_calls=len(target_calls),
         durable_evidence=frozenset(evidence),
@@ -28310,6 +28422,8 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
         ),
         infrastructure_failures=infrastructure_failures,
         budget=BudgetEvidence(exhausted),
+        attempted_coverage=attempted_coverage,
+        observation_fingerprint=observation_fingerprint,
     )
 
 

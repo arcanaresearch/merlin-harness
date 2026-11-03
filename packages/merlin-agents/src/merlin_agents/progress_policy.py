@@ -63,17 +63,22 @@ class ProgressSnapshot:
     provider_health: ProviderHealth = ProviderHealth.HEALTHY
     infrastructure_failures: frozenset[str] = frozenset()
     budget: BudgetEvidence = BudgetEvidence()
+    attempted_coverage: frozenset[str] = frozenset()
+    observation_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if self.durable_target_calls < 0:
             raise ValueError("durable target calls cannot be negative")
         if self.semantic_fingerprint is not None and not self.semantic_fingerprint.strip():
             raise ValueError("semantic fingerprint must be non-blank when supplied")
+        if self.observation_fingerprint is not None and not self.observation_fingerprint.strip():
+            raise ValueError("observation fingerprint must be non-blank when supplied")
         for label, values in (
             ("evidence identifiers", self.durable_evidence),
             ("frontier identifiers", self.unresolved_frontier),
             ("resolved frontier identifiers", self.durably_resolved),
             ("infrastructure failures", self.infrastructure_failures),
+            ("attempted coverage identifiers", self.attempted_coverage),
         ):
             if any(not value.strip() for value in values):
                 raise ValueError(f"{label} must not be blank")
@@ -236,6 +241,32 @@ def assess_campaign_progress(
     )
 
 
+def has_meaningful_campaign_progress(
+    previous: ProgressSnapshot | None,
+    current: ProgressSnapshot,
+) -> bool:
+    """Return whether durable work resets a campaign saturation budget.
+
+    New receipts, unresolved hypotheses, and target-call counts are discovery
+    telemetry, not sufficient campaign progress by themselves. The saturation
+    budget resets only for newly attempted admitted coverage, attributable
+    resolution, or a changed target observation.
+    """
+
+    _validate_monotonic_durability(previous, current)
+    if previous is None:
+        return False
+    return bool(
+        current.attempted_coverage - previous.attempted_coverage
+        or current.durably_resolved - previous.durably_resolved
+        or (
+            previous.observation_fingerprint is not None
+            and current.observation_fingerprint is not None
+            and current.observation_fingerprint != previous.observation_fingerprint
+        )
+    )
+
+
 def _validate_monotonic_durability(
     previous: ProgressSnapshot | None,
     current: ProgressSnapshot,
@@ -248,6 +279,8 @@ def _validate_monotonic_durability(
         raise ValueError("durable evidence cannot disappear")
     if not previous.durably_resolved.issubset(current.durably_resolved):
         raise ValueError("durable frontier resolutions cannot disappear")
+    if not previous.attempted_coverage.issubset(current.attempted_coverage):
+        raise ValueError("attempted catalogue coverage cannot disappear")
     removed = previous.unresolved_frontier - current.unresolved_frontier
     if unexplained := removed - current.durably_resolved:
         raise ValueError(

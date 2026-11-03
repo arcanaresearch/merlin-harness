@@ -7,6 +7,7 @@ from merlin_agents.progress_policy import (
     ProgressSnapshot,
     ProviderHealth,
     assess_campaign_progress,
+    has_meaningful_campaign_progress,
 )
 
 
@@ -21,6 +22,8 @@ def snapshot(
     health: ProviderHealth = ProviderHealth.HEALTHY,
     failures: frozenset[str] = frozenset(),
     exhausted: frozenset[str] = frozenset(),
+    attempted: frozenset[str] = frozenset(),
+    observation: str | None = None,
 ) -> ProgressSnapshot:
     return ProgressSnapshot(
         durable_target_calls=calls,
@@ -32,6 +35,8 @@ def snapshot(
         provider_health=health,
         infrastructure_failures=failures,
         budget=BudgetEvidence(exhausted),
+        attempted_coverage=attempted,
+        observation_fingerprint=observation,
     )
 
 
@@ -84,6 +89,56 @@ def test_semantically_new_target_observation_is_progress() -> None:
 
     assert decision.action is ProgressAction.CONTINUE
     assert decision.made_progress is True
+
+
+def test_receipt_and_hypothesis_churn_is_not_meaningful_saturation_progress() -> None:
+    previous = snapshot(
+        calls=2,
+        evidence=frozenset({"receipt-1"}),
+        frontier=frozenset({"hypothesis-1"}),
+        semantics="semantic-a",
+        attempted=frozenset({"catalogue-a"}),
+        observation="target-a",
+    )
+    current = snapshot(
+        calls=3,
+        evidence=frozenset({"receipt-1", "receipt-2"}),
+        frontier=frozenset({"hypothesis-1", "hypothesis-2"}),
+        semantics="semantic-b",
+        attempted=frozenset({"catalogue-a"}),
+        observation="target-a",
+    )
+
+    assert assess_campaign_progress(previous, current).action is ProgressAction.CONTINUE
+    assert not has_meaningful_campaign_progress(previous, current)
+
+
+def test_target_calls_alone_do_not_reset_saturation_budget() -> None:
+    previous = snapshot(calls=2, attempted=frozenset({"catalogue-a"}), observation="target-a")
+    current = snapshot(calls=3, attempted=frozenset({"catalogue-a"}), observation="target-a")
+
+    assert not has_meaningful_campaign_progress(previous, current)
+
+
+@pytest.mark.parametrize(
+    "current",
+    (
+        snapshot(attempted=frozenset({"catalogue-a", "catalogue-b"}), observation="target-a"),
+        snapshot(
+            frontier=frozenset(),
+            resolved=frozenset({"candidate-a"}),
+            attempted=frozenset({"catalogue-a"}),
+            observation="target-a",
+        ),
+        snapshot(attempted=frozenset({"catalogue-a"}), observation="target-b"),
+    ),
+)
+def test_meaningful_coverage_resolution_or_observation_resets_saturation_budget(
+    current: ProgressSnapshot,
+) -> None:
+    previous = snapshot(attempted=frozenset({"catalogue-a"}), observation="target-a")
+
+    assert has_meaningful_campaign_progress(previous, current)
 
 
 def test_durable_semantic_change_is_progress_without_requiring_another_target_call() -> None:
