@@ -127,6 +127,9 @@ def test_non_authoritative_valid_attempt_is_downgraded_to_uncertain() -> None:
     assert observation is not None
     assert observation["attempt_disposition"] == "uncertain"
     assert observation["outcome_authority"] == "none"
+    assert observation["candidate_outcome_projection"]["attempt_disposition"] == "uncertain"
+    assert observation["candidate_outcome_projection"]["outcome_authority"] == "none"
+    assert observation["candidate_outcome_projection"]["valid"] is False
 
 
 @pytest.mark.parametrize(
