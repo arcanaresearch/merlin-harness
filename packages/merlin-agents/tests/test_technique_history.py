@@ -26,7 +26,7 @@ from merlin_agents.campaign_service import (
     _deferred_coverage_rows,
     _json_value,
 )
-from merlin_agents.specialists import LanguageFrontierSpec
+from merlin_agents.specialists import LanguageCandidateReference, LanguageFrontierSpec
 from merlin_agents.technique_history import (
     entries_for_completion,
     plan_skip,
@@ -601,6 +601,12 @@ class _HistoryStore:
                     if isinstance(row.get("partial_signal"), dict)
                     else {}
                 ),
+                **({"native_score": row["native_score"]} if "native_score" in row else {}),
+                **(
+                    {"best_known_attempt": dict(row["best_known_attempt"])}
+                    if isinstance(row.get("best_known_attempt"), dict)
+                    else {}
+                ),
             }
             for row in self.history
             if row["target_id"] == target_id
@@ -670,7 +676,7 @@ async def test_lazy_frontier_history_never_drops_family_or_sibling_candidates() 
         prepared, generation
     )
 
-    assert admitted.assignment_context.techniques == (base,)
+    assert [item.id for item in admitted.assignment_context.techniques] == [base.id]
     assert partial == ()
     assert skipped == ()
     assert priors == (
@@ -693,6 +699,168 @@ async def test_lazy_frontier_history_never_drops_family_or_sibling_candidates() 
     assert row_by_id[terminal.id]["state"] == "queued"
     assert row_by_id[terminal.id]["priority"] == 0.2
     assert all(row_by_id[reference.id]["priority"] is None for reference in references[1:])
+
+
+async def test_lazy_frontier_recall_reaches_worker_with_bounded_stale_evidence() -> None:
+    from merlin_agents.campaign import (
+        compile_attack_campaign,
+        compile_baseline_agenda,
+        materialize_language_technique,
+    )
+    from merlin_agents.repeat_planning import PARTIAL_REPEAT_GUIDANCE_PREFIX
+
+    base = _technique("cell/a", mutation_seed="stable-seed", execution_role="direct")
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "es"),
+        code_switching=True,
+    )
+    prepared = _preparation((base,), language_frontier=frontier)
+    generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
+    references = enumerate_language_candidate_references((base,), frontier)
+    partial_reference, failed_reference = references[:2]
+
+    def row(
+        reference: LanguageCandidateReference,
+        outcome: str,
+        target_id: str = "target-1",
+    ) -> dict[str, object]:
+        return {
+            "target_id": target_id,
+            "adapter_generation": generation,
+            "technique_id": reference.id,
+            "controller_id": base.strategy_id,
+            "payload_family": reference.variant_id,
+            "language_id": reference.requested_language,
+            "mutation_id": technique_cell_parts(base)[4],
+            "outcome": outcome,
+            "source_campaign_id": f"campaign-{target_id}-{outcome}",
+            "partial_signal": {
+                "progress": "target engaged before the attempt stopped",
+                "evidence_refs": ["receipt/prior"],
+            },
+            "native_score": 0.625,
+            "best_known_attempt": {"attempt_id": "attempt-prior", "signal": "near-miss"},
+        }
+
+    store = _HistoryStore(
+        [
+            row(partial_reference, "partial"),
+            row(failed_reference, "refuted"),
+            row(partial_reference, "partial", target_id="target-other"),
+        ]
+    )
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+
+    admitted, _, partial, priors = await service._apply_technique_skip(  # noqa: SLF001
+        prepared, generation
+    )
+
+    assert len(partial) == 1
+    assert len(priors) == 2
+    documents = tuple(
+        item
+        for item in admitted.manifest.catalogue
+        if item.id.startswith(PARTIAL_REPEAT_GUIDANCE_PREFIX)
+    )
+    assert len(documents) == 1
+    document = documents[0]
+    assert len(document.content) <= 8_192
+    payload = json.loads(document.content)
+    assert payload["target_id"] == "target-1"
+    assert payload["adapter_generation"] == generation
+    assert payload["historical"] is True
+    assert payload["untrusted"] is True
+    assert payload["stale"] is True
+    assert payload["requires_fresh_observation"] is True
+    assert "target-other" not in document.content
+    attempts = {item["prior_outcome"]: item for item in payload["prior_attempts"]}
+    assert set(attempts) == {"partial", "refuted"}
+    assert attempts["partial"]["native_score"] == 0.625
+    assert attempts["partial"]["best_known_attempt"]["attempt_id"] == "attempt-prior"
+    assert payload["partial_progress_leads"] == [partial_reference.id]
+    assert payload["failed_technique_evidence"] == [failed_reference.id]
+    assert payload["remaining_hypotheses"] == [partial_reference.id]
+    assert document.id in admitted.assignment_context.techniques[0].guidance_ids
+
+    concrete = materialize_language_technique(
+        admitted.assignment_context.techniques[0], frontier, partial_reference
+    )
+    claimed_context = replace(admitted.assignment_context, techniques=(concrete,))
+    compilation = compile_baseline_agenda(
+        admitted.manifest,
+        claimed_context,
+        compile_attack_campaign(admitted.manifest, claimed_context),
+    )
+    assert len(compilation.worker_contexts) == 1
+    assert document in compilation.worker_contexts[0].guidance
+
+
+async def test_same_target_recall_excludes_other_targets() -> None:
+    technique = _technique("cell/a")
+    prepared = _preparation((technique,))
+    generation = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)
+    store = _HistoryStore(
+        [
+            {
+                "target_id": "target-other",
+                "adapter_generation": generation,
+                "technique_id": technique.id,
+                "controller_id": technique.strategy_id,
+                "payload_family": technique.transform_id,
+                "language_id": technique.language,
+                "mutation_id": "none",
+                "outcome": "partial",
+                "source_campaign_id": "campaign-other",
+            }
+        ]
+    )
+    service = CampaignService(store, object(), None)  # type: ignore[arg-type]
+
+    admitted, _, partial, priors = await service._apply_technique_skip(  # noqa: SLF001
+        prepared, generation
+    )
+
+    assert store.lookups[0][0] == "target-1"
+    assert admitted.manifest is prepared.manifest
+    assert admitted.assignment_context is prepared.assignment_context
+    assert partial == ()
+    assert priors == ()
+
+
+def test_same_target_recall_bounds_family_history_and_marks_truncation() -> None:
+    from merlin_agents.repeat_planning import partial_repeat_documents
+    from merlin_agents.technique_history import language_reference_cell_parts
+
+    base = _technique("cell/a")
+    frontier = LanguageFrontierSpec(
+        default_language="en",
+        planned_languages=("en", "es", "fr", "de", "it", "pt", "nl"),
+        code_switching=True,
+    )
+    prepared = _preparation((base,), language_frontier=frontier)
+    references = enumerate_language_candidate_references((base,), frontier)
+    history = {
+        language_reference_cell_parts(base, reference): {
+            "outcome": "partial",
+            "source_campaign_id": f"campaign-{reference.ordinal}",
+            "partial_signal": {"progress": "x" * 8_000},
+        }
+        for reference in references
+    }
+
+    documents = partial_repeat_documents(
+        prepared.assignment_context, history, adapter_generation="generation-1"
+    )
+
+    document = documents[technique_cell_parts(base)]
+    assert len(document.content) <= 8_192
+    payload = json.loads(document.content)
+    assert len(payload["prior_attempts"]) < len(references)
+    assert payload["omitted_attempt_count"] == len(references) - len(payload["prior_attempts"])
+    assert payload["prior_attempts"][0]["partial_signal"]["truncated"] is True
+    assert payload["stale"] is True
+    assert payload["requires_fresh_observation"] is True
 
 
 async def test_lazy_frontier_completion_records_reusable_exact_history_dimensions() -> None:
@@ -737,7 +905,7 @@ async def test_lazy_frontier_completion_records_reusable_exact_history_dimension
     next_prepared, skipped, partial, priors = await service._apply_technique_skip(  # noqa: SLF001
         prepared, generation
     )
-    assert next_prepared.assignment_context.techniques == (base,)
+    assert [item.id for item in next_prepared.assignment_context.techniques] == [base.id]
     assert partial == ()
     assert skipped == ()
     assert priors[0]["candidate_id"] == concrete.id
@@ -878,7 +1046,17 @@ async def test_partial_repeat_guidance_survives_review_resume_and_worker_compila
     assert "strategy_plan.thought" in prior["policy"]
     assert context.techniques[0].guidance_ids == ()
     assert guidance.id in context.techniques[1].guidance_ids
-    assert context.techniques[2].guidance_ids == ()
+    resolved_guidance = next(
+        document
+        for document in manifest.catalogue
+        if document.id in context.techniques[2].guidance_ids
+    )
+    resolved_prior = json.loads(resolved_guidance.content)
+    assert resolved_prior["prior_outcome"] == "refuted"
+    assert resolved_prior["failed_technique_evidence"] == ["cell/resolved"]
+    assert resolved_prior["remaining_hypotheses"] == []
+    assert resolved_prior["stale"] is True
+    assert resolved_prior["requires_fresh_observation"] is True
     agenda = compile_baseline_agenda(manifest, context, compile_attack_campaign(manifest, context))
     assert len(agenda.assignments) == 3
     assert [assignment.technique_ids for assignment in agenda.assignments] == [
@@ -889,6 +1067,7 @@ async def test_partial_repeat_guidance_survives_review_resume_and_worker_compila
     assert guidance not in agenda.worker_contexts[0].guidance
     assert guidance in agenda.worker_contexts[1].guidance
     assert guidance not in agenda.worker_contexts[2].guidance
+    assert resolved_guidance in agenda.worker_contexts[2].guidance
 
 
 async def test_semantic_triage_cannot_retire_partial_repeat(monkeypatch):

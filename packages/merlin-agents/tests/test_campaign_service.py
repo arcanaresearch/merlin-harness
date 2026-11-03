@@ -12607,7 +12607,15 @@ async def test_jev_cell_triage_keeps_terminal_history_eligible_without_model_adm
         {"jailbreak": 0.9},
         history=history,
     )
-    assert admitted.assignment_context.techniques == prepared.assignment_context.techniques
+    assert [item.id for item in admitted.assignment_context.techniques] == [
+        item.id for item in prepared.assignment_context.techniques
+    ]
+    for before, after in zip(
+        prepared.assignment_context.techniques,
+        admitted.assignment_context.techniques,
+        strict=True,
+    ):
+        assert set(before.guidance_ids) <= set(after.guidance_ids)
     assert skipped == ()
     assert partial == ()
     assert client.states == []

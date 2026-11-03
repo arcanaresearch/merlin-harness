@@ -2597,6 +2597,38 @@ class CampaignService:
         techniques = prepared.assignment_context.techniques
         if lookup is None or not techniques:
             return prepared, (), (), ()
+
+        def with_repeat_context(
+            candidate: CampaignPreparation, history: Mapping
+        ) -> CampaignPreparation:
+            repeat_documents = partial_repeat_documents(
+                candidate.assignment_context,
+                history,
+                adapter_generation=adapter_generation,
+            )
+            if not repeat_documents:
+                return candidate
+            techniques = tuple(
+                replace(
+                    technique,
+                    guidance_ids=tuple(
+                        dict.fromkeys(
+                            (
+                                *technique.guidance_ids,
+                                repeat_documents[technique_cell_parts(technique)].id,
+                            )
+                        )
+                    ),
+                )
+                if technique_cell_parts(technique) in repeat_documents
+                else technique
+                for technique in candidate.assignment_context.techniques
+            )
+            return CampaignPreparation(
+                reseal_repeat_manifest(candidate.manifest, tuple(repeat_documents.values())),
+                replace(candidate.assignment_context, techniques=techniques),
+            )
+
         language_frontier = prepared.assignment_context.language_frontier
         if language_frontier is not None:
             references = enumerate_language_candidate_references(techniques, language_frontier)
@@ -2650,7 +2682,7 @@ class CampaignService:
                 for reference, row in historical
                 if (outcome := normalize_outcome(row.get("outcome")))
             )
-            return prepared, (), partial_priors, exact_priors
+            return with_repeat_context(prepared, history), (), partial_priors, exact_priors
         history = await asyncio.to_thread(
             lookup,
             prepared.manifest.target.id,
@@ -2690,28 +2722,8 @@ class CampaignService:
         )
         if not exact_priors:
             return prepared, (), (), ()
-        repeat_documents = partial_repeat_documents(prepared.assignment_context, history)
-        if repeat_documents:
-            prepared = CampaignPreparation(
-                reseal_repeat_manifest(prepared.manifest, tuple(repeat_documents.values())),
-                prepared.assignment_context,
-            )
-            techniques = tuple(
-                replace(
-                    technique,
-                    guidance_ids=tuple(
-                        dict.fromkeys(
-                            (
-                                *technique.guidance_ids,
-                                repeat_documents[technique_cell_parts(technique)].id,
-                            )
-                        )
-                    ),
-                )
-                if technique_cell_parts(technique) in repeat_documents
-                else technique
-                for technique in techniques
-            )
+        prepared = with_repeat_context(prepared, history)
+        techniques = prepared.assignment_context.techniques
         # Legacy contexts are already fully materialized, so reflect the same
         # exploration-first ranking in their persisted assignment order. Keep
         # relative catalogue order within the untried and historical groups.
