@@ -101,6 +101,34 @@ def test_hypothesis_failure_requires_typed_infrastructure_category() -> None:
     assert disrupted is None
 
 
+def test_non_authoritative_valid_attempt_is_downgraded_to_uncertain() -> None:
+    task = AgentTask(
+        id="arm-worker",
+        objective="sealed hypothesis",
+        status="completed",
+        result="{}",
+        technique_ids=("technique-1",),
+    )
+
+    observation = _hypothesis_task_observation(
+        "campaign-1",
+        task,
+        {"id": "technique-1"},
+        {
+            "attempt_id": "attempt:one",
+            "reference": "receipt:one",
+            "digest": "sha256:" + "a" * 64,
+            "target_call_ids": ("call:one",),
+            "attempt_disposition": "valid",
+            "outcome_authority": "none",
+        },
+    )
+
+    assert observation is not None
+    assert observation["attempt_disposition"] == "uncertain"
+    assert observation["outcome_authority"] == "none"
+
+
 @pytest.mark.parametrize(
     ("target_session_id", "expected_state"),
     (("browser:session", "browser:session"), (None, "stateless:call:one")),
