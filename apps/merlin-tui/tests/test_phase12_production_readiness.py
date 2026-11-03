@@ -1348,10 +1348,25 @@ async def test_two_physical_recon_sessions_cleanup_and_prepare_only_the_selected
                 {
                     "objective": "Assess https://target.test Bank L1 for weaknesses",
                     "campaign_profile": "recommended",
-                    "adapter": {"recon_handoff_id": superseding_handoff_id},
+                    "adapter": {
+                        "recon_handoff_id": superseding_handoff_id,
+                        "expected_target_id": target_id,
+                        "expected_target_session_id": f"browser:{context_id}",
+                    },
                 },
             )
             assert prepared.is_error is False, prepared.content
+            with pytest.raises(
+                ValueError,
+                match="reviewed reconnaissance handoff belongs to another target session",
+            ):
+                await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
+                    console_session_id,
+                    {
+                        "recon_handoff_id": superseding_handoff_id,
+                        "expected_target_session_id": "browser:foreign-context",
+                    },
+                )
             final_adapter = await backend._campaigns.resolve_reviewed_adapter(  # type: ignore[attr-defined]
                 console_session_id, {"recon_handoff_id": superseding_handoff_id}
             )
