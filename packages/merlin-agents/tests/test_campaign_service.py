@@ -4996,8 +4996,8 @@ async def test_completed_wave_claims_arm_ranked_successor_and_keeps_other_candid
     replacement.cancel()
     await asyncio.gather(replacement, return_exceptions=True)
 
-    assert store.claims == [("cell/unscored",)]
-    assert store.queued == ["cell/low", "cell/high"]
+    assert store.claims == [("cell/high",)]
+    assert store.queued == ["cell/unscored", "cell/low"]
     assert service.started[:2] == (4, "frontier")
     assert isinstance(service.started[2], str) and service.started[2]
     arm_event = next(event for event in store.events if event["kind"] == "execution_arm_priority")
@@ -27307,6 +27307,34 @@ def test_execution_diversity_fills_batch_across_families_and_states():
         == 2
     )
     assert {item.id for item in ordered} == {item.id for item in candidates}
+
+
+def test_execution_diversity_single_slot_preserves_top_ranked_candidate():
+    base = AssignmentTechnique(
+        id="family/a/first",
+        objective="exercise highest-ranked family",
+        tags=frozenset(),
+        guidance_ids=(),
+        semantic_id="family/a",
+        domain_id="chat",
+    )
+    candidates = (
+        base,
+        replace(base, id="family/b", semantic_id="family/b"),
+        replace(base, id="family/c", semantic_id="family/c"),
+    )
+
+    ordered = CampaignService._diversify_execution_candidates(  # noqa: SLF001
+        "campaign/diversity",
+        candidates,
+        4,
+        1,
+        {},
+        frozenset(item.id for item in candidates),
+        {item.id: index for index, item in enumerate(candidates)},
+    )
+
+    assert ordered == candidates
 
 
 async def test_frontier_records_measured_arm_outcomes_before_successor_claim_and_replays_once():
