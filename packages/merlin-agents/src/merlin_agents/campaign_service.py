@@ -3004,13 +3004,13 @@ class CampaignService:
         """Order one bounded batch for family/state diversity without filtering.
 
         Objective phase gates have already established eligibility before this
-        point. This function only reorders eligible candidates: one stable
-        wave-specific exploration choice is followed by the highest-ranked
-        candidates that add a new family and target state. The complete suffix
-        is retained in ranked order for later durable claims.
+        point. This function only reorders eligible candidates. A single slot
+        keeps the highest-ranked candidate; wider batches reserve one stable
+        wave-specific exploration choice, then prefer new families and target
+        states. The complete suffix is retained for later durable claims.
         """
 
-        if len(candidates) < 2 or selection_width < 1:
+        if len(candidates) < 2 or selection_width <= 1:
             return candidates
 
         def candidate_id(candidate: Any) -> str:
