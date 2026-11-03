@@ -141,6 +141,7 @@ def _target_reobservation_recovery_action(
     if campaign_status != "executing" or scheduler_action not in {
         "bind_successor_schedule",
         "claim_successor",
+        "finalize_and_settle_terminal_batch",
         "idle",
         "persist_successor_schedule",
         "persist_wave_binding",

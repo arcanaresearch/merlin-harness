@@ -419,6 +419,153 @@ def test_auxiliary_target_reobservation_stays_live_until_lead_effect(
             assert continued["recovery_action"] != "recover_target_reobservation"
 
 
+def test_running_wave_with_pending_stale_adapter_recovers_reobservation_first(
+    tmp_path: Path,
+) -> None:
+    def insert_schedule(connection, schedule_id: str, session_id: str) -> None:
+        connection.execute(
+            """INSERT INTO merlin_storage.scheduler_schedules
+                   (id, session_id, graph, graph_digest, checkpoint,
+                    checkpoint_digest, last_event_digest, status)
+               VALUES (%s, %s, '{}'::jsonb, %s, '{}'::jsonb, %s, %s, 'completed')""",
+            (schedule_id, session_id, "1" * 64, "2" * 64, "3" * 64),
+        )
+
+    with Database(DatabaseConfig(data_dir=tmp_path / "postgres-stale-active-wave")) as database:
+        with database.connect() as connection:
+            MigrationRunner(connection).apply()
+            session = SessionRepository(connection).create("stale adapter active wave")
+            session_id = str(session.id)
+            campaign_id = "campaign/stale-active-wave"
+            target_id = "target/stale-active-wave"
+            campaigns = CampaignStore(connection)
+            campaigns.prepare(
+                campaign_id,
+                session_id,
+                {
+                    "manifest": {
+                        "id": campaign_id,
+                        "session_id": session_id,
+                        "target": {"id": target_id},
+                    },
+                    "assignment_context": {},
+                },
+                "sha256:" + "a" * 64,
+            )
+            connection.execute(
+                """UPDATE merlin_storage.assessment_campaigns
+                   SET status = 'executing' WHERE id = %s""",
+                (campaign_id,),
+            )
+            normalized = normalize_target_ui_transition(
+                {
+                    "schema": "merlin.target-ui-transition.v1",
+                    "material": True,
+                    "adapter_stale": True,
+                    "before_digest": "sha256:" + "b" * 64,
+                    "after_digest": "sha256:" + "c" * 64,
+                    "changed_dimensions": ["controls", "reviewed_controls"],
+                    "added_controls": [
+                        {
+                            "role": "button",
+                            "name": "Continue",
+                            "frame_ref": "main",
+                            "disabled": False,
+                        }
+                    ],
+                    "removed_controls": [],
+                    "controls_truncated": False,
+                    "evidence_refs": ["browser-snapshot:post-effect"],
+                    "reobservation_recommended": True,
+                }
+            )
+            assert normalized is not None
+            transition, transition_digest = normalized
+            receipt_sha256 = "d" * 64
+            target_session_id = "browser:stale-active-wave"
+            event_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        [
+                            campaign_id,
+                            target_session_id,
+                            "task/source",
+                            "call/source",
+                            receipt_sha256,
+                            transition_digest,
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+            )
+            obligation = TargetReobservationObligation(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                target_id=target_id,
+                target_session_id=target_session_id,
+                event_digest=event_digest,
+                transition_digest=transition_digest,
+                source_schedule_id="schedule/source",
+                source_wave=1,
+                source_task_id="task/source",
+                target_call_id="call/source",
+                receipt_sha256=receipt_sha256,
+                receipt_projection="target_evidence_receipts",
+                transition=transition,
+            )
+            campaigns.append_lead(
+                campaign_id,
+                1,
+                obligation.observed_payload(campaign_id, target_id),
+            )
+            campaigns.append_lead(
+                campaign_id,
+                1,
+                {
+                    "kind": "incremental_review_merge_completed",
+                    "state": "completed",
+                    "summary": "Re-observation is required before further claims.",
+                },
+            )
+            campaigns.register_frontier(
+                campaign_id,
+                [{"id": "family/a", "document": {"id": "family/a"}}],
+                [
+                    {
+                        "id": "candidate/a",
+                        "family_id": "family/a",
+                        "ordinal": 0,
+                        "requested_language": "en",
+                        "variant_id": "native",
+                    }
+                ],
+            )
+            terminal_schedule_id = str(
+                uuid5(NAMESPACE_URL, f"terminal-stale-active-wave\n{campaign_id}")
+            )
+            insert_schedule(connection, terminal_schedule_id, session_id)
+            terminal_batch_id = "batch/stale-active-wave"
+            campaigns.claim_frontier_batch(campaign_id, 1, terminal_batch_id, 1)
+            campaigns.bind_frontier_batch(campaign_id, terminal_batch_id, terminal_schedule_id)
+            campaigns.add_wave(campaign_id, 1, "frontier", terminal_schedule_id)
+
+            recovery = _campaign_recovery(
+                _reconcile(StateScopeRepository(connection), "daemon/stale-active-wave"),
+                campaign_id,
+            )
+
+            assert recovery["status"] == "executing"
+            assert recovery["latest_wave"]["wave_status"] == "running"
+            assert recovery["latest_wave"]["schedule_status"] == "completed"
+            assert recovery["target_reobservation"]["pending"]["count"] == 1
+            assert recovery["target_reobservation"]["recovery_state"]["phase"] == "reobserve"
+            assert recovery["recovery_action"] == "recover_target_reobservation"
+            assert recovery["scheduler_action"] == "recover_target_reobservation"
+
+
 def test_restart_releases_target_execution_lease_for_terminal_scheduler_attempt(
     tmp_path: Path,
 ) -> None:

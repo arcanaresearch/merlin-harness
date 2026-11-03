@@ -107,15 +107,17 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def _obligation() -> TargetReobservationObligation:
+def _obligation(*, adapter_stale: bool = False) -> TargetReobservationObligation:
     normalized = normalize_target_ui_transition(
         {
             "schema": "merlin.target-ui-transition.v1",
             "material": True,
-            "adapter_stale": False,
+            "adapter_stale": adapter_stale,
             "before_digest": "sha256:" + "1" * 64,
             "after_digest": "sha256:" + "2" * 64,
-            "changed_dimensions": ["controls"],
+            "changed_dimensions": (
+                ["controls", "reviewed_controls"] if adapter_stale else ["controls"]
+            ),
             "added_controls": [
                 {
                     "role": "button",
@@ -2028,6 +2030,112 @@ async def test_special_continuations_review_refresh_before_resuming_caller(
         "browser_fill",
         "browser_press",
     }.isdisjoint(refresh_assignment.tool_ids)
+
+
+async def test_active_wave_recovery_schedules_pending_reobservation_before_lead_review() -> None:
+    manifest, context = _campaign()
+    obligation = _obligation(adapter_stale=True)
+    order: list[tuple[str, str]] = []
+
+    class RecoveryStore(_JournalStore):
+        def __init__(self) -> None:
+            super().__init__(manifest, context, obligation, order)
+            self.row["status"] = "executing"
+            self.lead.append(
+                {
+                    "wave": 1,
+                    "payload": {
+                        "kind": "incremental_review_merge_completed",
+                        "state": "completed",
+                        "summary": "Re-observation is required before further claims.",
+                    },
+                }
+            )
+
+        def list_waves(self, _campaign_id: str):
+            return (
+                {
+                    "wave": 1,
+                    "kind": "frontier",
+                    "schedule_id": obligation.source_schedule_id,
+                    "status": "running",
+                },
+            )
+
+        def load_active_frontier_batch(self, _campaign_id: str):
+            return {"id": "batch/active", "wave": 1, "schedule_id": obligation.source_schedule_id}
+
+    class RecoveryService(_GateService):
+        def __init__(self, store: RecoveryStore, agents: _Agents) -> None:
+            super().__init__(store, agents)
+            self._lead_runner = object()  # type: ignore[assignment]
+            self.supervisions: list[tuple[str, int, bool]] = []
+
+        async def _run_lead_with_policy(self, active_manifest, tasks):
+            assert tuple(task.id for task in tasks) == ("source-task",)
+            projection = await self._target_reobservation_projection(active_manifest.id)
+            generation = next(iter(projection.generations.values()))
+            _append_reviewed(self._store, generation)
+            order.append(("lead", generation.generation_id))
+
+        async def _supervise(
+            self,
+            _campaign_id,
+            _manifest,
+            _context,
+            live,
+            *,
+            initial_wave,
+            wave_running=True,
+        ) -> None:
+            self.supervisions.append((live.id, initial_wave, wave_running))
+            order.append(("supervise", live.id))
+
+    store = RecoveryStore()
+    agents = _Agents(order)
+    agents.schedules[obligation.source_schedule_id] = SimpleNamespace(
+        id=obligation.source_schedule_id,
+        assignments=(SimpleNamespace(strategy_id="direct/v1", profile_id="attack"),),
+        worker_contexts={},
+        execution=None,
+    )
+    agents.tasks[obligation.source_schedule_id] = (
+        AgentTask(id="source-task", objective="observe target", status="completed"),
+    )
+    service = RecoveryService(store, agents)
+    service.settlement_outcomes.append("refreshed")
+    generation = _generation(obligation)
+    projection = await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
+    recovery_state = projection.recovery_state(latest_wave=1)
+    assert recovery_state is not None
+    assert recovery_state["phase"] == "reobserve"
+    assert recovery_state["schedule_id"] is None
+    assert store.lead[-1]["payload"]["kind"] == "incremental_review_merge_completed"
+    decision = SimpleNamespace(
+        campaign_id=manifest.id,
+        recovery_action="recover_target_reobservation",
+        target_reobservation_recovery_state=SimpleNamespace(**recovery_state),
+    )
+
+    assert await service._recover_recorded_action(decision, True) == 1  # noqa: SLF001
+    await service._supervisors[manifest.id]  # noqa: SLF001
+
+    refresh_schedule_id = service._target_reobservation_schedule_id(  # noqa: SLF001
+        manifest.id, generation.generation_id, 1
+    )
+    assert [str(options["schedule_id"]) for _, options in agents.submissions] == [
+        refresh_schedule_id
+    ]
+    assert agents.submissions[0][0][0].strategy_id == "target-reobservation/v1"
+    assert service.supervisions == [(obligation.source_schedule_id, 1, False)]
+    assert order.index(("submit", refresh_schedule_id)) < order.index(("settle", "refreshed"))
+    assert order.index(("settle", "refreshed")) < order.index(("lead", generation.generation_id))
+    assert order.index(("lead", generation.generation_id)) < order.index(
+        ("supervise", obligation.source_schedule_id)
+    )
+    reviewed = await service._target_reobservation_projection(manifest.id)  # noqa: SLF001
+    assert reviewed.pending == ()
+    assert reviewed.reviewed[generation.generation_id].startswith("lead-decision:")
 
 
 async def test_failed_wave_zero_reviews_refresh_once_before_terminal_reconciliation() -> None:
