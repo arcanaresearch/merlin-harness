@@ -6639,6 +6639,9 @@ class CampaignService:
             autonomous_adaptive = _specialist_composition(manifest) == "autonomous"
             recon_task: AgentTask | None = None
             recon_evidence: Mapping[str, object] | None = None
+            followup_progress_snapshot: ProgressSnapshot | None = None
+            followup_frontier_signature: tuple[tuple[str, ...], ...] | None = None
+            unchanged_followup_plans = 0
             while (
                 not budget_capped
                 and not frontier_retry_cap_reached
@@ -7009,6 +7012,16 @@ class CampaignService:
                     )
                 if not novel:
                     break
+                if (
+                    followup_progress_snapshot is None
+                    and manifest.profile is not CampaignProfile.QUICKSCAN
+                    and callable(getattr(self._store, "get", None))
+                ):
+                    followup_status = await self.status(campaign_id)
+                    followup_progress_snapshot = _progress_snapshot_from_status(followup_status)
+                    followup_frontier_signature = _coverage_frontier_signature(
+                        followup_status.get("saturation")
+                    )
                 candidate_wave = wave + 1
                 ordinary = tuple(item for item in novel if item.specialist is None)
                 dynamic = tuple(item for item in novel if item.specialist is not None)
@@ -7107,6 +7120,64 @@ class CampaignService:
                     assessment,
                     followups=self._route_typed_hypotheses(assessment.followups, routable_profiles),
                 )
+                if followup_progress_snapshot is not None:
+                    current_followup_status = await self.status(campaign_id)
+                    current_followup_progress = _progress_snapshot_from_status(
+                        current_followup_status
+                    )
+                    current_followup_signature = _coverage_frontier_signature(
+                        current_followup_status.get("saturation")
+                    )
+                    try:
+                        followup_progress_decision = assess_campaign_progress(
+                            followup_progress_snapshot,
+                            current_followup_progress,
+                        )
+                    except ValueError as error:
+                        await asyncio.to_thread(
+                            self._store.append_lead,
+                            campaign_id,
+                            wave,
+                            {
+                                "kind": "campaign_progress_projection_uncertain",
+                                "reason": str(error),
+                                "intervention": "rebuild the durable frontier and continue",
+                            },
+                        )
+                        unchanged_followup_plans = 0
+                    else:
+                        if (
+                            followup_progress_decision.action
+                            is ProgressAction.WAIT_FOR_INFRASTRUCTURE
+                        ):
+                            pass
+                        elif (
+                            current_followup_signature is not None
+                            and current_followup_signature == followup_frontier_signature
+                            and followup_progress_decision.action is ProgressAction.REPLAN
+                        ):
+                            unchanged_followup_plans += 1
+                        else:
+                            unchanged_followup_plans = 0
+                    followup_progress_snapshot = current_followup_progress
+                    followup_frontier_signature = current_followup_signature
+                    if unchanged_followup_plans >= 3:
+                        await asyncio.to_thread(
+                            self._store.append_lead,
+                            campaign_id,
+                            wave,
+                            {
+                                "kind": "coverage_followup_plan_budget_exhausted",
+                                "unchanged_followup_plans": unchanged_followup_plans,
+                                "reason": (
+                                    "three repeated follow-up plans produced target calls without "
+                                    "new durable evidence, frontier resolution, or semantic state "
+                                    "change; resolve the remaining coverage through the bounded "
+                                    "coverage decision"
+                                ),
+                            },
+                        )
+                        break
             budget_capped = await self._campaign_budget_capped(campaign_id)
             completion_status = (
                 await self.status(campaign_id)
@@ -7203,6 +7274,9 @@ class CampaignService:
                 ready = bool(isinstance(saturation, Mapping) and saturation.get("ready"))
                 purpose = "saturation" if ready else "coverage_extension"
                 auto_decision: str | None = None
+                repair_plan_budget_exhausted = (
+                    purpose == "coverage_extension" and unchanged_coverage_extensions >= 3
+                )
                 if (
                     purpose == "coverage_extension"
                     and manifest.profile is CampaignProfile.QUICKSCAN
@@ -7211,6 +7285,8 @@ class CampaignService:
                     # coverage past the capped initial wave. Stop at the first
                     # gate and finalize with the recorded limitations instead of
                     # waiting on an operator or auto-continuing indefinitely.
+                    auto_decision = "stop"
+                elif repair_plan_budget_exhausted:
                     auto_decision = "stop"
                 elif purpose == "coverage_extension" and self._max_coverage_extensions is not None:
                     # This flag selects unattended operation only. A fixed wave
@@ -7242,6 +7318,25 @@ class CampaignService:
                             automatic=auto_decision == "stop",
                             saturation=saturation if isinstance(saturation, Mapping) else {},
                         )
+                        if repair_plan_budget_exhausted:
+                            await asyncio.to_thread(
+                                self._store.append_lead,
+                                campaign_id,
+                                wave,
+                                {
+                                    "kind": "coverage_repair_plan_budget_exhausted",
+                                    "request_id": decision.get("request_id"),
+                                    "stop_reason": read_campaign_terminal_reason(stop_reason).value,
+                                    "unchanged_coverage_extensions": (
+                                        unchanged_coverage_extensions
+                                    ),
+                                    "reason": (
+                                        "three repeated repair plans produced target calls without "
+                                        "new durable evidence, frontier resolution, or semantic "
+                                        "state change; remaining coverage is a limitation"
+                                    ),
+                                },
+                            )
                     break
                 if (
                     purpose == "coverage_extension"
@@ -7319,11 +7414,18 @@ class CampaignService:
                     progress_decision = assess_campaign_progress(None, current_progress)
                 progress_snapshot = current_progress
                 current_frontier_signature = _coverage_frontier_signature(continuation_evidence)
-                if purpose == "coverage_extension" and operator_approved_coverage:
-                    operator_coverage_extensions += 1
-                if (
+                frontier_unchanged = (
                     current_frontier_signature is not None
                     and current_frontier_signature == coverage_frontier_signature
+                )
+                if purpose == "coverage_extension" and operator_approved_coverage:
+                    operator_coverage_extensions += 1
+                if progress_decision.action is ProgressAction.WAIT_FOR_INFRASTRUCTURE:
+                    pass
+                elif (
+                    purpose == "coverage_extension"
+                    and frontier_unchanged
+                    and progress_decision.action is ProgressAction.REPLAN
                 ):
                     unchanged_coverage_extensions += 1
                 else:
@@ -7333,7 +7435,7 @@ class CampaignService:
                     purpose == "coverage_extension"
                     and operator_approved_coverage
                     and (
-                        progress_decision.semantic_plateau
+                        (frontier_unchanged and progress_decision.semantic_plateau)
                         or unchanged_coverage_extensions >= 3
                         or operator_coverage_extensions >= 3
                     )
@@ -7363,7 +7465,6 @@ class CampaignService:
                             "operator_coverage_extensions": operator_coverage_extensions,
                         },
                     )
-                    unchanged_coverage_extensions = 0
                     operator_coverage_extensions = 0
                 if not continuation_canonical:
                     continuation_has_failures = any(
@@ -28139,7 +28240,6 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
                 evidence.add(value)
         for value in receipt.get("target_call_ids", ()):
             if isinstance(value, str) and value.strip():
-                evidence.add(value)
                 target_calls.add(value)
     infrastructure_failures = frozenset(
         reason
