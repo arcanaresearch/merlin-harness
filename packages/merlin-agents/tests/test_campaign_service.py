@@ -7193,7 +7193,7 @@ async def test_repeated_unresolved_repair_plans_stop_without_more_target_calls()
                         "ready": False,
                         "execution_complete": False,
                         "completion_frontier": (frontier,),
-                        "untested_cell_ids": ("technique/unexecuted",),
+                        "untested_cell_ids": (),
                         "catalogue_unresolved_cell_ids": ("technique/unclear",),
                         "frontier_runnable": 1,
                         "frontier_exhausted": False,
@@ -7260,7 +7260,7 @@ async def test_repeated_unresolved_repair_plans_stop_without_more_target_calls()
     continuations, decisions, terminal, lead = await run_scenario()
     assert continuations == 3
     assert decisions == ("continue", "continue", "continue", "stop")
-    assert terminal == ("completed", "budget_exhausted")
+    assert terminal == ("completed", "frontier_exhausted")
     assert any(
         item["payload"].get("kind") == "coverage_repair_plan_budget_exhausted" for item in lead
     )
@@ -7268,12 +7268,12 @@ async def test_repeated_unresolved_repair_plans_stop_without_more_target_calls()
     continuations, decisions, terminal, _ = await run_scenario(semantic_progress_at=3)
     assert continuations == 6
     assert decisions == (*("continue",) * 6, "stop")
-    assert terminal == ("completed", "budget_exhausted")
+    assert terminal == ("completed", "frontier_exhausted")
 
     continuations, decisions, terminal, _ = await run_scenario(infrastructure_at=3)
     assert continuations == 4
     assert decisions == (*("continue",) * 4, "stop")
-    assert terminal == ("completed", "budget_exhausted")
+    assert terminal == ("completed", "frontier_exhausted")
 
 
 @pytest.mark.parametrize(
@@ -7376,7 +7376,7 @@ async def test_autonomous_followup_plans_reach_bounded_coverage_stop(
                             "reasons": ("adapter unavailable",) if infrastructure else (),
                         },
                     ),
-                    "untested_cell_ids": ("technique/unexecuted",),
+                    "untested_cell_ids": (),
                     "catalogue_unresolved_cell_ids": ("technique/unclear",),
                     "frontier_runnable": 1,
                     "frontier_exhausted": False,
@@ -7485,16 +7485,20 @@ async def test_autonomous_followup_plans_reach_bounded_coverage_stop(
         for item in store.lead
     ]
     assert offered_auto_decisions == ["continue", "continue", "continue", "stop"]
-    assert store.terminal == ("completed", "budget_exhausted")
+    assert store.terminal == ("completed", "frontier_exhausted")
     assert any(
         item["payload"].get("kind") == "coverage_followup_plan_budget_exhausted"
         for item in store.lead
     )
 
 
-@pytest.mark.parametrize(("infrastructure_at", "expected_started"), ((None, 3), (2, 4)))
+@pytest.mark.parametrize(
+    ("unsearched_total", "infrastructure_at", "expected_started"),
+    ((None, None, 3), (None, 2, 4), (5, None, 7)),
+)
 async def test_frontier_churn_reaches_coverage_decision_after_three_non_improving_batches(
     monkeypatch: pytest.MonkeyPatch,
+    unsearched_total: int | None,
     infrastructure_at: int | None,
     expected_started: int,
 ) -> None:
@@ -7607,6 +7611,9 @@ async def test_frontier_churn_reaches_coverage_decision_after_three_non_improvin
                     "completion_frontier": frontier,
                     "catalogue_cell_owners": (("catalogue/already-attempted", "task-initial"),),
                     "untested_cell_ids": (),
+                    "catalogue_cells_unsearched": (
+                        max(0, unsearched_total - started) if unsearched_total is not None else 0
+                    ),
                     "catalogue_unresolved_cell_ids": (),
                     "adaptive_unresolved": tuple(
                         f"hypothesis:churn-{index}" for index in range(started + 1)
@@ -7648,7 +7655,7 @@ async def test_frontier_churn_reaches_coverage_decision_after_three_non_improvin
         async def _start_wave(self, _campaign_id, _manifest, wave, kind, _compiled, **_kwargs):
             nonlocal started
             started += 1
-            if started > 6:
+            if started > 8:
                 raise AssertionError("non-improving frontier churn was not bounded")
             return SimpleNamespace(
                 id=f"schedule-{wave}",
@@ -7687,7 +7694,7 @@ async def test_frontier_churn_reaches_coverage_decision_after_three_non_improvin
         if supervisor is None:
             break
         await supervisor
-        if started >= 6 or store.terminal is not None:
+        if started >= 8 or store.terminal is not None:
             break
 
     from merlin_agents.campaign_service import _coverage_frontier_signature
@@ -28089,6 +28096,73 @@ async def test_single_slot_prioritization_escalates_to_non_stalled_adaptive_fami
     escalation = next(event for event in store.events if event["kind"] == "adaptive_escalation")
     assert escalation["candidate_ids"] == (alternative_adaptive.id,)
     assert escalation["non_improving_completed_experiments"] == 3
+
+
+async def test_single_slot_adaptive_escalation_waits_for_admitted_execution() -> None:
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    direct = replace(base, id="cell/direct", strategy_id="direct")
+    alternative_adaptive = replace(base, id="cell/alternative", strategy_id="hydra-select")
+    identity = ArmIdentity("surface", "cell/stalled", "crescendo", "baseline", "und", "state")
+    negative = ArmObservation(
+        identity,
+        "clean_negative",
+        attempt_disposition="valid",
+        outcome_authority="target",
+        completed_experiment=True,
+        native_score_progress=False,
+    )
+
+    class Store:
+        def list_arms(self, _target_id, _scenario):
+            return []
+
+        def list_arm_observations(self, _target_id, _scenario):
+            return [negative, negative, negative]
+
+        def append_lead(self, *_args):
+            return None
+
+        def get(self, campaign_id):
+            return {"id": campaign_id}
+
+    class Service(CampaignService):
+        unsearched = 1
+
+        async def status(self, _campaign_id):
+            return {
+                "saturation": {
+                    "catalogue_cells_unsearched": self.unsearched,
+                    "untested_cell_ids": (direct.id,) if self.unsearched else (),
+                }
+            }
+
+    service = Service(  # type: ignore[arg-type]
+        Store(),
+        object(),
+        None,
+        arm_store=Store(),
+        max_worker_concurrency=1,
+    )
+
+    ordered = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        (alternative_adaptive, direct),
+        3,
+        selection_width=1,
+    )
+    assert ordered[0] is direct
+
+    service.unsearched = 0
+    ordered = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        (direct, alternative_adaptive),
+        4,
+        selection_width=1,
+    )
+    assert ordered[0] is alternative_adaptive
 
 
 async def test_frontier_records_measured_arm_outcomes_before_successor_claim_and_replays_once():

@@ -2771,6 +2771,41 @@ class CampaignService:
         negative or unavailable judgments. Scores never become attack outcomes or
         retirement evidence.
         """
+        if len(candidates) > 1 and callable(getattr(self._store, "get", None)):
+            try:
+                execution_status = await self.status(campaign_id)
+            except (KeyError, AttributeError):
+                execution_status = None
+            if execution_status is not None and not _admitted_execution_complete(
+                execution_status.get("saturation")
+            ):
+                saturation = execution_status.get("saturation")
+                saturation = saturation if isinstance(saturation, Mapping) else {}
+                untested_ids = {
+                    str(value)
+                    for field_name in ("untested_cell_ids", "untested_concrete_ids")
+                    for value in saturation.get(field_name, ())
+                }
+                preferred = tuple(
+                    candidate
+                    for candidate in candidates
+                    if str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                    in untested_ids
+                )
+                if preferred:
+                    preferred_ids = {
+                        str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                        for candidate in preferred
+                    }
+                    return (
+                        *preferred,
+                        *(
+                            candidate
+                            for candidate in candidates
+                            if str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                            not in preferred_ids
+                        ),
+                    )
         if len(candidates) < 2:
             return candidates
         diversity_enabled = selection_width is not None
@@ -2904,6 +2939,15 @@ class CampaignService:
                     )
             except Exception:  # noqa: BLE001 - advisory escalation cannot block execution
                 non_improving_experiments = 0
+                adaptive_escalation_ids = frozenset()
+        if adaptive_escalation_ids and callable(getattr(self._store, "get", None)):
+            try:
+                execution_status = await self.status(campaign_id)
+            except (KeyError, AttributeError):
+                execution_status = None
+            if execution_status is not None and not _admitted_execution_complete(
+                execution_status.get("saturation")
+            ):
                 adaptive_escalation_ids = frozenset()
         if adaptive_escalation_ids:
             append_lead = getattr(self._store, "append_lead", None)
@@ -6136,6 +6180,9 @@ class CampaignService:
                             elif (
                                 frontier_progress_snapshot is not None
                                 and not meaningful_frontier_progress
+                                and _admitted_execution_complete(
+                                    current_frontier_status.get("saturation")
+                                )
                             ):
                                 non_improving_frontier_batches += 1
                             else:
@@ -7243,6 +7290,9 @@ class CampaignService:
                             current_followup_signature is not None
                             and current_followup_signature == followup_frontier_signature
                             and followup_progress_decision.action is ProgressAction.REPLAN
+                            and _admitted_execution_complete(
+                                current_followup_status.get("saturation")
+                            )
                         ):
                             unchanged_followup_plans += 1
                         else:
@@ -7514,6 +7564,7 @@ class CampaignService:
                     purpose == "coverage_extension"
                     and frontier_unchanged
                     and progress_decision.action is ProgressAction.REPLAN
+                    and _admitted_execution_complete(continuation_evidence)
                 ):
                     unchanged_coverage_extensions += 1
                 else:
@@ -28425,6 +28476,22 @@ def _progress_snapshot_from_status(status: Mapping[str, object]) -> ProgressSnap
         attempted_coverage=attempted_coverage,
         observation_fingerprint=observation_fingerprint,
     )
+
+
+def _admitted_execution_complete(saturation: object) -> bool:
+    """Return whether every admitted catalogue cell had an execution opportunity."""
+    if not isinstance(saturation, Mapping):
+        return False
+    if "catalogue_cells_unsearched" in saturation:
+        try:
+            return int(saturation["catalogue_cells_unsearched"]) == 0
+        except (TypeError, ValueError):
+            return False
+    if "untested_cell_ids" in saturation or "untested_concrete_ids" in saturation:
+        return not saturation.get("untested_cell_ids") and not saturation.get(
+            "untested_concrete_ids"
+        )
+    return True
 
 
 def _coverage_extension_stop_reason(*, automatic: bool, saturation: Mapping[str, object]) -> str:
