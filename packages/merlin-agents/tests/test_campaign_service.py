@@ -7588,6 +7588,11 @@ async def test_frontier_churn_reaches_coverage_decision_after_three_non_improvin
                     "receipts": receipts,
                     "findings": (),
                     "capability_probes": (),
+                    "frontier_snapshot": {
+                        "row_digest": f"snapshot-digest-{started}",
+                        "total_count": started + 1,
+                        "counts": {"states": {"queued": started + 1}},
+                    },
                 },
                 "target_progress": {
                     "status": "unknown",
@@ -8271,6 +8276,47 @@ async def test_jev_override_livelock_concludes_when_no_dispatchable_work(
         item["payload"].get("kind") == "coverage_continuation_no_dispatchable_work"
         for item in store.lead
     )
+
+
+async def test_saturation_request_json_normalizes_frontier_execution_spec() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.lead: list[Mapping[str, object]] = []
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def commit_lead_decision(self, campaign_id, wave, _decision_id, payload, _mailbox):
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            self.lead.append({"campaign_id": campaign_id, "wave": wave, "payload": encoded})
+            return {}
+
+    store = Store()
+    service = CampaignService(store, object(), preparation)  # type: ignore[arg-type]
+    created_at = datetime.now(UTC)
+
+    decision = await service._await_saturation_decision(  # noqa: SLF001
+        "campaign-1",
+        4,
+        "sha256:incomplete",
+        purpose="coverage_extension",
+        saturation={
+            "completion_frontier": (
+                {
+                    "state": "unresolved",
+                    "execution_spec": {"created_at": created_at},
+                },
+            ),
+        },
+        auto_decision="stop",
+    )
+
+    assert decision["decision"] == "stop"
+    request = json.loads(store.lead[0]["payload"])
+    persisted_at = request["coverage_gaps"]["completion_frontier"][0]["execution_spec"][
+        "created_at"
+    ]
+    assert persisted_at == created_at.isoformat()
 
 
 async def test_coverage_extension_stops_when_continuation_makes_no_progress() -> None:
