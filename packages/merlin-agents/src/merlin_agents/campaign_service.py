@@ -159,6 +159,7 @@ from .completion_frontier import (
 )
 from .discovery import (
     ArmIdentity,
+    ArmObservation,
     aggregate_observations,
     classify_lifecycle,
     project_family_stalls,
@@ -2763,9 +2764,11 @@ class CampaignService:
         The incoming order carries coverage/history/ARM priorities. Reserve one
         deterministic exploration slot across technique families and target
         states, then fill the dispatch width from the ranked candidates while
-        preferring dimensions not already represented in the batch. All
-        remaining candidates stay queued, including negative or unavailable
-        judgments. Scores never become attack outcomes or retirement evidence.
+        preferring dimensions not already represented in the batch. A single-slot
+        batch can escalate to a non-stalled adaptive family after three completed
+        non-improving experiments. All remaining candidates stay queued, including
+        negative or unavailable judgments. Scores never become attack outcomes or
+        retirement evidence.
         """
         if len(candidates) < 2:
             return candidates
@@ -2778,6 +2781,9 @@ class CampaignService:
             ),
         )
         arm_state_ids: dict[str, set[str]] = {}
+        observations: Sequence[ArmObservation | Mapping[str, object]] = ()
+        non_improving_experiments = 0
+        adaptive_escalation_ids: frozenset[str] = frozenset()
         exploration_order = {
             str(getattr(candidate, "id", "") or _followup_digest(candidate)): index
             for index, candidate in enumerate(candidates)
@@ -2878,6 +2884,44 @@ class CampaignService:
                             ),
                         },
                     )
+        if diversity_enabled and dispatch_width == 1 and observations:
+            try:
+                non_improving_experiments = self._non_improving_experiment_streak(observations)
+                if non_improving_experiments >= 3:
+                    stalled_ids = {
+                        technique_id
+                        for technique_id, stall in project_family_stalls(observations).items()
+                        if stall.stalled
+                    }
+                    adaptive_escalation_ids = frozenset(
+                        str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                        for candidate in candidates
+                        if getattr(candidate, "strategy_id", None)
+                        in {"crescendo", "goat", "hydra-select"}
+                        and str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                        not in stalled_ids
+                    )
+            except Exception:  # noqa: BLE001 - advisory escalation cannot block execution
+                non_improving_experiments = 0
+                adaptive_escalation_ids = frozenset()
+        if adaptive_escalation_ids:
+            append_lead = getattr(self._store, "append_lead", None)
+            if callable(append_lead):
+                await asyncio.to_thread(
+                    append_lead,
+                    campaign_id,
+                    wave,
+                    {
+                        "kind": "adaptive_escalation",
+                        "candidate_ids": tuple(sorted(adaptive_escalation_ids)),
+                        "non_improving_completed_experiments": non_improving_experiments,
+                        "policy": (
+                            "after three non-improving completed experiments, one single-slot "
+                            "batch prefers an adaptive family that is not stalled; every other "
+                            "candidate remains queued"
+                        ),
+                    },
+                )
         client = self._jev_escalation_client()
         if client is None:
             if not diversity_enabled:
@@ -2890,6 +2934,7 @@ class CampaignService:
                 arm_state_ids,
                 exploration_ids,
                 exploration_order,
+                adaptive_escalation_ids,
             )
         width = max(1, self._max_worker_concurrency)
         shortlist = candidates[: 2 * width] if diversity_enabled else candidates[1 : 1 + 2 * width]
@@ -3006,7 +3051,27 @@ class CampaignService:
             arm_state_ids,
             exploration_ids,
             exploration_order,
+            adaptive_escalation_ids,
         )
+
+    @staticmethod
+    def _non_improving_experiment_streak(
+        observations: Sequence[ArmObservation | Mapping[str, object]],
+    ) -> int:
+        streak = 0
+        for raw in reversed(observations):
+            item = raw if isinstance(raw, ArmObservation) else ArmObservation.from_mapping(raw)
+            if item.is_infrastructure_failure or not item.is_completed_experiment:
+                continue
+            improved = item.outcome in {"finding", "validated_finding", "win"} or (
+                item.native_score_progress
+                if item.native_score_progress is not None
+                else item.partial_signal > 0
+            )
+            if improved:
+                break
+            streak += 1
+        return streak
 
     @staticmethod
     def _diversify_execution_candidates(
@@ -3017,21 +3082,34 @@ class CampaignService:
         arm_state_ids: Mapping[str, set[str]],
         exploration_ids: frozenset[str],
         exploration_order: Mapping[str, int],
+        adaptive_escalation_ids: frozenset[str] = frozenset(),
     ) -> tuple[Any, ...]:
         """Order one bounded batch for family/state diversity without filtering.
 
         Objective phase gates have already established eligibility before this
         point. This function only reorders eligible candidates. A single slot
-        keeps the highest-ranked candidate; wider batches reserve one stable
-        wave-specific exploration choice, then prefer new families and target
-        states. The complete suffix is retained for later durable claims.
+        keeps the highest-ranked candidate unless durable evidence triggers an
+        adaptive escalation; wider batches reserve one stable wave-specific
+        exploration choice, then prefer new families and target states. The
+        complete suffix is retained for later durable claims.
         """
-
-        if len(candidates) < 2 or selection_width <= 1:
-            return candidates
 
         def candidate_id(candidate: Any) -> str:
             return str(getattr(candidate, "id", "") or _followup_digest(candidate))
+
+        if selection_width == 1 and adaptive_escalation_ids:
+            adaptive = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate_id(candidate) in adaptive_escalation_ids
+                ),
+                None,
+            )
+            if adaptive is not None:
+                return (adaptive, *(item for item in candidates if item is not adaptive))
+        if len(candidates) < 2 or selection_width <= 1:
+            return candidates
 
         def family(candidate: Any) -> tuple[str, str]:
             semantic_id = str(
