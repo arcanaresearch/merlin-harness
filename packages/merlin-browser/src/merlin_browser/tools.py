@@ -6880,7 +6880,64 @@ class BrowserChatExchangeTool:
                 )
                 if tab_ref in setup_frontier_indexes
             ]
+        generic_composer_disclosure = False
+        if not compatible_tabs and not leading_setup_steps:
+            disclosure_candidates = [
+                (tab.tab_ref, observation, element)
+                for tab, observation in observed_tabs
+                if not _matching_reviewed_elements(
+                    observation,
+                    executable_adapter.interaction.input_locator,
+                    default_role="textbox",
+                )
+                for element in observation.elements
+                if element.role.casefold() == "button"
+                and not element.disabled
+                and not element.read_only
+                and not element.occluded
+                and _normalized_accessible_name(element.name)
+                in {
+                    "chat",
+                    "composer",
+                    "message circle",
+                    "message square",
+                    "messages square",
+                    "new chat",
+                    "open chat",
+                    "open composer",
+                    "pen line",
+                    "show chat",
+                    "show composer",
+                    "square pen",
+                    "write message",
+                }
+            ]
+            if len(disclosure_candidates) == 1:
+                disclosure_tab_ref, disclosure_observation, disclosure_element = (
+                    disclosure_candidates[0]
+                )
+                leading_setup_steps = (
+                    BrowserStep(
+                        role="setup",
+                        step_id="disclose-composer",
+                        tool="browser_click",
+                        arguments={
+                            "locator": {
+                                "role": "button",
+                                "name": disclosure_element.name,
+                            }
+                        },
+                    ),
+                )
+                leading_setup_step_ids = ("disclose-composer",)
+                setup_frontier_indexes[disclosure_tab_ref] = 0
+                setup_frontier_tabs.add(disclosure_tab_ref)
+                compatible_tabs = [(disclosure_tab_ref, disclosure_observation)]
+                activation_required = True
+                generic_composer_disclosure = True
         tab_resolution = "unique_compatible_tab"
+        if generic_composer_disclosure:
+            adapter_identity_metadata["composer_disclosure"] = "accessible_semantics"
         reviewed_affinity_status = "not_available"
         if len(compatible_tabs) > 1:
             handoff_id = adapter.get("recon_handoff_id")

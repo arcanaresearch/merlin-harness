@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 from collections import deque
 from collections.abc import Awaitable, Mapping
@@ -2424,9 +2425,17 @@ class BrowserSession:
             or (await locator.get_attribute("placeholder"))
             or (await locator.get_attribute("name"))
             or (await locator.inner_text())
-            or f"{role.title()} {index + 1}"
+            or ""
         )
-        return " ".join(name.split())[:200]
+        if not name.strip() and role == "button":
+            icon = locator.locator("[data-lucide], svg[class*='lucide-']").first
+            icon_name = await icon.get_attribute("data-lucide")
+            if icon_name is None:
+                icon_class = (await icon.get_attribute("class")) or ""
+                match = re.search(r"(?:^|\s)lucide-([a-z0-9-]+)(?:\s|$)", icon_class)
+                icon_name = match.group(1) if match is not None else None
+            name = icon_name.replace("-", " ") if icon_name else ""
+        return " ".join(name.split())[:200] or f"{role.title()} {index + 1}"
 
     def _frame(self, page: Page, frame_ref: str | None) -> tuple[Frame, str]:
         if frame_ref in (None, "main"):
