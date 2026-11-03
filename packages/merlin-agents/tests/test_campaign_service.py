@@ -7122,6 +7122,376 @@ async def test_operator_continue_expires_after_three_repair_waves() -> None:
     )
 
 
+async def test_repeated_unresolved_repair_plans_stop_without_more_target_calls() -> None:
+    async def run_scenario(
+        *, semantic_progress_at: int | None = None, infrastructure_at: int | None = None
+    ) -> tuple[int, tuple[str, ...], tuple[str, str], list[Mapping[str, object]]]:
+        prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+
+        class Store:
+            def __init__(self) -> None:
+                self.lead: list[Mapping[str, object]] = []
+                self.terminal = None
+
+            def get(self, campaign_id):
+                return {"id": campaign_id, "session_id": "session-1", "status": "executing"}
+
+            def list_lead(self, _campaign_id):
+                return list(self.lead)
+
+            def list_waves(self, _campaign_id):
+                return []
+
+            def finish_wave(self, *_args):
+                return None
+
+            def append_lead(self, _campaign_id, wave, payload):
+                self.lead.append({"wave": wave, "payload": dict(payload)})
+
+            def finish(self, _campaign_id, status, *, stop_reason=None):
+                self.terminal = (status, stop_reason)
+
+        class Agents:
+            async def list_schedule_tasks(self, _schedule_id):
+                return (AgentTask(id="worker", objective="probe", status="completed", result="{}"),)
+
+        continuations = 0
+        offered_auto_decisions: list[str | None] = []
+
+        class Service(CampaignService):
+            async def status(self, campaign_id):
+                infrastructure = continuations == infrastructure_at
+                frontier = {
+                    "kind": "candidate",
+                    "state": "unresolved",
+                    "key": ("candidate", "technique/unclear"),
+                    "identity": {"technique_id": "technique/unclear"},
+                    "sources": ("typed_failure",) if infrastructure else (),
+                    "reasons": ("adapter unavailable",) if infrastructure else (),
+                }
+                findings = (
+                    ({"id": "finding/progress", "status": "draft"},)
+                    if semantic_progress_at is not None and continuations >= semantic_progress_at
+                    else ()
+                )
+                return {
+                    "campaign_id": campaign_id,
+                    "completion_digest": (
+                        f"sha256:incomplete-{continuations}-{bool(findings)}-{infrastructure}"
+                    ),
+                    "completion_document": {
+                        "receipts": (
+                            {
+                                "target_call_ids": tuple(
+                                    f"target-call-{index}" for index in range(continuations)
+                                )
+                            },
+                        ),
+                        "findings": findings,
+                    },
+                    "saturation": {
+                        "ready": False,
+                        "execution_complete": False,
+                        "completion_frontier": (frontier,),
+                        "untested_cell_ids": ("technique/unexecuted",),
+                        "catalogue_unresolved_cell_ids": ("technique/unclear",),
+                        "frontier_runnable": 1,
+                        "frontier_exhausted": False,
+                        "total_tasks": continuations + 1,
+                        "terminal_tasks": continuations + 1,
+                    },
+                }
+
+            async def _await_saturation_decision(self, *args, auto_decision=None, **kwargs):
+                offered_auto_decisions.append(auto_decision)
+                if len(offered_auto_decisions) > 8:
+                    raise AssertionError("identical unresolved repair plans were not bounded")
+                return {
+                    "decision": auto_decision or "continue",
+                    "automatic": auto_decision is not None,
+                    "request_id": f"coverage-{len(offered_auto_decisions)}",
+                    "coverage_gaps": {
+                        "catalogue_unresolved_cell_ids": ("technique/unclear",),
+                    },
+                }
+
+            async def _run_saturation_continuation(
+                self, campaign_id, manifest, context, wave, tasks, decision, *args, **kwargs
+            ):
+                nonlocal continuations
+                continuations += 1
+                repaired = (
+                    AgentTask(
+                        id=f"repair-{continuations}",
+                        objective="retry unclear coverage",
+                        status="completed",
+                        result="{}",
+                    ),
+                )
+                return wave + 1, repaired, LeadAssessment("frontier unchanged", False), set()
+
+            async def _campaign_budget_capped(self, *_args):
+                return False
+
+        async def lead(*_args):
+            return LeadAssessment("coverage incomplete", False)
+
+        store = Store()
+        service = Service(  # type: ignore[arg-type]
+            store,
+            Agents(),
+            preparation,
+            lead,
+            max_coverage_extensions=8,
+        )
+        await service._supervise(  # noqa: SLF001
+            prepared.manifest.id,
+            prepared.manifest,
+            prepared.assignment_context,
+            SimpleNamespace(id="initial", execution=None),
+        )
+        return (
+            continuations,
+            tuple(str(item) for item in offered_auto_decisions),
+            store.terminal,
+            store.lead,
+        )
+
+    continuations, decisions, terminal, lead = await run_scenario()
+    assert continuations == 3
+    assert decisions == ("continue", "continue", "continue", "stop")
+    assert terminal == ("completed", "budget_exhausted")
+    assert any(
+        item["payload"].get("kind") == "coverage_repair_plan_budget_exhausted" for item in lead
+    )
+
+    continuations, decisions, terminal, _ = await run_scenario(semantic_progress_at=3)
+    assert continuations == 6
+    assert decisions == (*("continue",) * 6, "stop")
+    assert terminal == ("completed", "budget_exhausted")
+
+    continuations, decisions, terminal, _ = await run_scenario(infrastructure_at=3)
+    assert continuations == 4
+    assert decisions == (*("continue",) * 4, "stop")
+    assert terminal == ("completed", "budget_exhausted")
+
+
+@pytest.mark.parametrize(
+    ("semantic_progress_at", "infrastructure_at", "expected_target_waves"),
+    ((None, None, 6), (2, None, 8), (None, 2, 7)),
+)
+async def test_autonomous_followup_plans_reach_bounded_coverage_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_progress_at: int | None,
+    infrastructure_at: int | None,
+    expected_target_waves: int,
+) -> None:
+    prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
+    manifest = prepared.manifest
+    monkeypatch.setattr(
+        "merlin_agents.campaign_service._specialist_composition",
+        lambda _manifest: "autonomous",
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.lead: list[Mapping[str, object]] = []
+            self.terminal = None
+
+        def get(self, campaign_id):
+            return {"id": campaign_id, "session_id": "session-1", "status": "executing"}
+
+        def list_lead(self, _campaign_id):
+            return list(self.lead)
+
+        def list_waves(self, _campaign_id):
+            return []
+
+        def finish_wave(self, *_args):
+            return None
+
+        def append_lead(self, _campaign_id, wave, payload):
+            self.lead.append({"wave": wave, "payload": dict(payload)})
+
+        def finish(self, _campaign_id, status, *, stop_reason=None):
+            self.terminal = (status, stop_reason)
+
+    class Agents:
+        async def list_schedule_tasks(self, _schedule_id):
+            return (AgentTask(id="worker", objective="probe", status="completed", result="{}"),)
+
+    target_waves = 0
+    offered_auto_decisions: list[str | None] = []
+    recon = AgentTask(id="recon", objective="observed target", status="completed", result="{}")
+    hypothesis = FrontierHypothesis(
+        "reviewed surface",
+        "the same unresolved assertion",
+        "the reviewed oracle changes",
+        "the same target-derived repair plan",
+        target_id=manifest.target.id,
+        scenario_fingerprint=scenario_fingerprint_for(manifest.target, manifest.catalogue),
+    )
+    followup = LeadFollowUp(
+        "adversarial-explorer",
+        "retry the unresolved assertion",
+        (recon.id,),
+        hypothesis,
+        arm={"id": "arm/stable", "technique_id": "technique/unclear"},
+    )
+
+    class Service(CampaignService):
+        async def status(self, campaign_id):
+            infrastructure = target_waves == infrastructure_at
+            findings = (
+                ({"id": "finding/followup-progress", "status": "draft"},)
+                if semantic_progress_at is not None and target_waves >= semantic_progress_at
+                else ()
+            )
+            return {
+                "campaign_id": campaign_id,
+                "completion_digest": (
+                    f"sha256:incomplete-{target_waves}-{bool(findings)}-{infrastructure}"
+                ),
+                "completion_document": {
+                    "receipts": (
+                        {
+                            "target_call_ids": tuple(
+                                f"target-call-{index}" for index in range(target_waves)
+                            )
+                        },
+                    ),
+                    "findings": findings,
+                },
+                "saturation": {
+                    "ready": False,
+                    "execution_complete": False,
+                    "attempted_techniques": 1,
+                    "completion_frontier": (
+                        {
+                            "kind": "candidate",
+                            "state": "unresolved",
+                            "key": ("candidate", "technique/unclear"),
+                            "identity": {"technique_id": "technique/unclear"},
+                            "sources": ("typed_failure",) if infrastructure else (),
+                            "reasons": ("adapter unavailable",) if infrastructure else (),
+                        },
+                    ),
+                    "untested_cell_ids": ("technique/unexecuted",),
+                    "catalogue_unresolved_cell_ids": ("technique/unclear",),
+                    "frontier_runnable": 1,
+                    "frontier_exhausted": False,
+                    "total_tasks": target_waves + 1,
+                    "terminal_tasks": target_waves + 1,
+                },
+            }
+
+        async def _completed_recon_source(self, _campaign_id):
+            return recon, {"digest": "sha256:recon", "reference": "receipt:recon"}
+
+        async def _discover_arms(self, *_args, **_kwargs):
+            return (({"id": "arm/stable"}, followup),), {}, ()
+
+        def _select_exploration_followups(self, novel, *_args, **kwargs):
+            generated = tuple(followup for _arm, followup in kwargs.get("generated", ()))
+            return (*novel, *generated), {}
+
+        async def _prioritize_execution_candidates(self, _campaign_id, _manifest, novel, _wave):
+            return novel
+
+        def _followup_compilation(self, *_args, **_kwargs):
+            return SimpleNamespace(assignments=(object(),))
+
+        async def _cap_followups_within_hypothesis_budget(self, _campaign_id, novel, **_kwargs):
+            return novel, ()
+
+        async def _source_evidence(self, *_args):
+            return {}
+
+        async def _record_arm_outcomes(self, *_args, **_kwargs):
+            return None
+
+        async def _record_recommended_hypothesis_portfolio(self, *_args, **_kwargs):
+            return None
+
+        async def _persisted_campaign_wave_schedule_id(self, _campaign_id, wave):
+            return f"schedule-{wave}"
+
+        async def _run_wave(self, _campaign_id, _manifest, wave, _kind, _compiled):
+            nonlocal target_waves
+            target_waves += 1
+            if target_waves > 8:
+                raise AssertionError("autonomous follow-up plans were not bounded")
+            return (
+                AgentTask(
+                    id=f"repair-{target_waves}",
+                    objective="retry the unresolved assertion",
+                    status="completed",
+                    result="{}",
+                ),
+            )
+
+        async def _assess_and_journal(self, *_args):
+            return LeadAssessment("all tasks terminal", True)
+
+        async def _await_saturation_decision(self, *args, auto_decision=None, **kwargs):
+            offered_auto_decisions.append(auto_decision)
+            return {
+                "decision": auto_decision or "continue",
+                "automatic": auto_decision is not None,
+                "request_id": f"coverage-{len(offered_auto_decisions)}",
+                "coverage_gaps": {
+                    "catalogue_unresolved_cell_ids": ("technique/unclear",),
+                },
+            }
+
+        async def _run_saturation_continuation(
+            self, campaign_id, active_manifest, context, wave, tasks, decision, *args, **kwargs
+        ):
+            nonlocal target_waves
+            target_waves += 1
+            repaired = (
+                AgentTask(
+                    id=f"coverage-repair-{target_waves}",
+                    objective="retry unresolved coverage",
+                    status="completed",
+                    result="{}",
+                ),
+            )
+            return wave + 1, repaired, LeadAssessment("frontier unchanged", False), set()
+
+        async def _campaign_budget_capped(self, *_args):
+            return False
+
+    async def lead(*_args):
+        return LeadAssessment("all tasks terminal", True)
+
+    store = Store()
+    service = Service(  # type: ignore[arg-type]
+        store,
+        Agents(),
+        preparation,
+        lead,
+        max_coverage_extensions=8,
+    )
+    await service._supervise(  # noqa: SLF001
+        manifest.id,
+        manifest,
+        prepared.assignment_context,
+        SimpleNamespace(id="initial", execution=None),
+    )
+
+    assert target_waves == expected_target_waves, [
+        (item["wave"], item["payload"].get("kind"), item["payload"].get("target_wave"))
+        for item in store.lead
+    ]
+    assert offered_auto_decisions == ["continue", "continue", "continue", "stop"]
+    assert store.terminal == ("completed", "budget_exhausted")
+    assert any(
+        item["payload"].get("kind") == "coverage_followup_plan_budget_exhausted"
+        for item in store.lead
+    )
+
+
 async def test_fully_executed_inconclusive_graph_completes_with_limitations() -> None:
     prepared = await preparation("session-1", "Assess", CampaignProfile.RECOMMENDED)
 
