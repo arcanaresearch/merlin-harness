@@ -83,8 +83,13 @@ install_bundle() {
   printf '%s\n' "$requested_channel" > "$channel_stage"
   mv "$channel_stage" "$channel_file"
   mkdir -p -- "$postgres_home"
-  ln -sfn "$destination/payload/postgresql/$postgres_version" \
-    "$postgres_home/$postgres_version"
+  if [ -L "$postgres_home/$postgres_version" ]; then
+    ln -sfn "$destination/payload/postgresql/$postgres_version" \
+      "$postgres_home/$postgres_version"
+  elif [ ! -e "$postgres_home/$postgres_version" ]; then
+    ln -s "$destination/payload/postgresql/$postgres_version" \
+      "$postgres_home/$postgres_version"
+  fi
   "$bin_path" --version
   echo "installed: $bin_path"
 }
