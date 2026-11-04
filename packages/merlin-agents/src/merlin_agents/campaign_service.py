@@ -2750,6 +2750,125 @@ class CampaignService:
             exact_priors,
         )
 
+    @staticmethod
+    def _native_execution_priorities(
+        candidates: tuple[Any, ...],
+        observations: Sequence[ArmObservation | Mapping[str, object]],
+    ) -> dict[str, int]:
+        positive: list[tuple[str, str, str]] = []
+        for raw in observations:
+            item = raw if isinstance(raw, ArmObservation) else ArmObservation.from_mapping(raw)
+            has_positive_delta = item.native_score_progress is True or (
+                item.native_score_progress is False
+                and item.outcome == "near_miss"
+                and item.partial_signal > 0
+            )
+            if (
+                not has_positive_delta
+                or item.is_infrastructure_failure
+                or not item.quality_eligible
+                or not item.is_completed_experiment
+            ):
+                continue
+            positive.append(
+                (
+                    item.identity.technique_id,
+                    item.identity.technique_id.split("@lang=", 1)[0],
+                    item.identity.mutation_id,
+                )
+            )
+        priorities: dict[str, int] = {}
+        for candidate in candidates:
+            candidate_id = str(getattr(candidate, "id", "") or _followup_digest(candidate))
+            arm = getattr(candidate, "arm", None)
+            technique_id = (
+                str(arm.get("technique_id") or candidate_id)
+                if isinstance(arm, Mapping)
+                else candidate_id
+            )
+            mutation_id = (
+                str(arm.get("mutation_id") or "baseline")
+                if isinstance(arm, Mapping)
+                else str(getattr(candidate, "transform_id", "baseline") or "baseline")
+            )
+            family_id = str(
+                getattr(candidate, "semantic_id", None)
+                or getattr(candidate, "resolved_semantic_id", None)
+                or technique_id.split("@lang=", 1)[0]
+            )
+            for observed_id, observed_family, observed_mutation in positive:
+                priority = (
+                    3
+                    if technique_id == observed_id
+                    else 2
+                    if family_id == observed_family and mutation_id == observed_mutation
+                    else 1
+                    if family_id == observed_family
+                    else 0
+                )
+                priorities[candidate_id] = max(priority, priorities.get(candidate_id, 0))
+        return {key: value for key, value in priorities.items() if value}
+
+    @staticmethod
+    def _declared_level_target_met(progress: Mapping[str, object]) -> bool:
+        if (
+            progress.get("schema") != "merlin.target-progress.v1"
+            or progress.get("status") != "observed"
+            or progress.get("conflicts")
+        ):
+            return False
+        fields = progress.get("current_state")
+        if not isinstance(fields, Sequence) or isinstance(fields, (str, bytes)):
+            return False
+
+        def number(item: Mapping[str, object]) -> float | None:
+            value = item.get("value")
+            if (
+                item.get("trust_class") != "target_reported"
+                or item.get("value_type") not in {"integer", "number"}
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not str(item.get("source_call_id") or "")
+            ):
+                return None
+            return float(value)
+
+        for level in fields:
+            if not isinstance(level, Mapping) or level.get("role") != "progress_ordinal":
+                continue
+            level_number = number(level)
+            if level_number is None:
+                continue
+            for current in fields:
+                if (
+                    not isinstance(current, Mapping)
+                    or current.get("role") != "score"
+                    or current.get("name") not in {"current_score", "score", "progress_score"}
+                ):
+                    continue
+                current_number = number(current)
+                if current_number is None:
+                    continue
+                for target in fields:
+                    if (
+                        not isinstance(target, Mapping)
+                        or target.get("role") != "score"
+                        or target.get("name") != "target_score"
+                    ):
+                        continue
+                    target_number = number(target)
+                    call_ids = {
+                        str(item.get("source_call_id")) for item in (level, current, target)
+                    }
+                    if (
+                        target_number is not None
+                        and len(call_ids) == 1
+                        and current_number >= target_number
+                    ):
+                        return True
+        return False
+
     async def _prioritize_execution_candidates(
         self,
         campaign_id: str,
@@ -2771,7 +2890,33 @@ class CampaignService:
         negative or unavailable judgments. Scores never become attack outcomes or
         retirement evidence.
         """
-        if len(candidates) > 1 and callable(getattr(self._store, "get", None)):
+        if not candidates:
+            return candidates
+        try:
+            progress = await self.target_progress(campaign_id, manifest.target.id)
+        except Exception:  # noqa: BLE001 - target projection cannot block execution
+            progress = {}
+        if self._declared_level_target_met(progress):
+            return ()
+        observations: Sequence[ArmObservation | Mapping[str, object]] = ()
+        arm_source = self._arm_store
+        arm_loader = getattr(arm_source, "list_arms", None)
+        observation_loader = getattr(arm_source, "list_arm_observations", None)
+        native_priorities: dict[str, int] = {}
+        if callable(arm_loader) and callable(observation_loader):
+            scenario = scenario_fingerprint_for(manifest.target, manifest.catalogue)
+            try:
+                observations = await asyncio.to_thread(
+                    observation_loader, manifest.target.id, scenario
+                )
+                native_priorities = self._native_execution_priorities(candidates, observations)
+            except Exception:  # noqa: BLE001 - advisory ranking cannot block execution
+                observations = ()
+        if (
+            len(candidates) > 1
+            and not native_priorities
+            and callable(getattr(self._store, "get", None))
+        ):
             try:
                 execution_status = await self.status(campaign_id)
             except (KeyError, AttributeError):
@@ -2787,10 +2932,21 @@ class CampaignService:
                     for value in saturation.get(field_name, ())
                 }
                 preferred = tuple(
-                    candidate
-                    for candidate in candidates
-                    if str(getattr(candidate, "id", "") or _followup_digest(candidate))
-                    in untested_ids
+                    sorted(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                            in untested_ids
+                        ),
+                        key=lambda candidate: any(
+                            "/cat/agent-to-agent/" in str(value)
+                            for value in (
+                                getattr(candidate, "semantic_id", None),
+                                getattr(candidate, "id", ""),
+                            )
+                        ),
+                    )
                 )
                 if preferred:
                     preferred_ids = {
@@ -2817,7 +2973,6 @@ class CampaignService:
             ),
         )
         arm_state_ids: dict[str, set[str]] = {}
-        observations: Sequence[ArmObservation | Mapping[str, object]] = ()
         non_improving_experiments = 0
         adaptive_escalation_ids: frozenset[str] = frozenset()
         exploration_order = {
@@ -2840,9 +2995,6 @@ class CampaignService:
                 # operations on that connection intermittently fail and would
                 # make adaptive ranking fall back to catalogue order.
                 arms = await asyncio.to_thread(arm_loader, manifest.target.id, scenario)
-                observations = await asyncio.to_thread(
-                    observation_loader, manifest.target.id, scenario
-                )
                 candidate_ids = {
                     str(getattr(candidate, "id", "") or _followup_digest(candidate))
                     for candidate in candidates
@@ -2920,6 +3072,20 @@ class CampaignService:
                             ),
                         },
                     )
+        if native_priorities:
+            candidates = tuple(
+                candidate
+                for _, candidate in sorted(
+                    enumerate(candidates),
+                    key=lambda item: (
+                        -native_priorities.get(
+                            str(getattr(item[1], "id", "") or _followup_digest(item[1])),
+                            0,
+                        ),
+                        item[0],
+                    ),
+                )
+            )
         if diversity_enabled and dispatch_width == 1 and observations:
             try:
                 non_improving_experiments = self._non_improving_experiment_streak(observations)
@@ -3440,6 +3606,12 @@ class CampaignService:
                 selection_width=batch_limit,
                 exploration_candidate_ids=exploration_candidate_ids,
             )
+            if not prioritized:
+                return replace(context, techniques=()), {
+                    "id": batch_id,
+                    "state": "settled",
+                    "candidates": (),
+                }
             selected_ids = tuple(item.id for item in prioritized[:batch_limit])
             shortlist_by_id = {
                 str(row.get("id") or ""): row for row in shortlist_rows if isinstance(row, Mapping)
