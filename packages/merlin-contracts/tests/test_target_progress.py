@@ -79,6 +79,24 @@ def test_target_progress_projects_current_partition_and_transition() -> None:
     assert snapshot["latest_transition"]["outcome"] == "progress"
 
 
+def test_target_progress_drops_previous_level_score_on_level_transition() -> None:
+    observations = [
+        _observation("level", "progress_ordinal", "baseline", 2),
+        _observation("level", "progress_ordinal", "result", 3),
+        _observation("score", "score", "baseline", 100),
+        _observation("score", "score", "result", 100),
+    ]
+
+    snapshot = project_target_progress(
+        [_effect("call/level-change", observations)],
+        campaign_id="campaign/1",
+        target_id="target/1",
+        now=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+    )
+
+    assert [(item["name"], item["value"]) for item in snapshot["current_state"]] == [("level", 3)]
+
+
 def test_target_progress_deduplicates_promoted_browser_observations() -> None:
     level = _observation("level", "progress_ordinal", "result", 2)
     effect = _effect("call/browser", [level])

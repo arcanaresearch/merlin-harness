@@ -59,6 +59,19 @@ def project_target_progress(
         candidates = [item for item in _mapping_sequence(metadata.get("state_observations"))]
         for exchange in exchanges:
             candidates.extend(_mapping_sequence(exchange.get("state_observations")))
+        levels = [
+            item
+            for item in candidates
+            if item.get("name") in {"level", "level_number"}
+            and item.get("phase") in {"baseline", "result"}
+        ]
+        level_changed = any(
+            item.get("selected_value") != other.get("selected_value")
+            for index, item in enumerate(levels)
+            for other in levels[index + 1 :]
+        )
+        if level_changed:
+            candidates = [item for item in candidates if item.get("role") != "score"]
         identity = next(
             (
                 str(item["selected_digest"])
