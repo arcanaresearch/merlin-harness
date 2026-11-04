@@ -8233,13 +8233,32 @@ class BrowserChatExchangeTool:
         response_boundary_complete = False
         last_response_change = asyncio.get_running_loop().time()
         response_settle_seconds = min(0.6, max(0.2, timeout_ms / 4_000))
+        response_observation_seconds = min(1.5, max(response_settle_seconds, timeout_ms / 10_000))
+        response_observation_deadline: float | None = None
+        response_observation_truncated = False
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.2)
-            candidate = await session.snapshot(
-                tab_ref,
-                response_frame,
-                step=activation_steps_completed + len(executable) + 2,
-            )
+            try:
+                candidate = await session.snapshot(
+                    tab_ref,
+                    response_frame,
+                    step=activation_steps_completed + len(executable) + 2,
+                )
+            except Exception:
+                if not response_boundary_complete or response_observation_deadline is None:
+                    raise
+                rendered_state_capture_uncertainties.append(
+                    {
+                        "kind": "evaluation_uncertain",
+                        "source": "browser.rendered_state.post_response.capture",
+                        "reason": (
+                            "The optional post-response native-state observation was unavailable; "
+                            "the latest captured response evidence was retained."
+                        ),
+                        "confidence": 0.0,
+                    }
+                )
+                break
             candidate_url = next(
                 (tab.url for tab in session.metadata().tabs if tab.tab_ref == tab_ref),
                 after_observed_url,
@@ -8325,7 +8344,30 @@ class BrowserChatExchangeTool:
                 >= response_settle_seconds
             ):
                 response_boundary_complete = response_boundary_observed
-                break
+                if (
+                    not response_boundary_complete
+                    or not executable_adapter.interaction.state_observations
+                ):
+                    break
+                now = asyncio.get_running_loop().time()
+                if response_observation_deadline is None:
+                    requested_observation_deadline = now + response_observation_seconds
+                    response_observation_truncated = requested_observation_deadline > deadline
+                    response_observation_deadline = min(requested_observation_deadline, deadline)
+                if now >= response_observation_deadline:
+                    break
+        if response_boundary_complete and response_observation_truncated:
+            rendered_state_capture_uncertainties.append(
+                {
+                    "kind": "evaluation_uncertain",
+                    "source": "browser.rendered_state.post_response.deadline",
+                    "reason": (
+                        "The overall response deadline ended the optional native-state "
+                        "observation window; the latest captured response evidence was retained."
+                    ),
+                    "confidence": 0.0,
+                }
+            )
         response_completed = time.monotonic()
         public_after = after
         checkpoint_secret = captured_checkpoint_secret or restore_secret

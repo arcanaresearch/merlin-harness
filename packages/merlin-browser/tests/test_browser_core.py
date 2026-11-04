@@ -19592,7 +19592,7 @@ async def test_compiled_chat_exchange_rejects_occluded_reviewed_controls_pre_eff
 
 
 @pytest.mark.asyncio
-async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_modal_state() -> None:
+async def test_compiled_chat_exchange_captures_delayed_score_and_resets_next_level() -> None:
     chat = b"""
     <div id="level">Level 1</div>
     <div>Target score: 75</div>
@@ -19601,16 +19601,24 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
     <textarea aria-label="Message" maxlength="500"></textarea>
     <button aria-label="Send" onclick="
       document.getElementById('status').textContent='sending';
-      setTimeout(() => {
-        document.getElementById('reply').insertAdjacentHTML(
-          'beforeend', '<div>Score: 100</div>'
-        );
-      }, 800);
-      setTimeout(() => {
-        document.getElementById('current-score').textContent='100/100';
-        document.getElementById('history').textContent='Attack history: 9';
-        document.getElementById('modal').hidden=false;
-      }, 1050);
+      if (window.levelTwo) {
+        document.getElementById('reply').innerHTML=
+          '<div>Target reply</div><div>Score: 0</div>';
+      } else {
+        setTimeout(() => {
+          document.getElementById('reply').insertAdjacentHTML(
+            'beforeend', '<div>Target reply</div>'
+          );
+        }, 100);
+        setTimeout(() => {
+          document.getElementById('reply').insertAdjacentHTML(
+            'beforeend', '<div>Score: 100</div>'
+          );
+          document.getElementById('current-score').textContent='100/100';
+          document.getElementById('history').textContent='Attack history: 9';
+          document.getElementById('modal').hidden=false;
+        }, 1000);
+      }
     ">Send</button>
     <div id="status"></div>
     <div id="reply"><div>Score: 0</div></div>
@@ -19619,10 +19627,11 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
       <button aria-label="Keep Playing">Keep Playing</button>
       <button aria-label="Try Another App">Try Another App</button>
       <button aria-label="Next Level" onclick="
+        window.levelTwo=true;
         document.getElementById('level').textContent='Level 2';
         document.getElementById('current-score').textContent='0/100';
         document.getElementById('history').textContent='Attack history: 0';
-        document.getElementById('reply').innerHTML='';
+        document.getElementById('reply').innerHTML='<div>Score: 0</div>';
         document.getElementById('modal').hidden=true;
       ">Next Level</button>
     </div>
@@ -19668,7 +19677,7 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
             contract["submit_action"] = "button Send"
             probe = contract["probe"]
             assert isinstance(probe, dict)
-            probe["response_witness"] = "Score:"
+            probe["response_witness"] = "Target reply"
             contract["state_observations"] = [
                 {
                     "name": "level",
@@ -19790,6 +19799,7 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
                 "attack_history_count",
             }
             assert first.metadata["preferred_next_tool"] == "browser_snapshot"
+            assert exchange["response_wait_ms"] >= 900
 
             next_level = next(
                 item for item in final_snapshot["elements"] if item["name"] == "Next Level"
@@ -19832,6 +19842,64 @@ async def test_compiled_chat_exchange_waits_for_witness_and_projects_dynamic_mod
             assert advanced.metadata["preferred_next_tool"] == "browser_snapshot"
             assert advanced.metadata["compiled_adapter_digest"] == compiled_adapter_digest
             assert scope_store.settle_calls[-1]["transition_disposition"] == "progress"
+
+            second = await broker.invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello again", "timeout_ms": 3_000},
+            )
+            assert second.is_error is False
+            second_values = {
+                item["name"]: item["selected_value"]
+                for item in second.metadata["state_observations"]
+                if item["phase"] == "result"
+            }
+            assert second_values == {
+                "level": 2,
+                "target_score": 75,
+                "current_score": 0,
+                "reply_score": 0,
+                "attack_history_count": 0,
+            }
+
+            from merlin_contracts import (
+                ToolEffectRecord,
+                ToolEffectState,
+                project_target_progress,
+            )
+
+            def effect(call_id: str, result, observed_at: datetime) -> ToolEffectRecord:
+                return ToolEffectRecord(
+                    idempotency_key=f"effect:{call_id}",
+                    session_id="s1",
+                    call_id=call_id,
+                    campaign_id="campaign:test",
+                    target_id="target",
+                    tool_name="browser_chat_exchange",
+                    effect="target_network",
+                    arguments_digest="sha256:" + "1" * 64,
+                    state=ToolEffectState.ACKNOWLEDGED,
+                    result_metadata=result.metadata,
+                    created_at=observed_at,
+                    updated_at=observed_at,
+                )
+
+            progress = project_target_progress(
+                [
+                    effect("score-level-1", first, datetime(2026, 1, 1, tzinfo=UTC)),
+                    effect("score-level-2", second, datetime(2026, 1, 2, tzinfo=UTC)),
+                ],
+                campaign_id="campaign:test",
+                target_id="target",
+                now=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+            assert {item["name"]: item["value"] for item in progress["current_state"]} == {
+                "level": 2,
+                "current_score": 0,
+                "reply_score": 0,
+                "target_score": 75,
+                "attack_history_count": 0,
+            }
 
 
 @pytest.mark.asyncio
@@ -21465,6 +21533,171 @@ async def test_static_page_witness_does_not_accept_prompt_echo_alone(prompt: str
             assert result.metadata["response_boundary_complete"] is False
             assert result.metadata["response_boundary_fallback"] is False
             assert "target_exchanges" not in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_delayed_score_without_target_reply_does_not_complete_response() -> None:
+    chat = b"""
+    <div id="score">Score: 0</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      setTimeout(() => document.getElementById('score').textContent='Score: 100', 1000);
+    ">Send</button>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Target reply"
+            contract["state_observations"] = [
+                {
+                    "name": "score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "Score: {value}"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 0,
+                    "maximum_value": 100,
+                }
+            ]
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 2_000},
+            )
+
+            assert result.is_error is True
+            assert result.metadata["failure_code"] == "compiled_response_boundary_incomplete"
+            assert result.metadata["response_boundary_observed"] is False
+            assert result.metadata["response_boundary_complete"] is False
+            assert result.metadata["attempt_disposition"] == "uncertain"
+            assert "target_exchanges" not in result.metadata
+            assert {
+                (item["name"], item["phase"]): item["selected_value"]
+                for item in result.metadata["state_observations"]
+            } == {("score", "baseline"): 0, ("score", "result"): 100}
+
+
+@pytest.mark.asyncio
+async def test_post_response_state_deadline_preserves_reply_and_records_uncertainty() -> None:
+    chat = b"""
+    <div id="score">Score: 0</div>
+    <textarea aria-label="Message" maxlength="500"></textarea>
+    <button aria-label="Send" onclick="
+      setTimeout(() => document.getElementById('reply').textContent='Target reply', 400);
+      setTimeout(() => document.getElementById('score').textContent='Score: 100', 1200);
+    ">Send</button>
+    <div id="reply"></div>
+    """
+
+    class Recorder:
+        async def append_action(self, _value):
+            return None
+
+        async def append_observation(self, _value):
+            return None
+
+        async def record_evidence(self, *_value):
+            return None
+
+        async def save_metadata(self, _value):
+            return None
+
+    async def allow(*_):
+        return True
+
+    async with web_fixture(chat) as origin:
+        async with await launch_isolated(
+            BrowserBounds(target_id="target", allowed_origins={origin}), owner()
+        ) as session:
+            await session.new_tab(origin)
+            adapter = reviewed_browser_adapter(origin)
+            adapter["browser_steps"] = [
+                {
+                    "step_id": "fill",
+                    "tool": "browser_fill",
+                    "arguments": {"locator": "textbox Message"},
+                },
+                {
+                    "step_id": "submit",
+                    "tool": "browser_click",
+                    "arguments": {"locator": "button Send"},
+                },
+            ]
+            contract = adapter["interaction_contract"]
+            assert isinstance(contract, dict)
+            probe = contract["probe"]
+            assert isinstance(probe, dict)
+            probe["response_witness"] = "Target reply"
+            contract["state_observations"] = [
+                {
+                    "name": "score",
+                    "role": "score",
+                    "value_type": "integer",
+                    "capture": {"template": "Score: {value}"},
+                    "preferred_direction": "increase",
+                    "minimum_value": 0,
+                    "maximum_value": 100,
+                }
+            ]
+
+            result = await ToolBroker(
+                browser_tools(lambda _: session, Recorder(), lambda _: adapter),
+                confirmer=allow,
+            ).invoke(
+                "browser_chat_exchange",
+                ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
+                {"prompt": "hello", "timeout_ms": 900},
+            )
+
+            assert result.is_error is False, result.content
+            assert result.metadata["response_boundary_observed"] is True
+            assert result.metadata["response_boundary_complete"] is True
+            assert result.metadata["attempt_disposition"] == "valid"
+            assert result.metadata["response_wait_ms"] < 1_200
+            assert any(
+                item["source"] == "browser.rendered_state.post_response.deadline"
+                for item in result.metadata["evaluation_uncertainties"]
+            )
 
 
 @pytest.mark.asyncio
