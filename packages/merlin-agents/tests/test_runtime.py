@@ -7266,10 +7266,18 @@ def test_target_evidence_receipts_survive_long_run_checkpoint_compaction() -> No
             "target_session_id": "session-1",
             "adapter_digest": "sha256:adapter",
             "target_exchanges": [{"interaction": True, "cleanup": False}],
+            "state_observations": [
+                {"name": "score", "phase": "baseline", "selected_value": 10},
+                {"name": "score", "phase": "result", "selected_value": 36},
+            ],
         },
     )
     evidence: dict[str, dict[str, object]] = {}
     WorkerRuntime._record_target_evidence(evidence, handoff(), call, result)  # noqa: SLF001
+    assert evidence[call.call_id]["state_observations"] == [
+        {"name": "score", "phase": "baseline", "selected_value": 10},
+        {"name": "score", "phase": "result", "selected_value": 36},
+    ]
     messages = [
         ChatMessage(role="system", content="identity"),
         ChatMessage(role="user", content="objective"),
@@ -7324,6 +7332,7 @@ def test_target_evidence_receipts_survive_long_run_checkpoint_compaction() -> No
     assert receipt["semantic_response_sha256"] == WorkerRuntime._retry_semantic_fingerprint(  # noqa: SLF001
         result.content
     )
+    assert receipt["state_observations"] == result.metadata["state_observations"]
     assert "content" not in receipt
 
 

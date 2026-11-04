@@ -324,7 +324,13 @@ def test_worker_partial_outcome_without_valid_signal_is_ambiguous() -> None:
 
 
 def _native_score_committed(
-    hypothesis_id: str, before: int, after: int, *, call_id: str = "call:native"
+    hypothesis_id: str,
+    before: int,
+    after: int,
+    *,
+    call_id: str = "call:native",
+    dom_only: bool = False,
+    level_change: bool = False,
 ) -> dict[str, object]:
     def observed(phase: str, name: str, role: str, value: object) -> dict[str, object]:
         return build_state_observation(
@@ -336,11 +342,13 @@ def _native_score_committed(
             pointer=f"/state/{name}",
             binding_context={"adapter": "reviewed"},
             selected_value=value,
-            value_type="integer" if role == "score" else "string",
+            value_type="integer" if role in {"score", "progress_ordinal"} else "string",
             preferred_direction="increase" if role == "score" else None,
             minimum_value=0 if role == "score" else None,
             maximum_value=100 if role == "score" else None,
-            trust_class="host_observed" if role == "score" else None,
+            trust_class=("target_reported" if dom_only else "host_observed")
+            if role in {"score", "progress_ordinal"}
+            else None,
         )
 
     observations = [
@@ -349,6 +357,13 @@ def _native_score_committed(
         observed("baseline", "native_score", "score", before),
         observed("result", "native_score", "score", after),
     ]
+    if dom_only:
+        observations.extend(
+            [
+                observed("baseline", "level_number", "progress_ordinal", 2 if level_change else 3),
+                observed("result", "level_number", "progress_ordinal", 3),
+            ]
+        )
     transition = evaluate_state_transition(observations)
     digest = "a" * 64
     projection = project_candidate_outcome(
@@ -358,28 +373,32 @@ def _native_score_committed(
         outcome=transition["outcome"],
         evidence_digest=digest,
     )
+    receipt = {
+        "attempt_disposition": "valid",
+        "target_authoritative_state_outcome": transition["outcome"],
+        "target_state_transition": transition,
+        "candidate_outcome_projection": projection,
+    }
+    if dom_only:
+        receipt.pop("target_state_transition")
+        receipt.pop("target_authoritative_state_outcome")
+        receipt["state_observations"] = observations
     return {
         "attempt_id": "attempt:native",
         "reference": "receipt:native",
         "digest": "sha256:" + digest,
         "target_call_ids": (call_id,),
-        "target_evidence_receipts": {
-            call_id: {
-                "attempt_disposition": "valid",
-                "target_authoritative_state_outcome": transition["outcome"],
-                "target_state_transition": transition,
-                "candidate_outcome_projection": projection,
-            }
-        },
+        "target_evidence_receipts": {call_id: receipt},
     }
 
 
+@pytest.mark.parametrize("dom_only", [False, True])
 @pytest.mark.parametrize(
     ("after", "expected_signal", "meaningful"),
     [(15, 0.05, True), (14, 0.04, False)],
 )
 def test_native_score_delta_replaces_worker_signal_and_binds_target_call(
-    after: int, expected_signal: float, meaningful: bool
+    after: int, expected_signal: float, meaningful: bool, dom_only: bool
 ) -> None:
     hypothesis_id = "hypothesis:native-progress"
     task = AgentTask(
@@ -389,10 +408,10 @@ def test_native_score_delta_replaces_worker_signal_and_binds_target_call(
         result=json.dumps({"outcome": "near_miss", "signal": 0.9}),
         technique_ids=(hypothesis_id,),
     )
-    committed = _native_score_committed(hypothesis_id, 10, after)
-    unrelated = _native_score_committed(hypothesis_id, 0, 100, call_id="call:unrelated")[
-        "target_evidence_receipts"
-    ]
+    committed = _native_score_committed(hypothesis_id, 10, after, dom_only=dom_only)
+    unrelated = _native_score_committed(
+        hypothesis_id, 0, 100, call_id="call:unrelated", dom_only=dom_only
+    )["target_evidence_receipts"]
     committed["target_evidence_receipts"].update(unrelated)  # type: ignore[union-attr]
 
     measured = _hypothesis_task_observation("campaign-1", task, {"id": hypothesis_id}, committed)
@@ -425,6 +444,27 @@ def test_native_score_delta_replaces_worker_signal_and_binds_target_call(
     assert arm_observation is not None
     assert arm_observation["usage"]["completed_experiment"] is True
     assert arm_observation["usage"]["native_score_observation"] == native
+
+
+def test_dom_native_score_rejects_level_change() -> None:
+    hypothesis_id = "hypothesis:dom-level-change"
+    task = AgentTask(
+        id="arm-worker",
+        objective="sealed hypothesis",
+        status="completed",
+        result=json.dumps({"outcome": "partial", "signal": 0.9}),
+        technique_ids=(hypothesis_id,),
+    )
+    measured = _hypothesis_task_observation(
+        "campaign-1",
+        task,
+        {"id": hypothesis_id},
+        _native_score_committed(hypothesis_id, 10, 90, dom_only=True, level_change=True),
+    )
+    assert measured is not None
+    assert measured["outcome"] == "ambiguous"
+    assert measured["signal"] is None
+    assert "native_score_observation" not in measured
 
 
 def test_native_score_regression_never_accepts_worker_partial_credit() -> None:

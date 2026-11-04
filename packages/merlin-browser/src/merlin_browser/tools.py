@@ -8173,13 +8173,11 @@ class BrowserChatExchangeTool:
         after_observed_url = submitted_url
         after_signature = _browser_response_snapshot_signature(after, after_observed_url)
         response_witness_conflicted = bool(response_witness and response_witness in prompt)
-        response_boundary_unprovable = (
-            response_witness_conflicted or response_witness_invalid or response_count_unavailable
-        )
+        response_boundary_unprovable = response_witness_invalid or response_count_unavailable
         legacy_prompt_echo_only = False
         static_witness_fallback_armed = False
         static_witness_fallback_observed = False
-        if response_boundary_unprovable:
+        if response_boundary_unprovable or response_witness_conflicted:
             response_boundary_observed = False
         elif response_witness:
             submitted_witness_count = await safe_text_occurrences(
@@ -8209,11 +8207,16 @@ class BrowserChatExchangeTool:
                 and not response_count_unavailable
             )
             response_boundary_unprovable = response_count_unavailable
-        if (
+        response_witness_fallback_eligible = bool(
             response_witness
-            and not response_witness_conflicted
-            and response_witness_count_before is not None
-            and response_witness_count_before > 0
+            and (
+                response_witness_conflicted
+                or response_witness_count_before is not None
+                and response_witness_count_before > 0
+            )
+        )
+        if (
+            response_witness_fallback_eligible
             and not response_boundary_observed
             and prompt_count_before is not None
         ):
@@ -8274,12 +8277,12 @@ class BrowserChatExchangeTool:
                     static_witness_fallback_observed = True
                     fallback_just_observed = True
                     response_boundary_observed = True
+                    response_boundary_unprovable = (
+                        response_witness_invalid or response_count_unavailable
+                    )
                 elif (
                     visible_text_changed
-                    and response_witness
-                    and not response_witness_conflicted
-                    and response_witness_count_before is not None
-                    and response_witness_count_before > 0
+                    and response_witness_fallback_eligible
                     and not response_boundary_observed
                     and prompt_count_before is not None
                 ):

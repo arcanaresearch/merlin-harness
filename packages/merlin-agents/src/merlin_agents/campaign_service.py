@@ -27412,6 +27412,9 @@ def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, o
         if not isinstance(receipt, Mapping) or receipt.get("attempt_disposition") != "valid":
             continue
         transition = receipt.get("target_state_transition")
+        if transition is None:
+            observations.extend(_rendered_native_score_observations(receipt, call_id=call_id))
+            continue
         if not isinstance(transition, Mapping) or (
             transition.get("schema") != "merlin.target-state-transition.v2"
             or transition.get("authority") != "target"
@@ -27481,6 +27484,94 @@ def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, o
         "meaningful_progress": outcome == "progress" and delta >= 5.0,
         "observations": tuple(observations),
     }
+
+
+def _rendered_native_score_observations(
+    receipt: Mapping[str, object], *, call_id: str
+) -> tuple[dict[str, object], ...]:
+    raw = receipt.get("state_observations")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return ()
+
+    def target_authored(item: object) -> bool:
+        return (
+            isinstance(item, Mapping)
+            and item.get("authority") == "target"
+            and item.get("trust_class") == "target_reported"
+            and item.get("phase") in {"baseline", "result"}
+            and not item.get("validation_errors")
+        )
+
+    def number(value: object) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) else None
+
+    level_rows = [
+        item for item in raw if isinstance(item, Mapping) and item.get("name") == "level_number"
+    ]
+    if level_rows:
+        if not all(target_authored(item) for item in level_rows):
+            return ()
+        level_phases: dict[str, list[Mapping[str, object]]] = {}
+        for item in level_rows:
+            level_phases.setdefault(str(item["phase"]), []).append(item)
+        if set(level_phases) != {"baseline", "result"} or any(
+            len(items) != 1 for items in level_phases.values()
+        ):
+            return ()
+        before_level = number(level_phases["baseline"][0].get("selected_value"))
+        after_level = number(level_phases["result"][0].get("selected_value"))
+        if before_level is None or before_level != after_level:
+            return ()
+
+    grouped: dict[str, dict[str, list[Mapping[str, object]]]] = {}
+    for item in raw:
+        if not target_authored(item) or item.get("role") != "score":
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        grouped.setdefault(name, {}).setdefault(str(item["phase"]), []).append(item)
+
+    observations: list[dict[str, object]] = []
+    for name, phases in grouped.items():
+        if set(phases) != {"baseline", "result"} or any(
+            len(items) != 1 for items in phases.values()
+        ):
+            continue
+        baseline, result = phases["baseline"][0], phases["result"][0]
+        direction = result.get("preferred_direction")
+        before = number(baseline.get("selected_value"))
+        after = number(result.get("selected_value"))
+        if (
+            direction not in {"increase", "decrease"}
+            or baseline.get("preferred_direction") != direction
+            or baseline.get("pointer") != result.get("pointer")
+            or baseline.get("evaluation_root") != result.get("evaluation_root")
+            or before is None
+            or after is None
+        ):
+            continue
+        delta = after - before if direction == "increase" else before - after
+        minimum = number(result.get("minimum_value"))
+        maximum = number(result.get("maximum_value"))
+        scale = maximum - minimum if minimum is not None and maximum is not None else 5.0
+        if scale <= 0:
+            scale = 5.0
+        observations.append(
+            {
+                "name": name,
+                "target_call_id": call_id,
+                "status": "observed",
+                "before_value": baseline["selected_value"],
+                "after_value": result["selected_value"],
+                "preferred_direction": direction,
+                "delta": delta,
+                "signal": min(1.0, max(0.0, delta / scale)),
+            }
+        )
+    return tuple(observations)
 
 
 def _committed_attempt_authority(committed: Mapping[str, object]) -> tuple[str, str]:

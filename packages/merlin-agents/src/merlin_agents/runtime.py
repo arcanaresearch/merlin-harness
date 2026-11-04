@@ -10371,6 +10371,13 @@ class WorkerRuntime:
         state_identity_match = result.metadata.get("state_identity_match")
         if isinstance(state_identity_match, bool):
             receipt_body["state_identity_match"] = state_identity_match
+        raw_state_observations = result.metadata.get("state_observations")
+        if (
+            isinstance(raw_state_observations, Sequence)
+            and not isinstance(raw_state_observations, (str, bytes))
+            and all(isinstance(item, Mapping) for item in raw_state_observations)
+        ):
+            receipt_body["state_observations"] = cls._semantic_value(raw_state_observations)
         state_transition, state_outcome = cls._target_state_transition(result.metadata)
         if state_transition is not None:
             if attempt_disposition != "valid" and state_transition.get("outcome") != "unclear":

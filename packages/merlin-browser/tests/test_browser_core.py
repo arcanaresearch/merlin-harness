@@ -21320,7 +21320,8 @@ async def test_probe_scoped_response_witness_does_not_hide_target_reply() -> Non
 
 
 @pytest.mark.asyncio
-async def test_static_page_witness_accepts_stable_change_after_prompt_echo() -> None:
+@pytest.mark.parametrize("prompt", ["hello", "Please quote Score: verbatim"])
+async def test_static_page_witness_accepts_stable_change_after_prompt_echo(prompt: str) -> None:
     chat = b"""
     <div>Score: 0</div>
     <textarea aria-label="Message" maxlength="500"></textarea>
@@ -21382,7 +21383,7 @@ async def test_static_page_witness_accepts_stable_change_after_prompt_echo() -> 
             ).invoke(
                 "browser_chat_exchange",
                 ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
-                {"prompt": "hello", "timeout_ms": 3_000},
+                {"prompt": prompt, "timeout_ms": 3_000},
             )
 
             assert result.is_error is False
@@ -21397,7 +21398,8 @@ async def test_static_page_witness_accepts_stable_change_after_prompt_echo() -> 
 
 
 @pytest.mark.asyncio
-async def test_static_page_witness_does_not_accept_prompt_echo_alone() -> None:
+@pytest.mark.parametrize("prompt", ["echo me", "Please quote Score: verbatim"])
+async def test_static_page_witness_does_not_accept_prompt_echo_alone(prompt: str) -> None:
     chat = b"""
     <div>Score: 0</div>
     <textarea aria-label="Message" maxlength="500"></textarea>
@@ -21454,7 +21456,7 @@ async def test_static_page_witness_does_not_accept_prompt_echo_alone() -> None:
             ).invoke(
                 "browser_chat_exchange",
                 ToolContext(session_id="s1", workspace_root="/tmp", campaign_id="campaign:test"),
-                {"prompt": "echo me", "timeout_ms": 1_000},
+                {"prompt": prompt, "timeout_ms": 1_000},
             )
 
             assert result.is_error is True
