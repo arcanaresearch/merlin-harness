@@ -564,7 +564,22 @@ def test_baseline_agenda_is_ordered_and_control_context_is_neutral() -> None:
 
 
 def test_baseline_agenda_runs_ordinary_direct_cell_without_control_metadata() -> None:
-    prepared = manifest()
+    base = manifest()
+    prepared = CampaignManifest.create(
+        id=base.id,
+        session_id=base.session_id,
+        objective="Preserve TPO-4417 exactly once",
+        profile=base.profile,
+        target=base.target,
+        provider_id=base.provider_id,
+        provider_model=base.provider_model,
+        provider_effort=base.provider_effort,
+        authority_ids=base.authority_ids,
+        catalogue=base.catalogue,
+        skill_documents=base.skill_documents,
+        tool_ids=base.tool_ids,
+        budget=base.budget,
+    )
     context = AssignmentContext(
         target_profile_id="target-1",
         techniques=(
@@ -602,6 +617,7 @@ def test_baseline_agenda_runs_ordinary_direct_cell_without_control_metadata() ->
         "Do not open or navigate tabs, reset sessions, or perform generic fill/click"
         in observation.objective
     )
+    assert "Preserve TPO-4417 exactly once" in observation.objective
 
 
 def test_baseline_agenda_admits_multi_turn_with_reviewed_stateful_api_lifecycle() -> None:

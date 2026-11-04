@@ -2182,6 +2182,28 @@ async def test_new_campaign_extracts_typed_cli_objective_from_internal_prompt():
 
 
 @pytest.mark.asyncio
+async def test_new_campaign_honors_exploration_campaign_wording():
+    exact = "Prepare one bounded exploration campaign for https://target.test."
+    history = [ChatMessage(role="user", content=exact)]
+    tool = CampaignConfigureTool(AsyncMock(return_value=tuple(history)))
+
+    result = await tool.invoke(
+        context(),
+        {
+            "new_campaign": True,
+            "objective": exact,
+            "campaign_profile": "exploration",
+        },
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["settings"] == {
+        "objective": exact,
+        "campaign_profile": "exploration",
+    }
+
+
+@pytest.mark.asyncio
 async def test_new_campaign_restores_operator_url_when_model_omits_it():
     exact = "Run a redpen scan on https://break-room.ai, Bank L1"
     history = [ChatMessage(role="user", content=exact)]

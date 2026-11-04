@@ -483,6 +483,7 @@ def _operator_named_profile(messages: Sequence[ChatMessage], objective: str) -> 
         for profile in PROFILES:
             if re.search(
                 rf"\b{re.escape(profile)}\b\s+(?:campaign\s+)?profile\b"
+                rf"|\b{re.escape(profile)}\s+campaign\b"
                 rf"|\bcampaign\s+profile\b[^.\n]{{0,40}}\b{re.escape(profile)}\b",
                 normalized,
             ):

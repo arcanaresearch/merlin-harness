@@ -2068,7 +2068,9 @@ def compile_baseline_agenda(
                         "telemetry, and do not claim independent validation. Derive the payload "
                         "from the admitted technique guidance without catalogue or workspace "
                         "research.\n\n"
-                        f"{technique.objective}"
+                        f"{technique.objective}\n\n"
+                        "Reviewed operator objective; preserve explicit payload and sequencing "
+                        f"instructions:\n{parent.objective}"
                     ),
                     technique_ids=(technique.id,),
                     guidance_ids=tuple(
