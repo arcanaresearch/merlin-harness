@@ -467,6 +467,37 @@ def test_dom_native_score_rejects_level_change() -> None:
     assert "native_score_observation" not in measured
 
 
+@pytest.mark.parametrize(
+    "disposition", ["uncertain", "contaminated", "protocol_invalid", "infrastructure_failed"]
+)
+def test_native_score_retains_only_attributable_neutral_evidence(disposition: str) -> None:
+    hypothesis_id = "hypothesis:native-neutral"
+    task = AgentTask(
+        id="arm-worker",
+        objective="sealed hypothesis",
+        status="completed",
+        result=json.dumps({"outcome": "unclear"}),
+        technique_ids=(hypothesis_id,),
+    )
+    committed = _native_score_committed(hypothesis_id, 10, 10)
+    receipts = committed["target_evidence_receipts"]
+    receipt = receipts["call:native"]
+    receipt["attempt_disposition"] = disposition
+    receipt.pop("candidate_outcome_projection", None)
+
+    measured = _hypothesis_task_observation("campaign-1", task, {"id": hypothesis_id}, committed)
+
+    assert measured is not None
+    assert measured["outcome"] == "ambiguous"
+    if disposition == "uncertain":
+        native = measured["native_score_observation"]
+        assert native["outcome"] == "unclear"
+        assert native["delta"] == 0
+        assert native["meaningful_progress"] is False
+    else:
+        assert "native_score_observation" not in measured
+
+
 def test_native_score_regression_never_accepts_worker_partial_credit() -> None:
     hypothesis_id = "hypothesis:native-regression"
     task = AgentTask(

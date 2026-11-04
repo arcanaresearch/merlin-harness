@@ -28226,7 +28226,7 @@ async def test_positive_native_score_favors_family_and_mutation_over_untested_re
         selection_width=1,
     )
 
-    assert ordered[0] is matching_mutation
+    assert ordered[0] is other_mutation
     assert set(ordered) == set(candidates)
 
 
@@ -28278,7 +28278,7 @@ async def test_no_evidence_prefers_direct_channel_without_dropping_relay_coverag
 
 
 async def test_declared_target_on_same_typed_level_stops_frontier_claim() -> None:
-    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    prepared = await preparation("session-1", "Complete L1-L3", CampaignProfile.RECOMMENDED)
     base = prepared.assignment_context.techniques[0]
     techniques = (replace(base, id="cell/one"), replace(base, id="cell/two"))
     context = replace(prepared.assignment_context, techniques=techniques)
@@ -28290,7 +28290,7 @@ async def test_declared_target_on_same_typed_level_stops_frontier_claim() -> Non
             "value": value,
             "value_type": "integer",
             "trust_class": "target_reported",
-            "source_call_id": "call/level-2",
+            "source_call_id": "call/level-3",
             "observation_digest": f"sha256:{name}",
         }
 
@@ -28303,7 +28303,7 @@ async def test_declared_target_on_same_typed_level_stops_frontier_claim() -> Non
                 "schema": "merlin.target-progress.v1",
                 "status": "observed",
                 "current_state": (
-                    field("level", "progress_ordinal", 2),
+                    field("level", "progress_ordinal", 3),
                     *(
                         ()
                         if self.level_only

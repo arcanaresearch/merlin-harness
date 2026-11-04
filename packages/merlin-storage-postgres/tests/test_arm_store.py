@@ -169,6 +169,7 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
                             "delta": 6.0,
                             "signal": 0.06,
                             "meaningful_progress": True,
+                            "progress_ordinal": 2,
                             "observations": [],
                         },
                     },
@@ -189,6 +190,7 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
             assert history[0]["identity"]["state_id"] == "fresh-session"
             assert history[0]["completed_experiment"] is True
             assert history[0]["native_score_progress"] is True
+            assert history[0]["native_score_level"] == 2
             assert history[0]["evaluation_uncertainties"] == (
                 {
                     "source": "adapter_expected_status",
@@ -217,6 +219,7 @@ def test_pg0_arm_observation_round_trips_into_bandit_history(tmp_path: Path) -> 
                     "delta": 6.0,
                     "signal": 0.06,
                     "meaningful_progress": True,
+                    "progress_ordinal": 2,
                     "observations": [],
                 },
                 "evaluation_uncertainties": [

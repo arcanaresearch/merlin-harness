@@ -81,13 +81,19 @@ def _jsonb_canonicalize(value: object) -> object:
 
 def _arm_history_metadata(usage: object) -> dict[str, object]:
     if not isinstance(usage, Mapping):
-        return {"completed_experiment": None, "native_score_progress": None}
+        return {
+            "completed_experiment": None,
+            "native_score_progress": None,
+            "native_score_level": None,
+        }
     completed = usage.get("completed_experiment")
     native = usage.get("native_score_observation")
     progress = native.get("meaningful_progress") if isinstance(native, Mapping) else None
+    level = native.get("progress_ordinal") if isinstance(native, Mapping) else None
     return {
         "completed_experiment": completed if type(completed) is bool else None,
         "native_score_progress": progress if type(progress) is bool else None,
+        "native_score_level": level if type(level) is int and level >= 1 else None,
     }
 
 

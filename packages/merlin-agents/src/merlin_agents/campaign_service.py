@@ -2755,14 +2755,36 @@ class CampaignService:
         candidates: tuple[Any, ...],
         observations: Sequence[ArmObservation | Mapping[str, object]],
     ) -> dict[str, int]:
+        if CampaignService._non_improving_experiment_streak(observations) >= 3:
+            return {}
         positive: list[tuple[str, str, str]] = []
+        non_improving_ids: set[str] = set()
         for raw in observations:
             item = raw if isinstance(raw, ArmObservation) else ArmObservation.from_mapping(raw)
-            has_positive_delta = item.native_score_progress is True or (
-                item.native_score_progress is False
-                and item.outcome == "near_miss"
-                and item.partial_signal > 0
+            usage = raw.get("usage") if isinstance(raw, Mapping) else None
+            native = (
+                raw.get("native_score_observation") if isinstance(raw, Mapping) else None
+            ) or (usage.get("native_score_observation") if isinstance(usage, Mapping) else None)
+            has_positive_delta = (
+                native.get("outcome") == "progress"
+                if isinstance(native, Mapping)
+                else item.native_score_progress is True
+                or (
+                    item.native_score_progress is False
+                    and item.outcome == "near_miss"
+                    and item.partial_signal > 0
+                )
             )
+            if not item.is_infrastructure_failure and item.is_completed_experiment:
+                if (
+                    has_positive_delta
+                    or item.outcome in {"finding", "validated_finding", "win"}
+                    or item.native_score_progress is None
+                    and item.partial_signal > 0
+                ):
+                    non_improving_ids.clear()
+                else:
+                    non_improving_ids.add(item.identity.technique_id)
             if (
                 not has_positive_delta
                 or item.is_infrastructure_failure
@@ -2777,6 +2799,14 @@ class CampaignService:
                     item.identity.mutation_id,
                 )
             )
+
+        def same_family(candidate_family: str, observed_family: str) -> bool:
+            return candidate_family == observed_family or (
+                candidate_family.startswith("family/")
+                and not observed_family.startswith("family/")
+                and observed_family.startswith(candidate_family.removeprefix("family/") + "/")
+            )
+
         priorities: dict[str, int] = {}
         for candidate in candidates:
             candidate_id = str(getattr(candidate, "id", "") or _followup_digest(candidate))
@@ -2798,19 +2828,23 @@ class CampaignService:
             )
             for observed_id, observed_family, observed_mutation in positive:
                 priority = (
-                    3
-                    if technique_id == observed_id
+                    0
+                    if technique_id in non_improving_ids
                     else 2
-                    if family_id == observed_family and mutation_id == observed_mutation
+                    if technique_id == observed_id
+                    else 3
+                    if same_family(family_id, observed_family) and mutation_id != observed_mutation
                     else 1
-                    if family_id == observed_family
+                    if same_family(family_id, observed_family)
                     else 0
                 )
-                priorities[candidate_id] = max(priority, priorities.get(candidate_id, 0))
+                priorities[candidate_id] = priority
         return {key: value for key, value in priorities.items() if value}
 
     @staticmethod
-    def _declared_level_target_met(progress: Mapping[str, object]) -> bool:
+    def _declared_level_target_met(
+        progress: Mapping[str, object], final_level: int | None = None
+    ) -> bool:
         if (
             progress.get("schema") != "merlin.target-progress.v1"
             or progress.get("status") != "observed"
@@ -2853,7 +2887,7 @@ class CampaignService:
                 for target in fields:
                     if (
                         not isinstance(target, Mapping)
-                        or target.get("role") != "score"
+                        or target.get("role") not in {"score", "custom"}
                         or target.get("name") != "target_score"
                     ):
                         continue
@@ -2866,8 +2900,26 @@ class CampaignService:
                         and len(call_ids) == 1
                         and current_number >= target_number
                     ):
-                        return True
+                        if final_level is not None:
+                            return level_number == final_level
+                        return any(
+                            item.get("role") == "terminal_status"
+                            and item.get("trust_class") == "target_reported"
+                            and item.get("value")
+                            in {True, "won", "complete", "completed", "success", "passed"}
+                            for item in fields
+                            if isinstance(item, Mapping)
+                        )
         return False
+
+    @staticmethod
+    def _final_objective_level(manifest: CampaignManifest) -> int | None:
+        match = re.search(
+            r"\bL(\d+)\s*(?:-|–|…|\.\.)\s*L?(\d+)\b",
+            manifest.objective,
+            flags=re.IGNORECASE,
+        )
+        return int(match.group(2)) if match is not None else None
 
     async def _prioritize_execution_candidates(
         self,
@@ -2884,11 +2936,13 @@ class CampaignService:
         The incoming order carries coverage/history/ARM priorities. Reserve one
         deterministic exploration slot across technique families and target
         states, then fill the dispatch width from the ranked candidates while
-        preferring dimensions not already represented in the batch. A single-slot
-        batch can escalate to a non-stalled adaptive family after three completed
-        non-improving experiments. All remaining candidates stay queued, including
-        negative or unavailable judgments. Scores never become attack outcomes or
-        retirement evidence.
+        preferring dimensions not already represented in the batch. Current-level
+        native scores guide promising families and reset after a completed level.
+        A single-slot batch can prefer an untried candidate or non-stalled adaptive
+        family after three completed non-improving experiments. Optional model
+        ranking never overrides current-level native evidence. All remaining
+        candidates stay queued, including negative or unavailable judgments.
+        Scores never become attack outcomes or retirement evidence.
         """
         if not candidates:
             return candidates
@@ -2896,25 +2950,85 @@ class CampaignService:
             progress = await self.target_progress(campaign_id, manifest.target.id)
         except Exception:  # noqa: BLE001 - target projection cannot block execution
             progress = {}
-        if self._declared_level_target_met(progress):
+        if self._declared_level_target_met(progress, self._final_objective_level(manifest)):
             return ()
         observations: Sequence[ArmObservation | Mapping[str, object]] = ()
         arm_source = self._arm_store
         arm_loader = getattr(arm_source, "list_arms", None)
         observation_loader = getattr(arm_source, "list_arm_observations", None)
         native_priorities: dict[str, int] = {}
+        attempted_ids: set[str] = set()
+        current_level = None
         if callable(arm_loader) and callable(observation_loader):
             scenario = scenario_fingerprint_for(manifest.target, manifest.catalogue)
             try:
                 observations = await asyncio.to_thread(
                     observation_loader, manifest.target.id, scenario
                 )
+                fields = progress.get("current_state", ())
+                if isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
+                    current_level = next(
+                        (
+                            item["value"]
+                            for item in fields
+                            if isinstance(item, Mapping)
+                            and item.get("role") == "progress_ordinal"
+                            and item.get("name") in {"level", "level_number"}
+                            and item.get("trust_class") == "target_reported"
+                            and item.get("value_type") == "integer"
+                            and type(item.get("value")) is int
+                            and item["value"] >= 1
+                            and item.get("source_call_id")
+                        ),
+                        None,
+                    )
+                if current_level is not None:
+                    observations = (
+                        ()
+                        if self._declared_level_target_met(progress, current_level)
+                        else tuple(
+                            raw
+                            for raw in observations
+                            if not isinstance(raw, Mapping)
+                            or raw.get("native_score_level") in {None, current_level}
+                        )
+                    )
                 native_priorities = self._native_execution_priorities(candidates, observations)
+                if (
+                    not native_priorities
+                    and self._non_improving_experiment_streak(observations) >= 3
+                ):
+                    attempted_ids = {
+                        item.identity.technique_id
+                        for raw in observations
+                        for item in (
+                            raw
+                            if isinstance(raw, ArmObservation)
+                            else ArmObservation.from_mapping(raw),
+                        )
+                        if item.is_completed_experiment and not item.is_infrastructure_failure
+                    }
             except Exception:  # noqa: BLE001 - advisory ranking cannot block execution
                 observations = ()
+        if not native_priorities:
+            candidates = tuple(
+                sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        str(getattr(candidate, "id", "") or _followup_digest(candidate))
+                        in attempted_ids,
+                        getattr(candidate, "domain_id", None) == "agent-relay"
+                        or "/cat/agent-to-agent/"
+                        in str(
+                            getattr(candidate, "semantic_id", None) or getattr(candidate, "id", "")
+                        ),
+                    ),
+                )
+            )
         if (
             len(candidates) > 1
             and not native_priorities
+            and current_level is None
             and callable(getattr(self._store, "get", None))
         ):
             try:
@@ -3133,7 +3247,11 @@ class CampaignService:
                         ),
                     },
                 )
-        client = self._jev_escalation_client()
+        client = (
+            None
+            if native_priorities or attempted_ids or current_level is not None
+            else self._jev_escalation_client()
+        )
         if client is None:
             if not diversity_enabled:
                 return candidates
@@ -27566,6 +27684,62 @@ def _hypothesis_task_observation(
     return observation
 
 
+def _native_score_level(receipt: Mapping[str, object]) -> int | None:
+    def integer(value: object) -> int | None:
+        return value if type(value) is int and value >= 1 else None
+
+    levels: set[int] = set()
+    transition = receipt.get("target_state_transition")
+    if isinstance(transition, Mapping):
+        quarantined = {
+            str(item)
+            for item in transition.get("quarantined_observations", ())
+            if isinstance(item, str)
+        }
+        compared = transition.get("observations", ())
+        if isinstance(compared, Sequence) and not isinstance(compared, (str, bytes)):
+            for item in compared:
+                if (
+                    isinstance(item, Mapping)
+                    and item.get("role") == "progress_ordinal"
+                    and item.get("trust_class") == "target_reported"
+                    and item.get("name") not in quarantined
+                    and not item.get("validation_errors")
+                    and item.get("before_value") == item.get("after_value")
+                    and (level := integer(item.get("after_value"))) is not None
+                ):
+                    levels.add(level)
+    if len(levels) == 1:
+        return next(iter(levels))
+
+    grouped: dict[str, dict[str, list[Mapping[str, object]]]] = {}
+    raw = receipt.get("state_observations", ())
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    for item in raw:
+        if (
+            isinstance(item, Mapping)
+            and item.get("authority") == "target"
+            and item.get("role") == "progress_ordinal"
+            and item.get("trust_class") == "target_reported"
+            and item.get("phase") in {"baseline", "result"}
+            and not item.get("validation_errors")
+        ):
+            name = item.get("name")
+            if isinstance(name, str):
+                grouped.setdefault(name, {}).setdefault(str(item["phase"]), []).append(item)
+    for phases in grouped.values():
+        if set(phases) != {"baseline", "result"} or any(
+            len(items) != 1 for items in phases.values()
+        ):
+            continue
+        baseline = phases["baseline"][0].get("selected_value")
+        result = phases["result"][0].get("selected_value")
+        if baseline == result and (level := integer(result)) is not None:
+            levels.add(level)
+    return next(iter(levels)) if len(levels) == 1 else None
+
+
 def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, object] | None:
     receipts = committed.get("target_evidence_receipts")
     if not isinstance(receipts, Mapping):
@@ -27581,11 +27755,15 @@ def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, o
         if not isinstance(call_id, str):
             continue
         receipt = receipts.get(call_id)
-        if not isinstance(receipt, Mapping) or receipt.get("attempt_disposition") != "valid":
+        if not isinstance(receipt, Mapping) or receipt.get("attempt_disposition") not in {
+            "valid",
+            "uncertain",
+        }:
             continue
         transition = receipt.get("target_state_transition")
         if transition is None:
-            observations.extend(_rendered_native_score_observations(receipt, call_id=call_id))
+            if receipt.get("attempt_disposition") == "valid":
+                observations.extend(_rendered_native_score_observations(receipt, call_id=call_id))
             continue
         if not isinstance(transition, Mapping) or (
             transition.get("schema") != "merlin.target-state-transition.v2"
@@ -27648,7 +27826,13 @@ def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, o
     )
     delta = min(deltas) if regressed else max(deltas)
     signal = max(float(item["signal"]) for item in observations) if outcome == "progress" else None
-    return {
+    levels = {
+        level
+        for call_id in {str(item["target_call_id"]) for item in observations}
+        if isinstance(receipts.get(call_id), Mapping)
+        and (level := _native_score_level(receipts[call_id])) is not None
+    }
+    projection = {
         "schema": "merlin.native-score-observation.v1",
         "outcome": outcome,
         "delta": delta,
@@ -27656,6 +27840,9 @@ def _native_score_observation(committed: Mapping[str, object]) -> Mapping[str, o
         "meaningful_progress": outcome == "progress" and delta >= 5.0,
         "observations": tuple(observations),
     }
+    if len(levels) == 1:
+        projection["progress_ordinal"] = next(iter(levels))
+    return projection
 
 
 def _rendered_native_score_observations(

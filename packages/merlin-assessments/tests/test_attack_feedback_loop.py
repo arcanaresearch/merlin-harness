@@ -35,6 +35,7 @@ from merlin_storage_postgres import (
     SessionRepository,
     ToolEffectRepository,
 )
+from merlin_storage_postgres.arm_store import _arm_history_metadata
 from merlin_tools import ToolBroker
 
 
@@ -182,7 +183,13 @@ class ArmHistory:
         return list(self.arms.values())
 
     def list_arm_observations(self, _target_id: str, _scenario: str):
-        return list(self.observations)
+        return [
+            {
+                **observation,
+                **_arm_history_metadata(observation.get("usage")),
+            }
+            for observation in self.observations
+        ]
 
 
 def _technique(technique_id: str, semantic_id: str, domain_id: str) -> AssignmentTechnique:
@@ -202,9 +209,7 @@ def _arm(manifest: CampaignManifest, technique: AssignmentTechnique) -> dict[str
     return {
         "id": f"arm:{technique.id}",
         "target_id": manifest.target.id,
-        "scenario_fingerprint": scenario_fingerprint_for(
-            manifest.target, manifest.catalogue
-        ),
+        "scenario_fingerprint": scenario_fingerprint_for(manifest.target, manifest.catalogue),
         "surface_id": technique.domain_id,
         "semantic_id": technique.resolved_semantic_id,
         "strategy_id": technique.strategy_id,
@@ -241,7 +246,7 @@ async def test_three_level_attack_feedback_uses_native_score_to_mutate_replan_an
         "direct/base",
         "direct/mutation",
         "direct/stalled",
-        "direct/stalled",
+        "direct/base",
         "direct/replan",
         "direct/base",
         "direct/mutation",
@@ -254,7 +259,7 @@ async def test_three_level_attack_feedback_uses_native_score_to_mutate_replan_an
         manifest = CampaignManifest.create(
             id=campaign_id,
             session_id="session/native-feedback-fixture",
-            objective="Reach each level's native target score",
+            objective="Reach each level's native target score, L1-L3",
             profile=CampaignProfile.RECOMMENDED,
             target=ReviewedTargetAdapter(
                 id="target/native-feedback-fixture",
@@ -451,5 +456,16 @@ async def test_three_level_attack_feedback_uses_native_score_to_mutate_replan_an
         "progress",
         "progress",
         "progress",
+    ]
+    assert [item["progress_ordinal"] for item in native] == [
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
     ]
     assert states[-1]["status"] == "won"
