@@ -28165,6 +28165,249 @@ async def test_single_slot_adaptive_escalation_waits_for_admitted_execution() ->
     assert ordered[0] is alternative_adaptive
 
 
+async def test_positive_native_score_favors_family_and_mutation_over_untested_relay() -> None:
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    relay = replace(
+        base,
+        id="merlin-injection-taxonomy/cat/agent-to-agent/agent-authority-relay",
+        semantic_id="family/relay",
+    )
+    other_mutation = replace(
+        base,
+        id="family/direct@lang=en@variant=other",
+        semantic_id="family/direct",
+        transform_id="other",
+    )
+    matching_mutation = replace(
+        base,
+        id="family/direct@lang=en@variant=seeded",
+        semantic_id="family/direct",
+        transform_id="seeded",
+    )
+    candidates = (relay, other_mutation, matching_mutation)
+    identity = ArmIdentity("chat", "family/direct", "direct", "seeded", "en", "state")
+    positive = ArmObservation(
+        identity,
+        "near_miss",
+        partial_signal=0.01,
+        attempt_disposition="valid",
+        outcome_authority="target",
+        completed_experiment=True,
+        native_score_progress=False,
+    )
+
+    class Store:
+        def list_arms(self, _target_id, _scenario):
+            return []
+
+        def list_arm_observations(self, _target_id, _scenario):
+            return [positive]
+
+        def get(self, campaign_id):
+            return {"id": campaign_id}
+
+    class Service(CampaignService):
+        async def status(self, _campaign_id):
+            return {
+                "saturation": {
+                    "catalogue_cells_unsearched": len(candidates),
+                    "untested_cell_ids": tuple(item.id for item in candidates),
+                }
+            }
+
+    service = Service(Store(), object(), None, arm_store=Store(), max_worker_concurrency=1)  # type: ignore[arg-type]
+
+    ordered = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        candidates,
+        2,
+        selection_width=1,
+    )
+
+    assert ordered[0] is matching_mutation
+    assert set(ordered) == set(candidates)
+
+
+async def test_no_evidence_prefers_direct_channel_without_dropping_relay_coverage() -> None:
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    relay = replace(
+        base,
+        id="merlin-injection-taxonomy/cat/agent-to-agent/agent-authority-relay",
+        semantic_id="family/relay",
+    )
+    direct = replace(
+        base,
+        id="merlin-injection-taxonomy/cat/direct/credential-ask-direct",
+        semantic_id="family/direct",
+        tags=frozenset({"direct-user-channel"}),
+    )
+
+    class Store:
+        def list_arms(self, _target_id, _scenario):
+            return []
+
+        def list_arm_observations(self, _target_id, _scenario):
+            return []
+
+        def get(self, campaign_id):
+            return {"id": campaign_id}
+
+    class Service(CampaignService):
+        async def status(self, _campaign_id):
+            return {
+                "saturation": {
+                    "catalogue_cells_unsearched": 2,
+                    "untested_cell_ids": (relay.id, direct.id),
+                }
+            }
+
+    service = Service(Store(), object(), None, arm_store=Store(), max_worker_concurrency=1)  # type: ignore[arg-type]
+
+    ordered = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        (relay, direct),
+        1,
+        selection_width=1,
+    )
+
+    assert ordered == (direct, relay)
+
+
+async def test_declared_target_on_same_typed_level_stops_frontier_claim() -> None:
+    prepared = await preparation("session-1", "Assess target", CampaignProfile.RECOMMENDED)
+    base = prepared.assignment_context.techniques[0]
+    techniques = (replace(base, id="cell/one"), replace(base, id="cell/two"))
+    context = replace(prepared.assignment_context, techniques=techniques)
+
+    def field(name: str, role: str, value: int) -> dict[str, object]:
+        return {
+            "name": name,
+            "role": role,
+            "value": value,
+            "value_type": "integer",
+            "trust_class": "target_reported",
+            "source_call_id": "call/level-2",
+            "observation_digest": f"sha256:{name}",
+        }
+
+    class Agents:
+        current_score = 63
+        level_only = False
+
+        async def target_progress(self, _campaign_id, _target_id):
+            return {
+                "schema": "merlin.target-progress.v1",
+                "status": "observed",
+                "current_state": (
+                    field("level", "progress_ordinal", 2),
+                    *(
+                        ()
+                        if self.level_only
+                        else (
+                            field("current_score", "score", self.current_score),
+                            field("target_score", "score", 63),
+                        )
+                    ),
+                ),
+                "conflicts": (),
+            }
+
+    class Store:
+        def __init__(self):
+            self.claims = []
+
+        def claim_frontier_batch(self, *_args, **_kwargs):
+            raise AssertionError("normalized frontier must use exact claims")
+
+        def frontier_counts(self, _campaign_id):
+            return {"queued": 2, "total": 2}
+
+        def list_frontier_shortlist(self, _campaign_id, _limit, *, after_ordinal=None):
+            assert after_ordinal is None
+            return tuple(
+                {
+                    "id": technique.id,
+                    "family_id": technique.id,
+                    "ordinal": ordinal,
+                    "requested_language": "und",
+                    "variant_id": "baseline",
+                    "variant": {},
+                    "priority": None,
+                    "claim_generation": 0,
+                }
+                for ordinal, technique in enumerate(techniques)
+            )
+
+        def claim_frontier_batch_exact(self, *_args, **_kwargs):
+            self.claims.append(_args)
+            raise AssertionError("a met declared target must not claim more attacks")
+
+        def list_lead(self, _campaign_id):
+            return []
+
+    agents = Agents()
+    store = Store()
+    service = CampaignService(store, agents, None, max_worker_concurrency=1)  # type: ignore[arg-type]
+
+    completed, batch = await service._claim_execution_frontier_context(  # noqa: SLF001
+        prepared.manifest.id, prepared.manifest, context, 2
+    )
+
+    assert completed.techniques == ()
+    assert batch is not None and batch["state"] == "settled"
+    assert store.claims == []
+
+    agents.current_score = 62
+    prioritized = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        techniques,
+        2,
+        selection_width=1,
+    )
+    assert prioritized == techniques
+
+    agents.current_score = 63
+    agents.level_only = True
+    prioritized = await service._prioritize_execution_candidates(  # noqa: SLF001
+        prepared.manifest.id,
+        prepared.manifest,
+        techniques,
+        2,
+        selection_width=1,
+    )
+    assert prioritized == techniques
+
+
+def test_declared_target_requires_one_typed_observation_for_the_current_level() -> None:
+    def field(name: str, role: str, value: int, call_id: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "role": role,
+            "value": value,
+            "value_type": "integer",
+            "trust_class": "target_reported",
+            "source_call_id": call_id,
+        }
+
+    progress = {
+        "schema": "merlin.target-progress.v1",
+        "status": "observed",
+        "current_state": (
+            field("level", "progress_ordinal", 2, "call/level-2"),
+            field("current_score", "score", 63, "call/level-2"),
+            field("target_score", "score", 63, "call/level-1"),
+        ),
+        "conflicts": (),
+    }
+
+    assert CampaignService._declared_level_target_met(progress) is False  # noqa: SLF001
+
+
 async def test_frontier_records_measured_arm_outcomes_before_successor_claim_and_replays_once():
     prepared = await preparation("session-1", "Assess target", CampaignProfile.EXPLORATION)
     scenario = scenario_fingerprint_for(prepared.manifest.target, prepared.manifest.catalogue)

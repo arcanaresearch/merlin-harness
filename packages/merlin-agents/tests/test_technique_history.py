@@ -26,6 +26,7 @@ from merlin_agents.campaign_service import (
     _deferred_coverage_rows,
     _json_value,
 )
+from merlin_agents.repeat_planning import PARTIAL_REPEAT_POLICY
 from merlin_agents.specialists import LanguageCandidateReference, LanguageFrontierSpec
 from merlin_agents.technique_history import (
     entries_for_completion,
@@ -33,6 +34,12 @@ from merlin_agents.technique_history import (
     technique_cell_parts,
 )
 from merlin_contracts import AgentTask
+
+
+def test_repeat_policy_builds_on_native_progress_before_unrelated_work() -> None:
+    assert "Prefer untested work first." not in PARTIAL_REPEAT_POLICY
+    assert "positive native score delta" in PARTIAL_REPEAT_POLICY
+    assert "direct user-channel compatible untested work" in PARTIAL_REPEAT_POLICY
 
 
 def _technique(technique_id: str, **overrides: object) -> AssignmentTechnique:
